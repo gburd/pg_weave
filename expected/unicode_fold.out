@@ -1,0 +1,130 @@
+-- Unicode lowercasing in the built-in analyzer (to_wdoc(text)/to_wquery(text)):
+-- a token with non-ASCII bytes is lowercased per Unicode code point, so accented
+-- letters match case-insensitively ('CAFÉ' matches 'café').  The document side
+-- (built at index time) and the query side must fold identically, so every query
+-- below is run under a forced SEQ SCAN and a forced INDEX/BITMAP SCAN and must
+-- return the same rows.  (This is simple lowercasing, not case folding: 'ß' stays
+-- 'ß', so 'STRASSE' does not match 'Straße'.)
+SET client_min_messages = warning;
+CREATE TABLE ufold (id int, body text);
+INSERT INTO ufold VALUES
+  (1, 'café society'),
+  (2, 'CAFÉ RESTAURANT'),
+  (3, 'Le Café'),
+  (4, 'naïve approach'),
+  (5, 'NAÏVE idea'),
+  (6, 'MÜNCHEN city'),
+  (7, 'münchen bier'),
+  (8, 'RÉSUMÉ text'),
+  (9, 'Straße Berlin'),
+  (10, 'plain ascii only');
+-- ASCII filler so the planner prefers the index once seq scan is disabled
+INSERT INTO ufold SELECT g, 'filler token number ' || g
+  FROM generate_series(100, 3000) g;
+CREATE INDEX ufold_weave ON ufold USING weave (to_wdoc(body));
+ANALYZE ufold;
+-- The query side folds too: 'CAFÉ' -> 'café', 'MÜNCHEN' -> 'münchen'
+SELECT to_wquery('CAFÉ')::text AS q_cafe,
+       to_wquery('MÜNCHEN')::text AS q_munchen,
+       to_wquery('STRASSE')::text AS q_strasse;
+ q_cafe | q_munchen | q_strasse 
+--------+-----------+-----------
+ 'café' | 'münchen' | 'strasse'
+(1 row)
+
+-- ===== forced SEQ SCAN (@@@ evaluated on the heap, doc + query folded live) =====
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET enable_seqscan = on;
+EXPLAIN (COSTS OFF)
+  SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('CAFÉ');
+                    QUERY PLAN                    
+--------------------------------------------------
+ Seq Scan on ufold
+   Filter: (to_wdoc(body) @@@ '''café'''::wquery)
+(2 rows)
+
+SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('CAFÉ')    ORDER BY id;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('münchen') ORDER BY id;
+ id 
+----
+  6
+  7
+(2 rows)
+
+SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('naïve')   ORDER BY id;
+ id 
+----
+  4
+  5
+(2 rows)
+
+SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('résumé')  ORDER BY id;
+ id 
+----
+  8
+(1 row)
+
+SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('STRASSE') ORDER BY id;
+ id 
+----
+(0 rows)
+
+-- ===== forced INDEX/BITMAP SCAN (@@@ answered from the built terms) =====
+SET enable_seqscan = off;
+SET enable_indexscan = on;
+SET enable_bitmapscan = on;
+EXPLAIN (COSTS OFF)
+  SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('CAFÉ');
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Bitmap Heap Scan on ufold
+   Recheck Cond: (to_wdoc(body) @@@ '''café'''::wquery)
+   ->  Bitmap Index Scan on ufold_weave
+         Index Cond: (to_wdoc(body) @@@ '''café'''::wquery)
+(4 rows)
+
+SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('CAFÉ')    ORDER BY id;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('münchen') ORDER BY id;
+ id 
+----
+  6
+  7
+(2 rows)
+
+SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('naïve')   ORDER BY id;
+ id 
+----
+  4
+  5
+(2 rows)
+
+SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('résumé')  ORDER BY id;
+ id 
+----
+  8
+(1 row)
+
+SELECT id FROM ufold WHERE to_wdoc(body) @@@ to_wquery('STRASSE') ORDER BY id;
+ id 
+----
+(0 rows)
+
+RESET enable_seqscan;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE ufold;

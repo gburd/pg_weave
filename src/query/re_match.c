@@ -1,0 +1,234 @@
+/*-------------------------------------------------------------------------
+ *
+ * re_match.c -- TRE wrapper: compile/match entry points isolated from postgres.h
+ *
+ * Imported from pg_tre e03d6a8 (MIT, same author) and renamed into the
+ * weave namespace.  See doc/specs/IMPORT_pg_tre.md for the mapping and
+ * doc/CHANNELS.md for how this fits the fuzzy/regex channel.
+ *
+ * Copyright (c) 2025-2026, Gregory Burd
+ *
+ *-------------------------------------------------------------------------
+ */
+
+/*
+ * src/query/re_match.c - TRE wrapper implementation.
+ *
+ * This file includes TRE headers but NOT postgres.h. All TRE memory
+ * management uses standard malloc/free; callers palloc-wrap results.
+ */
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "tre.h"
+#include "tre-internal.h"
+#include "weave/re_match.h"
+
+/*
+ * Progress-hook plumbing.  The hook is installed by the PG-facing layer
+ * (src/module.c, which owns postgres.h and the deadline logic) and is
+ * invoked periodically from inside the vendored TRE matcher loop via
+ * tre_progress_check().  Keeping the pointer here -- not in vendor/tre --
+ * means the vendored matcher only references the plain extern symbol
+ * tre_progress_check() and stays free of any pg_weave/PG coupling.
+ *
+ * progress_aborted records whether the most recent match was cut short,
+ * so weave_do_match() can distinguish a genuine no-match from a timeout
+ * even though TRE collapses both into a non-REG_OK return.
+ */
+static WeaveProgressHook progress_hook = NULL;
+static int             progress_aborted = 0;
+
+/*
+ * Separate progress hook for the COMPILE path.  The vendored TRE
+ * compiler's AST-expansion loops (tre_expand_ast / tre_copy_ast /
+ * tre_add_tags) can blow up combinatorially on bounded repetitions such
+ * as a{1000}{1000}; this hook lets src/module.c arm a wall-clock
+ * compile deadline (pg_weave.compile_timeout_ms) checked from inside those
+ * loops.  Kept separate from the match hook so arming one never
+ * perturbs the other.  See tre-compile.c for the call sites.
+ */
+static WeaveProgressHook compile_progress_hook = NULL;
+
+WeaveProgressHook
+weave_set_compile_progress_hook(WeaveProgressHook hook)
+{
+    WeaveProgressHook prev = compile_progress_hook;
+    compile_progress_hook = hook;
+    return prev;
+}
+
+int
+tre_compile_progress_check(void)
+{
+    if (compile_progress_hook != NULL && compile_progress_hook() != 0)
+        return 1;
+    return 0;
+}
+
+WeaveProgressHook
+weave_set_progress_hook(WeaveProgressHook hook)
+{
+    WeaveProgressHook prev = progress_hook;
+    progress_hook = hook;
+    return prev;
+}
+
+int
+tre_progress_check(void)
+{
+    if (progress_hook != NULL && progress_hook() != 0)
+    {
+        progress_aborted = 1;
+        return 1;
+    }
+    return 0;
+}
+
+void *
+weave_compile_pattern(const char *pattern, int pattern_len, int *errcode_out)
+{
+    regex_t *preg;
+
+    preg = malloc(sizeof(regex_t));
+    if (preg == NULL)
+    {
+        *errcode_out = REG_ESPACE;
+        return NULL;
+    }
+    memset(preg, 0, sizeof(regex_t));
+
+    *errcode_out = tre_regncomp(preg, pattern, (size_t) pattern_len,
+                                REG_EXTENDED);
+    if (*errcode_out != REG_OK)
+    {
+        free(preg);
+        return NULL;
+    }
+
+    return preg;
+}
+
+void
+weave_free_pattern(void *compiled)
+{
+    if (compiled == NULL)
+        return;
+    tre_regfree((regex_t *) compiled);
+    free(compiled);
+}
+
+/*
+ * Return the number of states in the compiled NFA, or -1 if the handle
+ * is NULL or carries no internal NFA.  Used by the caller to reject
+ * patterns whose compiled automaton is large enough to make matching
+ * pathologically slow (the per-string match cost is roughly
+ * O(num_states * string_len * max_cost)).
+ */
+int
+weave_pattern_num_states(void *compiled)
+{
+    regex_t *preg = (regex_t *) compiled;
+    tre_tnfa_t *tnfa;
+
+    if (preg == NULL || preg->value == NULL)
+        return -1;
+    tnfa = (tre_tnfa_t *) preg->value;
+    return tnfa->num_states;
+}
+
+WeaveMatchResult
+weave_do_match(void *compiled, const char *str, int str_len,
+             int max_cost, int cost_ins, int cost_del,
+             int cost_subst, int max_ins, int max_del,
+             int max_subst, int max_err)
+{
+    regex_t        *preg = (regex_t *) compiled;
+    regaparams_t    params;
+    regmatch_t      pmatch;
+    regamatch_t     amatch;
+    WeaveMatchResult  result;
+    int             ret;
+
+    memset(&result, 0, sizeof(result));
+
+    tre_regaparams_default(&params);
+    params.cost_ins  = cost_ins;
+    params.cost_del  = cost_del;
+    params.cost_subst = cost_subst;
+    params.max_cost  = max_cost;
+    params.max_ins   = max_ins;
+    params.max_del   = max_del;
+    params.max_subst = max_subst;
+    params.max_err   = max_err;
+
+    /*
+     * Bound the edit-distance search space by max_cost.  Callers pass
+     * INT_MAX for the individual max_ins/max_del/max_subst/max_err
+     * limits, relying on max_cost alone; but leaving them at INT_MAX
+     * makes TRE allocate and explore a far larger reach space than the
+     * cost ceiling can ever accept.  When max_cost is finite and edit
+     * operations have unit (>=1) cost, no individual edit count can
+     * exceed max_cost, so clamp the per-operation limits down to it.
+     * This is the practical DoS bound on match work: with the NFA-state
+     * cap (pattern_cache.c) and this cost clamp, per-string match cost
+     * is O(num_states * str_len * max_cost), all three bounded.
+     */
+    if (max_cost >= 0 && max_cost != INT_MAX)
+    {
+        if (params.max_err > max_cost)   params.max_err = max_cost;
+        if (params.max_ins > max_cost)   params.max_ins = max_cost;
+        if (params.max_del > max_cost)   params.max_del = max_cost;
+        if (params.max_subst > max_cost) params.max_subst = max_cost;
+    }
+
+    memset(&amatch, 0, sizeof(amatch));
+    amatch.nmatch = 1;
+    amatch.pmatch = &pmatch;
+
+    /*
+     * Reset the per-match abort flag.  The vendored matcher calls
+     * tre_progress_check() once per input position; if the installed
+     * hook (a deadline check in module.c) fires, the matcher unwinds
+     * and returns non-REG_OK, and progress_aborted is left set.
+     */
+    progress_aborted = 0;
+
+    ret = tre_reganexec(preg, str, (size_t) str_len,
+                        &amatch, params, 0);
+
+    if (progress_aborted)
+    {
+        /*
+         * The match was cut short by the progress hook (wall-clock
+         * deadline).  Report a clean timeout; the PG caller turns this
+         * into an ereport(ERROR) and must not treat it as "no match".
+         */
+        result.timed_out = 1;
+        progress_aborted = 0;
+        return result;
+    }
+
+    if (ret == REG_OK)
+    {
+        result.matched     = 1;
+        result.cost        = amatch.cost;
+        result.num_ins     = amatch.num_ins;
+        result.num_del     = amatch.num_del;
+        result.num_subst   = amatch.num_subst;
+        result.match_start = (int) pmatch.rm_so;
+        result.match_end   = (int) pmatch.rm_eo;
+    }
+
+    return result;
+}
+
+const char *
+weave_errmsg(int errcode_val)
+{
+    static char buf[256];
+
+    tre_regerror(errcode_val, NULL, buf, sizeof(buf));
+    return buf;
+}

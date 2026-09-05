@@ -1,0 +1,19 @@
+*.o
+*.so
+*.bc
+results/
+regression.diffs
+regression.out
+tmp_check/
+log/
+.direnv/
+result
+result-*
+specs/
+*.zip
+output_iso/
+isolation_output/
+
+# The user's global core.excludesfile has a blanket "*.out" rule, which would
+# otherwise swallow the checked-in pg_regress/pg_isolation_regress fixtures.
+!expected/*.out

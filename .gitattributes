@@ -1,0 +1,2 @@
+*.out text eol=lf
+expected/* text eol=lf
