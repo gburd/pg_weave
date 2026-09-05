@@ -1,0 +1,3 @@
+# Build options for the Windows/MSVC meson build (see meson.build).
+option('pg_dir', type: 'string', value: 'C:/pgsql',
+  description: 'Prefix of an MSVC-built PostgreSQL >= 17 (include/server, lib/postgres.lib)')

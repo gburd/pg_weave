@@ -1,0 +1,52 @@
+{
+   "name": "pg_weave",
+   "abstract": "One index for BM25 text, vector similarity, fuzzy and regex search",
+   "description": "A PostgreSQL extension providing a single unified index access method (weave) that combines BM25 lexical full-text ranking, vector similarity, fuzzy (edit-distance) matching, and regex/trigram search, so applications no longer need to maintain separate GIN/GiST/vector indexes for hybrid retrieval.",
+   "version": "0.1.0",
+   "maintainer": [
+      "Gregory Burd <greg@burd.me>"
+   ],
+   "license": "postgresql",
+   "provides": {
+      "pg_weave": {
+         "abstract": "One index for BM25 text, vector similarity, fuzzy and regex search",
+         "file": "sql/pg_weave--0.1.0.sql",
+         "version": "0.1.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "17.0.0"
+         }
+      }
+   },
+   "resources": {
+      "repository": {
+         "url": "https://codeberg.org/gregburd/pg_weave.git",
+         "web": "https://codeberg.org/gregburd/pg_weave",
+         "type": "git"
+      },
+      "bugtracker": {
+         "web": "https://codeberg.org/gregburd/pg_weave/issues"
+      },
+      "homepage": "https://codeberg.org/gregburd/pg_weave"
+   },
+   "generated_by": "Gregory Burd",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "full text search",
+      "bm25",
+      "vector",
+      "ann",
+      "similarity",
+      "fuzzy",
+      "regex",
+      "trigram",
+      "hybrid search",
+      "index"
+   ]
+}
