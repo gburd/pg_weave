@@ -163,11 +163,38 @@ say "ssh up"
 
 # ---------------------------------------------------------------------------
 say "provisioning"
-$SSH 'sudo DEBIAN_FRONTEND=noninteractive apt-get -qq update && \
-	sudo DEBIAN_FRONTEND=noninteractive apt-get -qq install -y \
-		build-essential git postgresql-17 postgresql-server-dev-17 \
-		libipc-run-perl clang lld pkg-config >/dev/null 2>&1; \
-	pg_config --version' 2>&1 | tail -3 | tee "$OUT/provision.log"
+#
+# Ubuntu 24.04 ships PostgreSQL 16; pg_weave needs 17+.  So the PGDG apt
+# repository is mandatory, not a convenience.
+#
+# Errors are NOT swallowed here.  The first version redirected apt output to
+# /dev/null and used a `;` before the version check, so a failed install produced
+# a silent no-op and the run died 30 seconds later with "make: command not found"
+# -- a symptom three steps removed from the cause.  `set -e` inside the remote
+# shell plus a checked exit status makes provisioning fail where it fails.
+#
+$SSH 'set -e
+	export DEBIAN_FRONTEND=noninteractive
+	sudo apt-get -qq update
+	sudo apt-get -qq install -y curl ca-certificates gnupg lsb-release >/dev/null
+	sudo install -d /usr/share/postgresql-common/pgdg
+	sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+		https://www.postgresql.org/media/keys/ACCC4CF8.asc
+	echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+		| sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+	sudo apt-get -qq update
+	sudo apt-get -qq install -y build-essential git clang lld pkg-config \
+		postgresql-17 postgresql-server-dev-17 libipc-run-perl \
+		postgresql-17-pgtap >/dev/null 2>&1 || \
+	sudo apt-get -qq install -y build-essential git clang lld pkg-config \
+		postgresql-17 postgresql-server-dev-17 libipc-run-perl >/dev/null
+	echo "gcc:      $(gcc --version | head -1)"
+	echo "pg_config: $(/usr/lib/postgresql/17/bin/pg_config --version)"
+' 2>&1 | tee "$OUT/provision.log" || die "provisioning failed (see $OUT/provision.log)"
+
+grep -q 'pg_config: PostgreSQL 17' "$OUT/provision.log" \
+	|| die "PostgreSQL 17 not installed (see $OUT/provision.log)"
 
 say "uploading source"
 # git archive of HEAD: only committed state is measured, so a result can always
@@ -186,9 +213,10 @@ $SSH 'cd pg_weave && nproc && free -g | head -2 && lscpu | grep -E "^Model name|
 # ---------------------------------------------------------------------------
 run_smoke() {
 	say "build"
-	$SSH 'cd pg_weave && make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config 2>&1 | tail -20' \
-		| tee "$OUT/build.log"
-	$SSH 'test -f pg_weave/pg_weave.so' || die "build produced no shared library"
+	$SSH 'cd pg_weave && make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config 2>&1 \
+			| grep -viE "^(gcc|clang) " | tail -25; test -f pg_weave.so' \
+		| tee "$OUT/build.log" || die "build failed (see $OUT/build.log)"
+	say "build produced pg_weave.so"
 
 	say "lint gates"
 	$SSH 'cd pg_weave && for t in check-ascii check-alloc check-unity check-rename; do
