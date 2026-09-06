@@ -92,6 +92,7 @@ say "run $RUN  type=$ITYPE  job=$JOB  region=$REGION"
 
 KEYNAME=$RUN-key
 aws ec2 create-key-pair --profile "$PROFILE" --key-name "$KEYNAME" \
+	--key-type ed25519 \
 	--query KeyMaterial --output text >"$KEYFILE" || die "create-key-pair"
 chmod 600 "$KEYFILE"
 
@@ -129,11 +130,33 @@ HOST=$(aws ec2 describe-instances --profile "$PROFILE" --instance-ids "$IID" \
 	--query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 say "host $HOST"
 
-SSH="ssh -i $KEYFILE -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-	-o ConnectTimeout=10 -o LogLevel=ERROR ubuntu@$HOST"
+#
+# -F /dev/null is load-bearing, not defensive.  A developer's ~/.ssh/config
+# commonly has a `Host *` block, and this one sets ControlMaster auto with a
+# shared ControlPath, an explicit IdentityFile, and a 5-second ConnectTimeout.
+# Any of those breaks a fresh-instance connection: the mux socket can collide,
+# and the global IdentityFile is offered ahead of ours so authentication fails
+# before the launch key is ever tried.  The first version of this script did not
+# pass -F and failed with a bare "ssh never came up" that looked like a
+# networking problem and was not.
+#
+# IdentitiesOnly=yes stops the agent from offering unrelated keys.
+# ControlMaster=no / ControlPath=none belt-and-braces in case -F is ever dropped.
+#
+SSH="ssh -F /dev/null -i $KEYFILE -o IdentitiesOnly=yes \
+	-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+	-o ControlMaster=no -o ControlPath=none \
+	-o ConnectTimeout=15 -o LogLevel=ERROR ubuntu@$HOST"
 for i in $(seq 1 40); do
 	$SSH true 2>/dev/null && break
-	[ "$i" = 40 ] && die "ssh never came up"
+	if [ "$i" = 40 ]; then
+		# Capture what the instance itself thinks happened before giving up; a
+		# bare "ssh never came up" sent the first debugging session down a
+		# networking rabbit hole when the cause was client-side ssh config.
+		aws ec2 get-console-output --profile "$PROFILE" --instance-id "$IID" \
+			--output text >"$OUT/console.txt" 2>&1
+		die "ssh never came up (console output in $OUT/console.txt)"
+	fi
 	sleep 10
 done
 say "ssh up"
