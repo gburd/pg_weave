@@ -190,6 +190,24 @@ row() {                         # row <label> <weave-sql> <gin-sql>
         "$(coldq "$2")" "$(warmq "$2")" "$(coldq "$3")" "$(warmq "$3")"
 }
 
+# ---------------------------------------------------------------------------
+# Parallelism sweep.
+#
+# pg_weave's AM sets amcanparallel = false: a ranked index scan is serial.  With
+# parallel query enabled -- the default on every PostgreSQL since 10 -- the
+# planner can cost a 5-way Parallel Seq Scan below a serial index ordering scan
+# and choose it, at which point pg_weave evaluates <=> on every row of the table
+# and loses by two orders of magnitude.
+#
+# That is a real competitive gap, not a benchmark artifact, so it is measured
+# rather than tuned away: both settings are reported.  Reporting only the
+# parallelism-off number would be exactly the kind of flattering methodology this
+# project's own benchmark skill warns against.
+# ---------------------------------------------------------------------------
+for PAR in 4 0; do
+export PGOPTIONS="-c max_parallel_workers_per_gather=$PAR"
+say "==== max_parallel_workers_per_gather = $PAR ===="
+
 say "latency (ms): cold = first scan in a fresh backend; warm = p50/p99 in-session"
 {
 printf 'query\tweave_cold\tweave_p50\tweave_p99\tgin_cold\tgin_p50\tgin_p99\n'
@@ -209,8 +227,8 @@ row count_AND \
     "SELECT count(*) FROM docs WHERE d @@@ '$RARE & $MID'::wquery" \
     "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$RARE & $MID')"
 row count_prefix \
-    "SELECT count(*) FROM docs WHERE d @@@ 'word_001*'::wquery" \
-    "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','word_001:*')"
+    "SELECT count(*) FROM docs WHERE d @@@ 'word0001*'::wquery" \
+    "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','word0001:*')"
 } | column -t
 
 say "plan shapes (a [NO-INDEX] here explains a flat latency curve)"
@@ -233,6 +251,9 @@ printf 'count_AND\t%s\t%s\n' \
 
 say "full plans"
 cat "$PLANS"
+
+done
+unset PGOPTIONS
 
 say "segments (a fixed per-scan cost scales with this)"
 $PSQL -c "SELECT * FROM weave_index_stats('weave_idx')" 2>/dev/null || \

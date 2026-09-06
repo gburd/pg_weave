@@ -18,10 +18,16 @@ CREATE TABLE docs (id bigint PRIMARY KEY, body text);
 
 -- Sampling weight ~ 1/rank via floor(vocab * u^3): word_00001 is common,
 -- word_:vocab is rare.  8..15 words per document.
+-- NOTE: no underscore in the token.  pg_weave's analyzer splits on non-word
+-- bytes, so 'word_00042' tokenizes as TWO terms ('word' and '00042') and a query
+-- for it becomes an implicit AND.  The first version of this corpus used
+-- underscores and every "single rare term" measurement was silently measuring a
+-- two-term boolean query -- visible only in the EXPLAIN Sort Key, which is why
+-- bench/lexical.sh now captures plans.
 INSERT INTO docs
 SELECT g,
-       (SELECT string_agg('word_' || lpad(
-                 (floor(:vocab * power(random(), 3))::int + 1)::text, 5, '0'), ' ')
+       (SELECT string_agg('word' || lpad(
+                 (floor(:vocab * power(random(), 3))::int + 1)::text, 6, '0'), ' ')
         FROM generate_series(1, 8 + (g % 8)))
 FROM generate_series(1, :ndocs) g;
 
@@ -38,7 +44,7 @@ CREATE TABLE bands (band text PRIMARY KEY, term text, df bigint);
 WITH freq AS (
     SELECT w AS term, count(*) AS df
       FROM docs, unnest(string_to_array(body, ' ')) w
-     WHERE w LIKE 'word_%'
+     WHERE w LIKE 'word%'
      GROUP BY w
 ), ranked AS (
     SELECT term, df,
@@ -51,7 +57,7 @@ SELECT 'rare',   term, df FROM ranked WHERE pr BETWEEN 0.10 AND 0.12
 WITH freq AS (
     SELECT w AS term, count(*) AS df
       FROM docs, unnest(string_to_array(body, ' ')) w
-     WHERE w LIKE 'word_%'
+     WHERE w LIKE 'word%'
      GROUP BY w
 ), ranked AS (
     SELECT term, df, percent_rank() OVER (ORDER BY df) AS pr FROM freq
@@ -62,7 +68,7 @@ SELECT 'mid', term, df FROM ranked WHERE pr BETWEEN 0.55 AND 0.60
 WITH freq AS (
     SELECT w AS term, count(*) AS df
       FROM docs, unnest(string_to_array(body, ' ')) w
-     WHERE w LIKE 'word_%'
+     WHERE w LIKE 'word%'
      GROUP BY w
 )
 INSERT INTO bands
