@@ -156,7 +156,36 @@ warmq() {                       # warmq <sql>
              }'
 }
 
+# Capture the PLAN for every measured query.
+#
+# Not optional.  A latency that is constant across selectivity bands -- 32
+# matching documents costing the same as 179,262 -- is the signature of the
+# operator being evaluated per row, i.e. the index not being used at all.  A
+# harness that greps only "Execution Time" cannot tell "the index is slow" from
+# "the planner ignored the index", and those need completely different fixes.
+PLANS=${PLANS:-/tmp/lexical_plans.txt}
+: > "$PLANS"
+
+plan() {                        # plan <label> <sql>
+    {
+        printf '\n===== %s =====\n' "$1"
+        psql -X -q -d "$DB" -c "EXPLAIN (ANALYZE, BUFFERS, VERBOSE OFF) $2"
+    } >> "$PLANS" 2>&1
+}
+
+# One line of plan shape, for the summary table: the top node plus whether any
+# weave/gin index scan appears anywhere in the tree.
+planshape() {                   # planshape <sql>
+    psql -X -q -d "$DB" -t -A -c "EXPLAIN $1" 2>/dev/null \
+      | awk 'NR==1{gsub(/^ *->? */,"");sub(/ *\(cost.*/,"");top=$0}
+             /Index Scan|Bitmap Index Scan|Custom Scan/{ix=1}
+             END{printf "%s%s", top, (ix?"":"[NO-INDEX]")}' \
+      | cut -c1-38
+}
+
 row() {                         # row <label> <weave-sql> <gin-sql>
+    plan "$1 / weave" "$2"
+    plan "$1 / gin" "$3"
     printf '%s\t%s\t%s\t%s\t%s\n' "$1" \
         "$(coldq "$2")" "$(warmq "$2")" "$(coldq "$3")" "$(warmq "$3")"
 }
@@ -183,6 +212,27 @@ row count_prefix \
     "SELECT count(*) FROM docs WHERE d @@@ 'word_001*'::wquery" \
     "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','word_001:*')"
 } | column -t
+
+say "plan shapes (a [NO-INDEX] here explains a flat latency curve)"
+{
+printf 'query\tweave_plan\tgin_plan\n'
+for band in rare common; do
+    case $band in rare) T=$RARE;; common) T=$COMMON;; esac
+    printf 'ranked_%s\t%s\t%s\n' "$band" \
+      "$(planshape "SELECT id FROM docs ORDER BY d <=> '$T'::wquery LIMIT 10")" \
+      "$(planshape "SELECT id, ts_rank(tsv, to_tsquery('simple','$T')) r FROM docs
+                      WHERE tsv @@ to_tsquery('simple','$T') ORDER BY r DESC LIMIT 10")"
+done
+printf 'count_common\t%s\t%s\n' \
+  "$(planshape "SELECT count(*) FROM docs WHERE d @@@ '$COMMON'::wquery")" \
+  "$(planshape "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$COMMON')")"
+printf 'count_AND\t%s\t%s\n' \
+  "$(planshape "SELECT count(*) FROM docs WHERE d @@@ '$RARE & $MID'::wquery")" \
+  "$(planshape "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$RARE & $MID')")"
+} | column -t
+
+say "full plans"
+cat "$PLANS"
 
 say "segments (a fixed per-scan cost scales with this)"
 $PSQL -c "SELECT * FROM weave_index_stats('weave_idx')" 2>/dev/null || \
