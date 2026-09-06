@@ -102,51 +102,92 @@ done
 # rest.  Timing in the client would include psql startup, so use a server-side
 # clock via EXPLAIN ANALYZE's execution time.
 # ---------------------------------------------------------------------------
-timeq() {                       # timeq <label> <sql>
-    local label=$1 sql=$2 i ms
+# ---------------------------------------------------------------------------
+# Timing.
+#
+# ALL reps run in ONE psql session.  The first version used one psql invocation
+# per rep, which made every single measurement a first-scan-in-a-fresh-backend
+# and produced a latency that was FLAT at ~87 ms across every selectivity band --
+# 32 matching documents cost the same as 179,000.  That is not a posting-scan
+# cost, it is per-backend setup (the relcache doclen page directory and the
+# segment/dictionary open) being paid inside executor time on every rep.
+#
+# Both numbers matter and they answer different questions, so both are reported:
+#
+#	 cold  = first scan in a fresh backend.  What a non-pooled application pays
+#			 on every request, and what a pooled one pays after a reconnect.
+#	 warm  = steady state within a session.  What a pooled application pays.
+#
+# Reporting only warm hides a real cost; reporting only cold hides the actual
+# steady-state performance.  Conflating them, as the first version did, produces
+# a number that is wrong for both.
+# ---------------------------------------------------------------------------
+
+# cold: one fresh connection, one execution, take the median over CO independent
+# connections so a single unlucky page fault does not define the number.
+CO=5
+coldq() {                       # coldq <sql>
+    local sql=$1 i ms
     local -a t=()
-    for i in $(seq 1 "$REPS"); do
-        ms=$($PSQL -t -A -c "EXPLAIN (ANALYZE, TIMING OFF, SUMMARY ON) $sql" \
+    for i in $(seq 1 $CO); do
+        ms=$(psql -X -q -d "$DB" -t -A \
+             -c "EXPLAIN (ANALYZE, TIMING OFF, SUMMARY ON) $sql" \
              | sed -n 's/^Execution Time: \([0-9.]*\) ms$/\1/p')
-        [ -z "$ms" ] && ms=0
-        [ "$i" = 1 ] && continue      # drop the first
-        t+=("$ms")
+        t+=("${ms:-0}")
     done
-    printf '%s\n' "${t[@]}" | sort -g | awk -v l="$label" '
-        {v[NR]=$1}
-        END {
-            p50 = v[int((NR+1)/2)];
-            p99i = int(NR*0.99); if (p99i < 1) p99i = NR;
-            printf "%s\t%.2f\t%.2f\n", l, p50, v[p99i];
-        }'
+    printf '%s\n' "${t[@]}" | sort -g | awk '{v[NR]=$1} END {printf "%.2f", v[int((NR+1)/2)]}'
 }
 
-say "latency (ms, warm, median of $((REPS-1)) after dropping the first)"
+# warm: one session, REPS executions, drop the first, report p50 and p99.
+warmq() {                       # warmq <sql>
+    local sql=$1 i
+    {
+        for i in $(seq 1 "$REPS"); do
+            printf 'EXPLAIN (ANALYZE, TIMING OFF, SUMMARY ON) %s;\n' "$sql"
+        done
+    } | psql -X -q -d "$DB" -t -A \
+      | sed -n 's/^Execution Time: \([0-9.]*\) ms$/\1/p' \
+      | tail -n +2 \
+      | sort -g \
+      | awk '{v[NR]=$1}
+             END {
+                 p99i = int(NR*0.99); if (p99i < 1) p99i = NR;
+                 printf "%.2f\t%.2f", v[int((NR+1)/2)], v[p99i];
+             }'
+}
+
+row() {                         # row <label> <weave-sql> <gin-sql>
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" \
+        "$(coldq "$2")" "$(warmq "$2")" "$(coldq "$3")" "$(warmq "$3")"
+}
+
+say "latency (ms): cold = first scan in a fresh backend; warm = p50/p99 in-session"
 {
-printf 'query\tweave_p50\tweave_p99\tgin_p50\tgin_p99\n'
+printf 'query\tweave_cold\tweave_p50\tweave_p99\tgin_cold\tgin_p50\tgin_p99\n'
 for band in rare mid common; do
     case $band in rare) T=$RARE;; mid) T=$MID;; common) T=$COMMON;; esac
     for k in 10 100; do
-        w=$(timeq w "SELECT id FROM docs ORDER BY d <=> '$T'::wquery LIMIT $k")
-        g=$(timeq g "SELECT id, ts_rank(tsv, to_tsquery('simple','$T')) r FROM docs
-                     WHERE tsv @@ to_tsquery('simple','$T') ORDER BY r DESC LIMIT $k")
-        printf 'ranked_%s_k%s\t%s\t%s\n' "$band" "$k" \
-            "$(echo "$w" | cut -f2-3 | tr '\t' '\t')" "$(echo "$g" | cut -f2-3)"
+        row "ranked_${band}_k${k}" \
+            "SELECT id FROM docs ORDER BY d <=> '$T'::wquery LIMIT $k" \
+            "SELECT id, ts_rank(tsv, to_tsquery('simple','$T')) r FROM docs
+               WHERE tsv @@ to_tsquery('simple','$T') ORDER BY r DESC LIMIT $k"
     done
 done
-
-w=$(timeq w "SELECT count(*) FROM docs WHERE d @@@ '$COMMON'::wquery")
-g=$(timeq g "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$COMMON')")
-printf 'count_common\t%s\t%s\n' "$(echo "$w"|cut -f2-3)" "$(echo "$g"|cut -f2-3)"
-
-w=$(timeq w "SELECT count(*) FROM docs WHERE d @@@ '$RARE & $MID'::wquery")
-g=$(timeq g "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$RARE & $MID')")
-printf 'count_AND\t%s\t%s\n' "$(echo "$w"|cut -f2-3)" "$(echo "$g"|cut -f2-3)"
-
-w=$(timeq w "SELECT count(*) FROM docs WHERE d @@@ 'word_001*'::wquery")
-g=$(timeq g "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','word_001:*')")
-printf 'count_prefix\t%s\t%s\n' "$(echo "$w"|cut -f2-3)" "$(echo "$g"|cut -f2-3)"
+row count_common \
+    "SELECT count(*) FROM docs WHERE d @@@ '$COMMON'::wquery" \
+    "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$COMMON')"
+row count_AND \
+    "SELECT count(*) FROM docs WHERE d @@@ '$RARE & $MID'::wquery" \
+    "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$RARE & $MID')"
+row count_prefix \
+    "SELECT count(*) FROM docs WHERE d @@@ 'word_001*'::wquery" \
+    "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','word_001:*')"
 } | column -t
+
+say "segments (a fixed per-scan cost scales with this)"
+$PSQL -c "SELECT * FROM weave_index_stats('weave_idx')" 2>/dev/null || \
+  $PSQL -t -A -c "SELECT weave_segment_count('weave_idx')" 2>/dev/null || \
+  echo "  (no segment introspection function; see doc/GAPS.md)"
 
 say "build time (s) and index size"
 printf 'engine\tbuild_s\tsize\n%s\n%s\n' "$BUILD_WEAVE" "$BUILD_GIN" | column -t
