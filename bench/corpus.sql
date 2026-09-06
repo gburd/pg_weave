@@ -35,44 +35,44 @@ FROM generate_series(1, :ndocs) g;
 -- ground-truth match set for recall/nDCG checks.
 UPDATE docs SET body = body || ' zzqrare' WHERE id % 1000 = 0;
 
--- Pick the actual df bands from the generated data rather than assuming them.
--- Hardcoding a term and hoping it lands in the intended band is how a "rare
--- term" benchmark silently becomes a mid-frequency one.
+-- Pick the df bands from the generated data, by ABSOLUTE document frequency
+-- rather than by percent_rank.
+--
+-- percent_rank is the wrong tool here: with a heavy-tailed vocabulary most terms
+-- tie at a very low df, so the rank jumps and a window like
+-- "pr BETWEEN 0.10 AND 0.12" can select nothing at all -- which it did, leaving
+-- the rare band empty and every "rare term" measurement running against an empty
+-- query that trivially returned 0 rows.  Absolute df targets are deterministic,
+-- span four orders of magnitude, and cannot come up empty.
 DROP TABLE IF EXISTS bands;
 CREATE TABLE bands (band text PRIMARY KEY, term text, df bigint);
 
-WITH freq AS (
-    SELECT w AS term, count(*) AS df
-      FROM docs, unnest(string_to_array(body, ' ')) w
-     WHERE w LIKE 'word%'
-     GROUP BY w
-), ranked AS (
-    SELECT term, df,
-           percent_rank() OVER (ORDER BY df) AS pr
-      FROM freq
-)
+CREATE TEMP TABLE freq AS
+SELECT w AS term, count(*) AS df
+  FROM docs, unnest(string_to_array(body, ' ')) w
+ WHERE w LIKE 'word%'
+ GROUP BY w;
+
+-- rare: nearest to 25 matching documents  (high IDF, one posting block)
 INSERT INTO bands
-SELECT 'rare',   term, df FROM ranked WHERE pr BETWEEN 0.10 AND 0.12
-  ORDER BY df LIMIT 1;
-WITH freq AS (
-    SELECT w AS term, count(*) AS df
-      FROM docs, unnest(string_to_array(body, ' ')) w
-     WHERE w LIKE 'word%'
-     GROUP BY w
-), ranked AS (
-    SELECT term, df, percent_rank() OVER (ORDER BY df) AS pr FROM freq
-)
+SELECT 'rare', term, df FROM freq ORDER BY abs(df - 25), term LIMIT 1;
+-- mid: nearest to 2500                     (tens of posting blocks)
 INSERT INTO bands
-SELECT 'mid', term, df FROM ranked WHERE pr BETWEEN 0.55 AND 0.60
-  ORDER BY df LIMIT 1;
-WITH freq AS (
-    SELECT w AS term, count(*) AS df
-      FROM docs, unnest(string_to_array(body, ' ')) w
-     WHERE w LIKE 'word%'
-     GROUP BY w
-)
+SELECT 'mid', term, df FROM freq ORDER BY abs(df - 2500), term LIMIT 1;
+-- common: the single most frequent term    (posting-scan bound; where block-max
+--                                           WAND has to earn its keep)
 INSERT INTO bands
-SELECT 'common', term, df FROM freq ORDER BY df DESC LIMIT 1;
+SELECT 'common', term, df FROM freq ORDER BY df DESC, term LIMIT 1;
+
+-- Fail loudly rather than benchmark an empty query.
+DO $$
+DECLARE n int;
+BEGIN
+    SELECT count(*) INTO n FROM bands WHERE term IS NOT NULL AND df > 0;
+    IF n <> 3 THEN
+        RAISE EXCEPTION 'band selection produced % usable bands, not 3', n;
+    END IF;
+END $$;
 
 SELECT count(*) AS ndocs, avg(length(body))::int AS avg_bytes,
        pg_size_pretty(pg_total_relation_size('docs')) AS heap
