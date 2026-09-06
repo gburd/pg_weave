@@ -238,9 +238,12 @@ run_smoke() {
 		| tee "$OUT/installcheck.log"
 	$SSH 'cd pg_weave && cat regression.diffs 2>/dev/null | head -60' > "$OUT/regression.diffs" 2>/dev/null
 
-	say "TAP"
-	$SSH 'cd pg_weave && PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config \
-			make prove_installcheck 2>&1 | tail -20' | tee "$OUT/tap.log" || true
+	# No separate TAP step: TAP_TESTS = 1 in the Makefile means `make
+	# installcheck` already ran t/*.pl above, and PGXS exposes no
+	# prove_installcheck target to invoke them again.  The installcheck log holds
+	# the TAP results.
+	grep -E '^(t/|All tests|Result:|Files=)' "$OUT/installcheck.log" \
+		> "$OUT/tap.log" 2>/dev/null || true
 }
 
 run_bound() {
