@@ -12,9 +12,13 @@
 #					types the source projects used: r6id.4xlarge for the lexical
 #					5-way, i4i.8xlarge for at-scale stress.
 #	 job			 default `smoke`.  One of:
-#					  smoke	  build + regression + isolation + TAP + codec test
-#					  bound	  the block-bound pruning sweep (bench/bound_pruning.c)
-#					  all	   both
+#					  smoke	   build + regression + isolation + TAP + codec test
+#					  bound	   the block-bound pruning sweep (bench/bound_pruning.c)
+#					  lexical  smoke, then pg_weave vs tsvector+GIN on a real corpus
+#					  all	   all of the above
+#
+#	 NDOCS / VOCAB environment variables size the lexical corpus (default 1M /
+#	 200k).  A 1M-document run takes a few minutes to generate.
 #
 # The AWS profile is `bene`.  Everything this script creates is tagged
 # Project=pg_weave and named with the run id, so a stray is identifiable.
@@ -196,6 +200,30 @@ https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
 grep -q 'pg_config: PostgreSQL 17' "$OUT/provision.log" \
 	|| die "PostgreSQL 17 not installed (see $OUT/provision.log)"
 
+# Tune, and RECORD the tuning.  An untuned number and a tuned number differ by
+# more than most of the changes being measured, so an unrecorded setting makes a
+# result unusable (.agent/skills/weave-bench).
+say "tuning postgresql"
+MEMKB=$($SSH "awk '/MemTotal/{print \$2}' /proc/meminfo")
+SB=$(( MEMKB / 1024 / 1024 * 40 / 100 ))       # 40% of RAM, in MB
+$SSH "sudo tee -a /etc/postgresql/17/main/conf.d/bench.conf >/dev/null <<EOF
+shared_buffers = ${SB}MB
+maintenance_work_mem = 2GB
+work_mem = 256MB
+max_parallel_maintenance_workers = 8
+max_parallel_workers_per_gather = 4
+effective_cache_size = $(( MEMKB / 1024 / 1024 * 75 / 100 ))GB
+checkpoint_timeout = 30min
+max_wal_size = 8GB
+random_page_cost = 1.1
+jit = off
+EOF
+sudo mkdir -p /etc/postgresql/17/main/conf.d
+sudo pg_ctlcluster 17 main restart || sudo pg_ctlcluster 17 main start
+psql -U postgres -tAc \"select name||' = '||setting from pg_settings where name in
+  ('shared_buffers','maintenance_work_mem','work_mem','effective_cache_size','jit')\"" \
+	2>&1 | tee "$OUT/tuning.log"
+
 say "uploading source"
 # git archive of HEAD: only committed state is measured, so a result can always
 # be tied to a commit.
@@ -246,6 +274,17 @@ run_smoke() {
 		> "$OUT/tap.log" 2>/dev/null || true
 }
 
+run_lexical() {
+	# The comparison that decides adoption: pg_weave against the tsvector+GIN
+	# baseline every PostgreSQL user already has, on the same host and the same
+	# stored analyzed column.  Correctness is gated before any timing.
+	say "lexical benchmark vs tsvector+GIN"
+	$SSH "cd pg_weave && sudo -u postgres createuser -s ubuntu 2>/dev/null; \
+		  export PATH=/usr/lib/postgresql/17/bin:\$PATH PGDATABASE=weavebench; \
+		  bash bench/lexical.sh ${NDOCS:-1000000} ${VOCAB:-200000} 7" \
+		2>&1 | tee "$OUT/lexical.log"
+}
+
 run_bound() {
 	# The measurement from bench/RESULTS_BOUND_PRUNING.md, on real hardware and
 	# over more dimensions than a laptop run covers.  This is the number the
@@ -259,9 +298,10 @@ run_bound() {
 }
 
 case "$JOB" in
-	smoke) run_smoke ;;
-	bound) run_bound ;;
-	all)   run_smoke; run_bound ;;
+	smoke)   run_smoke ;;
+	bound)   run_bound ;;
+	lexical) run_smoke; run_lexical ;;
+	all)     run_smoke; run_bound; run_lexical ;;
 	*)     die "unknown job: $JOB" ;;
 esac
 

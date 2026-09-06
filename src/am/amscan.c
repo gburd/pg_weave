@@ -3862,6 +3862,9 @@ weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
 	WeaveDoclenDirCache *doclendir;	/* relcache-cached page directory over the v4
 									 * doclen sidecars (built once per backend, keyed
 									 * by generation); borrowed by the cursors below */
+	WeaveDoclenResident *doclenres = NULL;	/* one shared resident doclen block per
+											 * SEGMENT, so a multi-term query does not
+											 * decode the same block once per term */
 	WeaveTombstones tombs;
 	DocidFilter filter;
 	DocidFilter *filterp = NULL;
@@ -3882,6 +3885,9 @@ weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
 	/* relcache page directory over the v4 doclen sidecars (built once per backend,
 	 * keyed by meta.generation); NULL if no v4 sidecar segment exists */
 	doclendir = weave_doclendir_cache(index, &meta);
+	if (doclendir != NULL)
+		doclenres = (WeaveDoclenResident *)
+			palloc0(sizeof(WeaveDoclenResident) * Max((int) meta.nsegments, 1));
 
 	/*
 	 * Boolean-structure gating.  The WAND cursors below rank the term
@@ -4030,7 +4036,8 @@ weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
 			cursors[nactive].has_doclen_col =
 				(meta.segs[s].doclenstart == InvalidBlockNumber);
 			weave_doclen_cursor_init(&cursors[nactive].doclenc, index,
-									meta.segs[s].doclenstart, doclendir);
+									meta.segs[s].doclenstart, doclendir,
+									doclenres ? &doclenres[s] : NULL);
 			cursors[nactive].docid_lo = docid_lo;
 			cursors[nactive].docid_hi = docid_hi;
 			{
