@@ -3,11 +3,18 @@
 **One PostgreSQL index for BM25 text, vector similarity, fuzzy, regex, and facet
 search — with a single fused top-k threshold across all of them.**
 
-Status: **0.1.0, early.** The lexical channel works and is field-tested (it is
-`pg_fts` 1.5.8, forked). The fuzzy channel is imported and unwired. The vector
-codec is implemented and property-tested; its storage and graph are not. The
-fused scorer is specified and unimplemented. `doc/PHASES.md` is the honest
-picture of what exists.
+Status: **0.3.0, early. Not production-ready** — see
+`doc/PRODUCTION_READINESS.md`. The lexical channel works and is measured; the
+`wvec` type exists but the index does not accept it yet; the fuzzy channel is
+imported and unwired; the fused scorer is specified and unimplemented.
+`doc/GAPS.md` is the measured list of what stands between here and competitive,
+and `doc/PHASES.md` is the task plan.
+
+**Measured today** against tsvector + GIN, 1M documents (`bench/RESULTS_LEXICAL.md`):
+winning 8.2–19× on common-term ranked, **595×** on `count(*)`, 3.8–7.7× on prefix
+counting. Losing 1.7× on rare and mid ranked latency, 1.7–1.9× on index size, and
+carrying one silent 7,000× cliff on `ORDER BY <=> LIMIT` without a `WHERE` clause
+(gap G1, task L7 — the highest priority in the project).
 
 ## The idea
 
