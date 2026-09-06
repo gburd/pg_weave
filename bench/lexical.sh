@@ -214,11 +214,36 @@ printf 'query\tweave_cold\tweave_p50\tweave_p99\tgin_cold\tgin_p50\tgin_p99\n'
 for band in rare mid common; do
     case $band in rare) T=$RARE;; mid) T=$MID;; common) T=$COMMON;; esac
     for k in 10 100; do
+        # The form that reaches the AM's ordering path.  Per the regression test
+        # at sql/weave.sql:1443, weave_gettuple is only entered when the planner
+        # picks an "Index Scan ... Order By", and that needs a stored wdoc column
+        # AND the `WHERE d @@@ q` restriction alongside `ORDER BY d <=> q`.
         row "ranked_${band}_k${k}" \
-            "SELECT id FROM docs ORDER BY d <=> '$T'::wquery LIMIT $k" \
+            "SELECT id FROM docs WHERE d @@@ '$T'::wquery
+               ORDER BY d <=> '$T'::wquery LIMIT $k" \
             "SELECT id, ts_rank(tsv, to_tsquery('simple','$T')) r FROM docs
                WHERE tsv @@ to_tsquery('simple','$T') ORDER BY r DESC LIMIT $k"
     done
+done
+
+# The FOOTGUN, measured on purpose.
+#
+# `ORDER BY col <=> query LIMIT k` with no WHERE clause is the pgvector idiom and
+# the form any user will write first.  pg_weave does not generate an index path
+# for it -- the planner falls back to a Seq Scan plus a top-N Sort that evaluates
+# <=> on every row of the table.  Results are CORRECT and performance is
+# catastrophic, with no warning: measured at 350+ ms on 1M rows against 0.03 ms
+# for the same intent through the supported form.
+#
+# Correct results plus a 4-orders-of-magnitude cliff plus no diagnostic is the
+# worst failure mode a database feature can have, so it is measured and published
+# rather than quietly avoided by writing the benchmark in the supported form.
+for band in rare common; do
+    case $band in rare) T=$RARE;; common) T=$COMMON;; esac
+    row "bare_orderby_${band}" \
+        "SELECT id FROM docs ORDER BY d <=> '$T'::wquery LIMIT 10" \
+        "SELECT id, ts_rank(tsv, to_tsquery('simple','$T')) r FROM docs
+           ORDER BY r DESC LIMIT 10"
 done
 row count_common \
     "SELECT count(*) FROM docs WHERE d @@@ '$COMMON'::wquery" \
@@ -237,7 +262,8 @@ printf 'query\tweave_plan\tgin_plan\n'
 for band in rare common; do
     case $band in rare) T=$RARE;; common) T=$COMMON;; esac
     printf 'ranked_%s\t%s\t%s\n' "$band" \
-      "$(planshape "SELECT id FROM docs ORDER BY d <=> '$T'::wquery LIMIT 10")" \
+      "$(planshape "SELECT id FROM docs WHERE d @@@ '$T'::wquery
+                      ORDER BY d <=> '$T'::wquery LIMIT 10")" \
       "$(planshape "SELECT id, ts_rank(tsv, to_tsquery('simple','$T')) r FROM docs
                       WHERE tsv @@ to_tsquery('simple','$T') ORDER BY r DESC LIMIT 10")"
 done
@@ -247,6 +273,8 @@ printf 'count_common\t%s\t%s\n' \
 printf 'count_AND\t%s\t%s\n' \
   "$(planshape "SELECT count(*) FROM docs WHERE d @@@ '$RARE & $MID'::wquery")" \
   "$(planshape "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$RARE & $MID')")"
+printf 'bare_orderby\t%s\t-\n' \
+  "$(planshape "SELECT id FROM docs ORDER BY d <=> '$RARE'::wquery LIMIT 10")"
 } | column -t
 
 say "full plans"
