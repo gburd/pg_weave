@@ -2076,6 +2076,28 @@ weave_doclen_lookup(const WeaveDoclens *d, uint64 docid)
  * no sidecar (start == Invalid); its cursor returns 0 and the caller reads the
  * inline posting doclen.
  */
+/*
+ * Resident decoded doclen block, SHARED by every cursor of one scan that reads
+ * the same segment sidecar.
+ *
+ * Each (term, segment) gets its own WeaveDoclenCursor, but for a multi-term query
+ * every cursor sitting at the scored pivot docid looks up THE SAME docid -- so
+ * with per-cursor resident blocks an N-term match decoded the same sidecar block
+ * N times.  Hoisting the resident block into a per-segment shared slot makes the
+ * 2nd..Nth lookup of a docid a pure in-memory binary search.  Single-term scans
+ * are unaffected (one cursor, one slot).
+ */
+typedef struct WeaveDoclenResident
+{
+	BlockNumber blk;			/* block currently decoded, or Invalid */
+	uint64	   *docid;			/* docids of the resident block (palloc'd) */
+	uint8	   *byte;			/* parallel quantized bytes (palloc'd) */
+	int			n;				/* docs decoded in the resident block */
+	int			cap;			/* capacity of docid/byte */
+	uint64		first;			/* lowest docid in the resident block */
+	uint64		last;			/* highest docid in the resident block */
+} WeaveDoclenResident;
+
 typedef struct WeaveDoclenCursor
 {
 	Relation	index;
@@ -2084,14 +2106,9 @@ typedef struct WeaveDoclenCursor
 	const BlockNumber *dir_blk;	/* per-page block number (parallel) */
 	int			dir_n;			/* directory entries (= sidecar pages) */
 	int			dir_hint;		/* last page index hit (ascending-resume) */
-	/* one resident decoded page (a sidecar PAGE holds many 128-doc blocks; size
-	 * the resident arrays to the max docs a page can hold and decode the whole
-	 * page).  Heap-allocated once at init to keep the cursor struct small. */
-	BlockNumber res_blk;		/* block currently decoded, or Invalid */
-	uint64	   *res_docid;		/* docids on the resident page (palloc'd) */
-	uint8	   *res_byte;		/* parallel quantized bytes (palloc'd) */
-	int			res_n;			/* docs decoded on the resident page */
-	int			res_cap;		/* capacity of res_docid/res_byte */
+	WeaveDoclenResident *res;	/* SHARED resident block for this segment (borrowed
+								 * from the scan's per-segment slot; never freed
+								 * by the cursor) */
 } WeaveDoclenCursor;
 
 /*
@@ -2289,7 +2306,7 @@ weave_doclendir_cache(Relation index, const WeaveMetaPageData *meta)
 
 static void
 weave_doclen_cursor_init(WeaveDoclenCursor *c, Relation index, BlockNumber start,
-						WeaveDoclenDirCache *dc)
+						WeaveDoclenDirCache *dc, WeaveDoclenResident *res)
 {
 	c->index = index;
 	c->start = start;
@@ -2297,11 +2314,7 @@ weave_doclen_cursor_init(WeaveDoclenCursor *c, Relation index, BlockNumber start
 	c->dir_blk = NULL;
 	c->dir_n = 0;
 	c->dir_hint = 0;
-	c->res_blk = InvalidBlockNumber;
-	c->res_n = 0;
-	c->res_docid = NULL;
-	c->res_byte = NULL;
-	c->res_cap = 0;
+	c->res = NULL;
 
 	if (start == InvalidBlockNumber || dc == NULL)
 		return;					/* v3 segment (inline doclen) or no cache */
@@ -2318,48 +2331,67 @@ weave_doclen_cursor_init(WeaveDoclenCursor *c, Relation index, BlockNumber start
 				break;
 			}
 	}
-	if (c->dir_n > 0)
+	if (c->dir_n > 0 && res != NULL)
 	{
-		/* a sidecar page's data region is < BLCKSZ and every doc costs >= 1
-		 * length byte, so a page can hold at most BLCKSZ docs -- a safe bound
-		 * for the resident decode buffer (the whole page is decoded at once). */
-		c->res_cap = BLCKSZ;
-		c->res_docid = (uint64 *) palloc(c->res_cap * sizeof(uint64));
-		c->res_byte = (uint8 *) palloc(c->res_cap * sizeof(uint8));
+		/* Attach the SHARED resident block for this segment.  Lazily size it to
+		 * one 128-doc block (we decode only the block covering the sought docid,
+		 * never a whole page). */
+		if (res->docid == NULL)
+		{
+			res->cap = WEAVE_BLOCK_SIZE;
+			res->docid = (uint64 *) palloc(res->cap * sizeof(uint64));
+			res->byte = (uint8 *) palloc(res->cap * sizeof(uint8));
+			res->blk = InvalidBlockNumber;
+			res->n = 0;
+			res->first = 0;
+			res->last = 0;
+		}
+		c->res = res;
 	}
 }
 
 static void
 weave_doclen_cursor_free(WeaveDoclenCursor *c)
 {
-	/* directory arrays are borrowed from the relcache cache; free only the
-	 * cursor's own resident-page buffers */
-	if (c->res_docid)
-		pfree(c->res_docid);
-	if (c->res_byte)
-		pfree(c->res_byte);
-	c->res_docid = NULL;
-	c->res_byte = NULL;
+	/* the directory arrays are borrowed from the relcache cache and the resident
+	 * block from the scan's per-segment slot -- nothing here is cursor-owned */
 	c->dir_docid = NULL;
 	c->dir_blk = NULL;
 	c->dir_n = 0;
-	c->res_blk = InvalidBlockNumber;
-	c->res_n = 0;
-	c->res_cap = 0;
+	c->res = NULL;
 }
 
-/* Decode the sidecar page at blkno into the cursor's resident arrays. */
+/* Decode the ONE sidecar block on page `blkno` whose docid range covers `docid`
+ * into the cursor's resident arrays.
+ *
+ * A sidecar page holds many 128-doc blocks (~31 of them, ~4000 docs).  Decoding
+ * the WHOLE page per lookup was a large amplification for a scattered rare term:
+ * 10,875 postings spread over 2.19M docids touch essentially every sidecar page,
+ * and decoding ~4000 entries to answer each lookup meant ~2.2M doc-decodes to
+ * score 10,875 postings (~200x amplification; measured as ~7.9 ms of the 10.2 ms
+ * rare-term ranked latency).  So: walk only the block HEADERS (first_docid +
+ * count + gapbytes -- no FOR-unpack) to find the covering block, then unpack
+ * that single block.  Same page read, ~31x less decode work, no format change.
+ *
+ * `res_first`/`res_last` record the resident block's docid range so the caller's
+ * fast path can tell whether a later docid is still covered. */
 static void
-weave_doclen_cursor_load_page(WeaveDoclenCursor *c, BlockNumber blkno)
+weave_doclen_cursor_load_page(WeaveDoclenCursor *c, BlockNumber blkno, uint64 docid)
 {
+	WeaveDoclenResident *r = c->res;
 	Buffer		buf;
 	Page		page;
 	char	   *ptr,
 			   *end;
+	char	   *cand = NULL;		/* best (largest first_docid <= docid) block */
 
-	c->res_n = 0;
-	c->res_blk = blkno;
-	if (blkno == InvalidBlockNumber || c->res_docid == NULL ||
+	if (r == NULL)
+		return;
+	r->n = 0;
+	r->blk = blkno;
+	r->first = 0;
+	r->last = 0;
+	if (blkno == InvalidBlockNumber || r->docid == NULL ||
 		blkno >= RelationGetNumberOfBlocks(c->index))
 		return;
 	buf = ReadBuffer(c->index, blkno);
@@ -2370,33 +2402,53 @@ weave_doclen_cursor_load_page(WeaveDoclenCursor *c, BlockNumber blkno)
 		UnlockReleaseBuffer(buf);
 		return;
 	}
-	ptr = (char *) page + MAXALIGN(SizeOfPageHeaderData);
 	end = (char *) page + ((PageHeader) page)->pd_lower;
+
+	/* pass 1: headers only -- find the last block whose first_docid <= docid */
+	ptr = (char *) page + MAXALIGN(SizeOfPageHeaderData);
 	while (ptr + sizeof(WeaveDoclenBlockHdr) <= end)
 	{
 		WeaveDoclenBlockHdr *bh = (WeaveDoclenBlockHdr *) ptr;
-		uint64		gaps[WEAVE_BLOCK_SIZE];
-		uint8	   *bytes;
-		uint64		acc;
+		uint64		first;
 		char	   *blkend;
-		int			j;
 
 		if (bh->count == 0 || bh->count > WEAVE_BLOCK_SIZE)
 			break;
 		blkend = (char *) (bh + 1) + bh->gapbytes + bh->count;
 		if (blkend > end)
 			break;
+		first = ((uint64) bh->first_docid_hi << 32) | bh->first_docid_lo;
+		if (first <= docid)
+			cand = ptr;			/* still a candidate; a later block may be closer */
+		else
+			break;				/* blocks are docid-ascending: no later block fits */
+		ptr = (char *) MAXALIGN(blkend);
+	}
+
+	/* pass 2: unpack ONLY the covering block */
+	if (cand != NULL)
+	{
+		WeaveDoclenBlockHdr *bh = (WeaveDoclenBlockHdr *) cand;
+		uint64		gaps[WEAVE_BLOCK_SIZE];
+		uint8	   *bytes;
+		uint64		acc;
+		int			j;
+
 		weave_for_unpack((unsigned char *) (bh + 1), (int) bh->count, gaps);
 		bytes = (uint8 *) ((char *) (bh + 1) + bh->gapbytes);
 		acc = ((uint64) bh->first_docid_hi << 32) | bh->first_docid_lo;
-		for (j = 0; j < (int) bh->count && c->res_n < c->res_cap; j++)
+		for (j = 0; j < (int) bh->count && r->n < r->cap; j++)
 		{
 			acc += gaps[j];		/* gaps[0] == 0 */
-			c->res_docid[c->res_n] = acc;
-			c->res_byte[c->res_n] = bytes[j];
-			c->res_n++;
+			r->docid[r->n] = acc;
+			r->byte[r->n] = bytes[j];
+			r->n++;
 		}
-		ptr = (char *) MAXALIGN((char *) (bh + 1) + bh->gapbytes + bh->count);
+		if (r->n > 0)
+		{
+			r->first = r->docid[0];
+			r->last = r->docid[r->n - 1];
+		}
 	}
 	UnlockReleaseBuffer(buf);
 }
@@ -2407,18 +2459,20 @@ weave_doclen_cursor_load_page(WeaveDoclenCursor *c, BlockNumber blkno)
 static inline uint32
 weave_doclen_cursor_lookup(WeaveDoclenCursor *c, uint64 docid)
 {
+	WeaveDoclenResident *r = c->res;
 	int			lo,
 				hi,
 				pg;
 
-	if (c->dir_n == 0 || c->dir_docid == NULL)
+	if (c->dir_n == 0 || c->dir_docid == NULL || r == NULL)
 		return 0;
 
-	/* is docid already on the resident page? (ascending-scan common case) */
-	if (c->res_blk != InvalidBlockNumber && c->res_n > 0 &&
-		docid >= c->res_docid[0] && docid <= c->res_docid[c->res_n - 1])
+	/* Fast path: docid is inside the resident BLOCK's range.  This now also hits
+	 * when a DIFFERENT term's cursor of the same segment already decoded the
+	 * block for this pivot docid (the multi-term win). */
+	if (r->n > 0 && docid >= r->first && docid <= r->last)
 	{
-		/* fall through to in-page search below */
+		/* fall through to the in-block search below */
 	}
 	else
 	{
@@ -2445,25 +2499,24 @@ weave_doclen_cursor_lookup(WeaveDoclenCursor *c, uint64 docid)
 		if (pg < 0)
 			return 0;			/* docid precedes the first page's first docid */
 		c->dir_hint = pg;
-		if (c->dir_blk[pg] != c->res_blk)
-			weave_doclen_cursor_load_page(c, c->dir_blk[pg]);
+		weave_doclen_cursor_load_page(c, c->dir_blk[pg], docid);
 	}
 
-	/* binary-search within the resident page */
+	/* binary-search within the resident block */
 	{
 		int			rlo = 0,
-					rhi = c->res_n - 1;
+					rhi = r->n - 1;
 
 		while (rlo <= rhi)
 		{
 			int			mid = (rlo + rhi) >> 1;
 
-			if (c->res_docid[mid] < docid)
+			if (r->docid[mid] < docid)
 				rlo = mid + 1;
-			else if (c->res_docid[mid] > docid)
+			else if (r->docid[mid] > docid)
 				rhi = mid - 1;
 			else
-				return weave_byte_to_doclen(c->res_byte[mid]);
+				return weave_byte_to_doclen(r->byte[mid]);
 		}
 	}
 	return 0;

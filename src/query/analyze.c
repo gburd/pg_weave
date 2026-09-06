@@ -24,9 +24,11 @@
 #include "postgres.h"
 
 #include "weave/weave.h"
+#include "catalog/pg_collation.h"
 #include "common/unicode_case.h"
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
+#include "utils/formatting.h"
 #include "utils/memutils.h"
 
 PG_MODULE_MAGIC;
@@ -100,14 +102,30 @@ fold_token(const char *src, int len, int *outlen)
 	if (GetDatabaseEncoding() != PG_UTF8)
 	{
 		/*
-		 * Non-UTF-8: a byte >= 0x80 is not a UTF-8 code point, so keep the
-		 * ASCII-only behavior (such bytes pass through unchanged).  Folding is
-		 * length-preserving, so the len-sized buffer still suffices.
+		 * Non-UTF-8 server encoding.  ASCII bytes were already folded above; the
+		 * remaining high bytes (>= 0x80) are single-byte or multibyte characters
+		 * of the server encoding, which we cannot interpret as Unicode code
+		 * points.  Delegate to str_tolower() -- the same locale/collation-aware
+		 * primitive PostgreSQL's own text search uses -- so a LATIN1/WIN1252
+		 * database with a real locale folds accented letters exactly as
+		 * to_tsvector() does.
+		 *
+		 * Without this, a non-UTF-8 server left high bytes UNCHANGED, so on e.g.
+		 * LATIN1 + de_DE a document 'Apfel' (A-umlaut 0xC4) did not match a query
+		 * 'apfel' (a-umlaut 0xE4): case-insensitive search silently failed for
+		 * every non-ASCII letter, diverging from PostgreSQL's behaviour.
+		 *
+		 * str_tolower() may change the byte length (some encodings/locales are not
+		 * length-preserving), so take its result rather than writing in place.
+		 * DEFAULT_COLLATION_OID matches what tsearch's lowerstr() effectively
+		 * uses (the database default), keeping us consistent with to_tsvector.
 		 */
-		for (; i < len; i++)
-			dst[i] = fold_ascii((unsigned char) src[i]);
-		*outlen = len;
-		return dst;
+		char	   *low = str_tolower(src, (size_t) len, DEFAULT_COLLATION_OID);
+		int			lowlen = (int) strlen(low);
+
+		pfree(dst);
+		*outlen = lowlen;
+		return low;
 	}
 
 	/*
@@ -123,7 +141,16 @@ fold_token(const char *src, int len, int *outlen)
 	while (srcp < srcend)
 	{
 		int			clen = pg_utf_mblen(srcp);
-		pg_wchar	lc = unicode_lowercase_simple(utf8_to_unicode(srcp));
+		pg_wchar	lc;
+
+		/* Defensive: never read past the token.  The tokenizer keeps whole UTF-8
+		 * characters together (is_token_byte treats every >= 0x80 byte as part of
+		 * a token), so a truncated trailing character should not reach here -- but
+		 * utf8_to_unicode() would read clen bytes regardless, so bound it and stop
+		 * rather than over-read if any future caller hands us a split token. */
+		if (srcp + clen > srcend)
+			break;
+		lc = unicode_lowercase_simple(utf8_to_unicode(srcp));
 
 		/* unicode_to_utf8() returns the START pointer, so advance out by the
 		 * code point's UTF-8 length ourselves. */
