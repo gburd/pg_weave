@@ -46,7 +46,11 @@
         buildFor = postgresql:
           pkgs.stdenv.mkDerivation {
             pname = "pg_weave";
-            version = "0.1.0";
+            # Read from the control file rather than hardcoded, so a version bump
+            # is one edit instead of two that can silently disagree.
+            version = builtins.head (builtins.match
+              ".*default_version = '([^']+)'.*"
+              (builtins.readFile ./pg_weave.control));
             src = ./.;
 
             nativeBuildInputs = [ postgresql.pg_config pkgs.clang ];
@@ -63,7 +67,12 @@
               install -D -m 755 -t $out/lib pg_weave.so 2>/dev/null || \
                 install -D -m 755 -t $out/lib pg_weave.dylib
               install -D -m 644 -t $out/share/postgresql/extension pg_weave.control
-              install -D -m 644 -t $out/share/postgresql/extension sql/pg_weave--0.1.0.sql
+              # Glob, never enumerate.  A hardcoded filename here silently drops
+              # every newly added install or upgrade script: the build stays green,
+              # `make install` outside Nix is correct, and only the regression suite
+              # notices -- with "no update path from version X to Y", which points at
+              # the SQL rather than at this line.
+              install -D -m 644 -t $out/share/postgresql/extension sql/pg_weave--*.sql
               runHook postInstall
             '';
 

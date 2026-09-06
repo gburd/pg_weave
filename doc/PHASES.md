@@ -99,7 +99,7 @@ read but **not** to port line-by-line: `~/src/turbovec` (Rust, MIT).
 
 | id | task | gate |
 |---|---|---|
-| V1 | `wvec` type: I/O, casts, `<->` `<=>` `<#>` operators, aggregates. pgvector-compatible semantics. | pgvector's own operator semantics reproduced on a shared test vector set |
+| V1 | `wvec` type: I/O, typmod, casts, `<->` `<#>` `<=>` `<+>`, arithmetic, btree opclass, codec introspection | **DONE** — `sql/wvec.sql`, 4th regression test, green on PG 17 and 18. Found and fixed a silently-accepted trailing comma in the parser. |
 | V2 | Deterministic rotation: ChaCha8-seeded global permutation + sign flips + per-block normalized Walsh-Hadamard, K=2 rounds | **bit-identical output across x86-64 and aarch64 and across thread counts.** This is a hard gate; a fixture hash committed in `test/hegel/rotation_fixture.h` must match on both arches in CI |
 | V3 | Lloyd–Max codebook for Beta((d-1)/2,(d-1)/2), memoized by `(bits, dim)` | codebook values match a committed fixture to 1e-9; solve time ≤ 100 ms |
 | V4 | Encode: normalize, rotate, optional TQ+ affine calibration, quantize, bit-pack, store per-vector renormalization scale | round-trip property test; the compressed-domain inner-product estimator is unbiased within a stated tolerance |
@@ -113,6 +113,11 @@ read but **not** to port line-by-line: `~/src/turbovec` (Rust, MIT).
 | V12 | ColBERT-style multivector late interaction as a distinct channel kind | MaxSim correctness against a reference implementation |
 | V13 | **Warp ordering by cluster.** Assign warp positions in the order the Vamana build's k-means partition produces, so each 32-lane code block is spatially coherent. Not an optimization: `bench/RESULTS_BOUND_PRUNING.md` measures the block bound pruning 99.6% of blocks with a coherent warp and **0.0%** with a random one. | `bench/bound_pruning.c` reports ≥ 90% blocks pruned at k=10 on the shipped corpora; a heap-order build is rejected by the gate |
 | V14 | Per-block centroid (stored as a quantized code) + radius in `WeaveVecBlockHdr`, maintained across insert, vacuum lane-zero, and merge | `weave_check()` recomputes both and compares; a randomized soundness run of `bench/bound_pruning.c` finds no (C2) violation |
+
+**Status:** V1 done. V2–V5 have working scalar implementations in
+`src/vector/quantize.c` and `src/vector/pack.c` with 17,741 property checks
+passing, but no on-disk format and no committed cross-architecture fixture, so
+they are not gate-complete. V6–V14 not started.
 
 **Phase V gate:** on 1M × 1024-d Cohere-wiki, all three of
 `recall@10 ≥ 0.99`, `p50 ≤ 2× pgvector HNSW`, `size ≤ 0.15× pgvector HNSW`

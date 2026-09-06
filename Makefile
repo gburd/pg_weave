@@ -26,21 +26,24 @@ OBJS = \
 	src/util/migrate.o \
 	src/query/trgm.o \
 	src/util/sparsemap.o \
-	src/query/match.o
+	src/query/match.o \
+	src/vector/quantize.o \
+	src/vector/pack.o \
+	src/vector/wvec.o
 
 # Headers moved under include/weave/ (see RELAYOUT); every .c file uses
 # quoted "weave/foo.h" includes, so the include root needs to be on -I.
 PG_CPPFLAGS = -I$(srcdir)/include
 
 EXTENSION = pg_weave
-DATA = sql/pg_weave--0.1.0.sql
+DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql
 PGFILEDESC = "pg_weave - unified lexical + vector + fuzzy retrieval in one index"
 
 # sql/ and expected/ are already at the top level (PGXS's built-in default
 # --inputdir=$(srcdir) for pg_regress), so plain REGRESS with no REGRESS_OPTS
 # picks up sql/<name>.sql + expected/<name>.out directly. No relayout fix
 # needed here.
-REGRESS = weave unicode_fold idx_scan_stats
+REGRESS = weave unicode_fold idx_scan_stats wvec
 
 # --- Isolation tests -------------------------------------------------------
 # pg_isolation_regress hardcodes its two lookup paths relative to a SINGLE
@@ -60,6 +63,9 @@ REGRESS = weave unicode_fold idx_scan_stats
 ISOLATION = weave_concurrency weave_cic
 
 TAP_TESTS = 1
+
+# quantize.c uses sqrt/log/exp for the Lloyd-Max solver.
+SHLIB_LINK += -lm
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
