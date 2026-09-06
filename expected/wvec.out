@@ -9,7 +9,7 @@ NOTICE:  extension "pg_weave" already exists, skipping
 -- upgrade here is not a workaround -- it is the only coverage the 0.1.0 -> 0.2.0
 -- upgrade script has, and an unexercised upgrade script is a blocking gate in
 -- doc/PRODUCTION_READINESS.md.
-ALTER EXTENSION pg_weave UPDATE TO '0.2.0';
+ALTER EXTENSION pg_weave UPDATE;   -- to the current default_version
 -- ---- I/O ----------------------------------------------------------------
 SELECT '[1,2,3]'::wvec;
   wvec   

@@ -60,10 +60,22 @@ cheapest wins available anywhere in this project.
 | L4 | **Parallel merge.** Build is 1091 s vs vchord's 57 s, dominated by single-threaded merge + vacuum compaction. | — | full build+merge+vacuum of the 2.19M corpus ≤ 300 s on a 16-vCPU host |
 | L5 | Positions default review. Phrase is 8500 ms with positions unbuilt vs pg_search's 24.84 ms. Decide and document whether `positions=on` becomes the default; measure the size cost on the same corpus. | — | a recorded decision in `bench/RESULTS_POSITIONS.md` with both numbers, and the default set accordingly |
 | L6 | Storage AIO: use `read_stream` for posting-page prefetch. Pointer-chained pages currently defeat readahead. | — | measurable p50 improvement on cold-cache common-term scan; no regression warm |
+| **L7** | **Keyless ordering scan.** `ORDER BY d <=> q LIMIT k` with no `WHERE` must generate an index path. Today it silently falls back to Seq Scan + top-N Sort: measured 83 ms par4 / 362 ms serial vs **0.05 ms** for the supported form — a 7,000× cliff on the first query any user writes, because pgvector taught them that shape. `bench/RESULTS_LEXICAL.md` §Footgun, `doc/GAPS.md` G1. | `doc/specs/KEYLESS_ORDERING.md` (write it) | bare form produces `Index Scan ... Order By`; p50 within 20% of the `WHERE`-qualified form; `@@@`-parity assertion holds on every returned row |
+| **L8** | **Deterministic index size.** A fresh `CREATE INDEX` measures 156 MB and the same index after `weave_merge` + `weave_vacuum` measures 115 MB — a 35% swing on whether an optional maintenance step ran. `doc/GAPS.md` G6. | — | two consecutive builds of the same corpus report sizes within 2% with no manual maintenance; `bench/lexical.sh` stops tolerating a failed `weave_merge` |
+| **L9** | **Attribute the fixed per-scan cost.** Rare-term ranked is 0.05 ms vs GIN's 0.03 ms and mid-term is 3.54 vs 2.06 — a 70× latency ratio across a 100× document ratio, consistent with a small fixed setup cost plus linear per-document work. Profile with `perf` on EC2 and attribute it **before** changing code. `doc/GAPS.md` G3/G4. | — | a recorded profile in `bench/RESULTS_SCAN_PROFILE.md` naming where the fixed cost goes |
+| **L10** | **`weave_index_size_detail()`** — bytes per structure (dictionary, block index, postings, positions, doclen sidecar, livedocs, trigram) so the 1.7× size gap against GIN is attributed rather than guessed. `doc/GAPS.md` G2. | — | the function exists, sums to `pg_total_relation_size`, and `bench/RESULTS_LEXICAL.md` records the breakdown |
+| **L11** | **Parallel scan** (`amcanparallel`). GIN's common-term advantage halves when parallelism is removed, i.e. GIN currently benefits from parallelism pg_weave cannot use. `doc/GAPS.md` G11. | — | parallel ranked scan correct under `t/005`-style concurrency; measurable p50 improvement on common-term |
 
-**Phase L gate:** the 5-way benchmark in `bench/` re-run and recorded, with
-pg_weave no worse than the best competitor on rare, mid, count, AND, and prefix,
-and within 2× on common-term ranked.
+**Phase L gate:** `bench/lexical.sh` re-run and recorded with **zero measured
+losses** against tsvector + GIN on latency, p99, and index size — the six gaps
+G1–G6 in `doc/GAPS.md` all closed. Then the same against pg_search,
+pg_textsearch, and VectorChord (task P3).
+
+**Status 2026-09-06:** measured for the first time (`bench/RESULTS_LEXICAL.md`).
+Winning by 8.2–19× on common-term ranked, 595× on `count(*)`, and 3.8–7.7× on
+prefix. Losing by 1.7× on rare and mid ranked, 1.7–1.9× on index size, 1.2× on
+build time, and carrying one silent 7,000× cliff (L7). L1–L6 unstarted; L7 is now
+the highest priority in the project.
 
 ---
 
