@@ -84,13 +84,21 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 	int			i;
 
 	/*
-	 * Buckets, in report order.  WEAVE_FREED is listed last and separately from
-	 * "unknown": a freed page is a page merge or vacuum released but has not
-	 * given back to the filesystem, and telling that apart from a page we failed
-	 * to classify is the difference between "reclaimable" and "a bug in this
-	 * function".
+	 * Buckets.  "freed" is separate from "unclassified" on purpose: a freed page
+	 * is one that merge or vacuum released but has not returned to the
+	 * filesystem, and telling that apart from a page we failed to classify is the
+	 * difference between "reclaimable" and "a bug in this function".
+	 *
+	 * WEAVE_FREED MUST BE FIRST.  It is a state, not a kind: weave_free_page sets
+	 * it while LEAVING the page's original kind bit in place, so a freed posting
+	 * page has flags POSTING|FREED.  The loop below takes the first match, so
+	 * listing postings before freed counted every reclaimable page as live
+	 * postings -- which on a 1M-document build reported 108 MB of postings where
+	 * ~37 MB were live and the rest were awaiting truncation, turning a
+	 * reclaimable-space problem into an apparent data-size problem.
 	 */
 	WeaveSizeBucket buckets[] = {
+		{"freed", WEAVE_FREED, 0, 0},
 		{"meta", WEAVE_META, 0, 0},
 		{"dictionary", WEAVE_DICT, 0, 0},
 		{"dict_index", WEAVE_DICTINDEX, 0, 0},
@@ -100,7 +108,6 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 		{"trigram_dir", WEAVE_TRGM, 0, 0},
 		{"trigram_data", WEAVE_TRGM_DATA, 0, 0},
 		{"pending", WEAVE_PENDING, 0, 0},
-		{"freed", WEAVE_FREED, 0, 0},
 	};
 	int			nbuckets = lengthof(buckets);
 	int64		unknown_pages = 0;
@@ -167,8 +174,8 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 		 */
 		if (blk == WEAVE_METAPAGE_BLKNO)
 		{
-			buckets[0].npages++;
-			buckets[0].freebytes += (int64) freespace;
+			buckets[1].npages++;	/* "meta"; index 0 is "freed" */
+			buckets[1].freebytes += (int64) freespace;
 			UnlockReleaseBuffer(buf);
 			continue;
 		}
