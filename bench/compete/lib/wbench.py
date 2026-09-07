@@ -271,10 +271,17 @@ def cmd_stats(args):
     # noticed only when match counts diverged by 48%.
     fps = {e: d["meta"].get("corpus_fingerprint") for e, d in engines.items() if d.get("meta")}
     distinct = set(v for v in fps.values() if v)
-    corpus_ok = len(distinct) <= 1
+    # Zero engines is a FAILURE, not a vacuous pass.  The first run of this
+    # harness collected no data from either host and the analyzer cheerfully
+    # printed "PASS -- all 0 engines report fingerprint n/a" above a set of empty
+    # tables, which is exactly the kind of output that gets mistaken for a result.
+    corpus_ok = len(distinct) == 1 and len(fps) >= 1
     report = []
     report.append("## Corpus identity gate\n")
-    if corpus_ok:
+    if len(fps) == 0:
+        report.append("**FAIL -- no engine reported any data. There is nothing to compare; "
+                      "check the per-engine logs.**\n")
+    elif corpus_ok:
         report.append(f"PASS -- all {len(fps)} engines report fingerprint `{next(iter(distinct), 'n/a')}`.\n")
     else:
         report.append("**FAIL -- engines indexed different data. Every cross-engine "
