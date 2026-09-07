@@ -161,12 +161,39 @@ CREATE TEMP TABLE freq AS
   SELECT w AS term, count(*) AS df
     FROM docs, unnest(string_to_array(content,' ')) w
    WHERE w LIKE 'word%' GROUP BY w;
-INSERT INTO bands SELECT 'rare',   term, df FROM freq ORDER BY abs(df-10000), term LIMIT 1;
-INSERT INTO bands SELECT 'mid',    term, df FROM freq ORDER BY abs(df-25000), term LIMIT 1;
-INSERT INTO bands SELECT 'common', term, df FROM freq ORDER BY df DESC, term LIMIT 1;
-DO $$ DECLARE n int; BEGIN
-  SELECT count(*) INTO n FROM bands WHERE df > 0;
-  IF n <> 3 THEN RAISE EXCEPTION 'band selection produced % bands, not 3', n; END IF;
+-- Targets are FRACTIONS of the corpus, not absolute counts.  With absolute
+-- targets, a 200k-row corpus whose most frequent term has df 39,360 assigned
+-- both "mid" (nearest 25,000) and "common" (the maximum) to the SAME term -- so
+-- two of the three latency bands measured an identical query and the comparison
+-- silently lost a dimension.  At 2M rows these fractions reproduce the pg_fts
+-- bands closely (rare 10,875 / mid 24,097 / common 734,896).
+INSERT INTO bands
+  SELECT 'rare', term, df FROM freq
+   ORDER BY abs(df - (SELECT count(*)*0.005 FROM docs)), term LIMIT 1;
+INSERT INTO bands
+  SELECT 'mid', term, df FROM freq
+   WHERE term <> (SELECT term FROM bands WHERE band='rare')
+   ORDER BY abs(df - (SELECT count(*)*0.02 FROM docs)), term LIMIT 1;
+INSERT INTO bands
+  SELECT 'common', term, df FROM freq
+   WHERE term NOT IN (SELECT term FROM bands)
+   ORDER BY df DESC, term LIMIT 1;
+-- Assert three DISTINCT bands with strictly increasing df.  A collision or an
+-- empty band means the corpus is too small or too flat for the requested bands,
+-- and benchmarking it anyway produces numbers that look fine and mean nothing.
+DO $$
+DECLARE n int; nd int; r bigint; m bigint; c bigint;
+BEGIN
+  SELECT count(*), count(DISTINCT term) INTO n, nd FROM bands WHERE df > 0;
+  IF n <> 3 OR nd <> 3 THEN
+    RAISE EXCEPTION 'band selection produced % rows / % distinct terms, need 3/3', n, nd;
+  END IF;
+  SELECT df INTO r FROM bands WHERE band='rare';
+  SELECT df INTO m FROM bands WHERE band='mid';
+  SELECT df INTO c FROM bands WHERE band='common';
+  IF NOT (r < m AND m < c) THEN
+    RAISE EXCEPTION 'bands not strictly increasing in df: rare=% mid=% common=%', r, m, c;
+  END IF;
 END $$;
 SELECT band, term, df FROM bands ORDER BY df;
 SQL
@@ -178,7 +205,13 @@ SQL
 # of being inferred from divergent match counts a month later.
 FINGERPRINT_SQL="SELECT md5(string_agg(content, E'\n' ORDER BY id)) FROM docs"
 
-band() { psql -X -q -t -A -d "$PGDATABASE" -c "SELECT term FROM bands WHERE band='$1'"; }
+band() {
+    # PATH must be exported here too: this runs in a fresh shell per verb, and
+    # the first attempt failed with "psql: command not found" only AFTER the
+    # index had been built, wasting the whole provisioning phase.
+    export PATH="$NVME/pg/bin:$PATH"
+    psql -X -q -t -A -d "$PGDATABASE" -c "SELECT term FROM bands WHERE band='$1'"
+}
 
 timed_index() {
     local ddl=$1
