@@ -187,21 +187,57 @@ static inline uint64
 weave_for_get(const unsigned char *buf, int i)
 {
 	int			width = buf[0];
+	const unsigned char *bits;
 	int			bitpos;
-	uint64		v = 0;
-	int			b;
+	int			byte;
+	int			shift;
+	uint64		mask;
 
 	if (width == 0)
 		return 0;
+	bits = buf + 1;
 	bitpos = i * width;
-	for (b = 0; b < width; b++)
-	{
-		int			abs = bitpos + b;
+	byte = bitpos >> 3;
+	shift = bitpos & 7;
+	mask = (width >= 64) ? ~UINT64CONST(0) : (((uint64) 1 << width) - 1);
 
-		if (buf[1 + (abs >> 3)] & (1 << (abs & 7)))
-			v |= (uint64) 1 << b;
+	/*
+	 * Same word-load/shift/mask extraction weave_for_unpack() uses, rather than
+	 * the per-bit loop this function used to run.  A value spans at most
+	 * width+7 bits, so the covering bytes give it in one pass when
+	 * shift+width <= 64; the wide case assembles across a 9-byte window.
+	 *
+	 * This is on the per-posting hot path twice over: wand_contrib_cur() reads
+	 * `tf` through it for EVERY scored posting, and the v3 inline-doclen path
+	 * reads |D| through it too.  The per-bit version cost `width` branches per
+	 * call (profiled 2026-09-06).
+	 */
+	if (shift + width <= 64)
+	{
+		uint64		w = 0;
+		int			nb = (shift + width + 7) >> 3;
+		int			k;
+
+		for (k = 0; k < nb; k++)
+			w |= (uint64) bits[byte + k] << (k * 8);
+		return (w >> shift) & mask;
 	}
-	return v;
+	else
+	{
+		uint64		lo = 0;
+		int			k;
+
+		for (k = 0; k < 8; k++)
+			lo |= (uint64) bits[byte + k] << (k * 8);
+		/*
+		 * shift == 0 here only for a corrupt width > 64 (a valid width <= 64
+		 * gives shift >= 1 in this branch); a 64-bit shift is UB, and the high
+		 * word contributes nothing in that case.  Mirrors weave_for_unpack().
+		 */
+		if (shift == 0)
+			return lo & mask;
+		return ((lo >> shift) | ((uint64) bits[byte + 8] << (64 - shift))) & mask;
+	}
 }
 
 /*
