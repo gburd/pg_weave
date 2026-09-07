@@ -23,6 +23,7 @@ OBJS = \
 	src/am/am.o \
 	src/am/customscan.o \
 	src/am/amaux.o \
+	src/am/amsize.o \
 	src/util/migrate.o \
 	src/query/trgm.o \
 	src/util/sparsemap.o \
@@ -36,7 +37,7 @@ OBJS = \
 PG_CPPFLAGS = -I$(srcdir)/include
 
 EXTENSION = pg_weave
-DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql
+DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql
 PGFILEDESC = "pg_weave - unified lexical + vector + fuzzy retrieval in one index"
 
 # sql/ and expected/ are already at the top level (PGXS's built-in default
