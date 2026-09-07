@@ -63,6 +63,13 @@ RESET enable_indexscan;
 SELECT pg_stat_reset();
 EXPLAIN (COSTS OFF)
   SELECT id FROM ss WHERE to_wdoc(body) @@@ to_wquery('quick & fox')
+-- NOTE (task L7, 2026-09-06): this used to expect `Sort -> Seq Scan` and
+-- idx_scan = 0, because a bare `ORDER BY <=> LIMIT` with no WHERE clause could
+-- not produce an index path while amoptionalkey was false.  It now expects an
+-- ordering `Index Scan` and idx_scan = 1.  That change is the whole point of L7:
+-- the bare form was a silent seq scan costing 83 ms par4 / 362 ms serial on 1M
+-- documents against 0.05 ms for the WHERE-qualified form.  See
+-- bench/RESULTS_LEXICAL.md and doc/GAPS.md G1.
   ORDER BY to_wdoc(body) <=> to_wquery('quick & fox') LIMIT 5;
 SELECT count(*) FROM (
   SELECT id FROM ss WHERE to_wdoc(body) @@@ to_wquery('quick & fox')

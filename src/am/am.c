@@ -6100,6 +6100,34 @@ weave_costestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	*indexCorrelation = costs.indexCorrelation;
 	*indexPages = costs.numIndexPages;
 
+	/*
+	 * A scan with neither a restriction clause nor an ordering clause is a full
+	 * index scan, and this index CANNOT serve one correctly: weave_build_callback
+	 * and weave_insert both skip NULL values, so the index has no entry for a row
+	 * whose indexed column is NULL.  A full scan would therefore undercount, and
+	 * an undercount from `SELECT count(*)` is a wrong answer rather than a slow
+	 * one.
+	 *
+	 * amoptionalkey has to be true so the keyless ORDERING path exists (task L7),
+	 * but that also lets the planner consider an Index Only Scan for an
+	 * unqualified aggregate -- `count(*)` needs no columns at all, so
+	 * check_index_only() succeeds regardless of amcanreturn.  Price that shape
+	 * out of consideration.  weave_gettuple and weave_getbitmap additionally
+	 * reject it at runtime, which is what catches the residual case where a
+	 * competing path has been disabled by a GUC and is therefore never preferred
+	 * on cost at all (PostgreSQL 18 compares disabled-node counts before costs).
+	 *
+	 * Setting a prohibitive cost rather than returning an error from here is
+	 * deliberate: costing is called during planning for paths that may never be
+	 * chosen, so erroring would break queries that would have planned fine.
+	 */
+	if (path->indexclauses == NIL && path->indexorderbys == NIL)
+	{
+		*indexStartupCost = 1.0e12;
+		*indexTotalCost = 1.0e12;
+		return;
+	}
+
 	if (path->indexorderbys != NIL)
 	{
 		/*
@@ -6219,7 +6247,37 @@ weave_handler(PG_FUNCTION_ARGS)
 	amroutine->amcanbackward = false;
 	amroutine->amcanunique = false;
 	amroutine->amcanmulticol = false;
-	amroutine->amoptionalkey = false;
+	/*
+	 * amoptionalkey: can a scan run with no restriction clause on the first
+	 * index column?
+	 *
+	 * TRUE, and this single flag is the whole of task L7.  With it false the
+	 * planner refuses to generate ANY index path when there is no `WHERE d @@@ q`
+	 * clause, so the pgvector idiom
+	 *
+	 *		SELECT ... ORDER BY d <=> 'query'::wquery LIMIT 10
+	 *
+	 * silently fell back to a Seq Scan plus a top-N Sort that evaluated <=> on
+	 * every row of the table: measured 83 ms with 4 parallel workers and 362 ms
+	 * serial on 1M documents, against 0.05 ms for the same intent written with
+	 * the redundant WHERE clause (bench/RESULTS_LEXICAL.md, doc/GAPS.md G1).
+	 * Correct results, a 7,000x cliff, and no diagnostic -- on the form every
+	 * user writes first, because that is what pgvector taught them.
+	 *
+	 * Nothing else in the AM needed changing, which is why this went unnoticed:
+	 * weave_rescan already takes the query from the order-by argument when there
+	 * are no scan keys, and the ordering path already rechecks the exact @@@ test
+	 * itself rather than relying on an executor recheck (it has to, since an
+	 * ordering scan gets none).  So the keyless ordering scan runs the identical
+	 * candidate-generation and ranking code as the qualified form.
+	 *
+	 * The hazard this flag introduces is a scan with NEITHER a key NOR an
+	 * order-by -- reachable via a partial index, where a useful predicate alone
+	 * justifies a path.  weave_gettuple and weave_getbitmap reject that
+	 * explicitly rather than returning zero rows, because an empty result from a
+	 * full-index-scan plan is a wrong answer, not a slow one.
+	 */
+	amroutine->amoptionalkey = true;
 	amroutine->amsearcharray = false;
 	amroutine->amsearchnulls = false;
 	amroutine->amstorage = false;
