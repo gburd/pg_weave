@@ -763,8 +763,20 @@ weave_lookup_prefix(Relation index, const WeaveSegMeta *seg,
  * NOT is handled specially: a bare NOT is only meaningful as "a AND NOT b", so
  * we track whether each stack entry is "positive" (a TID set) or "negative"
  * (the complement of a TID set).  AND/OR combine them with De Morgan; a top-
- * level negative result is complemented against all indexed TIDs (via the
- * universe set).
+ * level negative result is complemented against all indexed TIDs (the universe).
+ *
+ * THE UNIVERSE IS BUILT LAZILY, and that is a performance requirement rather
+ * than a style preference.  Building it reads EVERY posting list of EVERY term
+ * in the segment -- Sum(df) work, the whole expanded inverted index, typically
+ * two orders of magnitude more than ndocs.  It was previously built eagerly
+ * whenever the query contained any NOT at all, but De Morgan means the common
+ * shape `a & !b` reduces to andnot(a, b) and never consults it: the universe is
+ * needed only when the TOP-LEVEL result is still negated, i.e. for a purely
+ * negative query like `!b`.  Measured cost of getting this wrong, on a 200k-row
+ * corpus: `count(*) WHERE d @@@ 'common & !rare'` took 603.9 ms against
+ * tsvector+GIN's 14.7 ms -- a 41x loss, entirely spent materialising a set the
+ * evaluation then discarded.  Boolean NOT was in no predecessor's benchmark
+ * matrix, which is why it went unmeasured for the whole life of the fork.
  */
 typedef struct EvalVal
 {
@@ -772,9 +784,39 @@ typedef struct EvalVal
 	bool		negated;		/* true => set represents docs NOT to include */
 } EvalVal;
 
+/*
+ * Everything weave_universe_bounded needs, so the evaluator can defer the call.
+ * `built` memoises within one evaluation; a query can only need the universe
+ * once, but the flag keeps that a local fact rather than an assumption.
+ */
+typedef struct UniverseSrc
+{
+	Relation	index;
+	BlockNumber dictstart;
+	double		ndocs;
+	bool		has_doclen_col;
+	bool		built;
+	TidSet		set;
+} UniverseSrc;
+
+static TidSet weave_universe_bounded(Relation index, BlockNumber dictstart,
+									 double ndocs, bool has_doclen_col);
+
+static TidSet
+universe_get(UniverseSrc *u)
+{
+	if (!u->built)
+	{
+		u->set = weave_universe_bounded(u->index, u->dictstart, u->ndocs,
+										u->has_doclen_col);
+		u->built = true;
+	}
+	return u->set;
+}
+
 static TidSet
 weave_eval_query(Relation index, const WeaveSegMeta *seg, WeaveQuery q,
-				TidSet universe)
+				UniverseSrc *universe)
 {
 	EvalVal    *stack;
 	int			top = 0;
@@ -885,7 +927,7 @@ weave_eval_query(Relation index, const WeaveSegMeta *seg, WeaveQuery q,
 
 	Assert(top == 1);
 	if (stack[0].negated)
-		result = tidset_andnot(universe, stack[0].set);
+		result = tidset_andnot(universe_get(universe), stack[0].set);
 	else
 		result = stack[0].set;
 
@@ -2020,7 +2062,8 @@ collect_retry:
 	for (s = 0; s < meta.nsegments; s++)
 	{
 		WeaveSegMeta *sg = &meta.segs[s];
-		TidSet		universe;
+		TidSet		universe;			/* only for the fuzzy/regex fallback below */
+		UniverseSrc uni;				/* lazy source for the boolean evaluator */
 
 		CHECK_FOR_INTERRUPTS();	/* per segment; no lock/window held (meta is in memory) */
 		if (sg->dictstart == InvalidBlockNumber)
@@ -2110,14 +2153,22 @@ collect_retry:
 			continue;
 		}
 
-		if (has_not)
-			universe = weave_universe_bounded(index, sg->dictstart, sg->ndocs,
-											 sg->doclenstart == InvalidBlockNumber);
-		else
-		{
-			universe.tids = NULL;
-			universe.n = 0;
-		}
+		/*
+		 * Do NOT build the universe here.  It is handed to the evaluator as a
+		 * lazy source and materialised only if the top-level result is still
+		 * negated after De Morgan -- see the comment on weave_eval_query.  The
+		 * eager build cost 603.9 ms on `common & !rare` at 200k rows for a set
+		 * that was then discarded.
+		 */
+		uni.index = index;
+		uni.dictstart = sg->dictstart;
+		uni.ndocs = sg->ndocs;
+		uni.has_doclen_col = (sg->doclenstart == InvalidBlockNumber);
+		uni.built = false;
+		uni.set.tids = NULL;
+		uni.set.n = 0;
+		universe.tids = NULL;
+		universe.n = 0;
 
 		if (use_pos_phrase)
 		{
@@ -2171,7 +2222,7 @@ collect_retry:
 
 		{
 			TidSet		result = weave_eval_query(index,
-												 sg, query, universe);
+												 sg, query, &uni);
 
 			if (result.n > 0)
 			{
