@@ -32,7 +32,7 @@ From `bench/RESULTS_LEXICAL.md`, 1M documents, r6id.4xlarge, PostgreSQL 17.
 
 | # | gap | measured | target |
 |---|---|---|---|
-| **G1** | bare `ORDER BY <=> LIMIT` does not use the index | 83 ms par4 / 362 ms serial, vs 0.05 ms for the supported form — **7,000×** | index path generated for the bare form |
+| ~~**G1**~~ | ~~bare `ORDER BY <=> LIMIT` does not use the index~~ | **CLOSED by L7.** 83 ms → **0.05 ms** (1,662× par4, 7,248× serial). Now beats GIN by 1,615×/7,080× on the same form. | done |
 | **G2** | index size | 115–156 MB vs GIN 68–81 MB — **1.7–1.9× larger** | ≤ GIN |
 | **G3** | ranked latency on rare terms (df 25) | 0.05 ms vs 0.03 ms — **1.7×** | ≤ GIN |
 | **G4** | ranked latency on mid terms (df 2.5k) | 3.54 ms vs 2.06 ms — **1.7×** | ≤ GIN |
@@ -46,7 +46,14 @@ fuzzy, and regex which GIN does not have at all.
 
 ## 3. Diagnosis
 
-### G1 — the bare `ORDER BY` form generates no index path
+### G1 — the bare `ORDER BY` form generates no index path — **CLOSED**
+
+**Resolved 2026-09-06 by task L7.** Root cause was `amoptionalkey = false`;
+setting it true was the entire fix. Confirmed by measurement: 83.09 → 0.05 ms
+par4, 362.38 → 0.05 ms serial, with no other measurement moving. The hazard it
+introduced (Index Only Scan over a NULL-skipping index for an unqualified
+`count(*)`) is contained by a prohibitive cost plus a runtime rejection. Original
+diagnosis retained below.
 
 **Root cause.** The AM's ordering path (`weave_gettuple`) is only reached when the
 planner picks an `Index Scan ... Order By`, and that currently requires *both* a
@@ -191,10 +198,12 @@ do not start the novel work until the channels it composes actually exist.
 ## 6. Honest position statement
 
 Today, against tsvector + GIN on a 1M-document corpus, pg_weave wins
-overwhelmingly on common-term ranking, `count(*)`, and prefix counting; wins on
-features outright; loses by 1.7× on rare and mid ranked latency; loses by 1.7–1.9×
-on index size; and has one silent 7,000× cliff on the query form users write
-first.
+overwhelmingly on common-term ranking (8.2–19×), `count(*)` (595×), prefix
+counting (3.8–7.7×), and — since L7 — the bare `ORDER BY` form (1,615–7,080×). It
+wins on features outright. It loses by 1.7× on rare and mid ranked latency and by
+1.7–1.9× on index size.
+
+**Five measured losses remain (G2–G6); the 7,000× cliff is gone.**
 
 Against the full separate-extension stack it is not yet a comparison: there is no
 vector index and no fuzzy channel.

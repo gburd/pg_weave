@@ -1,6 +1,6 @@
 # Result: lexical channel vs tsvector + GIN
 
-Date: 2026-09-06. Harness: `bench/lexical.sh` via `bench/aws/run.sh r6id.4xlarge lexical`.
+Date: 2026-09-06, re-measured after task L7. Harness: `bench/lexical.sh` via `bench/aws/run.sh r6id.4xlarge lexical`.
 Reproduce: `NDOCS=1000000 VOCAB=200000 bench/aws/run.sh r6id.4xlarge lexical`.
 
 tsvector + GIN is the baseline every PostgreSQL user already has. Beating it is
@@ -40,7 +40,8 @@ install). `par0` = serial.
 | `count(*)` common | **0.43** | 0.43 | 255.65 | 254.53 | **ahead 595×** |
 | `count(*)` AND (rare ∧ mid) | 0.04 | 0.04 | 0.02 | 0.02 | behind 2× (both trivial) |
 | `count(*)` prefix | **40.7** | 40.9 | 156.28 | 313.88 | ahead 3.8× / 7.7× |
-| **bare `ORDER BY` rare** | 83.1 | 83.4 | 80.4 | 352.6 | **see §Footgun** |
+| bare `ORDER BY` rare (no `WHERE`) | **0.05** | 0.06 | 80.75 | 354.00 | ahead **1,615× / 7,080×** |
+| bare `ORDER BY` common (no `WHERE`) | **15.04** | 15.07 | 78.04 | 343.35 | ahead **5.2× / 22.8×** |
 
 pg_weave's index-scan latencies are identical at par4 and par0 — the scan is
 serial either way. GIN's common-term ranked latency **doubles** when parallelism
@@ -61,9 +62,33 @@ itself a finding: the harness calls `weave_merge()` and `weave_vacuum()` with
 optional maintenance step ran is not acceptable for a published number, and the
 harness must stop tolerating it.
 
-## The footgun
+## The footgun — FIXED by task L7
 
-`ORDER BY d <=> query LIMIT k` **with no `WHERE` clause does not use the index.**
+**Status: fixed.** `amoptionalkey` was `false`, which made PostgreSQL refuse to
+generate any index path without a restriction clause on the first column. Setting
+it true was the whole fix; everything else the AM needed was already in place.
+Before and after, same corpus and host:
+
+| | before L7 | after L7 | change |
+|---|---:|---:|---|
+| bare `ORDER BY` rare, par4 | 83.09 ms | **0.05 ms** | **1,662× faster** |
+| bare `ORDER BY` rare, serial | 362.38 ms | **0.05 ms** | **7,248× faster** |
+| bare `ORDER BY` common, par4 | 79.18 ms | **15.04 ms** | 5.3× faster |
+| bare `ORDER BY` common, serial | 347.06 ms | **15.06 ms** | 23× faster |
+
+No other measurement moved: rare 0.05, mid 3.42, common 15.00, `count(*)` 0.42 are
+all unchanged, so the flag bought the bare form without costing the qualified one.
+`[NO-INDEX]` no longer appears in any plan shape.
+
+GIN cannot use its index for the bare form either — `ts_rank` with no `WHERE`
+clause is a seq scan for the same reason — so pg_weave now beats it there by
+**1,615× parallel and 7,080× serial**, which turns the project's worst liability
+into its largest single margin.
+
+The rest of this section is retained as the description of what was wrong, because
+the diagnosis is more useful than the fix.
+
+`ORDER BY d <=> query LIMIT k` **with no `WHERE` clause did not use the index.**
 The planner emits a Seq Scan plus a top-N Sort that evaluates `<=>` on every row:
 83 ms with 4 parallel workers, 362 ms serial, and **flat across every selectivity
 band** because 25 matching documents and 197,552 matching documents cost exactly
@@ -84,10 +109,19 @@ for the same intent.
 This is the worst failure mode a database feature can have: correct results, a
 four-orders-of-magnitude cliff, and no diagnostic. It is also the form every user
 will write first, because `ORDER BY embedding <=> $1 LIMIT 10` is what pgvector
-taught them. It is documented in pg_weave's own regression test
-(`sql/weave.sql:1443`) as a known constraint rather than treated as a bug, which
-is the wrong call. It is now task **L7** in `doc/PHASES.md` and the highest
-priority in `doc/GAPS.md`.
+taught them. It was documented in pg_weave's own regression test as a known constraint rather
+than treated as a bug, which was the wrong call. `sql/orderby.sql` now asserts the
+plan for both forms, because a test that only checks rows passes just as happily
+on the seq-scan path — which is exactly how the suite missed this.
+
+One hazard the fix introduces, and worth knowing about: an unqualified `count(*)`
+needs no columns, so `check_index_only()` succeeds regardless of `amcanreturn` and
+the planner will consider an Index Only Scan over the weave index. That plan is
+*wrong*, not slow — the index skips NULL values, so a full scan undercounts. It is
+priced at 1e12 by `weave_costestimate` and rejected at runtime by
+`weave_gettuple`/`weave_getbitmap`, the latter because PostgreSQL 18 compares
+disabled-node counts before costs and so a prohibitive cost alone would not stop a
+GUC-forced plan.
 
 ## Features GIN does not have
 
@@ -112,7 +146,8 @@ sequence is a decent argument for why a benchmark needs to capture plans:
    select nothing — leaving the rare band empty so the query matched 0 rows and
    the competitor "won" at 0.01 ms.
 4. **The bare `ORDER BY` form**, which measured a seq scan for six consecutive
-   runs while looking like an index benchmark.
+   runs while looking like an index benchmark — and which turned out to be a real
+   product bug, now fixed as task L7.
 
 None of these were visible from the timings alone. All four were found by making
 the harness assert correctness first and print `EXPLAIN` plans.
@@ -130,4 +165,7 @@ the harness assert correctness first and print `EXPLAIN` plans.
 - **Single-stream latency only.** No concurrency, no mixed read/write, no
   throughput-under-load.
 - **The 1.7× losses on rare and mid are small in absolute terms** (0.02 ms and
-  1.5 ms) but they are losses, and `doc/GAPS.md` treats them as such.
+  1.3 ms) but they are losses, and `doc/GAPS.md` treats them as such (G3, G4).
+- **Index size measured 156 MB in this run**, the uncompacted figure, because
+  `weave_merge`/`weave_vacuum` are still invoked with `|| true`. Gap G6 is open and
+  the harness still tolerates what it should fail on.
