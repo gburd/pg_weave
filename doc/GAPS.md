@@ -33,11 +33,11 @@ From `bench/RESULTS_LEXICAL.md`, 1M documents, r6id.4xlarge, PostgreSQL 17.
 | # | gap | measured | target |
 |---|---|---|---|
 | ~~**G1**~~ | ~~bare `ORDER BY <=> LIMIT` does not use the index~~ | **CLOSED by L7.** 83 ms → **0.05 ms** (1,662× par4, 7,248× serial). Now beats GIN by 1,615×/7,080× on the same form. | done |
-| **G2** | index size | 115–156 MB vs GIN 68–81 MB — **1.7–1.9× larger** | ≤ GIN |
+| ~~**G2**~~ | ~~index size~~ | **CLOSED by L8/L10.** The loss was a measurement artifact: 70.7% of the file was freed pages. Live content is **46 MB vs GIN's 81 MB — 1.76× smaller.** | done, and a win |
 | **G3** | ranked latency on rare terms (df 25) | 0.05 ms vs 0.03 ms — **1.7×** | ≤ GIN |
 | **G4** | ranked latency on mid terms (df 2.5k) | 3.54 ms vs 2.06 ms — **1.7×** | ≤ GIN |
-| **G5** | build time | 10.3–11.7 s vs 8.3–10.1 s — **1.2×** | ≤ GIN |
-| **G6** | index size is non-deterministic | 115 MB compacted vs 156 MB not — a 35 % swing on whether an optional maintenance step ran | one number, always |
+| **G5** | build time | **WORSE: 29.2 s vs 11.7 s — 2.5×** (was 1.2×). L8's vacate pass roughly doubles build write I/O. Known fix: task L12. | ≤ GIN |
+| ~~**G6**~~ | ~~index size is non-deterministic~~ | **CLOSED by L8.** as-built 46 MB, compacted 46 MB, swing **0.0%**; `weave_merge`/`weave_vacuum` both return false on a fresh build. | done |
 
 Where pg_weave already wins, and by how much, so the wins are not lost in the
 list of gaps: ranked common-term **8.2× (par4) / 19× (serial)**, `count(*)`
@@ -203,7 +203,15 @@ counting (3.8–7.7×), and — since L7 — the bare `ORDER BY` form (1,615–7
 wins on features outright. It loses by 1.7× on rare and mid ranked latency and by
 1.7–1.9× on index size.
 
-**Five measured losses remain (G2–G6); the 7,000× cliff is gone.**
+**Three measured losses remain: G3 and G4 (rare/mid ranked, 1.7×) and G5 (build
+time, now 2.5× after L8's trade).** G1, G2, and G6 are closed, and G2 turned out to
+be a win — pg_weave's index is 1.76× *smaller* than GIN's, not 1.9× larger.
+
+Compaction was also shown not to affect ranked latency, which **falsifies the
+stated G3/G4 diagnosis**: the build already produces one segment, so per-segment
+setup was never the cost. L9 still owes a profile, and the hypothesis it should
+test next is the dictionary lookup and cursor construction rather than segment
+iteration.
 
 Against the full separate-extension stack it is not yet a comparison: there is no
 vector index and no fuzzy channel.
