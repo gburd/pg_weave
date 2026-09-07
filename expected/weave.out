@@ -2280,11 +2280,18 @@ SELECT :idx_term5 = (SELECT count(*) FROM strm WHERE to_wdoc('simple',body) @@@ 
 (1 row)
 
 RESET enable_indexscan; RESET enable_bitmapscan;
-SET enable_seqscan = off;
 -- tombstones dropped: the merged segment's live ndocs equals the live heap
 -- rows (14000 - 3500 deleted + 4000 fresh = 14500), not the pre-delete total.
 -- If the streaming merge failed to drop tombstoned postings, ndocs would be
 -- inflated by the ~3500 deleted docs.
+--
+-- NOTE: enable_seqscan stays ON for this one.  The subquery is an unqualified
+-- `count(*)`, which needs no columns, so check_index_only() succeeds and -- now
+-- that amoptionalkey is true for the keyless ordering path (task L7) -- the
+-- planner will happily choose an Index Only Scan over the weave index if the seq
+-- scan is disabled.  That plan is rejected at runtime because the index skips
+-- NULL values and so cannot answer a full scan completely.  Forcing it here was
+-- testing the planner, not the merge.
 SELECT ndocs = (SELECT count(*) FROM strm) AS strm_tombstones_dropped
   FROM weave_index_stats('strm_bm25');
  strm_tombstones_dropped 
@@ -2292,6 +2299,7 @@ SELECT ndocs = (SELECT count(*) FROM strm) AS strm_tombstones_dropped
  t
 (1 row)
 
+SET enable_seqscan = off;
 -- phrase (position carry through the streaming merge) still matches
 SELECT count(*) > 0 AS strm_phrase_ok
   FROM strm WHERE to_wdoc('simple',body) @@@ to_wquery('simple','"term5 shared"');

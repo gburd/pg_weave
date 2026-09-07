@@ -1,0 +1,103 @@
+-- L7: the keyless ordering scan.
+--
+-- `ORDER BY d <=> q LIMIT k` with NO `WHERE` clause is the pgvector idiom
+-- (`ORDER BY embedding <=> $1 LIMIT 10`) and therefore the first form any user
+-- writes.  Measured on 1M documents, pg_weave answered it with a Seq Scan plus a
+-- top-N Sort evaluating <=> on every row: 83 ms with 4 parallel workers, 362 ms
+-- serial, against 0.05 ms for the same intent through the WHERE-qualified form.
+-- See bench/RESULTS_LEXICAL.md and doc/GAPS.md G1.
+--
+-- Correct results, a 7,000x cliff, and no diagnostic is the worst failure mode a
+-- database feature can have.  This file asserts the plan, because a test that
+-- only checks rows passes just as happily on the seq-scan path -- which is
+-- exactly how the regression suite missed this for the whole life of the fork.
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+ALTER EXTENSION pg_weave UPDATE;
+
+CREATE TABLE ob (id serial, d wdoc);
+-- A vocabulary with three frequency bands so ranking is meaningful and the
+-- top-k is not an arbitrary tie-break.
+INSERT INTO ob(d) SELECT to_wdoc('alpha rare' || g)        FROM generate_series(1, 5) g;
+INSERT INTO ob(d) SELECT to_wdoc('alpha beta mid' || g)    FROM generate_series(1, 50) g;
+INSERT INTO ob(d) SELECT to_wdoc('beta gamma common' || g) FROM generate_series(1, 500) g;
+CREATE INDEX ob_weave ON ob USING weave (d);
+ANALYZE ob;
+
+-- enable_seqscan=off is how we test PATH GENERATION rather than cost: if the AM
+-- can produce an ordering path the planner will take it, and if it cannot the
+-- planner falls back to Seq Scan even at disable_cost.  So a Seq Scan here means
+-- "no index path exists", not "the index looked expensive".
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = on;
+
+-- (1) The supported form: WHERE alongside ORDER BY.  Must be an ordering Index
+-- Scan with no Sort node.  This already worked.
+EXPLAIN (COSTS OFF)
+SELECT id FROM ob WHERE d @@@ 'alpha'::wquery
+ ORDER BY d <=> 'alpha'::wquery LIMIT 5;
+
+-- (2) THE TARGET: the bare form, no WHERE.  Must also be an ordering Index Scan
+-- with no Sort.  Before L7 this was `Sort -> Seq Scan`.
+EXPLAIN (COSTS OFF)
+SELECT id FROM ob ORDER BY d <=> 'alpha'::wquery LIMIT 5;
+
+-- (3) The bare form must return the SAME rows in the SAME order as the
+-- WHERE-qualified form, for a query whose match set exceeds the limit.  If the
+-- keyless path ranked a different candidate set, this would differ.
+SELECT count(*) AS bare_matches_qualified
+  FROM (SELECT id FROM ob ORDER BY d <=> 'alpha'::wquery LIMIT 5) a
+  JOIN (SELECT id FROM ob WHERE d @@@ 'alpha'::wquery
+         ORDER BY d <=> 'alpha'::wquery LIMIT 5) b USING (id);
+
+-- (4) Every row a keyless ordering scan returns must satisfy @@@.  A ranked scan
+-- that returns non-matching rows is the bug class the WHERE-qualified path
+-- already guards against (sql/weave.sql, boolean-structure tests); the keyless
+-- path must not reintroduce it.
+SELECT count(*) AS bare_nonmatching
+  FROM (SELECT d FROM ob ORDER BY d <=> 'alpha'::wquery LIMIT 20) s
+ WHERE NOT (s.d @@@ 'alpha'::wquery);
+
+-- (5) LIMIT larger than the match set must terminate and return exactly the
+-- matches, not pad with non-matching rows.  Only 55 docs contain 'alpha'.
+SELECT count(*) AS bare_all_matches
+  FROM (SELECT id FROM ob ORDER BY d <=> 'alpha'::wquery LIMIT 500) s;
+
+-- (6) Boolean structure must be honoured without a WHERE clause too.
+SELECT count(*) AS bare_and_nonmatching
+  FROM (SELECT d FROM ob ORDER BY d <=> 'alpha & beta'::wquery LIMIT 20) s
+ WHERE NOT (s.d @@@ 'alpha & beta'::wquery);
+SELECT count(*) AS bare_not_nonmatching
+  FROM (SELECT d FROM ob ORDER BY d <=> 'alpha & !beta'::wquery LIMIT 20) s
+ WHERE NOT (s.d @@@ 'alpha & !beta'::wquery);
+
+-- (7) A query matching nothing must return nothing, not the whole table ordered
+-- by an arbitrary score.
+SELECT count(*) AS bare_nomatch FROM (
+  SELECT id FROM ob ORDER BY d <=> 'zzznotpresent'::wquery LIMIT 10) s;
+
+-- (8) Scores must be identical between the two forms.  A keyless scan that
+-- computed BM25 against different corpus statistics would rank plausibly and
+-- wrongly.
+SELECT count(*) AS score_disagreements FROM (
+  SELECT id, round((d <=> 'alpha'::wquery)::numeric, 9) AS s
+    FROM ob WHERE d @@@ 'alpha'::wquery
+   ORDER BY d <=> 'alpha'::wquery LIMIT 5) q
+  JOIN (
+  SELECT id, round((d <=> 'alpha'::wquery)::numeric, 9) AS s
+    FROM ob ORDER BY d <=> 'alpha'::wquery LIMIT 5) b
+  USING (id)
+ WHERE q.s IS DISTINCT FROM b.s;
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET enable_indexscan;
+
+-- (9) With the seq-scan path available, the planner must still CHOOSE the index
+-- for the bare form on a table where the index is the better plan.  Path
+-- generation alone is not enough: doc/GAPS.md G10 notes an uncalibrated cost
+-- model silently loses the index, which is how this gap stayed hidden.
+EXPLAIN (COSTS OFF)
+SELECT id FROM ob ORDER BY d <=> 'alpha'::wquery LIMIT 5;
+
+DROP TABLE ob;

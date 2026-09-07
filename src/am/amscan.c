@@ -1414,6 +1414,25 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 	if (dir != ForwardScanDirection)
 		elog(ERROR, "weave: only forward ordering scans are supported");
 
+	/*
+	 * amoptionalkey is true (see weave_handler), so the planner may hand us a
+	 * scan with no restriction clause.  That is intended: it is how the keyless
+	 * ordering scan works, and weave_rescan takes the query from the order-by
+	 * argument in that case.
+	 *
+	 * But a scan with NEITHER a scan key NOR an order-by has no query at all,
+	 * and there is nothing correct to return.  Silently returning zero rows
+	 * would make such a plan produce an empty result set -- a wrong answer, not
+	 * a slow one -- so fail loudly.  Reachable via a partial index, where a
+	 * useful predicate alone can justify a path.
+	 */
+	if (scan->numberOfKeys == 0 && scan->numberOfOrderBys == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a weave index scan requires a query"),
+				 errdetail("The scan has neither a @@@ restriction nor an ORDER BY <=> ordering clause."),
+				 errhint("Add \"WHERE col @@@ query\" or \"ORDER BY col <=> query\".")));
+
 	if (!so->queryValid || so->query == NULL)
 		return false;
 
@@ -2313,6 +2332,25 @@ weave_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	WeaveScanOpaque so = (WeaveScanOpaque) scan->opaque;
 	TidSet		matches;
 	bool		recheck;
+
+	/*
+	 * amoptionalkey is true (see weave_handler), so the planner may hand us a
+	 * scan with no restriction clause.  That is intended: it is how the keyless
+	 * ordering scan works, and weave_rescan takes the query from the order-by
+	 * argument in that case.
+	 *
+	 * But a scan with NEITHER a scan key NOR an order-by has no query at all,
+	 * and there is nothing correct to return.  Silently returning zero rows
+	 * would make such a plan produce an empty result set -- a wrong answer, not
+	 * a slow one -- so fail loudly.  Reachable via a partial index, where a
+	 * useful predicate alone can justify a path.
+	 */
+	if (scan->numberOfKeys == 0 && scan->numberOfOrderBys == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a weave index scan requires a query"),
+				 errdetail("The scan has neither a @@@ restriction nor an ORDER BY <=> ordering clause."),
+				 errhint("Add \"WHERE col @@@ query\" or \"ORDER BY col <=> query\".")));
 
 	if (!so->queryValid || so->query == NULL)
 		return 0;
