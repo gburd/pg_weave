@@ -1526,13 +1526,24 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 		N = m0.ndocs < 1.0 ? 1.0 : m0.ndocs;
 		so->maxhits = weave_query_maxhits(scan->indexRelation, so->query, N);
 		/*
-		 * Start k at a full first page (100).  Measured trade: vs k=64 this costs
-		 * the top-10 case ~1ms, but serves the entire LIMIT 11..100 range in ONE
-		 * WAND pass instead of a pass-then-recompute (which for a common-term
-		 * query is ~35ms vs ~12ms) -- a net reduction for typical "first page of
-		 * results" pagination.  Beyond 100, grow x4 (capped).
+		 * Initial WAND k.  PostgreSQL gives an access method no way to learn the
+		 * query's LIMIT, so the scan starts at some k and grows x4 on demand.
+		 *
+		 * This value was 100, chosen so the whole LIMIT 11..100 range is served by
+		 * ONE pass rather than a pass-then-recompute.  The competitive benchmark
+		 * showed what that costs: pg_weave's ranked latency is IDENTICAL at
+		 * LIMIT 10 and LIMIT 100 -- measured k100/k10 ratios of 1.003, 1.007 and
+		 * 0.999 across the rare, mid and common bands -- because a LIMIT 10 query
+		 * does a k=100 pass.  Timescale pg_textsearch, over the same corpus and
+		 * query shape, scales 1.9x-4.1x with k and is 10-21x faster at k=10.
+		 * A top-k engine that does not get cheaper as k shrinks is not pruning for
+		 * the dominant query shape, which is a first page of ten results.
+		 *
+		 * Made a GUC so the trade can be swept in one benchmark run instead of
+		 * guessed at: bench/compete sweeps it and bench/RESULTS_WAND_K.md records
+		 * the frontier the default is chosen from.  See doc/GAPS.md G13.
 		 */
-		so->curk = 100;
+		so->curk = pg_weave_wand_initial_k;
 		if ((double) so->curk > so->maxhits)
 			so->curk = Max((int) so->maxhits, 1);
 		so->nordered = weave_topk_visible(scan->indexRelation, so->query,

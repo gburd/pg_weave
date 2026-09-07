@@ -1109,6 +1109,12 @@ static bool weave_alloc_extend_only = false;
 /* GUC: build finalizes to one segment only when total index <= this many MB;
  * above it the build stops at a bounded tiered set so it always converges.
  * Defined here, registered in _PG_init (pg_weave_customscan.c). */
+/* Initial top-k width for a ranked WAND scan; see amscan.c and doc/GAPS.md G13.
+ * Default 16 rather than the historical 100: the competitive benchmark measured
+ * ranked latency to be completely k-independent (k100/k10 ratio 1.00) because a
+ * LIMIT 10 query was doing a k=100 pass, while the best competitor scaled with k
+ * and was 10-21x faster at k=10. */
+int			pg_weave_wand_initial_k = 16;
 int			pg_weave_build_collapse_max_mb = 4096;
 
 /* GUC: per-participant flush-budget growth ceiling, in MB.  0 = keep the safe

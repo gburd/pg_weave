@@ -231,6 +231,7 @@ extern bool weave_trigrams_overlap(const uint32 *a, int na,
 
 /* pg_weave_am_scan.c -- count entry point reused by the COUNT-pushdown CustomScan */
 extern int64 weave_count_visible_oid(Oid indexoid, WeaveQuery q);
+extern int pg_weave_wand_initial_k;
 extern int pg_weave_build_collapse_max_mb;
 extern int pg_weave_build_mem_ceiling_mb;
 

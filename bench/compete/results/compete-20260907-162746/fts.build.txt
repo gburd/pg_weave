@@ -1,0 +1,3 @@
+53.638185372
+build includes fts_merge + fts_vacuum (pg_fts does not self-compact; pg_weave does, task L8)
+reloptions: defaults (positions off)

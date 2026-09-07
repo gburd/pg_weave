@@ -424,6 +424,20 @@ _PG_init(void)
 	 * segments (a small, fixed cost); run weave_merge() in a maintenance window to
 	 * collapse to one when desired.  0 = always collapse (the historical behavior).
 	 */
+	/*
+	 * Initial k for the ranked (block-max WAND) scan.  See the comment at the
+	 * so->curk assignment in amscan.c: PostgreSQL cannot tell an access method the
+	 * query's LIMIT, so the scan starts here and grows x4 on demand.  Too high and
+	 * every LIMIT 10 query pays for a top-100 pass; too low and a LIMIT 100 query
+	 * pays for repeated passes.  Swept by bench/compete.
+	 */
+	DefineCustomIntVariable("pg_weave.wand_initial_k",
+							"Initial top-k width for a ranked WAND scan before growing on demand.",
+							"PostgreSQL does not expose the query LIMIT to an index access method, so a ranked scan starts at this k and grows 4x when the executor asks for more. Lower favours a first page of results; higher favours deep pagination in one pass.",
+							&pg_weave_wand_initial_k,
+							16, 1, 100000,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+
 	DefineCustomIntVariable("pg_weave.build_collapse_max_mb",
 							"Max total index size (MB) for which a build finalizes to a single segment; larger builds stop at a bounded tiered set.",
 							"Above this, an index build leaves a bounded, size-tiered set of segments so it always converges; run weave_merge() to collapse to one. 0 = always collapse.",
