@@ -113,6 +113,15 @@ Corpora:
 | `glove-100` | ann-benchmarks GloVe-100 | 1.18 M | vector worst case for the Beta codebook assumption |
 | `logs-10m` | synthetic log lines, planted patterns | 10 M | fuzzy/regex at scale, and the temp-disk wall |
 
+**Document length is a corpus dimension, not a detail.** `synth-2m` averages 11.6
+words per document and measured a genuine 1.56× codec optimization at 1.06×,
+because at that length almost every term frequency is 1, the tf column packs at one
+bit, and the per-bit loop the optimization removed had one iteration. Wikipedia's
+avgdl is 485. A short-document corpus systematically understates **every**
+per-posting decode optimization, which is the entire class of work aimed at the
+largest competitive gap — see `bench/RESULTS_PORT_1_5_10.md`. Use `synth-2m-long`
+(~120 words) or `wiki-2m` for that class, and never `synth-2m`.
+
 Query terms are **selected from the built corpus by measured document frequency**,
 never hardcoded. pg_weave's own earlier harness silently benchmarked an empty term
 because a `percent_rank` window selected nothing; and pg_tre's realistic generator
@@ -175,6 +184,11 @@ Per measurement point:
   measurement.
 - **No outlier rejection.** Report the distribution. p99 is a deliverable, not
   noise — a p50 win with a p99 loss is a regression for anyone with an SLO.
+- **Do not compare medians across runs.** The disjoint-CI test compares engines
+  measured on the same host in the same run; applying it to a before/after pair
+  from two different runs is outside what it is designed for. A change's effect
+  must be measured by running both arms in one run, or by accepting that the
+  comparison carries un-quantified between-run variance and saying so.
 - **Host-variance quantification.** Run the pg_weave arm on **two independent
   instances of the same type**, and report the between-host delta. If that delta
   exceeds the smallest cross-engine difference being claimed, the claim is not
