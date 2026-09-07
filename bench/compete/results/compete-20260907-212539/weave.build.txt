@@ -1,0 +1,11 @@
+53.106120549
+reloptions: positions=off trigrams=off doclen_sidecar=on (defaults)
+      kind      | npages | pg_size_pretty 
+----------------+--------+----------------
+ postings       |   8714 | 68 MB
+ dictionary     |    785 | 6280 kB
+ doclen_sidecar |    579 | 4632 kB
+ dict_index     |      3 | 24 kB
+ meta           |      1 | 8192 bytes
+(5 rows)
+
