@@ -123,6 +123,28 @@ q += [
  {"label": "count_rare_marker", "sql": "SELECT count(*) FROM docs WHERE d @@@ 'zzqrare'::wquery",
   "expect_plan": IDX, "count_sql": "SELECT count(*) FROM docs WHERE d @@@ 'zzqrare'::wquery"},
 ]
+# ---------------------------------------------------------------------------
+# WAND initial-k sweep (doc/GAPS.md G13).
+#
+# PostgreSQL cannot tell an access method the query's LIMIT, so a ranked scan
+# starts at pg_weave.wand_initial_k and grows 4x on demand.  The value was 100,
+# and the first competitive run showed the consequence: ranked latency was
+# IDENTICAL at LIMIT 10 and LIMIT 100 (k100/k10 ratios 1.003 / 1.007 / 0.999)
+# because a LIMIT 10 query did a k=100 pass, while Timescale pg_textsearch scaled
+# 1.9-4.1x with k and was 10-21x faster at k=10.
+#
+# Sweeping it in-band beats guessing: the trade between a cheap first page and a
+# deep page in one pass is data-dependent, and the old default was chosen from a
+# k=64-vs-k=100 comparison that never asked what k=10 would cost.
+# ---------------------------------------------------------------------------
+for K in (4, 8, 16, 32, 64, 100, 200):
+    for band, T in (("rare", R), ("mid", M), ("common", C)):
+        for lim in (10, 100):
+            q.append({"label": f"wandk{K:03d}_{band}_k{lim}",
+                      "sql": f"SELECT id FROM docs WHERE d @@@ '{T}'::wquery "
+                             f"ORDER BY d <=> '{T}'::wquery LIMIT {lim}",
+                      "setup": f"SET pg_weave.wand_initial_k = {K};",
+                      "expect_plan": IDX})
 print(json.dumps({
   "engine": "weave",
   "version_sql": "SELECT 'pg_weave ' || extversion FROM pg_extension WHERE extname='pg_weave'",

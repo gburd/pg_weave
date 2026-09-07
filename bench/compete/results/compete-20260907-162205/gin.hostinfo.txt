@@ -1,0 +1,13 @@
+engine=gin
+CPU(s):                                  16
+Model name:                              Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz
+Thread(s) per core:                      2
+Core(s) per socket:                      8
+Socket(s):                               1
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl
+               total        used        free      shared  buff/cache   available
+Mem:             123           0         120           1           2         120
+/dev/nvme1n1    885G  6.6G  878G   1% /nvme
+kernel=6.18.44-99.149.amzn2023.x86_64
+PostgreSQL 17.6
+corpus_sha256=be0bc8f852342339843c953222e04926a25a763975ddc35dfd7d63c8d2dd1775

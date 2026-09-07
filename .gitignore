@@ -1,7 +1,8 @@
 *.o
 *.so
 *.bc
-results/
+/bench/aws/out/
+/bench/compete/results/*/key.pem
 regression.diffs
 regression.out
 tmp_check/
