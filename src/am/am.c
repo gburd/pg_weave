@@ -5095,20 +5095,35 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	}
 
 	/*
-	 * Reclaim the free tail the end-of-build merge left on disk.  The merge
-	 * writes the merged output before freeing the input segments (write-before-
-	 * free, for crash safety), so freed input pages accumulate but the file is
-	 * never shrunk during a build (only weave_vacuum truncates).  Truncating the
-	 * contiguous free tail reclaims what the final merge leaves above the
-	 * front-packed data -- substantial on a parallel build (freed tail present),
-	 * a no-op when the free space is interior (a serial single-segment layout);
-	 * fully compacting a freshly built index still needs weave_vacuum.  We hold the
-	 * index AccessExclusiveLock and any parallel workers are already torn down
+	 * Reclaim the space the end-of-build merge left on disk.
+	 *
+	 * The merge writes its output before freeing its inputs (write-before-free,
+	 * required for crash safety: the old pages must stay valid until the metapage
+	 * swap commits).  So a finished build has the live segment at the HIGH end of
+	 * the file and the freed input pages as a LOW free region -- exactly the
+	 * layout weave_vacuum_compact's header describes as the hard case, and one
+	 * where truncating the free TAIL reclaims nothing because the tail is live.
+	 *
+	 * Measured on a 1M-document build before this call was added: 156 MB on disk
+	 * of which 110 MB (70.7%) were freed pages, against 46 MB of live content --
+	 * a 3.4x bloat that went away only if the user knew to call weave_vacuum()
+	 * afterwards.  It also made pg_weave look 1.7-1.9x LARGER than tsvector+GIN
+	 * in bench/RESULTS_LEXICAL.md when the live content is in fact 1.76x SMALLER.
+	 * `CREATE INDEX` has to produce a finished index; requiring a follow-up
+	 * maintenance call to reach the natural size is a defect, not a tuning knob.
+	 * Gap G6 / task L8 in doc/GAPS.md.
+	 *
+	 * Safe here for the reasons the free-tail truncation was: we hold the index
+	 * AccessExclusiveLock, parallel workers are already torn down
 	 * (weave_end_parallel), and during ambuild the index is not yet visible to
 	 * other backends (indisready=false, even under CONCURRENTLY), so this backend
-	 * is the sole writer -- truncating the free tail is safe.
+	 * is the sole writer and the page-recycle gate's exclusive-lock precondition
+	 * holds.  The vacate phase grows the file transiently before truncating; that
+	 * is the price of a single-pass in-place shrink and is bounded by the live
+	 * index size.
 	 */
-	weave_truncate_free_tail(index);
+	if (!weave_vacuum_compact(index))
+		weave_truncate_free_tail(index);
 
 	MemoryContextDelete(bs.ctx);
 
