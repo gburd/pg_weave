@@ -1,7 +1,24 @@
 /*-------------------------------------------------------------------------
  *
  * graph.h
- *		Vamana proximity graph over quantized codes, for the weave vector weft.
+ *		Graph navigation over CENTROIDS for the weave vector weft.
+ *
+ * PLAN CHANGE, 2026-09-07.  This header was written to specify a Vamana graph over
+ * the quantized VECTORS.  That plan is withdrawn.  pg_turbovec added exactly that
+ * structure in v1.23.0 for exactly the reason given below, and DEPRECATED it in
+ * v2.5.0 after measuring, at matched recall on GIST-10M/960-d with R@10 >= 0.98:
+ * IVF 28.4 ms, flat 34.2 ms, and the graph unable to reach 0.98 at ANY latency
+ * (ceiling 0.873 at 181 ms), while being 57-90x slower to build with no
+ * out-of-core path.  Its apparent sublinearity held only at iso-beam -- p50
+ * improved 1.11x for a 10x corpus while recall fell 0.605 to 0.472.
+ *
+ * The corrected plan is an IVF coarse quantizer; see doc/specs/VECTOR_CHANNEL.md
+ * sect. 8.  This file is retained because deprecating the graph KIND is not
+ * deprecating graph TECHNIQUES: a graph that navigates CENTROIDS is small, fits in
+ * memory, shortens the nprobe search, and pg_turbovec kept theirs precisely
+ * because IVF's win partly rests on it.  The interfaces below are being repointed
+ * at that structure -- nodes are centroids, not documents -- and the volume of
+ * text about out-of-core partitioned builds no longer applies at centroid scale.
  *
  * The graph exists to fix one measured failure.  pg_turbovec shipped a flat
  * quantized scan and measured, on 1M x 1024-d Cohere-wiki, a warm p50 of
