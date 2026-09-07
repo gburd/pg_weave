@@ -1114,7 +1114,7 @@ static bool weave_alloc_extend_only = false;
  * ranked latency to be completely k-independent (k100/k10 ratio 1.00) because a
  * LIMIT 10 query was doing a k=100 pass, while the best competitor scaled with k
  * and was 10-21x faster at k=10. */
-int			pg_weave_wand_initial_k = 16;
+int			pg_weave_wand_initial_k = 32;
 int			pg_weave_build_collapse_max_mb = 4096;
 
 /* GUC: per-participant flush-budget growth ceiling, in MB.  0 = keep the safe

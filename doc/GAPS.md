@@ -32,6 +32,8 @@ From `bench/RESULTS_LEXICAL.md`, 1M documents, r6id.4xlarge, PostgreSQL 17.
 
 | # | gap | measured | target |
 |---|---|---|---|
+| **G13** | **ranked retrieval loses to Timescale pg_textsearch** | 7.6× (rare) / 18.2× (mid) / 7.9× (common) at `LIMIT 10`, after G13's partial fix narrowed it from 20.5/21.3/9.9×. `bench/RESULTS_WAND_K.md` | ≤ pg_textsearch |
+| ~~**G12**~~ | ~~boolean NOT~~ | **CLOSED.** `count(*) WHERE 'common & !rare'` 7008 ms → **14.05 ms** (499×) by building the NOT universe lazily. Now **beats GIN's 141 ms by 10×**. | done, and a win |
 | ~~**G1**~~ | ~~bare `ORDER BY <=> LIMIT` does not use the index~~ | **CLOSED by L7.** 83 ms → **0.05 ms** (1,662× par4, 7,248× serial). Now beats GIN by 1,615×/7,080× on the same form. | done |
 | ~~**G2**~~ | ~~index size~~ | **CLOSED by L8/L10.** The loss was a measurement artifact: 70.7% of the file was freed pages. Live content is **46 MB vs GIN's 81 MB — 1.76× smaller.** | done, and a win |
 | **G3** | ranked latency on rare terms (df 25) | 0.05 ms vs 0.03 ms — **1.7×** | ≤ GIN |
@@ -203,8 +205,9 @@ counting (3.8–7.7×), and — since L7 — the bare `ORDER BY` form (1,615–7
 wins on features outright. It loses by 1.7× on rare and mid ranked latency and by
 1.7–1.9× on index size.
 
-**Three measured losses remain: G3 and G4 (rare/mid ranked, 1.7×) and G5 (build
-time, now 2.5× after L8's trade).** G1, G2, and G6 are closed, and G2 turned out to
+**Standing losses: G13 (ranked vs pg_textsearch, 7.6–18.2× — now the largest),
+G5 (build time), G3/G4 (rare/mid ranked vs GIN).** G1, G2, G6 and G12 are closed,
+and G2 and G12 both turned out to be wins. G1, G2, and G6 are closed, and G2 turned out to
 be a win — pg_weave's index is 1.76× *smaller* than GIN's, not 1.9× larger.
 
 Compaction was also shown not to affect ranked latency, which **falsifies the

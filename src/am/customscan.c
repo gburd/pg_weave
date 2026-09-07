@@ -435,7 +435,7 @@ _PG_init(void)
 							"Initial top-k width for a ranked WAND scan before growing on demand.",
 							"PostgreSQL does not expose the query LIMIT to an index access method, so a ranked scan starts at this k and grows 4x when the executor asks for more. Lower favours a first page of results; higher favours deep pagination in one pass.",
 							&pg_weave_wand_initial_k,
-							16, 1, 100000,
+							32, 1, 100000,
 							PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("pg_weave.build_collapse_max_mb",
