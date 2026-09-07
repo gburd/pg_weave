@@ -70,7 +70,9 @@ build() {
 
 say "building indexes"
 BUILD_WEAVE=$(build weave "CREATE INDEX weave_idx ON docs USING weave (d)")
-$PSQL -c "SELECT weave_merge('weave_idx'); SELECT weave_vacuum('weave_idx');" >/dev/null 2>&1 || true
+# NOTE: deliberately NOT compacting here.  The as-built size is what a user gets
+# from CREATE INDEX, and measuring only the compacted size hid gap G6 for four
+# benchmark runs.  Compaction is measured explicitly further down.
 BUILD_GIN=$(build gin "CREATE INDEX gin_idx ON docs USING gin (tsv)")
 
 say "prewarming"
@@ -283,12 +285,62 @@ cat "$PLANS"
 done
 unset PGOPTIONS
 
-say "segments (a fixed per-scan cost scales with this)"
-$PSQL -c "SELECT * FROM weave_index_stats('weave_idx')" 2>/dev/null || \
-  $PSQL -t -A -c "SELECT weave_segment_count('weave_idx')" 2>/dev/null || \
-  echo "  (no segment introspection function; see doc/GAPS.md)"
+# ---------------------------------------------------------------------------
+# Where the bytes go, and what compaction is worth.
+#
+# Tasks L8 and L10, gaps G2 and G6.  The index measured 115 MB compacted and
+# 156 MB not -- a 35% swing on whether an optional maintenance step ran -- so both
+# states are reported, along with the per-page-kind breakdown that says which
+# structure to attack.  Publishing one number without saying which state it is
+# would be the flattering half of the truth.
+# ---------------------------------------------------------------------------
+say "corpus stats and segment count AS BUILT"
+$PSQL -c "SELECT * FROM weave_index_stats('weave_idx')"
+$PSQL -t -A -c "SELECT 'segments as built: ' || weave_index_nsegments('weave_idx')"
 
-say "build time (s) and index size"
+say "size breakdown AS BUILT (no manual maintenance)"
+$PSQL -c "SELECT kind, npages, pg_size_pretty(bytes) AS size,
+                 round(pct::numeric,1) AS pct, round(free_pct::numeric,1) AS free_pct
+            FROM weave_index_size_detail('weave_idx')
+           WHERE npages > 0 ORDER BY bytes DESC"
+SIZE_ASBUILT=$($PSQL -t -A -c "SELECT pg_relation_size('weave_idx')")
+
+say "compacting (weave_merge + weave_vacuum) -- FAILURE IS FATAL, gap G6"
+$PSQL -c "SELECT weave_merge('weave_idx')" \
+    || { echo "ABORT: weave_merge failed; a size number that depends on whether" \
+              "an optional step succeeded is not publishable (gap G6)" >&2; exit 1; }
+$PSQL -c "SELECT weave_vacuum('weave_idx')" \
+    || { echo "ABORT: weave_vacuum failed (gap G6)" >&2; exit 1; }
+
+say "segment count AFTER compaction"
+$PSQL -t -A -c "SELECT 'segments after merge: ' || weave_index_nsegments('weave_idx')"
+
+say "size breakdown AFTER compaction"
+$PSQL -c "SELECT kind, npages, pg_size_pretty(bytes) AS size,
+                 round(pct::numeric,1) AS pct, round(free_pct::numeric,1) AS free_pct
+            FROM weave_index_size_detail('weave_idx')
+           WHERE npages > 0 ORDER BY bytes DESC"
+SIZE_COMPACT=$($PSQL -t -A -c "SELECT pg_relation_size('weave_idx')")
+
+say "the G6 swing"
+printf 'as_built\t%s\ncompacted\t%s\nswing\t%s%%\n' \
+    "$($PSQL -t -A -c "SELECT pg_size_pretty($SIZE_ASBUILT::bigint)")" \
+    "$($PSQL -t -A -c "SELECT pg_size_pretty($SIZE_COMPACT::bigint)")" \
+    "$($PSQL -t -A -c "SELECT round(100.0*($SIZE_ASBUILT-$SIZE_COMPACT)/GREATEST($SIZE_COMPACT,1),1)")" \
+    | column -t
+
+say "does compaction change ranked latency? (the G3/G4 hypothesis)"
+{
+printf 'query\tp50_compacted\n'
+for band in rare mid common; do
+    case $band in rare) T=$RARE;; mid) T=$MID;; common) T=$COMMON;; esac
+    printf 'ranked_%s_k10\t%s\n' "$band" \
+      "$(warmq "SELECT id FROM docs WHERE d @@@ '$T'::wquery
+                  ORDER BY d <=> '$T'::wquery LIMIT 10" | cut -f1)"
+done
+} | column -t
+
+say "build time (s) and index size AS BUILT"
 printf 'engine\tbuild_s\tsize\n%s\n%s\n' "$BUILD_WEAVE" "$BUILD_GIN" | column -t
 
 say "heap"
