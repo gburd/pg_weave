@@ -109,6 +109,16 @@ aws ec2 create-key-pair --profile "$PROFILE" --key-name "$KEY" --key-type ed2551
     --query KeyMaterial --output text >"$KEYFILE" || die "create-key-pair"
 chmod 600 "$KEYFILE"
 
+# Dead-man's switch, in seconds.  The EXIT trap below is the primary cleanup, but
+# it only fires when THIS shell exits normally: a `kill -9`, a timeout that takes
+# out the process group, or a lost SSH session leaves instances running with no
+# trap to release them.  That happened -- three r6id.4xlarge hosts were orphaned
+# when a wrapper timeout killed the orchestrator -- so every instance now also
+# arms `shutdown -h` on itself at boot.  Combined with
+# instance-initiated-shutdown-behavior=terminate, an instance cannot outlive this
+# budget no matter what happens to the coordinator.
+DEADMAN_MIN=${DEADMAN_MIN:-240}
+
 MYIP=$(curl -s --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')
 [ -n "$MYIP" ] || die "cannot determine this host's public IP"
 VPC=$(aws ec2 describe-vpcs --profile "$PROFILE" --filters Name=isDefault,Values=true \
@@ -151,6 +161,7 @@ for e in "${ENGINES[@]}"; do
         --security-group-ids "$SGID" --count 1 \
         --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=120,VolumeType=gp3,DeleteOnTermination=true}' \
         --instance-initiated-shutdown-behavior terminate \
+        --user-data "$(printf '#!/bin/bash\nshutdown -h +%d\n' "$DEADMAN_MIN")" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$RUN-$e},{Key=Project,Value=pg_weave},{Key=Run,Value=$RUN},{Key=Engine,Value=$e}]" \
         --query 'Instances[0].InstanceId' --output text) \
         || die "run-instances for $e"

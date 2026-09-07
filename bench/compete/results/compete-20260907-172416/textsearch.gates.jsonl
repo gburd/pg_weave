@@ -1,0 +1,1 @@
+{"kind": "gates", "engine": "textsearch", "results": [{"gate": "topk_all_contain_term", "type": "topk_parity", "violations": 0, "passed": true}]}
