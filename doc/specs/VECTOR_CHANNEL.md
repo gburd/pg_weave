@@ -5,7 +5,8 @@ unimplemented.** Tasks **V1**–**V14** in `doc/PHASES.md`.
 
 Headers: `include/weave/quantize.h` (backend-independent codec),
 `include/weave/vector.h` (type, pages, shuttle), `include/weave/graph.h`
-(Vamana). Implementation: `src/vector/`.
+(IVF coarse quantizer; see §8a for why not a graph). Implementation:
+`src/vector/`.
 
 Read `include/weave/channel.h` first. The bound contract (C2) is the thing this
 channel exists to satisfy, and §6 below is the part of this document that
@@ -202,7 +203,7 @@ prunes 0.0 %, identically to the useless bounds. R is small only when block
 members are spatially near each other. An implementation that writes codes in
 heap order passes every correctness test, satisfies (C2), returns right answers —
 and silently degrades the fused scorer to a full scan. Hence task **V13**: assign
-warp positions in the order the Vamana build's k-means partition produces. The
+warp positions in the order the IVF build's k-means clustering produces. The
 partition is computed anyway for the out-of-core pass; it just has to be used.
 
 ## 7. Storage
@@ -214,7 +215,7 @@ Page kinds, from the allocation table in `doc/specs/SEGMENT_FORMAT.md` (bits
 |---|---|---|
 | 10 | `WEAVE_VMETA` | `WeaveVecMeta`: dim, bits, metric, pack layout, block directory root, calibration pointer, calibration sample size and date |
 | 11 | `WEAVE_VCODES` | 32-lane code blocks, each preceded by `WeaveVecBlockHdr` |
-| 12 | `WEAVE_VGRAPH` | Vamana CSR adjacency (`include/weave/graph.h`) |
+| 12 | `WEAVE_VGRAPH` | IVF centroids + cluster directory; optionally a centroid graph (`include/weave/graph.h`, §8a) |
 | 13 | `WEAVE_VRERANK` | optional full-precision sidecar for `recall=exact` |
 
 Two pack layouts, recorded in `WeaveVecMeta` because a reader that guesses wrong
@@ -256,6 +257,60 @@ scoring kernel that is one ULP off changes a score slightly, but a rotation
 kernel that is one ULP off changes a *code*, and therefore what the index
 contains. Bit-identical or rejected.
 
+## 8a. Coarse quantization (IVF), not a proximity graph
+
+**A corrected plan.** Earlier drafts of this document, `include/weave/graph.h`, and
+task V9 all specified a **Vamana graph over the quantized codes** as the route past
+the flat scan's measured 490x loss to pgvector HNSW. That is withdrawn, on the
+strength of the source project's own matched-recall data rather than on reasoning.
+
+pg_turbovec added exactly that structure in v1.23.0 for exactly that reason, and
+**deprecated it in v2.5.0**. GIST-10M, 960-d, at **R@10 >= 0.98**:
+
+| kind | p50 | qps@8 | reaches R@10 0.98? |
+|---|---:|---:|---|
+| **IVF** | **28.4 ms** | **161** | yes |
+| flat | 34.2 ms | 31 | yes |
+| graph | — | — | **no — ceiling 0.873 at 181 ms** |
+
+The graph did not merely lose; it **never reached the recall target at any
+latency**. Its apparent sublinearity held only at *iso-beam*: p50 improved 1.11x
+for a 10x larger corpus while recall fell 0.605 to 0.472. At iso-recall the curves
+diverge rather than cross. It was additionally 57-90x slower to build, larger on
+disk, and had no out-of-core path. Their conclusion: *"It is IVF, not the graph,
+that beats flat's O(n) wall."*
+
+So the sublinear path here is an **IVF coarse quantizer**: k-means over a sample,
+a per-cluster centroid, probe the `nprobe` nearest clusters, scan only their code
+blocks. It composes better with what already exists in this channel than a graph
+does:
+
+- The 32-lane code blocks already carry `(centroid, radius)` bounds (§6). IVF makes
+  those blocks **cluster-aligned**, which is the *same* requirement as task V13's
+  warp ordering — one mechanism satisfies both, where a graph needed V13 as a
+  separate, easily-forgotten constraint.
+- A filter bitmap prunes whole clusters before any distance is computed, which is
+  strictly cheaper than steering a traversal (§9).
+- Out-of-core build is a sample k-means plus one assignment pass, rather than a
+  partitioned graph construction.
+
+**What is retained, and the distinction that matters.** Deprecating the graph
+*kind* is not deprecating graph *techniques*. pg_turbovec kept its `coarse_graph`,
+which navigates **centroids** rather than vectors, and notes that IVF's win partly
+rests on it. A graph over a few thousand centroids is a different structure with a
+different cost profile from a graph over a million vectors.
+`include/weave/graph.h` is retained for that, and its header records the change so
+nobody implements the withdrawn version from a stale comment.
+
+**A second warning from the same release, folded into V9's gate.** pg_turbovec's
+partitioned graph build coupled shard count to thread count, and shards cost
+recall: GIST-1M R@10 fell **0.920 at P=4 to 0.605 at P=83**. A "60x parallel build
+speedup" survived review because the parity test used 2.5k rows per shard at dim 64
+where real workloads have ~12k at 960-d. Any partitioned build here must therefore
+carry a **recall floor** in its gate, not merely a build-time number, and its
+fixture must use realistic shard sizes. Ours does not exist yet, which is the
+cheapest possible moment to learn that.
+
 ## 9. Filtering makes queries faster
 
 Two mechanisms, both from `include/weave/channel.h`:
@@ -291,9 +346,9 @@ lanes. That is task V11 and its gate is a torn-write injection TAP test.
 
 1. **Recall × latency × storage: pick two.** pg_turbovec measured recall 1.000 at
    2552 ms; pgvector HNSW measured 0.96 at 5.2 ms on the same 1M × 1024-d corpus.
-   The graph (§V9) should land ≈0.99 at HNSW-like latency with the 10× storage
-   win — dominating that frontier, not abolishing it. `weave.vec_recall = exact`
-   always costs a scan.
+   IVF (§8a) is the route to a sublinear point on that frontier — **28.4 ms at
+   R@10 ≥ 0.98 on GIST-10M/960-d**, where a graph could not reach 0.98 at any
+   latency. `weave.vec_recall = exact` always costs a scan.
 2. **TQ+ calibration is a manual, one-shot fit with no drift detection.** If the
    corpus distribution moves away from the sample, recall degrades silently.
    Mitigation is weak: `WeaveVecMeta` records the sample size and fit timestamp so
