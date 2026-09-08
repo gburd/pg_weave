@@ -1,0 +1,1 @@
+{"kind": "gates", "engine": "gin", "results": [{"gate": "rare_setequal_vs_seqscan", "type": "set_equality", "missing": 0, "extra": 0, "passed": true}, {"gate": "common_setequal_vs_seqscan", "type": "set_equality", "missing": 0, "extra": 0, "passed": true}, {"gate": "and_setequal_vs_seqscan", "type": "set_equality", "missing": 0, "extra": 0, "passed": true}]}
