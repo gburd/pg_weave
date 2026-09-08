@@ -217,7 +217,13 @@ run_engine() {
         fi
 
         "${sh[@]}" "bash ~/compete/engines/$e.sh provision" 2>&1
-        "${sh[@]}" "bash ~/compete/engines/$e.sh load $CORPUS" 2>&1
+        # WIKI_SHA256 is the cross-host corpus assertion for a DOWNLOADED corpus.
+        # A generated corpus is deterministic from its seed; a fetched one is not --
+        # HuggingFace can re-shard, and "first N in parquet scan order" can then
+        # select different articles.  The first host to build records the checksum;
+        # every other host asserts against it and aborts BEFORE building an index.
+        # Without this passthrough the assertion silently never runs.
+        "${sh[@]}" "WIKI_SHA256='${WIKI_SHA256:-}' bash ~/compete/engines/$e.sh load $CORPUS" 2>&1
         "${sh[@]}" "bash ~/compete/engines/$e.sh index" 2>&1
 
         # Correctness gates BEFORE timing.  A failing gate is recorded and the

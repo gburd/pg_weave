@@ -157,10 +157,17 @@ SQL
 -- query that trivially returned 0 rows.
 DROP TABLE IF EXISTS bands;
 CREATE TABLE bands (band text PRIMARY KEY, term text NOT NULL, df bigint NOT NULL);
+-- Corpus-agnostic band selection.  This filtered on `w LIKE 'word%'`, which is the
+-- synthetic corpus's token shape and yields nothing on a real one -- so a wiki run
+-- would either pick arbitrary bands or trip the strictly-increasing-df assertion
+-- below.  Filter on token SHAPE instead: alphanumeric, 4..30 characters, which
+-- excludes punctuation fragments, single letters and the pathological long tokens
+-- that appear in scraped text, and works unchanged on both corpora.
 CREATE TEMP TABLE freq AS
   SELECT w AS term, count(*) AS df
-    FROM docs, unnest(string_to_array(content,' ')) w
-   WHERE w LIKE 'word%' GROUP BY w;
+    FROM docs, unnest(string_to_array(lower(content),' ')) w
+   WHERE w ~ '^[a-z0-9]{4,30}$'
+   GROUP BY w;
 -- Targets are FRACTIONS of the corpus, not absolute counts.  With absolute
 -- targets, a 200k-row corpus whose most frequent term has df 39,360 assigned
 -- both "mid" (nearest 25,000) and "common" (the maximum) to the SAME term -- so
