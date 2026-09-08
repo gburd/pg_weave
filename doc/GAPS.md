@@ -38,7 +38,7 @@ From `bench/RESULTS_LEXICAL.md`, 1M documents, r6id.4xlarge, PostgreSQL 17.
 | ~~**G2**~~ | ~~index size~~ | **CLOSED by L8/L10.** The loss was a measurement artifact: 70.7% of the file was freed pages. Live content is **46 MB vs GIN's 81 MB — 1.76× smaller.** | done, and a win |
 | **G3** | ranked latency on rare terms (df 25) | 0.05 ms vs 0.03 ms — **1.7×** | ≤ GIN |
 | **G4** | ranked latency on mid terms (df 2.5k) | 3.54 ms vs 2.06 ms — **1.7×** | ≤ GIN |
-| **G5** | build time | **NARROWED by L12: 495.9 s → 328.0 s (1.51×).** Now **6.96×** behind pg_textsearch (47.1 s) and **1.37×** behind GIN (239.2 s), from 11.0× and 2.10×. Index size unchanged at 625 MB. **No further route identified** — L4 and L11 are withdrawn on upstream evidence. `bench/RESULTS_L12.md` | ≤ GIN |
+| **G5** | build time | **NARROWED by L12: 495.9 s → 328.0 s (1.51×).** Now **6.96×** behind pg_textsearch (47.1 s) and **1.37×** behind GIN (239.2 s), from 11.0× and 2.10×. Index size unchanged at 625 MB. **A route DOES exist — the earlier "no route" claim was made without a profile and is withdrawn.** `bench/RESULTS_BUILD_PROFILE.md`: **37.5% of build time is dynahash lookups**, because the build's term key is a fixed 64-byte blob hashed and memcmp'd in full on every one of ~240M term occurrences. Task **L15**. `bench/RESULTS_L12.md` | ≤ GIN |
 | ~~**G6**~~ | ~~index size is non-deterministic~~ | **CLOSED by L8.** as-built 46 MB, compacted 46 MB, swing **0.0%**; `weave_merge`/`weave_vacuum` both return false on a fresh build. | done |
 
 Where pg_weave already wins, and by how much, so the wins are not lost in the
@@ -208,10 +208,12 @@ wins on features outright. It loses by 1.7× on rare and mid ranked latency and 
 **Standing losses after L12 and L14: G13 (ranked at k=10, 2.35–6.49×) and G5
 (build, 6.96× — narrowed from 11.0× and with no further route identified).**
 
-G13's remaining route is L2 (impact-ordered postings). G5 has none, so unless one
-appears the honest position is that pg_weave builds more slowly and that is the price
-of an index 1.4–1.8× smaller that needs no follow-up maintenance — and the README
-should say so rather than implying a fix is pending. G1, G2, G6 and G12 are closed,
+G13's remaining route is L2 (impact-ordered postings). **G5's is L15**: a profile
+(taken only after "no route identified" had already been written down, which was the
+error) attributes **37.5% of build time to dynahash lookups** on a fixed 64-byte term
+key. Eliminating all of it would take the build from 328 s to about 205 s — 4.4×
+behind pg_textsearch rather than 6.96×. That narrows G5 substantially without closing
+it, and the other 62.5% remains unattributed. G1, G2, G6 and G12 are closed,
 and G2 and G12 both turned out to be wins. G1, G2, and G6 are closed, and G2 turned out to
 be a win — pg_weave's index is 1.76× *smaller* than GIN's, not 1.9× larger.
 
