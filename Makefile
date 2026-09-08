@@ -30,14 +30,71 @@ OBJS = \
 	src/query/match.o \
 	src/vector/quantize.o \
 	src/vector/pack.o \
-	src/vector/wvec.o
+	src/vector/wvec.o \
+	$(FUZZY_OBJS) \
+	$(TRE_OBJS)
+
+# --- Fuzzy/regex/prefix channel (imported from pg_tre; see
+# doc/specs/IMPORT_pg_tre.md).  Ordinary translation units, unlike the
+# src/am/am.c unity build.  Wired into the build by task Z1/Z2; the channel
+# is not yet reachable from the access method or the planner (Z3 onward), so
+# these compile and link but nothing calls them yet.
+FUZZY_OBJS = \
+	src/query/fuzzy_guc.o \
+	src/query/hash.o \
+	src/query/surf.o \
+	src/query/uleven.o \
+	src/query/regex_ast.o \
+	src/query/regex_grammar.o \
+	src/query/regex_tokens.o \
+	src/query/parser.o \
+	src/query/extract.o \
+	src/query/tiling.o \
+	src/query/like_translate.o \
+	src/query/pattern_cache.o \
+	src/query/trgm_similarity.o \
+	src/query/re_match.o \
+	src/util/utf8.o
+
+# --- Vendored TRE (laurikari/tre d0e0c99, BSD-2; see doc/LICENSING.md).
+# Compiled in-tree as plain translation units rather than driven through
+# TRE's autotools: no submodule, no ./configure step in the extension build,
+# and the two feature headers TRE's configure would have generated are
+# checked in (vendor/tre/config.h, vendor/tre/local_includes/tre-config.h).
+# The source list mirrors libtre_la_SOURCES from vendor/tre/lib/Makefile.am
+# with TRE_APPROX on; xmalloc.c is upstream's malloc-debugging shim and is
+# not built (MALLOC_DEBUGGING is off, so xmalloc.h degrades to malloc()).
+TRE_OBJS = \
+	vendor/tre/lib/tre-ast.o \
+	vendor/tre/lib/tre-compile.o \
+	vendor/tre/lib/tre-match-approx.o \
+	vendor/tre/lib/tre-match-backtrack.o \
+	vendor/tre/lib/tre-match-parallel.o \
+	vendor/tre/lib/tre-mem.o \
+	vendor/tre/lib/tre-parse.o \
+	vendor/tre/lib/tre-stack.o \
+	vendor/tre/lib/regcomp.o \
+	vendor/tre/lib/regerror.o \
+	vendor/tre/lib/regexec.o
 
 # Headers moved under include/weave/ (see RELAYOUT); every .c file uses
 # quoted "weave/foo.h" includes, so the include root needs to be on -I.
 PG_CPPFLAGS = -I$(srcdir)/include
 
+# TRE's headers are deliberately NOT on the global include path: its
+# local_includes/ would put a bare "tre.h" next to PostgreSQL's headers, and
+# vendor/tre/config.h would shadow any other <config.h>.  Only the two kinds
+# of translation unit that need them get them -- the vendored TRE sources
+# themselves, and src/query/re_match.c, which reaches into tre-internal.h for
+# tre_tnfa_t.num_states and (deliberately) does not include postgres.h.
+TRE_CPPFLAGS = \
+	-DHAVE_CONFIG_H \
+	-I$(srcdir)/vendor/tre \
+	-I$(srcdir)/vendor/tre/lib \
+	-I$(srcdir)/vendor/tre/local_includes
+
 EXTENSION = pg_weave
-DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql
+DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql sql/pg_weave--0.4.0--0.5.0.sql
 PGFILEDESC = "pg_weave - unified lexical + vector + fuzzy retrieval in one index"
 
 # sql/ and expected/ are already at the top level (PGXS's built-in default
@@ -87,6 +144,29 @@ check: specs
 # those warnings for it only (public symbols are namespaced via
 # include/weave/sparsemap.h / sparsemap_impl.h).
 src/util/sparsemap.o: CFLAGS += -Wno-declaration-after-statement -Wno-implicit-fallthrough
+
+# --- Vendored TRE and its glue: include paths and upstream-warning relief ---
+# TRE is 2001-2009 C: mixed declarations, K&R-era prototypes, and its own
+# fallthrough convention.  Patching it to satisfy PostgreSQL's warning set
+# would make every future re-pin a merge conflict, so the warnings are
+# suppressed for the vendored files only.
+# The include flags go in CPPFLAGS because that is the one variable both the
+# .o rule and the LLVM-bitcode .bc rule use (the .bc rule uses
+# BITCODE_CFLAGS, not CFLAGS -- a with_llvm=yes build fails to find
+# <config.h> if the -I lands only in CFLAGS).
+TRE_TUS = $(TRE_OBJS) src/query/re_match.o
+$(TRE_TUS) $(TRE_TUS:.o=.bc): CPPFLAGS += $(TRE_CPPFLAGS)
+
+TRE_WARN_OFF = -Wno-declaration-after-statement -Wno-implicit-fallthrough \
+	-Wno-unused-parameter -Wno-missing-prototypes -Wno-sign-compare
+$(TRE_OBJS): CFLAGS += $(TRE_WARN_OFF)
+$(TRE_OBJS:.o=.bc): BITCODE_CFLAGS += $(TRE_WARN_OFF)
+
+# regex_grammar.c is Lime-generated (source: src/query/regex_grammar.y); do
+# not hand-edit it, and do not hold generated code to the project's warning
+# standard.  Regeneration needs Lime, which pg_weave does not vendor -- see
+# doc/LICENSING.md "Lime".
+src/query/regex_grammar.o: CFLAGS += -Wno-unused-parameter -Wno-missing-prototypes
 
 # --- Source distribution (PGXN release artifact) ---------------------------
 # `make dist` produces pg_weave-$(DISTVERSION).zip in PGXN layout (all files

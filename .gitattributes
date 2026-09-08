@@ -1,2 +1,14 @@
 *.out text eol=lf
 expected/* text eol=lf
+
+# src/query/regex_grammar.c/.h are Lime-generated LALR(1) parser output; the
+# source of truth is src/query/regex_grammar.y.  Do not hand-edit them, and
+# keep them out of language statistics and diff noise.  Regenerating needs the
+# Lime generator, which pg_weave deliberately does not vendor -- see
+# doc/LICENSING.md "Lime (probably not needed)".
+src/query/regex_grammar.c linguist-generated=true
+src/query/regex_grammar.h linguist-generated=true
+
+# vendor/tre is laurikari/tre @ d0e0c99 (BSD-2) plus
+# vendor/tre/patches/tre-progress-hook.patch.  See doc/LICENSING.md.
+vendor/** linguist-vendored=true

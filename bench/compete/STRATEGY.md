@@ -101,31 +101,66 @@ So the harness:
    identically, and the harness records `md5(string_agg(content))` per host and
    asserts equality across hosts in the analyzer.
 
-Corpora:
+Corpora, and honestly which of them exist:
 
-| id | source | rows | for |
-|---|---|---|---|
-| `wiki-2m` | wikimedia/wikipedia 20231101.en, first 2,188,038 | 2.19 M | lexical; comparable to all prior pg_fts runs |
-| `msmarco-1m` | MS MARCO passage v1 + qrels | 1 M | **relevance (nDCG@10)** — never once measured by any predecessor |
-| `beir-subset` | BEIR: nfcorpus, scifact, fiqa | ~50 k each | relevance generalisation |
-| `cohere-1m` | Cohere wiki-en embeddings, 1024-d | 1 M | vector; the corpus pg_turbovec's 490× loss was measured on |
-| `gist-1m` | ann-benchmarks GIST-1M HDF5 + neighbors | 1 M | vector with published ground truth |
-| `glove-100` | ann-benchmarks GloVe-100 | 1.18 M | vector worst case for the Beta codebook assumption |
-| `logs-10m` | synthetic log lines, planted patterns | 10 M | fuzzy/regex at scale, and the temp-disk wall |
+| id | source | rows | for | status |
+|---|---|---|---|---|
+| `synth-2m` | generated, Zipfian, seed 20260907 | 2 M | selectivity, boolean, count pushdown | **built** |
+| `synth-2m-long` | same generator, ~120 words/doc | 2 M | tf dynamic range, per-posting decode work | **built** |
+| `wiki-200k` | wikimedia/wikipedia 20231101.en, first 200 k | 200 k | fast validation of the harness on real prose | **built** |
+| `wiki-2m` | wikimedia/wikipedia 20231101.en, first 2,188,038 | 2.19 M | lexical; comparable to all prior pg_fts runs | **built**, not yet run |
+| `msmarco-1m` | MS MARCO passage v1 + qrels | 1 M | **relevance (nDCG@10)** — never once measured by any predecessor | owed |
+| `beir-subset` | BEIR: nfcorpus, scifact, fiqa | ~50 k each | relevance generalisation | owed |
+| `cohere-1m` | Cohere wiki-en embeddings, 1024-d | 1 M | vector; the corpus pg_turbovec's 490× loss was measured on | owed |
+| `gist-1m` | ann-benchmarks GIST-1M HDF5 + neighbors | 1 M | vector with published ground truth | owed |
+| `glove-100` | ann-benchmarks GloVe-100 | 1.18 M | vector worst case for the Beta codebook assumption | owed |
+| `logs-10m` | synthetic log lines, planted patterns | 10 M | fuzzy/regex at scale, and the temp-disk wall | owed |
+
+**A downloaded corpus cannot self-certify, and `wiki-*` is downloaded.** The
+checksum rule above assumes a seed makes the bytes reproducible. For Wikipedia it
+does not: HuggingFace can re-shard a config, and "the first N articles" is defined
+by a parquet scan order that is not contractually stable. `wiki-*` therefore sorts
+by numeric article id before writing — so the same *set* of articles always
+produces the same bytes — and the **first** host to build records the sha256 while
+every later host is passed it in `WIKI_SHA256` and **aborts** on mismatch. The
+residual risk is set *membership*, not order: if upstream re-shards, a corpus built
+later selects different articles and the assertion fails loudly instead of
+comparing quietly. Consequently a published `wiki-*` number must quote its corpus
+sha256, and a re-run that cannot reproduce that sha256 is measuring a different
+corpus and must say so. Achieved for the first 200 k articles, verified twice on
+independent builds: `avg_words_per_doc=695.2`,
+`sha256=4e88ec351ea440eae7c257b96534c56d2e0b9ed95002521b3432322a0ac838a7`.
+
+Invalid UTF-8 is handled during conversion, not afterwards. pg_fts fixed it with
+`iconv -c` post hoc and `bench/NOTE_CORPUS_20M.md` records that this silently
+changed the data; `wiki-*` decodes with `errors="ignore"` (same effect) and
+**counts and reports** the affected rows, along with rows dropped for being empty
+after cleaning or for a duplicate article id. On `wiki-200k` all four counters are
+zero.
 
 **Document length is a corpus dimension, not a detail.** `synth-2m` averages 11.6
 words per document and measured a genuine 1.56× codec optimization at 1.06×,
 because at that length almost every term frequency is 1, the tf column packs at one
 bit, and the per-bit loop the optimization removed had one iteration. Wikipedia's
-avgdl is 485. A short-document corpus systematically understates **every**
-per-posting decode optimization, which is the entire class of work aimed at the
-largest competitive gap — see `bench/RESULTS_PORT_1_5_10.md`. Use `synth-2m-long`
-(~120 words) or `wiki-2m` for that class, and never `synth-2m`.
+avgdl is 485 (695 whitespace tokens per document as this harness counts them,
+before stopword removal and stemming). A short-document corpus systematically
+understates **every** per-posting decode optimization, which is the entire class of
+work aimed at the largest competitive gap — see `bench/RESULTS_PORT_1_5_10.md`. Use
+`synth-2m-long` (~120 words) or `wiki-2m` for that class, and never `synth-2m`.
+
+Which corpus per axis: lexical latency and any per-posting decode work →
+`wiki-2m`; selectivity, boolean and `count(*)` pushdown → `synth-2m`; harness
+smoke tests → `wiki-200k` or `synth-200k`; relevance → `msmarco-1m` +
+`beir-subset`; vector → `cohere-1m` / `gist-1m` / `glove-100`; fuzzy and regex at
+scale → `logs-10m`.
 
 Query terms are **selected from the built corpus by measured document frequency**,
 never hardcoded. pg_weave's own earlier harness silently benchmarked an empty term
 because a `percent_rank` window selected nothing; and pg_tre's realistic generator
 exists only because the first corpus produced "pathologically non-selective rows".
+The band selector in `engines/common.sh` is still **synth-only** — it filters
+candidate terms with `LIKE 'word%'` — so it must be made corpus-aware before a
+`wiki-*` run can be measured. That is the one remaining blocker on `wiki-2m`.
 
 ## 3. Correctness gates — before any timing
 
