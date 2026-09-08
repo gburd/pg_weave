@@ -4524,6 +4524,74 @@ weave_index_is_compacted(Relation index)
 	return freebelow <= threshold;
 }
 
+
+/*
+ * Can a single LOW-BIAS pass front-pack the index, without the vacate phase?
+ *
+ * weave_vacuum_compact's two-phase relocation exists for the hard case its header
+ * describes: the live segment sits HIGH with the freed pages as a LOW free region
+ * SMALLER than the live segment, so a plain low-bias rewrite fills the low free
+ * space and then EXTENDS, straddling the file with a live tail that cannot be
+ * truncated.  Phase 1 (vacate, extend-only) exists purely to make that low free
+ * region big enough.
+ *
+ * At END OF BUILD it is already big enough, by a wide margin.  The merge writes its
+ * output before freeing its inputs (write-before-free, required for crash safety),
+ * so a freshly built index is roughly 70% freed pages below 30% live -- measured at
+ * 110 MB freed against 46 MB live on a 1M-document build.  Paying for the vacate
+ * there streams the whole segment through the buffer pool an extra time for nothing,
+ * and it is why build time went 12.6 s -> 29.2 s with L8 and stands at 495.9 s on a
+ * realistic corpus: an 11.0x deficit against Timescale pg_textsearch and the
+ * project's largest remaining gap (doc/GAPS.md G5, task L12).
+ *
+ * So count the mostly-free blocks strictly below the highest live block.  If that
+ * count is at least the number of live blocks, a low-bias rewrite provably fits
+ * entirely at the front and phase 1 is unnecessary.
+ *
+ * Conservative on purpose: it must never claim one pass suffices when it does not,
+ * because the index would then be left un-truncatable and the caller's convergence
+ * loop would waste a full pass discovering that.  Both counts use the free space
+ * map's own BLCKSZ/2 test -- the same criterion weave_index_is_compacted uses -- so
+ * the two agree about what "free" means.  The comparison needs no slack: equal is
+ * enough, because the pack phase frees each source page as it copies it.
+ */
+static bool
+weave_low_free_fits_live(Relation index)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	BlockNumber lastlive = 0;
+	BlockNumber freebelow = 0;
+	BlockNumber livebelow = 0;
+	BlockNumber blk;
+
+	if (nblocks <= 2)
+		return false;			/* nothing to relocate */
+
+	for (blk = nblocks; blk > 1; blk--)
+	{
+		CHECK_FOR_INTERRUPTS();		/* scan-only, no lock held */
+		if (GetRecordedFreeSpace(index, blk - 1) < BLCKSZ / 2)
+		{
+			lastlive = blk - 1;
+			break;
+		}
+	}
+	if (lastlive <= 1)
+		return false;			/* empty: the caller's compacted check handles it */
+
+	for (blk = 1; blk < lastlive; blk++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2)
+			freebelow++;
+		else
+			livebelow++;
+	}
+	livebelow++;				/* the highest live block relocates too */
+
+	return freebelow >= livebelow;
+}
+
 static bool
 weave_vacuum_compact(Relation index)
 {
@@ -4594,11 +4662,21 @@ weave_vacuum_compact(Relation index)
 			break;
 		}
 
-		/* Phase 1: vacate -- push the live segment onto fresh high blocks so the
-		 * freed old pages form one contiguous low free region >= live size. */
-		if (weave_compact_to_one(index, true))
-			didwork = true;
-		IndexFreeSpaceMapVacuum(index);
+		/*
+		 * Phase 1: vacate -- push the live segment onto fresh high blocks so the
+		 * freed old pages form one contiguous low free region >= live size.
+		 *
+		 * SKIPPED when the low free region already exceeds the live size, which is
+		 * exactly the end-of-build shape (~70% freed below ~30% live).  The vacate
+		 * is a full extra rewrite of the whole segment; skipping it halves the
+		 * compaction I/O of a fresh build.  Task L12 / gap G5.
+		 */
+		if (!weave_low_free_fits_live(index))
+		{
+			if (weave_compact_to_one(index, true))
+				didwork = true;
+			IndexFreeSpaceMapVacuum(index);
+		}
 
 		/* Phase 2: pack -- relocate the segment to the front (its free list now
 		 * spans that whole low region), freeing the phase-1 high copy. */
