@@ -33,6 +33,18 @@ typedef struct MatchVal
 	bool		present;
 	uint32	   *pos;			/* NULL if positions unavailable/irrelevant */
 	int			npos;
+	/*
+	 * Why `pos` is NULL, which decides what a phrase over this operand means.
+	 * True only for a PREFIX leaf, whose positions are deliberately not tracked
+	 * ("phrase-with-prefix is not tracked positionally") -- a shipped, lossy
+	 * behaviour we keep.  False everywhere else, including a positionless
+	 * document AND a boolean sub-expression (the AND/OR/NOT arms null `pos`),
+	 * both of which make adjacency unknowable and so must yield FALSE rather
+	 * than degrade to a conjunction.  Checking the document's flag alone is NOT
+	 * sufficient: `quick <-> (brown & fox)` reaches phrase_step with positions
+	 * nulled on a fully positioned doc.
+	 */
+	bool		pos_lossy_prefix;
 }			MatchVal;
 
 /*
@@ -51,6 +63,7 @@ term_positions(WeaveDoc doc, const char *term, int termlen, uint16 flags,
 	v.present = false;
 	v.pos = NULL;
 	v.npos = 0;
+	v.pos_lossy_prefix = false;
 
 	if (flags & WEAVE_QF_REGEX)
 	{
@@ -64,8 +77,11 @@ term_positions(WeaveDoc doc, const char *term, int termlen, uint16 flags,
 	}
 	if (flags & WEAVE_QF_PREFIX)
 	{
-		/* presence only; phrase-with-prefix is not tracked positionally */
+		/* presence only; phrase-with-prefix is not tracked positionally.  Mark
+		 * the absence as the deliberate prefix lossiness so a phrase over this
+		 * operand stays permissive instead of becoming unverifiable-false. */
 		v.present = weave_doc_has_prefix(doc, term, termlen);
+		v.pos_lossy_prefix = true;
 		return v;
 	}
 	else
@@ -93,7 +109,19 @@ term_positions(WeaveDoc doc, const char *term, int termlen, uint16 flags,
 		{
 			if (!WEAVE_DOC_HAS_POS(doc))
 			{
-				v.present = (wmask & 1u) != 0;	/* unlabeled == label D */
+				/*
+				 * Zone labels are carried in each position's high bits
+				 * (WEAVE_POS_LABEL), so a document without positions carries no
+				 * label information at all -- it is unknown, not "D".  Treating
+				 * unlabeled as D meant `term:D` matched EVERY positionless doc
+				 * while `term:A` matched none, and a concatenation that dropped
+				 * one side's labels (to_wdoc('simple','quick','A') ||
+				 * $$'zz':1$$::wdoc) silently answered `term:D` = true.  A
+				 * zone restriction we cannot evaluate must not match, for the
+				 * same reason an unverifiable phrase must not (see
+				 * phrase_step).
+				 */
+				v.present = false;
 			}
 			else
 			{
@@ -120,6 +148,7 @@ term_positions(WeaveDoc doc, const char *term, int termlen, uint16 flags,
 				{
 					v.pos = NULL;
 					v.npos = 0;
+					v.pos_lossy_prefix = false;
 				}
 			}
 		}
@@ -171,13 +200,46 @@ phrase_step(MatchVal left, MatchVal right, uint32 distance)
 	r.present = false;
 	r.pos = NULL;
 	r.npos = 0;
+	r.pos_lossy_prefix = false;
 
-	/* If either side lacks positions, fall back to presence-only AND: we
-	 * cannot verify adjacency, so treat the phrase as a conjunction (recall
-	 * preserved, precision degraded -- documented). */
+	/*
+	 * Either side may lack positions, and the right answer depends on WHY.
+	 *
+	 * (a) The DOCUMENT carries no positions at all.  Adjacency is unknowable,
+	 * so the phrase is FALSE.  This matches PostgreSQL: without
+	 * TS_EXEC_PHRASE_NO_POS, "OP_PHRASE always returns false if lexeme
+	 * position information is not available" (tsearch/ts_utils.h), and
+	 * `strip(to_tsvector('simple','quick brown')) @@ 'quick <-> brown'` is
+	 * false upstream even though the words ARE adjacent.  We claim to mirror
+	 * TS_execute (see this file's header), so we must not diverge here.
+	 *
+	 * This branch is reached by more than a positionless document: the
+	 * boolean arms below null out positions, so a boolean sub-expression
+	 * under a phrase (`quick <-> (brown & fox)`, reachable via the tsquery
+	 * cast) lands here even on a fully positioned doc.  Returning
+	 * presence-only AND there answered `t` where PostgreSQL answers `f`.
+	 *
+	 * (b) The operand is a PREFIX leaf, whose positions are deliberately not
+	 * tracked (see weave_doc_term_val: "phrase-with-prefix is not tracked
+	 * positionally").  That is a shipped, documented lossiness -- `"quick bro*"`
+	 * is over-permissive by design -- so keep presence-only there rather than
+	 * silently narrowing a feature people may rely on.
+	 *
+	 * Only the operand's own `pos_lossy_prefix` distinguishes these.  The
+	 * DOCUMENT's WEAVE_DOC_HAS_POS flag does NOT: the boolean case above arrives
+	 * here with pos == NULL on a fully positioned document.
+	 */
 	if (left.pos == NULL || right.pos == NULL)
 	{
-		r.present = left.present && right.present;
+		bool		lossy = (left.pos == NULL && left.pos_lossy_prefix) ||
+			(right.pos == NULL && right.pos_lossy_prefix);
+		bool		unknowable = (left.pos == NULL && !left.pos_lossy_prefix) ||
+			(right.pos == NULL && !right.pos_lossy_prefix);
+
+		if (unknowable)
+			return r;			/* (a) -> false, as PostgreSQL does */
+		if (lossy)
+			r.present = left.present && right.present;	/* (b) prefix */
 		return r;
 	}
 
@@ -218,6 +280,7 @@ weave_doc_matches(WeaveDoc doc, WeaveQuery query)
 			Assert(top >= 1);
 			stack[top - 1].present = !stack[top - 1].present;
 			stack[top - 1].pos = NULL;
+			stack[top - 1].pos_lossy_prefix = false;
 			stack[top - 1].npos = 0;
 		}
 		else if (it->op == WEAVE_OP_PHRASE)
@@ -232,6 +295,7 @@ weave_doc_matches(WeaveDoc doc, WeaveQuery query)
 			Assert(top >= 2);
 			stack[top - 2].present = stack[top - 2].present && stack[top - 1].present;
 			stack[top - 2].pos = NULL;
+			stack[top - 2].pos_lossy_prefix = false;
 			stack[top - 2].npos = 0;
 			top--;
 		}
@@ -240,6 +304,7 @@ weave_doc_matches(WeaveDoc doc, WeaveQuery query)
 			Assert(top >= 2);
 			stack[top - 2].present = stack[top - 2].present || stack[top - 1].present;
 			stack[top - 2].pos = NULL;
+			stack[top - 2].pos_lossy_prefix = false;
 			stack[top - 2].npos = 0;
 			top--;
 		}

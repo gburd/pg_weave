@@ -276,3 +276,94 @@ RESET pg_weave.wand_initial_k;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 DROP TABLE wg;
+
+-- ============================================================================
+-- Phrase on a POSITIONLESS document must be FALSE, not a silent conjunction.
+--
+-- Ported from pg_fts 2deb38e. This was a live WRONG-ANSWER bug here, and worse
+-- than upstream: pg_weave's `positions` reloption defaults to OFF, so every phrase
+-- query against a default index was answered as a presence-only AND.
+--
+-- PostgreSQL documents the opposite behaviour. tsearch/ts_utils.h: without
+-- TS_EXEC_PHRASE_NO_POS, "OP_PHRASE always returns false if lexeme position
+-- information is not available". Verify against core directly below, so this test
+-- pins OUR behaviour to CORE's rather than to a hand-written expectation.
+--
+-- false, not an error: a predicate that errors on a full scan but not under LIMIT
+-- is order-dependent, and it would turn a few wrong rows into a whole-table
+-- outage. false answers the correct rows.
+-- ============================================================================
+CREATE TABLE ph (id serial, d wdoc);
+-- Adjacent in the text, so a positional index WOULD match the phrase.
+INSERT INTO ph(d) SELECT to_wdoc('simple', 'quick brown fox');
+-- Both words present but NOT adjacent: an AND matches, a phrase must not.
+INSERT INTO ph(d) SELECT to_wdoc('simple', 'quick red slow brown');
+
+-- CORRECTION, and worth recording because the first version of this test asserted
+-- the wrong thing in two places and the run corrected me:
+--
+--  1. to_wdoc() does NOT strip positions. The `positions` reloption controls what
+--     the INDEX stores, not what the datum stores, and a phrase is verified at heap
+--     recheck against the datum. So a positional datum under a positionless index
+--     answers the phrase CORRECTLY -- better than core's stripped tsvector, not
+--     worse. The right core comparison is the UNSTRIPPED tsvector.
+--  2. PostgreSQL treats an unlabelled lexeme as weight D, so `quick:D` matching an
+--     unweighted document is correct, not a bug.
+--
+-- The genuinely positionless case is reachable only by building a wdoc FROM a
+-- stripped tsvector, which is what the second block below does. That is the case
+-- the fix is about.
+
+-- (a) Positional datum, positionless index: phrase is verified at recheck and must
+--     agree with core's UNSTRIPPED answer -- the adjacent row matches, the
+--     non-adjacent one does not.
+SELECT to_tsvector('simple','quick brown fox') @@ to_tsquery('simple','quick <-> brown')
+         AS core_adjacent,
+       to_tsvector('simple','quick red slow brown') @@ to_tsquery('simple','quick <-> brown')
+         AS core_nonadjacent;
+SELECT count(*) AS weave_phrase_positional_datum
+  FROM ph WHERE d @@@ '"quick brown"'::wquery;
+
+-- The AND is true for both rows, so the phrase result above is a real distinction.
+SELECT count(*) AS weave_and_rows
+  FROM ph WHERE d @@@ 'quick & brown'::wquery;
+
+-- (b) THE ACTUAL BUG: a genuinely positionless wdoc, built from a stripped
+--     tsvector. Core returns false even for the adjacent text; so must we. Before
+--     the fix this degraded to a presence-only AND and returned true.
+SELECT strip(to_tsvector('simple','quick brown fox')) @@ to_tsquery('simple','quick <-> brown')
+         AS core_stripped_adjacent;
+SELECT to_wdoc(strip(to_tsvector('simple','quick brown fox')))
+         @@@ '"quick brown"'::wquery AS weave_stripped_adjacent;
+SELECT to_wdoc(strip(to_tsvector('simple','quick red slow brown')))
+         @@@ '"quick brown"'::wquery AS weave_stripped_nonadjacent;
+
+-- (c) The fourth route, which no producer-side fix reaches: a boolean
+--     sub-expression under a phrase loses positions from the QUERY SHAPE, on a
+--     FULLY POSITIONED document. Reachable through the shipped tsquery cast.
+SELECT to_tsvector('simple','fox brown zzz quick') @@ to_tsquery('simple','quick <-> (brown & fox)')
+         AS core_bool_under_phrase;
+SELECT to_wdoc('simple','fox brown zzz quick')
+         @@@ (to_tsquery('simple','quick <-> (brown & fox)'))::wquery
+         AS weave_bool_under_phrase;
+
+-- (d) Phrase-with-prefix stays deliberately permissive: prefix expansion is not
+--     tracked positionally, and that is shipped behaviour. The fix distinguishes
+--     this from (b) and (c) with an explicit reason flag rather than a
+--     document-level position check -- which cannot tell "no positions anywhere"
+--     from "this operand lost them".
+SELECT count(*) AS weave_phrase_prefix_permissive
+  FROM ph WHERE d @@@ '"quick bro"*'::wquery;
+
+-- (e) Zone/label filtering, same root cause: labels live in position high bits, so
+--     a genuinely positionless document carries NO label information -- unknown,
+--     not "D". An unlabelled but POSITIONAL document is weight D, matching core.
+SELECT to_tsvector('simple','quick brown') @@ to_tsquery('simple','quick:D')
+         AS core_unlabelled_is_D;
+SELECT count(*) AS weave_zone_d_positional FROM ph WHERE d @@@ 'quick:D'::wquery;
+SELECT to_wdoc(strip(to_tsvector('simple','quick brown')))
+         @@@ 'quick:D'::wquery AS weave_zone_d_stripped;
+SELECT to_wdoc(strip(to_tsvector('simple','quick brown')))
+         @@@ 'quick:A'::wquery AS weave_zone_a_stripped;
+
+DROP TABLE ph;

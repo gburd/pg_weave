@@ -2802,11 +2802,25 @@ SELECT to_wdoc('anything at all') @@@ ''::wquery AS empty_query_no_match;
 SELECT to_wdoc('') @@@ 'anything'::wquery AS empty_doc_no_match;
 -- empty query against an empty doc
 SELECT to_wdoc('') @@@ ''::wquery AS empty_query_empty_doc;
--- phrase/NEAR on a doc built WITHOUT positions (canonical literal, no '@'):
--- phrase_step's "either side lacks positions" branch degrades to plain AND,
--- so a non-adjacent phrase still matches when both terms are merely present.
-SELECT $$'brown':1 'quick':1$$::wdoc @@@ '"quick brown"'::wquery AS phrase_nopos_degrades_to_and;
-SELECT $$'fox':1 'quick':1$$::wdoc @@@ 'NEAR(quick fox, 1)'::wquery AS near_nopos_degrades_to_and;
+-- phrase/NEAR on a doc built WITHOUT positions (canonical literal, no '@') must be
+-- FALSE, not a silent conjunction.
+--
+-- CHANGED 2026-09-08, porting pg_fts 2deb38e.  This asserted `t` and its name said
+-- "degrades_to_and": it was DOCUMENTING A WRONG-ANSWER BUG as correct behaviour,
+-- and pg_weave shipped that bug as the DEFAULT, because the `positions` reloption
+-- defaults to off.
+--
+-- PostgreSQL documents the opposite.  tsearch/ts_utils.h: without
+-- TS_EXEC_PHRASE_NO_POS, "OP_PHRASE always returns false if lexeme position
+-- information is not available".  Verified against core directly in
+-- sql/orderby.sql, which compares each case to the equivalent
+-- to_tsvector/to_tsquery answer instead of a hand-written expectation.
+--
+-- false rather than an error: a predicate that errors on a full scan but not under
+-- LIMIT is order-dependent, and would turn a few wrong rows into a whole-table
+-- outage.  false answers the correct rows.
+SELECT $$'brown':1 'quick':1$$::wdoc @@@ '"quick brown"'::wquery AS phrase_nopos_is_false;
+SELECT $$'fox':1 'quick':1$$::wdoc @@@ 'NEAR(quick fox, 1)'::wquery AS near_nopos_is_false;
 -- the commutator form (wquery @@@ wdoc) agrees with weave_match in both
 -- directions for the same boolean/phrase/NEAR cases above
 SELECT ('alpha & beta'::wquery @@@ to_wdoc('alpha beta'))
