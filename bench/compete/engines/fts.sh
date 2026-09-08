@@ -197,7 +197,7 @@ print(json.dumps({
   # Extension version AND commit sha: pg_fts ships many point releases whose
   # performance differs, and "pg_fts 1.5.x" is not enough to reproduce a number.
   "version_sql": "SELECT 'pg_fts ' || extversion || ' @%s' FROM pg_extension WHERE extname='pg_fts'" % SHA,
-  "fingerprint_sql": "SELECT md5(string_agg(content, E'\\n' ORDER BY id)) FROM docs",
+  "fingerprint_sql": "SELECT md5(string_agg(h, '' ORDER BY id)) FROM (SELECT id, md5(content) AS h FROM docs) t",
   "index_size_sql": "SELECT pg_relation_size('docs_fts')",
   "queries": q}, indent=1))
 PY

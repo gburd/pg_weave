@@ -148,7 +148,7 @@ for K in (4, 8, 16, 32, 64, 100, 200):
 print(json.dumps({
   "engine": "weave",
   "version_sql": "SELECT 'pg_weave ' || extversion FROM pg_extension WHERE extname='pg_weave'",
-  "fingerprint_sql": "SELECT md5(string_agg(content, E'\\n' ORDER BY id)) FROM docs",
+  "fingerprint_sql": "SELECT md5(string_agg(h, '' ORDER BY id)) FROM (SELECT id, md5(content) AS h FROM docs) t",
   "index_size_sql": "SELECT pg_relation_size('docs_weave')",
   "queries": q}, indent=1))
 PY

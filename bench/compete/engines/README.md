@@ -95,7 +95,7 @@ ranked_common_k10 ranked_common_k100  bare_orderby_common  count_or2
 
 Every spec must also carry `fingerprint_sql`, `index_size_sql`, `version_sql`
 and `build_seconds` read from `$OUTDIR/build.txt`. `fingerprint_sql` is
-`SELECT md5(string_agg(content, E'\n' ORDER BY id)) FROM docs` verbatim in every
+`SELECT md5(string_agg(h, '' ORDER BY id)) FROM (SELECT id, md5(content) AS h FROM docs) t` verbatim in every
 engine: the analyzer fails the whole run when two engines disagree, which is the
 mechanical form of the check whose absence forced the retraction of an entire
 5-way comparison.
