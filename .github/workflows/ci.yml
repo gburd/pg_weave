@@ -30,7 +30,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc clang make
+        run: |
+          sudo apt-get update
+          # libclang-rt-dev: Debian/Ubuntu clang does not ship the sanitizer
+          # runtimes, and check-fuzz fails at link time without them.
+          sudo apt-get install -y gcc clang make libclang-rt-dev
 
       - uses: actions/checkout@v4
 
@@ -72,8 +76,8 @@ jobs:
 
       - name: Build + install
         run: |
-          make PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
-          make install PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          make with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          make install with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
 
       - name: Regression + isolation
         # initdb refuses to run as root and the postgres image runs CI as root, so
@@ -142,10 +146,10 @@ jobs:
 
       - name: Build with ASan + UBSan
         run: |
-          make CC=clang \
+          make CC=clang with_llvm=no \
             COPT="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
             PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
-          make install PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          make install with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
 
       - name: Regression under sanitizers
         # halt_on_error is deliberately OFF for UBSan here: a report in PostgreSQL
