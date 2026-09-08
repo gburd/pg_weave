@@ -100,6 +100,9 @@ bv_init(SurfBitvec *bv, uint32 nbits)
 }
 
 static inline void
+bv_set(SurfBitvec *bv, uint32 i) pg_attribute_unused();
+
+static inline void
 bv_set(SurfBitvec *bv, uint32 i)
 {
 	bv->words[i >> 6] |= (UINT64CONST(1) << (i & 63));
@@ -374,7 +377,7 @@ surf_successor(const PgWeaveSurf *s, uint64 lo, uint64 *out)
 
 backtrack:
 	/* Walk up: at each recorded depth, try the next label after st_pos[d]. */
-	for (d = d; d >= 0; d--)
+	for (; d >= 0; d--)   /* d is already positioned by the loop above */
 	{
 		uint32		node = st_node[d];
 		uint32		nhi = surf_node_end(s, node);

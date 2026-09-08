@@ -145,6 +145,14 @@ check: specs
 # include/weave/sparsemap.h / sparsemap_impl.h).
 src/util/sparsemap.o: CFLAGS += -Wno-declaration-after-statement -Wno-implicit-fallthrough
 
+# Imported pg_tre sources and vendored TRE use C99 mixed declarations and their own
+# fallthrough conventions, which PostgreSQL's warning set forbids.  Scope the
+# override to those objects rather than rewriting imported code -- a local rewrite
+# would have to be redone on every upstream port, and ci/port-upstream.sh exists
+# precisely so ports stay mechanical.  Our own code stays warning-clean under the
+# full set.
+$(FUZZY_OBJS) $(TRE_OBJS): CFLAGS += -Wno-declaration-after-statement -Wno-implicit-fallthrough
+
 # --- Vendored TRE and its glue: include paths and upstream-warning relief ---
 # TRE is 2001-2009 C: mixed declarations, K&R-era prototypes, and its own
 # fallthrough convention.  Patching it to satisfy PostgreSQL's warning set
