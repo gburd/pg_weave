@@ -214,7 +214,7 @@ run_engine() {
         # incremental local build passed, because the stale callers still
         # referenced the old name.  The benign outcome is a link error; the
         # dangerous one is a successful link that MEASURES THE WRONG CODE.
-        tar -C "$ROOT" -cf - --exclude=.git --exclude='bench/compete/results' \
+        tar -C "$ROOT" -cf - --exclude=.git --exclude=.forgejo --exclude=.github --exclude='bench/compete/results' \
             --exclude='*.o' --exclude='*.so' --exclude='*.bc' --exclude='results' . \
             | "${sh[@]}" 'rm -rf ~/pg_weave && mkdir -p ~/pg_weave && tar -xf - -C ~/pg_weave'
         # Ship pg_fts from the workstation when it is present.  Cloning it on the

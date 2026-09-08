@@ -19,7 +19,7 @@ trap 'rm -rf "$out"' EXIT
 
 CC="${CC:-clang}"
 SAN="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
-CFLAGS="-std=c99 -g -O1 -Wall -Wextra -I$root $SAN"
+CFLAGS="-std=c99 -g -O1 -Wall -Wextra -I$root -I$root/include $SAN"
 
 export ASAN_OPTIONS="abort_on_error=1:detect_leaks=1"
 export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"

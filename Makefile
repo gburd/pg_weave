@@ -263,3 +263,65 @@ check-unity:
 	done; \
 	if [ "$$fail" -ne 0 ]; then exit 1; fi; \
 	echo "check-unity: amscan.c/lev.c/trgm_page.c are unity-included, not in OBJS"
+
+# --- Standalone tests: no PostgreSQL server, no extension install -------------
+#
+# These gate the algorithmic cores directly.  They exist because a
+# fixed-expected-output regression test structurally cannot catch a codec or bound
+# that is subtly wrong: the answers stay plausible, they are just wrong.  See
+# doc/TESTING.md, and AGENTS.md rule 1.
+#
+# Every target here must build with nothing but a C compiler and -I include.  The
+# inherited cmocka+hegel suite (test_for.c, test_for_props.c, test_docvalid.c,
+# test_lev.c) is deliberately NOT here: it needs two external libraries, so it
+# cannot gate a build, which is why dependency-free equivalents are being written
+# one at a time.
+CHECK_CC ?= cc
+STANDALONE_CFLAGS = -O2 -Wall -Wextra -Wno-unused-parameter -I include
+
+.PHONY: check-standalone
+check-standalone:
+	@set -e; \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	echo "== FOR codec: fast extractor vs the bit-by-bit implementation it replaced =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/for test/hegel/test_for_get.c -lm; \
+	$$tmp/for | tail -1; \
+	echo "== vector quantizer: rotation, codebook, encode, packing, block bound (C2) =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/q test/hegel/test_quantize.c \
+		src/vector/quantize.c src/vector/pack.c -lm; \
+	$$tmp/q | tail -1; \
+	echo "== ALL STANDALONE CHECKS PASSED =="
+
+# Cross-version sparsemap wire compatibility.  Separate because it needs the
+# sparsemap repository to extract the PREVIOUS release's sources -- it verifies that
+# blobs already on disk still read correctly, which is the hazard re-vendoring
+# carries and an ordinary dependency bump does not.  Skips with a loud notice rather
+# than failing when the repo is absent, so CI without it stays green while a
+# developer re-vendoring locally always runs it.
+.PHONY: check-sparsemap-wire
+check-sparsemap-wire:
+	@if [ -d "$${SPARSEMAP_REPO:-$$HOME/ws/sparsemap}/.git" ]; then \
+		bash test/hegel/run_sparsemap_wire.sh | tail -2; \
+	else \
+		echo "SKIP check-sparsemap-wire: no sparsemap repo (set SPARSEMAP_REPO)"; \
+		echo "  This is the gate that proves re-vendoring does not silently"; \
+		echo "  reinterpret blobs already written to disk.  Run it before any"; \
+		echo "  sparsemap version change."; \
+	fi
+
+# Fuzz/corruption harness: the parse-untrusted-bytes paths under ASan+UBSan.
+# On-disk bytes are not trusted, so a corrupt page must produce a clean ERROR and
+# never a crash or a wrong answer.  The harness also builds four PLANTED-BUG
+# variants and requires each to abort, so a toothless harness fails instead of
+# passing vacuously.  Needs clang.
+.PHONY: check-fuzz
+check-fuzz:
+	@if command -v $${CC:-clang} >/dev/null 2>&1 || command -v clang >/dev/null 2>&1; then \
+		bash test/fuzz/run.sh | tail -3; \
+	else \
+		echo "SKIP check-fuzz: clang not found (ASan+UBSan harness needs it)"; \
+	fi
+
+.PHONY: check-all
+check-all: check-ascii check-alloc check-unity check-rename check-standalone check-fuzz
+	@echo "== ALL LINT AND STANDALONE GATES PASSED =="
