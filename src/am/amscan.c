@@ -110,12 +110,30 @@ typedef struct WeaveScanOpaqueData
 {
 	WeaveQuery	query;			/* copied into the scan's context */
 	bool		queryValid;
-	/* ordering-scan (amgettuple) state, materialized on first call */
-	bool		orderInit;		/* have we computed the ordered results? */
-	ScoredTid  *ordered;		/* top-k by ascending distance */
-	int			nordered;
+	/* ordering-scan (amgettuple) state, materialized on first call.
+	 *
+	 * Two arrays, and the split between them is what makes a widening
+	 * incremental (task L14):
+	 *
+	 *  - cand[]    the ranked candidates of the CURRENT WAND pass, descending
+	 *              score, not yet visibility-checked.  candpos is how far the
+	 *              MVCC probe has walked.
+	 *  - ordered[] the visible rows already materialized, ascending distance.
+	 *              ACCUMULATED ACROSS PASSES: a widening keeps this array,
+	 *              re-probes none of it, and filters the new pass's candidates
+	 *              against it, so a recompute extends the previous pass instead
+	 *              of repeating its output. */
+	bool		orderInit;		/* has the first pass run? */
+	ScoredTid  *ordered;		/* visible results so far, ascending distance */
+	int			nordered;		/* how many are materialized */
+	int			maxordered;		/* allocated slots in ordered[] */
 	int			ordpos;			/* next result to return */
-	int			curk;			/* current materialized k (grows on demand) */
+	ScoredTid  *cand;			/* current pass's candidates, descending score */
+	int			ncand;
+	int			candpos;		/* next candidate to visibility-probe */
+	bool		candfull;		/* the pass filled its top-k heap, so matches
+								 * may exist beyond cand[] */
+	int			curk;			/* candidate width of the current pass */
 	double		maxhits;		/* provable upper bound on result size (cap growth) */
 	/* plain-scan (amgettuple, no ORDER BY) state for index-only counts */
 	bool		plainInit;		/* have we materialized the matching TIDs? */
@@ -128,6 +146,14 @@ typedef struct WeaveScanOpaqueData
 } WeaveScanOpaqueData;
 
 typedef WeaveScanOpaqueData *WeaveScanOpaque;
+
+/* ranked-scan growth (L14); defined next to the visibility machinery */
+static int weave_topk_candidates_guarded(Relation index, WeaveQuery q, int wantk,
+										ScoredTid **out);
+static int weave_ord_width(int k);
+static void weave_ord_pass(Relation index, WeaveScanOpaque so);
+static void weave_ord_probe(Relation index, WeaveScanOpaque so, int want);
+static bool weave_ord_grow(Relation index, WeaveScanOpaque so);
 
 static int
 cmp_tid(const void *a, const void *b)
@@ -1335,7 +1361,14 @@ weave_beginscan(Relation r, int nkeys, int norderbys)
 	so->orderInit = false;
 	so->ordered = NULL;
 	so->nordered = 0;
+	so->maxordered = 0;
 	so->ordpos = 0;
+	so->cand = NULL;
+	so->ncand = 0;
+	so->candpos = 0;
+	so->candfull = false;
+	so->curk = 0;
+	so->maxhits = 0;
 	so->plainInit = false;
 	so->plainTids = NULL;
 	so->nplain = 0;
@@ -1377,7 +1410,14 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->orderInit = false;
 	so->ordered = NULL;
 	so->nordered = 0;
+	so->maxordered = 0;
 	so->ordpos = 0;
+	so->cand = NULL;
+	so->ncand = 0;
+	so->candpos = 0;
+	so->candfull = false;
+	so->curk = 0;
+	so->maxhits = 0;
 	so->plainInit = false;
 	so->plainTids = NULL;
 	so->nplain = 0;
@@ -1510,13 +1550,14 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 	if (!so->orderInit)
 	{
 		/*
-		 * Adaptive-k WAND: start small so a small LIMIT (the common first page)
-		 * does minimal work -- WAND prunes hard for small k -- and grow on
-		 * demand.  The top-k engine over-fetches (wantk = k*4) for MVCC, and we
-		 * KEEP all those extra ranked candidates (see weave_topk_visible), so a
-		 * page-sized LIMIT is usually served from the first pass without a
-		 * recompute.  Growth is capped at the query's provable max hits so we
-		 * never recompute past the actual result size.
+		 * Adaptive-width WAND.  Start narrow so a small LIMIT (the common first
+		 * page) does minimal work -- WAND prunes hard for a small k -- and widen
+		 * on demand.  The pass's candidates are handed out LAZILY (visibility is
+		 * checked a batch at a time in weave_ord_probe), so the whole width of
+		 * the pass is available to the executor, not just the first
+		 * pg_weave.wand_initial_k rows of it: the x4 over-fetch that used to
+		 * exist only to survive MVCC filtering now also sets how deep a single
+		 * pass can serve.  See weave_ord_pass and doc/GAPS.md G13.
 		 */
 		double		N;
 		WeaveMetaPageData m0;
@@ -1543,50 +1584,44 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 		 * guessed at: bench/compete sweeps it and bench/RESULTS_WAND_K.md records
 		 * the frontier the default is chosen from.  See doc/GAPS.md G13.
 		 */
-		so->curk = pg_weave_wand_initial_k;
-		if ((double) so->curk > so->maxhits)
-			so->curk = Max((int) so->maxhits, 1);
-		so->nordered = weave_topk_visible(scan->indexRelation, so->query,
-										 so->curk, true, &so->ordered);
+		so->curk = weave_ord_width(pg_weave_wand_initial_k);
+		weave_ord_pass(scan->indexRelation, so);
 		so->ordpos = 0;
 		so->orderInit = true;
 	}
 
 	/*
-	 * Batch exhausted but it was full (nordered == curk): the executor wants
-	 * more than we materialized.  Grow k and recompute, skipping the rows
-	 * already returned.  (WAND is a batch top-k; this bounds work to demand
-	 * without a full resumable-cursor rewrite.)
+	 * Produce the next visible row.  Three sources, in increasing cost:
+	 *
+	 *  1. already materialized in ordered[] -- free;
+	 *  2. the current pass's remaining candidates -- one heap probe each;
+	 *  3. a wider pass (weave_ord_grow) -- a full WAND recompute.
+	 *
+	 * (3) EXTENDS the scan rather than repeating it: ordered[] survives, so the
+	 * rows already handed out are neither re-probed nor re-emitted.
 	 */
-	if (so->ordpos >= so->nordered && so->nordered == so->curk)
+	while (so->ordpos >= so->nordered)
 	{
-		int			prev = so->ordpos;
+		if (so->candpos < so->ncand)
+		{
+			/*
+			 * Probe a geometrically growing batch rather than exactly one row,
+			 * so the heap open and fetch setup amortize over the rows that
+			 * follow.  batch > nordered always (ordpos >= nordered here), so
+			 * each iteration consumes at least one candidate and cannot spin.
+			 */
+			int			batch = so->nordered < INT_MAX / 2 ? so->nordered * 2 : INT_MAX;
 
-		/*
-		 * Grow k for deeper scrolling.  The ONLY correct stop is the query's
-		 * provable max hits: an ORDER BY <=> index scan is an amcanorderbyop
-		 * (KNN) scan and MUST be able to return EVERY matching tuple in score
-		 * order -- the executor's LIMIT bounds how many are actually pulled, so
-		 * the access method must not impose its own ceiling (doing so silently
-		 * truncated a query matching more than the ceiling to that ceiling; see
-		 * the "orderby distance scan undercounts" report).  Grow x4 until every
-		 * possible match is materialized.  A broad query with a large (or no)
-		 * LIMIT is inherently expensive here, but correctness wins: a small-LIMIT
-		 * page is still served cheaply from the first pass (WAND prunes hard for
-		 * small k); only an explicit deep/unbounded scan pays for the deep pass.
-		 */
-		if ((double) so->curk >= so->maxhits)
-			return false;		/* already have every possible match */
-		so->curk *= 4;
-		if ((double) so->curk > so->maxhits)
-			so->curk = Max((int) so->maxhits, 1);
-		so->nordered = weave_topk_visible(scan->indexRelation, so->query,
-										 so->curk, true, &so->ordered);
-		so->ordpos = prev;		/* resume after the rows already emitted */
+			batch = Max(batch, 16);
+			batch = Max(batch, so->ordpos + 1);
+			weave_ord_probe(scan->indexRelation, so, batch);
+			if (so->ordpos < so->nordered)
+				break;
+		}
+		/* candidates exhausted: widen the pass, or the scan is complete */
+		if (!weave_ord_grow(scan->indexRelation, so))
+			return false;
 	}
-
-	if (so->ordpos >= so->nordered)
-		return false;
 
 	scan->xs_heaptid = so->ordered[so->ordpos].tid;
 	scan->xs_recheck = false;	/* score computed exactly from the index */
@@ -4173,8 +4208,10 @@ weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
 }
 
 /*
- * weave_topk_visible: serial top-k for the weave_search SRF and the amgettuple
- * ordering scan.  Generates candidates over the WHOLE corpus (docid range
+ * weave_topk_visible: serial top-k for the weave_search SRF.  (The amgettuple
+ * ordering scan drives the pass itself -- see weave_ord_pass -- so that it can
+ * hand out candidates lazily and keep them across a widening.)  Generates
+ * candidates over the WHOLE corpus (docid range
  * [0, MAX)) then applies MVCC visibility, over-fetching (wantk = k*4) so k
  * visible rows survive.  When as_distance is true each result's .score is the
  * ordering distance 1/(1+score).  Returns visible results (palloc'd) sorted by
@@ -4201,7 +4238,6 @@ weave_topk_visible(Relation index, WeaveQuery q, int k, bool as_distance,
 	Snapshot	snap = GetActiveSnapshot();
 	Relation	heap;
 	IndexFetchTableData *fetch;
-	uint32		gen0;
 
 	if (k < 1)
 		k = 1;
@@ -4209,27 +4245,14 @@ weave_topk_visible(Relation index, WeaveQuery q, int k, bool as_distance,
 
 	for (;;)
 	{
-		int			gen_retries = 0;
-
 		/*
 		 * Candidate generation reads segment pages under only per-page SHARE
-		 * locks off a metapage snapshot; a concurrent merge/vacuum can free +
-		 * recycle those pages mid-scan (the A1 race).  Bracket it with the
-		 * directory generation: if it moved, discard the candidates and redo
-		 * from a fresh snapshot (bounded).  The subsequent MVCC visibility
-		 * loop reads the heap, not the index, so it needs no guard.
+		 * locks off a metapage snapshot, so a concurrent merge/vacuum can free
+		 * and recycle them mid-scan (the A1 race); weave_topk_candidates_guarded
+		 * brackets that with the directory generation.  The MVCC visibility loop
+		 * below reads the heap, not the index, so it needs no guard.
 		 */
-		cand = NULL;
-		do
-		{
-			gen0 = weave_read_meta_generation(index);
-			ncand = weave_topk_candidates_range(index, q, wantk, 0, UINT64_MAX, &cand);
-			if (weave_read_meta_generation(index) == gen0)
-				break;
-			if (cand)
-				pfree(cand);
-			cand = NULL;
-		} while (gen_retries++ < 10);
+		ncand = weave_topk_candidates_guarded(index, q, wantk, &cand);
 
 		/* Drop any results from a prior (short) attempt before re-filling. */
 		if (results)
@@ -4277,6 +4300,272 @@ weave_topk_visible(Relation index, WeaveQuery q, int k, bool as_distance,
 
 	*out = results;
 	return nvis;
+}
+
+/*
+ * ---------------------- incremental ranked-scan growth (L14) ----------------
+ *
+ * PostgreSQL gives an index access method no way to learn the query's LIMIT, so
+ * a ranked scan must guess how deep to go and widen when the executor asks for
+ * more.  Before L14 a widening RECOMPUTED THE WHOLE PASS and threw the previous
+ * one away, which made the cost of a deep page a function of HOW MANY TIMES the
+ * scan had been redone rather than of the depth reached: from
+ * wand_initial_k = 16 a LIMIT 100 query ran three complete passes (16, 64, 256),
+ * from 32 two, from 100 one -- so the k frontier came out non-monotonic and the
+ * knob traded a small LIMIT against a deep one (bench/RESULTS_WAND_K.md).
+ *
+ * Two changes make a widening EXTEND the previous pass:
+ *
+ *  1. Visibility is checked LAZILY, a batch at a time, across the pass's whole
+ *     candidate list.  That list was always Max(k*4, 64) wide -- the over-fetch
+ *     existed so k rows survived MVCC filtering -- but everything past the k-th
+ *     visible row was discarded.  Keeping it lets one pass serve ~4x deeper, and
+ *     a small LIMIT now probes the heap FEWER times than before (as many rows as
+ *     are actually pulled, not k).
+ *
+ *  2. The accumulated visible rows survive a widening.  They are not re-probed
+ *     and, crucially, not re-emitted: the new pass's candidates are filtered
+ *     against the TIDs already materialized, so the scan continues where it
+ *     stopped instead of replaying its own output at an offset.
+ *
+ * What is NOT incremental: the per-term posting cursors still restart at docid 0
+ * on a widening, so the wider pass re-reads postings.  That is not fixable by
+ * bookkeeping -- a document pruned under the narrow pass's threshold can belong
+ * in the wider top-k, so the wider pass must be able to revisit it.  The saving
+ * here is the output side (heap probes, re-emission) plus the ~4x deeper reach
+ * per pass; the posting decode is task L2's (impact-ordered postings) problem.
+ */
+
+/*
+ * weave_ord_width: candidate width for a ranked pass at nominal k.
+ *
+ * Identical to the over-fetch weave_topk_visible has always used, so the FIRST
+ * pass of a scan reads exactly what it read before this change; what differs is
+ * that all of it is now reachable by the executor.  Clamped so that
+ * width * sizeof(ScoredTid) cannot overflow along the x4 widening ladder.
+ */
+#define WEAVE_ORD_WIDTH_MAX (INT_MAX / 32)
+
+static int
+weave_ord_width(int k)
+{
+	if (k < 1)
+		k = 1;
+	if (k > WEAVE_ORD_WIDTH_MAX / 4)
+		return WEAVE_ORD_WIDTH_MAX;
+	return Max(k * 4, 64);
+}
+
+/*
+ * weave_ord_pass: run one ranked candidate pass at width so->curk and install
+ * its result as the scan's candidate list.
+ *
+ * Candidates already materialized into so->ordered by an earlier, narrower pass
+ * are removed from the new list by TID.  That is what makes a widening an
+ * extension: those rows keep their original position and distance, are not
+ * probed against the heap again, and cannot be emitted twice.  (The predecessor
+ * of this code resumed by INDEX -- it recomputed the whole visible list and
+ * restarted at the count already returned -- which assumed the wider pass
+ * reproduced the narrower one's prefix exactly, including among tied scores.
+ * Filtering by TID needs no such assumption.)
+ *
+ * Ordering across the boundary does still rely on the earlier pass being exact,
+ * which it is: a document in an exact top-W1 has fewer than W1 <= W2 documents
+ * scoring above it, so nothing the wider pass newly finds outranks a row already
+ * handed out.  A document merged into the index BETWEEN two passes could; a
+ * ranked scan is not order-stable under concurrent modification and was not
+ * before this change either.
+ */
+static void
+weave_ord_pass(Relation index, WeaveScanOpaque so)
+{
+	ScoredTid  *cand = NULL;
+	int			ncand;
+	int			i;
+
+	ncand = weave_topk_candidates_guarded(index, so->query, so->curk, &cand);
+
+	/*
+	 * COMPLETENESS SIGNAL.  A pass whose top-k heap never filled scored and
+	 * admitted EVERY matching document: the threshold stays 0.0 until the heap
+	 * holds k entries, and every pruning rule in weave_search_bmw() and
+	 * weave_search_maxscore() is gated on nheap >= k, so nothing was skipped.
+	 * ncand < curk therefore means "this is the entire match set" -- an exact
+	 * stop for the widening ladder, stronger than the weave_query_maxhits
+	 * estimate it supplements.
+	 */
+	so->candfull = (ncand >= so->curk);
+
+	if (ncand > 0 && so->nordered > 0)
+	{
+		ItemPointerData *seen;
+		int			j = 0;
+
+		seen = (ItemPointerData *)
+			palloc(so->nordered * sizeof(ItemPointerData));	/* alloc-ok: one TID per row already materialized, bounded by the previous pass width, which allocated a wider array itself */
+		for (i = 0; i < so->nordered; i++)
+			seen[i] = so->ordered[i].tid;
+		qsort(seen, so->nordered, sizeof(ItemPointerData), cmp_tid);
+		for (i = 0; i < ncand; i++)
+			if (bsearch(&cand[i].tid, seen, so->nordered,
+						sizeof(ItemPointerData), cmp_tid) == NULL)
+				cand[j++] = cand[i];
+		ncand = j;
+		pfree(seen);
+	}
+
+	if (so->cand)
+		pfree(so->cand);
+	so->cand = cand;
+	so->ncand = ncand;
+	so->candpos = 0;
+}
+
+/*
+ * weave_ord_probe: extend so->ordered with MVCC-visible rows drawn from the
+ * candidate list, until it holds `want` rows or the candidates run out.
+ *
+ * The candidate list is the exact top-N by score, so its visible members are
+ * the exact top-M visible in the same order for every M it reaches: appending
+ * them in candidate order keeps ordered[] a correct score-ordered prefix.
+ */
+static void
+weave_ord_probe(Relation index, WeaveScanOpaque so, int want)
+{
+	Snapshot	snap = GetActiveSnapshot();
+	Relation	heap;
+	IndexFetchTableData *fetch;
+	TupleTableSlot *slot;
+
+	if (so->candpos >= so->ncand || so->nordered >= want)
+		return;
+
+	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+#if PG_VERSION_NUM >= 190000
+	fetch = table_index_fetch_begin(heap, SO_NONE);
+#else
+	fetch = table_index_fetch_begin(heap);
+#endif
+	slot = table_slot_create(heap, NULL);
+
+	while (so->candpos < so->ncand && so->nordered < want)
+	{
+		ScoredTid  *c = &so->cand[so->candpos];
+		ItemPointerData tid = c->tid;
+		bool		call_again = false;
+		bool		all_dead = false;
+
+		so->candpos++;
+		if (!table_index_fetch_tuple(fetch, &tid, snap, slot,
+									 &call_again, &all_dead))
+			continue;
+
+		if (so->nordered >= so->maxordered)
+		{
+			int			newmax;
+
+			if (so->maxordered == 0)
+				/* size to the pass, but do not front-load a very wide one for a
+				 * scan that may only pull a handful of rows */
+				newmax = Min(Max(so->ncand, 64), 4096);
+			else if (so->maxordered > INT_MAX / 2)
+				newmax = INT_MAX;
+			else
+				newmax = so->maxordered * 2;
+			if (so->ordered == NULL)
+				so->ordered = (ScoredTid *)
+					palloc(newmax * sizeof(ScoredTid));	/* alloc-ok: one entry per visible row materialized, bounded by the pass width, which allocated a same-sized array itself */
+			else
+				so->ordered = (ScoredTid *)
+					repalloc(so->ordered, newmax * sizeof(ScoredTid));	/* alloc-ok: as above */
+			so->maxordered = newmax;
+		}
+		so->ordered[so->nordered].tid = c->tid;
+		/* ordering distance: 1/(1+score); ascending distance == descending score */
+		so->ordered[so->nordered].score = 1.0 / (1.0 + c->score);
+		so->nordered++;
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+	table_index_fetch_end(fetch);
+	table_close(heap, AccessShareLock);
+}
+
+/*
+ * weave_ord_grow: widen the ranked pass because the executor wants more rows
+ * than the current one can supply.  Returns false when the scan is complete.
+ *
+ * The ONLY correct stops are ones that PROVE no further match exists.  An
+ * ORDER BY <=> index scan is an amcanorderbyop (KNN) scan and MUST be able to
+ * return EVERY matching tuple in score order -- the executor's LIMIT bounds how
+ * many are actually pulled, so the access method must not impose a ceiling of
+ * its own (doing so silently truncated a query matching more than the ceiling to
+ * that ceiling; see the "orderby distance scan undercounts" report).  Two proofs
+ * are used, in this order:
+ *
+ *  1. !candfull -- the pass's top-k heap never filled, so it pruned nothing and
+ *     its candidate list IS the complete match set.  Exact.
+ *  2. curk >= maxhits -- the pass was at least as wide as the provable upper
+ *     bound on the query's match count (weave_query_maxhits), so no wider pass
+ *     can find more.  Nearly redundant now: at that width the heap cannot fill,
+ *     so (1) fires anyway.  Kept as a cheap early stop.
+ *
+ * A broad query with a large (or no) LIMIT is inherently expensive here, but
+ * correctness wins; a small-LIMIT first page is still served by the narrow first
+ * pass alone.
+ */
+static bool
+weave_ord_grow(Relation index, WeaveScanOpaque so)
+{
+	if (!so->candfull)
+		return false;			/* the pass returned the complete match set */
+	if ((double) so->curk >= so->maxhits)
+		return false;			/* already as wide as every possible match */
+	if (so->curk >= WEAVE_ORD_WIDTH_MAX)
+		return false;			/* cannot widen further */
+
+	so->curk = (so->curk > WEAVE_ORD_WIDTH_MAX / 4)
+		? WEAVE_ORD_WIDTH_MAX : so->curk * 4;
+	weave_ord_pass(index, so);
+	return true;
+}
+
+/*
+ * weave_topk_candidates_guarded: weave_topk_candidates_range over the whole
+ * corpus, bracketed against the A1 race.
+ *
+ * Candidate generation reads segment pages under only per-page SHARE locks off a
+ * metapage snapshot, so a concurrent merge/vacuum can free and recycle those
+ * pages mid-scan.  Re-read the directory generation afterwards: if it moved the
+ * candidates may have come off recycled pages, so discard them and redo from a
+ * fresh snapshot, bounded at 10 attempts.  If every attempt races, return zero
+ * candidates -- never a nonzero count with a NULL array, which is what the
+ * inline copy of this loop this function replaced could do.
+ */
+static int
+weave_topk_candidates_guarded(Relation index, WeaveQuery q, int wantk,
+							 ScoredTid **out)
+{
+	int			gen_retries = 0;
+
+	do
+	{
+		ScoredTid  *cand = NULL;
+		uint32		gen0 = weave_read_meta_generation(index);
+		int			ncand = weave_topk_candidates_range(index, q, wantk, 0,
+														UINT64_MAX, &cand);
+
+		if (weave_read_meta_generation(index) == gen0)
+		{
+			*out = cand;
+			return ncand;
+		}
+		if (cand)
+			pfree(cand);
+	} while (gen_retries++ < 10);
+
+	*out = NULL;
+	return 0;
 }
 
 /*

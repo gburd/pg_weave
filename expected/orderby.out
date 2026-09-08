@@ -14,7 +14,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.4.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.5.0" of extension "pg_weave" is already installed
 CREATE TABLE ob (id serial, d wdoc);
 -- A vocabulary with three frequency bands so ranking is meaningful and the
 -- top-k is not an arbitrary tie-break.
@@ -147,3 +147,248 @@ SELECT id FROM ob ORDER BY d <=> 'alpha'::wquery LIMIT 5;
 (3 rows)
 
 DROP TABLE ob;
+-- ============================================================================
+-- L14: incremental WAND growth (doc/GAPS.md G13, bench/RESULTS_WAND_K.md).
+--
+-- PostgreSQL gives an access method no way to learn the query's LIMIT, so the
+-- ranked scan runs a block-max WAND pass at some candidate width and widens it
+-- when the executor asks for more rows than the pass materialized.  L14 makes a
+-- widening EXTEND the previous pass: the already-materialized visible rows are
+-- kept and never re-emitted, and the new pass's candidates are filtered against
+-- them.  The property that could break is exactly the one this section asserts:
+-- a deeply paginated scan must return the SAME rows in the SAME order, with no
+-- duplicate and no omission, as one wide pass.
+--
+-- pg_weave.wand_initial_k is a PGC_USERSET GUC, so the growth ladder is
+-- reachable from SQL: a small value forces several widenings for a deep scan and
+-- a large value serves the same scan in one pass.  Both must agree exactly.
+CREATE TABLE wg (id int, d wdoc);
+-- Unique tf per doc gives strictly distinct BM25 scores, so the ranking is a
+-- total order: a duplicated or dropped row shows up as a difference rather than
+-- disappearing into a tie shuffle.  Every 4th doc also carries beta, so the
+-- boolean gates (AND / NOT) are exercised across a growth too.
+INSERT INTO wg(id, d)
+SELECT g, to_wdoc(repeat('alpha ', g) ||
+       (CASE WHEN g % 4 = 0 THEN 'beta ' ELSE '' END))
+FROM generate_series(1, 400) g;
+CREATE INDEX wg_weave ON wg USING weave (d);
+ANALYZE wg;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- The assertions below are worthless unless the ranked ordering INDEX path is
+-- what runs them: a Sort over a bitmap scan would agree with itself no matter
+-- what the AM did.
+EXPLAIN (COSTS OFF)
+SELECT id FROM wg WHERE d @@@ 'alpha'::wquery
+ ORDER BY d <=> 'alpha'::wquery LIMIT 300;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Limit
+   ->  Index Scan using wg_weave on wg
+         Index Cond: (d @@@ '''alpha'''::wquery)
+         Order By: (d <=> '''alpha'''::wquery)
+(4 rows)
+
+-- (10) Deep pagination == one wide pass.  wand_initial_k=1 gives the minimum
+-- candidate width, so LIMIT 300 cannot be served without widening; =400 serves
+-- it in a single pass.
+SET pg_weave.wand_initial_k = 1;
+CREATE TEMP TABLE wg_grown AS
+  SELECT row_number() OVER () AS pos, id,
+         round((d <=> 'alpha'::wquery)::numeric, 9) AS dist
+    FROM (SELECT id, d FROM wg WHERE d @@@ 'alpha'::wquery
+           ORDER BY d <=> 'alpha'::wquery LIMIT 300) s;
+SET pg_weave.wand_initial_k = 400;
+CREATE TEMP TABLE wg_onepass AS
+  SELECT row_number() OVER () AS pos, id,
+         round((d <=> 'alpha'::wquery)::numeric, 9) AS dist
+    FROM (SELECT id, d FROM wg WHERE d @@@ 'alpha'::wquery
+           ORDER BY d <=> 'alpha'::wquery LIMIT 300) s;
+SELECT count(*) AS grown_rows FROM wg_grown;                 -- 300
+ grown_rows 
+------------
+        300
+(1 row)
+
+SELECT count(*) AS pagination_disagreements
+  FROM wg_grown g FULL JOIN wg_onepass o USING (pos)
+ WHERE g.id IS DISTINCT FROM o.id OR g.dist IS DISTINCT FROM o.dist;   -- 0
+ pagination_disagreements 
+--------------------------
+                        0
+(1 row)
+
+SELECT count(*) AS grown_duplicates
+  FROM (SELECT id FROM wg_grown GROUP BY id HAVING count(*) > 1) x;    -- 0
+ grown_duplicates 
+------------------
+                0
+(1 row)
+
+-- The rows a deeply grown scan returns must be the TRUE top-300: exact BM25
+-- (with the real corpus stats, the oracle form sql/weave.sql uses) may not put
+-- any returned row more than 1% below the exact 300th-best score.  A widening
+-- that lost or replaced a row shows up here; the 1% slack is the documented v4
+-- doclen-quantization tolerance, not slack in the growth logic.
+--
+-- Note this cannot be done with the `d <=> q` in a target list: evaluated as a
+-- plain expression it has no index behind it and therefore no ndocs/avgdl/df, so
+-- it is NOT the index's ordering score and is not monotone in the index's order.
+-- It is still a deterministic function of the row, which is what makes it a
+-- valid column to compare BETWEEN the two executions above.
+WITH st AS (SELECT ndocs, avgdl FROM weave_index_stats('wg_weave')),
+     dfs AS (SELECT weave_index_df('wg_weave', 'alpha'::wquery) AS df),
+     ix AS (SELECT weave_bm25(w.d, 'alpha'::wquery, st.ndocs, st.avgdl, dfs.df) AS sc
+              FROM wg_grown g JOIN wg w USING (id), st, dfs),
+     cut AS (SELECT min(sc) AS kth FROM (
+              SELECT weave_bm25(w.d, 'alpha'::wquery, st.ndocs, st.avgdl, dfs.df) AS sc
+                FROM wg w, st, dfs WHERE w.d @@@ 'alpha'::wquery
+               ORDER BY sc DESC LIMIT 300) z)
+SELECT count(*) AS grown_recall_misses
+  FROM ix, cut WHERE ix.sc < cut.kth * 0.99 - 1e-9;                    -- 0
+ grown_recall_misses 
+---------------------
+                   0
+(1 row)
+
+-- (11) No self-imposed ceiling.  An amcanorderbyop scan must be able to return
+-- EVERY match in score order; the executor's LIMIT is what bounds it.  A
+-- growth ladder that stops early silently truncates -- the bug the growth block
+-- in amscan.c warns about.  All three forms must see all 400 alpha docs at the
+-- smallest possible initial k.
+SET pg_weave.wand_initial_k = 1;
+SELECT count(*) AS all_matches_big_limit
+  FROM (SELECT id FROM wg WHERE d @@@ 'alpha'::wquery
+         ORDER BY d <=> 'alpha'::wquery LIMIT 5000) s;                 -- 400
+ all_matches_big_limit 
+-----------------------
+                   400
+(1 row)
+
+SELECT count(*) AS all_matches_no_limit
+  FROM (SELECT id FROM wg WHERE d @@@ 'alpha'::wquery
+         ORDER BY d <=> 'alpha'::wquery) s;                            -- 400
+ all_matches_no_limit 
+----------------------
+                  400
+(1 row)
+
+SELECT count(*) AS all_matches_bare
+  FROM (SELECT id FROM wg ORDER BY d <=> 'alpha'::wquery LIMIT 5000) s;-- 400
+ all_matches_bare 
+------------------
+              400
+(1 row)
+
+-- (12) Incremental demand through a CURSOR.  Fetching one row at a time makes
+-- every exhaustion of the materialized depth a widening MID-SCAN, which is the
+-- path a LIMIT cannot reach; the concatenated result must equal a single
+-- execution of the same query, row for row, and cover all 400 matches.  (A
+-- bare `MOVE FORWARD ALL` would not do: pg_regress runs psql quietly, so the
+-- row count in the command tag never reaches the output.)
+CREATE FUNCTION wg_cursor_walk() RETURNS TABLE (nrows int, mismatches int)
+LANGUAGE plpgsql AS $$
+DECLARE
+  c CURSOR FOR SELECT id FROM wg WHERE d @@@ 'alpha'::wquery
+                ORDER BY d <=> 'alpha'::wquery;
+  got int[] := '{}';
+  one int[];
+  r record;
+BEGIN
+  OPEN c;
+  LOOP
+    FETCH c INTO r;
+    EXIT WHEN NOT FOUND;
+    got := got || r.id;
+  END LOOP;
+  CLOSE c;
+  SELECT array_agg(id) INTO one FROM (
+    SELECT id FROM wg WHERE d @@@ 'alpha'::wquery
+     ORDER BY d <=> 'alpha'::wquery LIMIT 5000) s;
+  nrows := coalesce(array_length(got, 1), 0);
+  SELECT count(*) INTO mismatches
+    FROM generate_series(1, greatest(coalesce(array_length(got, 1), 0),
+                                     coalesce(array_length(one, 1), 0))) g
+   WHERE got[g] IS DISTINCT FROM one[g];
+  RETURN NEXT;
+END $$;
+SELECT * FROM wg_cursor_walk();                                        -- 400, 0
+ nrows | mismatches 
+-------+------------
+   400 |          0
+(1 row)
+
+DROP FUNCTION wg_cursor_walk();
+-- (13) Scores must not depend on how deep the scan went: the rows a LIMIT 10
+-- and a LIMIT 300 execution share must carry identical distances and identical
+-- positions.
+SELECT count(*) AS shallow_deep_score_disagreements FROM (
+  SELECT id, round((d <=> 'alpha'::wquery)::numeric, 9) AS s
+    FROM wg WHERE d @@@ 'alpha'::wquery
+   ORDER BY d <=> 'alpha'::wquery LIMIT 10) a
+  JOIN wg_grown g USING (id)
+ WHERE a.s IS DISTINCT FROM g.dist OR g.pos > 10;                      -- 0
+ shallow_deep_score_disagreements 
+----------------------------------
+                                0
+(1 row)
+
+-- (14) Boolean structure must survive a growth.  `alpha & beta` matches 100
+-- docs and `alpha & !beta` 300; at the smallest initial k both need several
+-- widenings to reach that depth, and neither may admit a row that @@@ rejects.
+SELECT count(*) AS and_rows FROM (
+  SELECT id FROM wg WHERE d @@@ 'alpha & beta'::wquery
+   ORDER BY d <=> 'alpha & beta'::wquery LIMIT 5000) s;                -- 100
+ and_rows 
+----------
+      100
+(1 row)
+
+SELECT count(*) AS and_violations FROM (
+  SELECT d FROM wg WHERE d @@@ 'alpha & beta'::wquery
+   ORDER BY d <=> 'alpha & beta'::wquery LIMIT 5000) s
+ WHERE NOT (s.d @@@ 'alpha & beta'::wquery);                           -- 0
+ and_violations 
+----------------
+              0
+(1 row)
+
+SELECT count(*) AS not_rows FROM (
+  SELECT id FROM wg WHERE d @@@ 'alpha & !beta'::wquery
+   ORDER BY d <=> 'alpha & !beta'::wquery LIMIT 5000) s;               -- 300
+ not_rows 
+----------
+      300
+(1 row)
+
+SELECT count(*) AS not_violations FROM (
+  SELECT d FROM wg WHERE d @@@ 'alpha & !beta'::wquery
+   ORDER BY d <=> 'alpha & !beta'::wquery LIMIT 5000) s
+ WHERE NOT (s.d @@@ 'alpha & !beta'::wquery);                          -- 0
+ not_violations 
+----------------
+              0
+(1 row)
+
+-- A deep boolean scan must also agree with a one-pass one, row for row.
+CREATE TEMP TABLE wg_and_grown AS
+  SELECT row_number() OVER () AS pos, id FROM (
+    SELECT id FROM wg WHERE d @@@ 'alpha & beta'::wquery
+     ORDER BY d <=> 'alpha & beta'::wquery LIMIT 5000) s;
+SET pg_weave.wand_initial_k = 400;
+CREATE TEMP TABLE wg_and_onepass AS
+  SELECT row_number() OVER () AS pos, id FROM (
+    SELECT id FROM wg WHERE d @@@ 'alpha & beta'::wquery
+     ORDER BY d <=> 'alpha & beta'::wquery LIMIT 5000) s;
+SELECT count(*) AS and_pagination_disagreements
+  FROM wg_and_grown g FULL JOIN wg_and_onepass o USING (pos)
+ WHERE g.id IS DISTINCT FROM o.id;                                     -- 0
+ and_pagination_disagreements 
+------------------------------
+                            0
+(1 row)
+
+RESET pg_weave.wand_initial_k;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE wg;
