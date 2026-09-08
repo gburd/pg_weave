@@ -34,7 +34,13 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            gcc clang make git ca-certificates libc6-dev
+            gcc clang make git ca-certificates libc6-dev \
+            libclang-rt-dev
+          # libclang-rt-dev is REQUIRED, not optional: Debian's clang package does
+          # not ship the sanitizer runtimes, so check-fuzz fails at link time with
+          # "cannot find libclang_rt.asan-x86_64.a".  Found by running this job in
+          # the real container before trusting it -- the workflow would otherwise
+          # have failed on its first execution.
 
       - uses: actions/checkout@v4
 
@@ -74,8 +80,16 @@ jobs:
 
       - name: Build + install
         run: |
-          make PG_CONFIG=/usr/bin/pg_config
-          make install PG_CONFIG=/usr/bin/pg_config
+          # with_llvm=no is REQUIRED here, not a preference.  PGXS generates LLVM
+          # bitcode for JIT inlining during `make install`, and in the postgres:17
+          # image that step aborts inside llvm-lto (core dumped, make exits 134) --
+          # a toolchain mismatch in the image, not a defect in pg_weave.  The
+          # extension does not need JIT inlining, and the .so and SQL install
+          # correctly without it.  Found by running this job in the real container
+          # before trusting it; CI would otherwise have failed on install while the
+          # regression tests that follow passed, which is a confusing way to fail.
+          make with_llvm=no PG_CONFIG=/usr/bin/pg_config
+          make install with_llvm=no PG_CONFIG=/usr/bin/pg_config
 
       - name: Regression + isolation
         # initdb refuses to run as root and the postgres image runs CI as root, so
@@ -150,10 +164,10 @@ jobs:
 
       - name: Build with ASan + UBSan
         run: |
-          make CC=clang \
+          make CC=clang with_llvm=no \
             COPT="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
             PG_CONFIG=/usr/bin/pg_config
-          make install PG_CONFIG=/usr/bin/pg_config
+          make install with_llvm=no PG_CONFIG=/usr/bin/pg_config
 
       - name: Regression under sanitizers
         # halt_on_error is deliberately OFF for UBSan here: a report in PostgreSQL
