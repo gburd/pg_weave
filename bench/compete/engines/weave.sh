@@ -160,11 +160,20 @@ json.dump(s,open('/tmp/spec.json','w'))"
     run_measure /tmp/spec.json "$samples" "$warmup" "$run"
 }
 
-case "${1:?usage: weave.sh <provision|load|index|gate|measure>}" in
+# Build profiling (G5).  A separate verb because it rebuilds the index several times
+# and must not perturb a measurement run.
+do_profile() {
+    export PATH="$NVME/pg/bin:$PATH"
+    sudo dnf install -y -q perf >/dev/null 2>&1 || true
+    bash "$HOME/pg_weave/bench/build_profile.sh"
+}
+
+case "${1:?usage: weave.sh <provision|load|index|gate|measure|profile>}" in
     provision) do_provision ;;
     load)      do_load "${2:?corpus}" ;;
     index)     do_index ;;
     gate)      do_gate ;;
     measure)   do_measure "${2:-200}" "${3:-10}" "${4:-adhoc}" ;;
+    profile)   do_profile ;;
     *) echo "unknown verb $1" >&2; exit 1 ;;
 esac
