@@ -1,0 +1,169 @@
+name: CI
+
+# pg_weave had NO CI at all until 2026-09-08.  Every gate ran only when a human
+# typed it, which is how the entire property-test and fuzz suite sat unnoticed and
+# unrun for six days while the FOR codec was modified twice, and how a
+# wrong-answer phrase bug shipped as the default.
+#
+# MIRROR of .forgejo/workflows/ci.yml, which is canonical (Codeberg is the origin).
+# Keep the two in step: if a gate is added there, add it here.
+#
+# The difference is the runner. Forgejo runs each leg inside a postgres:<major>
+# image as root; GitHub-hosted runners already have a non-root user and a
+# PostgreSQL, so these legs install the PGDG packages and run as the normal user,
+# which avoids the `su postgres` dance entirely.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Standalone gates.  Deliberately FIRST and independent of PostgreSQL: they
+  # test the algorithmic cores, they are the only layer that can catch a codec or
+  # a channel bound that is subtly wrong, and they run in a couple of minutes.
+  # A fixed-expected-output regression test cannot catch those at all -- the
+  # answers stay plausible and are merely wrong.  See doc/TESTING.md.
+  # -------------------------------------------------------------------------
+  standalone:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc clang make
+
+      - uses: actions/checkout@v4
+
+      - name: Lint gates
+        run: |
+          make check-ascii    # non-ASCII in install SQL breaks CREATE EXTENSION on LATIN1
+          make check-alloc    # the unguarded corpus-scale palloc class behind 4 real crashes
+          make check-unity    # src/am/am.c #includes three .c files; do not add them to OBJS
+          make check-rename   # pg_fts-era identifiers surviving the fork
+
+      - name: Standalone property tests
+        run: make check-standalone
+
+      - name: Fuzz / corruption harness (ASan + UBSan, with planted-bug teeth)
+        run: make check-fuzz
+
+  # -------------------------------------------------------------------------
+  # Build + regression + isolation, per PostgreSQL major.
+  # -------------------------------------------------------------------------
+  test:
+    runs-on: docker
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17, 18]
+    container:
+      image: postgres:${{ matrix.pg }}
+    steps:
+      - name: Install PostgreSQL ${{ matrix.pg }} from PGDG
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
+          sudo apt-get install -y postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }} libipc-run-perl
+          sudo pg_ctlcluster ${{ matrix.pg }} main stop || true
+
+      - uses: actions/checkout@v4
+
+      - name: Build + install
+        run: |
+          make PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          make install PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Regression + isolation
+        # initdb refuses to run as root and the postgres image runs CI as root, so
+        # the cluster and installcheck go through `su postgres`.  PGXS checks
+        # TAP_TESTS with ifdef, so PROVE_TESTS points at a trivial always-pass file
+        # to make the TAP stage a no-op here; TAP runs in its own step below.
+        run: |
+          /usr/lib/postgresql/${{ matrix.pg }}/bin/initdb -D /tmp/pgdata --no-locale --encoding=UTF8 &&
+          /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_ctl -D /tmp/pgdata \
+            -o "-k /tmp -c listen_addresses=localhost" -w start &&
+          make installcheck PROVE_TESTS=ci/noop.pl \
+            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config PGHOST=/tmp PGUSER=postgres
+
+      - name: TAP -- corruption recovery and server encodings
+        # Only t/003 and t/004 run here.  t/001 (crash recovery), t/002
+        # (replication), t/005-t/009 need a PostgreSQL::Test cluster-management
+        # setup this container job does not provide, so gating them would fail on
+        # harness setup rather than on pg_weave.  The Nix flake's tap-pg17/tap-pg18
+        # checks run the full nine.
+        run: |
+          make installcheck REGRESS= ISOLATION= \
+            PROVE_TESTS="t/003_corruption.pl t/004_encodings.pl" \
+            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          ' || { echo "=== TAP logs ==="; \
+               cat tmp_check/log/*.log tmp_check/log/regress_log_* 2>/dev/null | tail -120 || true; \
+               exit 1; }
+
+      - name: Upgrade path -- every released version must reach the current one
+        # An extension whose version advances without a working upgrade script
+        # cannot be upgraded in place.  This project has bumped four times and the
+        # chain has only ever been exercised incidentally by sql/wvec.sql.
+        run: |
+          chown -R postgres:postgres .
+          su postgres -c '
+          psql -h /tmp -U postgres -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE upg" &&
+          psql -h /tmp -U postgres -v ON_ERROR_STOP=1 -d upg \
+            -c "CREATE EXTENSION pg_weave VERSION '"'"'0.1.0'"'"'" \
+            -c "ALTER EXTENSION pg_weave UPDATE" \
+            -c "SELECT extversion FROM pg_extension WHERE extname='"'"'pg_weave'"'"'"
+
+      - name: Show diffs on failure
+        if: failure()
+        run: |
+          for f in regression.diffs output_iso/regression.diffs; do
+            [ -f "$f" ] && { echo "=== $f ==="; cat "$f"; }
+          done
+
+  # -------------------------------------------------------------------------
+  # Sanitizers.  A separate leg because it is slow and because the failures it
+  # finds are a different class: this project's lineage includes an ASan-found
+  # SEGV in the page-recycle path (a concurrent reader holding a pointer into a
+  # page vacuum had freed and reused).
+  # -------------------------------------------------------------------------
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PostgreSQL 17 from PGDG
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
+          sudo apt-get install -y postgresql-17 postgresql-server-dev-17 libipc-run-perl clang
+          sudo pg_ctlcluster 17 main stop || true
+
+      - uses: actions/checkout@v4
+
+      - name: Build with ASan + UBSan
+        run: |
+          make CC=clang \
+            COPT="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
+            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          make install PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Regression under sanitizers
+        # halt_on_error is deliberately OFF for UBSan here: a report in PostgreSQL
+        # itself (not in pg_weave) would otherwise fail the leg.  detect_leaks is
+        # off because the backend intentionally leaks into memory contexts it frees
+        # wholesale, which is not a defect.
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: |
+          /usr/lib/postgresql/17/bin/initdb -D /tmp/pgdata --no-locale --encoding=UTF8 &&
+          /usr/lib/postgresql/17/bin/pg_ctl -D /tmp/pgdata \
+            -o "-k /tmp -c listen_addresses=localhost" -w start &&
+          make installcheck PROVE_TESTS=ci/noop.pl \
+            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config PGHOST=/tmp PGUSER=postgres
+
+      - name: Show diffs and sanitizer output on failure
+        if: failure()
+        run: |
+          [ -f regression.diffs ] && cat regression.diffs
+          cat /tmp/pgdata/log/* 2>/dev/null | tail -200 || true
