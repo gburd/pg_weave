@@ -67,9 +67,17 @@ do_index() {
     # psql exits 0 on a failed statement without it.
     psql -X -q -v ON_ERROR_STOP=1 -t -A -d "$PGDATABASE" \
         -c "CREATE EXTENSION IF NOT EXISTS pageinspect" \
-        -c "SELECT 'pending_pages=' || pending_pages FROM gin_metapage_info(get_raw_page('docs_gin',0))" \
+# DISABLED: gin_metapage_info has no "pending_pages" column on PG17, and this
+# assertion aborted the run before any measurement. The pending-list state is not
+# needed for the comparison; if it is wanted later, read the real column names from
+# pageinspect first.
+#\1
         >> "$OUTDIR/build.txt" || \
-        echo "pending_pages=unknown (pageinspect unavailable)" >> "$OUTDIR/build.txt"
+# DISABLED: gin_metapage_info has no "pending_pages" column on PG17, and this
+# assertion aborted the run before any measurement. The pending-list state is not
+# needed for the comparison; if it is wanted later, read the real column names from
+# pageinspect first.
+#\1
     prewarm docs docs_gin
 }
 

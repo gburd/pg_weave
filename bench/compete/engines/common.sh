@@ -207,10 +207,18 @@ SQL
     say "corpus loaded, sha256=$sha"
 }
 
-# The fingerprint the analyzer compares across hosts.  md5 over the ordered
+# The fingerprint the analyzer compares across hosts.
+#
+# Hashes the per-row md5s rather than the concatenated corpus.  The obvious form,
+# md5(string_agg(content, ...)), materialises the ENTIRE corpus as one datum: at
+# 2M x 120 words that is 2.6 GB, which exceeds MaxAllocSize and failed a whole
+# three-host run with "out of memory" during the measure phase -- after 22 minutes
+# of provisioning, loading and indexing. Per-row md5 keeps the aggregate at 32
+# bytes per row (64 MB at 2M rows, 320 MB at 10M), and the ORDER BY id makes it
+# just as sensitive to any difference in content or row set.  md5 over the ordered
 # content, so any difference in what was indexed is caught mechanically instead
 # of being inferred from divergent match counts a month later.
-FINGERPRINT_SQL="SELECT md5(string_agg(content, E'\n' ORDER BY id)) FROM docs"
+FINGERPRINT_SQL="SELECT md5(string_agg(h, '' ORDER BY id)) FROM (SELECT id, md5(content) AS h FROM docs) t"
 
 band() {
     # PATH must be exported here too: this runs in a fresh shell per verb, and
