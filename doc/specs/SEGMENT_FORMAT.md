@@ -213,6 +213,15 @@ Design:
 4. Additive fields go **after** existing ones when the containing struct is not
    an array element, so offsets do not move (see `generation`, §3). Fields added
    to an array element require a version bump and a versioned reader.
+5. **Chain offsets must be COMPUTED from one place, never hand-summed per call
+   site.** pg_turbovec has now hit the same bug **four times**: a running
+   chain-offset sum omitted one count field, so a build wrote one chain on top of
+   another's data (v2.7.0 fixed the fourth instance, `set_ivf_chains` omitting
+   `bq_mean_count`, found by audit rather than a field report). When v5's channel
+   descriptors add per-segment chains here, derive every offset from a single
+   function over the descriptor array and have `weave_check()` assert that no two
+   chains overlap — a bug class that recurs four times in a sibling project is not
+   going to be avoided by care.
 
 ## 9. Invariants `weave_check()` must verify
 

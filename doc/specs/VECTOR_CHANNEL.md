@@ -252,6 +252,14 @@ the hardware has a dot-product instruction and *d* is large. Do not guess —
 `bench/kernels.c` should A/B them per host, and `weave_vec_kernel` exists to
 force a path when reproducing a bug report from a different machine.
 
+**Two data points from pg_turbovec v2.7.0, so we do not repeat the work.** They
+made a wide-word Hamming kernel **~4.4× faster** at embedding dimensions
+(100k×768-d: 6.13 → 1.28 ms; 1M×768-d: 59.0 → 13.7 ms, independently reproduced at
+4.5–5.4× on a second machine) — and then **measured AVX2 and declined it**, because
+the scalar wide-word form already extracts the available instruction-level
+parallelism. If a Hamming path is ever added here, start wide-word scalar and do
+not assume a vector ISA helps.
+
 **Rotation kernels are held to a stricter standard than scoring kernels:** a
 scoring kernel that is one ULP off changes a score slightly, but a rotation
 kernel that is one ULP off changes a *code*, and therefore what the index
@@ -353,9 +361,25 @@ lanes. That is task V11 and its gate is a torn-write injection TAP test.
    corpus distribution moves away from the sample, recall degrades silently.
    Mitigation is weak: `WeaveVecMeta` records the sample size and fit timestamp so
    `weave_check()` can at least report staleness.
-3. **Bit widths 2–4 only.** 1-bit is deliberately excluded: at 1 bit the
-   renormalization trick degenerates and RaBitQ-style sign coding with an
-   explicit error term is the better design. Not implemented.
+3. **Bit widths 2–4 only.** 1-bit is deliberately excluded, and pg_turbovec's
+   v2.6.0/v2.7.0 sign-BQ work (2026-09-08) supports that while adding three
+   constraints worth adopting now rather than rediscovering:
+
+   - **Raw sign-BQ fails outright on some corpora**: they measured
+     **GIST R@10 = 0.0** until the per-dimension corpus mean was subtracted before
+     taking the sign. So 1-bit is not "4-bit but smaller"; it needs its own
+     centering step and its own correctness argument.
+   - **BQ cells must live in the RAW L2-normalised space, not the rotated space.**
+     A sign code is the sign of a component, and probing rotated-space centroids
+     with un-rotated codes (or the reverse) "probes the wrong cells and collapses
+     recall". This is a direct constraint on §8a: our IVF clusters the warp, and
+     §3 rotates before quantizing, so **if 1-bit is ever added the IVF centroids
+     for it must be trained un-rotated** — a different structure from the
+     TurboQuant centroids, not a shared one. Worth writing down before V9 rather
+     than after.
+   - **No recall/latency/QPS number exists for BQ yet.** Their own docs say it
+     "still needs a real-corpus run". Their 1-bit is correctness-proven, not
+     performance-proven, so it is not evidence for adopting it here.
 4. **No near-lossless mode without the rerank sidecar**, which costs the storage
    win it exists to preserve.
 5. **L1 distance has no useful compressed-domain bound** — the quantizer is built
