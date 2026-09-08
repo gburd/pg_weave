@@ -211,9 +211,16 @@ fundamental and no amount of engineering removes them; they are knobs, not bugs.
    the index rather than merely idle, and `weave_check()` returning something a
    DBA can act on.
 
+5. **No parallel ranked scan.** Not merely unbuilt — measured and rejected. pg_fts
+   built a complete parallel ranked CustomScan, verified it byte-exact, and reverted
+   it: Amdahl p=0.88 caps an 8-worker best case at 8.3 ms against a competitor's
+   2.12 ms, `nsegments=1` is enforced by insert-time tiered merge so per-segment
+   parallelism divides by one, and workers refused to launch from inside
+   `ExecCustomScan`. A competitor that *can* parallelize therefore keeps an
+   advantage on scan-bound queries that pg_weave cannot answer with more CPUs.
+
 Not fundamental, merely unbuilt, and tracked in `doc/PHASES.md`:
-pg_fts's common-term ranked latency (74.7 ms vs pg_search's 2.27 ms at 2.19M
-docs — decode-bound, wants impact-ordered postings); single-threaded merge;
+pg_fts's common-term ranked latency (decode-bound, wants impact-ordered postings);
 pg_tre's build wall (dissolves under §7); the RRF over-fetch (dissolves under
 §6).
 
