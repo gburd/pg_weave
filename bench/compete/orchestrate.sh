@@ -40,6 +40,11 @@ REGION=$(aws configure get region --profile "$PROFILE")
 # pg_turbovec's competitive vector runs used.
 ITYPE_LEXICAL=${ITYPE_LEXICAL:-r6id.4xlarge}
 ITYPE_VECTOR=${ITYPE_VECTOR:-i4i.8xlarge}
+# DO_PROFILE, deliberately NOT named PROFILE: line 27 already binds PROFILE to the
+# AWS profile name, so a PROFILE=1 knob silently never fired AND, once "fixed" by
+# exporting it, would have clobbered the AWS profile and broken every aws call in
+# this script.  Exported so the backgrounded per-engine function sees it.
+export DO_PROFILE=${DO_PROFILE:-0}
 SAMPLES=${SAMPLES:-200}
 WARMUP=${WARMUP:-10}
 
@@ -247,8 +252,11 @@ run_engine() {
         # Optional extra phases, per-engine.  PROFILE=1 runs the build profiler,
         # which rebuilds the index several times and so must never run inside a
         # measurement pass.
-        if [ "${PROFILE:-0}" = 1 ]; then
-            "${sh[@]}" "bash ~/compete/engines/$e.sh profile" 2>&1 || echo "profile unsupported for $e"
+        echo "DO_PROFILE=$DO_PROFILE (1 enables the build profiler)"
+        if [ "$DO_PROFILE" = 1 ]; then
+            echo "=== running build profiler for $e ==="
+            "${sh[@]}" "bash ~/compete/engines/$e.sh profile" 2>&1 \
+                || echo "profile FAILED or unsupported for $e"
         fi
     } >"$log" 2>&1
     local rc=$?
