@@ -163,7 +163,7 @@ print(json.dumps({
   # Same fingerprint expression as every other arm, byte for byte.  The analyzer
   # fails the whole run if the values differ, which is the mechanical form of the
   # check whose absence forced the 5-way retraction (title||body vs body alone).
-  "fingerprint_sql": "SELECT md5(string_agg(content, E'\\n' ORDER BY id)) FROM docs",
+  "fingerprint_sql": "SELECT md5(string_agg(h, '' ORDER BY id)) FROM (SELECT id, md5(content) AS h FROM docs) t",
   "index_size_sql": "SELECT pg_relation_size('docs_bm25')",
   "queries": q}, indent=1))
 PY

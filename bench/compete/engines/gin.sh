@@ -183,7 +183,7 @@ print(json.dumps({
   # The cross-host corpus assertion.  The analyzer fails the entire run if two
   # engines disagree here; that is how the retracted 5-way (title||body vs body)
   # would have been caught on the day instead of a month later.
-  "fingerprint_sql": "SELECT md5(string_agg(content, E'\\n' ORDER BY id)) FROM docs",
+  "fingerprint_sql": "SELECT md5(string_agg(h, '' ORDER BY id)) FROM (SELECT id, md5(content) AS h FROM docs) t",
   "index_size_sql": "SELECT pg_relation_size('docs_gin')",
   "queries": q}, indent=1))
 PY
