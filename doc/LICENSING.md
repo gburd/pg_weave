@@ -26,10 +26,12 @@ engine with its own storage — the answer is no, even if it is faster.
 | Lexical channel: FOR codec, dictionary, block-max WAND, BM25/BM25F, positions, phrase/NEAR | `include/weave/{for,am,weave,docvalid}.h`, `src/query/{parse,doc,rank,analyze,tsanalyze,match}.c` | pg_fts 1.5.8 | **PostgreSQL** | forked wholesale |
 | Vocabulary trigram map, bounded Levenshtein automaton | `src/query/{trgm,lev}.c` | pg_fts 1.5.8 | **PostgreSQL** | forked wholesale |
 | Sparsemap (succinct bitmap, used for tombstones and trigram postings) | `src/util/sparsemap.c`, `include/weave/sparsemap_impl.h` | vendored in pg_fts; upstream v5.4.0 | **MIT**, © 2024 Gregory Burd | vendored, symbols namespaced |
-| SuRF trie, universal-Levenshtein expansion, regex AST, trigram tiling, LIKE translation, pattern cache, UTF-8 helpers | `src/query/{surf,uleven,regex_ast,tiling,like_translate,pattern_cache,regex_grammar,regex_tokens,re_match,trgm_similarity,extract,parser}.c`, `include/weave/{surf,uleven,regex_ast,tiling,like_translate,pattern_cache,re_match,utf8,popcount,hash}.h` | pg_tre 3.2.1, commit `e03d6a83` | **MIT** → relicensed | imported and renamed; **not yet wired into the build** |
+| SuRF trie, universal-Levenshtein expansion, regex AST, trigram tiling, LIKE translation, pattern cache, UTF-8 helpers | `src/query/{surf,uleven,regex_ast,tiling,like_translate,pattern_cache,regex_grammar,regex_tokens,re_match,trgm_similarity,extract,parser,hash}.c`, `src/util/utf8.c`, `include/weave/{surf,uleven,regex_ast,tiling,like_translate,pattern_cache,re_match,utf8,popcount,hash}.h` | pg_tre 3.2.1, commit `e03d6a83` | **MIT** → relicensed | imported and renamed; in `OBJS` since 0.5.0 (Z1/Z2), channel not yet reachable |
+| Approximate/regex matcher behind the fuzzy channel's verification step | `vendor/tre/**` | laurikari/tre, commit `d0e0c997336b3210f05b3e1daa7bb5cb9900d274` (`v0.8.0-145-gd0e0c99`, version string 0.9.0) | **BSD-2**, © 2001–2009 Ville Laurikari | vendored in-tree, one local patch, symbols **not** renamed — see below |
 | Vector quantizer: rotation, Lloyd–Max codebook, encode/decode, packing | `include/weave/quantize.h`, `src/vector/{quantize,pack}.c` | turbovec 1.0.0 | **MIT** | **reimplemented in C**, not ported |
 | Vamana graph over quantized codes; filter pushed into traversal; runtime ISA dispatch; multi-modal plan operators | `include/weave/graph.h`, `src/vector/graph.c` | pg_turbovec 2.1.0 (Apache-2.0), zvec (Apache-2.0) | — | **ideas only, no code** |
 | Fused-threshold top-k | `include/weave/{channel,fuse}.h`, `src/am/fuse.c` | new | PostgreSQL | written for pg_weave |
+| Fuzzy-channel GUCs and the TRE compile/match wall-clock deadlines | `include/weave/regex.h`, `src/query/fuzzy_guc.c` | new (replaces pg_tre's unimported `src/module.c`) | PostgreSQL | written for pg_weave |
 
 ### pg_fts — no issue
 
@@ -87,29 +89,98 @@ lexical, and scalar recall as interchangeable plan operators under one optimizer
 Ideas are not copyrightable; implementations are. Where an idea is used, the spec
 cites zvec so the lineage is visible.
 
-## Third-party code to be vendored
+### TRE — BSD-2, vendored in-tree at Z1
 
-### TRE (task Z1, not yet present)
+The fuzzy channel's final verification step needs a real approximate-regex
+matcher. `src/query/re_match.c` (imported from pg_tre) is glue for **TRE**,
+`https://github.com/laurikari/tre`. TRE is **2-clause BSD**, compatible with the
+PostgreSQL License, and requires only that the copyright notice be preserved:
+it is `vendor/tre/LICENSE`, byte-identical to upstream's.
 
-The fuzzy channel's final verification step needs a real regex matcher.
-`src/query/re_match.c` (imported from pg_tre) is glue for **TRE**,
-`https://github.com/laurikari/tre`, which pg_tre vendors as a git submodule
-pinned at `d0e0c99…`. TRE is **2-clause BSD**, which is compatible with the
-PostgreSQL License and requires only that the copyright notice be preserved.
+Recorded for Z1:
 
-When Z1 lands, this section must record: the pinned commit, the BSD-2 text
-included verbatim under `vendor/tre/`, and the local patch adding the
-progress/deadline hooks (`tre_progress_check`, `tre_compile_progress_check` —
-kept unrenamed precisely because they cross the vendored library's ABI boundary).
+| what | value |
+|---|---|
+| upstream | `https://github.com/laurikari/tre` |
+| pinned commit | `d0e0c997336b3210f05b3e1daa7bb5cb9900d274` (`git describe`: `v0.8.0-145-gd0e0c99`; `configure.ac` says `AC_INIT([TRE], [0.9.0])`) |
+| license | 2-clause BSD, © 2001–2009 Ville Laurikari, verbatim in `vendor/tre/LICENSE` |
+| how incorporated | **copied in-tree, not a submodule** |
+| local patch | `vendor/tre/patches/tre-progress-hook.patch`, **already applied** to the copied sources |
 
-### Lime (probably not needed)
+**Copied, not a submodule, and not built by autotools.** pg_tre carries TRE as a
+git submodule and runs `autoreconf && ./configure && make` on it from its own
+Makefile. pg_weave does neither. A submodule-free tree is a property this
+project already relies on (`nix build` only sees git-tracked files; a source
+tarball from `git archive` is complete), and an autotools sub-build inside a
+PGXS build is a second toolchain in the critical path. Instead the eleven
+`.c` files of `libtre_la_SOURCES` (with `TRE_APPROX` on) are compiled as
+ordinary translation units by `OBJS`, and the two headers `./configure` would
+have generated are checked in as **generated files with their provenance**
+(rule 5 below):
 
-pg_tre also vendors `lime`, an LALR parser generator (same author,
+- `vendor/tre/local_includes/tre-config.h` — the feature macros `<tre.h>` needs
+- `vendor/tre/config.h` — the rest of what `lib/*.c` consult
+
+Both say at the top that they are pg_weave's, not upstream's, and both explain
+each non-obvious setting. Two are worth naming here: `TRE_USE_ALLOCA` is
+**off**, because upstream's `alloca()` path sizes one stack allocation from the
+compiled NFA and the input length, which in a backend is an unbounded stack
+overrun rather than an `ereport`; and `HAVE_GETTEXT` is off, so there is no
+libintl link dependency. `vendor/tre/lib/xmalloc.c`, `lib/tre-filter.c`,
+`local_includes/regex.h`, and everything under `src/`, `utils/`, `tests/`,
+`po/`, `python/`, `win32/`, and `doc/` are **not** copied: they are upstream's
+malloc-debugging shim, an unused filter engine, the system-ABI `regex.h`
+alias header, and the `agrep` tool / test suite / NLS catalogues. Only the
+include paths of the vendored TUs and of `src/query/re_match.c` carry
+`vendor/tre`, so a bare `tre.h` or `config.h` can never shadow a PostgreSQL
+header elsewhere in the build.
+
+**The local patch, and why two symbols keep their `tre_` names.**
+`vendor/tre/patches/tre-progress-hook.patch` injects periodic calls to two
+hooks into upstream's compile and match loops — `tre_compile_progress_check()`
+in `lib/tre-compile.c` and `tre_progress_check()` in `lib/tre-match-approx.c`,
+`lib/tre-match-backtrack.c`, `lib/tre-match-parallel.c` — declared there as
+plain externs (`__attribute__((weak))` with a no-op default in the two files
+that own them, so upstream still links standalone). The strong definitions are
+in `src/query/re_match.c`, which must not include `postgres.h`; they forward to
+the wall-clock deadline hooks in `src/query/fuzzy_guc.c`.
+
+These two names are the **only** identifiers in the imported pg_tre code that
+were deliberately left unrenamed (EXCEPTION 2 in `doc/specs/IMPORT_pg_tre.md`).
+They cross the vendored library's ABI boundary: `vendor/tre` references them by
+name, through no header pg_weave controls. Renaming them would still compile
+and still link — the weak defaults satisfy the vendored call sites — and would
+silently disable both timeouts, which is the failure mode this project cares
+about most: no fixed-output test can see a missing timeout.
+
+The patch is checked in *already applied*, so the tree builds with no patch
+step. It is kept alongside as provenance: `patch -R -p1 < patches/tre-progress-hook.patch`
+inside `vendor/tre` reproduces pristine upstream for the four touched files, and
+`git diff` against a fresh checkout of `d0e0c99` then shows nothing. It differs
+from pg_tre's copy only in comment text (`pg_tre` → `pg_weave`, and the pointer
+to the strong definitions now reads `src/query/re_match.c`); every code line and
+both symbol names are identical.
+
+### Lime — not vendored; `regex_grammar.c` is a checked-in generated artifact
+
+pg_tre also vendors `lime`, an LALR(1) parser generator (same author,
 `codeberg.org/gregburd/lime`), used to generate `regex_grammar.c`. The generated
-file and its `.y` source are imported. Lime is a **build-time** tool, so it is
-needed only to regenerate the parser, not to build pg_weave. Decide at Z1 whether
-to vendor it or to treat `regex_grammar.c` as a checked-in generated artifact with
-documented regeneration instructions. Prefer the latter: fewer submodules.
+file and its `.y` source are both imported. Lime is a **build-time** tool, so it
+is needed only to regenerate the parser, not to build pg_weave.
+
+Decided at Z1: **do not vendor it.** `src/query/regex_grammar.c` and `.h` are
+treated as checked-in generated artifacts, marked `linguist-generated` in
+`.gitattributes`, next to their source `src/query/regex_grammar.y`. To
+regenerate, build Lime out of tree and run what pg_tre's Makefile runs:
+
+```sh
+lime -q -T<lime>/limpar.c -dsrc/query src/query/regex_grammar.y
+```
+
+The cost of the choice, stated plainly: a grammar change is not a one-command
+operation for someone who does not already have Lime. That is the right trade
+while the grammar is frozen, and it buys a tree with no submodules and no
+second code generator in the build.
 
 ## Rules for contributions
 

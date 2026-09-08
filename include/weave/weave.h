@@ -27,6 +27,14 @@
 #include "varatt.h"
 
 /*
+ * Fuzzy/regex/prefix channel GUCs and the TRE compile/match deadline
+ * helpers.  The files imported from pg_tre (uleven.c, tiling.c, extract.c,
+ * pattern_cache.c, trgm_similarity.c) reach them through this header, which
+ * is how pg_tre's own pg_tre.h was laid out.
+ */
+#include "weave/regex.h"
+
+/*
  * wdoc -- an analyzed document.
  *
  * A varlena holding a sorted, de-duplicated array of terms.  Each term entry

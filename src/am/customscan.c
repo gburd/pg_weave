@@ -415,6 +415,10 @@ _PG_init(void)
 	weave_init_reloptions();
 	RegisterCustomScanMethods(&weave_count_scan_methods);
 
+	/* Fuzzy/regex channel GUCs (src/query/fuzzy_guc.c).  Registered here because
+	 * this is the module's single documented entry point; see that file's note. */
+	pg_weave_init_fuzzy_guc();
+
 	/*
 	 * Cap (in MB) on the total index size for which an index BUILD finalizes to
 	 * a single optimal segment.  Above this, the build stops at a bounded,

@@ -1,9 +1,12 @@
 # Importing pg_tre's fuzzy/regex/prefix query-compilation subsystem
 
-Status: files imported, **not wired into the build**.  Owner of Makefile
-`OBJS`, the access method, and SQL catalog entries is a separate task/agent.
-It is expected that this code does not compile yet -- see "Wiring TODO"
-below.
+Status: files imported **and compiling**, channel **not reachable**.  Tasks
+Z1/Z2 (pg_weave 0.5.0) vendored TRE, defined the missing GUCs and deadline
+helpers, and put every imported file in `OBJS` / `meson.build`.  Nothing in
+the access method, the opclasses, or the planner calls any of it yet, and no
+SQL-visible function is declared -- that is Z3 onward.  A compiling, linked,
+unreachable channel is the intended Z1/Z2 milestone.  See "Wiring TODO"
+below for what is done and what remains.
 
 ## Source
 
@@ -43,6 +46,7 @@ below.
 | `include/pg_tre/utf8.h` | `include/weave/utf8.h` |
 | `include/pg_tre/popcount.h` | `include/weave/popcount.h` |
 | `include/pg_tre/hash.h` | `include/weave/hash.h` |
+| `src/util/hash.c` | `src/query/hash.c` (**added in Z1**, see below) |
 | `src/util/pattern_cache.c` | `src/query/pattern_cache.c` |
 | `include/pg_tre/pattern_cache.h` | `include/weave/pattern_cache.h` |
 | `src/query/tre_grammar.y` | `src/query/regex_grammar.y` |
@@ -54,6 +58,23 @@ below.
 | `src/query/trgm_similarity.c` | `src/query/trgm_similarity.c` |
 | `src/query/extract.c` | `src/query/extract.c` |
 | `src/query/parser.c` | `src/query/parser.c` |
+
+**`hash.c` was missing from the original import.** `include/weave/hash.h`
+came across but `src/util/hash.c` did not, leaving
+`pg_weave_hash_trigram_cp()` declared and undefined.  Nothing noticed,
+because no imported file was compiled.  The moment Z1 put them in `OBJS`
+the extension still *linked* -- a shared library may carry unresolved
+symbols -- and then failed at `CREATE EXTENSION` with
+
+```
+could not load library ".../pg_weave.so": undefined symbol: pg_weave_hash_trigram_cp
+```
+
+Z1 imported it to `src/query/hash.c` (`src/query/` is where the other two
+relocated `src/util/` files went) with the same rename rules.  It is
+25 lines of murmurhash32/hash_combine over three codepoints; the hash
+values it produces are on-disk-visible once the SuRF/trigram structures
+are written in Z3, so it must not be "improved" casually.
 
 `parser.c` and the grammar source were both present in pg_tre and are
 imported: `src/query/tre_grammar.y` is the LALR(1) grammar (Lime input,
@@ -206,25 +227,36 @@ the 24 imported files reference sparsemap at all (`popcount.h` is
 pg_tre's *own* copy of a popcount fallback, used independently of
 sparsemap's bundled one). pg_tre's sparsemap was **not** imported.
 
-## Vendored TRE (not imported this task)
+## Vendored TRE (done in Z1)
 
-TRE itself (`laurikari/tre`) is a git submodule in pg_tre at
-`vendor/tre`, pinned to `d0e0c997336b3210f05b3e1daa7bb5cb9900d274`, under
-the 2-clause BSD license. It is **not** imported by this task -- only
-recorded here. To make `src/query/re_match.c` (and therefore
-`pattern_cache.c`, `trgm_similarity.c`'s indirect callers, etc.) compile,
-whoever wires the build must:
-1. Vendor TRE into pg_weave (submodule or vendored copy) at the same pin
-   or later, under its own BSD license notice.
-2. Re-apply the equivalent of `patches/tre-progress-hook.patch` (or a
-   pg_weave-specific version of it) to `lib/tre-compile.c`,
-   `lib/tre-match-approx.c`, `lib/tre-match-backtrack.c`,
-   `lib/tre-match-parallel.c` so the weak symbols
-   `tre_progress_check`/`tre_compile_progress_check` exist for
-   `re_match.c` to override.
-3. Expose `tre.h` and `tre-internal.h` on the include path used to build
-   `src/query/re_match.c` (it deliberately does not include
-   `postgres.h`).
+TRE itself (`laurikari/tre`) is a git submodule in pg_tre at `vendor/tre`,
+pinned to `d0e0c997336b3210f05b3e1daa7bb5cb9900d274`, under the 2-clause
+BSD license.  **Z1 copied it in-tree** at that same pin, to
+`pg_weave/vendor/tre` -- not as a submodule.  All three prerequisites for
+`src/query/re_match.c` are satisfied:
+
+1. Vendored: the eleven `libtre_la_SOURCES` files (with `TRE_APPROX` on)
+   plus the `lib/*.h` internal headers and `local_includes/tre.h`, under
+   `vendor/tre/LICENSE`.  They are compiled as ordinary translation units
+   from `OBJS` (`TRE_OBJS`); there is no autotools sub-build, so the two
+   headers `./configure` would have generated are checked in:
+   `vendor/tre/local_includes/tre-config.h` and `vendor/tre/config.h`.
+2. Patched: `vendor/tre/patches/tre-progress-hook.patch` is checked in
+   **already applied**, so `tre_progress_check` and
+   `tre_compile_progress_check` exist as weak symbols in
+   `lib/tre-compile.c` / `lib/tre-match-{approx,backtrack,parallel}.c`
+   and `re_match.c`'s strong definitions win at link time.  Verified by
+   installing an always-abort hook and observing both a refused compile
+   and `WeaveMatchResult.timed_out`, not just by reading the patch.
+3. Include path: `TRE_CPPFLAGS` in the Makefile puts `vendor/tre`,
+   `vendor/tre/lib` and `vendor/tre/local_includes` on the command line
+   for `re_match.o` and for the vendored TUs **only** -- deliberately not
+   globally, so TRE's bare `tre.h` and `config.h` cannot shadow a
+   PostgreSQL header anywhere else.
+
+Provenance, the exact pin, the reason for copying instead of
+submoduling, and the reason those two symbols keep their `tre_` names are
+in `doc/LICENSING.md`.
 
 ## Deliberately NOT imported
 
@@ -263,63 +295,76 @@ has its own segment-based storage engine forked from pg_fts:
 
 ## Wiring TODO
 
-These files are self-consistent internally but reference external
-symbols/headers that do not yet exist anywhere in pg_weave. Whoever wires
-the build owns adding these (to `weave.h`, a new module-init file, and
-the Makefile/meson build):
+### Resolved in Z1/Z2 (pg_weave 0.5.0)
 
-- **GUCs** (referenced, not declared):
-  - `extern int pg_weave_max_nfa_states;` -- used in `pattern_cache.c` to
-    cap compiled-NFA size (was `pg_tre.max_nfa_states`).
-  - `extern int pg_weave_max_extraction_fanout;` -- used in `extract.c`
-    and `tiling.c` to cap universal-Levenshtein/tiling fanout (was
-    `pg_tre.max_extraction_fanout`).
-  - `extern double pg_weave_similarity_threshold;` -- used in
-    `trgm_similarity.c`'s `%`/`word_similarity`/`strict_word_similarity`
-    operators (was `pg_tre.similarity_threshold`, pg_trgm-compatible
-    default `0.3`).
-  - A `pg_weave.compile_timeout_ms` GUC is implied by
-    `pg_weave_arm_compile_deadline(int timeout_ms)` below (pg_tre's
-    default: arm with `0` meaning "use the GUC's configured value").
-- **Compile-deadline helpers** (declared in pg_tre.h, defined in
-  module.c; neither imported):
-  - `extern void pg_weave_arm_compile_deadline(int timeout_ms);`
-  - `extern void pg_weave_disarm_compile_deadline(void);`
-  - `extern void pg_weave_check_compile_timeout(void);` (raises
-    `ereport(ERROR)` with a timeout-specific message if the deadline
-    fired; called from `pattern_cache.c` right after compile.)
-  - These three are used inside a `PG_TRY/PG_FINALLY` in
-    `weave_cache_lookup_internal()` (`src/query/pattern_cache.c`).
-- **Match-deadline / progress-hook wiring** (declared in `re_match.h`,
-  not called anywhere in the imported set -- must be invoked by whatever
-  code path calls `weave_do_match()`):
-  - `WeaveProgressHook weave_set_progress_hook(WeaveProgressHook hook);`
-  - `WeaveProgressHook weave_set_compile_progress_hook(WeaveProgressHook hook);`
-  - A caller needs to install a hook (backed by a wall-clock deadline,
-    e.g. driven off `pg_weave.match_timeout_ms`) before calling
-    `weave_do_match()`, and inspect `WeaveMatchResult.timed_out` /
-    `ereport(ERROR)` on timeout, mirroring pg_tre's (unimported)
-    `pg_tre_arm_match_deadline`/`pg_tre_check_match_timeout`/
-    `pg_tre_disarm_match_deadline` triad.
-- **`weave/weave.h` additions**: none of the above GUCs/helpers exist in
-  `include/weave/weave.h` today; they need to be added there (or to a new
-  `include/weave/regex.h`) so `#include "weave/weave.h"` in `uleven.c`,
-  `tiling.c`, `pattern_cache.c`, `trgm_similarity.c`, and `extract.c`
-  resolves.
-- **Vendored TRE**: see "Vendored TRE" section above --
-  `src/query/re_match.c` needs `tre.h`/`tre-internal.h` on its include
-  path and a linkable `libtre` (or equivalent object files) providing
-  `tre_regncomp`, `tre_reganexec`, `tre_regfree`, `tre_regerror`,
-  `tre_regaparams_default`, plus the two weak-symbol hooks.
+- ~~**GUCs** (referenced, not declared)~~ -- all five are defined in
+  **`src/query/fuzzy_guc.c`** and declared in the new
+  **`include/weave/regex.h`**, which `include/weave/weave.h` includes so
+  the imported files' `#include "weave/weave.h"` resolves unchanged:
+
+  | GUC | C variable | default | range |
+  |---|---|---|---|
+  | `pg_weave.max_extraction_fanout` | `pg_weave_max_extraction_fanout` | 4096 | 1 .. 65536 |
+  | `pg_weave.max_nfa_states` | `pg_weave_max_nfa_states` | 10000 | 32 .. 1000000 |
+  | `pg_weave.compile_timeout_ms` | `pg_weave_compile_timeout_ms` | 1000 | 1 .. 600000 |
+  | `pg_weave.match_timeout_ms` | `pg_weave_match_timeout_ms` | 1000 | 1 .. 600000 |
+  | `pg_weave.similarity_threshold` | `pg_weave_similarity_threshold` | 0.3 | 0.0 .. 1.0 |
+
+  Defaults and ranges are pg_tre's, and `similarity_threshold`'s default
+  is pg_trgm's, so a query ported from either behaves the same.
+- ~~**Compile-deadline helpers**~~ -- `pg_weave_arm_compile_deadline`,
+  `pg_weave_disarm_compile_deadline` and `pg_weave_check_compile_timeout`
+  are in `src/query/fuzzy_guc.c`; `pattern_cache.c`'s existing
+  `PG_TRY`/`PG_FINALLY` compiles and links against them unmodified.
+- ~~**Match-deadline / progress-hook wiring**~~ -- the mirror triad
+  `pg_weave_arm_match_deadline` / `pg_weave_disarm_match_deadline` /
+  `pg_weave_check_match_timeout(const struct WeaveMatchResult *)` is in
+  the same file, installing `weave_set_progress_hook`.  Still **nobody
+  calls it**, because nothing calls `weave_do_match()` yet; the channel
+  code that does (Z4) must arm around the call and pass the result to
+  `pg_weave_check_match_timeout()`.  A timed-out match reported as a
+  no-match silently drops rows, which no fixed-output test can catch.
+- ~~**`weave/weave.h` additions**~~ -- done via `weave/regex.h`, not by
+  growing `weave.h` itself.
+- ~~**Vendored TRE**~~ -- see "Vendored TRE (done in Z1)" above.
+- ~~**Build wiring**~~ (the *compile* half) -- all fourteen fuzzy TUs
+  (`fuzzy_guc`, `surf`, `uleven`, `regex_ast`, `regex_grammar`,
+  `regex_tokens`, `parser`, `extract`, `tiling`, `like_translate`,
+  `pattern_cache`, `trgm_similarity`, `re_match`, and `src/util/utf8.c`)
+  are in the Makefile `OBJS` via `FUZZY_OBJS`, and in `meson.build`.
+  They are ordinary translation units: unlike `amscan.c`, `lev.c` and
+  `trgm_page.c` they must **not** be `#include`d into `src/am/am.c`, and
+  `make check-unity` enforces that boundary from the other side.
+
+### Still open
+
+- **GUC registration is not yet in `_PG_init()`.** The one `_PG_init()`
+  pg_weave has lives in `src/am/customscan.c`, which Z1/Z2 could not
+  touch.  `pg_weave_init_fuzzy_guc()` is therefore called from a
+  module-load constructor in `src/query/fuzzy_guc.c`.  It works, and it
+  is idempotent, but it is the wrong mechanism: not the documented
+  extension entry point, running before the `PG_MODULE_MAGIC` check, and
+  unavailable under MSVC -- so the meson/Windows build registers no fuzzy
+  GUCs at all.  The fix is one line in `_PG_init()`:
+
+  ```c
+  pg_weave_init_fuzzy_guc();
+  ```
+
+  then delete the constructor block.
+- **Nothing calls the channel.** No access method, opclass, or planner
+  path references `weave_tile_query`, `regex_extract_query`,
+  `pg_weave_surf_*`, `weave_cache_lookup*`, `pg_weave_like_to_regex`.
+  Because the whole build is LTO'd, the linker dead-strips almost all of
+  it out of `pg_weave.so` -- which is the expected observation at this
+  milestone, not a build failure.  Z3 onward.
+- **No SQL-visible functions.** `trgm_similarity.c`'s
+  `pg_weave_trgm_similarity` / `pg_weave_word_similarity` /
+  `pg_weave_trgm_sim_op` and friends have their `PG_FUNCTION_INFO_V1`
+  records but no `CREATE FUNCTION`; `sql/pg_weave--0.4.0--0.5.0.sql` is
+  deliberately DDL-free and says so.
 - **Generated-parser toolchain**: `src/query/regex_grammar.c`/`.h` are
-  Lime output; if `regex_grammar.y` ever needs to change, Lime
-  (`vendor/lime` in pg_tre, not vendored here) must be vendored or the
-  generated files hand-patched.
-- **Build wiring** (explicitly out of scope for this task, listed for the
-  owning agent): none of the 24 new files are in any `OBJS`/meson source
-  list, no access method references `weave_tile_query`/
-  `regex_extract_query`/`pg_weave_surf_*`/`weave_cache_lookup*`/
-  `pg_weave_like_to_regex` etc., and no SQL-visible functions
-  (`pg_weave_trgm_similarity`, `pg_weave_word_similarity`,
-  `pg_weave_trgm_sim_op`, etc. in `trgm_similarity.c`) are declared in
-  `sql/pg_weave--0.1.0.sql` or `pg_weave.control`.
+  Lime output and are marked `linguist-generated`.  Lime is not vendored
+  (decided at Z1, see `doc/LICENSING.md`); changing `regex_grammar.y`
+  means building Lime out of tree.  Do not hand-edit the generated
+  files.
