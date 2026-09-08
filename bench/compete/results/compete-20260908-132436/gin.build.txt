@@ -1,0 +1,3 @@
+223.214700136
+reloptions: fastupdate=on gin_pending_list_limit=4MB (defaults)
+pending_pages=unknown (pageinspect unavailable)

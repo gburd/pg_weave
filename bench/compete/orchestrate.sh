@@ -204,8 +204,19 @@ run_engine() {
         # Ship the harness and this engine's script.
         tar -C "$ROOT/bench/compete" -cf - lib engines corpus 2>/dev/null \
             | "${sh[@]}" 'mkdir -p ~/compete && tar -xf - -C ~/compete'
-        tar -C "$ROOT" -cf - --exclude=.git --exclude='bench/compete/results' . \
-            | "${sh[@]}" 'mkdir -p ~/pg_weave && tar -xf - -C ~/pg_weave'
+        # Build artifacts MUST be excluded, and the host MUST clean before building.
+        #
+        # Without this the tar ships the workstation's *.o/*.so, `make` sees them
+        # newer than their sources and does not rebuild, and the remote link can
+        # combine objects from different revisions.  It happened: renaming the
+        # vendored sparsemap symbol prefix produced
+        # "undefined symbol: __pg_bm25_sm_contains" on a clean host while the
+        # incremental local build passed, because the stale callers still
+        # referenced the old name.  The benign outcome is a link error; the
+        # dangerous one is a successful link that MEASURES THE WRONG CODE.
+        tar -C "$ROOT" -cf - --exclude=.git --exclude='bench/compete/results' \
+            --exclude='*.o' --exclude='*.so' --exclude='*.bc' --exclude='results' . \
+            | "${sh[@]}" 'rm -rf ~/pg_weave && mkdir -p ~/pg_weave && tar -xf - -C ~/pg_weave'
         # Ship pg_fts from the workstation when it is present.  Cloning it on the
         # host would benchmark whatever upstream HEAD happens to be, which is not
         # the version this comparison claims to have measured.
