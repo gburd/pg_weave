@@ -243,10 +243,17 @@ run_engine() {
         # fast-but-wrong scalar fallback, later corrected to a 490x loss.
         "${sh[@]}" "bash ~/compete/engines/$e.sh gate" 2>&1 || echo "GATE FAILURES (recorded)"
         "${sh[@]}" "bash ~/compete/engines/$e.sh measure $SAMPLES $WARMUP $RUN" 2>&1
+
+        # Optional extra phases, per-engine.  PROFILE=1 runs the build profiler,
+        # which rebuilds the index several times and so must never run inside a
+        # measurement pass.
+        if [ "${PROFILE:-0}" = 1 ]; then
+            "${sh[@]}" "bash ~/compete/engines/$e.sh profile" 2>&1 || echo "profile unsupported for $e"
+        fi
     } >"$log" 2>&1
     local rc=$?
 
-    for f in raw.jsonl gates.jsonl hostinfo.txt build.txt; do
+    for f in raw.jsonl gates.jsonl hostinfo.txt build.txt build_phases.txt build_symbols.txt; do
         "${sh[@]}" "cat ~/compete/out/$f 2>/dev/null" > "$OUT/$e.$f" 2>/dev/null || true
     done
     [ -s "$OUT/$e.raw.jsonl" ] && say "$e: collected $(wc -l < "$OUT/$e.raw.jsonl") raw records" \
