@@ -153,7 +153,7 @@ These are absences rather than regressions, and they are larger than everything 
 | **G8** | **No fuzzy/regex channel.** | Sources imported from pg_tre, not compiled. Tasks Z1–Z9. |
 | **G9** | **No fused top-k.** | The headline differentiator. Specified, unimplemented. Phase F. |
 | **G10** | **No cost-model calibration.** | Directly caused G1's discovery being delayed and will cause more: with `amcanorderbyop` the planner is choosing between an index ordering scan and a Sort, and a wrong cost silently loses the index. Task P4. |
-| **G11** | **No parallel scan.** | `amcanparallel = false`. GIN's common-term advantage halves when parallelism is removed, i.e. GIN is currently *benefiting* from parallelism we cannot use. Fixing this would widen our common-term win further. |
+| ~~**G11**~~ | ~~No parallel scan~~ | **NOT A GAP — a permanent characteristic.** pg_fts built a complete parallel ranked CustomScan, verified it byte-exact, measured it and reverted it (`a513d13`). Amdahl p=0.88 caps W=8 at 8.3 ms best case against pg_search's 2.12 ms, `nsegments=1` is enforced by tiered merge so per-segment parallelism divides by one, and workers refused to launch from `ExecCustomScan` on EC2. Moved to `doc/ARCHITECTURE.md` §8. |
 
 ## 5. Plan, in dependency order
 

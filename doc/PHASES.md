@@ -8,6 +8,29 @@ much code exists.
 Read `doc/CONVENTIONS.md` before writing code and `doc/TESTING.md` before
 claiming a gate.
 
+## Two tasks are withdrawn on upstream evidence
+
+**L4 (parallel merge) and L11 (parallel scan) are withdrawn**, not deferred. Both
+were listed here as routes to G5 and G11 and both were quoted to the maintainer as
+candidates. pg_fts has since measured L4 (1.45× slower, 19% bloatier) and
+re-analysed L11 (already built and reverted, with an Amdahl ceiling that cannot
+close the gap). Carrying disproven work in a plan is worse than having a shorter
+plan, because it makes the remaining gap look addressable when it is not.
+
+The consequence for **G5 (build time, 11.0× behind pg_textsearch)** is that **L12 is
+now the only remaining route.** If L12 does not deliver, the honest position is that
+pg_weave builds more slowly than its competitors and that is the price of a
+compacted, smaller index — and the README should say so rather than implying a fix
+is pending.
+
+The consequence for **G11 (no parallel scan)** is that it is no longer a gap to
+close but a permanent characteristic, and it belongs in
+`doc/ARCHITECTURE.md` §8's list of things pg_weave loses.
+
+**Process change:** upstream is reviewed on every release, not on request. Both of
+these had been measured upstream before I quoted them as open work, and the phrase
+correctness bug ported in `c0d65a7` was live and default-on here for days.
+
 ## Ordering principle
 
 Channels land **one at a time, fully**, in the order of decreasing certainty:
@@ -57,14 +80,14 @@ cheapest wins available anywhere in this project.
 | L1 | Split the `src/am/am.c` unity build into `am.c` / `amscan.c` / `ambuild.c` / `amvacuum.c` with real prototypes in `include/weave/am.h` | — | `make check-unity` deleted; each TU compiles standalone; zero new warnings; regression byte-identical |
 | L2 | **Common-term ranked latency.** 74.7 ms at 2.19M docs vs pg_search's 2.27 ms. Root cause is decode-bound posting scan on high-df terms. Implement impact-ordered posting blocks (sort within block by descending tf) so block-max WAND can terminate on the first block. | `doc/specs/IMPACT_ORDERING.md` (write it) | common-term (df > 5% of corpus) ranked k=10 p50 ≤ 8 ms on the 2.19M Wikipedia corpus; rare/mid must not regress by >10% |
 | L3 | **Doclen sidecar per-scan tax.** The v4 sidecar buys 4.7× index size (1421 MB vs 6729 MB) but decodes the whole segment sidecar per scan, a fixed ~18 ms. Replace with a page-directory random-access cursor; the 1.5.8 fork has a partial version. | `doc/specs/DOCLEN_SIDECAR.md` (write it) | rare-term ranked k=10 p50 ≤ 2.5 ms **with** `doclen_sidecar=on`; index size within 10% of the sidecar-on size today |
-| L4 | **Parallel merge.** Build is 1091 s vs vchord's 57 s, dominated by single-threaded merge + vacuum compaction. | — | full build+merge+vacuum of the 2.19M corpus ≤ 300 s on a 16-vCPU host |
+| ~~L4~~ | ~~**Parallel merge.**~~ **WITHDRAWN 2026-09-08 — measured upstream and it is a loss.** pg_fts `fa4c15e`: on 2.19M docs an 8-segment 7,185 MB index merges in **230.6 s serial vs 333.5 s parallel (1.45× SLOWER)** and the parallel path emits a **19% LARGER** index (10,229 vs 8,606 MB). W=1 costs the same as W=3, so it is a fixed penalty for taking the path, not a scaling curve. Suspected cause: per-worker output streams pack pages independently. Also a trap worth knowing: at `max_parallel_maintenance_workers=8` the workers register, start and exit within ~2 ms so the merge silently runs SERIAL — the "fast" runs were the serial path. | — | withdrawn |
 | L5 | Positions default review. Phrase is 8500 ms with positions unbuilt vs pg_search's 24.84 ms. Decide and document whether `positions=on` becomes the default; measure the size cost on the same corpus. | — | a recorded decision in `bench/RESULTS_POSITIONS.md` with both numbers, and the default set accordingly |
 | L6 | Storage AIO: use `read_stream` for posting-page prefetch. Pointer-chained pages currently defeat readahead. | — | measurable p50 improvement on cold-cache common-term scan; no regression warm |
 | ~~**L7**~~ | **DONE 2026-09-06.** **Keyless ordering scan.** `ORDER BY d <=> q LIMIT k` with no `WHERE` must generate an index path. Today it silently falls back to Seq Scan + top-N Sort: measured 83 ms par4 / 362 ms serial vs **0.05 ms** for the supported form — a 7,000× cliff on the first query any user writes, because pgvector taught them that shape. `bench/RESULTS_LEXICAL.md` §Footgun, `doc/GAPS.md` G1. | `sql/orderby.sql` | **MET:** bare form produces `Index Scan ... Order By`; p50 **0.05 ms == the qualified form**; `@@@`-parity, boolean-structure, score-equality, and LIMIT-overrun assertions all hold |
 | ~~**L8**~~ | **DONE 2026-09-07.** **Deterministic index size.** A fresh `CREATE INDEX` measures 156 MB and the same index after `weave_merge` + `weave_vacuum` measures 115 MB — a 35% swing on whether an optional maintenance step ran. `doc/GAPS.md` G6. | — | **MET:** as-built 46 MB == compacted 46 MB, swing 0.0%; `weave_merge`/`weave_vacuum` both return false on a fresh build; `bench/lexical.sh` now aborts if either fails |
 | **L9** | **Attribute the fixed per-scan cost.** Rare-term ranked is 0.05 ms vs GIN's 0.03 ms and mid-term is 3.54 vs 2.06 — a 70× latency ratio across a 100× document ratio, consistent with a small fixed setup cost plus linear per-document work. Profile with `perf` on EC2 and attribute it **before** changing code. `doc/GAPS.md` G3/G4. | — | a recorded profile in `bench/RESULTS_SCAN_PROFILE.md` naming where the fixed cost goes |
 | ~~**L10**~~ | **DONE 2026-09-07.** **`weave_index_size_detail()`** — bytes per structure (dictionary, block index, postings, positions, doclen sidecar, livedocs, trigram) so the 1.7× size gap against GIN is attributed rather than guessed. `doc/GAPS.md` G2. | — | **MET:** function exists and sums to `pg_relation_size`; breakdown recorded. It also found that 70.7% of a fresh index was freed pages, which closed G2 as a *win* |
-| **L11** | **Parallel scan** (`amcanparallel`). GIN's common-term advantage halves when parallelism is removed, i.e. GIN currently benefits from parallelism pg_weave cannot use. `doc/GAPS.md` G11. | — | parallel ranked scan correct under `t/005`-style concurrency; measurable p50 improvement on common-term |
+| ~~**L11**~~ | ~~**Parallel scan.**~~ **WITHDRAWN 2026-09-08 — already built, measured and deliberately reverted upstream.** pg_fts `a513d13`: a complete parallel ranked CustomScan was built, verified byte-exact, measured and reverted (`bench/NOTE_PARALLEL_RANKED.md` opens with "built, measured, reverted"). Amdahl p=0.88 gives W=8 a best case of 8.3 ms (realistically ~11.8) against pg_search's 2.12 ms — about 4.4× of a ~17× gap for 8 CPUs, and the shipped `max_parallel_workers_per_gather=2` default would give users ~20 ms. Two further blockers surfaced on re-analysis: `nsegments=1` is ENFORCED by insert-time tiered merge and autovacuum compaction, so per-segment parallelism divides by one; and workers refused to launch from inside `ExecCustomScan` on EC2 (0 workers, silent serial fallback). | — | withdrawn |
 | **L12** | **Low-bias end-of-build merge.** L8's vacate+pack pass roughly doubles build write I/O, taking build from 12.6 s to 29.2 s against GIN's 11.7 s. Make the end-of-build merge allocate output pages from the low free region so the result is front-packed and a plain tail truncation suffices, removing the relocation pass. Viable because at end of build the freed inputs are ~70% of the file and the live output ~30%, so the low free region exceeds the live segment; `weave_vacuum_compact`'s two-phase relocation exists for the harder general case where it does not. `doc/GAPS.md` G5. | — | build ≤ 15 s on the 1M corpus with as-built size still 46 MB |
 | **L13** | **WAND initial-k.** DONE 2026-09-07: made `pg_weave.wand_initial_k` a GUC, swept 4..200 against `LIMIT` 10 and 100 across three df bands, set the default from the frontier (32, was 100). `LIMIT 10` 2.3× faster on rare; `LIMIT 100` 1.67–1.96× slower. `bench/RESULTS_WAND_K.md`. | `bench/RESULTS_WAND_K.md` | **MET** |
 | ~~**L14**~~ | **DONE 2026-09-08.** **Incremental WAND growth.** The k frontier is non-monotonic because each ×4 growth recomputes the whole pass from scratch: from k=16 a `LIMIT 100` query runs three complete passes (16, 64, 256), from k=32 two, from k=100 one. So the cost of a deep page is dominated by how many times the scan is redone, and the initial k is the wrong knob. Keep the accumulated heap and per-term cursor state across a growth so a recompute extends the previous pass. This should make a low initial k strictly better at every `LIMIT` instead of a trade, and is the cheaper of the two routes at G13. | `bench/RESULTS_L14_LONG.md` | **MET in substance:** the scan stopped discarding 3/4 of every over-fetched pass, so k-scaling went from 1.00 (flat for a bad reason — a LIMIT 10 paid for k=100) to 1.04–1.21 (flat for a good one — a LIMIT 100 is served by one pass). pg_weave now WINS k=100 rare by 2.46× and ties mid/common. The literal gate wording (`k=8` matching `k=100`) is moot: k ≤ 16 are indistinguishable because the over-fetch floor is Max(4k,64)=64, so the knob has no effect there |
