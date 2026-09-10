@@ -2845,8 +2845,19 @@ weave_doclen_cursor_load_page(WeaveDoclenCursor *c, BlockNumber blkno, uint64 do
 	if (ptr + sizeof(WeaveDoclenBlockHdr) <= end)
 	{
 		WeaveDoclenBlockHdr *bh0 = (WeaveDoclenBlockHdr *) ptr;
+		uint32		bcount0 = WEAVE_DOCLEN_COUNT(bh0->count);
 
-		r->pagefirst = ((uint64) bh0->first_docid_hi << 32) | bh0->first_docid_lo;
+		/* Same validation weave_doclen_resident_find_block() applies to every
+		 * block it walks (and that the page-directory builder applies above):
+		 * `count` carries the WEAVE_DOCLEN_ABS flag, so the raw field is not a
+		 * bare count, and an out-of-range value means a corrupt or foreign
+		 * page.  pagelast already gets this check for free by going through
+		 * weave_doclen_resident_find_block(); pagefirst read the header
+		 * directly and skipped it -- doc/CONVENTIONS.md's "every decoder
+		 * validates" applies here too, even though no crash or wrong nonzero
+		 * doclen was observed from the gap. */
+		if (bcount0 > 0 && bcount0 <= WEAVE_BLOCK_SIZE)
+			r->pagefirst = ((uint64) bh0->first_docid_hi << 32) | bh0->first_docid_lo;
 	}
 	if (lastblk != NULL)
 	{
@@ -2874,18 +2885,16 @@ weave_doclen_cursor_load_page(WeaveDoclenCursor *c, BlockNumber blkno, uint64 do
 	weave_doclen_cursor_relocate(r, docid);
 }
 
-/* The 8-step linear pre-bisect walk (below) only pays off when the target is
- * within its own window of the resume hint -- true for a common term whose
- * consecutive docids land in adjacent block positions.  A rare/mid term's
- * sparse stride (~50-200 docids) usually lands the target either in a
- * different block (caught before the walk runs at all, see
- * weave_doclen_cursor_lookup) or far past the hint WITHIN the block, so an
- * unconditional walk paid its whole window and then bisected anyway: ~15
- * weave_for_get calls per lookup measured for ranked mid k=10, against ~7 for
- * a plain bisect (bench/RESULTS_L17.md's follow-up 1).  This is the walk's
- * window width; the gate is "would `WEAVE_DOCLEN_WALK_WINDOW` index steps be
- * enough", checked with one O(1) read before committing to the walk. */
-#define WEAVE_DOCLEN_WALK_WINDOW	8
+/*
+ * The in-block gated walk-then-bisect (weave_doclen_walk_abs/_arr, called
+ * below) and its WEAVE_DOCLEN_WALK_WINDOW gate live in include/weave/for.h,
+ * not here -- pulled out to backend-independent code, alongside weave_for_get
+ * and weave_byte_to_doclen, specifically so test/hegel/test_doclen_block.c can
+ * link and property-test the SAME code this function calls instead of a hand
+ * transcription of it.  See that header's comment on the two functions for
+ * the full rationale and bench/RESULTS_L17.md's follow-up 1 for the
+ * measurement that motivated the gate.
+ */
 
 /* Exact doclen for docid via the page-directory cursor.  Robust to ANY docid
  * order; the ascending-resume hint makes the common monotone WAND scan land on
@@ -2967,110 +2976,19 @@ weave_doclen_cursor_lookup(WeaveDoclenCursor *c, uint64 docid)
 	 */
 	if (r->isabs)
 	{
-		int			rlo = 0,
-					rhi = r->n - 1;
-		int			i = r->hint;
-		uint64		want;
+		int			byte = weave_doclen_walk_abs(r->raw, r->rawbyte, r->base,
+												 r->n, docid, &r->hint);
 
-		/* offsets are relative to r->base; a docid below it cannot be here */
-		if (docid < r->base)
-			return 0;
-		want = docid - r->base;
-
-		if (i < 0 || i >= r->n)
-			i = 0;
-
-		if (r->n > 0)
-		{
-			uint64		v = weave_for_get(r->raw, i);
-
-			if (v <= want && want - v < WEAVE_DOCLEN_WALK_WINDOW)
-			{
-				int			lim = i + WEAVE_DOCLEN_WALK_WINDOW;
-
-				if (lim > r->n)
-					lim = r->n;
-				for (;;)
-				{
-					if (v == want)
-					{
-						r->hint = i + 1;
-						return weave_byte_to_doclen(r->rawbyte[i]);
-					}
-					if (v > want)
-						break;	/* overshot: docid is absent (gap) or behind us */
-					if (++i >= lim)
-						break;
-					v = weave_for_get(r->raw, i);
-				}
-			}
-		}
-
-		while (rlo <= rhi)
-		{
-			int			mid = (rlo + rhi) >> 1;
-			uint64		v = weave_for_get(r->raw, mid);
-
-			if (v < want)
-				rlo = mid + 1;
-			else if (v > want)
-				rhi = mid - 1;
-			else
-			{
-				r->hint = mid + 1;
-				return weave_byte_to_doclen(r->rawbyte[mid]);
-			}
-		}
+		if (byte >= 0)
+			return weave_byte_to_doclen((uint8) byte);
 	}
 	else
 	{
-		int			rlo = 0,
-					rhi = r->n - 1;
-		int			i = r->hint;
+		int			byte = weave_doclen_walk_arr(r->docid, r->byte, r->n,
+												 docid, &r->hint);
 
-		if (i < 0 || i >= r->n)
-			i = 0;
-
-		if (r->n > 0)
-		{
-			uint64		v = r->docid[i];
-
-			if (v <= docid && docid - v < WEAVE_DOCLEN_WALK_WINDOW)
-			{
-				int			lim = i + WEAVE_DOCLEN_WALK_WINDOW;
-
-				if (lim > r->n)
-					lim = r->n;
-				for (;;)
-				{
-					if (v == docid)
-					{
-						r->hint = i + 1;
-						return weave_byte_to_doclen(r->byte[i]);
-					}
-					if (v > docid)
-						break;	/* overshot: docid is absent (gap) or behind us */
-					if (++i >= lim)
-						break;
-					v = r->docid[i];
-				}
-			}
-		}
-
-		while (rlo <= rhi)
-		{
-			int			mid = (rlo + rhi) >> 1;
-
-			if (r->docid[mid] < docid)
-				rlo = mid + 1;
-			else if (r->docid[mid] > docid)
-				rhi = mid - 1;
-			else
-			{
-				r->hint = mid + 1;
-				return weave_byte_to_doclen(r->byte[mid]);
-			}
-		}
+		if (byte >= 0)
+			return weave_byte_to_doclen((uint8) byte);
 	}
 	return 0;
 }
