@@ -295,6 +295,37 @@ has its own segment-based storage engine forked from pg_fts:
 
 ## Wiring TODO
 
+### Upstream fixes carried in, and the half still owed
+
+- **pg_tre `4a9c86c` (SuRF prefilter returned zero rows for case-insensitive
+  patterns) — HALF PORTED 2026-09-10.** A `~*` / `ILIKE` scan on an anchored
+  prefix could return an EMPTY result set for a pattern with real matches:
+  silently, no error, no crash. `always_true` is set for the case-insensitive
+  strategies *because* the index stores trigrams case-sensitively, but the
+  anchored-prefix key range is derived from raw literal codepoints with no case
+  folding, so `name ~* '^GIT'` carried the key for `"GIT"` while the index
+  legitimately stored only `"git"`.
+  - **Ported:** the extraction guard in `src/query/extract.c` — no key range is
+    published once extraction has given up. Latent here (the channel is
+    unreachable) and fixed anyway, so the wiring cannot reinherit it.
+  - **STILL OWED, a Z7 requirement:** the scan-side prefilter must *also* refuse
+    to reject whenever `always_true` is set. Upstream fixed both sides
+    deliberately — "a range that exists is a range some future caller may
+    consult". Whoever writes the shuttle owes a regression test in the shape of
+    pg_tre's `test/sql/surf_prefix.sql`: a case-insensitive anchored pattern must
+    return the same rows via the index as via a seq scan.
+- **pg_tre `1521662` (vendor TRE → master `f864ed0`) — NOT PORTED, required
+  before Z is claimed.** `vendor/tre` here is pinned at `d0e0c997` (≈ v0.9.0).
+  Upstream's unreleased hardening includes a **crash on inputs past `INT_MAX`**
+  (`ad26b6d`; position data was `int` throughout), a **backref wrong answer**
+  (`2f7dcec`; backtracking restarted from the wrong position, so matches at later
+  start offsets were missed), hard `TRE_MAX_RE` / `TRE_MAX_STACK` limits with
+  exponential rather than linear stack growth, and a `sizeof(pointer)` allocation
+  bug. pg_tre has already rebased `patches/tre-progress-hook.patch` onto the new
+  tree and resolved the two conflicting hunks — reuse that work rather than
+  redoing it. Not urgent while the channel is unreachable; a blocker for shipping
+  it.
+
 ### Resolved in Z1/Z2 (pg_weave 0.5.0)
 
 - ~~**GUCs** (referenced, not declared)~~ -- all five are defined in
