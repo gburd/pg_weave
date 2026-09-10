@@ -291,4 +291,171 @@ weave_byte_to_doclen(uint8 b)
 	return (0x08u | mant) << (e - 1);	/* implicit leading 1, shift back */
 }
 
+/*
+ * Gated ascending-resume-hint walk over a doclen sidecar BLOCK, falling back
+ * to a bisect, in the two representations a resident block can be in (see
+ * WeaveDoclenResident in src/am/am.c):
+ *
+ *   weave_doclen_walk_abs() -- v5, absolute offsets from `base`, packed and
+ *   read in place with weave_for_get(), never unpacked;
+ *
+ *   weave_doclen_walk_arr() -- v4, gap-coded on disk but already unpacked and
+ *   prefix-summed into a plain ascending uint64 array by the caller.
+ *
+ * Both return the block's raw length BYTE (1..255; the caller applies
+ * weave_byte_to_doclen()) for a present docid, or -1 if `docid` is absent from
+ * the block (a gap, or outside its span). `*hint` is read as the index to try
+ * first and rewritten to "one past the hit" on success, exactly like
+ * WeaveDoclenResident.hint; a stale, out-of-range, or cold (0) hint is safe --
+ * the walk gate below simply doesn't fire and the bisect finds the answer.
+ *
+ * This pair is extracted verbatim from weave_doclen_cursor_lookup()'s isabs
+ * and !isabs branches so that src/am/am.c and the standalone property test in
+ * test/hegel/test_doclen_block.c share the ACTUAL gated-walk code rather than
+ * the test hand-transcribing it -- which is what let a real gate change
+ * (WEAVE_DOCLEN_WALK_WINDOW below) go out with zero test coverage: the test's
+ * old copy simply didn't have the gate, so it kept passing regardless of what
+ * the gate did.  See doc/TESTING.md and include/weave/for.h's own top comment
+ * for why a backend-independent core is the house pattern for exactly this
+ * failure class.
+ *
+ * The walk only pays off when the target is within its own window of the
+ * resume hint -- true for a common term whose consecutive docids land in
+ * adjacent block positions.  A rare/mid term's sparse stride (~50-200 docids)
+ * usually lands the target either in a different block (caught by the caller
+ * before this function is even entered) or far past the hint WITHIN the
+ * block, so an UNCONDITIONAL walk paid its whole window and then bisected
+ * anyway: ~15 weave_for_get calls per lookup measured for ranked mid k=10,
+ * against ~7 for a plain bisect (bench/RESULTS_L17.md's follow-up 1).  The
+ * fix is one O(1) read at the hint deciding whether the walk could plausibly
+ * reach the target ("would WEAVE_DOCLEN_WALK_WINDOW index steps be enough")
+ * before committing to it, rather than always walking then bisecting anyway.
+ *
+ * A FRESH hint (index 0, value 0, i.e. right after a block change) with a far
+ * target is the dominant case in practice and the one this gate exists for:
+ * `v <= want` holds (0 <= anything) but `want - v < WEAVE_DOCLEN_WALK_WINDOW`
+ * fails for anything far away, so the walk is skipped after exactly one read
+ * instead of walking WEAVE_DOCLEN_WALK_WINDOW steps and overshooting into the
+ * bisect anyway.  A fix that widened the window, or that gated on `want < W`
+ * instead of `want - v < W`, would still pass every "does it find the right
+ * answer" check while reintroducing the overshoot this exists to avoid --
+ * which is exactly why the property test also mutates this constant and this
+ * comparison and checks that it FAILS.
+ */
+#define WEAVE_DOCLEN_WALK_WINDOW	8
+
+static inline int
+weave_doclen_walk_abs(const unsigned char *raw, const uint8 *rawbyte,
+					   uint64 base, int n, uint64 docid, int *hint)
+{
+	int			rlo = 0,
+				rhi = n - 1;
+	int			i = *hint;
+	uint64		want;
+
+	if (docid < base)
+		return -1;
+	want = docid - base;
+
+	if (i < 0 || i >= n)
+		i = 0;
+
+	if (n > 0)
+	{
+		uint64		v = weave_for_get(raw, i);
+
+		if (v <= want && want - v < WEAVE_DOCLEN_WALK_WINDOW)
+		{
+			int			lim = i + WEAVE_DOCLEN_WALK_WINDOW;
+
+			if (lim > n)
+				lim = n;
+			for (;;)
+			{
+				if (v == want)
+				{
+					*hint = i + 1;
+					return rawbyte[i];
+				}
+				if (v > want)
+					break;		/* overshot: docid is absent (gap) or behind us */
+				if (++i >= lim)
+					break;
+				v = weave_for_get(raw, i);
+			}
+		}
+	}
+
+	while (rlo <= rhi)
+	{
+		int			mid = (rlo + rhi) >> 1;
+		uint64		v = weave_for_get(raw, mid);
+
+		if (v < want)
+			rlo = mid + 1;
+		else if (v > want)
+			rhi = mid - 1;
+		else
+		{
+			*hint = mid + 1;
+			return rawbyte[mid];
+		}
+	}
+	return -1;
+}
+
+static inline int
+weave_doclen_walk_arr(const uint64 *docidarr, const uint8 *bytearr, int n,
+					   uint64 docid, int *hint)
+{
+	int			rlo = 0,
+				rhi = n - 1;
+	int			i = *hint;
+
+	if (i < 0 || i >= n)
+		i = 0;
+
+	if (n > 0)
+	{
+		uint64		v = docidarr[i];
+
+		if (v <= docid && docid - v < WEAVE_DOCLEN_WALK_WINDOW)
+		{
+			int			lim = i + WEAVE_DOCLEN_WALK_WINDOW;
+
+			if (lim > n)
+				lim = n;
+			for (;;)
+			{
+				if (v == docid)
+				{
+					*hint = i + 1;
+					return bytearr[i];
+				}
+				if (v > docid)
+					break;		/* overshot: docid is absent (gap) or behind us */
+				if (++i >= lim)
+					break;
+				v = docidarr[i];
+			}
+		}
+	}
+
+	while (rlo <= rhi)
+	{
+		int			mid = (rlo + rhi) >> 1;
+
+		if (docidarr[mid] < docid)
+			rlo = mid + 1;
+		else if (docidarr[mid] > docid)
+			rhi = mid - 1;
+		else
+		{
+			*hint = mid + 1;
+			return bytearr[mid];
+		}
+	}
+	return -1;
+}
+
 #endif							/* WEAVE_FOR_H */
