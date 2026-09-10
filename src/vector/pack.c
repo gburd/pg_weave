@@ -35,6 +35,15 @@
 /*
  * Bit index of coordinate j of lane s, in units of `bits`.
  *
+ * The maximum code index across all (slot, j) pairs is 32*dim - 1 in both
+ * layouts. In WEAVE_PACK_LANE, dim coordinates × 32 slots with coordinate j
+ * at slots 0..31 gives max = (dim-1)*32 + 31 = 32*dim - 1.  In WEAVE_PACK_VECMAJOR,
+ * slot s at dim coordinates gives max = 31*dim + (dim-1) = 32*dim - 1.  Both
+ * layouts therefore fit in 4*dim*bits bits per block (tight bound), with room for
+ * 0-28 bytes of slack in weave_block_codebytes(). This tight bound is invariant
+ * across kernel families (V6 byte-LUT and int8-dot both respect it), so the
+ * per-layout rounding is safe.
+ *
  * On x86 the LANE layout additionally permutes lanes by perm0 so that an AVX2
  * byte shuffle can cross the 128-bit lane boundary in one instruction.  That
  * permutation is a pure relabelling of the 32 slots and is applied by the

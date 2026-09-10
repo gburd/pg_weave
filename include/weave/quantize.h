@@ -473,7 +473,27 @@ typedef enum WeavePackLayout
 	WEAVE_PACK_VECMAJOR = 1
 } WeavePackLayout;
 
-/* Bytes needed for a full WEAVE_VEC_BLOCK-vector block at this width. */
+/*
+ * Bytes needed for a full WEAVE_VEC_BLOCK-vector block at this width.
+ *
+ * The maximum code index is 32*dim - 1 in both layouts (LANE: coordinates 0..dim-1
+ * at slot 31; VECMAJOR: slot 31 has dim coordinates). At 4 bits per code, that
+ * is 4*dim*32 bits = 16*dim bytes tight-bound. At 2 bits, 8*dim. Generally:
+ * max_code_index = 32*dim - 1, so tight bound = ceil((32*dim - 1 + 1) * bits / 8)
+ * = ceil(32*dim*bits / 8) = 4*dim*bits bytes for any bits.  The rounding
+ * ((dim*bits + 7) / 8 * 32) adds 0-28 bytes of slack per layout.
+ *
+ * ** Slack bytes are never written by any pack function (weave_pack_lane,
+ * weave_unpack_lane, weave_pack_move_lane, weave_pack_zero_lane).  An on-disk
+ * block image therefore carries uninitialized bytes.  Phase V7 (on-disk page
+ * format) MUST zero the block buffer before packing to ensure deterministic
+ * bytes on disk.
+ *
+ * ** If computing lane stride as weave_block_codebytes(dim, bits) / 32 for a
+ * SIMD fast path, verify that 8 divides dim*bits. When it does not, the rounding
+ * introduces a skew and consecutive lanes do not stride uniformly. VECMAJOR
+ * packs lanes bit-contiguously (no gap) so the skew read from disk gives bits
+ * out of order compared to what contiguous lanes would hold in a SIMD vector. */
 static inline int
 weave_block_codebytes(int dim, int bits)
 {
