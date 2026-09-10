@@ -147,9 +147,20 @@ say "ami $AMI"
 # -F /dev/null is load-bearing: a `Host *` block in the invoking user's
 # ~/.ssh/config with ControlMaster and an explicit IdentityFile breaks
 # fresh-instance auth entirely, and the symptom is an opaque "ssh never came up".
+#
+# ServerAliveInterval is also load-bearing: a `measure` phase runs for an hour
+# over one ssh session with long silent stretches (GIN's bare ORDER BY is 2.4 s
+# x 210 samples per band).  Without keepalives a session whose TCP path died
+# mid-measure hung FOREVER -- the instance stayed healthy and reachable by
+# status check but the orchestrator waited on a socket nothing would ever write
+# to, and had to be unblocked by hand (2026-09-10, gin host).  With keepalives
+# the dead session errors out after ~2 minutes, the engine is recorded as
+# failed, the other engines' results are still analyzed, and the EXIT trap
+# terminates everything on schedule.
 SSHOPTS=(-F /dev/null -o IdentitiesOnly=yes -o StrictHostKeyChecking=no
          -o UserKnownHostsFile=/dev/null -o ControlMaster=no -o ControlPath=none
-         -o ConnectTimeout=15 -o LogLevel=ERROR -i "$KEYFILE")
+         -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=4
+         -o LogLevel=ERROR -i "$KEYFILE")
 
 # ---------------------------------------------------------------------------
 # Launch every engine host at once.
