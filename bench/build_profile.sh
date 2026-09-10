@@ -66,6 +66,39 @@ printf '%-28s %8.1f s  <- what G5 must attack\n' "irreducible core (A)" "$A"
 } | tee "$OUT/build_phases.txt"
 
 # ---------------------------------------------------------------------------
+# Merge/rewrite accounting, from the extension's own DEBUG1 log.
+#
+# weave_merge_selected() already logs every merge it performs with the term
+# count, doc count and ELAPSED SECONDS (src/am/am.c, "wrote merged segment").
+# So the exact number of full-index rewrites a build performs, and the cost of
+# each, is available without perf and without a code change -- it just has
+# never been captured.
+#
+# This matters because a build can rewrite the whole index more than once:
+#   1. the scan flushes N segments, and weave_build_finalize merges them (the
+#      output must land on FRESH blocks -- write-before-free means the inputs it
+#      is still reading cannot be reused), then
+#   2. weave_vacuum_compact's PACK phase rewrites that segment again to move it
+#      to the front of the file so the tail can be truncated.
+# L12 removed the third rewrite (the VACATE phase) but not the pack. If the
+# scan leaves exactly one segment, weave_index_is_compacted() short-circuits
+# the whole thing and there is no rewrite at all -- so the count is a function
+# of maintenance_work_mem, and reading it here is how we find out which regime
+# the benchmark is actually in.
+# ---------------------------------------------------------------------------
+say "merge/rewrite accounting from DEBUG1"
+{
+    $PSQL -c "DROP INDEX IF EXISTS prof_weave" >/dev/null
+    echo "maintenance_work_mem = $($PSQL -t -A -c 'SHOW maintenance_work_mem')"
+    psql -X -q -v ON_ERROR_STOP=1 -d "$PGDATABASE" \
+         -c "SET client_min_messages = DEBUG1" \
+         -c "CREATE INDEX prof_weave ON docs USING weave (d)" 2>&1 \
+        | grep -iE 'merge|collaps|segment|compact|truncat' || echo "(no DEBUG1 merge lines emitted)"
+    echo "segments after build: $($PSQL -t -A -c "SELECT weave_index_nsegments('prof_weave')")"
+    $PSQL -c "DROP INDEX IF EXISTS prof_weave" >/dev/null
+} 2>&1 | tee "$OUT/build_merges.txt"
+
+# ---------------------------------------------------------------------------
 # Symbol-level profile of the DEFAULT build.
 #
 # perf needs the postgres binary's symbols; we built PostgreSQL from source with -O2
@@ -99,4 +132,4 @@ else
 fi
 
 $PSQL -c "DROP INDEX IF EXISTS prof_weave" >/dev/null
-say "artifacts: $OUT/build_phases.txt $OUT/build_symbols.txt"
+say "artifacts: $OUT/build_phases.txt $OUT/build_merges.txt $OUT/build_symbols.txt"

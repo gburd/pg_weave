@@ -168,12 +168,24 @@ do_profile() {
     bash "$HOME/pg_weave/bench/build_profile.sh"
 }
 
-case "${1:?usage: weave.sh <provision|load|index|gate|measure|profile>}" in
+# Scan profiling (G13).  Kept a SEPARATE verb from do_profile rather than folded
+# into it: the build profiler runs four extra CREATE INDEXes before anything
+# else, and that ordering alone shifts the harness's own timed_index by ~8%
+# (bench/RESULTS_L15.md "Method").  A scan profile that inherited that skew
+# would be attributing a latency it had already perturbed.
+do_scanprofile() {
+    export PATH="$NVME/pg/bin:$PATH"
+    sudo dnf install -y -q perf >/dev/null 2>&1 || true
+    bash "$HOME/pg_weave/bench/scan_profile.sh"
+}
+
+case "${1:?usage: weave.sh <provision|load|index|gate|measure|profile|scanprofile>}" in
     provision) do_provision ;;
     load)      do_load "${2:?corpus}" ;;
     index)     do_index ;;
     gate)      do_gate ;;
     measure)   do_measure "${2:-200}" "${3:-10}" "${4:-adhoc}" ;;
     profile)   do_profile ;;
+    scanprofile) do_scanprofile ;;
     *) echo "unknown verb $1" >&2; exit 1 ;;
 esac

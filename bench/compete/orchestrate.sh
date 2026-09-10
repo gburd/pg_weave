@@ -260,19 +260,31 @@ run_engine() {
         "${sh[@]}" "bash ~/compete/engines/$e.sh gate" 2>&1 || echo "GATE FAILURES (recorded)"
         "${sh[@]}" "bash ~/compete/engines/$e.sh measure $SAMPLES $WARMUP $RUN" 2>&1
 
-        # Optional extra phases, per-engine.  PROFILE=1 runs the build profiler,
-        # which rebuilds the index several times and so must never run inside a
-        # measurement pass.
-        echo "DO_PROFILE=$DO_PROFILE (1 enables the build profiler)"
-        if [ "$DO_PROFILE" = 1 ]; then
-            echo "=== running build profiler for $e ==="
-            "${sh[@]}" "bash ~/compete/engines/$e.sh profile" 2>&1 \
-                || echo "profile FAILED or unsupported for $e"
-        fi
+        # Optional extra phases, per-engine.  These rebuild the index several
+        # times and so must never run inside a measurement pass -- they are
+        # ordered after `measure` for that reason.
+        #
+        # DO_PROFILE=1|build  the build profiler (G5)
+        # DO_PROFILE=scan     the scan profiler (G13)
+        # DO_PROFILE=both     both, build first
+        echo "DO_PROFILE=$DO_PROFILE (1|build, scan, both)"
+        case "$DO_PROFILE" in
+            1|build|both)
+                echo "=== running build profiler for $e ==="
+                "${sh[@]}" "bash ~/compete/engines/$e.sh profile" 2>&1 \
+                    || echo "build profile FAILED or unsupported for $e" ;;
+        esac
+        case "$DO_PROFILE" in
+            scan|both)
+                echo "=== running scan profiler for $e ==="
+                "${sh[@]}" "bash ~/compete/engines/$e.sh scanprofile" 2>&1 \
+                    || echo "scan profile FAILED or unsupported for $e" ;;
+        esac
     } >"$log" 2>&1
     local rc=$?
 
-    for f in raw.jsonl gates.jsonl hostinfo.txt build.txt build_phases.txt build_symbols.txt; do
+    for f in raw.jsonl gates.jsonl hostinfo.txt build.txt build_phases.txt build_symbols.txt build_merges.txt \
+             scan_explain.txt scan_sidecar_ab.txt scan_symbols.txt; do
         "${sh[@]}" "cat ~/compete/out/$f 2>/dev/null" > "$OUT/$e.$f" 2>/dev/null || true
     done
     [ -s "$OUT/$e.raw.jsonl" ] && say "$e: collected $(wc -l < "$OUT/$e.raw.jsonl") raw records" \
