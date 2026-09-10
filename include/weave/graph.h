@@ -20,6 +20,14 @@
  * at that structure -- nodes are centroids, not documents -- and the volume of
  * text about out-of-core partitioned builds no longer applies at centroid scale.
  *
+ * A LATER pg_turbovec release (v2.7.4) measured that nprobe itself sets a hard
+ * recall ceiling that no amount of exact-rerank-window widening can break --
+ * see doc/specs/VECTOR_CHANNEL.md sect. 8a for the numbers and what they mean
+ * for task V9's recall@10 >= 0.99 gate.  This graph steers WHICH clusters get
+ * probed; it cannot rescue a query whose true neighbours sit in a cluster that
+ * was never probed, any more than a wider exact rerank downstream of it can.
+ * A short beam is not a free lunch just because it is centroid-scale.
+ *
  * The graph exists to fix one measured failure.  pg_turbovec shipped a flat
  * quantized scan and measured, on 1M x 1024-d Cohere-wiki, a warm p50 of
  * 2552 ms against pgvector HNSW's 5.2 ms -- a 490x loss -- in exchange for 10x
