@@ -15,22 +15,31 @@ codebase that is a prototype.
 
 | capability | state | evidence |
 |---|---|---|
-| BM25 lexical search, boolean, phrase, NEAR, prefix | **works** | inherited from pg_fts 1.5.8; 3 regression + 2 isolation + 81 TAP tests green on PG 17 and 18 |
-| Index-native `count(*)` | **works** | inherited; measured 3.8 ms vs pg_search's 16.31 ms at 2.19 M docs |
+| BM25 lexical search, boolean, phrase, NEAR, prefix | **works** | forked from pg_fts 1.5.8, current with upstream 1.6.0; 5 regression + 2 isolation + 61 TAP green on PG 17 and 18 |
+| Index-native `count(*)` | **works** | inherited; measured ~200× faster than tsvector+GIN at 2 M docs (`bench/RESULTS_LEXICAL.md`) |
+| Ranked top-k latency | **works, competitive at k=100** | after L14/L15/L17: rare k=10 1.51 ms (1.20× pg_textsearch), k=100 **wins** rare 3.96× and mid 1.27×; common k=10 still 4.75× behind (task L2). `bench/RESULTS_L17.md` |
+| Build time | **at GIN parity** | 192.5 s vs GIN 202.7 s, pg_textsearch 49.2 s (3.91× behind). `bench/RESULTS_L15.md` |
+| Index size | **best of the three** | 626 MB vs pg_textsearch 873 MB, tsvector+GIN 1120 MB |
 | Crash recovery, replication, MVCC, CIC/REINDEX | **works** | inherited; `t/001`–`t/009` |
 | Vacuum, tombstones, tiered merge | **works** | inherited; `t/008` reclaims 4688 → 2199 pages |
-| Vector quantizer: rotation, codebook, encode/decode, packing | **works** | 17,741 property checks, 0 failures |
+| Vector quantizer: rotation, codebook, encode/decode, packing | **works** | 17,741 property checks, 0 failures (tasks V2–V4) |
 | `wvec` type: I/O, typmod, casts, 4 distance operators, arithmetic, btree | **works** | task V1; `sql/wvec.sql`, green on PG 17 and 18 |
 | Quantizer reachable from SQL (`weave_quantize_roundtrip`) | **works** | lets reconstruction error be measured on a real corpus before the index exists |
 | Vector *indexing* (the AM accepting a `wvec` column) | **does not exist** | tasks V7–V9 |
-| Fuzzy / regex / prefix channel | **imported, not compiled** | sources present, not in `OBJS` |
+| Fuzzy / regex / prefix channel | **compiles, unreachable** | tasks Z1/Z2 done (TRE vendored, GUCs wired); no channel routing yet (Z3–Z7) |
 | Vector storage, SIMD kernels, ANN graph | **does not exist** | stubs that `ereport(ERROR)` |
 | Fused-threshold top-k | **does not exist** | specified only |
 | pgvector / tsvector / pg_trgm compatibility | **does not exist** | specified only |
 
 So: pg_weave today is *pg_fts with a rename, plus a tested quantizer nothing calls
-yet.* If you want the lexical capability in production today, **use pg_fts** — it
-is the same code with a longer track record and a real release history.
+yet* — with one qualification that has grown real since this line was written. The
+L-phase work (L7, L8, L10, L12, L14, L15, L17) has made the **lexical channel
+measurably better than what it forked from** on size, build time, `count(*)`,
+keyless `ORDER BY`, and deep-page ranked latency, all recorded in `bench/`. If you
+want the lexical capability in production today, **pg_fts is still the safer
+choice** — longer track record, real release history, and pg_weave's advantages are
+measured on one synthetic corpus. But the honest statement is no longer "identical
+code"; see "A lexical-only 1.0 is a real option" below.
 
 ## The gate list
 
@@ -50,10 +59,15 @@ mechanically checkable. `doc/PHASES.md` has the task-level detail.
 4. **`weave_check()` must verify every invariant** in
    `doc/specs/SEGMENT_FORMAT.md` §9, and there are 20-odd. Today it covers the
    inherited lexical ones only.
-5. **Format v5 must resolve the page-kind bit exhaustion.**
+5. **Format v6 must resolve the page-kind bit exhaustion.**
    `doc/specs/SEGMENT_FORMAT.md` §2 documents that the vector and fuzzy channels'
    proposed bits do not both fit in the `uint16` flags field. Shipping either
-   channel before fixing this bakes in a collision.
+   channel before fixing this bakes in a collision. **Renumbered v5 → v6 on
+   2026-09-10:** v5 was taken by a shipped change (L17's absolute-offset doclen
+   sidecar), so the planned format break is now v6. L17 also established the
+   pattern it should follow — a per-*block* self-describing flag in a field with
+   spare bits, which let one relation hold both encodings across an upgrade
+   instead of needing a per-index version that cannot describe a mixed index.
 6. **Upgrade path.** Partially addressed: `sql/pg_weave--0.1.0--0.2.0.sql` now
    exists and `sql/wvec.sql` exercises it on every regression run, which caught a
    `flake.nix` `installPhase` that hardcoded one SQL filename and silently dropped
@@ -119,6 +133,119 @@ docid space.
 The first 6 months produce something **worse** than using pg_fts, pgvector, and
 pg_trgm separately, because the channels will be half-built while the separate
 extensions are finished.
+
+## The route from here, in dependency order
+
+20 of 59 tasks are done (`doc/PHASES.md`). The ordering below is forced by three
+things: the page-kind bit exhaustion blocks *both* remaining channels, hard rule 7
+forbids starting F before L/Z/V gate, and every new on-disk structure owes the
+adversity gates (7–11) before it counts.
+
+### Stage 1 — finish the lexical channel (weeks)
+
+The only phase where pg_weave already competes, and the cheapest remaining wins.
+
+| task | why now |
+|---|---|
+| L17 follow-ups | Both specified and cheap from `bench/RESULTS_L17.md`: the 8-step pre-bisect walk is counterproductive at sparse stride (~15 `weave_for_get` calls/lookup), and a whole-page copy now cuts buffer hits ~15,000 → ~584 per query — an idea correctly rejected for v4 that v5 makes viable because it no longer decodes |
+| L2 | Re-aimed: owns the `common` band only (4.75× behind, 1.74 M postings genuinely read) |
+| L5 | Positions default decision — phrase is unusable with positions off, and this is a *documented decision*, not code |
+| L1 | Split the `am.c` unity build. Blocks nothing, but every task above grows a 6,800-line file |
+| L6 | `read_stream` prefetch: the only cold-cache work; all current numbers are warm |
+
+**Exit gate:** G13 at ≤2× pg_textsearch in every band, or the residual documented
+as permanent in `doc/ARCHITECTURE.md` §9.
+
+### Stage 2 — format v6, before either channel (weeks)
+
+Blocking gate 5, and it must come first: the vector and fuzzy page-kind bits do not
+both fit the `uint16` flags field, so shipping either channel first bakes in a
+collision. Follow L17's pattern — per-block self-description in spare bits of an
+existing field, which is what let one relation carry two sidecar encodings across an
+upgrade. Also resolve the `WeaveSegMeta` stride question
+(`SEGMENT_FORMAT.md` §2) in the same break, plus the `pg_upgrade` test (gate 15)
+and an upgrade over an index containing data (gate 6).
+
+### Stage 3 — Z, the cheap second channel (months)
+
+Two channels is the product; fuzzy is far cheaper than vector because the code is
+already imported and compiling.
+
+- **First:** vendor TRE `d0e0c997` → `f864ed0` (`IMPORT_pg_tre.md`). Carries an
+  `INT_MAX` crash fix and a backref wrong-answer fix; pg_tre already rebased the
+  progress-hook patch, so reuse it.
+- Z3 (SuRF over the *vocabulary*, not the corpus) → Z4/Z5/Z6 routing → Z7 shuttle.
+- **Z7 owes the other half of pg_tre `4a9c86c`**: the prefilter must refuse to
+  reject when `always_true` is set, with a case-insensitive-anchored-pattern
+  regression test. The extraction half is already ported.
+- Z8 (`cgram`) is opt-in and can slip; Z9 (`<@>` KNN) needs a real bound.
+
+**Exit gate:** bound property test (gate 3), fuzz target (gate 8), crash +
+replication TAP (gate 7), concurrency test matching `t/005`'s 58,049 reads
+(gate 11) — for the new weft specifically.
+
+### Stage 4 — V, the expensive channel (many months)
+
+V1–V4 are done (quantizer + type, 17,741 property checks). What remains is
+everything that touches disk.
+
+- V6 SIMD kernels with runtime dispatch; V7 `WEAVE_VCODES`/`WEAVE_VMETA` pages;
+  V8 code-scan shuttle; **V9 IVF** (not Vamana — withdrawn on pg_turbovec's
+  matched-recall evidence that the graph never reached R@10 0.98).
+- **V13 and V14 are not optional.** `bench/RESULTS_BOUND_PRUNING.md` measured the
+  spec'd per-coordinate bound pruning **0.0%** of blocks; centroid+radius prunes
+  99.6% *only* with a cluster-ordered warp. Skipping either yields a correct index
+  with no pruning, i.e. a linear scan.
+- V10 exact path; V11 torn-write detection with an injection test (gate 9).
+- Adopt pg_turbovec's measured lessons rather than rediscovering them: 1-bit BQ
+  needs mean-centering and un-rotated centroids, and its chain-offset-sum bug
+  recurred four times because descriptor offsets were not single-sourced.
+
+**Exit gate:** same four adversity gates as Stage 3, plus a matched-recall
+comparison against pgvector HNSW — recall held equal, then latency and size
+compared.
+
+### Stage 5 — F, the actual thesis (months)
+
+Only after L, Z and V gate (hard rule 7). F1–F4, and F5's property test: fused
+top-k identical to brute force over 10⁶ generated cases. Until F5 passes, the
+central claim of the project is a document.
+
+### Stage 6 — M, P, R: shippable (months)
+
+M1–M6 migration surfaces (pgvector/tsvector/pg_trgm), **P4 cost-model calibration**
+(without it `amcanorderbyop` silently stops choosing the index on large tables),
+P3 the reproducible competitive matrix including losses, then R1–R5: DocBook docs,
+examples, PGXN, managed-service readiness, contrib submission.
+
+### Cross-cutting, continuous — not a stage
+
+ASan/UBSan on the full suite (gate 10), a fuzz target per on-disk structure
+(gate 8), `weave_check()` covering all ~20 `SEGMENT_FORMAT.md` §9 invariants
+(gate 4), and documented resource behaviour (gate 14 — pg_tre shipped without it
+and a user hit a temp-disk wall the docs did not predict). Also: **a Codeberg CI
+runner is still not registered**, so `.forgejo/workflows/ci.yml` has never run.
+That is a repo-settings action and it gates everything above.
+
+## A lexical-only 1.0 is a real option
+
+The staged plan above is 18–30 months. There is a shorter path worth deciding
+explicitly rather than by default.
+
+After Stage 1, pg_weave's lexical channel is **already better than the alternatives
+on four measured axes** — index size (626 MB vs 873/1120), build time (at GIN
+parity), `count(*)` (~200×), keyless `ORDER BY` (index path where GIN seq-scans) —
+and near parity on ranked latency, winning outright at k=100. That is a shippable
+product with a defensible claim, reachable in weeks rather than years, and it does
+not foreclose the rest: Stage 2's format break is designed to be additive.
+
+The cost of choosing it: the fused top-k thesis stays unproven, and pg_weave ships
+as "a better pg_fts" rather than as the thing `doc/ARCHITECTURE.md` §3 argues for.
+The cost of *not* choosing it: 18–30 months during which the honest recommendation
+in the table below stays "use something else".
+
+This is a maintainer decision, not a technical one, and it should be made on
+purpose.
 
 ## What to do instead, today
 

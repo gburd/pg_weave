@@ -520,8 +520,29 @@ regex_extract_query(WeaveParseCtx *ctx, int32 max_cost, TrigramQuery *out)
      * leading literal, record the exact first-trigram key range so the
      * scan can reject the whole index when no such trigram exists.  Only
      * at k=0 (leading bytes are not editable).
+     *
+     * Never claim a range when the extraction is already always_true: the
+     * recheck is then the only authority on matching, and the key range --
+     * derived from raw literal codepoints with NO case folding -- may not
+     * describe what the index legitimately stores.
+     *
+     * Ported from pg_tre 4a9c86c, which fixed a SILENT WRONG ANSWER: an
+     * index scan with ~* or ILIKE on an anchored prefix returned an EMPTY
+     * result set for a pattern with real matches.  always_true is set for
+     * the case-insensitive strategies precisely because the index stores
+     * trigrams case-sensitively, so `name ~* '^GIT'` carried the trigram key
+     * for "GIT" while the index legitimately held only "git"; the SuRF
+     * correctly reported "no such key" and the scan returned nothing.
+     *
+     * pg_weave's fuzzy channel is not yet reachable (Z3-Z7), so this is
+     * latent here rather than live -- which is exactly why it is fixed now:
+     * the guard belongs at the source so the scan-side wiring cannot
+     * reinherit it.  Whoever implements the shuttle (Z7) owes the OTHER half
+     * of that upstream fix: the prefilter must also refuse to reject
+     * whenever always_true is set, because a range that exists is a range
+     * some future caller may consult.
      */
-    if (max_cost == 0)
+    if (max_cost == 0 && !out->always_true)
     {
         uint64  lo,
                 hi;
