@@ -50,20 +50,23 @@ incdirs = include_directories(
   'include',                             # weave/*.h (RELAYOUT: headers moved here)
 )
 
-# Mirrors the Makefile OBJS list. src/am/amscan.c, src/query/lev.c and
-# src/pages/trgm_page.c are #included into src/am/am.c (unity build, not
-# separate TUs), so they are intentionally NOT listed here.
+# Mirrors the Makefile OBJS list; keep the two in step.
 sources = files(
   'src/query/analyze.c',
   'src/query/tsanalyze.c',
   'src/query/doc.c',
   'src/query/parse.c',
   'src/query/rank.c',
+  'src/query/lev.c',
   'src/am/am.c',
+  'src/am/ambuild.c',
+  'src/am/amvacuum.c',
+  'src/am/amscan.c',
   'src/am/customscan.c',
   'src/am/amaux.c',
   'src/am/amsize.c',
   'src/am/amcheck.c',
+  'src/pages/trgm_page.c',
   'src/util/migrate.c',
   'src/query/trgm.c',
   'src/util/sparsemap.c',

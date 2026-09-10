@@ -247,7 +247,7 @@ run_smoke() {
 	say "build produced pg_weave.so"
 
 	say "lint gates"
-	$SSH 'cd pg_weave && for t in check-ascii check-alloc check-unity check-rename; do
+	$SSH 'cd pg_weave && for t in check-ascii check-alloc check-rename; do
 			printf "%-14s " "$t"
 			make -s $t PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1 \
 				&& echo PASS || echo FAIL

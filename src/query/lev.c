@@ -26,23 +26,19 @@
  * seeking) rather than a separate FST -- the sorted order is what an FST would
  * have given us for the ordered walk, and point lookups are already O(log P).
  *
+ * A separate translation unit since task L1; it used to be #included into
+ * src/am/am.c.  WeaveLevAut and the one export are in include/weave/lev.h.
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  pg_weave_lev.c
+ *	  src/query/lev.c
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres.h"
 
-/* Maximum query length the byte-wise automaton handles; longer falls back. */
-#define WEAVE_LEV_MAXQ 255
-
-typedef struct WeaveLevAut
-{
-	const unsigned char *q;		/* query bytes */
-	int			m;				/* query length */
-	int			k;				/* max edits */
-} WeaveLevAut;
+#include "weave/lev.h"
 
 /*
  * A DP row is m+1 int16 cells.  We keep rows on the caller's stack (small: a
@@ -112,7 +108,7 @@ weave_lev_accept(const WeaveLevAut *aut, const int16 *row)
  * the automaton never died while consuming cand.  Used to skip, in one jump,
  * every sorted dictionary term sharing a dead prefix.
  */
-static bool
+bool
 weave_lev_match_prefix(const WeaveLevAut *aut, const unsigned char *cand,
 					 int candlen, int *deadlen)
 {

@@ -96,8 +96,9 @@ mv expected/weave_cic.out         expected/weave_cic.out
 # ---------------------------------------------------------------------------
 # 3. Rewrite #include paths first: the old paths embed the old prefixes, so
 #    doing this after the identifier pass would need a second, subtler pass.
-#    pg_weave's am.c is a unity build (#include of three .c files); that structure
-#    is preserved for now -- splitting it is task L1 in doc/PHASES.md.
+#    pg_weave's am.c was a unity build (#include of three .c files) when this
+#    script ran; task L1 has since split it into am.c/ambuild.c/amvacuum.c/
+#    amscan.c with lev.c and trgm_page.c as ordinary TUs.
 # ---------------------------------------------------------------------------
 say "rewriting include paths"
 mapfile -t CFILES < <(find src include test -type f \( -name '*.c' -o -name '*.h' \))

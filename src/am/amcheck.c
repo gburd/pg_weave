@@ -27,8 +27,9 @@
  * would be reading the segs[] array at offsets it cannot justify
  * (doc/CONVENTIONS.md decision 3).
  *
- * A standalone translation unit on purpose, like src/am/amsize.c: src/am/am.c is
- * already a unity build of four files and task L1 is to split it.
+ * A standalone translation unit, like src/am/amsize.c.  It predates task L1, which
+ * split src/am/am.c the same way; what it needs from am.c is declared in
+ * include/weave/am.h.
  *
  * Copyright (c) 2025-2026, Gregory Burd
  *

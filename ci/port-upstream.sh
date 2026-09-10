@@ -13,8 +13,8 @@
 #
 # It prints the rewritten patch to stdout and, with -a, applies it.  Always
 # review before applying: the rename is mechanical but the surrounding code has
-# diverged (relayout, the unity build, the extra channels), so a hunk can apply
-# cleanly and still be wrong.
+# diverged (relayout, the L1 split of am.c into four TUs, the extra channels), so
+# a hunk can apply cleanly and still be wrong.
 #
 # After applying, the non-negotiable checks are:
 #	 make && make installcheck && make check-rename
@@ -112,10 +112,17 @@ sed -i \
 	-e 's|#include "pg_fts_docvalid\.h"|#include "weave/docvalid.h"|' \
 	-e 's|#include "pg_fts_sm\.h"|#include "weave/sparsemap.h"|' \
 	-e 's|#include "vendor/sm\.h"|#include "weave/sparsemap_impl.h"|' \
-	-e 's|#include "pg_fts_lev\.c"|#include "../query/lev.c"|' \
-	-e 's|#include "pg_fts_am_scan\.c"|#include "amscan.c"|' \
-	-e 's|#include "pg_fts_trgm_index\.c"|#include "../pages/trgm_page.c"|' \
 	"$OUT"
+
+# Upstream pg_fts still #includes pg_fts_lev.c, pg_fts_am_scan.c and
+# pg_fts_trgm_index.c into pg_fts_am.c.  pg_weave does not: task L1 split am.c
+# into am.c/ambuild.c/amvacuum.c/amscan.c and made lev.c and trgm_page.c ordinary
+# translation units.  A hunk that touches one of those three #include lines has no
+# target here and must be dropped by hand -- flag it rather than silently
+# rewriting it, because a hunk landing in the wrong one of four files compiles.
+if grep -qE '^\+.*#include "pg_fts_(lev|am_scan|trgm_index)\.c"' "$OUT"; then
+	say "WARNING: patch touches an upstream unity #include; pg_weave has no such line (task L1)"
+fi
 
 # The identifier rename, identical to ci/fork-rename.sh step 4 plus the
 # compound-identifier fixes that step missed the first time.  \b anchoring is

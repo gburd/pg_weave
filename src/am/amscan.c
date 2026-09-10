@@ -1,9 +1,11 @@
 /*-------------------------------------------------------------------------
  *
- * pg_weave_am_scan.c
+ * amscan.c
  *		Bitmap scan for the weave access method.
  *
- * Included directly into pg_weave_am.c (it shares static page helpers).  It
+ * A separate translation unit since task L1; it used to be #included into
+ * src/am/am.c, which is why it shared that file's static page helpers -- those
+ * are now declared in include/weave/am.h.  It
  * evaluates an wquery by set algebra over posting lists (a term yields the
  * TIDs whose document contains it; AND intersects, OR unions, NOT complements
  * against the indexed universe) for the bitmap and index-only scans, and runs
@@ -15,29 +17,75 @@
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  pg_weave_am_scan.c
+ *	  src/am/amscan.c
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * The include list below is src/am/am.c's, copied verbatim into each translation
+ * unit the L1 split produced.  Deliberately NOT pruned: L1 is a pure code move
+ * whose whole claim is that the object code did not change, and pruning would
+ * mix an unverifiable judgement call (is this header used directly, or only
+ * reachable through another?) into that claim.  It is also not free to prune
+ * correctly here -- weave/am.h reaches most of the backend transitively, so
+ * "still compiles" does not mean "not used".  Pruning per file is a separate,
+ * reviewable change.
+ */
+#include "postgres.h"
 
-/* A materialized, sorted, duplicate-free set of TIDs. */
-typedef struct TidSet
-{
-	ItemPointerData *tids;
-	int			n;
-} TidSet;
+#include "weave/weave.h"
+#include "weave/am.h"
+#include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
+#include <math.h>
+#include "access/genam.h"
+#include "access/generic_xlog.h"
+#include "access/transam.h"		/* ReadNextTransactionId (recycle gate) */
+#include "access/xlog.h"			/* RecoveryInProgress (maintenance-fn guard) */
+#include "access/parallel.h"
+#include "access/reloptions.h"
+#include "access/relscan.h"
+#include "access/table.h"
+#include "access/tableam.h"
+#include "access/visibilitymap.h"
+#include "catalog/index.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_type.h"
+#include "commands/defrem.h"
+#include "commands/vacuum.h"
+#include "executor/tuptable.h"
+#include "executor/executor.h"
+#include "executor/instrument.h"
+#include "funcapi.h"
+#include "miscadmin.h"
+#include "nodes/pathnodes.h"
+#include "nodes/tidbitmap.h"
+#include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
+#include "pgstat.h"
+#include "storage/bufmgr.h"
+#include "storage/buffile.h"
+#include "portability/instr_time.h"
+#include "catalog/storage.h"
+#include "storage/condition_variable.h"
+#include "storage/freespace.h"
+#include "storage/indexfsm.h"
+#include "storage/lmgr.h"
+#include "storage/spin.h"
+#include "tcop/tcopprot.h"
+#include "utils/array.h"
+#include "utils/acl.h"			/* object_ownercheck, aclcheck_error (maintenance-fn guard) */
+#include "utils/lsyscache.h"	/* get_rel_name (maintenance-fn guard) */
+#include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "utils/selfuncs.h"
+#include "weave/for.h"			/* FOR codec + doclen quantizer (the WAND cursor) */
+#include "weave/lev.h"
 
-/* forward decl: trigram-index candidate lookup (pg_weave_trgm_index.c) */
-static bool weave_trgm_candidates(Relation index, BlockNumber trgmstart,
-								 BlockNumber dictstart,
-								 const char *term, int termlen,
-								 int min_trigrams, bool is_regex, bool has_doclen_col,
-								 TidSet *out);
+/* forward decls: defined later in this file */
 static void weave_collect_matches(Relation index, WeaveQuery query, TidSet *out, bool *recheck);
 static void weave_recheck_exact(Relation index, WeaveQuery query, TidSet *set);
 static double weave_query_maxhits(Relation index, WeaveQuery q, double N);
-/* forward decl: blob reader (pg_weave_trgm_index.c, included after this file) */
-static uint8 *weave_read_blob(Relation index, BlockNumber blk, Size len);
 
 /*
  * EOF-tolerant page read for the scan's directory-following chain walks.
@@ -161,7 +209,7 @@ cmp_tid(const void *a, const void *b)
 	return ItemPointerCompare((ItemPointer) a, (ItemPointer) b);
 }
 
-static void
+void
 tidset_sort_uniq(TidSet *s)
 {
 	int			i,
@@ -2921,14 +2969,6 @@ typedef struct WandCursor
 
 static inline void wand_skip_own_tombstoned(WandCursor *c);
 static void wand_seek(WandCursor *c, uint64 target);
-
-static inline uint64
-tid_to_docid_s(ItemPointer tid)
-{
-	return (uint64) ItemPointerGetBlockNumber(tid) *
-		(uint64) MaxHeapTuplesPerPage +
-		(uint64) ItemPointerGetOffsetNumber(tid);
-}
 
 /*
  * Lazily load the next page-worth of THIS TERM's postings into the cursor.

@@ -9,10 +9,12 @@
 
 MODULE_big = pg_weave
 
-# Only separately-compiled translation units. src/am/amscan.c, src/query/lev.c
-# and src/pages/trgm_page.c are #included directly into src/am/am.c (unity
-# build) and must NOT be listed here or they will be compiled twice / linked
-# with duplicate symbols.
+# Every translation unit, compiled once each.  Until task L1 src/am/am.c was a
+# unity build that #included src/am/amscan.c, src/query/lev.c and
+# src/pages/trgm_page.c as text, and those three had to be kept OUT of this list
+# (a `make check-unity` target guarded it, and AGENTS.md carried a hard rule).
+# L1 split am.c into am.c/ambuild.c/amvacuum.c/amscan.c with the interface
+# declared in include/weave/am.h, so there is nothing special left here.
 OBJS = \
 	$(WIN32RES) \
 	src/query/analyze.o \
@@ -20,11 +22,16 @@ OBJS = \
 	src/query/doc.o \
 	src/query/parse.o \
 	src/query/rank.o \
+	src/query/lev.o \
 	src/am/am.o \
+	src/am/ambuild.o \
+	src/am/amvacuum.o \
+	src/am/amscan.o \
 	src/am/customscan.o \
 	src/am/amaux.o \
 	src/am/amsize.o \
 	src/am/amcheck.o \
+	src/pages/trgm_page.o \
 	src/util/migrate.o \
 	src/query/trgm.o \
 	src/util/sparsemap.o \
@@ -38,8 +45,7 @@ OBJS = \
 	$(TRE_OBJS)
 
 # --- Fuzzy/regex/prefix channel (imported from pg_tre; see
-# doc/specs/IMPORT_pg_tre.md).  Ordinary translation units, unlike the
-# src/am/am.c unity build.  Wired into the build by task Z1/Z2; the channel
+# doc/specs/IMPORT_pg_tre.md).  Wired into the build by task Z1/Z2; the channel
 # is not yet reachable from the access method or the planner (Z3 onward), so
 # these compile and link but nothing calls them yet.
 FUZZY_OBJS = \
@@ -244,29 +250,6 @@ check-rename:
 	fi; \
 	echo "check-rename: clean (no residual bm25_/ftsdoc/ftsquery/pg_fts identifiers)"
 
-# --- Unity-build guard -------------------------------------------------------
-# src/am/am.c #includes amscan.c, ../query/lev.c and ../pages/trgm_page.c
-# directly (unity build). If any of the three ever end up separately listed
-# in OBJS *and* still #included by am.c, their symbols get compiled/linked
-# twice. Guard both halves: they must NOT be in OBJS, and they MUST still be
-# #included by am.c.
-.PHONY: check-unity
-check-unity:
-	@fail=0; \
-	for f in "src/am/amscan.c" "src/query/lev.c" "src/pages/trgm_page.c"; do \
-		base=$$(basename $$f | sed 's/\.c$$/.o/'); \
-		if echo "$(OBJS)" | grep -qE "(^| )([^ ]*/)?$$base( |$$)"; then \
-			echo "ERROR: $$f is separately listed in OBJS (breaks the am.c unity build)" >&2; \
-			fail=1; \
-		fi; \
-		if ! grep -qE '#include[[:space:]]*"([^"]*/)?'"$$(basename $$f)"'"' src/am/am.c; then \
-			echo "ERROR: src/am/am.c no longer #includes $$f (unity build broken)" >&2; \
-			fail=1; \
-		fi; \
-	done; \
-	if [ "$$fail" -ne 0 ]; then exit 1; fi; \
-	echo "check-unity: amscan.c/lev.c/trgm_page.c are unity-included, not in OBJS"
-
 # --- Standalone tests: no PostgreSQL server, no extension install -------------
 #
 # These gate the algorithmic cores directly.  They exist because a
@@ -356,5 +339,5 @@ check-fuzz:
 	fi
 
 .PHONY: check-all
-check-all: check-ascii check-alloc check-unity check-rename check-standalone check-fuzz
+check-all: check-ascii check-alloc check-rename check-standalone check-fuzz
 	@echo "== ALL LINT AND STANDALONE GATES PASSED =="

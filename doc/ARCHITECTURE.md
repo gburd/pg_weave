@@ -270,9 +270,15 @@ doc/                     this directory
 doc/specs/               per-subsystem specifications; the build-out contract
 ```
 
-`src/am/am.c` is a unity build: it `#include`s `amscan.c`, `../query/lev.c`, and
-`../pages/trgm_page.c`. Inherited from pg_fts. `make check-unity` guards it, and
-splitting it is task **L1** in `doc/PHASES.md`.
+`src/am/` is four translation units -- `am.c` (AM core, page/segment/metapage
+machinery), `ambuild.c` (build, insert, segment writers, merge), `amvacuum.c`
+(bulkdelete, cleanup, compaction) and `amscan.c` (scan) -- with the interface
+between them declared, and justified declaration by declaration, in
+`include/weave/am.h`. It was a single 7,300-line unity build inherited from
+pg_fts, which `#include`d `amscan.c`, `../query/lev.c` and `../pages/trgm_page.c`
+as text; task **L1** split it, deleted the `make check-unity` guard that existed
+to stop anyone "fixing" it casually, and proved the change non-semantic by
+comparing the LTO'd shared object function by function.
 
 ## 11. Where to start reading
 
