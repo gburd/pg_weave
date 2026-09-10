@@ -13,9 +13,12 @@ codebase that is a prototype.
 
 ## What actually works today
 
-pg_weave's product definition is **one index replacing the combination of a BM25
-index and a vector-similarity index**. Read the table with that in mind: the left
-half of the product is real and competitive, the right half does not reach disk yet.
+pg_weave's product definition is **a singular text index**: BM25, vector similarity,
+fuzzy, approximate regex, prefix, and n-gram, over one docid space, in one
+`CREATE INDEX`. Read the table against that: two of the six retrieval kinds work
+today (BM25, prefix), one has a tested codec that no on-disk format calls yet
+(vector), and three are imported code that nothing routes (fuzzy, approximate regex,
+n-gram).
 
 | capability | state | evidence |
 |---|---|---|
@@ -36,7 +39,9 @@ half of the product is real and competitive, the right half does not reach disk 
 | Vector storage pages, IVF, ANN | **does not exist** | tasks V7, V9, V13, V14 |
 | Fused-threshold top-k | **does not exist** | specified only |
 | pgvector / tsvector compatibility | **does not exist** | specified only; M1–M3, and 1.0 requirements rather than polish |
-| Fuzzy / regex / prefix channel | **compiles, unreachable — and deliberately post-1.0** | Z1/Z2 done (TRE vendored at `f864ed0` and current, GUCs wired); no routing (Z3–Z7). Removed from the 1.0 path 2026-09-10: it is a third channel on a two-channel product |
+| Fuzzy / approximate regex / n-gram channel | **compiles, unreachable** | Z1/Z2 done (TRE vendored at `f864ed0` and current, GUCs wired); no routing (Z3–Z7). **Four of the six named product capabilities are here**, so this is on the 1.0 path |
+| Prefix search (`term*`) | **works via the lexical dictionary walk** | inherited; measured 3.8–7.7× faster than tsvector+GIN (`bench/RESULTS_LEXICAL.md`). Z4 re-routes it through SuRF, which must not regress it |
+| Unanchored cross-token substring (n-gram / `cgram`) | **does not exist** | task Z8, **now required** rather than opt-in. Its cost ships with it: with `cgram` on, pg_weave is not smaller than `pg_trgm` |
 
 So: pg_weave today is *a measurably improved pg_fts, plus a tested quantizer and
 verified scoring kernels that no on-disk format calls yet.* The L-phase work (L7,
@@ -158,8 +163,12 @@ These will not be fixed and belong in any evaluation:
 
 - **No index-only scans.** The index is non-covering by design.
 - **Exact recall × sublinear latency × minimal storage: pick two.**
-- **No unanchored cross-token substring search** without the opt-in corpus-trigram
-  channel, and with it we are not smaller than `pg_trgm`.
+- **Unanchored cross-token substring search costs `pg_trgm`-scale storage.** This
+  used to be phrased as a limitation avoided by keeping the corpus-trigram channel
+  opt-in. Since `n-gram` is a named product capability (task Z8), the honest form is:
+  the capability ships, and an index with `cgram` on **is not smaller than
+  `pg_trgm`**. The reloption remains so an index that does not need the capability
+  does not pay for it.
 - **128 segments per index** (metapage-size limit).
 - **Ranked scans do not see unflushed pending rows**; `@@@` and `weave_count()` do.
 
@@ -177,22 +186,21 @@ extensions are finished.
 
 ## The route from here, in dependency order
 
-**The product is BM25 + vector in one index.** That was settled on 2026-09-10 and it
-reorders everything below. pg_weave replaces the *combination* of a BM25 index and a
-vector-similarity index — the pgvector + pg_fts/pg_textsearch stack — with one index
-over one docid space. Fuzzy, regex and prefix remain in the architecture and their
-code remains imported and compiling, but **phase Z is no longer on the path to 1.0**:
-it is a third channel on a product that needs two.
+**The product is a singular text index.** Settled 2026-09-10: BM25, vector
+similarity, fuzzy, approximate regex, prefix, and n-gram, over one docid space, in
+one `CREATE INDEX`. All six ship, so phases L, Z and V are all on the path to 1.0
+and none is optional.
 
-That single decision is worth more than any task below, because it removes a whole
-phase from the critical path rather than making one faster. The former Stage 3 (Z)
-was justified as "the cheap second channel" — cheap, and the wrong one. Vector is
-expensive and it is the one the product definition names.
+*This section was rewritten twice on the same day — once to drop Z from the path
+when the scope was read as "BM25 + vector", then back when it was restated as all
+six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
+hard rule was weakened on an inference about scope rather than a question about it.*
 
-29 of 66 tasks are done (`doc/PHASES.md`), phase X included. The ordering is now
-forced by two things rather than three: hard rule 7 as amended (F waits for L and V,
-not for Z), and every new on-disk structure owing the adversity gates (7–11) before
-it counts. The page-kind exhaustion that used to force the ordering is closed.
+29 of 66 tasks are done (`doc/PHASES.md`), phase X included. The ordering below is
+forced by three things: hard rule 7 (F waits for L, Z **and** V), every new on-disk
+structure owing the adversity gates (7–11) before it counts, and hard rule 9 — which
+is why one *measurement* from phase V jumps ahead of both channels. The page-kind
+exhaustion that used to force the ordering is closed.
 
 ### Stage 1 — finish the lexical channel (weeks)
 
@@ -228,21 +236,69 @@ not fit the padding and at that moment the reader has to already be right.
 upgrade-over-an-index-with-data half of gate 6 is closed by
 `t/010_format_v6_upgrade.pl`.
 
-### Stage 3 — V, the other half of the product (many months)
+### Stage 3 — the V9 recall de-risk, before either channel (an afternoon)
 
-Promoted over Z on 2026-09-10. This is now the long pole and the only thing between
-pg_weave and the claim it exists to make.
+Out of phase order on purpose, and the cheapest high-value work left in the project.
 
-V1–V5 are done — quantizer, `wvec` type, and the 32-lane packing layout, at
+Phase V's gate is `recall@10 >= 0.99` and V9 chose IVF to reach it. pg_turbovec then
+measured IVF's probe count imposing a **hard recall ceiling** that no widening of the
+rerank window moves — 0.846/0.906/0.954/0.978/0.984 at probes 8/16/32/64/128 at
+`lists=512` — because probe count and rerank window fix different failure modes. That
+is a property of IVF, not of their 1-bit codes, so it applies to ours. And on their
+500k × 1024-d corpus, **pgvector HNSW never reached 0.99 either**, which would make
+the comparator half of the gate undefined on that corpus.
+
+So before any vector page is written: measure probes-vs-recall against **our own**
+Lloyd–Max codebook and rotation, standalone, no backend, the way
+`bench/bound_pruning.c` measured the block bound. Three outcomes, all useful:
+
+- 0.99 is reachable at a probe count whose latency fits → build V7–V14 as specified.
+- 0.99 is reachable only at a probe count that is effectively a linear scan → V9's
+  design changes, or the gate does, **before** months of disk work assume it.
+- 0.99 is unreachable → `doc/ARCHITECTURE.md` §9 gains a permanent limitation and the
+  README says so, which is hard rule 8's whole point.
+
+This is hard rule 9 applied verbatim: `bench/RESULTS_BOUND_PRUNING.md` cost an
+afternoon and would otherwise have surfaced months in. Same shape, same cost.
+
+### Stage 4 — Z: fuzzy, approximate regex, prefix routing, n-gram (months)
+
+Four of the six named capabilities, and the cheaper of the two remaining channels:
+the code is imported and compiling, TRE is current at `f864ed0`, and phase X already
+landed the kind space and per-bolt descriptors that Z3's new page kind needs.
+
+- Z3 (SuRF trie over the **bolt vocabulary**, not the corpus — that substitution is
+  the whole reason this channel can exist at a reasonable size) → Z4/Z5/Z6 routing →
+  Z7 shuttle.
+- **Z7 owes the other half of pg_tre `4a9c86c`**: the prefilter must refuse to reject
+  when `always_true` is set, with a case-insensitive-anchored-pattern regression test.
+  The extraction half is ported.
+- **Z8 (`cgram`) is now required, not opt-in**, because `n-gram` is a named product
+  capability. Its cost ships with it and `bench/RESULTS_CGRAM.md` must state it as
+  plainly as any win: with `cgram` on, pg_weave is not smaller than `pg_trgm`.
+- Z9 (`<@>` edit-distance KNN) needs a real bound, which means a bound property test
+  (gate 3), not a plausible-looking heuristic.
+- Z4 must **not regress prefix**, which already works and already beats tsvector+GIN
+  by 3.8–7.7×. A re-route that loses that is not an improvement.
+
+**Exit gate:** bound property test (gate 3), fuzz target (gate 8), crash +
+replication TAP (gate 7), concurrency test matching `t/005`'s 58,049 reads (gate 11)
+— for the new weft specifically. Plus the Phase Z gate in `doc/PHASES.md`: beat
+pg_tre on every row of its own perf table, and stay within 3× of `pg_trgm`'s index
+size with `cgram` off.
+
+### Stage 5 — V: the vector channel on disk (many months)
+
+The long pole. V1–V5 are done — quantizer, `wvec` type, 32-lane packing — at
 17,741 + 1,909,440 property checks. V6 is **partial**: the scalar scoring oracle
 exists and three paths (`scalar`, `lut-wide`, `lut-avx2`) are verified `memcmp`-
-identical to it over 308,278 differential checks, with dispatch resolved once in
-`weave_vec_kernels_init()`. Everything that touches disk remains.
+identical to it over 308,278 differential checks, dispatch resolved once at
+`_PG_init`. Everything that touches disk remains.
 
 - V7 `WEAVE_PK_VCODES`/`WEAVE_PK_VMETA` pages (kind ids reserved by X1 — read them
-  with `WeavePageHasKind()`, never a bitwise AND, and **zero the block buffer
-  before packing** or the page image is nondeterministic); V8 code-scan shuttle;
-  **V9 IVF**, not Vamana.
+  with `WeavePageHasKind()`, never a bitwise AND, and **zero the block buffer before
+  packing** or the page image is nondeterministic); V8 code-scan shuttle; **V9 IVF**,
+  not Vamana, and now informed by Stage 3's measurement rather than assuming it.
 - **V13 and V14 are not optional.** `bench/RESULTS_BOUND_PRUNING.md` measured the
   spec'd per-coordinate bound pruning **0.0%** of blocks; centroid+radius prunes
   99.6% *only* with a cluster-ordered warp. Skipping either yields a correct index
@@ -254,60 +310,36 @@ identical to it over 308,278 differential checks, with dispatch resolved once in
   and therefore *cannot* satisfy V6's "identical to scalar" gate; they owe a recall
   budget nobody has derived.
 
-**The Phase V gate may not be reachable as specified, and that is now on the
-record.** pg_turbovec v2.7.4 measured IVF's probe count imposing a hard recall
-ceiling — 0.846/0.906/0.954/0.978/0.984 at probes 8/16/32/64/128 at `lists=512` —
-which no widening of the rerank window moves, because probe count and rerank window
-fix different failure modes. That is a property of IVF, not of 1-bit codes, so it
-applies to our IVF too. Worse for the comparator: on pg_turbovec's own 500k × 1024-d
-corpus, **pgvector HNSW never reached 0.99 either**. So `recall@10 ≥ 0.99` may be a
-gate no available design clears on some corpora, and "some setting clears it" is not
-evidence that a *fast* setting does. V9's gate now requires a probes-vs-recall-vs-p50
-sweep, not a single passing triple. `doc/specs/VECTOR_CHANNEL.md` §8a.
+**Exit gate:** the four adversity gates (7, 8, 9, 11) for the new weft, plus a
+matched-recall comparison against pgvector HNSW — recall held equal *and demonstrated
+reachable by both*, then latency and size compared.
 
-**Exit gate:** the four adversity gates (7, 8, 9, 11) for the new weft
-specifically, plus a matched-recall comparison against pgvector HNSW — recall held
-equal *and demonstrated reachable by both*, then latency and size compared.
+### Stage 6 — F, the actual thesis (months)
 
-### Stage 4 — F, the actual thesis (months)
+Only after L, Z and V gate (hard rule 7, restored to its original form on 2026-09-10
+after a same-day amendment was reverted). F1–F4, and F5's property test: fused top-k
+identical to brute force over 10⁶ generated cases. Until F5 passes, the central claim
+of the project is a document.
 
-Only after L and V gate (hard rule 7 as amended 2026-09-10 — Z was removed from the
-precondition when it left the 1.0 path; the rule's *reason* is unchanged, which is
-that a fused scorer debugged against a half-working channel costs more than both).
-F1–F4, and F5's property test: fused top-k identical to brute force over 10⁶
-generated cases. Until F5 passes, the central claim of the project is a document.
+With six retrieval kinds rather than two, F is worth *more* and costs the same: the
+loop, pivot selection, the essential/non-essential partition and F5's property test
+are all channel-count agnostic, while the value of fusing rises with the number of
+channels a query can combine.
 
-Note what fusing two channels instead of three does *not* change: F1's pivot
-selection, the essential/non-essential partition, and F5's property test are all
-channel-count agnostic. Z arriving later costs F nothing.
+### Stage 7 — M, P, R: shippable (months)
 
-### Stage 5 — M, P, R: shippable (months)
+**M is where the product definition gets cashed.** "A singular text index replacing
+pgvector + a BM25 index + pg_trgm" is a compatibility claim before it is a
+performance claim, so M1/M2 (pgvector surface and coexistence), M3
+(`tsvector`/`tsquery` casts and a `@@`-compatible operator) and **M4 (pg_trgm
+surface: `%`, `similarity()`, `word_similarity()` over `cgram`)** are all 1.0
+requirements rather than polish. M4 returns to the 1.0 path with Z8. M5's in-place
+index swap and M6's `weave_check()` health reporting stay in.
 
-**M is where the product definition gets cashed.** "A replacement for pgvector +
-BM25" is a compatibility claim before it is a performance claim, so M1/M2 (pgvector
-surface and coexistence) and M3 (`tsvector`/`tsquery` casts and a `@@`-compatible
-operator) are 1.0 requirements, not polish. M4 (pg_trgm surface) follows Z and
-therefore slips past 1.0 with it. M5's in-place index swap and M6's `weave_check()`
-health reporting stay in.
-
-Then **P4 cost-model calibration** (without it `amcanorderbyop` silently stops
-choosing the index on large tables), P3 the reproducible competitive matrix
-including losses, then R1–R5: DocBook docs, examples, PGXN, managed-service
-readiness, contrib submission.
-
-### After 1.0 — Z, the third channel
-
-Not cancelled, not deferred by neglect: **deliberately sequenced after the product
-exists.** The code is imported and compiling, TRE is current (`f864ed0`, carrying
-the `INT_MAX` crash fix and the backref wrong-answer fix, both with regression
-coverage in `test/hegel/`), and Z3–Z9 are unchanged in `doc/PHASES.md`. Z7 still owes
-the other half of pg_tre `4a9c86c` — the prefilter must refuse to reject when
-`always_true` is set, with a case-insensitive-anchored-pattern regression test.
-
-The two bugs just ported are worth a note on why this ordering is safe: both were
-**latent** here, unreachable from SQL precisely because the channel is unrouted. An
-unrouted channel cannot return a wrong answer. That is what makes deferring Z cheap
-and deferring a *routed* half-built channel expensive.
+Then **P4 cost-model calibration** — with six channels and `amcanorderbyop`, an
+uncalibrated cost model does not merely mis-cost one path, it picks the wrong
+*channel* — P3 the reproducible competitive matrix including losses, then R1–R5:
+DocBook docs, examples, PGXN, managed-service readiness, contrib submission.
 
 ### Cross-cutting, continuous — not a stage
 
@@ -319,25 +351,27 @@ without it and a user hit a temp-disk wall the docs did not predict). Also: **a
 Codeberg CI runner is still not registered**, so `.forgejo/workflows/ci.yml` has
 never run. That is a repo-settings action and it gates everything above.
 
-## A lexical-only 1.0 is still a real option — but it is now a different trade
+## A lexical-only 1.0 is a worse idea than it was this morning
 
-The staged plan above remains 18–30 months, and dropping Z from the critical path
-does not change that, because Z was never the long pole. V is.
+The staged plan above remains 18–30 months. Dropping or adding Z does not change
+that, because Z was never the long pole. V is.
 
 pg_weave's lexical channel is **already better than the alternatives on four
 measured axes** — index size (626 MB vs 873/1120), build time (at GIN parity),
 `count(*)` (~200×), keyless `ORDER BY` (index path where GIN seq-scans) — and near
-parity on ranked latency, winning outright at k=100. That is a shippable product
-with a defensible claim, reachable in weeks rather than years.
+parity on ranked latency, winning outright at k=100. That is a shippable thing,
+reachable in weeks rather than years.
 
-What changed on 2026-09-10 is the cost of choosing it. With the product defined as
-BM25 + vector, a lexical-only 1.0 is no longer "ship early and add channels later" —
-it is **shipping something the product definition says is not the product.** It
-would compete with pg_fts and pg_textsearch, which is a fight over a channel we
-inherited rather than the fight the architecture argues for.
+But with the product defined as **six retrieval kinds in one index**, a lexical-only
+release ships one and a half of them (BM25, plus prefix), and it competes on a
+channel we inherited rather than on the thing the architecture argues for. It is a
+good **0.x** and a bad **1.0**. Version numbers are cheap; the fused thesis is not.
 
-The honest framing: a lexical-only release is a good *0.x* and a bad *1.0*. Version
-numbers are cheap and the fused thesis is not.
+The genuinely useful intermediate is different: **L + Z is four of the six** (BM25,
+fuzzy, approximate regex, prefix, and with Z8 n-gram makes five), needs no new
+codec, and would already be a single index replacing `pg_fts` + `pg_trgm` + `pg_tre`.
+That is a defensible 0.x milestone with a real claim, and unlike a lexical-only
+release it is on the way to 1.0 rather than beside it.
 
 This is a maintainer decision, not a technical one, and it should be made on
 purpose.
@@ -348,7 +382,7 @@ purpose.
 |---|---|
 | BM25 text search in Postgres | **pg_fts** (same code, real release history) or Timescale's pg_textsearch |
 | Vector search in Postgres | **pgvector** (HNSW), or VectorChord |
-| Fuzzy / substring | **pg_trgm**; add **pg_tre** only for k≥1 edit distance at modest scale |
+| Fuzzy / substring / regex | **pg_trgm**; add **pg_tre** only for k≥1 edit distance at modest scale |
 | Hybrid at scale, managed, willing to leave Postgres | **turbopuffer** or ParadeDB — see `doc/COMPETITIVE.md` |
 | Storage-optimal exact vector recall where an O(n) scan fits | pg_turbovec |
 
