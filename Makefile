@@ -310,7 +310,20 @@ check-standalone:
 	echo "== V5 32-lane packing: round-trip, lane isolation, move_lane/zero_lane, bounds =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/pack test/hegel/test_pack.c src/vector/pack.c; \
 	$$tmp/pack | tail -1; \
+	echo "== TRE d0e0c997 -> f864ed0 (pg_tre 1521662): backref wrong-answer fix =="; \
+	bash test/hegel/run_tre_bump.sh backref | tail -1; \
 	echo "== ALL STANDALONE CHECKS PASSED =="
+
+# The INT_MAX crash fix (pg_tre 1521662 / upstream ad26b6d) needs an actual
+# buffer bigger than INT_MAX bytes (~2 GiB) plus a guard page to reproduce
+# deterministically -- ~10s and ~2 GiB resident, not appropriate for the
+# default gate every `make check-standalone` run hits. Separate target, same
+# "skip loudly, do not fail CI silently" spirit as check-sparsemap-wire, but
+# this one has no external dependency to be missing, so it always runs when
+# invoked; it is just not invoked by check-standalone or check-all.
+.PHONY: check-tre-bump-intmax
+check-tre-bump-intmax:
+	@bash test/hegel/run_tre_bump.sh intmax
 
 # Cross-version sparsemap wire compatibility.  Separate because it needs the
 # sparsemap repository to extract the PREVIOUS release's sources -- it verifies that
