@@ -114,28 +114,59 @@ The two effects are within noise of each other on this corpus. Conclusions:
    removes the cost that currently offsets it. That is a better target than
    either L2 or L3.
 
-### Why decoding cannot simply be cached away
+### Why this cannot be fixed by caching, and what the actual route is
 
-Worth stating so the fix is not over-promised. The sidecar is delta-coded, so
-finding a docid requires prefix-summing gaps. The cursor already avoids the
-obvious waste: it walks *block headers only* (which carry `first_docid`) to find
-the covering block and FOR-unpacks just that one block. With mid's ~50-docid
-stride, ~2.6 of a block's 128 entries are ever used, and per query that is
-~15,000 block decodes ≈ 1.95M entry decodes — for a corpus with 2M documents.
-So the scan decodes roughly *one entry per document in the corpus* regardless.
-Decoding the whole page instead of the block does not help: same total entries.
+Worth deriving, because two plausible fixes are already known-dead and a third
+looks right until you do the arithmetic.
 
-What *is* pure waste, and what L17 removes:
+The sidecar's docid column is **delta-coded** (`weave_for_pack` over gaps), so
+finding a docid requires prefix-summing gaps from the block start. The candidate
+docids of a single-term scan ascend monotonically, so the current code is
+already performing an *optimal sequential sweep*: ~15,000 block loads × 128
+entries ≈ 1.9M gap decodes, against a floor of 2M (one per document in the
+corpus, since a mid-frequency term's candidates span the whole docid range).
+**The sequential decode is not redundant — it is at its floor.** Hence:
 
-- the **header re-walk from the start of the page** on every block change
-  (~40 header steps × ~15,000 loads ≈ 610K wasted iterations per query),
-- the **`ReadBuffer`/`LockBuffer`/`UnlockReleaseBuffer` per block change**
-  (~15,000 pin cycles per query; the 11,702 buffer hits in the EXPLAIN above),
-- decoding a block **past** the docid actually requested.
+- **Caching the whole page instead of the block does not help** (same total
+  entries). It was already tried and reverted for a worse reason: it amplified
+  scattered rare terms ~200×, ~7.9 ms of a 10.2 ms rare-term scan
+  (`src/am/am.c`, `weave_doclen_cursor_load_page` header).
+- **Lazy in-block decode barely helps.** With ~2.6 uniformly-placed candidates
+  per 128-entry block, the *last* one sits at ~93% of the block, so stopping at
+  the requested docid saves ~7%.
+- **Resuming the header walk** from the current block instead of the page start
+  removes ~610K wasted iterations per query — real, but only ~14% of
+  `load_page`'s self time. The other ~86% is the FOR-unpack plus prefix-sum of
+  128 entries per block change (~1.9M each, both inlined into `load_page`, which
+  is why they appear as its self time).
 
-So L17 is expected to remove a substantial fraction of the 72%, not all of it.
-Gate accordingly: mid k=10 ≤ 8 ms (from 10.26), rare ≤ 2.2 ms (from 2.82), with
-index size unchanged at 625 MB.
+So the only way to beat 1.9M is to **skip** entries rather than decode them, and
+that requires random access into the block. `weave_for_get(buf, i)` already
+provides exactly that — FOR packing is fixed-width, so entry *i* is O(1)
+addressable — but it cannot be used on a *gap* column, because entry *i*'s docid
+is a prefix sum, not a stored value.
+
+**The route is therefore to store the docid column as absolute offsets from the
+block's `first_docid` instead of gaps.** Both are FOR-packed by the same codec;
+only the values change. That makes the column monotone *and* randomly
+addressable, so locating a docid inside a block becomes a **binary search of
+~7 `weave_for_get` calls instead of 128 unpacks plus 128 prefix-sum stores**, and
+the resident `docid[]`/`byte[]` arrays stop being needed at all — the byte is
+read directly at the found index.
+
+| | now (gaps) | absolute offsets |
+|---|---:|---:|
+| decode work per block change | 128 unpack + 128 prefix-sum | ~7 `weave_for_get` |
+| per mid k=10 query | ~1.9M entry decodes | ~105K |
+| coded width, 128-doc block spanning ~6,400 docids | ~6 bits (gap ≈ stride) | ~13 bits |
+| sidecar size | 4,672 kB | ~9 MB (**+0.7%** of a 625 MB index) |
+
+That is a **segment-format change**, but a narrowly scoped one: it touches only
+the doclen sidecar's docid column encoding, and the segment format is already
+versioned (v3 inline vs v4 sidecar, with `weave_meta_upcast_page` and a
+reader that dispatches on version). It needs a version bump, an upgrade path
+that can still read v4 gap-coded sidecars, and an extension of the standalone
+FOR/wire property tests — which is why it is a task and not a patch.
 
 ## Consequence for L2
 
