@@ -13,33 +13,44 @@ codebase that is a prototype.
 
 ## What actually works today
 
+pg_weave's product definition is **one index replacing the combination of a BM25
+index and a vector-similarity index**. Read the table with that in mind: the left
+half of the product is real and competitive, the right half does not reach disk yet.
+
 | capability | state | evidence |
 |---|---|---|
-| BM25 lexical search, boolean, phrase, NEAR, prefix | **works** | forked from pg_fts 1.5.8, current with upstream 1.6.0; 5 regression + 2 isolation + 61 TAP green on PG 17 and 18 |
+| BM25 lexical search, boolean, phrase, NEAR, prefix | **works** | forked from pg_fts 1.5.8, current with upstream 1.6.0; 6 regression + 2 isolation + 105 TAP green on PG 17 and 18 |
 | Index-native `count(*)` | **works** | inherited; measured ~200× faster than tsvector+GIN at 2 M docs (`bench/RESULTS_LEXICAL.md`) |
 | Ranked top-k latency | **works, competitive at k=100** | after L14/L15/L17: rare k=10 1.51 ms (1.20× pg_textsearch), k=100 **wins** rare 3.96× and mid 1.27×; common k=10 still 4.75× behind (task L2). `bench/RESULTS_L17.md` |
 | Build time | **at GIN parity** | 192.5 s vs GIN 202.7 s, pg_textsearch 49.2 s (3.91× behind). `bench/RESULTS_L15.md` |
 | Index size | **best of the three** | 626 MB vs pg_textsearch 873 MB, tsvector+GIN 1120 MB |
 | Crash recovery, replication, MVCC, CIC/REINDEX | **works** | inherited; `t/001`–`t/009` |
 | Vacuum, tombstones, tiered merge | **works** | inherited; `t/008` reclaims 4688 → 2199 pages |
-| Vector quantizer: rotation, codebook, encode/decode, packing | **works** | 17,741 property checks, 0 failures (tasks V2–V4) |
+| Multi-channel on-disk substrate: per-bolt channel descriptors, extended page-kind space, versioned metapage reader | **works** | phase X (format v6); `t/010` upgrades a 20,000-row v5 index and proves byte-identical answers; `t/011` proves a corrupted descriptor `ERROR`s cleanly; 852,070 exhaustive kind-space checks |
+| `weave_check()` invariant verification | **partial** | 11 invariants, incl. chandesc reachability and page-kind classification. Before phase X only `weave_check_meta()` existed. ~14 of `SEGMENT_FORMAT.md` §9 still owed |
+| Vector quantizer: rotation, codebook, encode/decode, packing | **works** | 17,741 + 1,909,440 property checks, 0 failures (tasks V2–V5) |
+| Vector block scoring kernels | **partial** | scalar oracle + `lut-wide` + `lut-avx2`, verified `memcmp`-identical over 308,278 differential checks; dispatch resolved once at `_PG_init`. AVX-512, NEON and the approximate families are unmet and tabulated as unmet (`VECTOR_CHANNEL.md` §8) |
 | `wvec` type: I/O, typmod, casts, 4 distance operators, arithmetic, btree | **works** | task V1; `sql/wvec.sql`, green on PG 17 and 18 |
 | Quantizer reachable from SQL (`weave_quantize_roundtrip`) | **works** | lets reconstruction error be measured on a real corpus before the index exists |
-| Vector *indexing* (the AM accepting a `wvec` column) | **does not exist** | tasks V7–V9 |
-| Fuzzy / regex / prefix channel | **compiles, unreachable** | tasks Z1/Z2 done (TRE vendored, GUCs wired); no channel routing yet (Z3–Z7) |
-| Vector storage, SIMD kernels, ANN graph | **does not exist** | stubs that `ereport(ERROR)` |
+| Vector *indexing* (the AM accepting a `wvec` column) | **does not exist** | tasks V7–V9. **This is the gap between pg_weave and its own product definition** |
+| Vector storage pages, IVF, ANN | **does not exist** | tasks V7, V9, V13, V14 |
 | Fused-threshold top-k | **does not exist** | specified only |
-| pgvector / tsvector / pg_trgm compatibility | **does not exist** | specified only |
+| pgvector / tsvector compatibility | **does not exist** | specified only; M1–M3, and 1.0 requirements rather than polish |
+| Fuzzy / regex / prefix channel | **compiles, unreachable — and deliberately post-1.0** | Z1/Z2 done (TRE vendored at `f864ed0` and current, GUCs wired); no routing (Z3–Z7). Removed from the 1.0 path 2026-09-10: it is a third channel on a two-channel product |
 
-So: pg_weave today is *pg_fts with a rename, plus a tested quantizer nothing calls
-yet* — with one qualification that has grown real since this line was written. The
-L-phase work (L7, L8, L10, L12, L14, L15, L17) has made the **lexical channel
-measurably better than what it forked from** on size, build time, `count(*)`,
-keyless `ORDER BY`, and deep-page ranked latency, all recorded in `bench/`. If you
-want the lexical capability in production today, **pg_fts is still the safer
-choice** — longer track record, real release history, and pg_weave's advantages are
-measured on one synthetic corpus. But the honest statement is no longer "identical
-code"; see "A lexical-only 1.0 is a real option" below.
+So: pg_weave today is *a measurably improved pg_fts, plus a tested quantizer and
+verified scoring kernels that no on-disk format calls yet.* The L-phase work (L7,
+L8, L10, L12, L14, L15, L17) has made the **lexical channel measurably better than
+what it forked from** on size, build time, `count(*)`, keyless `ORDER BY`, and
+deep-page ranked latency, all recorded in `bench/`. Phase X made the substrate
+multi-channel. But the sentence that matters is this one: **the vector channel
+still cannot index a column**, so pg_weave is not yet a replacement for the pair it
+intends to replace, and anyone needing both capabilities today needs both
+extensions.
+
+If you want the lexical capability alone in production today, **pg_fts is still the
+safer choice** — longer track record, real release history, and pg_weave's
+advantages are measured on one synthetic corpus.
 
 ## The gate list
 
@@ -166,21 +177,33 @@ extensions are finished.
 
 ## The route from here, in dependency order
 
-24 of 63 tasks are done (`doc/PHASES.md`), phase X included. The ordering below is forced by three
-things: the page-kind bit exhaustion blocks *both* remaining channels, hard rule 7
-forbids starting F before L/Z/V gate, and every new on-disk structure owes the
-adversity gates (7–11) before it counts.
+**The product is BM25 + vector in one index.** That was settled on 2026-09-10 and it
+reorders everything below. pg_weave replaces the *combination* of a BM25 index and a
+vector-similarity index — the pgvector + pg_fts/pg_textsearch stack — with one index
+over one docid space. Fuzzy, regex and prefix remain in the architecture and their
+code remains imported and compiling, but **phase Z is no longer on the path to 1.0**:
+it is a third channel on a product that needs two.
+
+That single decision is worth more than any task below, because it removes a whole
+phase from the critical path rather than making one faster. The former Stage 3 (Z)
+was justified as "the cheap second channel" — cheap, and the wrong one. Vector is
+expensive and it is the one the product definition names.
+
+29 of 66 tasks are done (`doc/PHASES.md`), phase X included. The ordering is now
+forced by two things rather than three: hard rule 7 as amended (F waits for L and V,
+not for Z), and every new on-disk structure owing the adversity gates (7–11) before
+it counts. The page-kind exhaustion that used to force the ordering is closed.
 
 ### Stage 1 — finish the lexical channel (weeks)
 
-The only phase where pg_weave already competes, and the cheapest remaining wins.
+Half the product, already competitive, and the cheapest remaining wins.
 
 | task | why now |
 |---|---|
-| L17 follow-ups | Both specified and cheap from `bench/RESULTS_L17.md`: the 8-step pre-bisect walk is counterproductive at sparse stride (~15 `weave_for_get` calls/lookup), and a whole-page copy now cuts buffer hits ~15,000 → ~584 per query — an idea correctly rejected for v4 that v5 makes viable because it no longer decodes |
+| ~~L17 follow-ups~~ | **DONE 2026-09-10.** Both shipped: the pre-bisect walk is now gated by a window test (`weave_for_get` calls/lookup ~12.0 → ~6.55 against a plain bisect's ~7) and the cursor copies the whole sidecar page (buffer hits 767 → 90 on the profiled query, 100k-doc scratch corpus). The gated walk is now itself under property test — `test/hegel/test_doclen_block.c` went 2,839,534 → 22,751,425 checks after the walk was lifted into `include/weave/for.h` so a no-backend test could reach it |
 | L2 | Re-aimed: owns the `common` band only (4.75× behind, 1.74 M postings genuinely read) |
 | L5 | Positions default decision — phrase is unusable with positions off, and this is a *documented decision*, not code |
-| L1 | Split the `am.c` unity build. Blocks nothing, but every task above grows a 6,800-line file |
+| L1 | Split the `am.c` unity build. Blocks nothing, but every task above grows a 7,300-line file |
 | L6 | `read_stream` prefetch: the only cold-cache work; all current numbers are warm |
 
 **Exit gate:** G13 at ≤2× pg_textsearch in every band, or the residual documented
@@ -205,83 +228,116 @@ not fit the padding and at that moment the reader has to already be right.
 upgrade-over-an-index-with-data half of gate 6 is closed by
 `t/010_format_v6_upgrade.pl`.
 
-### Stage 3 — Z, the cheap second channel (months)
+### Stage 3 — V, the other half of the product (many months)
 
-Two channels is the product; fuzzy is far cheaper than vector because the code is
-already imported and compiling.
+Promoted over Z on 2026-09-10. This is now the long pole and the only thing between
+pg_weave and the claim it exists to make.
 
-- **First:** vendor TRE `d0e0c997` → `f864ed0` (`IMPORT_pg_tre.md`). Carries an
-  `INT_MAX` crash fix and a backref wrong-answer fix; pg_tre already rebased the
-  progress-hook patch, so reuse it.
-- Z3 (SuRF over the *vocabulary*, not the corpus) → Z4/Z5/Z6 routing → Z7 shuttle.
-- **Z7 owes the other half of pg_tre `4a9c86c`**: the prefilter must refuse to
-  reject when `always_true` is set, with a case-insensitive-anchored-pattern
-  regression test. The extraction half is already ported.
-- Z8 (`cgram`) is opt-in and can slip; Z9 (`<@>` KNN) needs a real bound.
+V1–V5 are done — quantizer, `wvec` type, and the 32-lane packing layout, at
+17,741 + 1,909,440 property checks. V6 is **partial**: the scalar scoring oracle
+exists and three paths (`scalar`, `lut-wide`, `lut-avx2`) are verified `memcmp`-
+identical to it over 308,278 differential checks, with dispatch resolved once in
+`weave_vec_kernels_init()`. Everything that touches disk remains.
 
-**Exit gate:** bound property test (gate 3), fuzz target (gate 8), crash +
-replication TAP (gate 7), concurrency test matching `t/005`'s 58,049 reads
-(gate 11) — for the new weft specifically.
-
-### Stage 4 — V, the expensive channel (many months)
-
-V1–V4 are done (quantizer + type, 17,741 property checks). What remains is
-everything that touches disk.
-
-- V6 SIMD kernels with runtime dispatch; V7 `WEAVE_VCODES`/`WEAVE_VMETA` pages;
-  V8 code-scan shuttle; **V9 IVF** (not Vamana — withdrawn on pg_turbovec's
-  matched-recall evidence that the graph never reached R@10 0.98).
+- V7 `WEAVE_PK_VCODES`/`WEAVE_PK_VMETA` pages (kind ids reserved by X1 — read them
+  with `WeavePageHasKind()`, never a bitwise AND, and **zero the block buffer
+  before packing** or the page image is nondeterministic); V8 code-scan shuttle;
+  **V9 IVF**, not Vamana.
 - **V13 and V14 are not optional.** `bench/RESULTS_BOUND_PRUNING.md` measured the
   spec'd per-coordinate bound pruning **0.0%** of blocks; centroid+radius prunes
   99.6% *only* with a cluster-ordered warp. Skipping either yields a correct index
   with no pruning, i.e. a linear scan.
 - V10 exact path; V11 torn-write detection with an injection test (gate 9).
-- Adopt pg_turbovec's measured lessons rather than rediscovering them: 1-bit BQ
-  needs mean-centering and un-rotated centroids, and its chain-offset-sum bug
-  recurred four times because descriptor offsets were not single-sourced.
+- The remaining ISA matrix (AVX-512BW/VNNI, NEON, NEON SDOT) and the approximate
+  byte-LUT / int8-dot families are unmet and tabulated as unmet in
+  `doc/specs/VECTOR_CHANNEL.md` §8. The approximate families quantize the query LUT
+  and therefore *cannot* satisfy V6's "identical to scalar" gate; they owe a recall
+  budget nobody has derived.
 
-**Exit gate:** same four adversity gates as Stage 3, plus a matched-recall
-comparison against pgvector HNSW — recall held equal, then latency and size
-compared.
+**The Phase V gate may not be reachable as specified, and that is now on the
+record.** pg_turbovec v2.7.4 measured IVF's probe count imposing a hard recall
+ceiling — 0.846/0.906/0.954/0.978/0.984 at probes 8/16/32/64/128 at `lists=512` —
+which no widening of the rerank window moves, because probe count and rerank window
+fix different failure modes. That is a property of IVF, not of 1-bit codes, so it
+applies to our IVF too. Worse for the comparator: on pg_turbovec's own 500k × 1024-d
+corpus, **pgvector HNSW never reached 0.99 either**. So `recall@10 ≥ 0.99` may be a
+gate no available design clears on some corpora, and "some setting clears it" is not
+evidence that a *fast* setting does. V9's gate now requires a probes-vs-recall-vs-p50
+sweep, not a single passing triple. `doc/specs/VECTOR_CHANNEL.md` §8a.
 
-### Stage 5 — F, the actual thesis (months)
+**Exit gate:** the four adversity gates (7, 8, 9, 11) for the new weft
+specifically, plus a matched-recall comparison against pgvector HNSW — recall held
+equal *and demonstrated reachable by both*, then latency and size compared.
 
-Only after L, Z and V gate (hard rule 7). F1–F4, and F5's property test: fused
-top-k identical to brute force over 10⁶ generated cases. Until F5 passes, the
-central claim of the project is a document.
+### Stage 4 — F, the actual thesis (months)
 
-### Stage 6 — M, P, R: shippable (months)
+Only after L and V gate (hard rule 7 as amended 2026-09-10 — Z was removed from the
+precondition when it left the 1.0 path; the rule's *reason* is unchanged, which is
+that a fused scorer debugged against a half-working channel costs more than both).
+F1–F4, and F5's property test: fused top-k identical to brute force over 10⁶
+generated cases. Until F5 passes, the central claim of the project is a document.
 
-M1–M6 migration surfaces (pgvector/tsvector/pg_trgm), **P4 cost-model calibration**
-(without it `amcanorderbyop` silently stops choosing the index on large tables),
-P3 the reproducible competitive matrix including losses, then R1–R5: DocBook docs,
-examples, PGXN, managed-service readiness, contrib submission.
+Note what fusing two channels instead of three does *not* change: F1's pivot
+selection, the essential/non-essential partition, and F5's property test are all
+channel-count agnostic. Z arriving later costs F nothing.
+
+### Stage 5 — M, P, R: shippable (months)
+
+**M is where the product definition gets cashed.** "A replacement for pgvector +
+BM25" is a compatibility claim before it is a performance claim, so M1/M2 (pgvector
+surface and coexistence) and M3 (`tsvector`/`tsquery` casts and a `@@`-compatible
+operator) are 1.0 requirements, not polish. M4 (pg_trgm surface) follows Z and
+therefore slips past 1.0 with it. M5's in-place index swap and M6's `weave_check()`
+health reporting stay in.
+
+Then **P4 cost-model calibration** (without it `amcanorderbyop` silently stops
+choosing the index on large tables), P3 the reproducible competitive matrix
+including losses, then R1–R5: DocBook docs, examples, PGXN, managed-service
+readiness, contrib submission.
+
+### After 1.0 — Z, the third channel
+
+Not cancelled, not deferred by neglect: **deliberately sequenced after the product
+exists.** The code is imported and compiling, TRE is current (`f864ed0`, carrying
+the `INT_MAX` crash fix and the backref wrong-answer fix, both with regression
+coverage in `test/hegel/`), and Z3–Z9 are unchanged in `doc/PHASES.md`. Z7 still owes
+the other half of pg_tre `4a9c86c` — the prefilter must refuse to reject when
+`always_true` is set, with a case-insensitive-anchored-pattern regression test.
+
+The two bugs just ported are worth a note on why this ordering is safe: both were
+**latent** here, unreachable from SQL precisely because the channel is unrouted. An
+unrouted channel cannot return a wrong answer. That is what makes deferring Z cheap
+and deferring a *routed* half-built channel expensive.
 
 ### Cross-cutting, continuous — not a stage
 
 ASan/UBSan on the full suite (gate 10), a fuzz target per on-disk structure
 (gate 8), `weave_check()` covering all ~20 `SEGMENT_FORMAT.md` §9 invariants
-(gate 4), and documented resource behaviour (gate 14 — pg_tre shipped without it
-and a user hit a temp-disk wall the docs did not predict). Also: **a Codeberg CI
-runner is still not registered**, so `.forgejo/workflows/ci.yml` has never run.
-That is a repo-settings action and it gates everything above.
+(gate 4 — `weave_check()` now exists and covers 11; before phase X there was only
+`weave_check_meta()`), and documented resource behaviour (gate 14 — pg_tre shipped
+without it and a user hit a temp-disk wall the docs did not predict). Also: **a
+Codeberg CI runner is still not registered**, so `.forgejo/workflows/ci.yml` has
+never run. That is a repo-settings action and it gates everything above.
 
-## A lexical-only 1.0 is a real option
+## A lexical-only 1.0 is still a real option — but it is now a different trade
 
-The staged plan above is 18–30 months. There is a shorter path worth deciding
-explicitly rather than by default.
+The staged plan above remains 18–30 months, and dropping Z from the critical path
+does not change that, because Z was never the long pole. V is.
 
-After Stage 1, pg_weave's lexical channel is **already better than the alternatives
-on four measured axes** — index size (626 MB vs 873/1120), build time (at GIN
-parity), `count(*)` (~200×), keyless `ORDER BY` (index path where GIN seq-scans) —
-and near parity on ranked latency, winning outright at k=100. That is a shippable
-product with a defensible claim, reachable in weeks rather than years, and it does
-not foreclose the rest: Stage 2's format break is designed to be additive.
+pg_weave's lexical channel is **already better than the alternatives on four
+measured axes** — index size (626 MB vs 873/1120), build time (at GIN parity),
+`count(*)` (~200×), keyless `ORDER BY` (index path where GIN seq-scans) — and near
+parity on ranked latency, winning outright at k=100. That is a shippable product
+with a defensible claim, reachable in weeks rather than years.
 
-The cost of choosing it: the fused top-k thesis stays unproven, and pg_weave ships
-as "a better pg_fts" rather than as the thing `doc/ARCHITECTURE.md` §3 argues for.
-The cost of *not* choosing it: 18–30 months during which the honest recommendation
-in the table below stays "use something else".
+What changed on 2026-09-10 is the cost of choosing it. With the product defined as
+BM25 + vector, a lexical-only 1.0 is no longer "ship early and add channels later" —
+it is **shipping something the product definition says is not the product.** It
+would compete with pg_fts and pg_textsearch, which is a fight over a channel we
+inherited rather than the fight the architecture argues for.
+
+The honest framing: a lexical-only release is a good *0.x* and a bad *1.0*. Version
+numbers are cheap and the fused thesis is not.
 
 This is a maintainer decision, not a technical one, and it should be made on
 purpose.

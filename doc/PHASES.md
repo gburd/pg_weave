@@ -33,14 +33,25 @@ correctness bug ported in `c0d65a7` was live and default-on here for days.
 
 ## Ordering principle
 
-Channels land **one at a time, fully**, in the order of decreasing certainty:
-the lexical channel is already field-tested, the fuzzy channel is imported code
-needing wiring, the vector channel is new code implementing a published
-algorithm, and the fused scorer is the only genuinely novel piece. Building the
-novel piece last means it is built against three working channels instead of
-three simultaneous unknowns.
+**The product decides the order.** pg_weave replaces the *combination* of a BM25
+index and a vector-similarity index, so BM25 and vector are the two channels that
+constitute the product and everything else is an addition to it. Settled
+2026-09-10; see `doc/PRODUCTION_READINESS.md` "The route from here".
 
-Corollary: **do not start F1 before L, Z, and V are green.** The temptation will
+Channels land **one at a time, fully**. The original order was by decreasing
+certainty — lexical (field-tested), fuzzy (imported code needing wiring), vector
+(new code implementing a published algorithm), fused scorer (the only genuinely
+novel piece). **Z and V swapped on 2026-09-10.** Certainty is the right tiebreak
+between tasks that both belong on the path; it is the wrong reason to put a
+*third* channel ahead of a channel the product definition names. Z was the cheap
+one, and the cheap one was not the product.
+
+Building the novel piece last still holds, and for the same reason: it is then
+built against working channels instead of simultaneous unknowns.
+
+Corollary: **do not start F1 before L and V are green** (amended 2026-09-10 from
+"L, Z, and V" — `AGENTS.md` hard rule 7 records why, and records that F is
+channel-count agnostic so Z arriving later costs F nothing). The temptation will
 be strong because F is the interesting part. Resist it. A fused scorer debugged
 against a half-working vector channel will consume more time than both.
 
@@ -54,9 +65,9 @@ have baked in a collision the other could only resolve with a REINDEX.
   phase 0  DONE   repository, build, lexical channel forked, all tests green
   phase L         lexical channel: pay down the inherited debt
   phase X  DONE   format substrate (v6): kind space + per-bolt weft descriptors
-  phase Z         fuzzy/regex/prefix channel: wire the pg_tre import
-  phase V         vector channel: new C code
+  phase V         vector channel: new C code -- the other half of the product
   phase F         fused-threshold top-k: the novel part
+  phase Z  POST-1.0  fuzzy/regex/prefix: a third channel on a two-channel product
   phase M         migration/compatibility surface
   phase P         performance: the numbers that justify the claims
   phase R         1.0: docs, packaging, PGXN, contrib submission
@@ -135,7 +146,17 @@ invariants (task M6).
 
 ---
 
-## Phase Z — fuzzy / regex / prefix channel
+## Phase Z — fuzzy / regex / prefix channel (POST-1.0)
+
+**Sequenced after 1.0 on 2026-09-10, not cancelled.** The product is BM25 + vector
+in one index; this is a third channel on a two-channel product, so it moved off the
+critical path while its tasks stayed exactly as written. Two things make deferring
+it cheap rather than risky. First, TRE is **current** (`f864ed0`), carrying the
+`INT_MAX` crash fix and the backref wrong-answer fix with regression coverage in
+`test/hegel/`. Second, both of those bugs were **latent** here — unreachable from
+SQL precisely because the channel is unrouted. An unrouted channel cannot return a
+wrong answer, which is what separates deferring Z from deferring a *routed*
+half-built channel.
 
 The code is imported (`doc/specs/IMPORT_pg_tre.md`). The work is wiring it to the
 **vocabulary** funnel rather than pg_tre's corpus-level trigram index — that
@@ -175,7 +196,7 @@ read but **not** to port line-by-line: `~/src/turbovec` (Rust, MIT).
 | **V6** | **PARTIAL 2026-09-10.** Block-scoring kernels with runtime dispatch. Implemented and verified bit-identical to the scalar oracle on x86-64: `scalar` (the oracle; reaches codes only through the pack API, so it is layout-agnostic), `lut-wide` (portable wide-word float-LUT gather), `lut-avx2` (`vpsrlvd` + `vpgatherdps` + `vcvtps2pd`). Dispatch resolves once in `weave_vec_kernels_init()` from `_PG_init`, honours the new `pg_weave.vec_kernel` GUC (`auto`/`scalar`/`lut`/`dot`), and `weave_vec_kernel_name()` reports whichever path was resolved. | `test/hegel/test_kernels.c`: **308,278 checks, 0 failures**, clean under `-fsanitize=address,undefined`, and mutation-tested — a swapped AVX2 lane half, a wrong shift, an ignored `allow` mask, a 1-byte over-read, a dropped `allow` bounds check (ASan heap-buffer-overflow), a defaulted-instead-of-rejected pack layout, and a query LUT built without the rotation (which K1 cannot see and K5 catches at 10^5× tolerance) are each caught. Scores are checked against the *definition* in `doc/specs/VECTOR_CHANNEL.md` §2 — ⟨q, reconstruct(code)⟩ from real `weave_encode`/`weave_decode` output — not only against a transcription of the LUT loop. **What is NOT done, and why:** (a) no SSE2 and no baseline-NEON path — held to exactness, scoring is *gather*-bound, and neither ISA has a gather or a variable shift, so an exact kernel there is `lut-wide` plus register shuffling; (b) no AVX-512BW/VNNI and no NEON SDOT — this host is x86-64 without AVX-512 and there is no aarch64 runner or emulator wired up here, and an ISA path nobody ran is the failure AGENTS.md rule 8 exists to prevent, so none was written; (c) **no nibble-split byte-LUT and no int8-dot kernel at all** — both families quantize the query table to 8 bits, so they cannot be "identical to the scalar path" as this gate says, and they owe a recall budget that does not exist yet (see `doc/specs/VECTOR_CHANNEL.md` §8); (d) `bench/kernels.c` is still owed, so which of the three verified paths is fastest on a given host is **unmeasured** — `auto` picks the widest ISA by convention, not by measurement; (e) the fast paths skip masked lanes at **8-lane granularity** where the oracle skips per lane, so a scattered filter saves them less than it saves the oracle — stated in `src/vector/kernels.c` and `doc/specs/VECTOR_CHANNEL.md` §9, and unresolvable without (d) since the output is identical either way. The full V6 gate as originally written (seven ISAs, both strategies) remains **unmet and is tabulated as unmet** in `doc/specs/VECTOR_CHANNEL.md` §8. |
 | V7 | New page kinds `WEAVE_PK_VCODES`/`WEAVE_PK_VMETA` (ids 18/17, reserved by X1 in the extended kind space -- read them with `WeavePageHasKind()`, never a bitwise AND); codes live in the bolt under GenericXLog. **On-disk determinism:** `weave_block_codebytes()` allocates 0-28 slack bytes per block beyond the tight `4*dim*bits` requirement (see the note above it in `include/weave/quantize.h`), and no pack function ever writes them, so V7 **must zero the block buffer before encoding** or two indexes holding identical vectors get different bytes on disk. | crash-recovery TAP test extended to a vector index |
 | V8 | Code-scan shuttle: `score_block` over 32 lanes, `allow`-mask block short-circuit, and the block bound from `doc/specs/FUSED_TOPK.md` §2. Passes the segment's pack layout and the allowlist's `nwarp` into `score_block()` — both are parameters of that prototype, neither is assumed (`doc/specs/VECTOR_CHANNEL.md` §§8, 9) | (C1)+(C2) property test; a selective mask makes the scan measurably *faster* |
-| V9 | **IVF coarse quantizer** over the quantized codes: k-means over a sample, per-cluster centroids, `nprobe` probing, cluster-aligned code blocks (which also satisfies V13). **NOT a proximity graph** — withdrawn after pg_turbovec deprecated its graph kind in v2.5.0, having measured that at R@10 ≥ 0.98 on GIST-10M/960-d IVF reached 28.4 ms while the graph could not reach 0.98 at **any** latency (ceiling 0.873 at 181 ms) and built 57–90× slower. `doc/specs/VECTOR_CHANNEL.md` §8a. | recall@10 ≥ 0.99 on 1M × 1024-d; p50 within 2× of pgvector HNSW; storage ≤ 0.15× pgvector HNSW; **plus a recall floor in the gate for any partitioned build** — pg_turbovec's shard/thread coupling cost R@10 0.920 → 0.605 while a build-time-only test called it a 60× speedup |
+| V9 | **IVF coarse quantizer** over the quantized codes: k-means over a sample, per-cluster centroids, `nprobe` probing, cluster-aligned code blocks (which also satisfies V13). **NOT a proximity graph** — withdrawn after pg_turbovec deprecated its graph kind in v2.5.0, having measured that at R@10 ≥ 0.98 on GIST-10M/960-d IVF reached 28.4 ms while the graph could not reach 0.98 at **any** latency (ceiling 0.873 at 181 ms) and built 57–90× slower. **A later release (v2.7.4) additionally measured that IVF's probe count sets a hard recall ceiling a wider rerank window cannot break — 0.846/0.906/0.954/0.978/0.984 at probes 8/16/32/64/128 at `lists=512` — a mechanism, not a BQ-specific artifact, so it applies to this design's IVF too.** `doc/specs/VECTOR_CHANNEL.md` §8a. | recall@10 ≥ 0.99 on 1M × 1024-d, **backed by a probes-vs-recall-vs-p50 sweep on pg_weave's own codebook and corpus geometry, not a single (probes, recall, p50) triple picked to clear the bar**; p50 within 2× of pgvector HNSW measured at the same recall target **on the same corpus** (confirm HNSW can itself reach 0.99 there before using it as the comparator — pg_turbovec's own data shows a corpus where HNSW topped out at 0.983); storage ≤ 0.15× pgvector HNSW; **plus a recall floor in the gate for any partitioned build** — pg_turbovec's shard/thread coupling cost R@10 0.920 → 0.605 while a build-time-only test called it a 60× speedup |
 | V10 | `recall=exact` path: graph off, full code scan, optional full-precision rerank sidecar | recall@10 == 1.000 |
 | V11 | Journal-checksum-style incremental commit for the vector wefts (alternating header slots, delta digest) — adapted to PostgreSQL's WAL rather than replacing it | torn-write injection TAP test detects and recovers |
 | V12 | ColBERT-style multivector late interaction as a distinct channel kind | MaxSim correctness against a reference implementation |
@@ -196,10 +217,20 @@ no per-host A/B. V7–V14 not started.
 
 **Phase V gate:** on 1M × 1024-d Cohere-wiki, all three of
 `recall@10 ≥ 0.99`, `p50 ≤ 2× pgvector HNSW`, `size ≤ 0.15× pgvector HNSW`
-simultaneously. Recorded in `bench/RESULTS_VECTOR.md`. Note this is the gate
-pg_turbovec **failed** (490× slower); the difference is V9. If V9 does not land,
-the vector channel is storage-optimal and latency-poor and the README must say
-exactly that.
+simultaneously. Recorded in `bench/RESULTS_VECTOR.md`, which **must include a
+probes-vs-recall sweep for V9's IVF, not a single passing configuration** —
+pg_turbovec's v2.7.4 measured that a fixed `nprobe` imposes a recall ceiling no
+rerank-window widening can break (`doc/specs/VECTOR_CHANNEL.md` §8a), so "some
+setting clears 0.99" is not evidence that a *fast* setting does.
+
+Two warnings about the gate itself, both from measurements taken after it was
+written. **The comparator may not clear its own bar:** on pg_turbovec's 500k ×
+1024-d corpus, pgvector HNSW never reached 0.99 at all, so `p50 ≤ 2× pgvector
+HNSW` at matched recall is undefined there and the corpus must be checked before
+it is used. And this is the gate pg_turbovec **failed** (490× slower); the
+difference is V9. If V9 does not land — **or lands and cannot clear 0.99 within
+the latency budget** — the vector channel is storage-optimal and latency-poor and
+the README must say exactly that.
 
 ---
 
