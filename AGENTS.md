@@ -12,13 +12,24 @@ in a segment share one dense docid, so a bound derived in one channel can skip
 work in another — which is how a selective `WHERE` clause makes a vector query
 faster instead of collapsing its recall.
 
-**The product, stated so priorities follow from it:** pg_weave is a replacement for
-the *combination* of a BM25 index and a vector-similarity index — one all-in-one
-search index in place of the pgvector + pg_fts/pg_textsearch stack. Two channels
-are the product; the lexical half is real and competitive today and the vector half
-cannot yet index a column, which is why phase V is the long pole and phase Z
-(fuzzy/regex/prefix) sequences after 1.0. If a task does not move BM25, vector, or
-the fusion of the two closer to working, it is not on the critical path.
+**The product, stated so priorities follow from it:** pg_weave is **a singular text
+index** carrying BM25, vector similarity, fuzzy, approximate regex, prefix, and
+n-gram retrieval over one docid space. Not "BM25 plus a vector index" -- all six, one
+index, one `CREATE INDEX`. That means every one of phases L, Z and V is on the path
+to 1.0, and none of them is optional.
+
+Two consequences that are easy to get wrong:
+
+1. **Z8 (`cgram`, the corpus n-gram channel) is required, not opt-in.** It used to be
+   described as opt-in and slippable. "n-gram" is now a named product capability, so
+   it ships -- and its known cost ships with it: with `cgram` on, pg_weave is **not
+   smaller than `pg_trgm`**. That is a stated cost of the product now, not a
+   limitation we avoid by defaulting it off.
+2. **Do not re-derive the scope from a single sentence in an issue or a commit.** It
+   was narrowed to "BM25 + vector" and re-widened to all six within one session on
+   2026-09-10, and the plan documents were rewritten both times. If a request seems
+   to change the product's scope, ask before rewriting the roadmap.
+
 See `doc/PRODUCTION_READINESS.md` "The route from here".
 
 The thesis is `doc/ARCHITECTURE.md` §3. The novel algorithm is
@@ -155,19 +166,17 @@ Apache-2.0's patent grant and NOTICE requirements are incompatible with a clean
 PostgreSQL-licensed release, and contrib-track eligibility is the reason that
 matters. See `doc/LICENSING.md`.
 
-**7. Do not start Phase F before the L and V gates pass.** The fused scorer is the
-interesting part and the temptation is strong. A fused scorer debugged against a
-half-working vector channel costs more time than both, because every wrong answer
-has two possible causes and you will chase the wrong one.
+**7. Do not start Phase F before the L, Z, and V gates pass.** The fused scorer is
+the interesting part and the temptation is strong. A fused scorer debugged against a
+half-working channel costs more time than all of them, because every wrong answer
+has several possible causes and you will chase the wrong one.
 
-*Amended 2026-09-10:* this rule used to read "L, Z, and V". **Z was removed from the
-precondition, not from the project.** The product is a replacement for the
-combination of a BM25 index and a vector-similarity index, so fuzzy/regex/prefix is
-a third channel on a two-channel product and it sequences after 1.0
-(`doc/PRODUCTION_READINESS.md`). The rule's *reason* is unchanged and still binding
-for V. Nothing about F is channel-count dependent: pivot selection, the
-essential/non-essential partition, and F5's property test are all agnostic, so Z
-arriving later costs F nothing.
+*History, because the amendment and its reversal are both instructive:* on
+2026-09-10 this was amended to "L and V" when the product was briefly understood as
+BM25 + vector, and **reverted the same day** when the scope was restated as all six
+retrieval kinds. The rule is back to its original form. The lesson is not about the
+rule, it is about the process: a hard rule was weakened on an inference about scope
+rather than a question about scope.
 
 **8. Record losses as prominently as wins.** The house standard is
 `pg_turbovec/docs/PARITY_GAPS.md`, which retracted its own headline performance

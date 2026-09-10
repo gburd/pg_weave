@@ -33,27 +33,42 @@ correctness bug ported in `c0d65a7` was live and default-on here for days.
 
 ## Ordering principle
 
-**The product decides the order.** pg_weave replaces the *combination* of a BM25
-index and a vector-similarity index, so BM25 and vector are the two channels that
-constitute the product and everything else is an addition to it. Settled
-2026-09-10; see `doc/PRODUCTION_READINESS.md` "The route from here".
+**The product decides the order.** pg_weave is a **singular text index**: BM25,
+vector similarity, fuzzy, approximate regex, prefix, and n-gram over one docid
+space, in one `CREATE INDEX`. All six ship. So phases L, Z and V are all on the
+path to 1.0 and the only open question is their sequence.
 
-Channels land **one at a time, fully**. The original order was by decreasing
-certainty — lexical (field-tested), fuzzy (imported code needing wiring), vector
-(new code implementing a published algorithm), fused scorer (the only genuinely
-novel piece). **Z and V swapped on 2026-09-10.** Certainty is the right tiebreak
-between tasks that both belong on the path; it is the wrong reason to put a
-*third* channel ahead of a channel the product definition names. Z was the cheap
-one, and the cheap one was not the product.
+*This paragraph was rewritten twice on 2026-09-10 -- first to drop Z from the path
+when the product was read as "BM25 + vector", then back when the scope was restated
+as all six. Both rewrites are in `git log`. Recorded because a plan that changes
+under you is worth less than one that says why it changed.*
 
-Building the novel piece last still holds, and for the same reason: it is then
+Channels land **one at a time, fully**, in the order of decreasing certainty: the
+lexical channel is field-tested, the fuzzy channel is imported code needing wiring,
+the vector channel is new code implementing a published algorithm, and the fused
+scorer is the only genuinely novel piece. Building the novel piece last means it is
 built against working channels instead of simultaneous unknowns.
 
-Corollary: **do not start F1 before L and V are green** (amended 2026-09-10 from
-"L, Z, and V" — `AGENTS.md` hard rule 7 records why, and records that F is
-channel-count agnostic so Z arriving later costs F nothing). The temptation will
+**The sequence, and the one deliberate exception to certainty ordering.** Z before
+V, because Z is months where V is many months, its code is already imported and
+compiling, TRE is current at `f864ed0`, and phase X just landed the kind space and
+per-bolt descriptors that Z3's new page kind needs. But one piece of V jumps the
+queue: **V9's recall assumption gets measured before either channel is built.**
+Hard rule 9 exists for exactly this -- pg_turbovec measured IVF's probe count
+imposing a recall ceiling no rerank window moves, which may put Phase V's
+`recall@10 >= 0.99` gate out of reach *by design*. That question costs an afternoon
+with a standalone program now and costs months if V7/V8/V9 are built first. So:
+
+```
+  L tail + V9 recall de-risk  ->  Z3-Z9  ->  V7-V14  ->  F
+```
+
+The de-risk is a *measurement*, not a channel, and it does not violate the
+one-channel-at-a-time rule.
+
+Corollary: **do not start F1 before L, Z, and V are green.** The temptation will
 be strong because F is the interesting part. Resist it. A fused scorer debugged
-against a half-working vector channel will consume more time than both.
+against a half-working channel will consume more time than all of them.
 
 Second corollary, and the reason phase X exists: **the format substrate both
 remaining channels share had to land before either of them.** The page-kind space
@@ -65,9 +80,9 @@ have baked in a collision the other could only resolve with a REINDEX.
   phase 0  DONE   repository, build, lexical channel forked, all tests green
   phase L         lexical channel: pay down the inherited debt
   phase X  DONE   format substrate (v6): kind space + per-bolt weft descriptors
-  phase V         vector channel: new C code -- the other half of the product
+  phase Z         fuzzy / approx-regex / prefix / n-gram: wire the pg_tre import
+  phase V         vector channel: new C code -- the long pole
   phase F         fused-threshold top-k: the novel part
-  phase Z  POST-1.0  fuzzy/regex/prefix: a third channel on a two-channel product
   phase M         migration/compatibility surface
   phase P         performance: the numbers that justify the claims
   phase R         1.0: docs, packaging, PGXN, contrib submission
@@ -146,17 +161,27 @@ invariants (task M6).
 
 ---
 
-## Phase Z — fuzzy / regex / prefix channel (POST-1.0)
+## Phase Z — fuzzy / approximate-regex / prefix / n-gram channel
 
-**Sequenced after 1.0 on 2026-09-10, not cancelled.** The product is BM25 + vector
-in one index; this is a third channel on a two-channel product, so it moved off the
-critical path while its tasks stayed exactly as written. Two things make deferring
-it cheap rather than risky. First, TRE is **current** (`f864ed0`), carrying the
-`INT_MAX` crash fix and the backref wrong-answer fix with regression coverage in
-`test/hegel/`. Second, both of those bugs were **latent** here — unreachable from
-SQL precisely because the channel is unrouted. An unrouted channel cannot return a
-wrong answer, which is what separates deferring Z from deferring a *routed*
-half-built channel.
+**Four of the product's six named retrieval kinds live here**, which makes this
+phase load-bearing rather than an add-on. It was briefly moved post-1.0 on
+2026-09-10 and moved back the same day when the scope was restated; see the
+ordering principle above.
+
+**Z8 is no longer opt-in.** It used to read "opt-in and can slip". `n-gram` is a
+named product capability, so the corpus character-trigram channel ships, and the
+cost it was hedged behind ships with it: **with `cgram` on, pg_weave is not smaller
+than `pg_trgm`.** That moves from a limitation we dodge by defaulting off, to a
+stated cost of the product, and `bench/RESULTS_CGRAM.md` has to record it as
+plainly as any win (hard rule 8). The reloption stays -- an index that does not need
+unanchored substring search should not pay for it -- but the *default-on* decision
+is now the product's, not an optimization's.
+
+One thing that made deferring Z look cheap is still true and still worth knowing:
+TRE is current (`f864ed0`), carrying an `INT_MAX` crash fix and a backref
+wrong-answer fix with regression coverage in `test/hegel/`, and both bugs were
+**latent** here because the channel is unrouted. An unrouted channel cannot return a
+wrong answer. Routing it is what makes those fixes matter, which is the work below.
 
 The code is imported (`doc/specs/IMPORT_pg_tre.md`). The work is wiring it to the
 **vocabulary** funnel rather than pg_tre's corpus-level trigram index — that
@@ -172,7 +197,7 @@ See `doc/ARCHITECTURE.md` §7 and `doc/specs/FUZZY_CHANNEL.md`.
 | Z5 | Route fuzzy (`term~k`) through universal-Levenshtein neighbourhood expansion over the vocabulary trigram map | index-accelerated `k=1` and `k=2` on a 1M-row corpus, p50 ≤ 200 ms (pg_tre measured 5.5 s and 7.3 s) |
 | Z6 | Route regex (`/re/`) through regex AST → trigram tiling → vocabulary candidates | character-class regex `E-[0-9]{4}` p50 ≤ 100 ms (pg_tre measured 1.5 s) |
 | Z7 | Implement the fuzzy/regex shuttle per `include/weave/channel.h` (C5 boolean gate) | property test in `test/hegel/test_bounds.c` covers it |
-| Z8 | **Opt-in** corpus-level character-trigram channel `cgram` for unanchored cross-token substring (`LIKE '%tion refu%'`) | correctness parity with `pg_trgm` on a randomized pattern suite; size honestly recorded in `bench/RESULTS_CGRAM.md` |
+| Z8 | **REQUIRED (was opt-in; `n-gram` is a named product capability).** Corpus-level character-trigram channel `cgram` for unanchored cross-token substring (`LIKE '%tion refu%'`) | correctness parity with `pg_trgm` on a randomized pattern suite; size honestly recorded in `bench/RESULTS_CGRAM.md` |
 | Z9 | `<@>` edit-distance KNN ordering as a shuttle with a real bound | correctness parity with a seq-scan `levenshtein()` reference |
 
 **Phase Z gate:** on the 1M-row corpus from `pg_tre/doc/perf.md`, pg_weave beats
