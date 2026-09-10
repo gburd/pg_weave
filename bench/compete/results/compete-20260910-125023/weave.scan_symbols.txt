@@ -1,0 +1,26 @@
+===== SELF TIME (which code is executing) =====
+    32.14%  [.] weave_doclen_cursor_lookup
+            |
+            ---weave_doclen_cursor_lookup
+               weave_topk_candidates_range.constprop.0
+    18.11%  [.] weave_topk_candidates_range.constprop.0
+            |
+            ---weave_topk_candidates_range.constprop.0
+    13.04%  [.] weave_doclen_cursor_load_page
+            |
+            ---weave_doclen_cursor_load_page
+               weave_doclen_cursor_lookup
+               weave_topk_candidates_range.constprop.0
+     4.65%  [.] hash_search_with_hash_value
+            |
+            ---hash_search_with_hash_value
+               |          
+                --4.57%--BufTableLookup
+                          StartReadBuffer
+                          ReadBufferExtended
+                          |          
+                           --4.07%--weave_doclen_cursor_load_page
+                                     weave_doclen_cursor_lookup
+                                     weave_topk_candidates_range.constprop.0
+     3.14%  [.] LWLockRelease
+            |
