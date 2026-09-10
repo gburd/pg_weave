@@ -222,7 +222,20 @@ Page kinds, from the allocation table in `doc/specs/SEGMENT_FORMAT.md` (bits
 Two pack layouts, recorded in `WeaveVecMeta` because a reader that guesses wrong
 returns wrong distances rather than an error: `WEAVE_PACK_LANE`
 (coordinate-major, what byte-LUT kernels want) and `WEAVE_PACK_VECMAJOR`
-(vector-major, what int8-dot kernels want).
+(vector-major, what int8-dot kernels want). The layout is a *parameter* of every
+scoring entry point, never an assumption — see §8.
+
+**A note for V7, which owns the on-disk image.** `weave_block_codebytes()` returns
+`ceil(dim·bits/8) · 32`, which is 0–28 bytes more than the tight `4·dim·bits` a
+`WEAVE_PACK_LANE` block actually occupies (the per-vector `ceil` is rounded up 32
+times instead of once). Those slack bytes are **never written** by
+`weave_pack_lane()` and never read by any kernel — correctness is unaffected, and
+`test/hegel/test_kernels.c` `memset`s them so its blocks are deterministic. But a
+page image containing them is nondeterministic unless the writer zeroes them, which
+matters for two things V7 introduces: a `GenericXLog` delta over a page whose
+uninitialized tail changes between rewrites, and any cross-architecture fixture
+hash of a `WEAVE_VCODES` page. **The block writer must zero the block buffer before
+packing into it.** V6 has no writer, so this is recorded and not fixed.
 
 Adding a vector weft bumps the segment format to **v5**, because a bolt must
 self-describe which wefts it carries — an index built without a vector channel
@@ -273,7 +286,7 @@ scalar, and do not assume a vector ISA helps.
 coordinates.** Each lane's sum stays in strict ascending *j* order in a double,
 exactly as `weave_lut_score_code()` does it, so running 8 lanes at once
 reassociates nothing. `test/hegel/test_kernels.c` compares with `memcmp` and not a
-tolerance (236,481 checks), which means a future kernel either matches or is
+tolerance (308,278 checks), which means a future kernel either matches or is
 rejected — no judgement calls. A kernel that used multiple partial sums per lane,
 or FMA, would forfeit that and is not worth the speed.
 
@@ -282,12 +295,51 @@ byte-LUT gather cross the 128-bit lane boundary in one instruction; a
 `vpgatherdps` kernel indexes lanes directly, so introducing one would only create
 an opportunity to permute the output.
 
-Which of the three verified paths is fastest on a given host is **not measured**:
-`bench/kernels.c` is still owed, `auto` picks the widest ISA by convention rather
-than by measurement, and `pg_weave.vec_kernel` (`auto`/`scalar`/`lut`/`dot`)
-exists to force a path for A/B work and to reproduce a bug report from another
-machine. Since every implemented path is bit-identical, that GUC changes speed
-and never answers.
+### The unmet gate, kept as an unmet gate
+
+V6's gate as written in `doc/PHASES.md` was **the seven-ISA matrix above, both
+strategies, every path identical to scalar.** Three paths ship. The rest is
+**not met**, and it is recorded here rather than deleted because a gate you have
+not met is precisely what `AGENTS.md` rule 8 and this document's own §6 exist to
+keep visible. Restated so it can be checked rather than argued about:
+
+| owed | what would close it | why it is open |
+|---|---|---|
+| SSE2, baseline NEON | an exact kernel on each, `memcmp`-identical | held to exactness there is nothing to gain: no gather, no variable shift, so the kernel *is* `lut-wide` plus shuffles. Closing this means measuring `lut-wide` against a hand-written SSE2/NEON form and keeping it only if it wins |
+| AVX-512BW, AVX-512 VNNI, NEON SDOT/SMMLA | a host or emulator that runs them, plus the differential test green on it | no such host or runner is wired up here. An ISA path nobody executed is the fast-but-wrong shape rule 8 is about, so none was written rather than written and hoped for |
+| nibble-split byte-LUT, int8 dot (either ISA) | **a different gate**: an error budget, a recall measurement against the exact path, and a tolerance derived from it | both quantize the query table to 8 bits, so "identical to scalar" is unreachable *by construction* — this is the one entry where the original gate is wrong rather than merely unsatisfied, and replacing it needs a measurement, not a decision |
+| `bench/kernels.c` | a per-host A/B of the three verified paths | not written. `auto` therefore picks the widest ISA by convention, which for a gather-bound kernel is a weaker assumption than usual |
+
+**And the strategy guidance the original draft carried, which still stands:**
+nibble-split byte-LUT is expected to win at low bit widths and small *d*, and
+int8 dot to win where the hardware has a dot-product instruction and *d* is large.
+**Do not guess between them** — `bench/kernels.c` should A/B them per host, and
+`pg_weave.vec_kernel` exists to force a path when reproducing a bug report from a
+different machine. Nothing in this repository has measured either family, so treat
+those two sentences as the hypothesis they are.
+
+Which of the three *verified* paths is fastest on a given host is likewise **not
+measured**: `bench/kernels.c` is still owed, and `pg_weave.vec_kernel`
+(`auto`/`scalar`/`lut`/`dot`) exists to force a path for A/B work and to reproduce
+a bug report from another machine. Since every implemented path is bit-identical,
+that GUC changes speed and never answers.
+
+### The pack layout is a parameter, never an assumption
+
+`WeaveVecKernelOps.score_block()` and `WeaveScoreBlock` both carry a
+`WeavePackLayout`, threaded from the segment's `WeaveVecMeta` (§7). This is not
+tidiness. `src/vector/pack.c` states the failure mode: a reader that guesses the
+layout wrong *"does not fail, it returns wrong distances."* So:
+
+- the oracle is **layout-agnostic** — it reaches codes only through
+  `weave_unpack_lane()`, so it handles both layouts today and a third one for
+  free;
+- `lut-wide` and `lut-avx2` assume `WEAVE_PACK_LANE`'s byte-aligned 8-lane groups
+  and **decline** anything else explicitly, by delegating to the oracle rather
+  than by reading the bytes some other way;
+- a layout value that is neither of the two defined ones is **rejected**, because
+  it arrived from a page and defaulting it would be exactly the wrong-distances
+  case above.
 
 **Two data points from pg_turbovec v2.7.0, so we do not repeat the work.** They
 made a wide-word Hamming kernel **~4.4× faster** at embedding dimensions
@@ -367,6 +419,38 @@ Two mechanisms, both from `include/weave/channel.h`:
   descent starts, so the greedy search is steered into the surviving region
   rather than post-filtered.
 
+**The bitmap travels with its length.** `score_block()` takes `nwarp` alongside
+`allow`, and a block whose lanes fall outside `[0, nwarp)` is a corrupt page and
+raises. `WeaveVecBlockHdr.firstwarp` is what indexes the bitmap and it comes off
+disk, so a bitmap without a length is an unbounded out-of-bounds read — the case
+`doc/CONVENTIONS.md` rule 2 rules out. A short tail block (a weft whose warp count
+is not a multiple of 32) is *trimmed* to the warps that exist; a block that starts
+outside the segment is *refused*. `test/hegel/test_kernels.c` allocates the bitmap
+to exactly `nwarp` bits so that an over-read is an ASan report and not a quiet
+pass.
+
+**The granularity at which masked lanes are skipped differs per kernel, and it is
+the mechanism this section's claim rests on, so it is stated rather than left to be
+inferred.** The oracle skips one lane at a time. `lut-wide` and `lut-avx2` skip a
+**group of 8 lanes** at a time, because the group is the unit their addressing is
+built on (§8). Consequences, in order of how much they matter:
+
+- A filter selective enough to empty whole blocks costs nothing to exploit: the
+  shuttle short-circuits before a kernel is called at all. This is the case the
+  channel is designed around and the one §6's bound serves.
+- A filter that empties whole 8-lane groups saves the fast paths the same
+  proportion of work it saves the oracle.
+- A filter that is selective but *scattered* — one surviving lane per group — saves
+  the fast paths nothing, while it saves the oracle 7/8. Finer masking inside a
+  group is possible (gather anyway, then blend), but the gathers are the cost and
+  they would still be issued, so what it saves is the adds.
+
+Whether that last case is worth code is **not measured**: it needs
+`bench/kernels.c`, which is owed. It cannot be settled by
+`test/hegel/test_kernels.c`, because the output is identical either way — only the
+work differs. Warp ordering (§6, task V13) is what makes surviving lanes clustered
+rather than scattered, so it is load-bearing here for a second, independent reason.
+
 That is the difference between a selective predicate making the query faster and
 making recall collapse. The subtlety in the graph case: an excluded node must
 still be **expanded**, just never **admitted**. Refusing to expand excluded nodes
@@ -435,7 +519,7 @@ lanes. That is task V11 and its gate is a torn-write injection TAP test.
 | V3 codebook | `test_quantize.c` P4 (sorted, symmetric, `absmax < 6/√d`) + fixture | passing |
 | V4 encode round-trip and unbiasedness | `test_quantize.c` P5, P6 | passing |
 | V5 packing | `test/hegel/test_pack.c`: round-trip, lane isolation, `move_lane`/`zero_lane`, guard-byte bounds | passing, 1,909,440 checks |
-| V6 kernel equivalence | `test/hegel/test_kernels.c`: every ISA path == scalar | passing, 236,481 checks over `scalar`, `lut-wide`, `lut-avx2`; no AVX-512, NEON or approximate path exists to compare (§8) |
+| V6 kernel equivalence | `test/hegel/test_kernels.c`: every ISA path == scalar | passing, 308,278 checks over `scalar`, `lut-wide`, `lut-avx2`, including ⟨q, reconstruct(code)⟩ agreement (K5) and rejection of an out-of-range `firstwarp` (K4, under ASan); **the rest of the ISA matrix is unmet, tabulated as unmet in §8** |
 | V7 crash safety | extend `t/001_crash_recovery.pl` to a vector index | not started |
 | V8 shuttle contract | `test_quantize.c` P8 (C2 soundness) + `bench/bound_pruning.c` soundness assert | passing, 17741 checks |
 | V9 graph recall/latency/storage | `bench/RESULTS_VECTOR.md` | not started |

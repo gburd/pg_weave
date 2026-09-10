@@ -38,6 +38,18 @@
  *		 (C5), not a convenience.
  *	 K4  an inconsistent block description is rejected (-1) by every path rather
  *		 than scored.  These numbers come off a page and pages are not trusted.
+ *		 Includes the two that are memory safety and not merely arithmetic: an
+ *		 unrecognized pack layout, and a `firstwarp` that would index the
+ *		 `allow` bitmap past its `nwarp` end.  The firstwarp case is run against
+ *		 an exactly-sized heap allocation so that ASan sees the read if the
+ *		 bound is ever removed -- a check that only asserted the return value
+ *		 would still pass with the bound deleted on most runs.
+ *	 K5  the kernel's score for a REAL quantized vector equals the inner product
+ *		 of the query with the RECONSTRUCTION, within tolerance -- the definition
+ *		 in doc/specs/VECTOR_CHANNEL.md sect. 2, computed from float vectors that
+ *		 never went near a lookup table.  K1 compares two transcriptions of the
+ *		 same expression and so can only catch a typo; K5 is what would catch a
+ *		 wrong scoring DEFINITION.
  *
  * The grid deliberately includes the awkward cases: dim not a multiple of
  * anything, 3-bit codes (whose groups are byte-aligned only because the group is
@@ -186,6 +198,7 @@ typedef struct KernelCase
 	weave_uint32 livemask;
 	weave_uint32 firstwarp;
 	int			allowkind;		/* 0 NULL, 1 all-ones, 2 all-zero, 3 random */
+	int			nwarpslack;		/* 0 bitmap ends exactly at the block, 1 slack */
 	int			lutkind;		/* 0 normal, 1 with zeros/denormals/huge */
 	int			scalekind;		/* 0 positive, 1 mixed sign, 2 with zeros */
 } KernelCase;
@@ -198,7 +211,17 @@ run_case(const KernelCase *c)
 	int			nlevels = 1 << c->bits;
 	int			codebytes = (c->dim * c->bits + 7) / 8;
 	size_t		blockbytes = (size_t) weave_block_codebytes(c->dim, c->bits);
-	size_t		allowwords = (size_t) ((c->firstwarp + WEAVE_VEC_BLOCK) / 64 + 2);
+
+	/*
+	 * The allowlist is allocated EXACTLY as long as nwarp says it is, and by
+	 * default nwarp ends at the block's last lane -- the tightest legal case.
+	 * A loose allocation would hide precisely the bug this bound exists to
+	 * prevent: with slack, an over-read lands in the malloc'd region and ASan
+	 * stays quiet.  Tight, it is a heap-buffer-overflow report.
+	 */
+	weave_uint32 nwarp = c->firstwarp + (weave_uint32) c->nlanes +
+		(c->nwarpslack ? 77u : 0u);
+	size_t		allowwords = (size_t) ((nwarp + 63) / 64);
 	WeaveQueryLut lut;
 	WeaveScoreBlock blk;
 	weave_uint8 *block = malloc(blockbytes);
@@ -301,6 +324,7 @@ run_case(const KernelCase *c)
 	blk.livemask = c->livemask;
 	blk.firstwarp = c->firstwarp;
 	blk.allow = (c->allowkind == 0) ? NULL : allow;
+	blk.nwarp = nwarp;
 
 	/* K1: the oracle against an independent reimplementation. */
 	n = weave_score_kernel_scalar.score_block(&blk, expected);
@@ -473,7 +497,307 @@ test_rejects(void)
 		CHECK(kernels[k]->score_block(&bad, out) == -1,
 			  "K4 %s accepted dim > WEAVE_MAX_DIM", kernels[k]->name);
 		lut.dim = 8;
+
+		/*
+		 * A pack layout that is not one of the two defined values.  Not a
+		 * pedantic check: the layout selects a bit-addressing scheme, and
+		 * src/vector/pack.c states the consequence of getting it wrong -- the
+		 * reader "does not fail, it returns wrong distances".  Defaulting an
+		 * unknown value to either layout would be exactly that.
+		 */
+		bad = blk;
+		bad.layout = (WeavePackLayout) 2;
+		CHECK(kernels[k]->score_block(&bad, out) == -1,
+			  "K4 %s accepted pack layout 2", kernels[k]->name);
+		bad.layout = (WeavePackLayout) 255;
+		CHECK(kernels[k]->score_block(&bad, out) == -1,
+			  "K4 %s accepted pack layout 255", kernels[k]->name);
 	}
+}
+
+/* ---------------------------------------------------------------------------
+ * K4, the memory-safety half: a firstwarp that does not fit inside the `allow`
+ * bitmap is rejected, and not read.
+ *
+ * firstwarp comes out of a WeaveVecBlockHdr, i.e. off a page, and it indexes
+ * `allow`.  Before nwarp existed the bitmap carried no length, so a corrupt
+ * header was an unbounded out-of-bounds read -- doc/CONVENTIONS.md forbids that
+ * outright ("a corrupt page produces a clean ERROR, never a crash and never a
+ * wrong answer"), and this codebase has already had one such read turn into a
+ * real SEGV (weave_page_recyclable).
+ *
+ * The bitmap here is heap-allocated at EXACTLY nwarp bits and the offending
+ * firstwarps are far past its end, so if the bound is ever removed this function
+ * is a heap-buffer-overflow under -fsanitize=address rather than a quiet pass.
+ * That is why it allocates instead of using a stack array with slack.
+ * ------------------------------------------------------------------------- */
+static void
+test_allow_bounds(void)
+{
+	const WeaveScoreKernel *kernels[8];
+	int			nkernel = weave_score_kernel_list(kernels, 8);
+	const int	dim = 8;
+	const int	bits = 4;
+	const weave_uint32 nwarp = 200;	/* 4 words minus 56 bits: a tight tail */
+	size_t		allowwords = (size_t) ((nwarp + 63) / 64);
+	weave_uint64 *allow = malloc(allowwords * sizeof(weave_uint64));
+	weave_uint8 *block = malloc((size_t) weave_block_codebytes(dim, bits));
+	float	   *lutvals = malloc(sizeof(float) * (size_t) dim * 16);
+	float		scales[WEAVE_VEC_BLOCK];
+	float		out[WEAVE_VEC_BLOCK];
+	WeaveQueryLut lut;
+	WeaveScoreBlock blk;
+	weave_uint32 bad_firstwarp[] = {
+		nwarp,					/* one warp past the end */
+		nwarp - WEAVE_VEC_BLOCK + 1, /* starts inside, ends one past */
+		nwarp + 1,
+		4096,
+		0x7FFFFFFFu,
+		0xFFFFFFFFu,			/* the wrap-around case: +nlanes overflows 32 bits */
+		0xFFFFFFE0u
+	};
+	int			nbad = (int) (sizeof(bad_firstwarp) / sizeof(bad_firstwarp[0]));
+	int			i,
+				k;
+
+	memset(allow, 0xFF, allowwords * sizeof(weave_uint64));
+	memset(block, 0x5A, (size_t) weave_block_codebytes(dim, bits));
+	for (i = 0; i < dim * 16; i++)
+		lutvals[i] = 0.25f;
+	for (i = 0; i < WEAVE_VEC_BLOCK; i++)
+		scales[i] = 1.0f;
+
+	memset(&lut, 0, sizeof(lut));
+	lut.dim = dim;
+	lut.nlevels = 16;
+	lut.lut = lutvals;
+
+	memset(&blk, 0, sizeof(blk));
+	blk.lut = &lut;
+	blk.layout = WEAVE_PACK_LANE;
+	blk.codes = block;
+	blk.scales = scales;
+	blk.scalestride = 1;
+	blk.nlanes = WEAVE_VEC_BLOCK;
+	blk.livemask = 0xFFFFFFFFu;
+	blk.allow = allow;
+	blk.nwarp = nwarp;
+
+	for (k = 0; k < nkernel; k++)
+	{
+		for (i = 0; i < nbad; i++)
+		{
+			WeaveScoreBlock bad = blk;
+
+			bad.firstwarp = bad_firstwarp[i];
+			CHECK(kernels[k]->score_block(&bad, out) == -1,
+				  "K4 %s read allow[] with firstwarp=%u against nwarp=%u",
+				  kernels[k]->name, bad_firstwarp[i], nwarp);
+		}
+
+		/* The last legal block, which must still be SCORED: an off-by-one in
+		 * the other direction would reject valid pages. */
+		{
+			WeaveScoreBlock ok = blk;
+
+			ok.firstwarp = nwarp - WEAVE_VEC_BLOCK;
+			CHECK(kernels[k]->score_block(&ok, out) == WEAVE_VEC_BLOCK,
+				  "K4 %s rejected the last legal block (firstwarp=%u nwarp=%u)",
+				  kernels[k]->name, ok.firstwarp, nwarp);
+		}
+
+		/* A short tail block whose lanes end exactly at nwarp.  This is the case
+		 * that makes lane_avail_mask() address its second word from
+		 * firstwarp + nlanes - 1 rather than from firstwarp + 31. */
+		{
+			WeaveScoreBlock ok = blk;
+
+			ok.nlanes = 9;
+			ok.firstwarp = nwarp - 9;
+			CHECK(kernels[k]->score_block(&ok, out) == 9,
+				  "K4 %s rejected a legal 9-lane tail block", kernels[k]->name);
+		}
+
+		/* nwarp is ignored when there is no bitmap, so an absurd firstwarp with
+		 * allow == NULL is not an error: nothing indexes it. */
+		{
+			WeaveScoreBlock ok = blk;
+
+			ok.allow = NULL;
+			ok.nwarp = 0;
+			ok.firstwarp = 0xFFFFFFFFu;
+			CHECK(kernels[k]->score_block(&ok, out) == WEAVE_VEC_BLOCK,
+				  "K4 %s rejected an unfiltered block over firstwarp",
+				  kernels[k]->name);
+		}
+	}
+
+	free(allow);
+	free(block);
+	free(lutvals);
+}
+
+/* ---------------------------------------------------------------------------
+ * K5: the kernels compute the thing the SPEC defines, not merely the thing the
+ * reference loop transcribes.
+ *
+ * K1 checks the kernels against a reimplementation of
+ * scale * sum_j lut[j][code_j] over a random table.  That catches a typo, a lane
+ * mixup or a layout misreading -- but both sides are transcriptions of the same
+ * expression, so if that expression were the WRONG DEFINITION of a score, K1
+ * would pass.
+ *
+ * doc/specs/VECTOR_CHANNEL.md sect. 2 defines the score of a code as the inner
+ * product of the query with the RECONSTRUCTION:
+ *
+ *		score = <q, scale * R^-1(dequant(code))>
+ *
+ * so this builds a real query and real quantized vectors through
+ * weave_quantizer_init / weave_encode, reconstructs each one with
+ * weave_decode(), takes the dot product in float space -- no lookup table
+ * anywhere on that side -- and compares.
+ *
+ * TOLERANCE, and why it is not memcmp.  This side goes through the inverse
+ * rotation and dim float multiplies; the kernel side goes through a float
+ * lookup table built from the forward-rotated query.  They are the same value in
+ * exact arithmetic and differ by rounding, whose natural scale is the
+ * Cauchy-Schwarz magnitude ||q|| * ||rec|| rather than the score itself (a score
+ * near zero is a cancellation of dim terms that are not near zero).  The bound
+ * used is 1e-5 * ||q|| * ||rec||, which is ~100x the worst deviation actually
+ * observed; the observed ratio is printed so the constant is a measured margin
+ * and not a wish, and so a host whose rounding differs shows up as a shrinking
+ * margin before it shows up as a failure.  This is the one property in this file
+ * that is a tolerance, and it is the one that could not be anything else.  It is
+ * still tight enough to catch a wrong DEFINITION by orders of magnitude: dropping
+ * the renormalization scale, or scoring against dequant(code) instead of the
+ * reconstruction, is an O(1) relative error.
+ * ------------------------------------------------------------------------- */
+
+static double
+dot_f(const float *a, const float *b, int dim)
+{
+	double		s = 0.0;
+	int			j;
+
+	for (j = 0; j < dim; j++)
+		s += (double) a[j] * (double) b[j];
+	return s;
+}
+
+static double worst_recon_ratio = 0.0;
+
+static void
+recon_case(int dim, int bits, WeavePackLayout layout)
+{
+	const WeaveScoreKernel *kernels[8];
+	int			nkernel = weave_score_kernel_list(kernels, 8);
+	WeaveQuantizer q;
+	WeaveQueryLut lut;
+	WeaveScoreBlock blk;
+	float	   *query = malloc(sizeof(float) * (size_t) dim);
+	float	   *v = malloc(sizeof(float) * (size_t) dim);
+	float	   *rec = malloc(sizeof(float) * (size_t) dim);
+	weave_uint8 *block;
+	float		scales[WEAVE_VEC_BLOCK];
+	float		want[WEAVE_VEC_BLOCK];
+	float		out[WEAVE_VEC_BLOCK];
+	double		tol[WEAVE_VEC_BLOCK];
+	double		qnorm;
+	int			s,
+				j,
+				k;
+
+	if (weave_quantizer_init(&q, dim, bits, NULL, malloc, free) != 0)
+	{
+		CHECK(0, "K5 quantizer_init failed dim=%d bits=%d", dim, bits);
+		free(query);
+		free(v);
+		free(rec);
+		return;
+	}
+	block = malloc((size_t) weave_block_codebytes(dim, bits));
+	memset(block, 0, (size_t) weave_block_codebytes(dim, bits));
+
+	for (j = 0; j < dim; j++)
+		query[j] = (float) rnd_normal();
+	qnorm = sqrt(dot_f(query, query, dim));
+
+	CHECK(weave_query_lut_build(&lut, &q, query, malloc) == 0,
+		  "K5 query_lut_build failed dim=%d bits=%d", dim, bits);
+
+	for (s = 0; s < WEAVE_VEC_BLOCK; s++)
+	{
+		weave_uint8 code[WEAVE_CODE_MAX_BYTES];
+		float		norm,
+					scale;
+		double		recnorm;
+
+		for (j = 0; j < dim; j++)
+			v[j] = (float) rnd_normal();
+		CHECK(weave_encode(&q, v, code, &norm, &scale) == 0,
+			  "K5 encode failed dim=%d bits=%d lane=%d", dim, bits, s);
+		weave_pack_lane(layout, dim, bits, block, s, code);
+		scales[s] = scale;
+
+		weave_decode(&q, code, scale, rec);
+		recnorm = sqrt(dot_f(rec, rec, dim));
+		want[s] = (float) dot_f(query, rec, dim);
+		tol[s] = 1e-5 * qnorm * recnorm + 1e-9;
+	}
+
+	memset(&blk, 0, sizeof(blk));
+	blk.lut = &lut;
+	blk.layout = layout;
+	blk.codes = block;
+	blk.scales = scales;
+	blk.scalestride = 1;
+	blk.nlanes = WEAVE_VEC_BLOCK;
+	blk.livemask = 0xFFFFFFFFu;
+
+	for (k = 0; k < nkernel; k++)
+	{
+		CHECK(kernels[k]->score_block(&blk, out) == WEAVE_VEC_BLOCK,
+			  "K5 %s wrong return dim=%d bits=%d", kernels[k]->name, dim, bits);
+
+		for (s = 0; s < WEAVE_VEC_BLOCK; s++)
+		{
+			double		err = fabs((double) out[s] - (double) want[s]);
+			double		scale_of_err = err / (tol[s] > 0 ? tol[s] : 1.0);
+
+			if (scale_of_err > worst_recon_ratio)
+				worst_recon_ratio = scale_of_err;
+			CHECK(err <= tol[s],
+				  "K5 %s dim=%d bits=%d layout=%d lane %d: kernel %.9g but "
+				  "<q,reconstruct> %.9g (err %.4g, tol %.4g)",
+				  kernels[k]->name, dim, bits, (int) layout, s,
+				  (double) out[s], (double) want[s], err, tol[s]);
+		}
+	}
+
+	free(lut._alloc);
+	free(block);
+	free(query);
+	free(v);
+	free(rec);
+	weave_quantizer_free(&q, free);
+}
+
+static void
+test_reconstruction(void)
+{
+	int			dims[] = {8, 32, 64, 256, 384};
+	int			ndims = (int) (sizeof(dims) / sizeof(dims[0]));
+	int			bits,
+				i,
+				layout;
+
+	for (bits = WEAVE_BITS_MIN; bits <= WEAVE_BITS_MAX; bits++)
+		for (i = 0; i < ndims; i++)
+			for (layout = 0; layout <= 1; layout++)
+				recon_case(dims[i], bits, (WeavePackLayout) layout);
+
+	printf("  worst |kernel - <q,reconstruct>| was %.3f of the tolerance\n",
+		   worst_recon_ratio);
 }
 
 /*
@@ -625,7 +949,10 @@ main(void)
 				run_case(&c);
 				c.nlanes = WEAVE_VEC_BLOCK;
 
-				/* the allowlist, including the two-word window */
+				/* the allowlist, including the two-word window.  The bitmap is
+				 * allocated to exactly nwarp bits and nwarp ends at the block's
+				 * last lane unless nwarpslack says otherwise, so an over-read is
+				 * an ASan report rather than a quiet pass. */
 				for (k = 0; k < nfw; k++)
 				{
 					c.firstwarp = firstwarps[k];
@@ -635,6 +962,9 @@ main(void)
 					run_case(&c);
 					c.allowkind = 3;
 					run_case(&c);
+					c.nwarpslack = 1;
+					run_case(&c);
+					c.nwarpslack = 0;
 				}
 				c.firstwarp = 0;
 				c.allowkind = 0;
@@ -667,6 +997,7 @@ main(void)
 			c.livemask &= (weave_uint32) rnd64();	/* sparser */
 		c.firstwarp = (weave_uint32) (rnd64() % 4096);
 		c.allowkind = rnd_below(4);
+		c.nwarpslack = rnd_below(2);
 		c.lutkind = rnd_below(2);
 		c.scalekind = rnd_below(3);
 		run_case(&c);
@@ -675,8 +1006,14 @@ main(void)
 	printf("lane sidecar stride\n");
 	test_scalestride();
 
+	printf("scores against <query, reconstruct(code)>\n");
+	test_reconstruction();
+
 	printf("rejection of impossible block descriptions\n");
 	test_rejects();
+
+	printf("rejection of a firstwarp that would read past allow[]\n");
+	test_allow_bounds();
 
 	printf("\n%d checks, %d failures\n", checks, failures);
 	return failures == 0 ? 0 : 1;
