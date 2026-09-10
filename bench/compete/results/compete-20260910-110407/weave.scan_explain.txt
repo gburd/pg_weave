@@ -1,0 +1,96 @@
+=== rare k=10 (term=word001596)
+                                                                QUERY PLAN                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.01..3.31 rows=10 width=16) (actual time=4.752..4.992 rows=10 loops=1)
+   Output: id, ((d <=> '''word001596'''::wquery))
+   Buffers: shared hit=4213
+   ->  Index Scan using docs_weave on public.docs  (cost=0.01..661347.93 rows=2000000 width=16) (actual time=4.749..4.988 rows=10 loops=1)
+         Output: id, (d <=> '''word001596'''::wquery)
+         Order By: (docs.d <=> '''word001596'''::wquery)
+         Buffers: shared hit=4213
+ Planning:
+   Buffers: shared hit=96
+ Planning Time: 0.338 ms
+ Execution Time: 5.025 ms
+(11 rows)
+
+=== rare k=100 (term=word001596)
+                                                                 QUERY PLAN                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.01..33.07 rows=100 width=16) (actual time=4.501..6.979 rows=100 loops=1)
+   Output: id, ((d <=> '''word001596'''::wquery))
+   Buffers: shared hit=4775
+   ->  Index Scan using docs_weave on public.docs  (cost=0.01..661347.93 rows=2000000 width=16) (actual time=4.500..6.967 rows=100 loops=1)
+         Output: id, (d <=> '''word001596'''::wquery)
+         Order By: (docs.d <=> '''word001596'''::wquery)
+         Buffers: shared hit=4775
+ Planning:
+   Buffers: shared hit=96
+ Planning Time: 0.325 ms
+ Execution Time: 7.015 ms
+(11 rows)
+
+=== mid k=10 (term=word000198)
+                                                                 QUERY PLAN                                                                  
+---------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.01..3.31 rows=10 width=16) (actual time=12.071..12.297 rows=10 loops=1)
+   Output: id, ((d <=> '''word000198'''::wquery))
+   Buffers: shared hit=11702
+   ->  Index Scan using docs_weave on public.docs  (cost=0.01..661347.93 rows=2000000 width=16) (actual time=12.070..12.294 rows=10 loops=1)
+         Output: id, (d <=> '''word000198'''::wquery)
+         Order By: (docs.d <=> '''word000198'''::wquery)
+         Buffers: shared hit=11702
+ Planning:
+   Buffers: shared hit=96
+ Planning Time: 0.371 ms
+ Execution Time: 12.330 ms
+(11 rows)
+
+=== mid k=100 (term=word000198)
+                                                                  QUERY PLAN                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.01..33.07 rows=100 width=16) (actual time=12.015..14.669 rows=100 loops=1)
+   Output: id, ((d <=> '''word000198'''::wquery))
+   Buffers: shared hit=12260
+   ->  Index Scan using docs_weave on public.docs  (cost=0.01..661347.93 rows=2000000 width=16) (actual time=12.013..14.657 rows=100 loops=1)
+         Output: id, (d <=> '''word000198'''::wquery)
+         Order By: (docs.d <=> '''word000198'''::wquery)
+         Buffers: shared hit=12260
+ Planning:
+   Buffers: shared hit=96
+ Planning Time: 0.341 ms
+ Execution Time: 14.708 ms
+(11 rows)
+
+=== common k=10 (term=word000001)
+                                                                 QUERY PLAN                                                                  
+---------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.01..3.31 rows=10 width=16) (actual time=17.871..18.104 rows=10 loops=1)
+   Output: id, ((d <=> '''word000001'''::wquery))
+   Buffers: shared hit=18503
+   ->  Index Scan using docs_weave on public.docs  (cost=0.01..661347.93 rows=2000000 width=16) (actual time=17.869..18.101 rows=10 loops=1)
+         Output: id, (d <=> '''word000001'''::wquery)
+         Order By: (docs.d <=> '''word000001'''::wquery)
+         Buffers: shared hit=18503
+ Planning:
+   Buffers: shared hit=96
+ Planning Time: 0.365 ms
+ Execution Time: 18.139 ms
+(11 rows)
+
+=== common k=100 (term=word000001)
+                                                                  QUERY PLAN                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.01..33.07 rows=100 width=16) (actual time=18.362..21.166 rows=100 loops=1)
+   Output: id, ((d <=> '''word000001'''::wquery))
+   Buffers: shared hit=19045
+   ->  Index Scan using docs_weave on public.docs  (cost=0.01..661347.93 rows=2000000 width=16) (actual time=18.360..21.154 rows=100 loops=1)
+         Output: id, (d <=> '''word000001'''::wquery)
+         Order By: (docs.d <=> '''word000001'''::wquery)
+         Buffers: shared hit=19045
+ Planning:
+   Buffers: shared hit=96
+ Planning Time: 0.423 ms
+ Execution Time: 21.215 ms
+(11 rows)
+

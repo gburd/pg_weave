@@ -1,0 +1,10 @@
+NOTICE:  index "prof_sc_on" does not exist, skipping
+NOTICE:  index "prof_sc_off" does not exist, skipping
+sidecar=on  size: 625 MB
+sidecar=on  rare k=10                  9.64 ms/query
+sidecar=on  mid k=10                  17.13 ms/query
+sidecar=on  common k=10               23.03 ms/query
+sidecar=off size: 859 MB
+sidecar=off rare k=10                  9.69 ms/query
+sidecar=off mid k=10                  17.23 ms/query
+sidecar=off common k=10               22.96 ms/query

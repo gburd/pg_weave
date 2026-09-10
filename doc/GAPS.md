@@ -32,7 +32,7 @@ From `bench/RESULTS_LEXICAL.md`, 1M documents, r6id.4xlarge, PostgreSQL 17.
 
 | # | gap | measured | target |
 |---|---|---|---|
-| **G13** | **ranked retrieval loses to Timescale pg_textsearch at k=10** | **NARROWED by L14 and inverted at k=100.** On a realistic corpus (120 words/doc): k=10 behind 2.35× (rare) / 6.49× (mid) / 4.92× (common), down from 7.6/18.2/7.9×. At **k=100 pg_weave WINS rare 2.46× and ties mid (1.22×) and common (1.08×)** — its k-scaling ratio is 1.04–1.21 against pg_textsearch's 4.74–7.01. `bench/RESULTS_L14_LONG.md` | ≤ pg_textsearch |
+| **G13** | ranked latency at k=10 | **ROOT CAUSE MEASURED 2026-09-10 (`bench/RESULTS_SCAN_PROFILE.md`).** pg_weave 2.82 / 10.26 / 15.35 ms (rare/mid/common) vs pg_textsearch 1.25 / 1.63 / 3.16 — 2.25×/6.31×/4.86×. The cost is **k-independent and df-proportional** (pg_weave k=10 and k=100 differ <10%; pg_textsearch's k=100 is 5–7× its k=10), so it is paid per *candidate*, not per *result*, and `wand_initial_k` is not the floor (mid k=10 is 9.82 ms at 4 vs 10.31 at 32). Profile: **~72% is the doclen sidecar cursor**, only 1.9% of it buffer lookup — 11,702 buffer hits to return 10 rows, one page touch per 3.4 candidates against a documented intent of ~1 per 128. Posting decode + BM25 + WAND are the other ~28%, so **L2 (impact ordering) attacks the smaller half and its "decode-bound" root cause is withdrawn**. Route is **L17** (cursor advances instead of re-deriving; no format change). | ≤ 2× pg_textsearch at k=10 |
 | ~~**G12**~~ | ~~boolean NOT~~ | **CLOSED.** `count(*) WHERE 'common & !rare'` 7008 ms → **14.05 ms** (499×) by building the NOT universe lazily. Now **beats GIN's 141 ms by 10×**. | done, and a win |
 | ~~**G1**~~ | ~~bare `ORDER BY <=> LIMIT` does not use the index~~ | **CLOSED by L7.** 83 ms → **0.05 ms** (1,662× par4, 7,248× serial). Now beats GIN by 1,615×/7,080× on the same form. | done |
 | ~~**G2**~~ | ~~index size~~ | **CLOSED by L8/L10.** The loss was a measurement artifact: 70.7% of the file was freed pages. Live content is **46 MB vs GIN's 81 MB — 1.76× smaller.** | done, and a win |
@@ -177,8 +177,10 @@ do not start the novel work until the channels it composes actually exist.
 
 **Next — close the measured losses**
 
-4. **G3/G4**, profile the fixed per-scan cost on EC2 and attribute the 0.05 ms
-   before changing anything. New task **L9**.
+4. ~~**G3/G4**, profile the fixed per-scan cost on EC2 and attribute the 0.05 ms
+   before changing anything. New task **L9**.~~ **DONE 2026-09-10** —
+   `bench/RESULTS_SCAN_PROFILE.md`. The answer was the doclen cursor (~72%), not
+   dictionary lookup or cursor construction. Route is L17.
 5. **G2**, `weave_index_size_detail()` then attack the largest attributable
    component. New task **L10**.
 6. **G5/G11**, parallel merge (L4) and parallel scan (L11).
@@ -208,11 +210,21 @@ counting (3.8–7.7×), and — since L7 — the bare `ORDER BY` form (1,615–7
 wins on features outright. It loses by 1.7× on rare and mid ranked latency and by
 1.7–1.9× on index size.
 
-**Standing losses after L12, L14 and L15: G13 (ranked at k=10, 2.35–6.49×) and G5
+**Standing losses after L12, L14 and L15: G13 (ranked at k=10, 2.25–6.31×) and G5
 (build, 3.91× behind pg_textsearch — narrowed from 11.0× → 6.96× → 3.91×; now at
 parity with GIN in one run).**
 
-G13's remaining route is L2 (impact-ordered postings). **G5's route was L15, and
+G13 now has a *measured* root cause rather than an asserted one, and it was not the
+asserted one. `bench/RESULTS_SCAN_PROFILE.md`: ~72% of a ranked scan is the doclen
+sidecar cursor re-deriving its position — it keeps one 128-docid block resident and
+re-pins the page and re-walks its block headers from the start on every block change,
+which for a mid-frequency term is every ~2.6 candidate documents. L2's on-disk impact
+ordering attacks the other ~28%. Route is L17. This is the second time in this project
+that a hot symbol's *cause* was mis-stated before anyone profiled (see L15), and the
+second time the fix turned out to be cheaper than the prescribed one.
+
+G13's remaining route is **L17** (L2 is demoted: it attacks the ~28% the profile
+leaves, not the 72% it found). **G5's route was L15, and
 it over-delivered**: the profile predicted a ceiling of ~205 s from eliminating the
 term hash; the build reached 192.5 s because the larger cost was a second,
 unnamed per-posting hash (the doclen collector). The profile's estimate was
@@ -224,9 +236,12 @@ be a win — pg_weave's index is 1.76× *smaller* than GIN's, not 1.9× larger.
 
 Compaction was also shown not to affect ranked latency, which **falsifies the
 stated G3/G4 diagnosis**: the build already produces one segment, so per-segment
-setup was never the cost. L9 still owes a profile, and the hypothesis it should
-test next is the dictionary lookup and cursor construction rather than segment
-iteration.
+setup was never the cost. **L9's profile has since been taken
+(`bench/RESULTS_SCAN_PROFILE.md`) and the hypothesis recorded here — dictionary
+lookup and cursor construction — was also wrong.** It is the doclen sidecar
+cursor: ~72% of a ranked mid k=10 scan, re-pinning the page and re-walking its
+block headers on every 128-docid block change. Recorded rather than deleted
+because it is the third hypothesis in this file that a profile overturned.
 
 Against the full separate-extension stack it is not yet a comparison: there is no
 vector index and no fuzzy channel.
