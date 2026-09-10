@@ -1,7 +1,7 @@
 /* tre-config.h -- hand-maintained replacement for TRE's autoconf output.
  *
  * NOT UPSTREAM.  Written for pg_weave; everything else under vendor/tre/ is
- * laurikari/tre @ d0e0c997336b3210f05b3e1daa7bb5cb9900d274 (BSD-2, see
+ * laurikari/tre @ f864ed08a7499865c75b8b59c0cf39a9d59133fe (BSD-2, see
  * vendor/tre/LICENSE) plus vendor/tre/patches/tre-progress-hook.patch.
  *
  * Upstream generates this file from local_includes/tre-config.h.in by running
