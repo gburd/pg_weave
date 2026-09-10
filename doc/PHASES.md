@@ -171,7 +171,7 @@ read but **not** to port line-by-line: `~/src/turbovec` (Rust, MIT).
 | ~~**V2**~~ | **DONE.** Deterministic rotation: ChaCha8-seeded global permutation + sign flips + per-block normalized Walsh-Hadamard, K=2 rounds | **bit-identical output across x86-64 and aarch64 and across thread counts.** This is a hard gate; a fixture hash committed in `test/hegel/rotation_fixture.h` must match on both arches in CI |
 | ~~**V3**~~ | **DONE.** Lloyd–Max codebook for Beta((d-1)/2,(d-1)/2), memoized by `(bits, dim)` | codebook values match a committed fixture to 1e-9; solve time ≤ 100 ms |
 | ~~**V4**~~ | **DONE.** Encode: normalize, rotate, optional TQ+ affine calibration, quantize, bit-pack, store per-vector renormalization scale | round-trip property test; the compressed-domain inner-product estimator is unbiased within a stated tolerance |
-| V5 | 32-lane packing layout; x86 `perm0`-interleaved, ARM sequential, plus the vector-major layout for int8-dot kernels | `test/hegel/test_pack.c`: pack/unpack round-trip, `move_lane`/`zero_lane` O(1) swap-remove |
+| ~~**V5**~~ | **DONE.** 32-lane packing layout: `WEAVE_PACK_LANE` (coordinate-major) and `WEAVE_PACK_VECMAJOR` (vector-major, for int8-dot kernels), plus the O(1) `weave_pack_move_lane` swap-remove vacuum needs. x86 `perm0` lane interleaving is a kernel-internal register relabelling (task V6), not a third on-disk variant — see the note in `include/weave/quantize.h` above `WeavePackLayout` and `doc/specs/VECTOR_CHANNEL.md` §8 for why. | `test/hegel/test_pack.c`: pack/unpack round-trip, per-lane isolation, `move_lane`/`zero_lane` O(1) swap-remove, guard-byte bounds check — **1,909,440 checks, 0 failures**, also clean under `-fsanitize=address,undefined` |
 | V6 | SIMD kernels with runtime dispatch: scalar, SSE2, AVX2, AVX-512BW, AVX-512 VNNI, NEON, NEON SDOT. Nibble-split byte-LUT **and** int8-dot strategies. | every ISA path produces results identical to the scalar path on a randomized suite (`test/hegel/test_kernels.c`); CI runs the AVX-512 path under an emulator or an appropriate runner |
 | V7 | New page kinds `WEAVE_PK_VCODES`/`WEAVE_PK_VMETA` (ids 18/17, reserved by X1 in the extended kind space -- read them with `WeavePageHasKind()`, never a bitwise AND); codes live in the bolt under GenericXLog | crash-recovery TAP test extended to a vector index |
 | V8 | Code-scan shuttle: `score_block` over 32 lanes, `allow`-mask block short-circuit, and the block bound from `doc/specs/FUSED_TOPK.md` §2 | (C1)+(C2) property test; a selective mask makes the scan measurably *faster* |
@@ -182,10 +182,13 @@ read but **not** to port line-by-line: `~/src/turbovec` (Rust, MIT).
 | V13 | **Warp ordering by cluster.** Assign warp positions in the order the IVF build's k-means clustering produces (§8a of doc/specs/VECTOR_CHANNEL.md; IVF satisfies this requirement inherently, where the withdrawn graph plan needed it as a separate constraint), so each 32-lane code block is spatially coherent. Not an optimization: `bench/RESULTS_BOUND_PRUNING.md` measures the block bound pruning 99.6% of blocks with a coherent warp and **0.0%** with a random one. | `bench/bound_pruning.c` reports ≥ 90% blocks pruned at k=10 on the shipped corpora; a heap-order build is rejected by the gate |
 | V14 | Per-block centroid (stored as a quantized code) + radius in `WeaveVecBlockHdr`, maintained across insert, vacuum lane-zero, and merge | `weave_check()` recomputes both and compares; a randomized soundness run of `bench/bound_pruning.c` finds no (C2) violation |
 
-**Status:** V1 done. V2–V5 have working scalar implementations in
-`src/vector/quantize.c` and `src/vector/pack.c` with 17,741 property checks
-passing, but no on-disk format and no committed cross-architecture fixture, so
-they are not gate-complete. V6–V14 not started.
+**Status:** V1–V5 done. V2–V5 have working scalar implementations in
+`src/vector/quantize.c` and `src/vector/pack.c` with 17,741 + 1,909,440
+property checks passing, but no on-disk format and no committed
+cross-architecture fixture, so V2–V4 are not yet gate-complete in the on-disk
+sense (V5's gate is a standalone codec property test and does not need one:
+the packing layout is architecture-independent by design, see the header note
+above `WeavePackLayout`). V6–V14 not started.
 
 **Phase V gate:** on 1M × 1024-d Cohere-wiki, all three of
 `recall@10 ≥ 0.99`, `p50 ≤ 2× pgvector HNSW`, `size ≤ 0.15× pgvector HNSW`

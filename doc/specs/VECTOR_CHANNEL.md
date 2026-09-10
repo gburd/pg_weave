@@ -397,7 +397,7 @@ lanes. That is task V11 and its gate is a torn-write injection TAP test.
 | V2 rotation determinism | `test/hegel/test_quantize.c` P1–P3 + committed cross-arch fixture hash | properties pass; fixture owed |
 | V3 codebook | `test_quantize.c` P4 (sorted, symmetric, `absmax < 6/√d`) + fixture | passing |
 | V4 encode round-trip and unbiasedness | `test_quantize.c` P5, P6 | passing |
-| V5 packing | `test_quantize.c` P7, both layouts, lane zeroing | passing |
+| V5 packing | `test/hegel/test_pack.c`: round-trip, lane isolation, `move_lane`/`zero_lane`, guard-byte bounds | passing, 1,909,440 checks |
 | V6 kernel equivalence | `test/hegel/test_kernels.c`: every ISA path == scalar | not started |
 | V7 crash safety | extend `t/001_crash_recovery.pl` to a vector index | not started |
 | V8 shuttle contract | `test_quantize.c` P8 (C2 soundness) + `bench/bound_pruning.c` soundness assert | passing, 17741 checks |
