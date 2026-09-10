@@ -5,9 +5,24 @@ description: Use when working on the pg_weave access method itself — amroutine
 
 # Working on the weave index access method
 
-`src/am/am.c` is the AM. It is a **unity build**: it `#include`s `amscan.c`,
-`../query/lev.c`, and `../pages/trgm_page.c`. Do not add those to `OBJS`;
-`make check-unity` guards it. Splitting it is task L1 in `doc/PHASES.md`.
+`src/am/` is the AM, split by task L1 into four translation units along the
+seams the access method already had:
+
+| file | owns |
+|---|---|
+| `am.c` | the `amhandler`, reloptions, cost estimation, page allocation and recycling, page kinds, the metapage and its versioned reader, channel descriptors, the segment directory, the posting decoder, and the doclen-sidecar read cursor |
+| `ambuild.c` | `ambuild`/`aminsert`, the segment writers (postings, doclen sidecar, dictionary), the streaming k-way merge and the size-tiered merge policy, parallel build and parallel merge |
+| `amvacuum.c` | `ambulkdelete`, `amvacuumcleanup`, the vacate/pack/truncate compaction, and `weave_merge()`/`weave_vacuum()` |
+| `amscan.c` | `ambeginscan`..`amendscan`, boolean/phrase set algebra, the fuzzy and regex walks, and the block-max WAND / MaxScore top-k |
+
+`src/query/lev.c` (Levenshtein automaton) and `src/pages/trgm_page.c` (trigram
+page layout) are ordinary translation units too.
+
+**The interface between them is `include/weave/am.h`,** which for every
+declaration says which file defines it, which files consume it, and why it is not
+`static`. Read that section before adding a cross-file call: if the symbol you
+want is not there, the question is whether your code is in the right file, not
+whether to add an `extern`.
 
 ## Capability flags, and the reasons
 

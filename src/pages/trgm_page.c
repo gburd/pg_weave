@@ -1,9 +1,10 @@
 /*-------------------------------------------------------------------------
  *
- * pg_weave_trgm_index.c
+ * trgm_page.c
  *		On-disk trigram index for narrowing fuzzy/regex candidates.
  *
- * Included into pg_weave_am.c.  Maps every trigram of every indexed term to the
+ * A separate translation unit since task L1; it used to be #included into
+ * src/am/am.c.  Maps every trigram of every indexed term to the
  * set of TERM ORDINALS (positions in the segment's sorted dictionary) whose
  * term contains that trigram, stored as a namespaced sparsemap (see
  * pg_weave_sm.h).  Keying on the vocabulary rather than the docid space keeps
@@ -25,12 +26,20 @@
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  pg_weave_trgm_index.c
+ *	  src/pages/trgm_page.c
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres.h"
 
+#include "weave/weave.h"
+#include "weave/am.h"
 #include "weave/sparsemap.h"
+
+#include "access/generic_xlog.h"
+#include "miscadmin.h"
+#include "storage/bufmgr.h"
+#include "utils/rel.h"
 
 typedef struct TrgmAccum
 {
@@ -57,7 +66,7 @@ cmp_uint64(const void *a, const void *b)
  * Write `len` bytes across a fresh chain of WEAVE_TRGM_DATA pages (one page per
  * GenericXLog cycle, so no page-count limit).  Returns the first block.
  */
-static BlockNumber
+BlockNumber
 weave_write_blob(Relation index, const uint8 *data, Size len)
 {
 	BlockNumber first = InvalidBlockNumber;
@@ -106,7 +115,7 @@ weave_write_blob(Relation index, const uint8 *data, Size len)
 }
 
 /* Read `len` bytes starting at data block `blk` into a palloc'd buffer. */
-static uint8 *
+uint8 *
 weave_read_blob(Relation index, BlockNumber blk, Size len)
 {
 	uint8	   *buf = (uint8 *) palloc(len ? len : 1);
@@ -138,7 +147,7 @@ weave_read_blob(Relation index, BlockNumber blk, Size len)
  * as a data-page blob, plus a fixed-size directory entry (trgm, smlen,
  * firstdata) on directory pages.  Returns the first directory block.
  */
-static BlockNumber
+BlockNumber
 weave_write_trigrams_iter(Relation index, DictNextFn next, void *nstate)
 {
 	HTAB	   *ht;
@@ -313,17 +322,6 @@ weave_write_trigrams_iter(Relation index, DictNextFn next, void *nstate)
 	return first;
 }
 
-/* Thin wrapper: write trigrams from an in-memory bs->terms[] array. */
-static BlockNumber
-weave_write_trigrams(Relation index, WeaveBuildState *bs)
-{
-	DictTermArrayIter it;
-
-	it.bs = bs;
-	it.i = 0;
-	return weave_write_trigrams_iter(index, dict_term_array_next, &it);
-}
-
 /*
  * Gather candidate docids for a fuzzy/regex query term into a TidSet.
  *
@@ -336,7 +334,7 @@ weave_write_trigrams(Relation index, WeaveBuildState *bs)
  * pattern has too few usable trigrams (e.g. it is shorter than a trigram) we
  * return false and the caller falls back to a full scan (always correct).
  */
-static bool
+bool
 weave_trgm_candidates(Relation index, BlockNumber trgmstart,
 					 BlockNumber dictstart,
 					 const char *term, int termlen, int min_trigrams,

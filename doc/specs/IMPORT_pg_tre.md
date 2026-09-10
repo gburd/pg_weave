@@ -373,9 +373,10 @@ has its own segment-based storage engine forked from pg_fts:
   `regex_tokens`, `parser`, `extract`, `tiling`, `like_translate`,
   `pattern_cache`, `trgm_similarity`, `re_match`, and `src/util/utf8.c`)
   are in the Makefile `OBJS` via `FUZZY_OBJS`, and in `meson.build`.
-  They are ordinary translation units: unlike `amscan.c`, `lev.c` and
-  `trgm_page.c` they must **not** be `#include`d into `src/am/am.c`, and
-  `make check-unity` enforces that boundary from the other side.
+  They are ordinary translation units. So, since task L1, are `amscan.c`,
+  `lev.c` and `trgm_page.c`: the `src/am/am.c` unity build and the
+  `make check-unity` target that guarded it are both gone, so there is no
+  longer a second kind of source file to be careful about.
 
 ### Still open
 

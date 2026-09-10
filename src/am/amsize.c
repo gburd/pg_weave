@@ -18,9 +18,8 @@
  * approach eventually would.  This is a diagnostic run by a human or a benchmark,
  * not a hot path.
  *
- * A standalone translation unit on purpose.  src/am/am.c is already a unity build
- * of four files (AGENTS.md rule 5) and growing it further makes the L1 split
- * harder; this file needs nothing from am.c's statics.
+ * A standalone translation unit.  It predates task L1, which split src/am/am.c the
+ * same way; what it needs from am.c is declared in include/weave/am.h.
  *
  * Copyright (c) 2025-2026, Gregory Burd
  *

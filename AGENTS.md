@@ -124,9 +124,9 @@ the hard way:
 | target | protects against |
 |---|---|
 | `make check-rename` | pg_fts-era identifiers surviving the fork. The fork was mechanical; a missed `ftsdoc` compiles fine and confuses everyone afterwards |
-| `make check-unity` | someone "fixing" the `src/am/am.c` unity build and getting duplicate symbols |
 | `make check-ascii` | a non-ASCII byte in install SQL, which makes `CREATE EXTENSION` **fail** on a LATIN1 or EUC_JP server |
 | `make check-alloc` | a `palloc` sized from a corpus- or vocabulary-scale quantity without the huge-safe variant. This is the exact class behind four real crashes in pg_fts 0.3.4 / 1.0.1 / 1.0.2 / 1.0.3 |
+| ~~`make check-unity`~~ | **DELETED by task L1.** It guarded the `src/am/am.c` unity build against someone adding the three `#include`d `.c` files to `OBJS` and getting duplicate symbols. L1 split the file, so all three are ordinary translation units in `OBJS` and the failure mode the target existed to catch is structurally gone -- there is no `#include` of a `.c` file left to conflict with. Keeping the target would have required inverting it, and an inverted guard asserts the absence of a mistake nobody is positioned to make |
 
 ## Hard rules
 
@@ -157,9 +157,25 @@ documentation bug. `ci/fork-rename.sh` anchors on `\b` and on `BM25<Uppercase>`
 for exactly this reason. The first pass got it wrong and produced "Weave ranking"
 and `WeaveF`.
 
-**5. `src/am/am.c` is a unity build.** It `#include`s `amscan.c`,
-`../query/lev.c`, and `../pages/trgm_page.c`. Do not add those to `OBJS`.
-`make check-unity` guards it. Splitting it properly is task **L1**.
+**5. ~~`src/am/am.c` is a unity build.~~ RETIRED by task L1 (done).** It used to
+`#include` `amscan.c`, `../query/lev.c` and `../pages/trgm_page.c`, so those three
+had to be kept out of `OBJS` or their symbols were compiled and linked twice;
+`make check-unity` guarded both halves of that and has been **deleted** with the
+target.
+
+The AM is now `src/am/am.c` (AM core, page/segment/metapage machinery),
+`src/am/ambuild.c` (build, insert, segment writers, merge), `src/am/amvacuum.c`
+(bulkdelete, cleanup, compaction, maintenance SQL) and `src/am/amscan.c` (scan),
+with `src/query/lev.c` and `src/pages/trgm_page.c` as ordinary translation units.
+The interface between them is `include/weave/am.h`, which says of every
+declaration why it is there. **Add new AM code to the file that owns the seam**,
+and if a symbol has to become non-`static` to be reached, declare it there with a
+reason rather than putting an `extern` at the top of a `.c` file.
+
+*Why the rule is gone rather than reworded:* the hazard it named was a textual
+`#include` of a `.c` file colliding with a compiled object of the same file.
+There is no such `#include` left, so there is nothing to guard. The rule that
+replaced it is the one above about where code goes.
 
 **6. Do not copy code from `~/src/zvec`.** Alibaba, Apache-2.0. Ideas only.
 Apache-2.0's patent grant and NOTICE requirements are incompatible with a clean
