@@ -93,7 +93,23 @@ typedef uint8 weave_uint8;
  * validated for these; 1 bit is deliberately excluded because at 1 bit the
  * renormalization trick degenerates and RaBitQ-style sign coding with an
  * explicit error term is the better design (not implemented; see
- * doc/specs/VECTOR_CHANNEL.md sect. 11). */
+ * doc/specs/VECTOR_CHANNEL.md sect. 11).
+ *
+ * A second, independent reason to gate 1 bit if it is ever added: pg_turbovec's
+ * OWN 1-bit sign code (a different design from this file's renormalization
+ * trick -- corpus-mean-centered sign, not a Lloyd-Max cell) measured that its
+ * rerank-window penalty vs. its 2-bit code is dimension-dependent and severe
+ * at low dim -- 125x at 256-d, 8x at 1024-d, "effectively unusable" below
+ * 256-d, at matched R@10 >= 0.95 (v2.7.5, 2026-09-09; their 256/512-d arms are
+ * PREFIX SLICES of a 1024-d embedding, so treat the low-dim magnitude as an
+ * upper bound, not calibrated).  That is evidence about a neighbouring
+ * design, not a measurement of the rotated codebook here -- do not treat it
+ * as a number for this quantizer.  What it does establish safely: a 1-bit
+ * coordinate-wise code's information loss is plausibly dimension-sensitive in
+ * general, which is a reason a future WEAVE_BITS_MIN == 1 should be
+ * dimension-gated (e.g. refuse below some dim) rather than accepted at every
+ * dim RaBitQ nominally supports.  See doc/specs/VECTOR_CHANNEL.md sect. 11
+ * item 3 for the numbers and the full non-transfer argument. */
 #define WEAVE_BITS_MIN			2
 #define WEAVE_BITS_MAX			4
 

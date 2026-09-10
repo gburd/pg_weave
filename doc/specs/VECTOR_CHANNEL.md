@@ -408,6 +408,63 @@ carry a **recall floor** in its gate, not merely a build-time number, and its
 fixture must use realistic shard sizes. Ours does not exist yet, which is the
 cheapest possible moment to learn that.
 
+**A third warning, from a later release, not yet folded into V9's gate — it
+should be.** pg_turbovec's v2.7.4 measured that **probe count sets a hard
+recall ceiling that a wider exact-rerank window cannot break**
+(`docs/BQ_RECALL_BENCH.md` §0.6a, `bq_ivf_20260909`): 250k × 1024-d
+Cohere-wiki, `bit_width = 1`, `lists = 512`, probes swept 8→128 against rerank
+windows 256–2000. At every probe count, R@10 saturates and then stays flat
+across every window wider than it needs:
+
+| probes (of 512 lists) | R@10 ceiling | R@100 ceiling |
+|---:|---:|---:|
+| 8 | 0.846 | 0.784 |
+| 16 | 0.906 | 0.852 |
+| 32 | 0.954 | 0.905 |
+| 64 | 0.978 | 0.933 |
+| 128 | 0.984 | 0.945 |
+| flat (all cells) | **0.994** | 0.948 |
+
+No probe count up to 128/512 (25 % of `lists`) reached flat's own R@10 = 0.994,
+let alone 0.99, and flat was already cheaper than IVF at this scale — their
+guidance is "below ~1M, prefer flat BQ; above it, unmeasured." The mechanism is
+general, not a property of 1-bit codes: **the probe count and the rerank
+window fix two different failure modes.** A neighbour whose cell was never
+probed cannot be recovered by reranking a wider *retrieved* set, no matter how
+wide — that is retrieval-bound loss. pg_turbovec's own docs call out the
+mirror-image case from an earlier release (their "Gap-B", v1.25.0): high-dim
+recall loss that was **not** retrieval-bound — cell recall was already
+0.98–0.996 — where a wider exact window *did* fix it. Same symptom in a naive
+read (recall too low at the default window), opposite cause and opposite fix.
+Diagnose which one a given recall gap is before reaching for either knob.
+
+**This bears directly on V9 and on Phase V's `recall@10 ≥ 0.99` gate.** pg_weave's
+quantizer is not 1-bit — it is the 2–4 bit Lloyd-Max codebook of §4, closer to
+pg_turbovec's ordinary (non-BQ) code than to sign-BQ — so the ceiling *values*
+above do not transfer. But the mechanism is unconditional on bit width: it
+concerns which cells get probed, not how vectors within a probed cell are
+scored, so it applies to this design's IVF exactly as written. The nearest
+same-author, non-BQ data point is encouraging but is not a substitute for
+measuring our own: on 500k × 1024-d Cohere-wiki (`docs/BENCHMARKS.md`,
+"Recall-vs-p50 frontier", v1.11.x/Phase A-2 — an older, separate measurement,
+cited here as context for V9's risk and **not** one of the two claims this
+section otherwise verifies), 4-bit IVF reached R@10 = 0.990 at `probes = 256`
+(36 % of `lists = 707`, p50 25.3 ms) and R@10 = 1.000 at `probes = lists`
+(p50 41.4 ms — necessarily equal to flat's 41.4 ms, since probing every cell
+*is* the full scan). On that same corpus, **pgvector HNSW never reached
+R@10 = 0.99 at any `ef`** (`ef = 400` topped out at 0.983). If that holds on
+Phase V's own 1M × 1024-d gate corpus, `p50 ≤ 2× pgvector HNSW` at
+`recall@10 ≥ 0.99` is comparing against a baseline that cannot itself clear
+the recall bar, which is worth resolving explicitly rather than discovering at
+gate time.
+
+Per `AGENTS.md` rule 9: **the thing V9's design rests on — that some `nprobe`
+reaches `recall@10 ≥ 0.99` within the gate's latency budget, on our own
+codebook and corpus geometry — has not been measured.** The 4-bit precedent
+above makes it plausible, not proven. `bench/RESULTS_VECTOR.md` should carry a
+probes-vs-recall-vs-p50 sweep shaped like `bq_ivf_20260909`, not a single
+`(probes, recall, p50)` triple chosen after the fact to clear 0.99.
+
 ## 9. Filtering makes queries faster
 
 Two mechanisms, both from `include/weave/channel.h`:
@@ -483,8 +540,8 @@ lanes. That is task V11 and its gate is a torn-write injection TAP test.
    Mitigation is weak: `WeaveVecMeta` records the sample size and fit timestamp so
    `weave_check()` can at least report staleness.
 3. **Bit widths 2–4 only.** 1-bit is deliberately excluded, and pg_turbovec's
-   v2.6.0/v2.7.0 sign-BQ work (2026-09-08) supports that while adding three
-   constraints worth adopting now rather than rediscovering:
+   sign-BQ work across v2.6.0–v2.8.1 (2026-09-08 through 2026-09-10) supports
+   that while adding constraints worth adopting now rather than rediscovering:
 
    - **Raw sign-BQ fails outright on some corpora**: they measured
      **GIST R@10 = 0.0** until the per-dimension corpus mean was subtracted before
@@ -498,9 +555,54 @@ lanes. That is task V11 and its gate is a torn-write injection TAP test.
      for it must be trained un-rotated** — a different structure from the
      TurboQuant centroids, not a shared one. Worth writing down before V9 rather
      than after.
-   - **No recall/latency/QPS number exists for BQ yet.** Their own docs say it
-     "still needs a real-corpus run". Their 1-bit is correctness-proven, not
-     performance-proven, so it is not evidence for adopting it here.
+   - **1-bit is a high-dimension technique, and numbers now exist.** An earlier
+     draft of this document said no recall/latency/QPS number existed for BQ yet
+     — **that is now false and is corrected here.** pg_turbovec's v2.7.5
+     dimension sweep (`docs/BQ_RECALL_BENCH.md` §0.6c, 250k rows × {256, 512,
+     1024}-d Cohere-wiki, 100 held-out queries; the 1024-d arm reproduced its own
+     earlier published recall **bit-identically**, which validates the harness)
+     measured the rerank window their 1-bit code needs for R@10 ≥ 0.95, against
+     their 2-bit code at the same dim:
+
+     | dim | 1-bit window | 2-bit window | penalty |
+     |---:|---:|---:|---:|
+     | 256 | 4000 | 100 | **125×** |
+     | 512 | 800 | 32 | 25× |
+     | 1024 | 256 | 32 | **8×** |
+
+     At 256-d, R@10 ≥ 0.99 needs a window of 16 000 — reranking 6.4 % of a 250k
+     corpus — which they call "effectively unusable"; storage moves the same
+     direction (1.902×→1.971× vs 2-bit as dim rises 256→1024, because 1-bit's
+     fixed per-index overhead amortises away). Their conclusion: **prefer
+     768-d and up.** Caveat they recorded and this document repeats: the
+     256-d and 512-d arms are **prefix slices** of a 1024-d embedding, not
+     natively-trained low-dim vectors, so the measured penalty is an *upper
+     bound* on a native low-dim model's penalty, not a calibrated one.
+
+     **This does not transfer number-for-number to a future 1-bit addition
+     here, and reading it as if it did would overclaim.** pg_turbovec's 1-bit is
+     a corpus-mean-centered sign code; this project's quantizer at every bit
+     width, including a hypothetical 1, would be a Lloyd-Max cell over a
+     *rotated* coordinate (§3, §4) — a different distribution assumption at
+     every width, not just at 1 bit. What the result establishes safely is
+     narrower but still useful: *some* 1-bit coordinate-wise code's rerank
+     penalty is strongly dimension-dependent, which is a plausible — not
+     proven — property of any 1-bit-per-coordinate code, including a rotated
+     Lloyd-Max one. **It bounds the question rather than answers it: if a
+     1-bit `WEAVE_BITS_MIN` is ever proposed, run the dimension sweep against
+     the rotated-Beta codebook specifically (§5's calibration harness is the
+     right place) before offering any `dim < 768` configuration, rather than
+     assuming this number carries over.** `include/weave/quantize.h`'s comment
+     above `WEAVE_BITS_MIN` records the same pointer.
+   - **A composed, and separate, finding: IVF's probe count — not the rerank
+     window — is what actually gates BQ's recall at scale, and that mechanism
+     is not specific to 1-bit either.** v2.7.4 measured that `lists = 512`
+     IVF+1-bit-BQ tops out at R@10 = 0.984 (`probes = 128`) with no window able
+     to push it higher, and never reaches flat's own 0.994 within the tested
+     range. §8a above has the full table and, more importantly, why this is a
+     live risk for **this project's** V9 and Phase V's `recall@10 ≥ 0.99` gate
+     — not a BQ-specific curiosity.
+
 4. **No near-lossless mode without the rerank sidecar**, which costs the storage
    win it exists to preserve.
 5. **L1 distance has no useful compressed-domain bound** — the quantizer is built
@@ -522,7 +624,7 @@ lanes. That is task V11 and its gate is a torn-write injection TAP test.
 | V6 kernel equivalence | `test/hegel/test_kernels.c`: every ISA path == scalar | passing, 308,278 checks over `scalar`, `lut-wide`, `lut-avx2`, including ⟨q, reconstruct(code)⟩ agreement (K5) and rejection of an out-of-range `firstwarp` (K4, under ASan); **the rest of the ISA matrix is unmet, tabulated as unmet in §8** |
 | V7 crash safety | extend `t/001_crash_recovery.pl` to a vector index | not started |
 | V8 shuttle contract | `test_quantize.c` P8 (C2 soundness) + `bench/bound_pruning.c` soundness assert | passing, 17741 checks |
-| V9 graph recall/latency/storage | `bench/RESULTS_VECTOR.md` | not started |
+| V9 IVF recall/latency/storage, **including a probes-vs-recall sweep** (§8a: probe count, not rerank window, is what a fixed-`nprobe` recall ceiling needs) | `bench/RESULTS_VECTOR.md` | not started |
 | V13 warp ordering | `bench/bound_pruning.c` ≥ 90 % blocks pruned | harness exists, ordering not built |
 | V14 block header maintenance | `weave_check()` recompute-and-compare | not started |
 
