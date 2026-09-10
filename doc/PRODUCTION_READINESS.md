@@ -73,15 +73,21 @@ mechanically checkable. `doc/PHASES.md` has the task-level detail.
    extended integer kind space held in the second page-opaque word; the ten shipped
    kinds keep their one-hot bits, so a v6-written lexical page is byte-identical to
    a v5-written one, no page is rewritten, and the vector and fuzzy channels have
-   twelve reserved ids between them instead of ten bits that do not fit. Chosen
+   ten reserved ids between them (`WEAVE_PK_VMETA`..`WEAVE_PK_CGRAM`,
+   `include/weave/pagekind.h`) instead of the ten bit positions that did not
+   fit. Chosen
    over widening `flags` to `uint32`, which moves the opaque area on every page of
    every existing index. It follows L17's pattern -- a per-*object* self-describing
    discriminator in spare bits of an existing field, which is what let one relation
    hold both doclen-sidecar encodings across an upgrade instead of needing a
-   per-index version that cannot describe a mixed index -- and the fail-closed
-   consequence (a v5 reader matches no kind on a v6 page, rather than mistaking
-   kind 20 for `POSTING|TRGM`) is proved exhaustively over all 2^16 flag words by
-   `test/hegel/test_pagekind.c`. The same break added per-bolt weft descriptors
+   per-index version that cannot describe a mixed index. The hard guarantee that a
+   v5 `.so` cannot misread a v6 index is `weave_check_meta()`'s version gate
+   (`src/am/am.c:1695`), which refuses before any page kind is examined; the
+   fail-closed bit encoding (a v5 reader matches no kind on a v6 page, rather
+   than mistaking kind 20 for `POSTING|TRGM`) is defence in depth for readers
+   that already understand format version 6, and is proved exhaustively over
+   all 2^16 flag words by `test/hegel/test_pagekind.c`. The same break added
+   per-bolt weft descriptors
    (`WeaveSegMeta.chandesc`, `SEGMENT_FORMAT.md` §6), the versioned metapage
    reader, and `weave_check()`.
 6. **Upgrade path.** Partially addressed: `sql/pg_weave--0.1.0--0.2.0.sql` now

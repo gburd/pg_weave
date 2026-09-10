@@ -3,14 +3,20 @@
  * (include/weave/pagekind.h).  No PostgreSQL, no cmocka, no hegel: plain C,
  * plain asserts, so `make check-standalone` can gate a build on it.
  *
- * WHY THIS TEST EXISTS.  doc/specs/SEGMENT_FORMAT.md sect. 2's v6 decision rests
- * on a claim about code that is not in this tree: what a v5 binary does when it
- * reaches a page written with the extended kind encoding.  The claim is that it
- * FAILS CLOSED -- matches no page kind and treats the page as absent -- rather
- * than mistaking, say, WEAVE_PK_CHANDESC (id 16) for a posting page.  A claim
- * like that is worth nothing as a paragraph, so property 4 below restates the v5
- * reader's rule (first matching bit wins, exactly as src/am/amsize.c did before
- * v6) and checks it against every allocated kind.
+ * WHY THIS TEST EXISTS.  A v6 index can never actually reach a v5 `.so`'s page-
+ * kind code at all: `weave_check_meta()` (src/am/am.c:1695) rejects any metapage
+ * whose version exceeds the reading build's own WEAVE_VERSION before that build
+ * examines a single page kind, and that check is unconditional on bit layout.
+ * That version gate is the hard guarantee.  What this file proves is narrower
+ * and secondary: doc/specs/SEGMENT_FORMAT.md sect. 2's defence-in-depth claim
+ * about code that is not in this tree -- what a v5 binary's first-match rule
+ * does if it ever reached a page written with the extended kind encoding
+ * anyway.  The claim is that it FAILS CLOSED -- matches no page kind and treats
+ * the page as absent -- rather than mistaking, say, WEAVE_PK_CHANDESC (id 16)
+ * for a posting page.  A claim like that is worth nothing as a paragraph, so
+ * property 4 below restates the v5 reader's rule (first matching bit wins,
+ * exactly as src/am/amsize.c did before v6) and checks it against every
+ * allocated kind.
  *
  * The flag word is 16 bits, so "for all inputs" is 65,536 cases per kind value
  * and the whole space is enumerable.  Nothing here is random: an exhaustive
