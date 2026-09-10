@@ -378,7 +378,8 @@ weave_chandesc_required(Relation index, BlockNumber blk,
 }
 
 /* scan functions (pg_weave_am_scan.c, #included into pg_weave_am.c) */
-extern void weave_init_reloptions(void);extern IndexScanDesc weave_beginscan(Relation r, int nkeys, int norderbys);
+extern void weave_init_reloptions(void);
+extern IndexScanDesc weave_beginscan(Relation r, int nkeys, int norderbys);
 extern void weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 						ScanKey orderbys, int norderbys);
 extern int64 weave_getbitmap(IndexScanDesc scan, TIDBitmap *tbm);

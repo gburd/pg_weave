@@ -233,18 +233,21 @@ wvck_page_kinds(WeaveCheckCtx *cx)
 			  nunknown > 0 ? d.data : NULL);
 	pfree(d.data);
 
-	/* An extended-but-never-initialized page is not corruption -- a crash between
-	 * the extend and the GenericXLog commit leaves one -- but it is worth
-	 * reporting, because a growing count means a write path is losing pages. */
-	if (nnew > 0)
+	/* Not an invariant, a fact worth surfacing: an extended-but-never-initialized
+	 * page is not corruption on its own -- a crash between the extend and the
+	 * GenericXLog commit leaves exactly one, and that is a normal recoverable
+	 * state, not a violation.  A single weave_check() call has no history to
+	 * compare against, so it cannot tell "one stray page from a crash we already
+	 * recovered from" apart from "a write path that is steadily losing pages" --
+	 * only a *growing* count across repeated checks would mean the latter. Report
+	 * the count for a human or a monitoring query to trend, but do not fail the
+	 * invariant on it. */
 	{
 		initStringInfo(&d);
 		appendStringInfo(&d, "%lld uninitialized page(s)", (long long) nnew);
-		wvck_emit(cx, "no_uninitialized_pages", false, d.data);
+		wvck_emit(cx, "uninitialized_page_count", true, d.data);
 		pfree(d.data);
 	}
-	else
-		wvck_emit(cx, "no_uninitialized_pages", true, NULL);
 }
 
 /*
@@ -255,10 +258,13 @@ wvck_page_kinds(WeaveCheckCtx *cx)
  * indistinguishable here, which is the whole point of putting the discriminator
  * in the bolt rather than in the metapage version.
  *
- * When it is set, weave_read_chandesc() validates the page (and ERRORs on a
- * corrupt one, which is why this runs inside a subtransaction-free PG_TRY:
- * weave_check must report a corrupt descriptor page as a violated invariant, not
- * abort the whole report).
+ * When it is set, weave_read_chandesc() (src/am/am.c:3413) validates the page
+ * and NEVER THROWS: it returns a WeaveCdError instead of ereport()'ing, exactly
+ * so this function can report a corrupt descriptor page as a violated
+ * invariant and carry on to the remaining invariants, instead of needing a
+ * PG_TRY/PG_CATCH around a throwing reader (which would require a
+ * subtransaction to unwind safely). There is no PG_TRY here because none is
+ * needed -- see the loop below, which just checks the returned error code.
  */
 static void
 wvck_chandesc(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)

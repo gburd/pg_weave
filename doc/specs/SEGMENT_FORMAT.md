@@ -108,15 +108,28 @@ The argument, in the order that decided it:
    upgrade one relation holds v5-written lexical pages and v6-written channel
    pages at the same time, so the discriminator has to be **per page**.
 
-2. **It fails closed against an older `.so`.** Under the extended encoding every
-   legacy kind bit is zero, so a v5 binary reaching such a page matches no kind
-   and treats it as absent/unclassified. Had the kind integer been laid into the
-   **low** bits of `flags` instead, kind 20 (`0b10100`) would have read as
-   `POSTING|TRGM` to that binary — a wrong answer rather than a refusal. This is
-   not an assertion: `test/hegel/test_pagekind.c` transcribes the v5 first-match
-   rule and checks it against every allocated kind, exhaustively over all 2¹⁶ flag
-   words. (The metapage version gate refuses first; this is the second line of
-   defence, the same two-layer argument `WEAVE_DOCLEN_ABS` makes in §5.)
+2. **The hard guarantee is the metapage version gate, not the bit layout.**
+   `weave_check_meta()` (`src/am/am.c:1695`) rejects any metapage whose
+   `version` exceeds the reading build's own `WEAVE_VERSION` before that build
+   ever looks at a page's kind bits. A v5 `.so` has `WEAVE_VERSION == 5`; it
+   opens a v6 index, sees `meta->version == 6`, and errors out at every entry
+   point that calls it (`am.c:6123`, `am.c:6583`, `amscan.c:335`,
+   `amcheck.c:684`) — before scanning a single non-meta page. That check does
+   not depend on which bits an extended kind sets, so it holds even if a future
+   encoding reused low bits by mistake; it is the reason a v5 `.so` never
+   reaches a `WEAVE_PK_CHANDESC` page at all.
+   The kind encoding below is **defence in depth**, not the primary mechanism:
+   it covers the narrower case of two readers that both understand format
+   version 6 but disagree about which bits are legacy versus extended. There,
+   under the extended encoding every legacy kind bit is zero, so a reader that
+   does not know about the escape matches no kind and treats the page as
+   absent/unclassified, rather than misreading it. Had the kind integer been
+   laid into the **low** bits of `flags` instead, kind 20 (`0b10100`) would
+   have read as `POSTING|TRGM` — a wrong answer rather than a refusal.
+   `test/hegel/test_pagekind.c` transcribes that first-match rule and checks it
+   against every allocated kind, exhaustively over all 2¹⁶ flag words, but it
+   proves only that narrower, secondary property — not "a v5 `.so` cannot
+   misread a v6 index," which is the version gate's job.
 
 3. **The shipped kinds do not move.** A v6 build keeps writing the legacy bitmap
    for all ten existing kinds, so a lexical page written by v6 is **byte-identical**
@@ -444,8 +457,9 @@ recorded: which index attribute the lexical weft indexes.
      it cannot arise from any writer — and `weave_check()` reports it as a violated
      invariant (`chandesc_version_consistent`) rather than following the pointer.
    - A `WEAVE_CHANDESC` page that fails any structural rule in §6 is an `ERROR`
-     with a specific `errdetail` naming which rule; there are fifteen distinct
-     codes, because "which of the fifteen ways this page is wrong" is the
+     with a specific `errdetail` naming which rule; there are fourteen distinct
+     codes (`WeaveCdError` in `include/weave/chandesc.h`), because "which of the
+     fourteen ways this page is wrong" is the
      difference between a diagnosable corruption report and "index is corrupted".
    - `weave_check()` is the one caller that reports instead of throwing, which is
      why the descriptor reader returns a code and a thin wrapper
@@ -504,9 +518,12 @@ cannot justify.
   invariant the v6 kind space owes: under the old flat bitmap an unrecognized page
   was one with no bit set, and now it is also one with a reserved bit set, two kind
   bits set, or an extended id outside the allocated range.
-- `no_uninitialized_pages` — reports extended-but-never-initialized pages. Not
-  corruption (a crash between the extend and the `GenericXLog` commit leaves one),
-  but a growing count means a write path is losing pages.
+- `uninitialized_page_count` — informational: how many pages are
+  extended-but-never-initialized. Not corruption on its own (a crash between the
+  extend and the `GenericXLog` commit leaves one, which is a normal recoverable
+  state), and a single check has no history to distinguish that from a write
+  path steadily losing pages — only a *growing* count across repeated checks
+  would mean the latter, which is why this is reported rather than asserted.
 - `chandesc_reachable` — every bolt that names a descriptor page has one that is in
   bounds, is a `WEAVE_CHANDESC` page, and passes every §6 structural rule.
 - `chandesc_roots_agree` — the descriptor's `LEXICAL` weft root equals the bolt's

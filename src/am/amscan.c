@@ -329,12 +329,36 @@ weave_read_meta(Relation index, WeaveMetaPageData *out)
 {
 	Buffer		buffer = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
 	Page		page;
+	uint32		s;
 
 	LockBuffer(buffer, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buffer);
 	weave_check_meta(page, index);
 	weave_meta_from_page(page, out);	/* version-aware: expands a v3 metapage */
 	UnlockReleaseBuffer(buffer);
+
+	/*
+	 * Every v6 bolt is self-describing (SEGMENT_FORMAT.md sect. 6): when
+	 * segs[i].chandesc is set, later code is entitled to trust the weft array
+	 * on that page.  This is the one place every scan, build, merge and vacuum
+	 * path reads the segment directory before acting on it, so it is where a
+	 * corrupt descriptor page must turn into a clean ERROR
+	 * (doc/CONVENTIONS.md decision 2: on-disk bytes are not trusted) rather
+	 * than only being caught later by an explicit weave_check() call, or not
+	 * at all. weave_chandesc_required() is the throwing wrapper built for
+	 * exactly this call site.
+	 */
+	for (s = 0; s < out->nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		WeaveSegMeta *seg = &out->segs[s];
+		WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
+
+		if (seg->dictstart == InvalidBlockNumber)
+			continue;			/* consumed slot */
+		if (seg->chandesc == InvalidBlockNumber)
+			continue;			/* pre-v6 bolt, not yet merged */
+		(void) weave_chandesc_required(index, seg->chandesc, weft, WEAVE_MAX_WEFTS);
+	}
 }
 
 /*

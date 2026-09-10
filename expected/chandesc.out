@@ -36,10 +36,10 @@ SELECT invariant, ok FROM weave_check('cd_weave') ORDER BY invariant;
  chandesc_roots_agree             | t
  chandesc_version_consistent      | t
  metapage_version_recognized      | t
- no_uninitialized_pages           | t
  nsegments_bound                  | t
  page_kinds_decodable             | t
  segment_roots_have_expected_kind | t
+ uninitialized_page_count         | t
 (9 rows)
 
 -- The deep pass adds full-relation page reachability and the
@@ -53,11 +53,11 @@ SELECT invariant, ok FROM weave_check('cd_weave', true) ORDER BY invariant;
  chandesc_roots_agree             | t
  chandesc_version_consistent      | t
  metapage_version_recognized      | t
- no_uninitialized_pages           | t
  nsegments_bound                  | t
  page_kinds_decodable             | t
  pages_reachable_or_freed         | t
  segment_roots_have_expected_kind | t
+ uninitialized_page_count         | t
 (11 rows)
 
 -- The only assertion that matters: nothing is violated.
