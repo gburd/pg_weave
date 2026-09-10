@@ -59,7 +59,7 @@ FUZZY_OBJS = \
 	src/query/re_match.o \
 	src/util/utf8.o
 
-# --- Vendored TRE (laurikari/tre d0e0c99, BSD-2; see doc/LICENSING.md).
+# --- Vendored TRE (laurikari/tre f864ed0, BSD-2; see doc/LICENSING.md).
 # Compiled in-tree as plain translation units rather than driven through
 # TRE's autotools: no submodule, no ./configure step in the extension build,
 # and the two feature headers TRE's configure would have generated are

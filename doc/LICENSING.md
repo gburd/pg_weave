@@ -27,7 +27,7 @@ engine with its own storage — the answer is no, even if it is faster.
 | Vocabulary trigram map, bounded Levenshtein automaton | `src/query/{trgm,lev}.c` | pg_fts 1.5.8 | **PostgreSQL** | forked wholesale |
 | Sparsemap (succinct bitmap, used for tombstones and trigram postings) | `src/util/sparsemap.c`, `include/weave/sparsemap_impl.h` | vendored in pg_fts; upstream v5.4.0 | **MIT**, © 2024 Gregory Burd | vendored, symbols namespaced |
 | SuRF trie, universal-Levenshtein expansion, regex AST, trigram tiling, LIKE translation, pattern cache, UTF-8 helpers | `src/query/{surf,uleven,regex_ast,tiling,like_translate,pattern_cache,regex_grammar,regex_tokens,re_match,trgm_similarity,extract,parser,hash}.c`, `src/util/utf8.c`, `include/weave/{surf,uleven,regex_ast,tiling,like_translate,pattern_cache,re_match,utf8,popcount,hash}.h` | pg_tre 3.2.1, commit `e03d6a83` | **MIT** → relicensed | imported and renamed; in `OBJS` since 0.5.0 (Z1/Z2), channel not yet reachable |
-| Approximate/regex matcher behind the fuzzy channel's verification step | `vendor/tre/**` | laurikari/tre, commit `d0e0c997336b3210f05b3e1daa7bb5cb9900d274` (`v0.8.0-145-gd0e0c99`, version string 0.9.0) | **BSD-2**, © 2001–2009 Ville Laurikari | vendored in-tree, one local patch, symbols **not** renamed — see below |
+| Approximate/regex matcher behind the fuzzy channel's verification step | `vendor/tre/**` | laurikari/tre, commit `f864ed08a7499865c75b8b59c0cf39a9d59133fe` (`v0.8.0-163-gf864ed0`, version string 0.9.0) | **BSD-2**, © 2001–2009 Ville Laurikari | vendored in-tree, one local patch, symbols **not** renamed — see below |
 | Vector quantizer: rotation, Lloyd–Max codebook, encode/decode, packing | `include/weave/quantize.h`, `src/vector/{quantize,pack}.c` | turbovec 1.0.0 | **MIT** | **reimplemented in C**, not ported |
 | Vamana graph over quantized codes; filter pushed into traversal; runtime ISA dispatch; multi-modal plan operators | `include/weave/graph.h`, `src/vector/graph.c` | pg_turbovec 2.1.0 (Apache-2.0), zvec (Apache-2.0) | — | **ideas only, no code** |
 | Fused-threshold top-k | `include/weave/{channel,fuse}.h`, `src/am/fuse.c` | new | PostgreSQL | written for pg_weave |
@@ -102,10 +102,54 @@ Recorded for Z1:
 | what | value |
 |---|---|
 | upstream | `https://github.com/laurikari/tre` |
-| pinned commit | `d0e0c997336b3210f05b3e1daa7bb5cb9900d274` (`git describe`: `v0.8.0-145-gd0e0c99`; `configure.ac` says `AC_INIT([TRE], [0.9.0])`) |
+| pinned commit | `f864ed08a7499865c75b8b59c0cf39a9d59133fe` (`git describe`: `v0.8.0-163-gf864ed0`; `configure.ac` still says `AC_INIT([TRE], [0.9.0])` — the package version string did not move) |
 | license | 2-clause BSD, © 2001–2009 Ville Laurikari, verbatim in `vendor/tre/LICENSE` |
 | how incorporated | **copied in-tree, not a submodule** |
 | local patch | `vendor/tre/patches/tre-progress-hook.patch`, **already applied** to the copied sources |
+
+**Bumped from `d0e0c997` to `f864ed0` (18 commits), porting pg_tre `1521662`.**
+Two of those 18 commits are the reason this was priority 1, not routine
+housekeeping:
+
+- `ad26b6d` ("Avoid crashing on large inputs") — `pos`/`len` in the three
+  matcher backends (`lib/tre-match-{approx,backtrack,parallel}.c`) were
+  plain `int`; upstream widened them to `ssize_t` and added a
+  `TRE_MAX_STRING` (`INT_MAX`) clamp (`lib/tre-internal.h`). Before this,
+  an input long enough to overflow `int` in the position arithmetic is a
+  crash, not a wrong answer.
+- `2f7dcec`/`e0d2777` ("Fix backtracking restart so backrefs scan later
+  start positions") — `lib/tre-match-backtrack.c`'s end-of-string check
+  used the *current* backtracking position (`next_c`/`pos`) instead of the
+  position at the start of the current search attempt
+  (`next_c_start`/`pos_start`), so the backtracker gave up scanning for a
+  match at a later start offset when it shouldn't have. Silent wrong
+  answer: fewer matches than a correct engine, no error.
+
+Also carried: `1e8683a`/`6859a2e`/`35f6307`/`13d597c` — `tre_stack_t`
+switched from a fixed `increment` to exponential growth and `int` sizes to
+`size_t` (`lib/tre-stack.{c,h}`, `lib/tre-compile.c`, `lib/tre-parse.{c,h}`,
+`lib/regcomp.c`), a hard `TRE_MAX_RE` (65536) limit on regex length
+(`lib/regcomp.c`), and a `sizeof(int)` → `sizeof(*tags)`/`sizeof(*tnfa->minimal_tags)`
+allocation-size fix in `lib/tre-compile.c` (cosmetic here — the pointee type
+did not change size — but wrong on any platform where it did). None of these
+four are separately regression-tested below; they are upstream's own
+hardening, carried along because they touch the same files, and are covered
+by the existing standalone TRE build (this project has no exact-output test
+depending on `TRE_MAX_RE` or stack growth behavior).
+
+`vendor/tre/patches/tre-progress-hook.patch` is pg_tre's own rebase of the
+hook onto `f864ed0` (renamed `pg_tre`→`pg_weave` per the usual rule; see
+`doc/specs/IMPORT_pg_tre.md`), reapplied here rather than re-derived — pg_tre
+had already resolved the two conflicting hunks in `tre_add_tags()`
+(upstream's loop condition absorbed the redundant inner `status` check the
+patch used to add) and in `tre_tnfa_run_approx()` (upstream's `DPRINT` format
+widened to `%zd`). `configure.ac`'s `AC_TYPE_SSIZE_T` and `win32/config.h`'s
+`ssize_t` typedef are autotools/MSVC-only concerns pg_weave's hand-maintained
+`vendor/tre/config.h` doesn't need: `HAVE_SYS_TYPES_H` was already `1`
+(`vendor/tre/local_includes/tre-config.h:26`), which is sufficient for
+`<sys/types.h>`'s `ssize_t` on the POSIX targets this project builds for.
+License terms did not change (`git diff d0e0c997..f864ed0 -- LICENSE` is
+empty) — still 2-clause BSD, same copyright holder.
 
 **Copied, not a submodule, and not built by autotools.** pg_tre carries TRE as a
 git submodule and runs `autoreconf && ./configure && make` on it from its own
@@ -156,7 +200,7 @@ about most: no fixed-output test can see a missing timeout.
 The patch is checked in *already applied*, so the tree builds with no patch
 step. It is kept alongside as provenance: `patch -R -p1 < patches/tre-progress-hook.patch`
 inside `vendor/tre` reproduces pristine upstream for the four touched files, and
-`git diff` against a fresh checkout of `d0e0c99` then shows nothing. It differs
+`git diff` against a fresh checkout of `f864ed0` then shows nothing. It differs
 from pg_tre's copy only in comment text (`pg_tre` → `pg_weave`, and the pointer
 to the strong definitions now reads `src/query/re_match.c`); every code line and
 both symbol names are identical.

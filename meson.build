@@ -87,7 +87,7 @@ sources = files(
   'src/util/utf8.c',
 )
 
-# Vendored TRE (laurikari/tre @ d0e0c99, BSD-2; see doc/LICENSING.md).  Built
+# Vendored TRE (laurikari/tre @ f864ed0, BSD-2; see doc/LICENSING.md).  Built
 # as ordinary translation units, not via TRE's autotools, so the two headers
 # ./configure would have produced are checked in (vendor/tre/config.h and
 # vendor/tre/local_includes/tre-config.h).  Mirrors libtre_la_SOURCES from

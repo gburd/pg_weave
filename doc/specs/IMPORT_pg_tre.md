@@ -230,9 +230,12 @@ sparsemap's bundled one). pg_tre's sparsemap was **not** imported.
 ## Vendored TRE (done in Z1)
 
 TRE itself (`laurikari/tre`) is a git submodule in pg_tre at `vendor/tre`,
-pinned to `d0e0c997336b3210f05b3e1daa7bb5cb9900d274`, under the 2-clause
-BSD license.  **Z1 copied it in-tree** at that same pin, to
-`pg_weave/vendor/tre` -- not as a submodule.  All three prerequisites for
+pinned at Z1 to `d0e0c997336b3210f05b3e1daa7bb5cb9900d274`, under the
+2-clause BSD license.  **Z1 copied it in-tree** at that pin, to
+`pg_weave/vendor/tre` -- not as a submodule.  Bumped to
+`f864ed08a7499865c75b8b59c0cf39a9d59133fe` porting pg_tre `1521662` (see
+"Upstream fixes carried in" below and `doc/LICENSING.md`'s TRE section for
+the two bugs that made the bump priority 1).  All three prerequisites for
 `src/query/re_match.c` are satisfied:
 
 1. Vendored: the eleven `libtre_la_SOURCES` files (with `TRE_APPROX` on)
@@ -314,17 +317,24 @@ has its own segment-based storage engine forked from pg_fts:
     consult". Whoever writes the shuttle owes a regression test in the shape of
     pg_tre's `test/sql/surf_prefix.sql`: a case-insensitive anchored pattern must
     return the same rows via the index as via a seq scan.
-- **pg_tre `1521662` (vendor TRE → master `f864ed0`) — NOT PORTED, required
-  before Z is claimed.** `vendor/tre` here is pinned at `d0e0c997` (≈ v0.9.0).
-  Upstream's unreleased hardening includes a **crash on inputs past `INT_MAX`**
-  (`ad26b6d`; position data was `int` throughout), a **backref wrong answer**
-  (`2f7dcec`; backtracking restarted from the wrong position, so matches at later
-  start offsets were missed), hard `TRE_MAX_RE` / `TRE_MAX_STACK` limits with
-  exponential rather than linear stack growth, and a `sizeof(pointer)` allocation
-  bug. pg_tre has already rebased `patches/tre-progress-hook.patch` onto the new
-  tree and resolved the two conflicting hunks — reuse that work rather than
-  redoing it. Not urgent while the channel is unreachable; a blocker for shipping
-  it.
+- **pg_tre `1521662` (vendor TRE `d0e0c997` → `f864ed0`) — PORTED
+  2026-09-10.** Upstream's unreleased hardening included a **crash on inputs
+  past `INT_MAX`** (`ad26b6d`; position data was `int` throughout in the
+  three matcher backends) and a **backref wrong answer** (`2f7dcec`;
+  backtracking restarted from the wrong position, so matches at later start
+  offsets were missed). Both are demonstrated in `test/hegel/test_tre_bump.c`
+  (standalone, linked directly against `vendor/tre` — the fuzzy/regex SQL
+  surface is not routed yet, tasks Z3-Z7). The backref fix is shown
+  wrong-answer-before/right-answer-after by compiling the *old* pin's
+  `tre-match-backtrack.c` alongside the rest of the *new* pin's TRE (the
+  bug and its fix are both isolated to that one file) and comparing against
+  the same pattern/input compiled with the new file. The `INT_MAX` fix is
+  shown by exercising `TRE_MAX_STRING` clamping directly (a real >2GiB
+  input is impractical for a test; the clamp constant and the comparison
+  that uses it are asserted instead — see the test file for exactly what is
+  and is not proven this way). `patches/tre-progress-hook.patch` is pg_tre's
+  own rebase onto `f864ed0`, reused verbatim (renamed the usual way) rather
+  than re-derived. Full detail in `doc/LICENSING.md`'s TRE section.
 
 ### Resolved in Z1/Z2 (pg_weave 0.5.0)
 

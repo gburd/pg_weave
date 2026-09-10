@@ -202,13 +202,13 @@ typedef struct tre_backtrack_struct {
 
 reg_errcode_t
 tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
-		       int len, tre_str_type_t type, int *match_tags,
+		       ssize_t len, tre_str_type_t type, int *match_tags,
 		       int eflags, int *match_end_ofs)
 {
   /* State variables required by GET_NEXT_WCHAR. */
   tre_char_t prev_c = 0, next_c = 0;
   const char *str_byte = string;
-  int pos = 0;
+  ssize_t pos = 0;
   unsigned int pos_add_next = 1;
 #ifdef TRE_WCHAR
   const wchar_t *str_wide = string;
@@ -233,6 +233,7 @@ tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
 #ifdef TRE_MBSTATE
   mbstate_t mbstate_start;
 #endif /* TRE_MBSTATE */
+  reg_errcode_t ret;
 
   /* End offset of best match so far, or -1 if no match found yet. */
   int match_eo = -1;
@@ -250,7 +251,15 @@ tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
 
   tre_tnfa_transition_t *trans_i;
   regmatch_t *pmatch = NULL;
-  int ret;
+
+  /*
+   * TRE internals tend to use int instead of size_t for positions or
+   * lengths and don't check for overflow.  This will take time to fix
+   * properly.  In the meantime, simply limit the input to what we can
+   * handle.
+   */
+  if (len > TRE_MAX_STRING)
+    len = TRE_MAX_STRING;
 
 #ifdef TRE_MBSTATE
   memset(&mbstate, '\0', sizeof(mbstate));
@@ -268,7 +277,7 @@ tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
   stack->next = NULL;
 
   DPRINT(("tnfa_execute_backtrack, input type %d\n", type));
-  DPRINT(("len = %d\n", len));
+  DPRINT(("len = %zd\n", len));
 
 #ifdef TRE_USE_ALLOCA
   tags = alloca(sizeof(*tags) * tnfa->num_tags);
@@ -368,7 +377,7 @@ tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
       tags[*next_tags] = pos;
 
 
-  DPRINT(("entering match loop, pos %d, str_byte %p\n", pos, str_byte));
+  DPRINT(("entering match loop, pos %zd, str_byte %p\n", pos, str_byte));
   DPRINT(("pos:chr/code | state and tags\n"));
   DPRINT(("-------------+------------------------------------------------\n"));
 
@@ -393,7 +402,7 @@ tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
       DPRINT(("start loop\n"));
       if (state == tnfa->final)
 	{
-	  DPRINT(("  match found, %d %d\n", match_eo, pos));
+	  DPRINT(("  match found, %d %zd\n", match_eo, pos));
 	  if (match_eo < pos
 	      || (match_eo == pos
 		  && match_tags
@@ -414,7 +423,7 @@ tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
 	}
 
 #ifdef TRE_DEBUG
-      DPRINT(("%3d:%2lc/%05d | %p ", pos, (tre_cint_t)next_c, (int)next_c,
+      DPRINT(("%3zd:%2lc/%05d | %p ", pos, (tre_cint_t)next_c, (int)next_c,
 	      state));
       {
 	int i;
@@ -519,7 +528,7 @@ tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
 #endif /* TRE_WCHAR */
 	      pos += bt_len - 1;
 	      GET_NEXT_WCHAR();
-	      DPRINT(("	 pos now %d\n", pos));
+	      DPRINT(("	 pos now %zd\n", pos));
 	    }
 	  else
 	    {
@@ -537,7 +546,7 @@ tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
 		  if (str_user_end)
 		    goto backtrack;
 		}
-	      else if (next_c == L'\0')
+	      else if (next_c == L'\0' || pos >= TRE_MAX_STRING)
 		goto backtrack;
 	    }
 	  else
@@ -630,7 +639,7 @@ tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
 	      /* Check for end of string. */
 	      if (len < 0)
 		{
-		  if (next_c == L'\0')
+		  if (next_c_start == L'\0' || pos_start >= TRE_MAX_STRING)
 		    {
 		      DPRINT(("end of string.\n"));
 		      break;
@@ -638,7 +647,7 @@ tre_tnfa_run_backtrack(const tre_tnfa_t *tnfa, const void *string,
 		}
 	      else
 		{
-		  if (pos >= len)
+		  if (pos_start >= len)
 		    {
 		      DPRINT(("end of string.\n"));
 		      break;
