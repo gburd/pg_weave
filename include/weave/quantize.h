@@ -476,24 +476,26 @@ typedef enum WeavePackLayout
 /*
  * Bytes needed for a full WEAVE_VEC_BLOCK-vector block at this width.
  *
- * The maximum code index is 32*dim - 1 in both layouts (LANE: coordinates 0..dim-1
- * at slot 31; VECMAJOR: slot 31 has dim coordinates). At 4 bits per code, that
- * is 4*dim*32 bits = 16*dim bytes tight-bound. At 2 bits, 8*dim. Generally:
- * max_code_index = 32*dim - 1, so tight bound = ceil((32*dim - 1 + 1) * bits / 8)
- * = ceil(32*dim*bits / 8) = 4*dim*bits bytes for any bits.  The rounding
- * ((dim*bits + 7) / 8 * 32) adds 0-28 bytes of slack per layout.
+ * The maximum code index is 32*dim - 1 in both layouts (LANE: coordinates
+ * 0..dim-1 at slot 31; VECMAJOR: slot 31 has dim coordinates), so the tight
+ * requirement is ceil(32*dim*bits / 8) = 4*dim*bits bytes for any bits, while
+ * this function returns ceil(dim*bits/8) * 32 -- the per-vector code size
+ * rounded up, 32 times.  So it returns 0-28 bytes MORE than either layout uses.
  *
- * ** Slack bytes are never written by any pack function (weave_pack_lane,
- * weave_unpack_lane, weave_pack_move_lane, weave_pack_zero_lane).  An on-disk
- * block image therefore carries uninitialized bytes.  Phase V7 (on-disk page
- * format) MUST zero the block buffer before packing to ensure deterministic
- * bytes on disk.
+ * ** No pack function ever writes that tail (not weave_pack_lane,
+ * weave_unpack_lane, weave_pack_move_lane, nor weave_pack_zero_lane).  Harmless
+ * for scoring, since no kernel reads it -- but a caller that puts the buffer on
+ * a page MUST zero it first or the page image is nondeterministic: GenericXLog
+ * would take a delta over bytes that change between rewrites, and any
+ * cross-architecture fixture hash of a WEAVE_PK_VCODES page would not reproduce.
+ * That is task V7's obligation (doc/PHASES.md, doc/specs/VECTOR_CHANNEL.md
+ * sect. 7); there is no block writer yet.
  *
- * ** If computing lane stride as weave_block_codebytes(dim, bits) / 32 for a
- * SIMD fast path, verify that 8 divides dim*bits. When it does not, the rounding
- * introduces a skew and consecutive lanes do not stride uniformly. VECMAJOR
- * packs lanes bit-contiguously (no gap) so the skew read from disk gives bits
- * out of order compared to what contiguous lanes would hold in a SIMD vector. */
+ * ** Do NOT use weave_block_codebytes(dim, bits) / 32 as a lane stride in a SIMD
+ * fast path unless 8 divides dim*bits.  The per-lane rounding skews it, and
+ * VECMAJOR packs lanes bit-contiguously with no gap, so the strided read gets
+ * bits out of order relative to what contiguous lanes actually hold.
+ */
 static inline int
 weave_block_codebytes(int dim, int bits)
 {

@@ -49,49 +49,87 @@ StaticAssertDecl(sizeof(WeaveVecLane) == 2 * sizeof(float4),
 /*
  * Adapt WeaveVecKernelOps.score_block to WeaveScoreBlock.
  *
- * A GAP IN THE OPS INTERFACE, deliberately not papered over: score_block() takes
- * no pack layout, but which layout a segment used is a per-segment fact recorded
- * in WeaveVecMeta, and a scorer that guesses wrong returns wrong distances rather
- * than an error (doc/specs/VECTOR_CHANNEL.md sect. 7).  This adapter therefore
- * asserts the byte-LUT layout, which is the only layout any implemented kernel
- * reads, and V8 should call weave_score_block() directly with the layout from the
- * segment descriptor -- or this signature should grow the layout -- rather than
- * inherit the assumption.  A WEAVE_PACK_VECMAJOR segment scored through here
- * would be silently wrong, so it must not be reachable from the shuttle until
- * that is settled.
+ * Two page-derived facts are threaded through rather than assumed, because
+ * assuming either one is a silently-wrong-answer or a crash on a corrupt page:
+ *
+ *	 `layout`	is the pack layout from this segment's WeaveVecMeta.  A scorer
+ *				that guesses it returns wrong distances rather than an error
+ *				(src/vector/pack.c, doc/specs/VECTOR_CHANNEL.md sect. 7), so it
+ *				is a parameter of the ops prototype and this adapter passes it
+ *				straight through.  Kernels that only read WEAVE_PACK_LANE
+ *				decline anything else by delegating to the layout-agnostic
+ *				oracle; an unrecognized value is rejected.
+ *
+ *	 `nwarp`	is the length of the `allow` bitmap, in warps.  hdr->firstwarp
+ *				indexes that bitmap and hdr->firstwarp comes off a page, so
+ *				without a length a corrupt header is an unbounded out-of-bounds
+ *				read.  The bounds check lives in the kernels too -- they are the
+ *				code doing the indexing, and the standalone test exercises it
+ *				there -- but this adapter is where nwarp is known, so it is where
+ *				a start outside the segment becomes a specific error ("block
+ *				inconsistent" would send a reader looking at the geometry) and
+ *				where a legitimate short tail block is trimmed.
  */
 static int
 weave_score_block_ops(const WeaveQueryLut *lut,
+					  WeavePackLayout layout,
 					  const WeaveVecBlockHdr *hdr,
 					  const uint8 *codes,
 					  const WeaveVecLane *lanes,
 					  const uint64 *allow,
+					  WeaveWarp nwarp,
 					  float4 *out)
 {
 	WeaveScoreBlock blk;
+	int			nlanes = WEAVE_VEC_BLOCK;
 	int			n;
 
 	if (lut == NULL || hdr == NULL || codes == NULL || lanes == NULL)
 		elog(ERROR, "weave vector kernel called with a NULL block argument");
 
+	if (allow != NULL)
+	{
+		/*
+		 * A block that does not start inside the segment's warp space is a
+		 * corrupt header, not a short block: nothing legitimate can point
+		 * there.  A block that starts inside it and RUNS PAST the end is the
+		 * ordinary tail of a weft whose warp count is not a multiple of 32, so
+		 * it is trimmed rather than refused -- and trimmed here, where nwarp is
+		 * known, rather than left for the kernel to clamp, because clamping an
+		 * out-of-range index is how an out-of-bounds read becomes a wrong
+		 * answer instead of an error.
+		 */
+		if ((uint64) hdr->firstwarp >= (uint64) nwarp)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("weave vector code block starts outside the segment"),
+					 errdetail("Block header claims warp %u, but the segment "
+							   "has only %u warps.",
+							   (unsigned) hdr->firstwarp, (unsigned) nwarp)));
+		if ((uint64) nwarp - (uint64) hdr->firstwarp < (uint64) WEAVE_VEC_BLOCK)
+			nlanes = (int) (nwarp - hdr->firstwarp);
+	}
+
 	memset(&blk, 0, sizeof(blk));
 	blk.lut = lut;
-	blk.layout = WEAVE_PACK_LANE;
+	blk.layout = layout;
 	blk.codes = codes;
 	blk.scales = &lanes[0].scale;
 	blk.scalestride = (int) (sizeof(WeaveVecLane) / sizeof(float4));
-	blk.nlanes = WEAVE_VEC_BLOCK;
+	blk.nlanes = nlanes;
 	blk.livemask = hdr->livemask;
 	blk.firstwarp = hdr->firstwarp;
 	blk.allow = allow;
+	blk.nwarp = nwarp;
 
 	n = vec_core->score_block(&blk, out);
 	if (n < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("weave vector code block is inconsistent"),
-				 errdetail("dim %d, %d levels: not a geometry this index can "
-						   "have written.", lut->dim, lut->nlevels)));
+				 errdetail("dim %d, %d levels, pack layout %d: not a geometry "
+						   "this index can have written.",
+						   lut->dim, lut->nlevels, (int) layout)));
 	return n;
 }
 

@@ -258,16 +258,33 @@ typedef struct WeaveVecKernelOps
 {
 	const char *name;			/* "avx512vnni", "neon-sdot", "scalar", ... */
 
-	/* Score up to WEAVE_VEC_BLOCK lanes of one block against a prepared query
-	 * table.  `allow` is a warp-indexed bitmap or NULL; lanes whose warp bit is
-	 * clear must be skipped without being scored.  Returns the number of scores
-	 * written, and writes WEAVE_SCORE_NEVER for skipped lanes so the caller's
-	 * indexing stays positional. */
+	/*
+	 * Score up to WEAVE_VEC_BLOCK lanes of one block against a prepared query
+	 * table.  Returns the number of scores written, and writes
+	 * WEAVE_SCORE_NEVER for skipped lanes so the caller's indexing stays
+	 * positional.
+	 *
+	 * `layout` is the pack layout recorded in this segment's WeaveVecMeta, and
+	 * it is a parameter rather than an assumption because a scorer that guesses
+	 * it wrong does not fail, it returns wrong distances (src/vector/pack.c,
+	 * doc/specs/VECTOR_CHANNEL.md sect. 7).  Callers pass the segment's value;
+	 * they do not pass a constant.
+	 *
+	 * `allow` is a warp-indexed bitmap of `nwarp` warps, or NULL meaning
+	 * "everything is allowed" -- which is not the same as an all-zero bitmap.
+	 * Lanes whose warp bit is clear must be skipped without being scored.
+	 * `nwarp` is mandatory when `allow` is non-NULL: lane s of the block sits at
+	 * warp hdr->firstwarp + s, hdr->firstwarp comes off a page, and an untrusted
+	 * index into a bitmap with no length is an unbounded out-of-bounds read.
+	 * A block whose lanes fall outside [0, nwarp) is a corrupt page and raises.
+	 */
 	int			(*score_block) (const WeaveQueryLut *lut,
+								WeavePackLayout layout,
 								const WeaveVecBlockHdr *hdr,
 								const uint8 *codes,
 								const WeaveVecLane *lanes,
 								const uint64 *allow,
+								WeaveWarp nwarp,
 								float4 *out);
 
 	/* Rotation, which must be bit-identical to the scalar reference in

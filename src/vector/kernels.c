@@ -106,6 +106,13 @@ bits_from_nlevels(int nlevels)
  * most two 64-bit words and is extracted with one shift.  A NULL allowlist means
  * "everything is allowed" -- the unfiltered scan -- and must not be confused with
  * an all-zero bitmap, which means the opposite.
+ *
+ * The second word is addressed from firstwarp + nlanes - 1 and NOT from
+ * firstwarp + WEAVE_VEC_BLOCK - 1: block_bits() has already established that
+ * warp firstwarp + nlanes - 1 is inside the bitmap, whereas a short block at the
+ * end of a weft can have firstwarp + WEAVE_VEC_BLOCK past its end.  Bits above
+ * nlanes are trimmed off `m` before the allowlist is consulted, so reading fewer
+ * words loses nothing.
  */
 static inline weave_uint32
 lane_avail_mask(const WeaveScoreBlock *blk)
@@ -118,7 +125,7 @@ lane_avail_mask(const WeaveScoreBlock *blk)
 	if (blk->allow != NULL)
 	{
 		size_t		w0 = (size_t) (blk->firstwarp >> 6);
-		size_t		w1 = (size_t) ((blk->firstwarp + WEAVE_VEC_BLOCK - 1) >> 6);
+		size_t		w1 = (size_t) ((blk->firstwarp + (weave_uint32) blk->nlanes - 1) >> 6);
 		int			off = (int) (blk->firstwarp & 63);
 		weave_uint64 a = blk->allow[w0] >> off;
 
@@ -129,7 +136,23 @@ lane_avail_mask(const WeaveScoreBlock *blk)
 	return m;
 }
 
-/* Validate what came off the page before indexing anything with it. */
+/*
+ * Validate what came off the page before indexing anything with it.
+ *
+ * Returns the code width, or -1 for a description no valid page can have
+ * produced.  Three of these checks are about untrusted numbers reaching an
+ * index rather than about arithmetic:
+ *
+ *	 - `layout` selects a bit-addressing scheme.  pack.c: a reader that guesses
+ *	   the layout wrong "does not fail, it returns wrong distances".  An
+ *	   out-of-range enum value must therefore be an error and not a default.
+ *	 - `firstwarp` indexes `allow`, and `firstwarp` comes off a block header.
+ *	   Without nwarp there is nothing to compare it against and a corrupt header
+ *	   is an unbounded out-of-bounds read; with it, the block is rejected.  The
+ *	   comparison is done in 64 bits so that a firstwarp near UINT32_MAX cannot
+ *	   wrap into a passing value.
+ *	 - `nlanes` and `scalestride` bound the two other indexed arrays.
+ */
 static inline int
 block_bits(const WeaveScoreBlock *blk)
 {
@@ -142,6 +165,12 @@ block_bits(const WeaveScoreBlock *blk)
 	if (blk->nlanes < 1 || blk->nlanes > WEAVE_VEC_BLOCK)
 		return -1;
 	if (blk->scalestride < 1)
+		return -1;
+	if (blk->layout != WEAVE_PACK_LANE && blk->layout != WEAVE_PACK_VECMAJOR)
+		return -1;
+	if (blk->allow != NULL &&
+		(weave_uint64) blk->firstwarp + (weave_uint64) blk->nlanes >
+		(weave_uint64) blk->nwarp)
 		return -1;
 	bits = bits_from_nlevels(blk->lut->nlevels);
 	if (bits < WEAVE_BITS_MIN || bits > WEAVE_BITS_MAX)
@@ -169,10 +198,19 @@ fill_never(float *out, int from, int to)
  * writing WEAVE_SCORE_NEVER for lanes that are dead or masked out so the
  * caller's indexing stays positional.
  *
- * `allow` is a warp-indexed bitmap or NULL.  A masked lane must be SKIPPED, not
- * scored and discarded: skipping is the mechanism by which a selective predicate
- * makes this channel faster rather than slower (doc/specs/VECTOR_CHANNEL.md
- * sect. 9).
+ * `allow` is a warp-indexed bitmap of blk->nwarp warps, or NULL.  A masked lane
+ * must be SKIPPED, not scored and discarded: skipping is the mechanism by which a
+ * selective predicate makes this channel faster rather than slower
+ * (doc/specs/VECTOR_CHANNEL.md sect. 9).
+ *
+ * SKIP GRANULARITY: one lane.  The oracle unpacks lane by lane, so it can skip
+ * lane by lane, and it is therefore the strictest possible statement of what the
+ * masking is allowed to save.  The fast paths below skip in groups of 8 and are
+ * consequently allowed to do arithmetic for a masked lane whose group has any
+ * live-and-allowed member; that difference is invisible in the OUTPUT (the
+ * sentinel is written either way, which is what the differential test compares)
+ * and visible only in the work done, which is why it is written down at each
+ * path rather than left to be inferred.
  *
  * It reaches the codes ONLY through weave_unpack_lane() and scores them only
  * through weave_lut_score_code(), which is what makes it a trustworthy oracle:
@@ -240,6 +278,21 @@ const WeaveScoreKernel weave_score_kernel_scalar = {
  * reads it back through weave_unpack_lane(), so a layout change that this file
  * failed to follow fails the test rather than silently returning wrong
  * distances.
+ *
+ * AND THE CONSEQUENCE FOR FILTERING, which is worth stating explicitly because
+ * it is the mechanism doc/specs/VECTOR_CHANNEL.md sect. 9 -- and the project
+ * thesis -- rests on: the group is also the unit of SKIPPING.  These paths test
+ * the 8 avail bits of a group and skip the whole group when none is set; the
+ * oracle tests one lane at a time.  So a 1-in-8-selective filter saves the
+ * oracle 7/8 of the scoring work and may save these paths nothing at all, while
+ * a filter selective enough to empty whole groups (or whole blocks, which is the
+ * case the shuttle short-circuits before it gets here) saves them the same
+ * proportion.  Finer masking inside a group is possible -- gather anyway, then
+ * blend -- but it costs the same gathers, so the work saved would be the adds
+ * only.  Nothing here is measured; bench/kernels.c is owed (doc/PHASES.md V6)
+ * and it is the thing that should decide whether per-lane masking inside a group
+ * is worth writing.  The output is identical either way, which is why the
+ * differential test cannot answer this question and why this note exists.
  * ------------------------------------------------------------------------- */
 
 #define LANE_ROW_BYTES(bits)	((size_t) (WEAVE_VEC_BLOCK * (bits)) / 8)
@@ -339,11 +392,13 @@ weave_score_block_wide(const WeaveScoreBlock *blk, float *out)
 		return -1;
 
 	/*
-	 * VECMAJOR packs a lane's coordinates contiguously and, when dim * bits is
-	 * not a multiple of 8, starts each lane mid-byte.  The wide and vector paths
-	 * are built on the LANE layout's byte-aligned lane groups, so a VECMAJOR
-	 * block goes to the oracle rather than to a second, less-tested addressing
-	 * scheme.  int8-dot kernels are what that layout is for, and none exists.
+	 * DECLINE, rather than assume.  VECMAJOR packs a lane's coordinates
+	 * contiguously and, when dim * bits is not a multiple of 8, starts each lane
+	 * mid-byte.  The wide and vector paths are built on the LANE layout's
+	 * byte-aligned lane groups, so a VECMAJOR block goes to the oracle -- which
+	 * reaches codes only through the pack API and so handles either layout --
+	 * rather than to a second, less-tested addressing scheme here.  int8-dot
+	 * kernels are what VECMAJOR is for, and none exists.
 	 */
 	if (blk->layout != WEAVE_PACK_LANE)
 		return weave_score_block_scalar(blk, out);
@@ -364,8 +419,10 @@ weave_score_block_wide(const WeaveScoreBlock *blk, float *out)
 			break;
 		if (((avail >> (g * 8)) & 0xFFu) == 0)
 		{
-			/* Whole group masked out or dead: skipped, not scored and
-			 * discarded. */
+			/* Whole group masked out or dead: skipped, not scored and discarded.
+			 * 8 LANES is this path's skip granularity, versus the oracle's 1 --
+			 * see the group-addressing note above for why, and for what that
+			 * costs a filter that is selective but scattered. */
 			fill_never(out, g * 8,
 					   (g * 8 + 8 < blk->nlanes) ? g * 8 + 8 : blk->nlanes);
 			continue;
@@ -468,6 +525,10 @@ weave_score_block_avx2(const WeaveScoreBlock *blk, float *out)
 
 	if (bits < 0)
 		return -1;
+
+	/* Declined explicitly, for the reason spelled out in
+	 * weave_score_block_wide(): this path assumes the LANE layout's byte-aligned
+	 * 8-lane groups, and the oracle is the one that reads either layout. */
 	if (blk->layout != WEAVE_PACK_LANE)
 		return weave_score_block_scalar(blk, out);
 
@@ -486,6 +547,8 @@ weave_score_block_avx2(const WeaveScoreBlock *blk, float *out)
 			break;
 		if (((avail >> (g * 8)) & 0xFFu) == 0)
 		{
+			/* Skipped at 8-lane granularity, as in lut-wide: no gather is issued
+			 * for a group with no live-and-allowed lane. */
 			fill_never(out, g * 8,
 					   (g * 8 + 8 < blk->nlanes) ? g * 8 + 8 : blk->nlanes);
 			continue;
