@@ -487,7 +487,6 @@ add_posting(WeaveBuildState *bs, const char *term, int len,
 
 /* forward decls: segment writers are defined later; the build flush uses them */
 static void weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg);
-static void weave_meta_from_page(Page page, WeaveMetaPageData *out);
 static void weave_meta_upcast_page(Page page);
 static bool weave_meta_add_segment(Relation index, const WeaveSegMeta *seg);
 static void weave_add_segment_with_room(Relation index, const WeaveSegMeta *seg);
@@ -1329,21 +1328,94 @@ weave_new_buffer(Relation index)
 	return buffer;
 }
 
+/*
+ * Initialize a fresh page as `kind`.
+ *
+ * Takes a WeavePageKind, not a raw flag word, on purpose: since v6 the kind is
+ * not always a bit (see the escape-bit rationale in weave/am.h), so the encoding
+ * must happen in exactly one place.  A caller that passed WEAVE_VMETA as a
+ * bitmask would silently produce a page with reserved bits set and no kind.
+ */
 static void
-weave_init_page(Page page, uint16 flags)
+weave_init_page(Page page, WeavePageKind kind)
 {
 	WeavePageOpaque opaque;
 
+	Assert(weave_page_kind_legacy_bit(kind) != 0 ||
+		   (kind >= WEAVE_PK_EXT_FIRST && kind < WEAVE_PK_NKINDS));
+
 	PageInit(page, BLCKSZ, sizeof(WeavePageOpaqueData));
 	opaque = WeavePageGetOpaque(page);
-	opaque->flags = flags;
+	/* One of the ten shipped kinds keeps writing the legacy one-hot bitmap, so a
+	 * v6-written lexical page is byte-identical to a v5-written one; only a new
+	 * kind uses the escape bit.  weave/pagekind.h owns that choice. */
+	weave_page_kind_encode(kind, &opaque->flags, &opaque->kind);
 	opaque->nextblk = InvalidBlockNumber;
 	/* start item area at the (MAXALIGN'd) contents offset used by readers */
 	((PageHeader) page)->pd_lower = (char *) PageGetContents(page) - (char *) page;
 }
 
 /*
- * Version-aware metapage read (the 1.5.0 dual-read fix).
+ * Human-readable page-kind name, for weave_index_size_detail() and for
+ * weave_check()'s corruption reports.  Non-static because amsize.c is a separate
+ * translation unit (AGENTS.md rule 5 keeps it out of the am.c unity build) and
+ * duplicating this table there is how the two drift apart.
+ */
+const char *
+weave_page_kind_name(WeavePageKind kind)
+{
+	switch (kind)
+	{
+		case WEAVE_PK_UNKNOWN:
+			return "unclassified";
+		case WEAVE_PK_META:
+			return "meta";
+		case WEAVE_PK_DICT:
+			return "dictionary";
+		case WEAVE_PK_POSTING:
+			return "postings";
+		case WEAVE_PK_PENDING:
+			return "pending";
+		case WEAVE_PK_TRGM:
+			return "trigram_dir";
+		case WEAVE_PK_TRGM_DATA:
+			return "trigram_data";
+		case WEAVE_PK_LIVEDOCS:
+			return "livedocs";
+		case WEAVE_PK_DICTINDEX:
+			return "dict_index";
+		case WEAVE_PK_DOCLEN:
+			return "doclen_sidecar";
+		case WEAVE_PK_CHANDESC:
+			return "chandesc";
+		case WEAVE_PK_VMETA:
+			return "vector_meta";
+		case WEAVE_PK_VCODES:
+			return "vector_codes";
+		case WEAVE_PK_VGRAPH:
+			return "vector_graph";
+		case WEAVE_PK_VRERANK:
+			return "vector_rerank";
+		case WEAVE_PK_SURF:
+			return "surf_trie";
+		case WEAVE_PK_ULEV:
+			return "uleven_aux";
+		case WEAVE_PK_REGEX:
+			return "regex_cache";
+		case WEAVE_PK_FUZZY_SPARE:
+			return "fuzzy_spare";
+		case WEAVE_PK_DOCVALS:
+			return "docvalues";
+		case WEAVE_PK_CGRAM:
+			return "corpus_trigram";
+		case WEAVE_PK_NKINDS:
+			break;
+	}
+	return "unclassified";
+}
+
+/*
+ * Version-aware metapage read (the 1.5.0 dual-read fix, extended for v6).
  *
  * 1.5.0 added BlockNumber doclenstart to WeaveSegMeta, which GREW the struct
  * (v3 48 bytes -> v4 56 bytes with padding).  WeaveSegMeta is stored INLINE in
@@ -1353,11 +1425,21 @@ weave_init_page(Page page, uint16 flags)
  * generation from the wrong offsets -> garbage livedocslen (palloc(-1)) and
  * garbage dictstart (wild block seek): the two upgrade regressions.
  *
- * This deserializes EITHER version into an in-memory v4 WeaveMetaPageData.  For
- * a v3 page it copies the fixed head, then expands each v3-stride segmeta into
- * the v4 struct and sets doclenstart = InvalidBlockNumber (segment carries
- * inline doclen), and reads `generation` from the v3 offset.  A v4 page is a
- * straight copy.  ALL readers use this instead of casting the page directly.
+ * v6 adds BlockNumber chandesc.  It lands in the four bytes of TAIL PADDING the
+ * v4/v5 struct already had (offset 52; sizeof stays 56), so unlike doclenstart it
+ * does NOT change the segs[] stride and does not move `generation`.  That was
+ * worth checking rather than assuming -- doc/specs/SEGMENT_FORMAT.md sect. 6
+ * predicted a stride change -- and it is asserted below so a future field that
+ * does not fit the padding fails the build instead of silently re-striding.
+ *
+ * A v3/v4/v5 page's chandesc bytes are padding and MUST NOT be trusted even
+ * though every historical writer zeroed them, so the reader overwrites the field
+ * with InvalidBlockNumber ("lexical only") for any version < 6.  That is the
+ * whole of the v6 upgrade path for existing indexes: no page rewrite, and each
+ * bolt is still read according to its own descriptor.
+ *
+ * This deserializes ANY supported version into an in-memory v6
+ * WeaveMetaPageData.  ALL readers use this instead of casting the page directly.
  */
 typedef struct WeaveSegMetaV3
 {
@@ -1388,14 +1470,51 @@ typedef struct WeaveMetaPageDataV3
 	uint32		generation;
 } WeaveMetaPageDataV3;
 
-static void
+/*
+ * The v4/v5 bolt descriptor and metapage, i.e. WeaveSegMeta/WeaveMetaPageData
+ * as they were before `chandesc`.  Spelled out rather than inferred from the
+ * live struct so that (a) the reader below is written against the OLD layout
+ * explicitly, field by field, and (b) the static asserts have something to
+ * compare against.  Keeping these even though the stride happens not to have
+ * moved is the point: the next field added to WeaveSegMeta will not fit the
+ * padding, and at that moment this reader is already correct.
+ */
+typedef struct WeaveSegMetaV5
+{
+	BlockNumber dictstart;
+	BlockNumber trgmstart;
+	BlockNumber livedocs;
+	double		ndocs;
+	double		sumdoclen;
+	uint32		nterms;
+	uint32		ndeleted;
+	uint32		livedocslen;
+	BlockNumber dictindexstart;
+	BlockNumber doclenstart;
+} WeaveSegMetaV5;
+
+typedef struct WeaveMetaPageDataV5
+{
+	uint32		magic;
+	uint32		version;
+	double		ndocs;
+	double		sumdoclen;
+	uint32		nsegments;
+	BlockNumber pendinghead;
+	BlockNumber pendingtail;
+	uint32		npending;
+	WeaveSegMetaV5 segs[WEAVE_MAX_SEGMENTS];
+	uint32		generation;
+} WeaveMetaPageDataV5;
+
+void
 weave_meta_from_page(Page page, WeaveMetaPageData *out)
 {
 	const WeaveMetaPageData *raw = WeavePageGetMeta(page);
 
 	/*
 	 * Layout contract (the 1.5.0 dual-read fix): the v3 read-struct and the
-	 * live v4 struct MUST agree on every field up to and including segs[0], so a
+	 * live struct MUST agree on every field up to and including segs[0], so a
 	 * v3 metapage's head + first segment are read at identical offsets; only the
 	 * segs[] STRIDE (48 vs 56 bytes) and the position of `generation` differ,
 	 * which weave_meta_from_page handles explicitly.  These asserts fail the build
@@ -1406,12 +1525,53 @@ weave_meta_from_page(Page page, WeaveMetaPageData *out)
 	StaticAssertStmt(offsetof(WeaveSegMetaV3, dictindexstart) == offsetof(WeaveSegMeta, dictindexstart),
 					 "v3/v4 segmeta head layout diverged");
 
-	if (raw->version >= WEAVE_VERSION_DOCLEN_SIDECAR)
+	/*
+	 * v5 -> v6 contract.  chandesc must sit in the old tail padding, so the
+	 * stride, the segs[] offset and the generation offset are all unchanged and a
+	 * v5 metapage needs no re-striding.  If any of these ever fails, the v5 branch
+	 * below must switch from a whole-struct memcpy to a per-segment expansion --
+	 * which is exactly the shape the v3 branch already has, so copy that.
+	 */
+	StaticAssertStmt(sizeof(WeaveSegMetaV5) == sizeof(WeaveSegMeta),
+					 "v6 chandesc changed the segs[] stride: expand segs[] per-segment");
+	StaticAssertStmt(offsetof(WeaveMetaPageDataV5, segs) == offsetof(WeaveMetaPageData, segs),
+					 "v5/v6 metapage head layout diverged");
+	StaticAssertStmt(offsetof(WeaveMetaPageDataV5, generation) == offsetof(WeaveMetaPageData, generation),
+					 "v6 chandesc moved `generation`: pre-v6 metapages need re-striding");
+	StaticAssertStmt(offsetof(WeaveSegMetaV5, doclenstart) == offsetof(WeaveSegMeta, doclenstart),
+					 "v5/v6 segmeta head layout diverged");
+	StaticAssertStmt(offsetof(WeaveSegMeta, chandesc) == sizeof(WeaveSegMetaV5) - sizeof(BlockNumber),
+					 "chandesc is not in the v5 tail padding");
+
+	if (raw->version >= WEAVE_VERSION_CHANDESC)
 	{
 		memcpy(out, raw, sizeof(WeaveMetaPageData));
 		return;
 	}
-	/* v3 page: expand v3-stride segs[] into the v4 in-memory struct */
+
+	if (raw->version >= WEAVE_VERSION_DOCLEN_SIDECAR)
+	{
+		/*
+		 * v4/v5 page.  The stride is identical (asserted above), so the head and
+		 * every segs[] field through doclenstart come across in one memcpy; only
+		 * chandesc has to be synthesized, because on such a page those four bytes
+		 * are padding.  The cast to the V5 struct is what makes that statement
+		 * checkable rather than a comment.
+		 */
+		const WeaveMetaPageDataV5 *v5 PG_USED_FOR_ASSERTS_ONLY =
+			(const WeaveMetaPageDataV5 *) raw;
+		uint32		s;
+
+		memcpy(out, raw, sizeof(WeaveMetaPageData));
+		for (s = 0; s < WEAVE_MAX_SEGMENTS; s++)
+		{
+			Assert(out->segs[s].doclenstart == v5->segs[s].doclenstart);
+			out->segs[s].chandesc = InvalidBlockNumber; /* lexical only */
+		}
+		return;
+	}
+
+	/* v3 page: expand v3-stride segs[] into the current in-memory struct */
 	{
 		const WeaveMetaPageDataV3 *v3 = (const WeaveMetaPageDataV3 *) raw;
 		uint32		s;
@@ -1426,6 +1586,11 @@ weave_meta_from_page(Page page, WeaveMetaPageData *out)
 		out->pendingtail = v3->pendingtail;
 		out->npending = v3->npending;
 		out->generation = v3->generation;
+		for (s = 0; s < WEAVE_MAX_SEGMENTS; s++)
+		{
+			out->segs[s].doclenstart = InvalidBlockNumber;
+			out->segs[s].chandesc = InvalidBlockNumber;
+		}
 		for (s = 0; s < v3->nsegments && s < WEAVE_MAX_SEGMENTS; s++)
 		{
 			out->segs[s].dictstart = v3->segs[s].dictstart;
@@ -1438,17 +1603,24 @@ weave_meta_from_page(Page page, WeaveMetaPageData *out)
 			out->segs[s].livedocslen = v3->segs[s].livedocslen;
 			out->segs[s].dictindexstart = v3->segs[s].dictindexstart;
 			out->segs[s].doclenstart = InvalidBlockNumber;	/* v3: inline doclen */
+			out->segs[s].chandesc = InvalidBlockNumber; /* v3: lexical only */
 		}
 	}
 }
 
 /*
- * Upcast a v3 metapage to the v4 in-place layout under the caller's exclusive
- * lock, via GenericXLog, so subsequent in-place struct writes are correct.
- * Idempotent: a no-op if the page is already v4.  MUST be called (under the
- * metapage's exclusive lock, before read-modify-writing it) by every path that
- * mutates the metapage in place (add-segment, merge, bulkdelete livedocs swap).
- * `page` is a GenericXLog-registered writable copy.
+ * Upcast a pre-v6 metapage to the current in-place layout under the caller's
+ * exclusive lock, via GenericXLog, so subsequent in-place struct writes are
+ * correct.  Idempotent: a no-op if the page is already current.  MUST be called
+ * (under the metapage's exclusive lock, before read-modify-writing it) by every
+ * path that mutates the metapage in place (add-segment, merge, bulkdelete
+ * livedocs swap).  `page` is a GenericXLog-registered writable copy.
+ *
+ * For a v4/v5 page this rewrites nothing but the version word and the per-segment
+ * chandesc (Invalid), because the stride did not move -- but it must still run,
+ * or a v4/v5 metapage's padding bytes would be left as the chandesc of every
+ * bolt and a merge would then write a real chandesc into a directory whose other
+ * entries still hold padding.
  */
 static void
 weave_meta_upcast_page(Page page)
@@ -1456,10 +1628,10 @@ weave_meta_upcast_page(Page page)
 	WeaveMetaPageData tmp;
 	WeaveMetaPageData *m;
 
-	if (WeavePageGetMeta(page)->version >= WEAVE_VERSION_DOCLEN_SIDECAR)
+	if (WeavePageGetMeta(page)->version >= WEAVE_VERSION_CHANDESC)
 		return;
 
-	weave_meta_from_page(page, &tmp);	/* read v3 into a v4-shaped temp */
+	weave_meta_from_page(page, &tmp);	/* read old into a current-shaped temp */
 	tmp.version = WEAVE_VERSION;
 	m = WeavePageGetMeta(page);
 	MemSet(m, 0, sizeof(WeaveMetaPageData));
@@ -1481,7 +1653,7 @@ weave_init_metapage(Relation index)
 
 	state = GenericXLogStart(index);
 	page = GenericXLogRegisterBuffer(state, buffer, GENERIC_XLOG_FULL_IMAGE);
-	weave_init_page(page, WEAVE_META);
+	weave_init_page(page, WEAVE_PK_META);
 	meta = WeavePageGetMeta(page);
 	MemSet(meta, 0, sizeof(WeaveMetaPageData));
 	meta->magic = WEAVE_MAGIC;
@@ -1507,7 +1679,7 @@ weave_init_metapage(Relation index)
  * mismatch raises a clear, actionable error rather than silently misreading
  * bytes.
  */
-static void
+void
 weave_check_meta(Page page, Relation index)
 {
 	WeaveMetaPageData *meta = WeavePageGetMeta(page);
@@ -1979,7 +2151,7 @@ weave_write_postings(WeavePostWriter *pw, BuildTerm *bt,
 				pw->buffer = next;
 				pw->state = GenericXLogStart(index);
 				pw->page = GenericXLogRegisterBuffer(pw->state, pw->buffer, GENERIC_XLOG_FULL_IMAGE);
-				weave_init_page(pw->page, WEAVE_POSTING);
+				weave_init_page(pw->page, WEAVE_PK_POSTING);
 			}
 		}
 		if (pw->buffer == InvalidBuffer)
@@ -1987,7 +2159,7 @@ weave_write_postings(WeavePostWriter *pw, BuildTerm *bt,
 			pw->buffer = weave_new_buffer(index);
 			pw->state = GenericXLogStart(index);
 			pw->page = GenericXLogRegisterBuffer(pw->state, pw->buffer, GENERIC_XLOG_FULL_IMAGE);
-			weave_init_page(pw->page, WEAVE_POSTING);
+			weave_init_page(pw->page, WEAVE_PK_POSTING);
 		}
 
 		/* record the term's start at its first block */
@@ -2096,7 +2268,7 @@ weave_write_doclen_sidecar(Relation index, DoclenCollector *c)
 				pw.buffer = next;
 				pw.state = GenericXLogStart(index);
 				pw.page = GenericXLogRegisterBuffer(pw.state, pw.buffer, GENERIC_XLOG_FULL_IMAGE);
-				weave_init_page(pw.page, WEAVE_DOCLEN);
+				weave_init_page(pw.page, WEAVE_PK_DOCLEN);
 			}
 		}
 		if (pw.buffer == InvalidBuffer)
@@ -2104,7 +2276,7 @@ weave_write_doclen_sidecar(Relation index, DoclenCollector *c)
 			pw.buffer = weave_new_buffer(index);
 			pw.state = GenericXLogStart(index);
 			pw.page = GenericXLogRegisterBuffer(pw.state, pw.buffer, GENERIC_XLOG_FULL_IMAGE);
-			weave_init_page(pw.page, WEAVE_DOCLEN);
+			weave_init_page(pw.page, WEAVE_PK_DOCLEN);
 		}
 		if (!start_recorded)
 		{
@@ -2182,7 +2354,7 @@ weave_doclens_load(Relation index, BlockNumber doclenstart, WeaveDoclens *d)
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		if (PageIsNew(page) ||
-			!(WeavePageGetOpaque(page)->flags & WEAVE_DOCLEN))
+			!WeavePageHasKind(page, WEAVE_PK_DOCLEN))
 		{
 			UnlockReleaseBuffer(buf);
 			break;
@@ -2459,7 +2631,7 @@ weave_doclendir_scan_seg(Relation index, BlockNumber start,
 		buf = ReadBuffer(index, b);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		if (PageIsNew(page) || !(WeavePageGetOpaque(page)->flags & WEAVE_DOCLEN))
+		if (PageIsNew(page) || !WeavePageHasKind(page, WEAVE_PK_DOCLEN))
 		{
 			UnlockReleaseBuffer(buf);
 			break;
@@ -2513,7 +2685,7 @@ weave_doclendir_count_seg(Relation index, BlockNumber start)
 		buf = ReadBuffer(index, b);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		if (PageIsNew(page) || !(WeavePageGetOpaque(page)->flags & WEAVE_DOCLEN))
+		if (PageIsNew(page) || !WeavePageHasKind(page, WEAVE_PK_DOCLEN))
 		{
 			UnlockReleaseBuffer(buf);
 			break;
@@ -2826,7 +2998,7 @@ weave_doclen_cursor_load_page(WeaveDoclenCursor *c, BlockNumber blkno, uint64 do
 	buf = ReadBuffer(c->index, blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-	if (PageIsNew(page) || !(WeavePageGetOpaque(page)->flags & WEAVE_DOCLEN))
+	if (PageIsNew(page) || !WeavePageHasKind(page, WEAVE_PK_DOCLEN))
 	{
 		UnlockReleaseBuffer(buf);
 		return;
@@ -3071,7 +3243,7 @@ weave_write_dictionary_iter(Relation index, DictNextFn next, void *nstate,
 			buffer = nextbuf;
 			state = GenericXLogStart(index);
 			page = GenericXLogRegisterBuffer(state, buffer, GENERIC_XLOG_FULL_IMAGE);
-			weave_init_page(page, WEAVE_DICT);
+			weave_init_page(page, WEAVE_PK_DICT);
 			newpage = true;
 		}
 
@@ -3147,7 +3319,7 @@ weave_write_dictionary_iter(Relation index, DictNextFn next, void *nstate,
 				ib = nextbuf;
 				istate = GenericXLogStart(index);
 				ip = GenericXLogRegisterBuffer(istate, ib, GENERIC_XLOG_FULL_IMAGE);
-				weave_init_page(ip, WEAVE_DICTINDEX);
+				weave_init_page(ip, WEAVE_PK_DICTINDEX);
 			}
 			dst = (char *) ip + ((PageHeader) ip)->pd_lower;
 			ie = (WeaveDictIndexEntry *) dst;
@@ -3258,6 +3430,183 @@ static BlockNumber weave_write_trigrams_iter(Relation index, DictNextFn next,
 static BlockNumber weave_write_blob(Relation index, const uint8 *data, Size len);
 static uint8 *weave_read_blob(Relation index, BlockNumber blk, Size len);
 
+/* ---------------------------------------------------------------------------
+ * WEAVE_CHANDESC: the per-bolt weft descriptor page (v6)
+ *
+ * One page per bolt, holding a WeaveChanDescPageData header plus a
+ * (kind, attnum)-ascending array of WeaveChannelDesc.  It answers "which wefts
+ * does this bolt carry, and where does each start" from the bolt itself, so an
+ * index built without a vector column stores no vector structures at all and a
+ * reader never derives a weft's geometry from a GUC that may have changed since
+ * the build (doc/specs/SEGMENT_FORMAT.md sect. 6).
+ *
+ * WHY THE ROOTS ARE STORED, NOT COMPUTED.  SEGMENT_FORMAT.md sect. 8 item 5
+ * records that a sibling project has now four times shipped a bug where a
+ * running chain-offset sum omitted one count field and one chain was written
+ * over another's data.  The structural defence taken here is that a weft's root
+ * is an EXPLICIT BlockNumber written by the code that allocated the chain -- there
+ * is no running sum to omit a term from.  The residual risk, two descriptors
+ * naming the same root, is checked by weave_chandesc_check() on every read and
+ * again by weave_check() over the whole relation.
+ * ------------------------------------------------------------------------- */
+
+static BlockNumber
+weave_write_chandesc(Relation index, const WeaveChannelDesc *weft, int nweft)
+{
+	Buffer		buffer;
+	GenericXLogState *state;
+	Page		page;
+	WeaveChanDescPageData *cd;
+	BlockNumber blk;
+
+	Assert(nweft >= 1 && nweft <= WEAVE_MAX_WEFTS);
+
+	buffer = weave_new_buffer(index);
+	blk = BufferGetBlockNumber(buffer);
+	state = GenericXLogStart(index);
+	page = GenericXLogRegisterBuffer(state, buffer, GENERIC_XLOG_FULL_IMAGE);
+	weave_init_page(page, WEAVE_PK_CHANDESC);
+
+	cd = WeavePageGetChanDesc(page);
+	MemSet(cd, 0, offsetof(WeaveChanDescPageData, weft));
+	cd->magic = WEAVE_CHANDESC_MAGIC;
+	cd->version = WEAVE_CHANDESC_VERSION;
+	cd->nweft = (uint16) nweft;
+	cd->reserved = 0;
+	memcpy(cd->weft, weft, (Size) nweft * sizeof(WeaveChannelDesc));
+	((PageHeader) page)->pd_lower =
+		((char *) cd->weft + (Size) nweft * sizeof(WeaveChannelDesc)) - (char *) page;
+
+	GenericXLogFinish(state);
+	UnlockReleaseBuffer(buffer);
+	return blk;
+}
+
+/*
+ * Read and VALIDATE a bolt's descriptor page into out[max].  Returns WEAVE_CD_OK
+ * and sets *nweft_out on success; on any failure returns the specific error and
+ * sets *nweft_out to 0.
+ *
+ * NEVER THROWS, on purpose.  The read path must refuse to use a corrupt
+ * descriptor page -- weave_chandesc_required() in weave/am.h turns any error into
+ * an ERROR with the errdetail, which is the "a corrupt page produces a clean
+ * ERROR" half of doc/CONVENTIONS.md decision 2 -- but weave_check() must REPORT a
+ * corrupt page as a violated invariant and carry on to the remaining invariants,
+ * and doing that with PG_CATCH around a throwing reader means catching an error
+ * without a subtransaction.  Returning a code is the better trade.
+ *
+ * The validation body itself is weave_chandesc_check() in weave/chandesc.h, which
+ * is backend-independent so test/fuzz/fuzz_chandesc.c and
+ * test/hegel/test_chandesc.c hammer the exact code this path runs.
+ */
+WeaveCdError
+weave_read_chandesc(Relation index, BlockNumber blk,
+					WeaveChannelDesc *out, int max, int *nweft_out)
+{
+	Buffer		buffer;
+	Page		page;
+	WeaveCdError err;
+	uint16		nweft = 0;
+	BlockNumber nblocks;
+	Size		avail;
+	int			n;
+
+	/* Layout contract with the pure validator.  These are the guard; the comment
+	 * in weave/chandesc.h is not. */
+	StaticAssertStmt(sizeof(WeaveCdDesc) == sizeof(WeaveChannelDesc),
+					 "WeaveCdDesc and WeaveChannelDesc layouts diverged");
+	StaticAssertStmt(sizeof(WeaveCdPage) == offsetof(WeaveChanDescPageData, weft),
+					 "WeaveCdPage and WeaveChanDescPageData headers diverged");
+	StaticAssertStmt(offsetof(WeaveCdDesc, root) == offsetof(WeaveChannelDesc, root),
+					 "WeaveCdDesc.root offset diverged");
+	StaticAssertStmt(WEAVE_CD_INVALID_BLK == InvalidBlockNumber,
+					 "WEAVE_CD_INVALID_BLK != InvalidBlockNumber");
+
+	if (nweft_out != NULL)
+		*nweft_out = 0;
+
+	nblocks = RelationGetNumberOfBlocks(index);
+	if (blk == InvalidBlockNumber || blk == WEAVE_METAPAGE_BLKNO || blk >= nblocks)
+		return WEAVE_CD_BLKRANGE;
+
+	buffer = ReadBuffer(index, blk);
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buffer);
+
+	if (PageIsNew(page))
+	{
+		UnlockReleaseBuffer(buffer);
+		return WEAVE_CD_PAGENEW;
+	}
+	if (!WeavePageHasKind(page, WEAVE_PK_CHANDESC))
+	{
+		UnlockReleaseBuffer(buffer);
+		return WEAVE_CD_PAGEKIND;
+	}
+
+	/* pd_lower bounds what the writer actually wrote; never read past it, and
+	 * never trust it to be sane either (a torn header can make it small). */
+	avail = 0;
+	if (((PageHeader) page)->pd_lower >=
+		(char *) PageGetContents(page) - (char *) page)
+		avail = ((PageHeader) page)->pd_lower -
+			((char *) PageGetContents(page) - (char *) page);
+
+	err = weave_chandesc_check(PageGetContents(page), avail, nblocks, &nweft);
+	if (err != WEAVE_CD_OK)
+	{
+		UnlockReleaseBuffer(buffer);
+		return err;
+	}
+
+	n = Min((int) nweft, max);
+	if (n > 0)
+		memcpy(out, WeavePageGetChanDesc(page)->weft,
+			   (Size) n * sizeof(WeaveChannelDesc));
+	UnlockReleaseBuffer(buffer);
+	if (nweft_out != NULL)
+		*nweft_out = (int) nweft;
+	return WEAVE_CD_OK;
+}
+
+/*
+ * The descriptor array a freshly written lexical-only bolt gets.
+ *
+ * Every v6 bolt gets a descriptor page, even one that carries nothing but the
+ * lexical weft.  The alternative -- write the page only once a second channel
+ * exists -- would leave the writer, the WAL path, the free path, the validator
+ * and weave_check()'s reachability rule completely unexercised until the vector
+ * channel lands, which is the failure mode blocking gate 5 exists to prevent.
+ * The measured cost is one page per bolt (see doc/PHASES.md X2), and it buys one
+ * thing v4 never recorded: WHICH index attribute the lexical weft indexes.
+ */
+static int
+weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
+						   WeaveChannelDesc *weft)
+{
+	int			n = 0;
+
+	Assert(seg->dictstart != InvalidBlockNumber);
+	weft[n].kind = (uint16) WEAVE_WK_LEXICAL;
+	weft[n].attnum = 1;			/* the lexical weft is over attribute 1 today;
+								 * multi-attribute wefts are what attnum is for */
+	weft[n].flags = 0;
+	weft[n].root = seg->dictstart;
+	n++;
+	return n;
+}
+
+/* Attach a descriptor page to a just-written bolt.  Call AFTER every other
+ * chain of the bolt has been written, so each root is known. */
+static void
+weave_attach_chandesc(Relation index, WeaveSegMeta *seg)
+{
+	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
+	int			nweft = weave_chandesc_for_segment(index, seg, weft);
+
+	seg->chandesc = weave_write_chandesc(index, weft, nweft);
+}
+
 /*
  * Write one immutable segment (dictionary + postings + trigram index) from a
  * populated build state, filling *seg.  The build state's terms must already
@@ -3295,6 +3644,7 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 	pw_finish(&pw);
 
 	MemSet(seg, 0, sizeof(WeaveSegMeta));
+	seg->chandesc = InvalidBlockNumber;	/* set for real by weave_attach_chandesc */
 	seg->dictstart = weave_write_dictionary(index, bs, postings, offsets, &seg->dictindexstart);
 	seg->trgmstart = bs->want_trigrams ? weave_write_trigrams(index, bs)
 		: InvalidBlockNumber;	/* trigrams opt-in (WITH (trigrams=on)); see weave_index_wants_trigrams */
@@ -3305,6 +3655,7 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 	seg->nterms = bs->nterms;
 	seg->ndeleted = 0;
 	seg->livedocslen = 0;
+	weave_attach_chandesc(index, seg);	/* v6: last, so every root is known */
 	doclen_collector_free(&dc);
 	pfree(postings);
 	pfree(offsets);
@@ -3920,6 +4271,7 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	bs->nterms = (int) nout;
 
 	MemSet(seg, 0, sizeof(WeaveSegMeta));
+	seg->chandesc = InvalidBlockNumber;	/* set for real by weave_attach_chandesc */
 	seg->doclenstart = bs->want_sidecar ? weave_write_doclen_sidecar(index, &mergedc) : InvalidBlockNumber;
 	doclen_collector_free(&mergedc);
 	dict_spill_rewind(&spill);
@@ -3941,6 +4293,7 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	seg->nterms = bs->nterms;
 	seg->ndeleted = 0;
 	seg->livedocslen = 0;
+	weave_attach_chandesc(index, seg);	/* v6: last, so every root is known */
 
 	for (i = 0; i < nsel; i++)
 		weave_doclens_free(&srcv[i].doclens);
@@ -4020,7 +4373,7 @@ weave_page_recyclable(Relation index, Page page)
 		CheckRelationLockedByMe(index, AccessExclusiveLock, true))
 		return true;
 	op = WeavePageGetOpaque(page);
-	if (!(op->flags & WEAVE_FREED))
+	if ((op->flags & WEAVE_FREED) == 0)
 		return true;			/* not gated (older free, or in-use race) */
 	/*
 	 * Is the freeing xid old enough that no snapshot can still reference this
@@ -4122,6 +4475,8 @@ weave_free_segment(Relation index, const WeaveSegMeta *seg)
 		weave_free_chain(index, seg->dictindexstart);
 	if (seg->doclenstart != InvalidBlockNumber)
 		weave_free_chain(index, seg->doclenstart);	/* v4 doclen sidecar */
+	if (seg->chandesc != InvalidBlockNumber)
+		weave_free_chain(index, seg->chandesc);	/* v6 weft descriptor page */
 }
 
 /*
@@ -5862,6 +6217,17 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			((PageHeader) tailpage)->pd_lower += need;
 			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
 			meta = WeavePageGetMeta(metapage);
+			/*
+			 * NO weave_meta_upcast_page() HERE, deliberately.  Every field this
+			 * path writes lives in the metapage HEAD (magic .. npending), which is
+			 * at byte-identical offsets in v3, v4/v5 and v6 -- only the segs[]
+			 * stride and the position of `generation` ever moved, and this path
+			 * touches neither.  Upcasting on an insert would also be wrong in
+			 * spirit: the version word should advance when the DIRECTORY changes,
+			 * which is where the six upcast calls are.  Verified when v6 was added
+			 * by grepping every in-place metapage writer; if a future field is
+			 * added to the head, revisit this.
+			 */
 			meta->ndocs += 1.0;
 			meta->sumdoclen += doc->doclen;
 			meta->npending += 1;
@@ -5884,7 +6250,7 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			Page		np = GenericXLogRegisterBuffer(state, newbuf,
 													   GENERIC_XLOG_FULL_IMAGE);
 
-			weave_init_page(np, WEAVE_PENDING);
+			weave_init_page(np, WEAVE_PK_PENDING);
 			pi = (WeavePendingItem *) ((char *) np +
 									 ((PageHeader) np)->pd_lower);
 			pi->tid = *ht_ctid;

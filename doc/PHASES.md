@@ -44,9 +44,16 @@ Corollary: **do not start F1 before L, Z, and V are green.** The temptation will
 be strong because F is the interesting part. Resist it. A fused scorer debugged
 against a half-working vector channel will consume more time than both.
 
+Second corollary, and the reason phase X exists: **the format substrate both
+remaining channels share had to land before either of them.** The page-kind space
+was a `uint16` bitmap with bits 0-9 spent, and the vector and fuzzy channels each
+wanted four more — they do not both fit, so whichever channel shipped first would
+have baked in a collision the other could only resolve with a REINDEX.
+
 ```
   phase 0  DONE   repository, build, lexical channel forked, all tests green
   phase L         lexical channel: pay down the inherited debt
+  phase X  DONE   format substrate (v6): kind space + per-bolt weft descriptors
   phase Z         fuzzy/regex/prefix channel: wire the pg_tre import
   phase V         vector channel: new C code
   phase F         fused-threshold top-k: the novel part
@@ -107,6 +114,27 @@ the highest priority in the project.
 
 ---
 
+## Phase X — format substrate: the v6 break (DONE)
+
+`doc/PRODUCTION_READINESS.md` blocking gate 5, and its Stage 2. Two coupled
+problems, fixed in one break because either alone would have forced a second one.
+Spec: `doc/specs/SEGMENT_FORMAT.md` §§2, 4, 6, 8, 9.
+
+| id | task | spec | gate |
+|---|---|---|---|
+| ~~**X1**~~ | **DONE 2026-09-10 (0.6.0).** **The page-kind space stops being a flat bitmap.** `flags` bit 15 is a reserved escape selecting an extended integer kind space held in the second opaque word (was `unused`); the ten shipped kinds keep their one-hot bits, so a v6-written lexical page is byte-identical to a v5-written one and no page is rewritten. Chosen over widening `flags` to `uint32`, which moves the opaque area on every page of every existing index and would force a REINDEX on relations containing no new kind at all. Follows L17's precedent: a per-*object* self-describing discriminator in spare bits of an existing field, because after an upgrade one relation holds both generations and a per-index version cannot describe it. | `SEGMENT_FORMAT.md` §2 | **MET.** `test/hegel/test_pagekind.c`: 852,070 checks, exhaustive over all 2^16 flag words — encode/decode bijection, the shipped kinds' byte patterns unchanged, and the **fail-closed** property (a v5 reader's first-match rule finds no kind bit on any extended page, so it refuses rather than mistaking kind 20 for `POSTING|TRGM`) |
+| ~~**X2**~~ | **DONE 2026-09-10 (0.6.0).** **Per-bolt weft descriptors.** `WeaveSegMeta.chandesc` names a `WEAVE_CHANDESC` page holding a header plus a `(kind, attnum)`-ascending array of `WeaveChannelDesc`. A bolt self-describes what it carries, so an index built without a vector column stores no vector structures and a reader never infers a weft's geometry from a GUC that may have changed since the build. Every v6 bolt gets one — including a lexical-only bolt — because a descriptor page that no shipped code writes is a substrate whose writer, WAL path, free path and validator are all untested until the vector channel lands, which is the failure mode this gate exists to prevent. | `SEGMENT_FORMAT.md` §6 | **MET.** `sql/chandesc.sql`: one descriptor page per live bolt across build, insert, merge, vacuum and REINDEX; zero unclassified pages; identical answers index-vs-seqscan. Cost **one 8 KB page per bolt** (raw measurement, not a ratio) |
+| ~~**X3**~~ | **DONE 2026-09-10 (0.6.0).** **Versioned metapage reader + `weave_check()`.** `weave_meta_from_page()` deserializes v3/v4/v5/v6 into the current struct behind `StaticAssertStmt`s on every layout relationship the branching depends on. `weave_check(regclass, deep)` is new — there was none before, only `weave_check_meta()` on the metapage header — and reports one row per invariant so a corruption test can assert a *specific* fault is caught. Eleven invariants implemented, including `page_kinds_decodable`, `chandesc_reachable`, `chandesc_roots_agree`, `chandesc_version_consistent`, `pages_reachable_or_freed` and `chains_do_not_overlap`. | `SEGMENT_FORMAT.md` §§8-9 | **MET.** Fuzz: `test/fuzz/fuzz_chandesc.c`, 856,784 images under ASan+UBSan with an exact-sized buffer, plus a planted-bug variant that must abort. **A finding**: `WEAVE_LIVEDOCS` is allocated in the table and in the header but no writer sets it — the livedocs blob goes out on `WEAVE_TRGM_DATA` pages, so `weave_index_size_detail()` reports zero livedocs pages. Recorded in §2, not fixed here |
+| ~~**X4**~~ | **DONE 2026-09-10 (0.6.0).** **The backward-compatibility test the project owed.** `t/010_format_v6_upgrade.pl` builds a v6 index over 20,000 rows, records six counts + a ranked top-20 + twenty distance values, stops the server, rewrites the metapage into exactly the bytes a v5 build would have written, restarts, and asserts the answers are **byte-identical** — then upgrades in place by inserting 3,000 rows and merging, and asserts they still are. `t/009_doclen_sidecar.pl` had said the equivalent v3 check was "validated out-of-tree in the release qualification (it needs two `.so` builds)", which is a gate nobody runs. Closes `PRODUCTION_READINESS.md` gate 6's "upgrade over an index containing data". | `SEGMENT_FORMAT.md` §8 item 6 | **MET.** 32 assertions, green on PG17. Also proves the leak detector has teeth: the orphaned descriptor pages the downgrade creates are *reported* as unreachable, and the only cure is REINDEX |
+
+**Phase X gate:** regression + isolation green on PG17 and PG18, TAP green, and a
+pre-v6 index readable with identical results. **MET.** Not in scope and
+deliberately not done: writing any vector or fuzzy page (their kinds are reserved,
+not implemented), the `pg_upgrade` test (gate 15), and the remaining `weave_check()`
+invariants (task M6).
+
+---
+
 ## Phase Z — fuzzy / regex / prefix channel
 
 The code is imported (`doc/specs/IMPORT_pg_tre.md`). The work is wiring it to the
@@ -118,7 +146,7 @@ See `doc/ARCHITECTURE.md` §7 and `doc/specs/FUZZY_CHANNEL.md`.
 |---|---|---|
 | ~~**Z1**~~ | **DONE 2026-09-09 (0.5.0).** Vendor TRE (laurikari/tre, BSD-2) as a submodule or in-tree copy; record the pinned commit and license in `doc/LICENSING.md`; get `src/query/re_match.c` compiling | `make` clean with the fuzzy sources in OBJS |
 | ~~**Z2**~~ | **DONE 2026-09-09 (0.5.0).** Wire the missing GUCs and deadline helpers listed in `doc/specs/IMPORT_pg_tre.md` "Wiring TODO" | all imported TUs compile; GUCs visible in `pg_settings` |
-| Z3 | Build the SuRF trie over the **bolt vocabulary** (dictionary terms), not the corpus. New page kind `WEAVE_SURF`. | `weave_check()` validates the trie; a property test asserts trie membership == dictionary membership |
+| Z3 | Build the SuRF trie over the **bolt vocabulary** (dictionary terms), not the corpus. New page kind `WEAVE_PK_SURF` (id 21, reserved by X1 in the extended kind space -- read it with `WeavePageHasKind()`, never a bitwise AND). | `weave_check()` validates the trie; a property test asserts trie membership == dictionary membership |
 | Z4 | Route prefix (`term*`) through SuRF instead of the current dictionary walk | prefix p50 ≤ today's, and `EXPLAIN` shows the surf channel |
 | Z5 | Route fuzzy (`term~k`) through universal-Levenshtein neighbourhood expansion over the vocabulary trigram map | index-accelerated `k=1` and `k=2` on a 1M-row corpus, p50 ≤ 200 ms (pg_tre measured 5.5 s and 7.3 s) |
 | Z6 | Route regex (`/re/`) through regex AST → trigram tiling → vocabulary candidates | character-class regex `E-[0-9]{4}` p50 ≤ 100 ms (pg_tre measured 1.5 s) |
@@ -145,7 +173,7 @@ read but **not** to port line-by-line: `~/src/turbovec` (Rust, MIT).
 | ~~**V4**~~ | **DONE.** Encode: normalize, rotate, optional TQ+ affine calibration, quantize, bit-pack, store per-vector renormalization scale | round-trip property test; the compressed-domain inner-product estimator is unbiased within a stated tolerance |
 | V5 | 32-lane packing layout; x86 `perm0`-interleaved, ARM sequential, plus the vector-major layout for int8-dot kernels | `test/hegel/test_pack.c`: pack/unpack round-trip, `move_lane`/`zero_lane` O(1) swap-remove |
 | V6 | SIMD kernels with runtime dispatch: scalar, SSE2, AVX2, AVX-512BW, AVX-512 VNNI, NEON, NEON SDOT. Nibble-split byte-LUT **and** int8-dot strategies. | every ISA path produces results identical to the scalar path on a randomized suite (`test/hegel/test_kernels.c`); CI runs the AVX-512 path under an emulator or an appropriate runner |
-| V7 | New page kinds `WEAVE_VCODES`, `WEAVE_VMETA`; codes live in the bolt under GenericXLog | crash-recovery TAP test extended to a vector index |
+| V7 | New page kinds `WEAVE_PK_VCODES`/`WEAVE_PK_VMETA` (ids 18/17, reserved by X1 in the extended kind space -- read them with `WeavePageHasKind()`, never a bitwise AND); codes live in the bolt under GenericXLog | crash-recovery TAP test extended to a vector index |
 | V8 | Code-scan shuttle: `score_block` over 32 lanes, `allow`-mask block short-circuit, and the block bound from `doc/specs/FUSED_TOPK.md` §2 | (C1)+(C2) property test; a selective mask makes the scan measurably *faster* |
 | V9 | **IVF coarse quantizer** over the quantized codes: k-means over a sample, per-cluster centroids, `nprobe` probing, cluster-aligned code blocks (which also satisfies V13). **NOT a proximity graph** — withdrawn after pg_turbovec deprecated its graph kind in v2.5.0, having measured that at R@10 ≥ 0.98 on GIST-10M/960-d IVF reached 28.4 ms while the graph could not reach 0.98 at **any** latency (ceiling 0.873 at 181 ms) and built 57–90× slower. `doc/specs/VECTOR_CHANNEL.md` §8a. | recall@10 ≥ 0.99 on 1M × 1024-d; p50 within 2× of pgvector HNSW; storage ≤ 0.15× pgvector HNSW; **plus a recall floor in the gate for any partitioned build** — pg_turbovec's shard/thread coupling cost R@10 0.920 → 0.605 while a build-time-only test called it a 60× speedup |
 | V10 | `recall=exact` path: graph off, full code scan, optional full-precision rerank sidecar | recall@10 == 1.000 |

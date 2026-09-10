@@ -51,7 +51,7 @@
 typedef struct WeaveSizeBucket
 {
 	const char *kind;
-	uint16		flag;
+	WeavePageKind pk;
 	int64		npages;
 	int64		freebytes;		/* PageGetFreeSpace, summed */
 } WeaveSizeBucket;
@@ -89,25 +89,30 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 	 * filesystem, and telling that apart from a page we failed to classify is the
 	 * difference between "reclaimable" and "a bug in this function".
 	 *
-	 * WEAVE_FREED MUST BE FIRST.  It is a state, not a kind: weave_free_page sets
-	 * it while LEAVING the page's original kind bit in place, so a freed posting
-	 * page has flags POSTING|FREED.  The loop below takes the first match, so
-	 * listing postings before freed counted every reclaimable page as live
-	 * postings -- which on a 1M-document build reported 108 MB of postings where
-	 * ~37 MB were live and the rest were awaiting truncation, turning a
-	 * reclaimable-space problem into an apparent data-size problem.
+	 * WEAVE_FREED IS A STATE, NOT A KIND.  weave_free_page sets it while LEAVING
+	 * the page's kind in place, so a freed posting page decodes as POSTING and is
+	 * ALSO freed.  Under the old flat bitmap this function encoded that by
+	 * listing "freed" first and taking the first bit that matched; listing
+	 * postings before freed counted every reclaimable page as live postings --
+	 * which on a 1M-document build reported 108 MB of postings where ~37 MB were
+	 * live and the rest were awaiting truncation, turning a reclaimable-space
+	 * problem into an apparent data-size problem.  Since v6 the kind is decoded
+	 * once by weave_page_kind_decode() and freed-ness is a separate explicit
+	 * test, so the ordering of this array no longer carries that meaning -- but
+	 * "freed" stays first so the report reads the same way.
 	 */
 	WeaveSizeBucket buckets[] = {
-		{"freed", WEAVE_FREED, 0, 0},
-		{"meta", WEAVE_META, 0, 0},
-		{"dictionary", WEAVE_DICT, 0, 0},
-		{"dict_index", WEAVE_DICTINDEX, 0, 0},
-		{"postings", WEAVE_POSTING, 0, 0},
-		{"doclen_sidecar", WEAVE_DOCLEN, 0, 0},
-		{"livedocs", WEAVE_LIVEDOCS, 0, 0},
-		{"trigram_dir", WEAVE_TRGM, 0, 0},
-		{"trigram_data", WEAVE_TRGM_DATA, 0, 0},
-		{"pending", WEAVE_PENDING, 0, 0},
+		{"freed", WEAVE_PK_UNKNOWN, 0, 0},	/* by state, not by kind; see below */
+		{"meta", WEAVE_PK_META, 0, 0},
+		{"dictionary", WEAVE_PK_DICT, 0, 0},
+		{"dict_index", WEAVE_PK_DICTINDEX, 0, 0},
+		{"postings", WEAVE_PK_POSTING, 0, 0},
+		{"doclen_sidecar", WEAVE_PK_DOCLEN, 0, 0},
+		{"livedocs", WEAVE_PK_LIVEDOCS, 0, 0},
+		{"trigram_dir", WEAVE_PK_TRGM, 0, 0},
+		{"trigram_data", WEAVE_PK_TRGM_DATA, 0, 0},
+		{"pending", WEAVE_PK_PENDING, 0, 0},
+		{"chandesc", WEAVE_PK_CHANDESC, 0, 0},
 	};
 	int			nbuckets = lengthof(buckets);
 	int64		unknown_pages = 0;
@@ -142,8 +147,8 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 	{
 		Buffer		buf;
 		Page		page;
-		uint16		flags;
 		Size		freespace;
+		WeavePageKind pk;
 		bool		matched = false;
 
 		CHECK_FOR_INTERRUPTS();
@@ -164,12 +169,11 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 			continue;
 		}
 
-		flags = WeavePageGetOpaque(page)->flags;
 		freespace = PageGetFreeSpace(page);
 
 		/*
 		 * The metapage is block 0 and does not carry WEAVE_META in every format
-		 * generation, so classify it by position.  Doing it by flag alone
+		 * generation, so classify it by position.  Doing it by kind alone
 		 * misfiled block 0 as unknown on an older index.
 		 */
 		if (blk == WEAVE_METAPAGE_BLKNO)
@@ -180,14 +184,23 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 			continue;
 		}
 
-		for (i = 0; i < nbuckets; i++)
+		if (WeavePageIsFreed(page))
 		{
-			if (flags & buckets[i].flag)
+			buckets[0].npages++;	/* "freed": the state wins over the kind */
+			buckets[0].freebytes += (int64) freespace;
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+
+		pk = WeavePageGetKind(page);
+		for (i = 1; i < nbuckets; i++)
+		{
+			if (pk == buckets[i].pk)
 			{
 				buckets[i].npages++;
 				buckets[i].freebytes += (int64) freespace;
 				matched = true;
-				break;			/* first match wins; a page is one kind */
+				break;			/* a page is exactly one kind */
 			}
 		}
 		if (!matched)

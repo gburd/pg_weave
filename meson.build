@@ -62,6 +62,8 @@ sources = files(
   'src/am/am.c',
   'src/am/customscan.c',
   'src/am/amaux.c',
+  'src/am/amsize.c',
+  'src/am/amcheck.c',
   'src/util/migrate.c',
   'src/query/trgm.c',
   'src/util/sparsemap.c',

@@ -21,6 +21,16 @@ Coverage:
 - `test_docvalid.c` — the structural WeaveDoc validator (`weave/docvalid.h`:
   `weave_doc_check`), the trust boundary for a hostile/corrupt wdoc datum.
   Builds valid images byte-for-byte like `weave_doc_build()` and mutates them.
+- `test_pagekind.c` — the v6 page-kind space (`weave/pagekind.h`:
+  `weave_page_kind_encode`/`_decode`/`_legacy_bit`). **Dependency-free and
+  exhaustive rather than sampled**: the flag word is 16 bits, so "for all inputs"
+  is enumerable and an exhaustive check is strictly better than a random one when
+  the domain is this small. It is also the only place a compatibility claim about
+  code that is not in this tree gets checked — it transcribes the v4/v5 reader's
+  first-match-bit rule and asserts that rule finds **no** kind bit on any page
+  written with the extended encoding, i.e. that an older `.so` fails closed instead
+  of mistaking `WEAVE_PK_CHANDESC` for a posting page. Wired into
+  `make check-standalone`, so it gates a build.
 
 Both include the real source directly (the header / the `.c`), so the tests and
 the extension share one copy — no duplicated logic to drift.

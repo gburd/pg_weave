@@ -151,14 +151,15 @@
               # Run the t/*.pl TAP tests via prove against the TAP-enabled server.
               # PROVE_TESTS selects the pg_weave-behavior tests that run cleanly
               # in the nix build sandbox (corruption, multi-encoding,
-              # concurrency, segment cap, vacuum reclaim, doclen sidecar). The
+              # concurrency, segment cap, vacuum reclaim, doclen sidecar,
+              # format-v6 upgrade). The
               # crash-recovery (t/001) and replication (t/002) tests use an
               # older PostgreSQL::Test idiom that the nixpkgs-shipped harness
               # rejects under the sandbox; they are gated in CI (real PG,
               # matching harness), not here. This is what makes `nix flake
               # check` actually exercise TAP instead of silently skipping it.
               make installcheck REGRESS= ISOLATION= \
-                PROVE_TESTS='t/003_corruption.pl t/004_encodings.pl t/005_concurrency.pl t/006_concurrent_extend.pl t/007_segment_cap.pl t/008_vacuum_reclaim.pl t/009_doclen_sidecar.pl' \
+                PROVE_TESTS='t/003_corruption.pl t/004_encodings.pl t/005_concurrency.pl t/006_concurrent_extend.pl t/007_segment_cap.pl t/008_vacuum_reclaim.pl t/009_doclen_sidecar.pl t/010_format_v6_upgrade.pl' \
                 PG_CONFIG=${pgConfigWrapped}/bin/pg_config \
                 || { echo '--- TAP logs ---'; cat tmp_check/log/*.log tmp_check/log/regress_log_* 2>/dev/null; exit 1; }
               touch $out

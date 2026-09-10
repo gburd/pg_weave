@@ -20,8 +20,16 @@
 #include "storage/bufpage.h"
 #include "storage/itemptr.h"
 
+#include "weave/chandesc.h"
+#include "weave/pagekind.h"
+
 #define WEAVE_MAGIC			0x42324635	/* "B2F5" */
-#define WEAVE_VERSION		5		/* v5: the doclen sidecar's docid column stores
+#define WEAVE_VERSION		6		/* v6: every bolt SELF-DESCRIBES its wefts.
+										 * WeaveSegMeta gains `chandesc`, naming a
+										 * WEAVE_CHANDESC page, and the page-kind space
+										 * stops being a flat uint16 bitmap (see
+										 * WEAVE_PAGE_KIND_EXT below).  v5: the doclen
+										 * sidecar's docid column stores
 										 * ABSOLUTE offsets from each block's first_docid
 										 * instead of gaps, so the column is randomly
 										 * addressable (weave_for_get) and an in-block
@@ -37,6 +45,7 @@
 #define WEAVE_VERSION_DOCLEN_INLINE 3	/* oldest format we dual-read */
 #define WEAVE_VERSION_DOCLEN_SIDECAR 4	/* first version with the doclen sidecar */
 #define WEAVE_VERSION_DOCLEN_ABS 5	/* first version writing absolute-offset sidecars */
+#define WEAVE_VERSION_CHANDESC	6	/* first version with per-bolt weft descriptors */
 
 /*
  * Set in WeaveDoclenBlockHdr.count to mark a sidecar block whose docid column is
@@ -59,36 +68,25 @@
 #define WEAVE_DOCLEN_IS_ABS(c)	(((c) & WEAVE_DOCLEN_ABS) != 0)
 #define WEAVE_METAPAGE_BLKNO	0
 
-/* page opaque flags */
-#define WEAVE_META			(1 << 0)
-#define WEAVE_DICT			(1 << 1)
-#define WEAVE_POSTING		(1 << 2)
-#define WEAVE_PENDING		(1 << 3)
-#define WEAVE_TRGM			(1 << 4)	/* trigram directory page */
-#define WEAVE_TRGM_DATA		(1 << 5)	/* trigram sparsemap blob page */
-#define WEAVE_LIVEDOCS		(1 << 6)	/* per-segment tombstone bitmap page */
-#define WEAVE_DICTINDEX		(1 << 7)	/* sparse block index over dict pages */
-#define WEAVE_DOCLEN			(1 << 9)	/* per-segment doclen sidecar page (v4):
-										 * a chain of 128-doc blocks, each a
-										 * FOR-packed docid-gap column + one quantized
-										 * length byte per doc, ordered by segment-local
-										 * ascending docid.  Replaces the per-posting
-										 * doclen column; scoring reads the byte and a
-										 * precomputed 256-entry length-norm table. */
-#define WEAVE_FREED			(1 << 8)	/* page freed & pending recycle: nextblk
-										 * holds the free-time TransactionId (see
-										 * weave_free_page / the recycle gate in
-										 * weave_new_buffer).  Reusing nextblk (dead on
-										 * an off-chain freed page) keeps the page
-										 * opaque layout unchanged -- no format change,
-										 * so existing indexes need no REINDEX.  A page
-										 * freed by an older version lacks this flag and
-										 * is treated as immediately recyclable. */
+/* ---------------------------------------------------------------------------
+ * Page kinds
+ *
+ * The kind space, the escape bit that ended the flat bitmap, the WeavePageKind
+ * enum and the pure encode/decode pair are in weave/pagekind.h -- backend-
+ * independent so test/hegel/test_pagekind.c can prove the fail-closed property
+ * the v6 design rests on exhaustively.  READ THAT HEADER before adding a kind.
+ *
+ * Here: only the Page-level accessors, which need PostgreSQL's Page type.
+ * ------------------------------------------------------------------------- */
 
 typedef struct WeavePageOpaqueData
 {
 	uint16		flags;
-	uint16		unused;
+	uint16		kind;			/* extended WeavePageKind; meaningful ONLY when
+								 * WEAVE_PAGE_KIND_EXT is set in flags.  Was
+								 * `unused`, and reading it is gated on the escape
+								 * bit precisely so that we never have to assume
+								 * what an older build left in these two bytes. */
 	BlockNumber nextblk;		/* next page in a dict/posting/pending chain */
 } WeavePageOpaqueData;
 
@@ -96,6 +94,20 @@ typedef WeavePageOpaqueData *WeavePageOpaque;
 
 #define WeavePageGetOpaque(page) \
 	((WeavePageOpaque) PageGetSpecialPointer(page))
+
+#define WeavePageGetKind(page) \
+	(weave_page_kind_decode(WeavePageGetOpaque(page)->flags, \
+							WeavePageGetOpaque(page)->kind))
+
+/* Is this page of kind k?  USE THIS, not `flags & WEAVE_FOO`: an extended kind
+ * is not a bit and a bitwise test against one silently reads false. */
+#define WeavePageHasKind(page, k)	(WeavePageGetKind(page) == (k))
+
+/* WEAVE_FREED is a state, orthogonal to kind, under both encodings. */
+#define WeavePageIsFreed(page) \
+	((WeavePageGetOpaque(page)->flags & WEAVE_FREED) != 0)
+
+extern const char *weave_page_kind_name(WeavePageKind kind);
 
 /*
  * A segment: an immutable, self-contained mini-index built from one flush of
@@ -121,7 +133,55 @@ typedef struct WeaveSegMeta
 	BlockNumber doclenstart;	/* first doclen-sidecar page (v4), or Invalid for a
 								 * v3 segment whose postings still carry inline
 								 * doclen.  Dual-read keys off this per segment. */
+	BlockNumber chandesc;		/* v6: the bolt's WEAVE_CHANDESC page, listing every
+								 * weft it carries; Invalid means "lexical only",
+								 * which is exactly what a v3/v4/v5 bolt is.  So a
+								 * pre-v6 bolt and a v6 lexical-only bolt are the
+								 * same thing to a reader, and dual-read is
+								 * per-bolt -- the doclenstart pattern again.
+								 *
+								 * This field lands at offset 52, inside the four
+								 * bytes of tail padding WeaveSegMeta already had
+								 * for its double members, so sizeof() and hence
+								 * the segs[] STRIDE do not change and neither does
+								 * the offset of the metapage's `generation`.  See
+								 * doc/specs/SEGMENT_FORMAT.md sect. 6: the spec
+								 * predicted a stride change and was wrong.  The
+								 * version bump is still required -- an older build
+								 * would read those four bytes as padding and leak
+								 * every chandesc page on merge -- and the versioned
+								 * reader still exists, because the NEXT added field
+								 * will not be free. */
 } WeaveSegMeta;
+
+/* Static asserts on the above live in src/am/am.c (weave_meta_from_page). */
+
+/*
+ * The backend view of a WEAVE_CHANDESC page.  Byte-identical to WeaveCdPage /
+ * WeaveCdDesc in weave/chandesc.h, which carry the validator that both the
+ * backend and the fuzz harness call; the asserts that keep the two in step are
+ * in src/am/am.c.  Declared here because weave/am.h is the header of record for
+ * what is on disk.
+ */
+typedef struct WeaveChannelDesc
+{
+	uint16		kind;			/* WeaveWeftKind (weave/chandesc.h); never 0 */
+	uint16		attnum;			/* 1-based index attribute, or 0 if not per-attr */
+	uint32		flags;			/* WEAVE_WEFT_F_* */
+	BlockNumber root;			/* first page of the weft */
+} WeaveChannelDesc;
+
+typedef struct WeaveChanDescPageData
+{
+	uint32		magic;			/* WEAVE_CHANDESC_MAGIC */
+	uint16		version;		/* WEAVE_CHANDESC_VERSION */
+	uint16		nweft;			/* 1..WEAVE_MAX_WEFTS */
+	uint32		reserved;		/* must be zero */
+	WeaveChannelDesc weft[FLEXIBLE_ARRAY_MEMBER];
+} WeaveChanDescPageData;
+
+#define WeavePageGetChanDesc(page) \
+	((WeaveChanDescPageData *) PageGetContents(page))
 
 #define WEAVE_MAX_SEGMENTS 128	/* fits the metapage (~6KB of ~8KB); the size-
 										 * tiered merge keeps the live count far below
@@ -277,9 +337,48 @@ typedef struct WeaveTrgmEntry
 	BlockNumber firstdata;		/* first WEAVE_TRGM_DATA page of the term-ord set */
 } WeaveTrgmEntry;
 
+/*
+ * Metapage and channel-descriptor readers (src/am/am.c).  Exported because
+ * src/am/amsize.c and src/am/amcheck.c are separate translation units -- am.c is
+ * already a 7,000-line unity build of four files (AGENTS.md rule 5) and task L1
+ * is to shrink it, not to grow it.
+ *
+ * weave_meta_from_page() is the ONLY correct way to read a metapage: it
+ * deserializes v3/v4/v5/v6 into the current in-memory struct.  Casting the page
+ * to WeaveMetaPageData directly is the 1.5.0 upgrade bug.
+ */
+extern void weave_check_meta(Page page, Relation index);
+extern void weave_meta_from_page(Page page, WeaveMetaPageData *out);
+extern WeaveCdError weave_read_chandesc(Relation index, BlockNumber blk,
+										WeaveChannelDesc *out, int max,
+										int *nweft_out);
+
+/*
+ * The read-path wrapper: a corrupt descriptor page must produce a clean ERROR,
+ * never a best-effort read that hands a caller a wild root block
+ * (doc/CONVENTIONS.md decision 2, doc/specs/SEGMENT_FORMAT.md sect. 8 item 3).
+ * Channel code reads descriptors through THIS; only weave_check() calls the
+ * code-returning form, because it has to report and continue.
+ */
+static inline int
+weave_chandesc_required(Relation index, BlockNumber blk,
+						WeaveChannelDesc *out, int max)
+{
+	int			nweft = 0;
+	WeaveCdError err = weave_read_chandesc(index, blk, out, max, &nweft);
+
+	if (err != WEAVE_CD_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" has a corrupt channel-descriptor page at block %u",
+						RelationGetRelationName(index), blk),
+				 errdetail("%s", weave_chandesc_errstr(err)),
+				 errhint("REINDEX the index to rebuild it.")));
+	return nweft;
+}
+
 /* scan functions (pg_weave_am_scan.c, #included into pg_weave_am.c) */
-extern void weave_init_reloptions(void);
-extern IndexScanDesc weave_beginscan(Relation r, int nkeys, int norderbys);
+extern void weave_init_reloptions(void);extern IndexScanDesc weave_beginscan(Relation r, int nkeys, int norderbys);
 extern void weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 						ScanKey orderbys, int norderbys);
 extern int64 weave_getbitmap(IndexScanDesc scan, TIDBitmap *tbm);
