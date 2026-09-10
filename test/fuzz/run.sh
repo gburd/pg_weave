@@ -25,7 +25,7 @@ export ASAN_OPTIONS="abort_on_error=1:detect_leaks=1"
 export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
 
 echo "== building fuzzers ($CC, ASan+UBSan) =="
-for f in fuzz_for fuzz_docvalid fuzz_block; do
+for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc; do
     $CC $CFLAGS "$here/$f.c" -o "$out/$f"
 done
 # planted-bug binaries: fuzz_block with (a) the count clamp reverted, (b) the
@@ -36,10 +36,13 @@ $CC $CFLAGS -DFUZZ_NO_CLAMP=1 "$here/fuzz_block.c" -o "$out/fuzz_block_noclamp"
 $CC $CFLAGS -DFUZZ_SIGNED_COUNT=1 "$here/fuzz_block.c" -o "$out/fuzz_block_signed"
 $CC $CFLAGS -DFUZZ_RANDOM_STREAM=1 "$here/fuzz_block.c" -o "$out/fuzz_block_randstream"
 $CC $CFLAGS -DFUZZ_NO_SUMTF_GUARD=1 "$here/fuzz_block.c" -o "$out/fuzz_block_nosumtf"
+# planted-bug binary for the v6 channel-descriptor decoder: the "descriptor array
+# must fit the readable bytes" guard removed.  MUST abort under ASan.
+$CC $CFLAGS -DFUZZ_NO_ARRAY_GUARD=1 "$here/fuzz_chandesc.c" -o "$out/fuzz_chandesc_noarray"
 
 echo "== running fuzzers =="
 rc=0
-for f in fuzz_for fuzz_docvalid fuzz_block; do
+for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc; do
     if "$out/$f"; then
         echo "PASS: $f"
     else
@@ -88,6 +91,16 @@ if "$out/fuzz_block_nosumtf" >/dev/null 2>&1; then
     rc=1
 else
     echo "PASS: fuzz_block_nosumtf aborted as expected (sumtf-vs-posbytelen teeth)"
+fi
+
+# The chandesc no-array-guard build lets a corrupt nweft walk the descriptor
+# array past the buffer; ASan must abort it -- proving the harness detects the
+# missing-length-guard class on the v6 channel-descriptor page.
+if "$out/fuzz_chandesc_noarray" >/dev/null 2>&1; then
+    echo "FAIL: fuzz_chandesc_noarray exited 0 -- harness did NOT catch the missing array guard!"
+    rc=1
+else
+    echo "PASS: fuzz_chandesc_noarray aborted as expected (descriptor-array teeth)"
 fi
 
 if [ "$rc" -eq 0 ]; then

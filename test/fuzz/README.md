@@ -88,6 +88,31 @@ the header comment in `fuzz_block.c` for the honest accounting.
 - Iterations: 300,000 block + 100,000 primitive.
 - Seed: `0xB10CC0DEB10CC0DE`.
 
+### `fuzz_chandesc.c` -- the v6 channel-descriptor page (`weave/chandesc.h`)
+Exercises `weave_chandesc_check` -- **the real decoder, not a model**: the
+validator is backend-independent for exactly this reason, so this is the same
+function `weave_read_chandesc()` calls in `src/am/am.c`. A bolt's descriptor page
+is the first thing a v6 reader parses about a bolt and every field in it is a
+length or a block number that later code dereferences (`nweft` indexes an array,
+each weft's `root` becomes a `ReadBuffer` argument).
+- **(1)** every well-formed image of every legal weft count (1..32) must be
+  accepted, and its postcondition independently re-verified without reusing the
+  validator's code -- a validator that returns OK on a page it should have rejected
+  is a wrong answer, which the sanitizers cannot see;
+- **(2)** the same images truncated to every length in [0, len];
+- **(3)** 1-6 random byte smashes of a well-formed image, with the *declared*
+  length corrupted independently of the buffer handed over (a torn `pd_lower`);
+- **(4)** fully random bytes at random lengths, half of them with a valid magic and
+  version so the deeper checks are actually reached;
+- **(5)** the `nblocks == 0` mode, which disables the root bounds check.
+- The buffer is sized **exactly** to the declared length, not to a whole 8 KB page,
+  so ASan's heap redzone sits immediately past the last readable byte -- stricter
+  than the backend, where the page really is BLCKSZ, and deliberately so.
+- Every rejection must carry a recognized error code: an unrecognized one means a
+  failure mode nobody wrote an `errdetail` for.
+- Iterations: 856,784 (32 + 1,089 truncations + 400,000 + 400,000 + 50,000).
+- Seed: splitmix64 from `0x9E3779B97F4A7C15`.
+
 ## The extraction (one non-test change, behavior-identical)
 
 To fuzz `weave_doc_is_valid` standalone (it lives in `pg_weave_doc.c` which
@@ -142,7 +167,11 @@ elsewhere); the fuzzer's "teeth" builds reproduce them on demand.
 
 ## Teeth (planted-bug discipline)
 
-`run.sh` compiles `fuzz_block.c` in three "teeth" modes and asserts each
+`run.sh` compiles `fuzz_block.c` in four "teeth" modes and `fuzz_chandesc.c` in
+one (`FUZZ_NO_ARRAY_GUARD`, a copy of the validator with the
+descriptor-array-fits-avail guard deleted -- the single most likely guard to drop,
+since the magic and version checks look like they already bound the page), and
+asserts each
 **aborts** under ASan -- if any exited 0, the harness would be toothless and the
 whole run fails:
 

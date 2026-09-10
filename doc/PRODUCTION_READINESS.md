@@ -57,22 +57,43 @@ mechanically checkable. `doc/PHASES.md` has the task-level detail.
    silently drops rows and no regression test catches it
    (`doc/TESTING.md`). Non-negotiable.
 4. **`weave_check()` must verify every invariant** in
-   `doc/specs/SEGMENT_FORMAT.md` §9, and there are 20-odd. Today it covers the
-   inherited lexical ones only.
-5. **Format v6 must resolve the page-kind bit exhaustion.**
-   `doc/specs/SEGMENT_FORMAT.md` §2 documents that the vector and fuzzy channels'
-   proposed bits do not both fit in the `uint16` flags field. Shipping either
-   channel before fixing this bakes in a collision. **Renumbered v5 → v6 on
-   2026-09-10:** v5 was taken by a shipped change (L17's absolute-offset doclen
-   sidecar), so the planned format break is now v6. L17 also established the
-   pattern it should follow — a per-*block* self-describing flag in a field with
-   spare bits, which let one relation hold both encodings across an upgrade
-   instead of needing a per-index version that cannot describe a mixed index.
+   `doc/specs/SEGMENT_FORMAT.md` §9, and there are 20-odd. **Corrected
+   2026-09-10:** the earlier claim that it "covers the inherited lexical ones
+   only" was wrong -- there was no `weave_check()` at all, only
+   `weave_check_meta()` validating the metapage magic and version. Task X3 built
+   the function and eleven invariants: the metapage version gate, `nsegments`
+   bound, per-bolt chain kinds, `page_kinds_decodable`, uninitialized-page count,
+   the four channel-descriptor invariants, and (behind `deep`)
+   `pages_reachable_or_freed` and `chains_do_not_overlap`. The lexical ones -- the
+   dictionary ordering, the block-max bound recompute that is a live contract-(C2)
+   check, the livedocs popcount, the trigram ordinals, the doclen sidecar
+   coverage -- are still owed, and are task M6.
+5. ~~**Format v6 must resolve the page-kind bit exhaustion.**~~ **DONE 2026-09-10
+   (0.6.0), tasks X1-X4.** `flags` bit 15 is now a reserved escape selecting an
+   extended integer kind space held in the second page-opaque word; the ten shipped
+   kinds keep their one-hot bits, so a v6-written lexical page is byte-identical to
+   a v5-written one, no page is rewritten, and the vector and fuzzy channels have
+   twelve reserved ids between them instead of ten bits that do not fit. Chosen
+   over widening `flags` to `uint32`, which moves the opaque area on every page of
+   every existing index. It follows L17's pattern -- a per-*object* self-describing
+   discriminator in spare bits of an existing field, which is what let one relation
+   hold both doclen-sidecar encodings across an upgrade instead of needing a
+   per-index version that cannot describe a mixed index -- and the fail-closed
+   consequence (a v5 reader matches no kind on a v6 page, rather than mistaking
+   kind 20 for `POSTING|TRGM`) is proved exhaustively over all 2^16 flag words by
+   `test/hegel/test_pagekind.c`. The same break added per-bolt weft descriptors
+   (`WeaveSegMeta.chandesc`, `SEGMENT_FORMAT.md` §6), the versioned metapage
+   reader, and `weave_check()`.
 6. **Upgrade path.** Partially addressed: `sql/pg_weave--0.1.0--0.2.0.sql` now
    exists and `sql/wvec.sql` exercises it on every regression run, which caught a
    `flake.nix` `installPhase` that hardcoded one SQL filename and silently dropped
-   every new one. Still owed: a `pg_upgrade` test and an upgrade over an index
-   containing data.
+   every new one. **The upgrade over an index containing data is now covered**
+   (2026-09-10, task X4): `t/010_format_v6_upgrade.pl` builds a 20,000-row index,
+   manufactures a pre-v6 metapage image with the server down, and asserts
+   byte-identical answers before and after, then again after an in-place upgrade by
+   insert + merge. It also replaces the out-of-tree-only compatibility check
+   `t/009_doclen_sidecar.pl` admitted to. **Still owed: a `pg_upgrade` test**
+   (gate 15).
 
 ### Blocking — correctness under adversity
 
@@ -81,7 +102,10 @@ mechanically checkable. `doc/PHASES.md` has the task-level detail.
    crash test is a data-loss risk.
 8. **Fuzz targets for every new on-disk structure.** On-disk bytes are not
    trusted; a corrupt page must `ERROR`, never crash and never return a wrong
-   answer.
+   answer. Current coverage: `fuzz_for`, `fuzz_docvalid`, `fuzz_block`, and
+   (2026-09-10) `fuzz_chandesc` for the v6 descriptor page. Each of the last two
+   ships a planted-bug variant that must abort, so a toothless harness fails
+   instead of passing vacuously.
 9. **Torn-write detection** (task V11) with an injection test.
 10. **ASan/UBSan clean** on the full suite, not just a normal build. The
     inherited code has one ASan-found SEGV in its history
@@ -136,7 +160,7 @@ extensions are finished.
 
 ## The route from here, in dependency order
 
-20 of 59 tasks are done (`doc/PHASES.md`). The ordering below is forced by three
+24 of 63 tasks are done (`doc/PHASES.md`), phase X included. The ordering below is forced by three
 things: the page-kind bit exhaustion blocks *both* remaining channels, hard rule 7
 forbids starting F before L/Z/V gate, and every new on-disk structure owes the
 adversity gates (7–11) before it counts.
@@ -156,15 +180,24 @@ The only phase where pg_weave already competes, and the cheapest remaining wins.
 **Exit gate:** G13 at ≤2× pg_textsearch in every band, or the residual documented
 as permanent in `doc/ARCHITECTURE.md` §9.
 
-### Stage 2 — format v6, before either channel (weeks)
+### Stage 2 — format v6, before either channel — DONE 2026-09-10 (0.6.0)
 
-Blocking gate 5, and it must come first: the vector and fuzzy page-kind bits do not
-both fit the `uint16` flags field, so shipping either channel first bakes in a
-collision. Follow L17's pattern — per-block self-description in spare bits of an
-existing field, which is what let one relation carry two sidecar encodings across an
-upgrade. Also resolve the `WeaveSegMeta` stride question
-(`SEGMENT_FORMAT.md` §2) in the same break, plus the `pg_upgrade` test (gate 15)
-and an upgrade over an index containing data (gate 6).
+Blocking gate 5, and it had to come first: the vector and fuzzy page-kind bits did
+not both fit the `uint16` flags field, so shipping either channel first would have
+baked in a collision. Delivered as `doc/PHASES.md` phase X (tasks X1-X4), following
+L17's pattern — per-*object* self-description in spare bits of an existing field.
+
+The `WeaveSegMeta` stride question `SEGMENT_FORMAT.md` §2 raised is resolved and
+the answer was "it does not move": `chandesc` fits the four bytes of tail padding
+the struct already carried for its `double` members, so `sizeof` stays 56, the
+`segs[]` stride is unchanged, and the metapage's `generation` does not move either.
+The versioned reader (`WeaveMetaPageDataV5` alongside the live struct, with a
+`StaticAssertStmt` on the stride) was still built, because the next field added will
+not fit the padding and at that moment the reader has to already be right.
+
+**Still open from this stage:** the `pg_upgrade` test (gate 15). The
+upgrade-over-an-index-with-data half of gate 6 is closed by
+`t/010_format_v6_upgrade.pl`.
 
 ### Stage 3 — Z, the cheap second channel (months)
 

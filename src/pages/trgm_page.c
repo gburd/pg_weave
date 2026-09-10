@@ -74,7 +74,7 @@ weave_write_blob(Relation index, const uint8 *data, Size len)
 		Page		page = GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE);
 		Size		chunk = Min(len - off, (Size) WEAVE_TRGMDATA_CAP);
 
-		weave_init_page(page, WEAVE_TRGM_DATA);
+		weave_init_page(page, WEAVE_PK_TRGM_DATA);
 		if (chunk > 0)
 		{
 			memcpy((char *) PageGetContents(page), data + off, chunk);
@@ -291,7 +291,7 @@ weave_write_trigrams_iter(Relation index, DictNextFn next, void *nstate)
 			dbuf = next;
 			dstate = GenericXLogStart(index);
 			dpage = GenericXLogRegisterBuffer(dstate, dbuf, GENERIC_XLOG_FULL_IMAGE);
-			weave_init_page(dpage, WEAVE_TRGM);
+			weave_init_page(dpage, WEAVE_PK_TRGM);
 		}
 		{
 			WeaveTrgmEntry *te = (WeaveTrgmEntry *) ((char *) dpage +

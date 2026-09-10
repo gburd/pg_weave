@@ -24,6 +24,7 @@ OBJS = \
 	src/am/customscan.o \
 	src/am/amaux.o \
 	src/am/amsize.o \
+	src/am/amcheck.o \
 	src/util/migrate.o \
 	src/query/trgm.o \
 	src/util/sparsemap.o \
@@ -94,14 +95,14 @@ TRE_CPPFLAGS = \
 	-I$(srcdir)/vendor/tre/local_includes
 
 EXTENSION = pg_weave
-DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql sql/pg_weave--0.4.0--0.5.0.sql
+DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql sql/pg_weave--0.4.0--0.5.0.sql sql/pg_weave--0.5.0--0.6.0.sql
 PGFILEDESC = "pg_weave - unified lexical + vector + fuzzy retrieval in one index"
 
 # sql/ and expected/ are already at the top level (PGXS's built-in default
 # --inputdir=$(srcdir) for pg_regress), so plain REGRESS with no REGRESS_OPTS
 # picks up sql/<name>.sql + expected/<name>.out directly. No relayout fix
 # needed here.
-REGRESS = weave unicode_fold idx_scan_stats wvec orderby
+REGRESS = weave unicode_fold idx_scan_stats wvec orderby chandesc
 
 # --- Isolation tests -------------------------------------------------------
 # pg_isolation_regress hardcodes its two lookup paths relative to a SINGLE
@@ -293,6 +294,12 @@ check-standalone:
 	echo "== v5 doclen sidecar: random access over absolute offsets == gap decode =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/dlb test/hegel/test_doclen_block.c -lm; \
 	$$tmp/dlb | tail -1; \
+	echo "== v6 page-kind space: encode/decode bijection + fail-closed vs a v5 reader =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/pk test/hegel/test_pagekind.c; \
+	$$tmp/pk | tail -1; \
+	echo "== v6 channel descriptor: pure validator on well-formed and corrupt images =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/cd test/fuzz/fuzz_chandesc.c; \
+	$$tmp/cd | tail -1; \
 	echo "== ALL STANDALONE CHECKS PASSED =="
 
 # Cross-version sparsemap wire compatibility.  Separate because it needs the

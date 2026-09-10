@@ -1,0 +1,116 @@
+-- Format v6: per-bolt channel descriptors, and the end of the flat page-kind
+-- bitmap.  doc/specs/SEGMENT_FORMAT.md sections 2, 6, 8, 9;
+-- doc/PRODUCTION_READINESS.md blocking gate 5.
+--
+-- Two coupled things are under test here.  (1) A bolt now SELF-DESCRIBES which
+-- wefts it carries, on a WEAVE_CHANDESC page named by WeaveSegMeta.chandesc, so
+-- an index built without a vector column stores no vector structures at all.
+-- (2) The page-kind space is no longer a uint16 bitmap: the ten shipped kinds
+-- keep their one-hot bits and new kinds are integer ids behind an escape bit, so
+-- the vector and fuzzy channels can both be added without colliding.
+--
+-- The compatibility half -- reading a genuinely pre-v6 on-disk index -- cannot be
+-- done from SQL, because it needs the metapage bytes rewritten with the server
+-- down.  It lives in t/010_format_v6_upgrade.pl.  What is here is everything
+-- reachable with one .so and a running server.
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+ALTER EXTENSION pg_weave UPDATE;
+
+CREATE TABLE cd (id serial, d wdoc);
+-- Three frequency bands so the index has a real dictionary and several posting
+-- blocks, not a degenerate one-page structure that no invariant can be wrong on.
+INSERT INTO cd(d)
+  SELECT to_wdoc('shared common' || (g % 11) || ' mid' || (g % 97) || ' rare' || g)
+  FROM generate_series(1, 600) g;
+CREATE INDEX cd_weave ON cd USING weave (d);
+ANALYZE cd;
+
+-- ---- weave_check() on a freshly built index -----------------------------
+-- Every invariant, shallow.  The rows are the contract: adding an invariant
+-- changes this list on purpose.
+SELECT invariant, ok FROM weave_check('cd_weave') ORDER BY invariant;
+
+-- The deep pass adds full-relation page reachability and the
+-- no-two-chains-overlap assertion (SEGMENT_FORMAT.md section 8 item 5).
+SELECT invariant, ok FROM weave_check('cd_weave', true) ORDER BY invariant;
+
+-- The only assertion that matters: nothing is violated.
+SELECT count(*) AS violations FROM weave_check('cd_weave', true) WHERE NOT ok;
+
+-- The metapage reports the version this build writes.
+SELECT detail FROM weave_check('cd_weave')
+ WHERE invariant = 'metapage_version_recognized';
+
+-- Every bolt is self-describing on a fresh v6 build.
+SELECT detail FROM weave_check('cd_weave') WHERE invariant = 'chandesc_coverage';
+
+-- ---- the new page kind is visible and accounted for ---------------------
+-- One descriptor page per live bolt, and weave_index_size_detail() classifies it
+-- under its own name rather than as "unclassified" -- which is what would happen
+-- if a reader tested the extended kind with a bitwise AND.
+SELECT (SELECT npages FROM weave_index_size_detail('cd_weave') WHERE kind = 'chandesc')
+     = weave_index_nsegments('cd_weave') AS one_chandesc_page_per_bolt;
+
+-- No page falls through the classifier.  A nonzero count here is the v6
+-- equivalent of the L17 bug: a reader that did not learn the new encoding.
+SELECT npages AS unclassified_pages FROM weave_index_size_detail('cd_weave')
+ WHERE kind = 'unclassified';
+
+-- ---- the write paths that create and free descriptor pages --------------
+-- Pending inserts, then a merge: the merged bolt gets a new descriptor page and
+-- the consumed bolts' pages must be freed, not leaked.  weave_check(deep) is what
+-- catches a leak; nothing else would.
+INSERT INTO cd(d)
+  SELECT to_wdoc('shared delta' || (g % 5) || ' rare' || (1000 + g))
+  FROM generate_series(1, 400) g;
+SELECT weave_merge('cd_weave') IS NOT NULL AS merged;
+SELECT count(*) AS violations_after_merge
+  FROM weave_check('cd_weave', true) WHERE NOT ok;
+SELECT (SELECT npages FROM weave_index_size_detail('cd_weave') WHERE kind = 'chandesc')
+     = weave_index_nsegments('cd_weave') AS chandesc_pages_match_after_merge;
+
+-- Vacuum compaction rewrites every bolt and truncates the freed tail.
+DELETE FROM cd WHERE id % 3 = 0;
+SELECT weave_vacuum('cd_weave') IS NOT NULL AS vacuumed;
+SELECT count(*) AS violations_after_vacuum
+  FROM weave_check('cd_weave', true) WHERE NOT ok;
+SELECT (SELECT npages FROM weave_index_size_detail('cd_weave') WHERE kind = 'chandesc')
+     = weave_index_nsegments('cd_weave') AS chandesc_pages_match_after_vacuum;
+
+-- REINDEX rebuilds from the heap: still consistent, still self-describing.
+REINDEX INDEX cd_weave;
+SELECT count(*) AS violations_after_reindex
+  FROM weave_check('cd_weave', true) WHERE NOT ok;
+
+-- ---- answers are unaffected by the format change ------------------------
+-- The descriptor page is metadata; it must not perturb a single result.  Index
+-- path versus sequential path, which is the only ground truth available.
+SET enable_seqscan = off;
+SELECT count(*) AS idx_common FROM cd WHERE d @@@ 'common3'::wquery;
+SET enable_indexscan = off; SET enable_bitmapscan = off; SET enable_seqscan = on;
+SELECT count(*) AS seq_common FROM cd WHERE d @@@ 'common3'::wquery;
+RESET enable_indexscan; RESET enable_bitmapscan; RESET enable_seqscan;
+
+SET enable_seqscan = off;
+SELECT id FROM cd WHERE d @@@ 'shared'::wquery
+ ORDER BY d <=> 'shared common3'::wquery, id LIMIT 5;
+RESET enable_seqscan;
+
+-- ---- error surface -------------------------------------------------------
+-- Not a weave index: refuse, do not guess.
+CREATE TABLE cdnb (id int);
+CREATE INDEX cdnb_btree ON cdnb(id);
+SELECT * FROM weave_check('cdnb_btree');
+
+-- An index built over an empty table still has a metapage and an empty bolt
+-- directory, so every invariant holds vacuously and nothing is violated.  (The
+-- zero-block case weave_check() also handles is only reachable for an index whose
+-- storage was never created.)
+CREATE TABLE cdempty (id serial, d wdoc);
+CREATE INDEX cdempty_weave ON cdempty USING weave (d);
+SELECT count(*) AS violations_empty
+  FROM weave_check('cdempty_weave', true) WHERE NOT ok;
+
+DROP TABLE cd;
+DROP TABLE cdnb;
+DROP TABLE cdempty;

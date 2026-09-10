@@ -8,13 +8,19 @@
  * weave/graph.h.  Read doc/specs/VECTOR_CHANNEL.md before changing anything
  * here, and weave/channel.h before touching the shuttle.
  *
- * PAGE-KIND BIT ALLOCATION.  weave/am.h bits 0-9 belong to the lexical channel
- * and the segment machinery.  The allocation for the rest is fixed in
- * doc/specs/SEGMENT_FORMAT.md and must not be improvised:
+ * PAGE-KIND ALLOCATION.  The vector channel's four page kinds are NOT bits.
+ * weave/am.h bits 0-9 of WeavePageOpaqueData.flags are spent on the lexical
+ * channel and the segment machinery, bit 8 is the WEAVE_FREED state and bits
+ * 10-14 are reserved-zero, so there is no room for a vector bit -- shipping one
+ * would collide with the fuzzy channel (doc/specs/SEGMENT_FORMAT.md sect. 2,
+ * blocking gate 5).  Since v6 the kinds below are INTEGER ids in the extended
+ * kind space, stored in WeavePageOpaqueData.kind under the
+ * WEAVE_PAGE_KIND_EXT escape bit.  Read them with WeavePageHasKind(), never with
+ * a bitwise AND: `flags & WEAVE_VMETA` compiles and is always false.
  *
- *		10-13	vector channel			(this header)
- *		14-17	fuzzy/regex channel		(weave/surf.h et al.)
- *		18-19	docvalues and cgram
+ * The ids themselves are allocated in one place, the WeavePageKind enum in
+ * weave/am.h, so a second channel cannot quietly take a number this one used.
+ * The names below are aliases kept beside the structs they describe.
  *
  * Copyright (c) 2025-2026, Gregory Burd
  *
@@ -37,14 +43,14 @@
  * Page kinds
  * ------------------------------------------------------------------------- */
 
-#define WEAVE_VMETA			(1 << 10)	/* per-segment vector channel descriptor:
+#define WEAVE_VMETA			WEAVE_PK_VMETA	/* per-segment vector channel descriptor:
 										 * dim, bits, metric, pack layout,
 										 * calibration, block directory root */
-#define WEAVE_VCODES		(1 << 11)	/* packed quantized codes, 32-vector
+#define WEAVE_VCODES		WEAVE_PK_VCODES /* packed quantized codes, 32-vector
 										 * blocks, each preceded by a
 										 * WeaveVecBlockHdr */
-#define WEAVE_VGRAPH		(1 << 12)	/* Vamana CSR adjacency (weave/graph.h) */
-#define WEAVE_VRERANK		(1 << 13)	/* optional full-precision sidecar for
+#define WEAVE_VGRAPH		WEAVE_PK_VGRAPH /* Vamana CSR adjacency (weave/graph.h) */
+#define WEAVE_VRERANK		WEAVE_PK_VRERANK	/* optional full-precision sidecar for
 										 * the recall=exact rerank tail */
 
 /* ---------------------------------------------------------------------------
