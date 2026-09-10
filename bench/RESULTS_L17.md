@@ -128,6 +128,21 @@ follow-ups, both consequences of measurements in this run:
    both fall from ~15,000 to ~584 per query, at the same total memcpy volume.
    The objection that killed this idea for v4 does not apply to v5.
 
+**Status: both shipped 2026-09-10** (`src/am/am.c`, doclen sidecar cursor;
+`doc/PHASES.md` L17). (1) became `WEAVE_DOCLEN_WALK_WINDOW`: one O(1)
+`weave_for_get` read at the resume hint decides whether the walk can reach the
+target within its window before committing to it, rather than "bisect
+immediately on overshoot" alone — the overshoot check alone does not catch the
+common failure mode here, where the hint is fresh (index 0) and the target is
+merely far away without ever being overshot. (2) shipped as specified:
+`weave_doclen_cursor_load_page` copies the whole page into
+`WeaveDoclenResident`, and a new `weave_doclen_cursor_relocate` serves any
+other block on that page from memory. Instrumented on a smaller (100k-doc)
+scratch corpus, not this file's 2M-doc benchmark: `weave_for_get` calls/lookup
+~12.0 → ~6.55 (mid term), warm buffer hits for the same query 767 → 90. Result
+rows verified identical before/after. No new latency table was run for this
+change; see `doc/PHASES.md` L17 for the exact numbers and their scale caveat.
+
 ## Limitations, stated rather than smoothed over
 
 - **No test reads a real on-disk v4 sidecar page.** The dual reader is covered at

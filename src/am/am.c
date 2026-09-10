@@ -2331,7 +2331,34 @@ weave_doclen_lookup(const WeaveDoclens *d, uint64 docid)
  */
 typedef struct WeaveDoclenResident
 {
-	BlockNumber blk;			/* page the resident block came from, or Invalid */
+	/*
+	 * v5 whole-PAGE cache (follow-up to L17; bench/RESULTS_L17.md "Copy the
+	 * whole page instead of the block").  A sidecar page holds ~31 128-doc
+	 * blocks (~4000 docs); at rare/mid stride (~50-200 docids) a lookup's
+	 * next docid usually falls on a DIFFERENT BLOCK of the SAME PAGE, and
+	 * re-running ReadBuffer/LockBuffer/UnlockReleaseBuffer just to reach a
+	 * block already sitting in shared buffers measured ~15,000 buffer hits
+	 * for one ranked mid k=10 query. Copying the WHOLE page once per page
+	 * change turns that into ~1 buffer touch per ~31 candidates instead of
+	 * per 1, at the cost of one 8 KB memcpy instead of a few-hundred-byte
+	 * one -- see weave_doclen_cursor_load_page().
+	 *
+	 * This is the SAME idea that was tried and reverted for v4 (see that
+	 * function's history): a v4 block has to be FOR-unpacked and
+	 * prefix-summed before it is usable, so copying ~31 blocks to answer one
+	 * lookup was ~31x decode amplification for no benefit. v5's column is
+	 * fixed-width addressable and is never decoded -- weave_for_get() reads
+	 * packed bytes directly -- so a whole-page copy costs exactly one memcpy
+	 * and nothing downstream gets bigger. The objection that killed this for
+	 * v4 does not apply to v5, which is why this is safe now and was not
+	 * safe at L17 time.
+	 */
+	BlockNumber pageblk;		/* page currently copied into `page`, or Invalid */
+	unsigned char *page;		/* palloc'd copy of the whole sidecar page (BLCKSZ) */
+	int			pagecap;		/* capacity of page (== BLCKSZ once allocated) */
+	uint64		pagefirst;		/* first docid covered by the resident page */
+	uint64		pagelast;		/* last docid covered by the resident page */
+
 	uint64	   *docid;			/* v4 only: decoded docids (palloc'd) */
 	uint8	   *byte;			/* v4 only: parallel quantized bytes (palloc'd) */
 	int			n;				/* docs in the resident block */
@@ -2344,21 +2371,20 @@ typedef struct WeaveDoclenResident
 	/*
 	 * v5 fast path.  A v5 block's docid column is absolute offsets from `base`
 	 * and is therefore fixed-width addressable, so instead of decoding the block
-	 * we keep a COPY OF ITS PACKED BYTES and binary-search them in place with
-	 * weave_for_get().  The copy is a few hundred bytes (a 128-entry column at
-	 * ~13 bits plus 128 length bytes) against the 128 FOR-unpacks + 128
-	 * prefix-sum stores it replaces -- which were ~72% of a ranked scan
-	 * (bench/RESULTS_SCAN_PROFILE.md).  `docid`/`byte` stay unused for v5.
+	 * we binary-search its packed bytes in place with weave_for_get().  `raw`
+	 * and `rawbyte` point INTO the whole-page copy above -- there is no
+	 * separate per-block copy any more -- so relocating to a different block
+	 * of the same resident page is pointer arithmetic, not a memcpy.
+	 * `docid`/`byte` stay unused for v5.
 	 *
 	 * A copy rather than a pin: load_page releases the buffer before returning,
-	 * and holding a pin across executor calls to keep the block addressable
+	 * and holding a pin across executor calls to keep the page addressable
 	 * would be a materially bigger change to the scan's locking story for no
 	 * measured gain (buffer lookup was 1.9% of the scan).
 	 */
 	bool		isabs;			/* resident block is v5 (absolute offsets) */
-	unsigned char *raw;			/* packed docid column, copied (palloc'd) */
-	int			rawcap;			/* capacity of raw */
-	const uint8 *rawbyte;		/* length bytes, inside raw[] after the column */
+	const unsigned char *raw;	/* packed docid column, pointing into `page` */
+	const uint8 *rawbyte;		/* length bytes, inside `page` after the column */
 	uint64		base;			/* block's first_docid */
 } WeaveDoclenResident;
 
@@ -2603,23 +2629,25 @@ weave_doclen_cursor_init(WeaveDoclenCursor *c, Relation index, BlockNumber start
 	}
 	if (c->dir_n > 0 && res != NULL)
 	{
-		/* Attach the SHARED resident block for this segment.  Lazily size it to
-		 * one 128-doc block (we decode only the block covering the sought docid,
-		 * never a whole page). */
-		if (res->docid == NULL)
+		/* Attach the SHARED resident page/block for this segment.  `page` is
+		 * sized to one whole sidecar page (WeaveDoclenResident's comment
+		 * explains why a whole page, not one block); `docid`/`byte` remain
+		 * one-block-sized because a v4 block is decoded into them, not
+		 * addressed in place. */
+		if (res->page == NULL)
 		{
 			res->cap = WEAVE_BLOCK_SIZE;
 			res->docid = (uint64 *) palloc(res->cap * sizeof(uint64));
 			res->byte = (uint8 *) palloc(res->cap * sizeof(uint8));
-			/* v5: room for one block's packed docid column plus its length bytes.
-			 * The column is at most WEAVE_BLOCK_SIZE 64-bit values plus the codec's
-			 * leading width byte, which is also the writer's own scratch bound. */
-			res->rawcap = 1 + (WEAVE_BLOCK_SIZE * 64 + 7) / 8 + WEAVE_BLOCK_SIZE;
-			res->raw = (unsigned char *) palloc(res->rawcap);
+			res->pagecap = BLCKSZ;
+			res->page = (unsigned char *) palloc(res->pagecap);
+			res->pageblk = InvalidBlockNumber;
+			res->pagefirst = 0;
+			res->pagelast = 0;
+			res->raw = NULL;
 			res->rawbyte = NULL;
 			res->isabs = false;
 			res->base = 0;
-			res->blk = InvalidBlockNumber;
 			res->n = 0;
 			res->first = 0;
 			res->last = 0;
@@ -2640,63 +2668,17 @@ weave_doclen_cursor_free(WeaveDoclenCursor *c)
 	c->res = NULL;
 }
 
-/* Decode the ONE sidecar block on page `blkno` whose docid range covers `docid`
- * into the cursor's resident arrays.
- *
- * A sidecar page holds many 128-doc blocks (~31 of them, ~4000 docs).  Decoding
- * the WHOLE page per lookup was a large amplification for a scattered rare term:
- * 10,875 postings spread over 2.19M docids touch essentially every sidecar page,
- * and decoding ~4000 entries to answer each lookup meant ~2.2M doc-decodes to
- * score 10,875 postings (~200x amplification; measured as ~7.9 ms of the 10.2 ms
- * rare-term ranked latency).  So: walk only the block HEADERS (first_docid +
- * count + gapbytes -- no FOR-unpack) to find the covering block, then take that
- * single block.  Same page read, ~31x less work, no format change.
- *
- * v5 goes further and does not decode the block at all.  Its docid column is
- * absolute offsets from first_docid, hence fixed-width addressable, so we copy
- * the packed column (a few hundred bytes) and let the caller binary-search it
- * with weave_for_get().  v4's gap-coded column still has to be unpacked and
- * prefix-summed into r->docid[]/r->byte[], which is the path this function took
- * for every block change and which measured ~72% of a ranked scan
- * (bench/RESULTS_SCAN_PROFILE.md).
- *
- * `res_first`/`res_last` record the resident block's docid range so the caller's
- * fast path can tell whether a later docid is still covered. */
-static void
-weave_doclen_cursor_load_page(WeaveDoclenCursor *c, BlockNumber blkno, uint64 docid)
+/* Header-only walk of the resident page copy `r->page`, from `start` to the
+ * page's end, finding the LAST block whose first_docid <= docid.  Used both
+ * right after a page copy (start = the page's first block) and by the
+ * same-page relocation fast path.  Never touches the buffer manager: `r->page`
+ * is already a private copy. */
+static inline char *
+weave_doclen_resident_find_block(char *start, char *end, uint64 docid)
 {
-	WeaveDoclenResident *r = c->res;
-	Buffer		buf;
-	Page		page;
-	char	   *ptr,
-			   *end;
-	char	   *cand = NULL;		/* best (largest first_docid <= docid) block */
+	char	   *ptr = start;
+	char	   *cand = NULL;
 
-	if (r == NULL)
-		return;
-	r->n = 0;
-	r->blk = blkno;
-	r->first = 0;
-	r->last = 0;
-	r->hint = 0;				/* new block: the ascending-resume hint restarts */
-	r->isabs = false;
-	r->rawbyte = NULL;
-	r->base = 0;
-	if (blkno == InvalidBlockNumber || r->docid == NULL ||
-		blkno >= RelationGetNumberOfBlocks(c->index))
-		return;
-	buf = ReadBuffer(c->index, blkno);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
-	if (PageIsNew(page) || !(WeavePageGetOpaque(page)->flags & WEAVE_DOCLEN))
-	{
-		UnlockReleaseBuffer(buf);
-		return;
-	}
-	end = (char *) page + ((PageHeader) page)->pd_lower;
-
-	/* pass 1: headers only -- find the last block whose first_docid <= docid */
-	ptr = (char *) page + MAXALIGN(SizeOfPageHeaderData);
 	while (ptr + sizeof(WeaveDoclenBlockHdr) <= end)
 	{
 		WeaveDoclenBlockHdr *bh = (WeaveDoclenBlockHdr *) ptr;
@@ -2716,59 +2698,194 @@ weave_doclen_cursor_load_page(WeaveDoclenCursor *c, BlockNumber blkno, uint64 do
 			break;				/* blocks are docid-ascending: no later block fits */
 		ptr = (char *) MAXALIGN(blkend);
 	}
+	return cand;
+}
 
-	/* pass 2: take ONLY the covering block */
-	if (cand != NULL)
+/* Populate the block-level fields of `r` (isabs/raw/rawbyte/base/first/last/n)
+ * from the block header at `bh`, an address INSIDE r->page.  `bytes` is the
+ * on-disk length column that follows the docid column. */
+static inline void
+weave_doclen_resident_load_block(WeaveDoclenResident *r, WeaveDoclenBlockHdr *bh)
+{
+	uint32		bcount = WEAVE_DOCLEN_COUNT(bh->count);
+	uint8	   *bytes = (uint8 *) ((char *) (bh + 1) + bh->gapbytes);
+
+	r->hint = 0;				/* new block: the ascending-resume hint restarts */
+	if (WEAVE_DOCLEN_IS_ABS(bh->count))
 	{
-		WeaveDoclenBlockHdr *bh = (WeaveDoclenBlockHdr *) cand;
+		/*
+		 * v5: point at the packed column + its length bytes IN PLACE inside
+		 * the resident page copy -- no per-block copy at all.  first/last
+		 * come from the column's endpoints, which are O(1) reads -- offs[0]
+		 * is always 0, so `first` is the base.
+		 */
+		r->raw = (const unsigned char *) (bh + 1);
+		r->rawbyte = (const uint8 *) (r->raw + bh->gapbytes);
+		r->base = ((uint64) bh->first_docid_hi << 32) | bh->first_docid_lo;
+		r->n = (int) bcount;
+		r->isabs = true;
+		r->first = r->base;
+		r->last = r->base + weave_for_get(r->raw, (int) bcount - 1);
+	}
+	else
+	{
+		/* v4: gap-coded, so the block must be unpacked and prefix-summed */
+		uint64		gaps[WEAVE_BLOCK_SIZE];
+		uint64		acc;
+		int			j;
+
+		r->isabs = false;
+		r->raw = NULL;
+		r->rawbyte = NULL;
+		r->n = 0;
+		weave_for_unpack((unsigned char *) (bh + 1), (int) bcount, gaps);
+		acc = ((uint64) bh->first_docid_hi << 32) | bh->first_docid_lo;
+		for (j = 0; j < (int) bcount && r->n < r->cap; j++)
+		{
+			acc += gaps[j];		/* gaps[0] == 0 */
+			r->docid[r->n] = acc;
+			r->byte[r->n] = bytes[j];
+			r->n++;
+		}
+		if (r->n > 0)
+		{
+			r->first = r->docid[0];
+			r->last = r->docid[r->n - 1];
+		}
+	}
+}
+
+/* Relocate the resident BLOCK to the one covering `docid` within the resident
+ * PAGE copy `r->page`, WITHOUT touching the buffer manager.  Callable whenever
+ * `docid` is known to fall within [r->pagefirst, r->pagelast]: right after
+ * weave_doclen_cursor_load_page() copies a new page, and from the cursor's
+ * same-page-different-block fast path. */
+static void
+weave_doclen_cursor_relocate(WeaveDoclenResident *r, uint64 docid)
+{
+	char	   *end = (char *) r->page + ((PageHeader) r->page)->pd_lower;
+	char	   *start = (char *) r->page + MAXALIGN(SizeOfPageHeaderData);
+	char	   *cand = weave_doclen_resident_find_block(start, end, docid);
+
+	r->n = 0;
+	r->first = 0;
+	r->last = 0;
+	r->hint = 0;
+	r->isabs = false;
+	r->raw = NULL;
+	r->rawbyte = NULL;
+	r->base = 0;
+	if (cand != NULL)
+		weave_doclen_resident_load_block(r, (WeaveDoclenBlockHdr *) cand);
+}
+
+/* Copy the sidecar PAGE `blkno` into the cursor's resident page cache and
+ * relocate to the block covering `docid`.
+ *
+ * Earlier versions of this function copied only the ONE covering block, not
+ * the whole page: a sidecar page holds ~31 128-doc blocks (~4000 docs), and
+ * for v4 (gap-coded, must be FOR-unpacked + prefix-summed to be usable)
+ * copying-and-decoding all ~31 to serve one lookup was ~31x amplification --
+ * tried and reverted; see the comment on WeaveDoclenResident.  v5's docid
+ * column is fixed-width addressable and is NEVER decoded, so the objection
+ * does not apply: copying the whole page costs one 8 KB memcpy, and every
+ * block on that page becomes reachable by weave_doclen_cursor_relocate()
+ * without another trip through the buffer manager.  Measured: buffer hits for
+ * one ranked mid k=10 query fell from ~15,000 to ~584
+ * (bench/RESULTS_L17.md's follow-up 2).
+ *
+ * `r->pagefirst`/`r->pagelast` record the resident PAGE's docid range (not
+ * just the resident block's) so the caller's fast path can relocate within
+ * the page instead of re-reading it. */
+static void
+weave_doclen_cursor_load_page(WeaveDoclenCursor *c, BlockNumber blkno, uint64 docid)
+{
+	WeaveDoclenResident *r = c->res;
+	Buffer		buf;
+	Page		page;
+	char	   *ptr,
+			   *end;
+	char	   *lastblk;
+
+	if (r == NULL)
+		return;
+	r->n = 0;
+	r->first = 0;
+	r->last = 0;
+	r->hint = 0;
+	r->isabs = false;
+	r->raw = NULL;
+	r->rawbyte = NULL;
+	r->base = 0;
+	r->pageblk = InvalidBlockNumber;
+	r->pagefirst = 0;
+	r->pagelast = 0;
+	if (blkno == InvalidBlockNumber || r->page == NULL ||
+		blkno >= RelationGetNumberOfBlocks(c->index))
+		return;
+	buf = ReadBuffer(c->index, blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	if (PageIsNew(page) || !(WeavePageGetOpaque(page)->flags & WEAVE_DOCLEN))
+	{
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+	memcpy(r->page, page, BLCKSZ);
+	UnlockReleaseBuffer(buf);		/* r->page is a private copy from here on */
+	r->pageblk = blkno;
+
+	end = (char *) r->page + ((PageHeader) r->page)->pd_lower;
+	ptr = (char *) r->page + MAXALIGN(SizeOfPageHeaderData);
+
+	/* header-only walk to find the page's first and last docid, and the last
+	 * block header (reused below to compute pagelast) -- ~31 header hops,
+	 * done once per PAGE change rather than once per lookup */
+	lastblk = weave_doclen_resident_find_block(ptr, end, PG_UINT64_MAX);
+	if (ptr + sizeof(WeaveDoclenBlockHdr) <= end)
+	{
+		WeaveDoclenBlockHdr *bh0 = (WeaveDoclenBlockHdr *) ptr;
+
+		r->pagefirst = ((uint64) bh0->first_docid_hi << 32) | bh0->first_docid_lo;
+	}
+	if (lastblk != NULL)
+	{
+		WeaveDoclenBlockHdr *bh = (WeaveDoclenBlockHdr *) lastblk;
 		uint32		bcount = WEAVE_DOCLEN_COUNT(bh->count);
-		uint8	   *bytes = (uint8 *) ((char *) (bh + 1) + bh->gapbytes);
+		uint64		first = ((uint64) bh->first_docid_hi << 32) | bh->first_docid_lo;
 
 		if (WEAVE_DOCLEN_IS_ABS(bh->count))
-		{
-			/*
-			 * v5: copy the packed column + its length bytes and leave them
-			 * packed.  first/last come from the column's endpoints, which are
-			 * O(1) reads -- offs[0] is always 0, so `first` is the base.
-			 */
-			Size		need = (Size) bh->gapbytes + bcount;
-
-			if (need <= (Size) r->rawcap)
-			{
-				memcpy(r->raw, (unsigned char *) (bh + 1), need);
-				r->rawbyte = (const uint8 *) (r->raw + bh->gapbytes);
-				r->base = ((uint64) bh->first_docid_hi << 32) | bh->first_docid_lo;
-				r->n = (int) bcount;
-				r->isabs = true;
-				r->first = r->base;
-				r->last = r->base + weave_for_get(r->raw, (int) bcount - 1);
-			}
-		}
+			r->pagelast = first + weave_for_get((const unsigned char *) (bh + 1),
+												 (int) bcount - 1);
 		else
 		{
-			/* v4: gap-coded, so the block must be unpacked and prefix-summed */
+			/* v4: the last block's last docid needs one unpack */
 			uint64		gaps[WEAVE_BLOCK_SIZE];
-			uint64		acc;
+			uint64		acc = first;
 			int			j;
 
 			weave_for_unpack((unsigned char *) (bh + 1), (int) bcount, gaps);
-			acc = ((uint64) bh->first_docid_hi << 32) | bh->first_docid_lo;
-			for (j = 0; j < (int) bcount && r->n < r->cap; j++)
-			{
-				acc += gaps[j];		/* gaps[0] == 0 */
-				r->docid[r->n] = acc;
-				r->byte[r->n] = bytes[j];
-				r->n++;
-			}
-			if (r->n > 0)
-			{
-				r->first = r->docid[0];
-				r->last = r->docid[r->n - 1];
-			}
+			for (j = 0; j < (int) bcount; j++)
+				acc += gaps[j];
+			r->pagelast = acc;
 		}
 	}
-	UnlockReleaseBuffer(buf);
+
+	weave_doclen_cursor_relocate(r, docid);
 }
+
+/* The 8-step linear pre-bisect walk (below) only pays off when the target is
+ * within its own window of the resume hint -- true for a common term whose
+ * consecutive docids land in adjacent block positions.  A rare/mid term's
+ * sparse stride (~50-200 docids) usually lands the target either in a
+ * different block (caught before the walk runs at all, see
+ * weave_doclen_cursor_lookup) or far past the hint WITHIN the block, so an
+ * unconditional walk paid its whole window and then bisected anyway: ~15
+ * weave_for_get calls per lookup measured for ranked mid k=10, against ~7 for
+ * a plain bisect (bench/RESULTS_L17.md's follow-up 1).  This is the walk's
+ * window width; the gate is "would `WEAVE_DOCLEN_WALK_WINDOW` index steps be
+ * enough", checked with one O(1) read before committing to the walk. */
+#define WEAVE_DOCLEN_WALK_WINDOW	8
 
 /* Exact doclen for docid via the page-directory cursor.  Robust to ANY docid
  * order; the ascending-resume hint makes the common monotone WAND scan land on
@@ -2784,12 +2901,22 @@ weave_doclen_cursor_lookup(WeaveDoclenCursor *c, uint64 docid)
 	if (c->dir_n == 0 || c->dir_docid == NULL || r == NULL)
 		return 0;
 
-	/* Fast path: docid is inside the resident BLOCK's range.  This now also hits
-	 * when a DIFFERENT term's cursor of the same segment already decoded the
-	 * block for this pivot docid (the multi-term win). */
+	/* Fast path 1: docid is inside the resident BLOCK's range.  This now also
+	 * hits when a DIFFERENT term's cursor of the same segment already decoded
+	 * the block for this pivot docid (the multi-term win). */
 	if (r->n > 0 && docid >= r->first && docid <= r->last)
 	{
 		/* fall through to the in-block search below */
+	}
+	/* Fast path 2: docid is outside the resident BLOCK but still inside the
+	 * resident PAGE's range.  weave_doclen_cursor_load_page() copies the
+	 * WHOLE page (see its comment and WeaveDoclenResident's), so every other
+	 * block on that page is already in local memory -- relocate to it with a
+	 * header re-walk instead of a fresh ReadBuffer. */
+	else if (r->pageblk != InvalidBlockNumber &&
+			 docid >= r->pagefirst && docid <= r->pagelast)
+	{
+		weave_doclen_cursor_relocate(r, docid);
 	}
 	else
 	{
@@ -2828,6 +2955,11 @@ weave_doclen_cursor_lookup(WeaveDoclenCursor *c, uint64 docid)
 	 * common-term ranked query -- 7 branchy iterations per posting, on a term
 	 * whose docids are consecutive.
 	 *
+	 * The walk itself is gated by WEAVE_DOCLEN_WALK_WINDOW (see its comment):
+	 * one O(1) read at the hint decides whether the walk can plausibly reach
+	 * the target, so a term whose stride makes the walk hopeless costs 1
+	 * wasted read instead of 8 before falling back to the bisect.
+	 *
 	 * v5 searches the block's PACKED column in place via weave_for_get (O(1) per
 	 * probe, fixed-width offsets from r->base), so no block decode happened at
 	 * all.  v4 searches the arrays that load_page had to materialize.  Both use
@@ -2838,7 +2970,6 @@ weave_doclen_cursor_lookup(WeaveDoclenCursor *c, uint64 docid)
 		int			rlo = 0,
 					rhi = r->n - 1;
 		int			i = r->hint;
-		int			lim;
 		uint64		want;
 
 		/* offsets are relative to r->base; a docid below it cannot be here */
@@ -2848,20 +2979,31 @@ weave_doclen_cursor_lookup(WeaveDoclenCursor *c, uint64 docid)
 
 		if (i < 0 || i >= r->n)
 			i = 0;
-		lim = i + 8;
-		if (lim > r->n)
-			lim = r->n;
-		for (; i < lim; i++)
+
+		if (r->n > 0)
 		{
 			uint64		v = weave_for_get(r->raw, i);
 
-			if (v == want)
+			if (v <= want && want - v < WEAVE_DOCLEN_WALK_WINDOW)
 			{
-				r->hint = i + 1;
-				return weave_byte_to_doclen(r->rawbyte[i]);
+				int			lim = i + WEAVE_DOCLEN_WALK_WINDOW;
+
+				if (lim > r->n)
+					lim = r->n;
+				for (;;)
+				{
+					if (v == want)
+					{
+						r->hint = i + 1;
+						return weave_byte_to_doclen(r->rawbyte[i]);
+					}
+					if (v > want)
+						break;	/* overshot: docid is absent (gap) or behind us */
+					if (++i >= lim)
+						break;
+					v = weave_for_get(r->raw, i);
+				}
 			}
-			if (v > want)
-				break;			/* overshot: docid is absent (gap) or behind us */
 		}
 
 		while (rlo <= rhi)
@@ -2885,22 +3027,34 @@ weave_doclen_cursor_lookup(WeaveDoclenCursor *c, uint64 docid)
 		int			rlo = 0,
 					rhi = r->n - 1;
 		int			i = r->hint;
-		int			lim;
 
 		if (i < 0 || i >= r->n)
 			i = 0;
-		lim = i + 8;
-		if (lim > r->n)
-			lim = r->n;
-		for (; i < lim; i++)
+
+		if (r->n > 0)
 		{
-			if (r->docid[i] == docid)
+			uint64		v = r->docid[i];
+
+			if (v <= docid && docid - v < WEAVE_DOCLEN_WALK_WINDOW)
 			{
-				r->hint = i + 1;
-				return weave_byte_to_doclen(r->byte[i]);
+				int			lim = i + WEAVE_DOCLEN_WALK_WINDOW;
+
+				if (lim > r->n)
+					lim = r->n;
+				for (;;)
+				{
+					if (v == docid)
+					{
+						r->hint = i + 1;
+						return weave_byte_to_doclen(r->byte[i]);
+					}
+					if (v > docid)
+						break;	/* overshot: docid is absent (gap) or behind us */
+					if (++i >= lim)
+						break;
+					v = r->docid[i];
+				}
 			}
-			if (r->docid[i] > docid)
-				break;			/* overshot: docid is absent (gap) or behind us */
 		}
 
 		while (rlo <= rhi)
