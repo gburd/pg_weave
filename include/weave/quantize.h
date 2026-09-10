@@ -448,10 +448,18 @@ weave_block_bound_l2(const WeaveQueryLut *lut, float smax, float maxrecnorm,
  * never has to guess:
  *
  *	 WEAVE_PACK_LANE		coordinate-major within a 32-vector block, the
- *							layout the byte-LUT kernels want.  On x86 the lanes
- *							are permuted by perm0 so an AVX2 shuffle can cross
- *							the 128-bit lane boundary; on ARM they are
- *							sequential.
+ *							layout the byte-LUT kernels want.  On x86 the AVX2
+ *							kernel additionally shuffles lanes by `perm0` so one
+ *							instruction can cross the 128-bit lane boundary; on
+ *							ARM the NEON byte-LUT kernel visits lanes
+ *							sequentially. Either way `perm0` is a REGISTER-level
+ *							relabelling the kernel applies after loading these
+ *							same on-disk bytes -- it is not a third value of
+ *							this enum and it never changes what is written to
+ *							the block.  `src/vector/pack.c`'s `code_index()` is
+ *							the only bit-index mapping WEAVE_PACK_LANE has, on
+ *							every architecture; see the comment there and
+ *							`doc/specs/VECTOR_CHANNEL.md` §8.
  *	 WEAVE_PACK_VECMAJOR	vector-major, the layout the int8 dot-product
  *							kernels (NEON SDOT/SMMLA, AVX-512 VNNI) want.
  *
@@ -481,5 +489,20 @@ extern void weave_unpack_lane(WeavePackLayout layout, int dim, int bits,
 							  const weave_uint8 *block, int slot, weave_uint8 *code);
 extern void weave_pack_zero_lane(WeavePackLayout layout, int dim, int bits,
 								 weave_uint8 *block, int slot);
+
+/*
+ * Move lane `src` into lane `dst`, overwriting whatever was there.  This is
+ * the O(1) half of vacuum's swap-remove: retire the deleted vector's slot by
+ * moving the block's last live lane into it (`weave_pack_move_lane`), then
+ * mark the vacated source slot dead in WeaveVecBlockHdr.livemask (its bits are
+ * left as-is; livemask, not zero content, is what makes a lane live).  Cost is
+ * one lane's worth of bits, not the block's, which is the point: vacuuming one
+ * row must not touch the other 31.
+ *
+ * dst == src is a correctly-handled no-op, not a caller precondition -- the
+ * deleted lane can already be the last live one.
+ */
+extern void weave_pack_move_lane(WeavePackLayout layout, int dim, int bits,
+								 weave_uint8 *block, int dst, int src);
 
 #endif							/* WEAVE_QUANTIZE_H */

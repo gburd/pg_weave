@@ -133,3 +133,32 @@ weave_pack_zero_lane(WeavePackLayout layout, int dim, int bits,
 	for (j = 0; j < dim; j++)
 		put_bits(block, code_index(layout, dim, slot, j), bits, 0);
 }
+
+/*
+ * Move lane `src` to lane `dst`, coordinate by coordinate, without touching
+ * any other lane's bits.  See the declaration in weave/quantize.h for why this
+ * is the operation vacuum wants: it costs one lane, not the block.
+ *
+ * Reads all of `src` before writing any of `dst`... no, it does not need to:
+ * `code_index` is injective in (slot, j) for fixed layout, so src's and dst's
+ * bit ranges never overlap when dst != src, and a single left-to-right pass
+ * reading-then-writing coordinate j at a time is safe.  The dst == src case is
+ * a copy onto itself, which is also safe without special-casing, but the
+ * early return avoids WEAVE_VEC_BLOCK-many redundant bit twiddles.
+ */
+void
+weave_pack_move_lane(WeavePackLayout layout, int dim, int bits,
+					 weave_uint8 *block, int dst, int src)
+{
+	int			j;
+
+	if (dst == src)
+		return;
+
+	for (j = 0; j < dim; j++)
+	{
+		weave_uint32 v = get_bits(block, code_index(layout, dim, src, j), bits);
+
+		put_bits(block, code_index(layout, dim, dst, j), bits, v);
+	}
+}
