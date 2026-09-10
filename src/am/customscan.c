@@ -50,6 +50,7 @@
 
 #include "weave/weave.h"
 #include "weave/am.h"			/* weave_init_reloptions */
+#include "weave/vector.h"		/* weave_vec_kernels_init */
 
 /* engine entry point implemented in pg_weave_am_scan.c (via pg_weave_am.c) */
 extern int64 weave_count_visible_oid(Oid indexoid, WeaveQuery q);
@@ -418,6 +419,12 @@ _PG_init(void)
 	/* Fuzzy/regex channel GUCs (src/query/fuzzy_guc.c).  Registered here because
 	 * this is the module's single documented entry point; see that file's note. */
 	pg_weave_init_fuzzy_guc();
+
+	/* Vector-channel kernel dispatch (src/vector/kernel_ops.c): resolve the
+	 * function-pointer table and register pg_weave.vec_kernel.  Once, here, the
+	 * way core resolves pg_popcount -- so weave_vec_kernel_name() can answer
+	 * "which path ran?" in a bug report. */
+	weave_vec_kernels_init();
 
 	/*
 	 * Cap (in MB) on the total index size for which an index BUILD finalizes to

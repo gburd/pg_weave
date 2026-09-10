@@ -1,7 +1,8 @@
 # Specification: the vector channel
 
-Status: **codec implemented and property-tested; storage, kernels, and graph
-unimplemented.** Tasks **V1**–**V14** in `doc/PHASES.md`.
+Status: **codec implemented and property-tested; scoring kernels partially
+implemented (three exact paths, §8); storage and IVF unimplemented.** Tasks
+**V1**–**V14** in `doc/PHASES.md`.
 
 Headers: `include/weave/quantize.h` (backend-independent codec),
 `include/weave/vector.h` (type, pages, shuttle), `include/weave/graph.h`
@@ -237,20 +238,56 @@ shape PostgreSQL itself uses for `pg_popcount` and CRC32C (`src/port/`).
 Following core's pattern rather than inventing one keeps "which path ran?"
 answerable from `weave_vec_kernel_name()` in a bug report.
 
-| ISA | strategy | notes |
-|---|---|---|
-| scalar | reference | the oracle; every other path must match it |
-| SSE2 | byte LUT | baseline x86-64 |
-| AVX2 | byte LUT, `perm0`-interleaved lanes | one shuffle crosses the 128-bit lane boundary |
-| AVX-512BW | byte LUT | wider accumulate |
-| AVX-512 VNNI | int8 dot | vector-major layout |
-| NEON | byte LUT | baseline aarch64 |
-| NEON SDOT / I8MM SMMLA | int8 dot | vector-major; credited with turbovec's 3.4–3.7× ARM speedup |
+The ISA matrix as originally drafted, and what V6 actually shipped:
 
-Nibble-split byte-LUT wins at low bit widths and small *d*; int8 dot wins when
-the hardware has a dot-product instruction and *d* is large. Do not guess —
-`bench/kernels.c` should A/B them per host, and `weave_vec_kernel` exists to
-force a path when reproducing a bug report from a different machine.
+| ISA | strategy | status |
+|---|---|---|
+| scalar | reference | **implemented** (`scalar`); the oracle, and the only path that reads codes through the pack API rather than assuming a layout |
+| portable wide-word | exact float LUT | **implemented** (`lut-wide`); not in the original table, and it is the baseline every vector path must beat |
+| AVX2 | exact float LUT: `vpsrlvd` + `vpgatherdps` + `vcvtps2pd` | **implemented** (`lut-avx2`), verified on x86-64 |
+| SSE2 | byte LUT | **not implemented** — see below |
+| AVX-512BW | byte LUT | not implemented; no AVX-512 host or emulator available to verify on |
+| AVX-512 VNNI | int8 dot | not implemented — approximate, see below |
+| NEON | byte LUT | not implemented — see below; aarch64 runs `lut-wide` |
+| NEON SDOT / I8MM SMMLA | int8 dot | not implemented — approximate, see below |
+
+**The gate and the strategy table were in conflict, and the gate won.** V6's gate
+is "every ISA path produces results identical to the scalar path". A nibble-split
+byte-LUT or an int8-dot kernel quantizes the *query lookup table* to 8 bits before
+gathering, so it is not one ULP from the scalar reference, it is one quantization
+step from it — it cannot pass that gate, and it owes a recall budget and a recall
+measurement that do not exist yet. Both approximate families were therefore left
+unimplemented rather than shipped against a tolerance nobody had derived. That
+choice is reversible; the sequence is not. Measure the error first.
+
+**Held to exactness, scoring is gather-bound, which shortens the matrix a second
+time.** The exact kernel is 32 independent table lookups per coordinate plus a
+double accumulate. SSE2 has neither a gather nor a variable shift, and neither
+does baseline NEON, so an exact kernel on either ISA is `lut-wide` plus register
+shuffling — which is why neither was written and why aarch64 currently runs the
+portable path. AVX2 is the first x86 ISA with both. This is the same shape of
+conclusion pg_turbovec reached for their Hamming kernel (below): start wide-word
+scalar, and do not assume a vector ISA helps.
+
+**Bit-identity is affordable because the parallelism is across lanes, not across
+coordinates.** Each lane's sum stays in strict ascending *j* order in a double,
+exactly as `weave_lut_score_code()` does it, so running 8 lanes at once
+reassociates nothing. `test/hegel/test_kernels.c` compares with `memcmp` and not a
+tolerance (236,481 checks), which means a future kernel either matches or is
+rejected — no judgement calls. A kernel that used multiple partial sums per lane,
+or FMA, would forfeit that and is not worth the speed.
+
+Also not present: the `perm0` lane interleave. It exists to let a VPSHUFB
+byte-LUT gather cross the 128-bit lane boundary in one instruction; a
+`vpgatherdps` kernel indexes lanes directly, so introducing one would only create
+an opportunity to permute the output.
+
+Which of the three verified paths is fastest on a given host is **not measured**:
+`bench/kernels.c` is still owed, `auto` picks the widest ISA by convention rather
+than by measurement, and `pg_weave.vec_kernel` (`auto`/`scalar`/`lut`/`dot`)
+exists to force a path for A/B work and to reproduce a bug report from another
+machine. Since every implemented path is bit-identical, that GUC changes speed
+and never answers.
 
 **Two data points from pg_turbovec v2.7.0, so we do not repeat the work.** They
 made a wide-word Hamming kernel **~4.4× faster** at embedding dimensions
@@ -398,7 +435,7 @@ lanes. That is task V11 and its gate is a torn-write injection TAP test.
 | V3 codebook | `test_quantize.c` P4 (sorted, symmetric, `absmax < 6/√d`) + fixture | passing |
 | V4 encode round-trip and unbiasedness | `test_quantize.c` P5, P6 | passing |
 | V5 packing | `test/hegel/test_pack.c`: round-trip, lane isolation, `move_lane`/`zero_lane`, guard-byte bounds | passing, 1,909,440 checks |
-| V6 kernel equivalence | `test/hegel/test_kernels.c`: every ISA path == scalar | not started |
+| V6 kernel equivalence | `test/hegel/test_kernels.c`: every ISA path == scalar | passing, 236,481 checks over `scalar`, `lut-wide`, `lut-avx2`; no AVX-512, NEON or approximate path exists to compare (§8) |
 | V7 crash safety | extend `t/001_crash_recovery.pl` to a vector index | not started |
 | V8 shuttle contract | `test_quantize.c` P8 (C2 soundness) + `bench/bound_pruning.c` soundness assert | passing, 17741 checks |
 | V9 graph recall/latency/storage | `bench/RESULTS_VECTOR.md` | not started |

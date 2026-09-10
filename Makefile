@@ -31,6 +31,8 @@ OBJS = \
 	src/query/match.o \
 	src/vector/quantize.o \
 	src/vector/pack.o \
+	src/vector/kernels.o \
+	src/vector/kernel_ops.o \
 	src/vector/wvec.o \
 	$(FUZZY_OBJS) \
 	$(TRE_OBJS)
@@ -291,6 +293,11 @@ check-standalone:
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/q test/hegel/test_quantize.c \
 		src/vector/quantize.c src/vector/pack.c -lm; \
 	$$tmp/q | tail -1; \
+	echo "== vector kernels: every available ISA path == the scalar oracle, bit for bit =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/k test/hegel/test_kernels.c \
+		src/vector/kernels.c src/vector/quantize.c src/vector/pack.c -lm; \
+	$$tmp/k > $$tmp/k.log || { cat $$tmp/k.log; exit 1; }; \
+	sed -n '1p;$$p' $$tmp/k.log; \
 	echo "== v5 doclen sidecar: random access over absolute offsets == gap decode =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/dlb test/hegel/test_doclen_block.c -lm; \
 	$$tmp/dlb | tail -1; \
