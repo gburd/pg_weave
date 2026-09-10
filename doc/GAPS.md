@@ -32,7 +32,7 @@ From `bench/RESULTS_LEXICAL.md`, 1M documents, r6id.4xlarge, PostgreSQL 17.
 
 | # | gap | measured | target |
 |---|---|---|---|
-| **G13** | ranked latency at k=10 | **ROOT CAUSE MEASURED 2026-09-10 (`bench/RESULTS_SCAN_PROFILE.md`).** pg_weave 2.82 / 10.26 / 15.35 ms (rare/mid/common) vs pg_textsearch 1.25 / 1.63 / 3.16 — 2.25×/6.31×/4.86×. The cost is **k-independent and df-proportional** (pg_weave k=10 and k=100 differ <10%; pg_textsearch's k=100 is 5–7× its k=10), so it is paid per *candidate*, not per *result*, and `wand_initial_k` is not the floor (mid k=10 is 9.82 ms at 4 vs 10.31 at 32). Profile: **~72% is the doclen sidecar cursor**, only 1.9% of it buffer lookup — 11,702 buffer hits to return 10 rows, one page touch per 3.4 candidates against a documented intent of ~1 per 128. Posting decode + BM25 + WAND are the other ~28%, so **L2 (impact ordering) attacks the smaller half and its "decode-bound" root cause is withdrawn**. Route is **L17**: the sequential decode is already at its floor (~1.9M entry decodes vs a 2M one-per-document floor), so caching cannot fix it — the docid column must become randomly addressable (absolute offsets instead of gaps, enabling a ~7-step `weave_for_get` binary search in place of 128 unpacks per block change) at a cost of +0.7% index size. | ≤ 2× pg_textsearch at k=10 |
+| **G13** | ranked latency at k=10 | **NARROWED by L17 2026-09-10 (`bench/RESULTS_L17.md`).** rare **2.82 → 1.51 ms (1.20× behind** pg_textsearch, from 2.25×), mid **10.26 → 6.19 (3.81× behind**, from 6.31×), common 15.35 → 14.92 (4.75× behind, from 4.86×). At k=100 pg_weave now WINS rare by 3.96× and mid by 1.27×. Cause was measured, not assumed: the doclen sidecar cursor was 72% of a ranked scan because its gap-coded docid column had to be unpacked and prefix-summed (128 entries) to serve ~2.6 candidates. v5 stores absolute offsets from each block's `first_docid`, making the column randomly addressable, so a lookup is a `weave_for_get` binary search — cursor now 45.2%, index +0.16%. The win scales with candidate stride, so `common` (stride ~1.15) is flat by construction and is now L2's target. | ≤ 2× pg_textsearch at k=10 — **met for rare**, open for mid/common |
 | ~~**G12**~~ | ~~boolean NOT~~ | **CLOSED.** `count(*) WHERE 'common & !rare'` 7008 ms → **14.05 ms** (499×) by building the NOT universe lazily. Now **beats GIN's 141 ms by 10×**. | done, and a win |
 | ~~**G1**~~ | ~~bare `ORDER BY <=> LIMIT` does not use the index~~ | **CLOSED by L7.** 83 ms → **0.05 ms** (1,662× par4, 7,248× serial). Now beats GIN by 1,615×/7,080× on the same form. | done |
 | ~~**G2**~~ | ~~index size~~ | **CLOSED by L8/L10.** The loss was a measurement artifact: 70.7% of the file was freed pages. Live content is **46 MB vs GIN's 81 MB — 1.76× smaller.** | done, and a win |
@@ -210,7 +210,7 @@ counting (3.8–7.7×), and — since L7 — the bare `ORDER BY` form (1,615–7
 wins on features outright. It loses by 1.7× on rare and mid ranked latency and by
 1.7–1.9× on index size.
 
-**Standing losses after L12, L14 and L15: G13 (ranked at k=10, 2.25–6.31×) and G5
+**Standing losses after L12, L14, L15 and L17: G13 (ranked at k=10, now 1.20–4.75×) and G5
 (build, 3.91× behind pg_textsearch — narrowed from 11.0× → 6.96× → 3.91×; now at
 parity with GIN in one run).**
 
@@ -223,8 +223,10 @@ ordering attacks the other ~28%. Route is L17. This is the second time in this p
 that a hot symbol's *cause* was mis-stated before anyone profiled (see L15), and the
 second time the fix turned out to be cheaper than the prescribed one.
 
-G13's remaining route is **L17** (L2 is demoted: it attacks the ~28% the profile
-leaves, not the 72% it found). **G5's route was L15, and
+G13's route was **L17**, which delivered on the sparse bands (rare 1.87×, mid
+1.66×) and left `common` flat by construction — the win scales with candidate
+stride, and a term matching 87% of the corpus has none to exploit. **L2 now owns
+the common band**, where the scan really is reading 1.74M postings. **G5's route was L15, and
 it over-delivered**: the profile predicted a ceiling of ~205 s from eliminating the
 term hash; the build reached 192.5 s because the larger cost was a second,
 unnamed per-posting hash (the doclen collector). The profile's estimate was

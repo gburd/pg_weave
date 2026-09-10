@@ -21,12 +21,42 @@
 #include "storage/itemptr.h"
 
 #define WEAVE_MAGIC			0x42324635	/* "B2F5" */
-#define WEAVE_VERSION		4		/* v4: per-segment doclen sidecar (1 quantized
-										 * byte/doc) replacing the per-posting doclen FOR
-										 * column; v3 (inline doclen) still read.  v3:
-										 * segmented layout + optional token positions. */
+#define WEAVE_VERSION		5		/* v5: the doclen sidecar's docid column stores
+										 * ABSOLUTE offsets from each block's first_docid
+										 * instead of gaps, so the column is randomly
+										 * addressable (weave_for_get) and an in-block
+										 * lookup is a ~7-step binary search instead of a
+										 * 128-entry FOR-unpack + prefix sum -- ~72% of a
+										 * ranked scan was that decode
+										 * (bench/RESULTS_SCAN_PROFILE.md).  v4: per-segment
+										 * doclen sidecar (1 quantized byte/doc) replacing
+										 * the per-posting doclen FOR column; v4 sidecars are
+										 * still read (each BLOCK self-describes, see
+										 * WEAVE_DOCLEN_ABS).  v3: inline doclen, segmented
+										 * layout + optional token positions; still read. */
 #define WEAVE_VERSION_DOCLEN_INLINE 3	/* oldest format we dual-read */
 #define WEAVE_VERSION_DOCLEN_SIDECAR 4	/* first version with the doclen sidecar */
+#define WEAVE_VERSION_DOCLEN_ABS 5	/* first version writing absolute-offset sidecars */
+
+/*
+ * Set in WeaveDoclenBlockHdr.count to mark a sidecar block whose docid column is
+ * absolute offsets from first_docid rather than gaps.
+ *
+ * The flag lives in `count` rather than in a new header field on purpose. The
+ * discriminator has to be PER BLOCK, not per index: an index built by <= 0.5.0
+ * and then upgraded keeps its v4 gap-coded sidecar pages while later inserts and
+ * merges write v5 ones, so the two encodings coexist in one relation and a
+ * per-index version cannot describe them. `count` is bounded by
+ * WEAVE_BLOCK_SIZE (128), so its high bits are free, and every existing reader
+ * already validates `count == 0 || count > WEAVE_BLOCK_SIZE` and stops -- so an
+ * older .so meeting a v5 block fails closed (block treated as absent) instead of
+ * misreading the offsets as gaps. The metapage version bump to 5 is what
+ * actually stops that .so first, with the REINDEX hint (weave_meta_validate);
+ * this is the second line of defence.
+ */
+#define WEAVE_DOCLEN_ABS		0x80000000u
+#define WEAVE_DOCLEN_COUNT(c)	((c) & ~WEAVE_DOCLEN_ABS)
+#define WEAVE_DOCLEN_IS_ABS(c)	(((c) & WEAVE_DOCLEN_ABS) != 0)
 #define WEAVE_METAPAGE_BLKNO	0
 
 /* page opaque flags */

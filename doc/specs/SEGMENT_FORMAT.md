@@ -2,7 +2,7 @@
 
 Authoritative description of what a `weave` index contains on disk. This document
 distinguishes carefully between **what exists today (v4)** and **what is
-specified but unbuilt (v5)**; the distinction is marked on every section, because
+specified but unbuilt (v6)**; the distinction is marked on every section, because
 a reader who confuses the two will write code against structures that are not
 there.
 
@@ -43,22 +43,22 @@ header, and extending `weave_check()` with an invariant for the new page type.
 | 7 | `WEAVE_DICTINDEX` | lexical (sparse block index over dict pages) | v4, exists |
 | 8 | `WEAVE_FREED` | segment machinery (page pending recycle) | v4, exists |
 | 9 | `WEAVE_DOCLEN` | lexical (per-segment doclen sidecar) | v4, exists |
-| 10 | `WEAVE_VMETA` | vector | v5, specified |
-| 11 | `WEAVE_VCODES` | vector | v5, specified |
-| 12 | `WEAVE_VGRAPH` | vector | v5, specified |
-| 13 | `WEAVE_VRERANK` | vector | v5, specified |
-| 14 | `WEAVE_SURF` | fuzzy (LOUDS-Sparse trie over the vocabulary) | v5, specified |
+| 10 | `WEAVE_VMETA` | vector | v6, specified |
+| 11 | `WEAVE_VCODES` | vector | v6, specified |
+| 12 | `WEAVE_VGRAPH` | vector | v6, specified |
+| 13 | `WEAVE_VRERANK` | vector | v6, specified |
+| 14 | `WEAVE_SURF` | fuzzy (LOUDS-Sparse trie over the vocabulary) | v6, specified |
 | 15 | `WEAVE_ULEV` | fuzzy (universal-Levenshtein aux, if needed) | reserved |
 | 16 | `WEAVE_REGEX` | fuzzy (compiled-pattern cache page, if persisted) | reserved |
 | 17 | — | fuzzy | reserved |
-| 18 | `WEAVE_DOCVALS` | docvalues (scalar/facet forward store) | v5, specified |
-| 19 | `WEAVE_CGRAM` | opt-in corpus-level character trigrams | v5, specified |
-| 20 | `WEAVE_CHANDESC` | v5 per-bolt channel descriptor | v5, specified |
+| 18 | `WEAVE_DOCVALS` | docvalues (scalar/facet forward store) | v6, specified |
+| 19 | `WEAVE_CGRAM` | opt-in corpus-level character trigrams | v6, specified |
+| 20 | `WEAVE_CHANDESC` | v6 per-bolt channel descriptor | v6, specified |
 | 21–15 | — | unallocated | `flags` is `uint16`; bits 21+ do not exist |
 
 `flags` is 16 bits. Allocation is therefore finite and bits 14–19 above already
 exceed it if taken literally — **this is a real constraint that must be resolved
-in v5**, not a detail. Two options, and v5 must pick one explicitly:
+in v6**, not a detail. Two options, and v6 must pick one explicitly:
 
 1. Widen `flags` to `uint32` in the page opaque area. Changes the page layout for
    every page, so it is a hard format break requiring REINDEX.
@@ -67,8 +67,8 @@ in v5**, not a detail. Two options, and v5 must pick one explicitly:
    things at once; in practice no page is, so this is the cleaner fix and it
    leaves room for 250 kinds.
 
-Recommendation: option 2, taken as part of the v5 bump, since v5 is already a
-format break. Whoever implements v5 must resolve this before adding the vector
+Recommendation: option 2, taken as part of the v6 bump, since v6 is already a
+format break. Whoever implements v6 must resolve this before adding the vector
 pages, or the vector and fuzzy channels will collide.
 
 ## 3. Metapage — v4, EXISTS
@@ -120,7 +120,7 @@ works. Keep this trick in mind for future additive fields.
 
 `doclenstart` being per-bolt is what makes dual-read work: a v3 bolt and a v4 bolt
 can coexist in one index and each is read according to its own descriptor. This is
-the pattern to follow for v5.
+the pattern to follow for v6.
 
 ## 5. Lexical weft — v4, EXISTS
 
@@ -158,14 +158,40 @@ property-tested and fuzzed standalone.
 
 **Tombstones.** A vendored sparsemap blob per bolt.
 
-**Doclen sidecar (v4).** One quantized length byte per doc plus a FOR docid-gap
+**Doclen sidecar (v4/v5).** One quantized length byte per doc plus a FOR docid
 column, in 128-doc blocks. Bought a 4.7× index-size reduction (1421 MB vs
-6729 MB on the 2.19 M-article corpus) and introduced a per-scan decode tax that is
-task **L3** in `doc/PHASES.md`.
+6729 MB on the 2.19 M-article corpus).
 
-## 6. v5: channel descriptors — SPECIFIED, NOT BUILT
+The docid column's encoding changed in **v5** and each BLOCK self-describes which
+it uses, via the `WEAVE_DOCLEN_ABS` flag in the high bits of
+`WeaveDoclenBlockHdr.count` (so always read that field through
+`WEAVE_DOCLEN_COUNT()` — it is not a bare count):
 
-The problem v5 solves: a bolt must **self-describe which wefts it carries**, so
+| | v4 | v5 |
+|---|---|---|
+| stored value | gap from the predecessor | **absolute offset from the block's `first_docid`** |
+| entry *i*'s docid | prefix sum of gaps 0..*i* | `first_docid + value[i]`, one `weave_for_get()` |
+| in-block lookup | unpack all 128 + prefix-sum, then search | **~7-step binary search on the packed column** |
+| coded width, 128 docs over ~6,400 docids | ~6 bits | ~13 bits |
+
+The flag is per *block* rather than per index because an index built by ≤ 0.5.0
+keeps its v4 pages after an upgrade while later inserts and merges write v5 ones,
+so both encodings coexist in one relation. Readers must handle both; the metapage
+version gate (`weave_meta_validate`) is what stops an *older* `.so` from meeting a
+v5 block, and the flag's placement in `count` means such a reader fails closed
+(the block looks over-long and is skipped) rather than misreading offsets as gaps.
+
+Why: the v4 decode was **~72% of a ranked scan** — a single-term scan probes
+ascending docids with stride `ndocs/df`, so a 128-docid block covers ~2.6
+candidates and was fully unpacked to answer each one
+(`bench/RESULTS_SCAN_PROFILE.md`, task **L17**). Task L3 asserted the sidecar
+imposed a whole-sidecar decode per scan and was **closed as already satisfied** —
+a measured `doclen_sidecar=on/off` A/B is identical in latency at 625 MB vs
+859 MB, so the sidecar is a size win whose cost was this cursor.
+
+## 6. v6: channel descriptors — SPECIFIED, NOT BUILT
+
+The problem v6 solves: a bolt must **self-describe which wefts it carries**, so
 that an index built without a vector channel costs literally zero vector bytes
 rather than empty structures, and so a reader never infers geometry from a GUC
 that may have changed since the build.
@@ -217,7 +243,7 @@ Design:
    site.** pg_turbovec has now hit the same bug **four times**: a running
    chain-offset sum omitted one count field, so a build wrote one chain on top of
    another's data (v2.7.0 fixed the fourth instance, `set_ivf_chains` omitting
-   `bq_mean_count`, found by audit rather than a field report). When v5's channel
+   `bq_mean_count`, found by audit rather than a field report). When v6's channel
    descriptors add per-segment chains here, derive every offset from a single
    function over the descriptor array and have `weave_check()` assert that no two
    chains overlap — a bug class that recurs four times in a sibling project is not
@@ -225,7 +251,7 @@ Design:
 
 ## 9. Invariants `weave_check()` must verify
 
-One per line, each mechanically testable. Marked (v5) where the structure does not
+One per line, each mechanically testable. Marked (v6) where the structure does not
 exist yet.
 
 - Metapage magic and version are recognized.
@@ -245,17 +271,23 @@ exist yet.
 - Trigram directory entries point at `WEAVE_TRGM_DATA` pages; every term ordinal
   in a trigram sparsemap is `< nterms`.
 - Doclen sidecar covers exactly the bolt's docid range with no gaps or duplicates.
+- Doclen sidecar: for every block, decoding the docid column under the encoding
+  its `WEAVE_DOCLEN_ABS` flag declares yields a strictly ascending docid sequence
+  whose first element is `first_docid`. Both encodings must yield the IDENTICAL
+  sequence for the same input — asserted over 2.8 M random cases by
+  `test/hegel/test_doclen_block.c`, because a disagreement produces a wrong
+  document length, hence a plausible-but-wrong BM25 ranking rather than an error.
 - Every page is reachable from the metapage, or flagged `WEAVE_FREED`. An
   unreachable unflagged page is a leak.
-- (v5) Every `WeaveVecBlockHdr.smax`, `maxrecnorm`, `minnorm`, `cenrad` equals a
+- (v6) Every `WeaveVecBlockHdr.smax`, `maxrecnorm`, `minnorm`, `cenrad` equals a
   recomputation from the block's live lanes. See
   `bench/RESULTS_BOUND_PRUNING.md` for why `cenrad` in particular must be
   recomputed against the centroid *as decoded from its stored code*.
-- (v5) Graph: out-degree `<= R`; neighbour lists sorted ascending; no edge to a
+- (v6) Graph: out-degree `<= R`; neighbour lists sorted ascending; no edge to a
   warp position `>= nnodes`; no edge to a tombstoned node; entry point live; every
   live node reachable from the entry point. The last is the expensive check and
   the one that actually catches a bad build, so it belongs behind `deep => true`.
-- (v5) SuRF trie membership is exactly the bolt's dictionary term set.
+- (v6) SuRF trie membership is exactly the bolt's dictionary term set.
 
 ## 10. WAL policy
 

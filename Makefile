@@ -290,6 +290,9 @@ check-standalone:
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/q test/hegel/test_quantize.c \
 		src/vector/quantize.c src/vector/pack.c -lm; \
 	$$tmp/q | tail -1; \
+	echo "== v5 doclen sidecar: random access over absolute offsets == gap decode =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/dlb test/hegel/test_doclen_block.c -lm; \
+	$$tmp/dlb | tail -1; \
 	echo "== ALL STANDALONE CHECKS PASSED =="
 
 # Cross-version sparsemap wire compatibility.  Separate because it needs the
