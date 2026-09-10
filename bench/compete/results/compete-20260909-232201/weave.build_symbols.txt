@@ -1,0 +1,30 @@
+    46.83%  [.] hash_search_with_hash_value
+            |
+            ---hash_search_with_hash_value
+               |          
+               |--29.49%--weave_merge_segments_streaming.constprop.0
+               |          weave_merge_selected
+               |          
+               |--11.75%--add_posting
+               |          weave_build_callback
+               |          heapam_index_build_range_scan
+               |          weave_scan_and_build
+               |          weave_build
+               |          index_build
+               |          index_create
+               |          DefineIndex
+               |          ProcessUtilitySlow.constprop.0
+               |          standard_ProcessUtility
+               |          PortalRunUtility
+               |          PortalRunMulti
+               |          PortalRun
+               |          exec_simple_query
+               |          PostgresMain
+               |          BackendMain
+               |          postmaster_child_launch
+               |          ServerLoop
+               |          
+                --5.31%--weave_write_segment
+                          weave_build_flush_segment.part.0
+                          weave_build
+                          index_build

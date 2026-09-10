@@ -1,0 +1,4 @@
+
+positions cost (B-A)             39.9 s
+trigrams cost (C-A)              -3.9 s
+irreducible core (A)            274.2 s  <- what G5 must attack

@@ -62,6 +62,15 @@ The merge path pays the same cost again, once per term per segment.
 
 ## So G5 has a route after all — two, in fact
 
+> **Outcome (2026-09-10, `bench/RESULTS_L15.md`):** step 1 was worth 3.9% and step
+> 2 is withdrawn. The 37.5% was real but this section's explanation of it was
+> wrong: the cost was dynahash pointer chasing, not hashing, and it came from
+> *three* per-posting hash paths, of which this profile named one. The build went
+> 354 → 194 s, past the "~205 s ceiling" stated below, because the ceiling only
+> counted the hash this profile could see. Kept unedited below as the record of
+> what a symbol-level profile does and does not tell you.
+
+
 Recorded as new task **L15**, and the claim in `doc/GAPS.md` is corrected.
 
 1. **Hash and compare only the real term length.** Store the length in the key and

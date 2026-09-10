@@ -1,0 +1,30 @@
+    17.36%  [.] weave_merge_segments_streaming.constprop.0
+            |
+            ---weave_merge_segments_streaming.constprop.0
+               weave_merge_selected
+    14.74%  [.] weave_write_postings
+            |
+            ---weave_write_postings
+               |          
+               |--10.06%--weave_merge_segments_streaming.constprop.0
+               |          weave_merge_selected
+               |          
+                --4.69%--weave_write_segment
+                          weave_build_flush_segment.part.0
+                          weave_build
+                          index_build
+                          index_create
+                          DefineIndex
+    14.26%  [.] hash_search_with_hash_value
+            |
+            ---hash_search_with_hash_value
+               |          
+                --14.00%--add_posting
+                          weave_build_callback
+                          heapam_index_build_range_scan
+                          weave_scan_and_build
+                          weave_build
+                          index_build
+                          index_create
+                          DefineIndex
+                          ProcessUtilitySlow.constprop.0

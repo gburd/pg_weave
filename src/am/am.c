@@ -222,20 +222,66 @@ cmp_buildterm(const void *a, const void *b)
 }
 
 /*
- * Find or create a BuildTerm for (term,len).  We use a dynahash keyed by a
- * fixed-size padded copy of the term to avoid an O(n^2) linear scan.  Terms
- * longer than the key buffer fall back to exact comparison via the stored
- * BuildTerm, which is correct though it may hash-collide slightly; term length
- * is bounded by MAXSTRLEN in practice.
+ * Find or create a BuildTerm for (term,len).  We use a dynahash keyed by the
+ * term's length plus a bounded copy of its bytes to avoid an O(n^2) linear
+ * scan.  Terms longer than the key buffer fall back to exact comparison via
+ * the stored BuildTerm, which is correct though it may hash-collide slightly;
+ * term length is bounded by MAXSTRLEN in practice.
+ *
+ * L15: the key is NOT a HASH_BLOBS blob.  A build does one lookup per term
+ * occurrence (~240M on a 2M x 120-word corpus) and a typical term is ~10
+ * bytes, so hashing and memcmp-ing a fixed 64-byte blob cost ~6x more than
+ * the data requires and showed up as 37.5% of build time
+ * (bench/RESULTS_BUILD_PROFILE.md).  The hash, compare and copy callbacks
+ * below touch only `len` bytes.
  */
 #include "utils/hsearch.h"
+#include "common/hashfn.h"
 
 #define WEAVE_TERMKEYLEN 64
 
 typedef struct TermKey
 {
-	char		key[WEAVE_TERMKEYLEN];
+	int32		len;			/* true term length (clamped >= 0) */
+	char		key[WEAVE_TERMKEYLEN];	/* first Min(len, WEAVE_TERMKEYLEN) bytes */
 } TermKey;
+
+static inline int
+termkey_nbytes(const TermKey *k)
+{
+	return Min(k->len, WEAVE_TERMKEYLEN);
+}
+
+static uint32
+termkey_hash(const void *key, Size keysize)
+{
+	const TermKey *k = (const TermKey *) key;
+
+	return hash_bytes((const unsigned char *) k->key, termkey_nbytes(k))
+		^ (uint32) k->len;
+}
+
+static int
+termkey_match(const void *key1, const void *key2, Size keysize)
+{
+	const TermKey *a = (const TermKey *) key1;
+	const TermKey *b = (const TermKey *) key2;
+
+	if (a->len != b->len)
+		return 1;
+	return memcmp(a->key, b->key, termkey_nbytes(a));
+}
+
+static void *
+termkey_copy(void *dest, const void *src, Size keysize)
+{
+	const TermKey *s = (const TermKey *) src;
+	TermKey    *d = (TermKey *) dest;
+
+	d->len = s->len;
+	memcpy(d->key, s->key, termkey_nbytes(s));
+	return dest;
+}
 
 typedef struct TermHashEntry
 {
@@ -255,11 +301,16 @@ weave_build_ht_init(WeaveBuildState *bs)
 {
 	HASHCTL		ctl;
 
+	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(TermKey);
 	ctl.entrysize = sizeof(TermHashEntry);
+	ctl.hash = termkey_hash;
+	ctl.match = termkey_match;
+	ctl.keycopy = termkey_copy;
 	ctl.hcxt = bs->ctx;
 	build_ht = hash_create("weave build terms", 1024, &ctl,
-						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+						   HASH_ELEM | HASH_FUNCTION | HASH_COMPARE |
+						   HASH_KEYCOPY | HASH_CONTEXT);
 }
 
 static void
@@ -274,89 +325,65 @@ make_termkey(TermKey *k, const char *term, int len)
 	 * first (weave_doc_is_valid); this is the last line of defense. */
 	if (n < 0)
 		n = 0;
-	memset(k, 0, sizeof(TermKey));
+	k->len = n;
 	memcpy(k->key, term, Min(n, WEAVE_TERMKEYLEN));
-	/* fold length into the tail so different-length terms sharing a prefix do
-	 * not collide on the key */
-	if (n < WEAVE_TERMKEYLEN)
-		k->key[n] = '\1';
 }
 
-static void
-add_posting(WeaveBuildState *bs, const char *term, int len,
-			ItemPointer tid, uint32 tf, uint32 doclen,
-			const uint32 *pos, int npos)
+/*
+ * Append a new BuildTerm for (term,len) to bs->terms, chained after `next`,
+ * and return it.  No hash involvement: callers that already know the term is
+ * new (the merge, which processes one term at a time) use this directly.
+ */
+static BuildTerm *
+build_term_new(WeaveBuildState *bs, const char *term, int len, int next)
 {
-	TermKey		key;
-	TermHashEntry *entry;
-	bool		found;
-	BuildTerm  *bt = NULL;
-	int			idx;
+	BuildTerm  *bt;
 
-	make_termkey(&key, term, len);
-	entry = (TermHashEntry *) hash_search(build_ht, &key, HASH_ENTER, &found);
-
-	/*
-	 * On a hash hit, walk the chain of BuildTerms sharing this key and pick the
-	 * truly-equal one.  The key is a padded/length-folded prefix, so two DISTINCT
-	 * terms >= WEAVE_TERMKEYLEN bytes sharing that prefix can land on the same
-	 * key; chaining keeps them as separate BuildTerms instead of clobbering the
-	 * entry (which previously fragmented a term's postings across unreachable
-	 * dictionary entries).
-	 */
-	if (found)
+	if (bs->nterms >= bs->maxterms)
 	{
-		for (idx = entry->termidx; idx >= 0; idx = bs->terms[idx].next)
-		{
-			BuildTerm  *cand = &bs->terms[idx];
-
-			if (cand->len == len && memcmp(cand->term, term, len) == 0)
-			{
-				bt = cand;
-				break;
-			}
-		}
+		bs->maxterms = bs->maxterms ? bs->maxterms * 2 : 1024;
+		if (bs->terms == NULL)
+			bs->terms = (BuildTerm *) WEAVE_ALLOC_MAYBE_HUGE(bs->maxterms * sizeof(BuildTerm));
+		else
+			bs->terms = (BuildTerm *) WEAVE_REALLOC_MAYBE_HUGE(bs->terms,
+													   bs->maxterms * sizeof(BuildTerm));
 	}
-
-	if (bt == NULL)
+	bt = &bs->terms[bs->nterms];
+	bt->term = (char *) palloc(len);
+	memcpy(bt->term, term, len);
+	bt->len = len;
+	bt->maxposts = 4;
+	bt->nposts = 0;
+	bt->max_tf = 0;			/* filled by weave_write_postings */
+	bt->tids = (ItemPointerData *) WEAVE_ALLOC_MAYBE_HUGE(bt->maxposts * sizeof(ItemPointerData));
+	bt->tfs = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE(bt->maxposts * sizeof(uint32));
+	bt->doclens = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE(bt->maxposts * sizeof(uint32));
+	bt->positions = NULL;
+	bt->posoff = NULL;
+	bt->poscnt = NULL;
+	bt->npos = 0;
+	bt->maxpos = 0;
+	if (bs->want_positions)
 	{
-		if (bs->nterms >= bs->maxterms)
-		{
-			bs->maxterms = bs->maxterms ? bs->maxterms * 2 : 1024;
-			if (bs->terms == NULL)
-				bs->terms = (BuildTerm *) WEAVE_ALLOC_MAYBE_HUGE(bs->maxterms * sizeof(BuildTerm));
-			else
-				bs->terms = (BuildTerm *) WEAVE_REALLOC_MAYBE_HUGE(bs->terms,
-														   bs->maxterms * sizeof(BuildTerm));
-		}
-		bt = &bs->terms[bs->nterms];
-		bt->term = (char *) palloc(len);
-		memcpy(bt->term, term, len);
-		bt->len = len;
-		bt->maxposts = 4;
-		bt->nposts = 0;
-		bt->max_tf = 0;			/* filled by weave_write_postings */
-		bt->tids = (ItemPointerData *) WEAVE_ALLOC_MAYBE_HUGE(bt->maxposts * sizeof(ItemPointerData));
-		bt->tfs = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE(bt->maxposts * sizeof(uint32));
-		bt->doclens = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE(bt->maxposts * sizeof(uint32));
-		bt->positions = NULL;
-		bt->posoff = NULL;
-		bt->poscnt = NULL;
-		bt->npos = 0;
-		bt->maxpos = 0;
-		if (bs->want_positions)
-		{
-			bt->posoff = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE(bt->maxposts * sizeof(uint32));
-			bt->poscnt = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE(bt->maxposts * sizeof(uint32));
-			bt->maxpos = 8;
-			bt->positions = (uint32 *) palloc(bt->maxpos * sizeof(uint32));	/* alloc-ok: seed=8, grown huge-safe below; one term in a budget-bounded segment */
-		}
-		/* push onto the head of this key's chain (-1 = end of chain) */
-		bt->next = found ? entry->termidx : -1;
-		entry->termidx = bs->nterms;
-		bs->nterms++;
+		bt->posoff = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE(bt->maxposts * sizeof(uint32));
+		bt->poscnt = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE(bt->maxposts * sizeof(uint32));
+		bt->maxpos = 8;
+		bt->positions = (uint32 *) palloc(bt->maxpos * sizeof(uint32));	/* alloc-ok: seed=8, grown huge-safe below; one term in a budget-bounded segment */
 	}
+	bt->next = next;
+	bs->nterms++;
+	return bt;
+}
 
+/*
+ * Append one posting to an already-located BuildTerm.  Hash-free: the merge
+ * calls this once per posting of the term it is currently gathering.
+ */
+static void
+build_term_append(WeaveBuildState *bs, BuildTerm *bt,
+				  ItemPointer tid, uint32 tf, uint32 doclen,
+				  const uint32 *pos, int npos)
+{
 	if (bt->nposts >= bt->maxposts)
 	{
 		bt->maxposts *= 2;
@@ -406,6 +433,56 @@ add_posting(WeaveBuildState *bs, const char *term, int len,
 		bt->poscnt[bt->nposts] = 0;
 	}
 	bt->nposts++;
+}
+
+/*
+ * Find or create the BuildTerm for (term,len) through the build hash, then
+ * append one posting.  This is the per-occurrence path of the heap scan.
+ */
+static void
+add_posting(WeaveBuildState *bs, const char *term, int len,
+			ItemPointer tid, uint32 tf, uint32 doclen,
+			const uint32 *pos, int npos)
+{
+	TermKey		key;
+	TermHashEntry *entry;
+	bool		found;
+	BuildTerm  *bt = NULL;
+	int			idx;
+
+	make_termkey(&key, term, len);
+	entry = (TermHashEntry *) hash_search(build_ht, &key, HASH_ENTER, &found);
+
+	/*
+	 * On a hash hit, walk the chain of BuildTerms sharing this key and pick the
+	 * truly-equal one.  The key is (len, bounded prefix), so two DISTINCT
+	 * terms > WEAVE_TERMKEYLEN bytes sharing length and prefix can land on the same
+	 * key; chaining keeps them as separate BuildTerms instead of clobbering the
+	 * entry (which previously fragmented a term's postings across unreachable
+	 * dictionary entries).
+	 */
+	if (found)
+	{
+		for (idx = entry->termidx; idx >= 0; idx = bs->terms[idx].next)
+		{
+			BuildTerm  *cand = &bs->terms[idx];
+
+			if (cand->len == len && memcmp(cand->term, term, len) == 0)
+			{
+				bt = cand;
+				break;
+			}
+		}
+	}
+
+	if (bt == NULL)
+	{
+		/* push onto the head of this key's chain (-1 = end of chain) */
+		bt = build_term_new(bs, term, len, found ? entry->termidx : -1);
+		entry->termidx = bs->nterms - 1;
+	}
+
+	build_term_append(bs, bt, tid, tf, doclen, pos, npos);
 }
 
 /* forward decls: segment writers are defined later; the build flush uses them */
@@ -1497,14 +1574,43 @@ cmp_posting_docid(const void *a, const void *b)
  */
 typedef struct DoclenEntry
 {
-	uint64		docid;			/* hash key */
+	uint64		docid;
 	uint8		byte;			/* quantized doclen */
 } DoclenEntry;
 
+/*
+ * Per-heap-block leaf of the collector: doclen bytes for the offsets seen so
+ * far, indexed by docid % WEAVE_OFFSET_FACTOR (the same split weave_docid_to_tid
+ * uses, so every representable docid maps to exactly one slot and round-trips
+ * bit-exactly through the cursor).  Grown on demand, so a block whose highest
+ * live offset is 40 costs ~41 bytes rather than MaxHeapTuplesPerPage.  A zero
+ * byte means "not seen" (weave_doclen_to_byte() yields 0 only for doclen 0,
+ * which is coded identically, so the sentinel is exact).
+ */
+typedef struct DoclenLeaf
+{
+	uint16		nalloc;			/* bytes[] capacity */
+	uint16		nseen;			/* distinct docids recorded in this leaf */
+	uint8	   *bytes;
+} DoclenLeaf;
+
+/*
+ * L15: docid -> quantized doclen, as a radix map keyed by heap block, then
+ * offset.  This used to be a uint64-keyed dynahash probed ONCE PER POSTING by
+ * both the segment writer and the merge (~240M probes into a ~2M-entry table
+ * on a 2M x 120-word corpus) and was the largest single cost in CREATE INDEX
+ * (bench/RESULTS_BUILD_PROFILE.md, bench/RESULTS_L15.md).  Docids are dense
+ * per block (docid = block * MaxHeapTuplesPerPage + offset), so a two-level
+ * array replaces the hash, iterates in docid order for free (no qsort), and
+ * costs ~1 byte per live tuple plus a pointer per heap block.
+ */
 typedef struct DoclenCollector
 {
-	HTAB	   *ht;				/* docid -> DoclenEntry */
 	MemoryContext ctx;
+	DoclenLeaf *leaves;			/* indexed by heap block number */
+	BlockNumber nleaves;		/* leaves[] capacity */
+	BlockNumber maxblk;			/* highest block with any entry, +1 */
+	uint64		ndocs;			/* distinct docids recorded */
 } DoclenCollector;
 
 /* One doclen-sidecar block header: count docs, first docid for binary locate,
@@ -1519,17 +1625,26 @@ typedef struct WeaveDoclenBlockHdr
 } WeaveDoclenBlockHdr;
 
 static void
-doclen_collector_init(DoclenCollector *c, MemoryContext ctx, long nhint)
+doclen_collector_init(DoclenCollector *c, MemoryContext ctx, long nhint pg_attribute_unused())
 {
-	HASHCTL		ctl;
-
-	MemSet(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(uint64);
-	ctl.entrysize = sizeof(DoclenEntry);
-	ctl.hcxt = ctx;
 	c->ctx = ctx;
-	c->ht = hash_create("pg_weave doclen sidecar", Max(nhint, 1024), &ctl,
-						HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	c->nleaves = 1024;
+	c->maxblk = 0;
+	c->ndocs = 0;
+	c->leaves = (DoclenLeaf *) MemoryContextAllocZero(ctx,
+														  (Size) c->nleaves * sizeof(DoclenLeaf));	/* alloc-ok: fixed 1024-entry seed; grown huge-safe in doclen_collector_add */
+}
+
+static void
+doclen_collector_free(DoclenCollector *c)
+{
+	BlockNumber b;
+
+	for (b = 0; b < c->maxblk; b++)
+		if (c->leaves[b].bytes != NULL)
+			pfree(c->leaves[b].bytes);
+	pfree(c->leaves);
+	c->leaves = NULL;
 }
 
 /* Record one doc's length (idempotent per docid: the byte is a function of the
@@ -1537,20 +1652,104 @@ doclen_collector_init(DoclenCollector *c, MemoryContext ctx, long nhint)
 static inline void
 doclen_collector_add(DoclenCollector *c, uint64 docid, uint32 doclen)
 {
-	bool		found;
-	DoclenEntry *e = (DoclenEntry *) hash_search(c->ht, &docid, HASH_ENTER, &found);
+	BlockNumber blk = (BlockNumber) (docid / WEAVE_OFFSET_FACTOR);
+	uint32		off = (uint32) (docid % WEAVE_OFFSET_FACTOR);	/* 0..FACTOR-1 */
+	DoclenLeaf *leaf;
 
-	if (!found)
-		e->byte = weave_doclen_to_byte(doclen);
+	if (blk >= c->nleaves)
+	{
+		BlockNumber newn = c->nleaves;
+		MemoryContext old;
+
+		while (newn <= blk)
+			newn *= 2;
+		old = MemoryContextSwitchTo(c->ctx);
+		c->leaves = (DoclenLeaf *) WEAVE_REALLOC_MAYBE_HUGE(c->leaves,
+															(Size) newn * sizeof(DoclenLeaf));
+		MemoryContextSwitchTo(old);
+		memset(c->leaves + c->nleaves, 0,
+			   (Size) (newn - c->nleaves) * sizeof(DoclenLeaf));
+		c->nleaves = newn;
+	}
+	if (blk >= c->maxblk)
+		c->maxblk = blk + 1;
+	leaf = &c->leaves[blk];
+	if (off >= leaf->nalloc)
+	{
+		uint16		newn = leaf->nalloc ? leaf->nalloc : 16;
+
+		while (newn <= off)
+			newn = (uint16) Min((uint32) newn * 2, WEAVE_OFFSET_FACTOR);
+		if (leaf->bytes == NULL)
+			leaf->bytes = (uint8 *) MemoryContextAllocZero(c->ctx, newn);	/* alloc-ok: <= MaxHeapTuplesPerPage bytes */
+		else
+			leaf->bytes = (uint8 *) repalloc0(leaf->bytes, leaf->nalloc, newn);	/* alloc-ok: <= MaxHeapTuplesPerPage bytes */
+		leaf->nalloc = newn;
+	}
+	if (leaf->bytes[off] == 0)
+	{
+		uint8		byte = weave_doclen_to_byte(doclen);
+
+		/* doclen 0 codes to byte 0, the "unseen" sentinel, and is deliberately
+		 * NOT stored: weave_doclen_lookup() returns 0 for an absent docid, so
+		 * readers cannot tell the two apart and the sidecar only gets smaller. */
+		if (byte == 0)
+			return;
+		leaf->bytes[off] = byte;
+		leaf->nseen++;
+		c->ndocs++;
+	}
 }
 
-static int
-cmp_doclen_entry(const void *a, const void *b)
+/*
+ * Ascending-docid cursor over a DoclenCollector.  Because docids are
+ * (block, offset) and the map is indexed the same way, in-order iteration
+ * is a plain nested walk -- no materialized array, no sort.
+ */
+typedef struct DoclenCursor
 {
-	uint64		da = ((const DoclenEntry *) a)->docid;
-	uint64		db = ((const DoclenEntry *) b)->docid;
+	const DoclenCollector *c;
+	BlockNumber blk;
+	uint32		off;			/* 0-based index into leaf bytes[] */
+} DoclenCursor;
 
-	return (da < db) ? -1 : (da > db) ? 1 : 0;
+static inline void
+doclen_cursor_init(DoclenCursor *cur, const DoclenCollector *c)
+{
+	cur->c = c;
+	cur->blk = 0;
+	cur->off = 0;
+}
+
+static bool
+doclen_cursor_next(DoclenCursor *cur, DoclenEntry *out)
+{
+	const DoclenCollector *c = cur->c;
+
+	while (cur->blk < c->maxblk)
+	{
+		const DoclenLeaf *leaf = &c->leaves[cur->blk];
+
+		if (leaf->nseen > 0)
+		{
+			while (cur->off < leaf->nalloc)
+			{
+				uint8		b = leaf->bytes[cur->off];
+				uint32		off = cur->off;
+
+				cur->off++;
+				if (b != 0)
+				{
+					out->docid = (uint64) cur->blk * WEAVE_OFFSET_FACTOR + off;
+					out->byte = b;
+					return true;
+				}
+			}
+		}
+		cur->blk++;
+		cur->off = 0;
+	}
+	return false;
 }
 
 /*
@@ -1822,34 +2021,27 @@ weave_write_postings(WeavePostWriter *pw, BuildTerm *bt,
 static BlockNumber
 weave_write_doclen_sidecar(Relation index, DoclenCollector *c)
 {
-	HASH_SEQ_STATUS seq;
-	DoclenEntry *e;
-	DoclenEntry *arr;
-	long		n = hash_get_num_entries(c->ht);
-	long		idx = 0;
-	long		i;
+	DoclenCursor cur;
+	DoclenEntry e;
+	bool		have;
 	WeavePostWriter pw;
 	BlockNumber first = InvalidBlockNumber;
 	bool		start_recorded = false;
 
-	if (n == 0)
+	if (c->ndocs == 0)
 		return InvalidBlockNumber;
 
-	arr = (DoclenEntry *) WEAVE_ALLOC_MAYBE_HUGE((Size) n * sizeof(DoclenEntry));	/* alloc-ok: n = ndocs (per-doc), not Sum(df) */
-	hash_seq_init(&seq, c->ht);
-	while ((e = (DoclenEntry *) hash_seq_search(&seq)) != NULL)
-		arr[idx++] = *e;
-	qsort(arr, n, sizeof(DoclenEntry), cmp_doclen_entry);
+	doclen_cursor_init(&cur, c);
+	have = doclen_cursor_next(&cur, &e);
 
 	pw_begin(&pw, index);
-	i = 0;
-	while (i < n)
+	while (have)
 	{
 		uint64		gaps[WEAVE_BLOCK_SIZE];
 		uint8		bytes[WEAVE_BLOCK_SIZE];
 		unsigned char gapscratch[1 + (WEAVE_BLOCK_SIZE * 64 + 7) / 8];
-		uint64		first_docid = arr[i].docid;
-		uint64		prev = arr[i].docid;
+		uint64		first_docid = e.docid;
+		uint64		prev = e.docid;
 		int			bcount = 0;
 		int			gapbytes;
 		Size		need;
@@ -1857,13 +2049,13 @@ weave_write_doclen_sidecar(Relation index, DoclenCollector *c)
 		char	   *dst;
 		WeaveDoclenBlockHdr *bh;
 
-		while (i < n && bcount < WEAVE_BLOCK_SIZE)
+		while (have && bcount < WEAVE_BLOCK_SIZE)
 		{
-			gaps[bcount] = arr[i].docid - prev;	/* first gap 0 */
-			bytes[bcount] = arr[i].byte;
-			prev = arr[i].docid;
+			gaps[bcount] = e.docid - prev;	/* first gap 0 */
+			bytes[bcount] = e.byte;
+			prev = e.docid;
 			bcount++;
-			i++;
+			have = doclen_cursor_next(&cur, &e);
 		}
 		gapbytes = weave_for_pack(gaps, bcount, gapscratch);
 		need = MAXALIGN(sizeof(WeaveDoclenBlockHdr) + gapbytes + bcount);
@@ -1908,7 +2100,6 @@ weave_write_doclen_sidecar(Relation index, DoclenCollector *c)
 		((PageHeader) pw.page)->pd_lower += need;
 	}
 	pw_finish(&pw);
-	pfree(arr);
 	return first;
 }
 
@@ -2873,7 +3064,7 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 	seg->nterms = bs->nterms;
 	seg->ndeleted = 0;
 	seg->livedocslen = 0;
-	hash_destroy(dc.ht);
+	doclen_collector_free(&dc);
 	pfree(postings);
 	pfree(offsets);
 }
@@ -3332,6 +3523,7 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 		MemoryContext told;
 		WeaveBuildState tbs;
 		BuildTerm  *bt;
+		BuildTerm  *mbt;		/* the one term this pass gathers */
 		BlockNumber fb;
 		uint32		fo;
 
@@ -3382,7 +3574,17 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 		tbs.maxterms = 0;
 		tbs.ndocs = 0;
 		tbs.sumdoclen = 0;
-		weave_build_ht_init(&tbs);
+
+		/*
+		 * L15: the merge gathers exactly one term per pass, so it needs no
+		 * term hash at all.  It used to create a fresh dynahash here and probe
+		 * it once per posting of the term -- 19% of total build time spent
+		 * looking up the one entry the table could ever hold
+		 * (bench/RESULTS_BUILD_PROFILE.md).  The BuildTerm is created lazily on
+		 * the first surviving posting so a fully tombstoned term still yields
+		 * tbs.nterms == 0 below.
+		 */
+		mbt = NULL;
 
 		for (i = 0; i < nsel; i++)
 		{
@@ -3422,9 +3624,11 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 				 * Invalid, and the merged 2-column postings are then mis-read as
 				 * inline (garbage doclen, WAND pruning defeated). */
 				doclen_collector_add(&mergedc, weave_tid_to_docid(&post[k].tid), doclen);
-				add_posting(&tbs, mt->term, mt->termlen,
-							&post[k].tid, post[k].tf, doclen,
-							post[k].pos, post[k].pos ? (int) post[k].tf : 0);
+				if (mbt == NULL)
+					mbt = build_term_new(&tbs, smterm, smlen, -1);
+				build_term_append(&tbs, mbt,
+								  &post[k].tid, post[k].tf, doclen,
+								  post[k].pos, post[k].pos ? (int) post[k].tf : 0);
 			}
 			pfree(post);
 			if (posarena)
@@ -3476,7 +3680,7 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 
 	MemSet(seg, 0, sizeof(WeaveSegMeta));
 	seg->doclenstart = bs->want_sidecar ? weave_write_doclen_sidecar(index, &mergedc) : InvalidBlockNumber;
-	hash_destroy(mergedc.ht);
+	doclen_collector_free(&mergedc);
 	dict_spill_rewind(&spill);
 	seg->dictstart = weave_write_dictionary_iter(index, dict_spill_next, &spill,
 												&seg->dictindexstart);
@@ -5575,15 +5779,7 @@ weave_flush_pending(Relation index)
 	bs.sumdoclen = 0;
 	bs.nflushes = 0;
 	bs.flush_budget = 0;
-	{
-		HASHCTL		ctl;
-
-		ctl.keysize = sizeof(TermKey);
-		ctl.entrysize = sizeof(TermHashEntry);
-		ctl.hcxt = bs.ctx;
-		build_ht = hash_create("weave flush terms", 1024, &ctl,
-							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	}
+	weave_build_ht_init(&bs);
 
 	/* fold only the pending documents into the build state */
 	blk = meta.pendinghead;

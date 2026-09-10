@@ -1,0 +1,3 @@
+49.242678616
+reloptions: text_config=english
+size_at_build_end=873 MB
