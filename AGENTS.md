@@ -63,11 +63,41 @@ changed. This cost real time to discover; do not rediscover it.
 Standalone codec tests, no backend needed:
 
 ```sh
-gcc -O2 -I include -o /tmp/tq test/hegel/test_quantize.c \
-    src/vector/quantize.c src/vector/pack.c -lm && /tmp/tq
-gcc -O2 -I include -o /tmp/bp bench/bound_pruning.c \
-    src/vector/quantize.c src/vector/pack.c -lm && /tmp/bp 1 && /tmp/bp 0
+gcc -O2 -I include -o /scratch/tq test/hegel/test_quantize.c \
+    src/vector/quantize.c src/vector/pack.c -lm && /scratch/tq
+gcc -O2 -I include -o /scratch/bp bench/bound_pruning.c \
+    src/vector/quantize.c src/vector/pack.c -lm && /scratch/bp 1 && /scratch/bp 0
 ```
+
+## Scratch space, and where parallel worktrees go
+
+**Everything that is not the repository goes in `/scratch`.** Build outputs,
+compiled standalone tests, throwaway clusters, corpora, profiles, and git
+worktrees. Do not create sibling directories next to the checkout: `~/ws` is the
+maintainer's workspace root holding a hundred unrelated projects, and a
+`~/ws/wt-something` is indistinguishable from one of them a week later.
+
+When several agents work at once they need **separate worktrees**, because a
+shared tree means concurrent `make` runs writing the same object files:
+
+```sh
+git worktree add /scratch/pgw-<task> -b wt/<task> main
+# ... work, commit in the worktree, do not push ...
+git worktree remove /scratch/pgw-<task>
+```
+
+`/scratch` is a **different filesystem** from `$HOME`, so `git worktree move`
+into it fails with "Invalid cross-device link". Create it in the right place the
+first time; relocating means `worktree remove` + `worktree add`, which is only
+safe once every change is committed.
+
+Two quirks a fresh worktree has that the main checkout does not, both discovered
+the hard way:
+
+- `make` tries to re-run bison on the Lime grammar, because fresh checkout mtimes
+  make `src/query/regex_grammar.c` look stale. `touch src/query/regex_grammar.c`.
+- `nix build` sees only what git has indexed, so `git add` your new files before
+  building or the flake builds without them.
 
 ## Lint targets and what each protects against
 
