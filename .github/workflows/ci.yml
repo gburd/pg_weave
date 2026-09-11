@@ -112,9 +112,11 @@ jobs:
           sudo apt-get install -y \
             postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} \
             gcc make libipc-run-perl
-          # The PGDG package starts a cluster on install; stop it so it cannot
-          # compete for a port or confuse a later initdb.
-          sudo pg_ctlcluster ${{ matrix.pg }} main stop || true
+          # The PGDG package USUALLY starts a cluster on install; stop it so it
+          # cannot compete for a port or confuse a later initdb.  On the hosted
+          # image it often does not create one at all, so "specified cluster
+          # '17 main' does not exist" in the log is expected and not a failure.
+          sudo pg_ctlcluster ${{ matrix.pg }} main stop 2>/dev/null || true
 
       - name: Build + install
         run: |
@@ -139,7 +141,13 @@ jobs:
         # always-pass file to make the TAP stage a no-op here; TAP runs below.
         env:
           PGHOST: /tmp
-          PGUSER: ${{ github.actor }}
+          # PGUSER is deliberately NOT set.  initdb creates a superuser named after
+          # the OS user that ran it -- `runner` on a hosted runner -- and libpq
+          # already defaults PGUSER to the OS user, so the default is correct and
+          # any explicit value is a chance to be wrong.  This previously read
+          # `${{ github.actor }}`, which is the GitHub account that pushed
+          # (`gburd`), an identity that does not exist as a database role:
+          # `FATAL: role "gburd" does not exist`.
         run: make installcheck PROVE_TESTS=ci/noop.pl
 
       - name: TAP -- the full suite
@@ -202,7 +210,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             postgresql-17 postgresql-server-dev-17 clang make libipc-run-perl
-          sudo pg_ctlcluster 17 main stop || true
+          sudo pg_ctlcluster 17 main stop 2>/dev/null || true
 
       - name: Build with ASan + UBSan
         run: |
@@ -219,7 +227,7 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1
           PGHOST: /tmp
-          PGUSER: ${{ github.actor }}
+          # See the note in the `test` job: PGUSER must not be set here either.
         run: |
           "$PGBIN/initdb" -D /tmp/pgdata --no-locale --encoding=UTF8
           "$PGBIN/pg_ctl" -D /tmp/pgdata -o "-k /tmp -c listen_addresses=localhost" -w start
