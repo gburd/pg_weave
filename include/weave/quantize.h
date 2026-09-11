@@ -23,9 +23,19 @@
  * vector toward the origin, so <q, dequant(code)> underestimates <q, u>.
  * Storing scale and reconstructing as scale * dequant(code) forces the
  * reconstruction's projection onto the true direction to equal norm exactly,
- * which makes the compressed-domain inner-product estimator unbiased.  An
- * unbiased estimator is what removes the need for a float32 rerank pass at
- * moderate k -- see doc/specs/VECTOR_CHANNEL.md sect. 2.
+ * which makes the compressed-domain inner-product estimator unbiased.
+ *
+ * WHAT UNBIASEDNESS DOES NOT BUY, measured 2026-09-10 (bench/RESULTS_IVF_RECALL.md).
+ * This comment used to continue "...which is what removes the need for a float32
+ * rerank pass at moderate k".  That was wrong, and wrong in an instructive way.
+ * Unbiasedness constrains the MEAN signed error; recall@10 depends on the RANKING
+ * under per-vector error, and an unbiased estimator with nonzero variance still
+ * permutes a top-10 list.  Measured at full probe, so with zero probe-miss error,
+ * compressed-domain-only recall@10 tops out at 0.7345 / 0.8515 / 0.9205 at 2 / 3 / 4
+ * bits on GloVe-200d and 0.6130 / 0.7880 / 0.8780 on GIST-960d.  Phase V's gate is
+ * 0.99.  So a full-precision rerank pass is REQUIRED at k=10, not optional, and
+ * WEAVE_VRERANK is not an extra.  A rerank window of 100 closed the gap on both
+ * corpora.  See doc/specs/VECTOR_CHANNEL.md sect. 2.
  *
  * DETERMINISM IS PART OF THE CONTRACT.  Encoding the same vector must produce
  * byte-identical codes on x86-64 and aarch64, under any thread count, forever.

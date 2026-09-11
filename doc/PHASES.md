@@ -110,7 +110,7 @@ cheapest wins available anywhere in this project.
 
 | id | task | spec | gate |
 |---|---|---|---|
-| L1 | Split the `src/am/am.c` unity build into `am.c` / `amscan.c` / `ambuild.c` / `amvacuum.c` with real prototypes in `include/weave/am.h` | — | `make check-unity` deleted; each TU compiles standalone; zero new warnings; regression byte-identical |
+| ~~**L1**~~ | **DONE 2026-09-10.** Split the 7,260-line `src/am/am.c` unity build into `am.c` 2,337 (AM core, page/segment/metapage machinery) / `ambuild.c` 3,895 (build, insert, segment writers, merge) / `amvacuum.c` 988 (bulkdelete, cleanup, compaction) / `amscan.c` 5,339, with `src/query/lev.c` and `src/pages/trgm_page.c` promoted to ordinary TUs in `OBJS` and `meson.build`. 37 symbols lost `static`, all declared in `include/weave/am.h` with per-declaration rationale. | **MET, with mechanical evidence:** `make check-unity` deleted and AGENTS.md rule 5 retired; every TU compiles standalone with zero warnings; regression **byte-identical** (zero `expected/*.out` changes, pg17 6+2, pg18 6+2, TAP 105). Object-code comparison of the LTO'd `.so`: 422 sized symbols both sides with 415 identical in size, no linkage-class or import change, 301 of 310 `.text` functions byte-identical after normalizing `__LINE__`; the 9 that differ all call a symbol that crossed a TU boundary and differ only in register allocation, stack slots or inlining. A byte-identical `.so` is unachievable since `__FILE__`/`__LINE__` must change, so per-function equivalence is the strongest available claim |
 | L2 | **Common-term ranked latency — ROOT CAUSE CORRECTED 2026-09-10, DEMOTED BELOW L17.** The original entry asserted "decode-bound posting scan on high-df terms" and prescribed impact-ordered posting blocks (an on-disk format change) on the strength of that sentence, with no profile. `bench/RESULTS_SCAN_PROFILE.md` measured it: posting decode, BM25 and WAND together are **~28%** of a ranked scan; **~72% is the doclen cursor** (now L17). Impact ordering attacks the 28%. It is **not withdrawn**, and after L17 it is RE-AIMED: L17 fixed the sparse-term cost (rare 1.87×, mid 1.66×) but left `common` flat at 14.9 ms, because at df 1.74M of 2M the candidate stride is ~1.15 docids and the scan genuinely reads 1.74M postings — which is exactly what impact ordering and earlier block-max termination attack. **L2 is now the route for the common band specifically** (4.75× behind pg_textsearch, the worst remaining ratio). Its stated baseline (74.7 ms at 2.19M) predates L7/L12/L13/L14 and is stale (now 15.35 ms common k=10). | `doc/specs/IMPACT_ORDERING.md` (write it) | common-term (df > 5%) ranked k=10 p50 ≤ 8 ms; rare/mid must not regress by >10%. Re-derive the gate after L17 |
 | ~~L3~~ | ~~**Doclen sidecar per-scan tax.**~~ **CLOSED 2026-09-10 — the gap does not exist in this codebase.** L3 inherited the claim that the v4 sidecar "decodes the whole segment sidecar per scan, a fixed ~18 ms" and prescribed a page-directory random-access cursor. pg_weave already has that cursor and does no whole-sidecar decode. Measured A/B (`bench/RESULTS_SCAN_PROFILE.md`): `doclen_sidecar=on` vs `off` is identical within noise in all three bands, at **625 MB vs 859 MB** — the sidecar is a 234 MB win at no latency cost. The equality is two costs cancelling (sidecar: cheap postings + cursor lookups; inline: 37% more posting data + free doclen), which is *why* making the cursor cheaper (L17) is a strict win rather than a wash. | `bench/RESULTS_SCAN_PROFILE.md` | closed |
 | ~~L4~~ | ~~**Parallel merge.**~~ **WITHDRAWN 2026-09-08 — measured upstream and it is a loss.** pg_fts `fa4c15e`: on 2.19M docs an 8-segment 7,185 MB index merges in **230.6 s serial vs 333.5 s parallel (1.45× SLOWER)** and the parallel path emits a **19% LARGER** index (10,229 vs 8,606 MB). W=1 costs the same as W=3, so it is a fixed penalty for taking the path, not a scaling curve. Suspected cause: per-worker output streams pack pages independently. Also a trap worth knowing: at `max_parallel_maintenance_workers=8` the workers register, start and exit within ~2 ms so the merge silently runs SERIAL — the "fast" runs were the serial path. | — | withdrawn |
@@ -192,7 +192,7 @@ See `doc/ARCHITECTURE.md` §7 and `doc/specs/FUZZY_CHANNEL.md`.
 |---|---|---|
 | ~~**Z1**~~ | **DONE 2026-09-09 (0.5.0).** Vendor TRE (laurikari/tre, BSD-2) as a submodule or in-tree copy; record the pinned commit and license in `doc/LICENSING.md`; get `src/query/re_match.c` compiling | `make` clean with the fuzzy sources in OBJS |
 | ~~**Z2**~~ | **DONE 2026-09-09 (0.5.0).** Wire the missing GUCs and deadline helpers listed in `doc/specs/IMPORT_pg_tre.md` "Wiring TODO" | all imported TUs compile; GUCs visible in `pg_settings` |
-| Z3 | Build the SuRF trie over the **bolt vocabulary** (dictionary terms), not the corpus. New page kind `WEAVE_PK_SURF` (id 21, reserved by X1 in the extended kind space -- read it with `WeavePageHasKind()`, never a bitwise AND). | `weave_check()` validates the trie; a property test asserts trie membership == dictionary membership |
+| **Z3** | **PURE CORE DONE 2026-09-10.** SuRF trie over the **bolt vocabulary** (dictionary terms), not the corpus: `include/weave/surftrie.h` + `src/query/surftrie.c` are the backend-independent builder/reader/validator (LOUDS-Sparse, page kind `WEAVE_PK_SURF` id 21 as reserved by X1), format v1 recorded in `doc/specs/FUZZY_CHANNEL.md` §3.3. A separate `terminal` bitmap replaces SuRF's reserved `0xFF` terminator label, because on a non-UTF-8 server a term can legitimately contain `0xFF` and that collision is a wrong answer in the false-negative direction. | **MET for the core:** `test/hegel/test_surf.c` 2,843,941 checks, 0 failures, clean under ASan+UBSan, asserting trie membership == dictionary membership in **both** directions plus prefix-enumeration exactness and the one-sided (false-positive-only) contract for over-long terms; `test/fuzz/fuzz_surftrie.c` 278,387 cases with two planted-bug builds that abort. 20 of 21 mutations caught; the 21st is provably redundant (derived at `src/query/surftrie.c:1136`, not deleted). **Still owed:** AM wiring — the bolt-flush/merge writer onto a `WEAVE_PK_SURF` page chain and the `weave_check()` row comparing trie against dictionary |
 | Z4 | Route prefix (`term*`) through SuRF instead of the current dictionary walk | prefix p50 ≤ today's, and `EXPLAIN` shows the surf channel |
 | Z5 | Route fuzzy (`term~k`) through universal-Levenshtein neighbourhood expansion over the vocabulary trigram map | index-accelerated `k=1` and `k=2` on a 1M-row corpus, p50 ≤ 200 ms (pg_tre measured 5.5 s and 7.3 s) |
 | Z6 | Route regex (`/re/`) through regex AST → trigram tiling → vocabulary candidates | character-class regex `E-[0-9]{4}` p50 ≤ 100 ms (pg_tre measured 1.5 s) |
@@ -222,7 +222,7 @@ read but **not** to port line-by-line: `~/src/turbovec` (Rust, MIT).
 | V7 | New page kinds `WEAVE_PK_VCODES`/`WEAVE_PK_VMETA` (ids 18/17, reserved by X1 in the extended kind space -- read them with `WeavePageHasKind()`, never a bitwise AND); codes live in the bolt under GenericXLog. **On-disk determinism:** `weave_block_codebytes()` allocates 0-28 slack bytes per block beyond the tight `4*dim*bits` requirement (see the note above it in `include/weave/quantize.h`), and no pack function ever writes them, so V7 **must zero the block buffer before encoding** or two indexes holding identical vectors get different bytes on disk. | crash-recovery TAP test extended to a vector index |
 | V8 | Code-scan shuttle: `score_block` over 32 lanes, `allow`-mask block short-circuit, and the block bound from `doc/specs/FUSED_TOPK.md` §2. Passes the segment's pack layout and the allowlist's `nwarp` into `score_block()` — both are parameters of that prototype, neither is assumed (`doc/specs/VECTOR_CHANNEL.md` §§8, 9) | (C1)+(C2) property test; a selective mask makes the scan measurably *faster* |
 | V9 | **IVF coarse quantizer** over the quantized codes: k-means over a sample, per-cluster centroids, `nprobe` probing, cluster-aligned code blocks (which also satisfies V13). **NOT a proximity graph** — withdrawn after pg_turbovec deprecated its graph kind in v2.5.0, having measured that at R@10 ≥ 0.98 on GIST-10M/960-d IVF reached 28.4 ms while the graph could not reach 0.98 at **any** latency (ceiling 0.873 at 181 ms) and built 57–90× slower. **A later release (v2.7.4) additionally measured that IVF's probe count sets a hard recall ceiling a wider rerank window cannot break — 0.846/0.906/0.954/0.978/0.984 at probes 8/16/32/64/128 at `lists=512` — a mechanism, not a BQ-specific artifact, so it applies to this design's IVF too.** `doc/specs/VECTOR_CHANNEL.md` §8a. | recall@10 ≥ 0.99 on 1M × 1024-d, **backed by a probes-vs-recall-vs-p50 sweep on pg_weave's own codebook and corpus geometry, not a single (probes, recall, p50) triple picked to clear the bar**; p50 within 2× of pgvector HNSW measured at the same recall target **on the same corpus** (confirm HNSW can itself reach 0.99 there before using it as the comparator — pg_turbovec's own data shows a corpus where HNSW topped out at 0.983); storage ≤ 0.15× pgvector HNSW; **plus a recall floor in the gate for any partitioned build** — pg_turbovec's shard/thread coupling cost R@10 0.920 → 0.605 while a build-time-only test called it a 60× speedup |
-| V10 | `recall=exact` path: graph off, full code scan, optional full-precision rerank sidecar | recall@10 == 1.000 |
+| V10 | **PROMOTED to a 0.99 prerequisite 2026-09-10, was "optional".** `recall=exact` path: graph off, full code scan, and the full-precision rerank sidecar `WEAVE_PK_VRERANK`. `bench/RESULTS_IVF_RECALL.md` measured compressed-domain-only recall@10 at **full probe** — probe-miss error zero, so this is the ceiling over every `nprobe` — topping out at 0.9205 (GloVe-200d) and 0.8780 (GIST-960d) at 4 bits, against a 0.99 gate. A rerank window of 100 closed the gap on both corpora. So the sidecar is not an extra for an exactness mode; it is how the ordinary gate is met. `doc/specs/VECTOR_CHANNEL.md` §2.1. | recall@10 == 1.000 for `recall=exact`, **and** the rerank window needed for `recall@10 >= 0.99` recorded per bit width and corpus |
 | V11 | Journal-checksum-style incremental commit for the vector wefts (alternating header slots, delta digest) — adapted to PostgreSQL's WAL rather than replacing it | torn-write injection TAP test detects and recovers |
 | V12 | ColBERT-style multivector late interaction as a distinct channel kind | MaxSim correctness against a reference implementation |
 | V13 | **Warp ordering by cluster.** Assign warp positions in the order the IVF build's k-means clustering produces (§8a of doc/specs/VECTOR_CHANNEL.md; IVF satisfies this requirement inherently, where the withdrawn graph plan needed it as a separate constraint), so each 32-lane code block is spatially coherent. Not an optimization: `bench/RESULTS_BOUND_PRUNING.md` measures the block bound pruning 99.6% of blocks with a coherent warp and **0.0%** with a random one. | `bench/bound_pruning.c` reports ≥ 90% blocks pruned at k=10 on the shipped corpora; a heap-order build is rejected by the gate |
@@ -240,22 +240,58 @@ checks),
 no verified vector ISA outside x86-64 AVX2, no approximate kernel family, and
 no per-host A/B. V7–V14 not started.
 
-**Phase V gate:** on 1M × 1024-d Cohere-wiki, all three of
-`recall@10 ≥ 0.99`, `p50 ≤ 2× pgvector HNSW`, `size ≤ 0.15× pgvector HNSW`
-simultaneously. Recorded in `bench/RESULTS_VECTOR.md`, which **must include a
-probes-vs-recall sweep for V9's IVF, not a single passing configuration** —
-pg_turbovec's v2.7.4 measured that a fixed `nprobe` imposes a recall ceiling no
-rerank-window widening can break (`doc/specs/VECTOR_CHANNEL.md` §8a), so "some
-setting clears 0.99" is not evidence that a *fast* setting does.
+**Phase V gate — REOPENED AS A QUESTION 2026-09-10.** The gate was: on
+1M × 1024-d Cohere-wiki, all three of `recall@10 ≥ 0.99`, `p50 ≤ 2× pgvector HNSW`,
+`size ≤ 0.15× pgvector HNSW` simultaneously. `bench/RESULTS_IVF_RECALL.md` measured
+something that puts two of those three in direct tension:
 
-Two warnings about the gate itself, both from measurements taken after it was
-written. **The comparator may not clear its own bar:** on pg_turbovec's 500k ×
-1024-d corpus, pgvector HNSW never reached 0.99 at all, so `p50 ≤ 2× pgvector
-HNSW` at matched recall is undefined there and the corpus must be checked before
-it is used. And this is the gate pg_turbovec **failed** (490× slower); the
-difference is V9. If V9 does not land — **or lands and cannot clear 0.99 within
-the latency budget** — the vector channel is storage-optimal and latency-poor and
-the README must say exactly that.
+- Compressed-domain-only recall@10 at **full probe** tops out at 0.9205 (GloVe-200d)
+  and 0.8780 (GIST-960d) at 4 bits. Full probe means zero probe-miss error, so that
+  is the ceiling over every `nprobe`, and **0.99 is unreachable without a
+  full-precision rerank** (§2.1 of `doc/specs/VECTOR_CHANNEL.md`).
+- A full-coverage float32 rerank sidecar costs `4 * dim` bytes per vector — 4,096 at
+  1024-d — which is roughly what pgvector HNSW spends on the vector it stores. The
+  `size ≤ 0.15×` figure assumed the codes were the whole index.
+
+So `recall@10 ≥ 0.99` **and** `size ≤ 0.15× pgvector HNSW` may be jointly
+unsatisfiable, and that is a maintainer decision rather than an engineering task.
+The three honest resolutions, none yet chosen:
+
+1. **Keep both, prove them.** Requires a rerank representation cheaper than float32
+   that still lifts recall to 0.99 — unmeasured, and TQ+ calibration already moved
+   recall the *wrong* way at 3 of 4 points, so it is not the candidate.
+2. **Keep the storage claim, lower the recall claim.** "0.92 recall at ~0.12× the
+   storage" is a real product position and a defensible one. It is not the position
+   `doc/ARCHITECTURE.md` §8 currently implies.
+3. **Keep the recall claim, drop the storage claim.** pg_weave then competes with
+   pgvector on latency and integration rather than size.
+
+Until one is chosen, the gate is: **all three measured and recorded on the real
+corpus, with a probes-vs-recall-vs-p50 sweep and the rerank sidecar counted in the
+size**, and whichever of the three is not met stated plainly. Recorded in
+`bench/RESULTS_VECTOR.md`, which **must include a probes-vs-recall-vs-p50 sweep for
+V9's IVF, not a single passing configuration** — both pg_turbovec's v2.7.4 and our
+own `bench/RESULTS_IVF_RECALL.md` measured a fixed `nprobe` imposing a recall ceiling
+no rerank-window widening breaks, so "some setting clears 0.99" is not evidence that
+a *fast* setting does.
+
+Two further warnings about the gate, both from measurements taken after it was
+written:
+
+- **The comparator may not clear its own bar.** On pg_turbovec's 500k × 1024-d
+  corpus pgvector HNSW never reached 0.99 at all, so `p50 ≤ 2× pgvector HNSW` at
+  matched recall is undefined there. Confirm HNSW reaches the target on *our* corpus
+  before using it as the comparator.
+- **Our own probe-miss numbers are pessimistically biased and must not be quoted as
+  the ceiling.** `bench/ivf_recall.c` uses a deliberately crude Lloyd k-means with
+  random init and 12–32 sample rows per centroid; a better partition can only raise
+  those recalls. The *quantization* half of that measurement is the robust half,
+  because it is taken at full probe where the partition cannot matter.
+
+This is also the gate pg_turbovec **failed** (490× slower); the difference is V9. If
+V9 does not land — or lands and cannot clear 0.99 within the latency and storage
+budget — the vector channel is storage-optimal and latency-poor and the README must
+say exactly that.
 
 ---
 

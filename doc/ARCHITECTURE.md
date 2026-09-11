@@ -197,6 +197,19 @@ fundamental and no amount of engineering removes them; they are knobs, not bugs.
    — but it cannot abolish the frontier. `vec_recall` is a per-query GUC and
    `recall=exact` will always cost a scan.
 
+   **Measured 2026-09-10, and it costs us part of that ambition**
+   (`bench/RESULTS_IVF_RECALL.md`): quantized codes alone do not reach 0.99 at
+   k=10. At full probe — zero probe-miss error, so this is the ceiling over every
+   `nprobe` — recall@10 tops out at 0.9205 (GloVe-200d) and 0.8780 (GIST-960d) at
+   4 bits. Reaching 0.99 requires a full-precision rerank pass, and a
+   full-coverage float32 sidecar costs `4 * dim` bytes per vector, which is about
+   what pgvector HNSW spends on the vector it stores. So the "10× storage win *at*
+   0.99" formulation is not yet supported by anything we have measured, and the
+   honest position until it is: **pg_weave can offer 0.92-ish recall at roughly
+   0.12× the storage, or ~0.99 recall at roughly pgvector's storage, and picking
+   between those is the user's knob, not a defect we are hiding.** Do not write
+   "0.99 at 0.15×" in the README until a measurement says so.
+
 2. **Unanchored cross-token substring search.** See §7. With `cgram` off we
    cannot answer it from the index; with `cgram` on we are not smaller than
    pg_trgm. Do not claim otherwise in the README.
