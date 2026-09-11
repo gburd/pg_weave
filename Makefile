@@ -104,14 +104,14 @@ TRE_CPPFLAGS = \
 	-I$(srcdir)/vendor/tre/local_includes
 
 EXTENSION = pg_weave
-DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql sql/pg_weave--0.4.0--0.5.0.sql sql/pg_weave--0.5.0--0.6.0.sql
+DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql sql/pg_weave--0.4.0--0.5.0.sql sql/pg_weave--0.5.0--0.6.0.sql sql/pg_weave--0.6.0--0.7.0.sql
 PGFILEDESC = "pg_weave - unified lexical + vector + fuzzy retrieval in one index"
 
 # sql/ and expected/ are already at the top level (PGXS's built-in default
 # --inputdir=$(srcdir) for pg_regress), so plain REGRESS with no REGRESS_OPTS
 # picks up sql/<name>.sql + expected/<name>.out directly. No relayout fix
 # needed here.
-REGRESS = weave unicode_fold idx_scan_stats wvec orderby chandesc
+REGRESS = weave unicode_fold idx_scan_stats wvec orderby chandesc surf
 
 # --- Isolation tests -------------------------------------------------------
 # pg_isolation_regress hardcodes its two lookup paths relative to a SINGLE

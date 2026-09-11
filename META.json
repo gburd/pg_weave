@@ -2,7 +2,7 @@
    "name": "pg_weave",
    "abstract": "One index for BM25 text, vector similarity, fuzzy and regex search",
    "description": "A PostgreSQL extension providing a single unified index access method (weave) that combines BM25 lexical full-text ranking, vector similarity, fuzzy (edit-distance) matching, and regex/trigram search, so applications no longer need to maintain separate GIN/GiST/vector indexes for hybrid retrieval.",
-   "version": "0.6.0",
+   "version": "0.7.0",
    "maintainer": [
       "Gregory Burd <greg@burd.me>"
    ],
@@ -11,7 +11,7 @@
       "pg_weave": {
          "abstract": "One index for BM25 text, vector similarity, fuzzy and regex search",
          "file": "sql/pg_weave--0.1.0.sql",
-         "version": "0.6.0"
+         "version": "0.7.0"
       }
    },
    "prereqs": {

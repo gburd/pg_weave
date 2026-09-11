@@ -1,6 +1,7 @@
 # Specification: the fuzzy, regex, and prefix channel
 
-Status: **sources imported from pg_tre, not wired.** Tasks **Z1**–**Z9** in
+Status: **Z3 done — the SuRF trie is on disk, verified and loadable. The rest of the
+sources are imported and not wired.** Tasks **Z1**–**Z9** in
 `doc/PHASES.md`. Import mapping and wiring TODO: `doc/specs/IMPORT_pg_tre.md`.
 
 ## 1. The substitution this whole channel rests on
@@ -68,7 +69,8 @@ pattern
 
 | stage | structure | source file | origin |
 |---|---|---|---|
-| prefix / range / anchored | SuRF, LOUDS-Sparse trie | `src/query/surf.c` | pg_tre |
+| prefix / range / anchored | SuRF, LOUDS-Sparse trie | `src/query/surftrie.c` (over vocabulary terms; **wired**) | pg_weave (Z3) |
+| prefix over trigram keys | SuRF over uint64 keys | `src/query/surf.c` | pg_tre |
 | fuzzy neighbourhood | universal Levenshtein (Mihov–Schulz) | `src/query/uleven.c` | pg_tre |
 | fuzzy verification | bounded Levenshtein automaton | `src/query/lev.c` | pg_fts |
 | regex parse | LALR grammar → AST | `src/query/regex_grammar.c`, `regex_ast.c` | pg_tre |
@@ -84,6 +86,11 @@ specific candidate term is within k (an acceptor). Using the generator as an
 acceptor would be slow; using the acceptor as a generator is impossible.
 
 ## 3. SuRF over the vocabulary — task Z3
+
+Status: **on disk and verified.** The pure core (§3.1) plus the AM half — the page
+chain, the descriptor registration, the `weave_check()` gate, and a reader — are
+implemented. **No query is routed through it yet**; that is Z4 (prefix), Z5 (fuzzy)
+and Z6 (regex).
 
 Page kind `WEAVE_PK_SURF`, **id 21 in the extended kind space** — already reserved
 by X1, see the authoritative table in `doc/specs/SEGMENT_FORMAT.md` §2. It is an
@@ -106,14 +113,40 @@ Invariant for `weave_check()`: trie membership is **exactly** the bolt's
 dictionary term set. Not a subset, not a superset. A one-sided error here silently
 changes results, so the check must compare both directions.
 
-### 3.1 The Z3 deliverable: a pure core
+### 3.1 The Z3 deliverable: a pure core, plus the AM half
 
 `include/weave/surftrie.h` + `src/query/surftrie.c` are the backend-independent
 builder, reader and validator; `test/hegel/test_surf.c` is the property test and
-`test/fuzz/fuzz_surftrie.c` the corruption harness. Nothing in `src/am/` calls
-them yet — **the AM wiring is deliberately a follow-up task**, sequenced after L1
-splits the `src/am/am.c` unity build, because Z3 landing inside that file at the
-same time is a guaranteed conflict.
+`test/fuzz/fuzz_surftrie.c` the corruption harness.
+
+The AM half, sequenced after L1 split the `src/am/am.c` unity build:
+
+| piece | where | why there |
+|---|---|---|
+| vocabulary collection | inside `weave_write_dictionary_iter()` (`src/am/ambuild.c`) | the trie must be built from the **same term sequence the dictionary writer emitted**. There are two dictionary writers (an in-memory array at bolt flush, a spilled stream at merge); building at each call site would mean two places that must independently agree with the dictionary. Feeding a collector from inside the writer makes the agreement structural. |
+| build + page chain | `weave_build_surf_weft()` (`src/am/ambuild.c`), called from `weave_write_segment()` and `weave_merge_segments_streaming()` right after the dictionary is written | the seam is the segment writer, and `src/am/ambuild.c` owns segment writers |
+| the chain writer/reader | `weave_write_surf()`, `weave_read_surf()`, `weave_surf_load()` (`src/am/am.c`) | `src/am/am.c` owns page and segment machinery |
+| the gate | `surf_trie_matches_dictionary` in `src/am/amcheck.c` | §3 above, and `doc/specs/SEGMENT_FORMAT.md` §9 |
+| byte accounting | a `surf_trie` bucket in `weave_index_size_detail()`, plus `weave_surf_stats()` (`src/am/amsize.c`) | a structure whose bytes are unattributed is a structure that gets big unnoticed |
+
+Two things the writer does that are not obvious from the format:
+
+1. **On merge the trie is REBUILT, not merged.** A merged bolt's vocabulary is the
+   union of its inputs' minus terms whose every posting was tombstoned, so its
+   level-order slot numbering, its rank/select tables and every one of its term
+   ordinals differ from both inputs. Two LOUDS-Sparse images cannot be
+   concatenated or unioned in place. Rebuilding is nearly free because the merged
+   term sequence is what the dictionary writer just emitted.
+2. **A vocabulary the format cannot represent completely gets NO weft at all,**
+   not a partial one. Absent is safe: a caller that finds no fuzzy weft falls back
+   to the dictionary walk, which is slower and correct. Incomplete is a false
+   negative. So a zero-length term (`WEAVE_SURF_EMPTY_TERM`) or a vocabulary above
+   the format cap omits the weft with a `WARNING`, and the descriptor simply has no
+   `WEAVE_WK_FUZZY` entry. An input that is not strictly ascending is different in
+   kind — it means the dictionary on disk is not sorted either, which also breaks
+   the sparse block index and the k-way merge — so that one is an `ERROR`, and it is
+   the only free check the tree has of the "dictionary terms are strictly ascending
+   within a bolt" invariant `SEGMENT_FORMAT.md` §9 still owes.
 
 Note what is *not* here: `include/weave/surf.h` / `src/query/surf.c` are the
 imported pg_tre SuRF over **uint64 trigram keys** (`pg_weave_surf_*`, palloc,
@@ -151,9 +184,31 @@ term the dictionary contains.
 ### 3.3 On-disk layout, v1
 
 One contiguous little-endian image, `WEAVE_SURFTRIE_MAGIC` = `"WST1"`. The AM
-lays it on a `WEAVE_PK_SURF` page chain with the existing blob writer; the image
-is position-independent and length-checked, so page chaining is not part of this
-format.
+lays it on a `WEAVE_PK_SURF` page chain; the image is position-independent and
+length-checked, so page chaining is not part of this format.
+
+> **Where §3.3 was wrong.** It said "with the existing blob writer". That cannot be
+> done: `weave_write_blob()` hard-codes `WEAVE_PK_TRGM_DATA` — which is exactly why
+> the livedocs blob lands on trigram-data pages and `WEAVE_PK_LIVEDOCS` has no
+> writer at all (`SEGMENT_FORMAT.md` §2). Reusing it would have put the trie on
+> pages whose kind says "trigram data", and `weave_check()` and
+> `weave_index_size_detail()` would then have had no way to tell the two apart.
+> `weave_read_blob()` is worse for this purpose: it validates no page kind, follows
+> `nextblk` and trusts `pd_lower`. For a structure whose entire job is to be a
+> filter that never produces a false negative, the reader must refuse bytes that
+> are not demonstrably its own. `weave_write_surf()` / `weave_read_surf()` in
+> `src/am/am.c` are the pair, and the reader checks
+> `WeavePageHasKind(page, WEAVE_PK_SURF)` on every page.
+>
+> **Where §3.3 was underspecified: how the reader knows the image length.** "The
+> image is length-checked" presumes a length, and the section never said where it
+> comes from. It comes from the chain: the pages carry the image bytes and nothing
+> else, so the length is the sum of their payloads, and the reader walks the chain
+> to compute it *before* it allocates. That is not a detail — a length stored in the
+> descriptor or in a per-chain header would be a second source of truth for a
+> number the bytes already determine, exactly the objection §3.3 raises against an
+> offset table, and it would also let a corrupt count drive a 1.3 GB allocation.
+> Deriving it from the chain bounds the allocation by pages that exist.
 
 Every multi-byte integer is written **byte-wise little-endian** and every read
 goes through a shift-assembly helper. There is no struct overlay, no padding, and
@@ -233,6 +288,25 @@ terminal count is exactly what the header claims, the observed maximum depth
 equals `maxdepth`, and the ordinals are `0 = ord₀ < ord₁ < … < nterms`. Together
 with a dictionary walk that is set equality in both directions, which is the Z3
 gate.
+
+**Neither layer is sufficient, and that is measured rather than asserted.**
+`t/013_surf_corruption.pl` bumps the header's `nterms` by one: no section length
+depends on `nterms` (only `nslots`, `nnodes` and `nterminal` do), so the image is
+still exactly as long as its own counts imply, every popcount identity holds,
+every accelerator table still equals a recomputation, and the ordinal-range test
+`ord < nterms` only got looser — **both layers accept it.** The same test then sets
+the label byte of the *last* slot to `0xFF`, which preserves "labels strictly
+ascending within a node" (`0xFF` is the largest byte, and that slot ends its node)
+and touches no bitmap: structurally perfect, semantically a different vocabulary.
+Only the comparison against the dictionary sees either one. That is why the gate is
+a cross-structure invariant and not "run the validator".
+
+The byte cost, measured on a 200,000-row build of short text: **~5.5 bytes per
+vocabulary term**, flat across a 3.7× change in vocabulary size (274,244 terms →
+1,514,433 B; 74,244 terms → 410,061 B), which is 17.1 % of the dictionary it
+indexes and 5–7 % of the whole index at that corpus size. The table and the caveat
+about how that share moves as the vocabulary saturates are in
+`doc/specs/SEGMENT_FORMAT.md` §6.
 
 One of those checks is provably redundant, and it is recorded rather than removed.
 Mutation testing showed that deleting the reachability comparison changes no test
@@ -371,7 +445,7 @@ anyone enables it on a multi-GB column.
 |---|---|---|
 | Z1 | build with fuzzy sources in `OBJS` | needs vendored TRE, BSD-2; record commit in `doc/LICENSING.md` |
 | Z2 | GUCs visible in `pg_settings` | wiring list is in `doc/specs/IMPORT_pg_tre.md` |
-| Z3 | `weave_check()` trie/dictionary set equality, both directions | property test, not a fixed-output test |
+| Z3 | `weave_check()` trie/dictionary set equality, both directions | **done**: `surf_trie_matches_dictionary` (`src/am/amcheck.c`), plus `sql/surf.sql`, `t/012_surf_crash_recovery.pl` and `t/013_surf_corruption.pl` |
 | Z4 | prefix p50 ≤ today's; `EXPLAIN` shows the surf channel | |
 | Z5 | k=1 and k=2 index-accelerated, p50 ≤ 200 ms at 1 M rows | vs pg_tre's 5.5 s / 7.3 s |
 | Z6 | `E-[0-9]{4}` p50 ≤ 100 ms | vs pg_tre's 1.5 s |

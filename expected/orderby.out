@@ -14,7 +14,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.6.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.7.0" of extension "pg_weave" is already installed
 CREATE TABLE ob (id serial, d wdoc);
 -- A vocabulary with three frequency bands so ranking is meaningful and the
 -- top-k is not an arbitrary tie-break.
