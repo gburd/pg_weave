@@ -186,6 +186,19 @@ $(TRE_OBJS:.o=.bc): BITCODE_CFLAGS += $(TRE_WARN_OFF)
 # doc/LICENSING.md "Lime".
 src/query/regex_grammar.o: CFLAGS += -Wno-unused-parameter -Wno-missing-prototypes
 
+# PGXS ships an implicit `%.c: %.y` rule that runs bison, and both the Lime
+# grammar and its generated output are committed.  `git checkout` writes them in
+# index order with near-identical mtimes, so whether make thinks the .c is stale
+# comes down to nanoseconds: equal mtimes mean "up to date", and one nanosecond
+# of skew means bison is handed a Lime grammar, chokes on `%syntax_error`, and
+# takes the build with it.  That is how CI's `sanitize` leg failed while
+# `standalone` and both `test` legs passed on the very same commit, and it is
+# what the `touch src/query/regex_grammar.c` folklore for fresh worktrees was
+# working around.  An explicit rule with an empty recipe cancels implicit-rule
+# search for this target, which is the documented way to say "this file is a
+# source, not a derived file" (GNU make, "Using Empty Recipes").
+src/query/regex_grammar.c: ;
+
 # --- Source distribution (PGXN release artifact) ---------------------------
 # `make dist` produces pg_weave-$(DISTVERSION).zip in PGXN layout (all files
 # under a pg_weave-$(DISTVERSION)/ prefix) straight from the committed tree
