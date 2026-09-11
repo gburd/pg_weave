@@ -24,7 +24,7 @@
 #
 set -uo pipefail
 
-PROFILE=${AWS_PROFILE:-bene}
+PROFILE=${AWS_PROFILE:-lava}
 CORPUS=${1:?usage: orchestrate.sh <corpus> <engine> [engine ...]}
 shift
 ENGINES=("$@")
