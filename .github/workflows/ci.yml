@@ -5,18 +5,45 @@ name: CI
 # unrun for six days while the FOR codec was modified twice, and how a
 # wrong-answer phrase bug shipped as the default.
 #
-# MIRROR of .forgejo/workflows/ci.yml, which is canonical (Codeberg is the origin).
-# Keep the two in step: if a gate is added there, add it here.
+# THIS FILE IS THE ONE THAT IS ACTUALLY WATCHED.  Codeberg is the canonical remote
+# and .forgejo/workflows/ci.yml is its workflow, but the Codeberg runner has never
+# been registered, whereas Codeberg push-mirrors to github.com/gburd/pg_weave where
+# Actions is enabled.  So this file is the operative gate and the Forgejo one is
+# kept in sync against the day a Codeberg runner appears.
 #
-# The difference is the runner. Forgejo runs each leg inside a postgres:<major>
-# image as root; GitHub-hosted runners already have a non-root user and a
-# PostgreSQL, so these legs install the PGDG packages and run as the normal user,
-# which avoids the `su postgres` dance entirely.
+# It was also broken from the day it was written until 2026-09-10, in three ways
+# that are worth naming because each is a way a mirrored workflow rots:
+#
+#   1. The `test` job carried `runs-on: docker` and a `container:` image copied
+#      from the Forgejo file.  GitHub has no runner labelled `docker`, so those
+#      jobs sat QUEUED -- not failed, queued -- for 21+ hours across four pushes.
+#      A queued job is worse than a failing one: nothing goes red.
+#   2. The `sanitize` job interpolated ${{ matrix.pg }} while having no matrix, so
+#      it built with PG_CONFIG=/usr/lib/postgresql//bin/pg_config and died on
+#      "No such file or directory".
+#   3. Its steps mixed the container idiom (root, `su postgres`) with the hosted
+#      idiom (unprivileged `runner`, `sudo`).
+#
+# The lesson, and the reason this comment is long: a mirrored workflow shares text
+# with its origin but not its runtime, and the differences are exactly the lines
+# that decide whether anything runs at all.  When editing either file, diff both.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+
+# Four pushes each queued a full matrix and none of them ever started.  Superseded
+# runs on the same ref are now cancelled so the queue cannot silently deepen.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Every job installs PostgreSQL from PGDG rather than using the runner's
+  # preinstalled major, because pg_weave gates on 17 AND 18 and the hosted image
+  # tracks neither reliably.
+  DEBIAN_FRONTEND: noninteractive
 
 jobs:
   # -------------------------------------------------------------------------
@@ -29,14 +56,20 @@ jobs:
   standalone:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Install toolchain
         run: |
           sudo apt-get update
-          # libclang-rt-dev: Debian/Ubuntu clang does not ship the sanitizer
-          # runtimes, and check-fuzz fails at link time without them.
-          sudo apt-get install -y gcc clang make libclang-rt-dev
-
-      - uses: actions/checkout@v4
+          sudo apt-get install -y gcc clang make
+          # The sanitizer runtimes are split out of Ubuntu's clang package, and
+          # check-fuzz fails at LINK time without them ("cannot find
+          # libclang_rt.asan-x86_64.a").  The unversioned name does not exist on
+          # every release, so fall back to the versioned one derived from clang
+          # itself rather than hardcoding a number that will age.
+          sudo apt-get install -y libclang-rt-dev || \
+            sudo apt-get install -y \
+              "libclang-rt-$(clang --version | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p' | head -1)-dev"
 
       - name: Lint gates
         run: |
@@ -51,78 +84,96 @@ jobs:
         run: make check-fuzz
 
   # -------------------------------------------------------------------------
-  # Build + regression + isolation, per PostgreSQL major.
+  # Build + regression + isolation + TAP, per PostgreSQL major.
   # -------------------------------------------------------------------------
   test:
-    runs-on: docker
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         pg: [17, 18]
-    container:
-      image: postgres:${{ matrix.pg }}
+    env:
+      PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+      PGBIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
     steps:
+      - uses: actions/checkout@v4
+
       - name: Install PostgreSQL ${{ matrix.pg }} from PGDG
         run: |
-          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          # `apt-key` was REMOVED in Ubuntu 24.04, which ubuntu-latest now is, so
+          # the key goes in a keyring and the repo line points at it.  The old
+          # `apt-key add` form fails outright.
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc > /dev/null
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y postgresql-${{ matrix.pg }} \
-            postgresql-server-dev-${{ matrix.pg }} libipc-run-perl
+          sudo apt-get install -y \
+            postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} \
+            gcc make libipc-run-perl
+          # The PGDG package starts a cluster on install; stop it so it cannot
+          # compete for a port or confuse a later initdb.
           sudo pg_ctlcluster ${{ matrix.pg }} main stop || true
-
-      - uses: actions/checkout@v4
 
       - name: Build + install
         run: |
-          make with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
-          make install with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          # with_llvm=no is REQUIRED, not a preference.  PGXS generates LLVM
+          # bitcode for JIT inlining during `make install` and that step has
+          # aborted inside llvm-lto on these images (core dumped, exit 134) -- a
+          # toolchain mismatch, not a defect in pg_weave.  The extension does not
+          # need JIT inlining and installs correctly without it.
+          make with_llvm=no
+          sudo make install with_llvm=no PG_CONFIG="$PG_CONFIG"
+
+      - name: Start a cluster
+        # Unlike the Forgejo container job, the hosted runner is an unprivileged
+        # user, so initdb runs directly -- no `su postgres`, which would fail here
+        # because that account does not own the checkout.
+        run: |
+          "$PGBIN/initdb" -D /tmp/pgdata --no-locale --encoding=UTF8
+          "$PGBIN/pg_ctl" -D /tmp/pgdata -o "-k /tmp -c listen_addresses=localhost" -w start
 
       - name: Regression + isolation
-        # initdb refuses to run as root and the postgres image runs CI as root, so
-        # the cluster and installcheck go through `su postgres`.  PGXS checks
-        # TAP_TESTS with ifdef, so PROVE_TESTS points at a trivial always-pass file
-        # to make the TAP stage a no-op here; TAP runs in its own step below.
-        run: |
-          /usr/lib/postgresql/${{ matrix.pg }}/bin/initdb -D /tmp/pgdata --no-locale --encoding=UTF8 &&
-          /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_ctl -D /tmp/pgdata \
-            -o "-k /tmp -c listen_addresses=localhost" -w start &&
-          make installcheck PROVE_TESTS=ci/noop.pl \
-            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config PGHOST=/tmp PGUSER=postgres
+        # PGXS checks TAP_TESTS with ifdef, so PROVE_TESTS points at a trivial
+        # always-pass file to make the TAP stage a no-op here; TAP runs below.
+        env:
+          PGHOST: /tmp
+          PGUSER: ${{ github.actor }}
+        run: make installcheck PROVE_TESTS=ci/noop.pl
 
-      - name: TAP -- corruption recovery and server encodings
-        # Only t/003 and t/004 run here.  t/001 (crash recovery), t/002
-        # (replication), t/005-t/009 need a PostgreSQL::Test cluster-management
-        # setup this container job does not provide, so gating them would fail on
-        # harness setup rather than on pg_weave.  The Nix flake's tap-pg17/tap-pg18
-        # checks run the full nine.
-        run: |
-          make installcheck REGRESS= ISOLATION= \
-            PROVE_TESTS="t/003_corruption.pl t/004_encodings.pl" \
-            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
-          ' || { echo "=== TAP logs ==="; \
-               cat tmp_check/log/*.log tmp_check/log/regress_log_* 2>/dev/null | tail -120 || true; \
-               exit 1; }
+      - name: TAP -- the full suite
+        # The Forgejo container job can only run t/003 and t/004, because
+        # PostgreSQL::Test needs to manage its own clusters and that container
+        # cannot. A hosted runner can, and PGDG's -server-dev package ships the
+        # PostgreSQL::Test perl modules, so this leg gates all of t/ -- including
+        # t/001 crash recovery, t/002 replication, t/010 the format-v6 upgrade
+        # over an index containing data, and t/011 chandesc corruption.
+        run: make installcheck REGRESS= ISOLATION=
 
       - name: Upgrade path -- every released version must reach the current one
         # An extension whose version advances without a working upgrade script
-        # cannot be upgraded in place.  This project has bumped four times and the
-        # chain has only ever been exercised incidentally by sql/wvec.sql.
+        # cannot be upgraded in place.  This chain has only ever been exercised
+        # incidentally by sql/wvec.sql.
+        env:
+          PGHOST: /tmp
         run: |
-          chown -R postgres:postgres .
-          su postgres -c '
-          psql -h /tmp -U postgres -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE upg" &&
-          psql -h /tmp -U postgres -v ON_ERROR_STOP=1 -d upg \
-            -c "CREATE EXTENSION pg_weave VERSION '"'"'0.1.0'"'"'" \
+          psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE upg"
+          psql -v ON_ERROR_STOP=1 -d upg \
+            -c "CREATE EXTENSION pg_weave VERSION '0.1.0'" \
             -c "ALTER EXTENSION pg_weave UPDATE" \
-            -c "SELECT extversion FROM pg_extension WHERE extname='"'"'pg_weave'"'"'"
+            -c "SELECT extversion FROM pg_extension WHERE extname='pg_weave'"
 
-      - name: Show diffs on failure
+      - name: Show diffs and logs on failure
         if: failure()
         run: |
           for f in regression.diffs output_iso/regression.diffs; do
             [ -f "$f" ] && { echo "=== $f ==="; cat "$f"; }
           done
+          for f in tmp_check/log/*.log tmp_check/log/regress_log_*; do
+            [ -f "$f" ] && { echo "=== $f ==="; tail -80 "$f"; }
+          done
+          cat /tmp/pgdata/log/* 2>/dev/null | tail -100 || true
 
   # -------------------------------------------------------------------------
   # Sanitizers.  A separate leg because it is slow and because the failures it
@@ -132,38 +183,47 @@ jobs:
   # -------------------------------------------------------------------------
   sanitize:
     runs-on: ubuntu-latest
+    env:
+      # Pinned to 17 on purpose.  This job previously interpolated a matrix
+      # variable it did not have and built against an empty path; a literal is
+      # correct here precisely because there is no matrix.
+      PG_CONFIG: /usr/lib/postgresql/17/bin/pg_config
+      PGBIN: /usr/lib/postgresql/17/bin
     steps:
+      - uses: actions/checkout@v4
+
       - name: Install PostgreSQL 17 from PGDG
         run: |
-          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc > /dev/null
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y postgresql-17 postgresql-server-dev-17 libipc-run-perl clang
+          sudo apt-get install -y \
+            postgresql-17 postgresql-server-dev-17 clang make libipc-run-perl
           sudo pg_ctlcluster 17 main stop || true
-
-      - uses: actions/checkout@v4
 
       - name: Build with ASan + UBSan
         run: |
           make CC=clang with_llvm=no \
-            COPT="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
-            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
-          make install with_llvm=no PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+            COPT="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1"
+          sudo make install with_llvm=no PG_CONFIG="$PG_CONFIG"
 
       - name: Regression under sanitizers
-        # halt_on_error is deliberately OFF for UBSan here: a report in PostgreSQL
+        # halt_on_error is deliberately OFF for UBSan: a report in PostgreSQL
         # itself (not in pg_weave) would otherwise fail the leg.  detect_leaks is
         # off because the backend intentionally leaks into memory contexts it frees
         # wholesale, which is not a defect.
         env:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1
+          PGHOST: /tmp
+          PGUSER: ${{ github.actor }}
         run: |
-          /usr/lib/postgresql/17/bin/initdb -D /tmp/pgdata --no-locale --encoding=UTF8 &&
-          /usr/lib/postgresql/17/bin/pg_ctl -D /tmp/pgdata \
-            -o "-k /tmp -c listen_addresses=localhost" -w start &&
-          make installcheck PROVE_TESTS=ci/noop.pl \
-            PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config PGHOST=/tmp PGUSER=postgres
+          "$PGBIN/initdb" -D /tmp/pgdata --no-locale --encoding=UTF8
+          "$PGBIN/pg_ctl" -D /tmp/pgdata -o "-k /tmp -c listen_addresses=localhost" -w start
+          make installcheck PROVE_TESTS=ci/noop.pl
 
       - name: Show diffs and sanitizer output on failure
         if: failure()
