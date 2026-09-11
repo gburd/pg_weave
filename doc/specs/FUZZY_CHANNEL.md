@@ -337,6 +337,63 @@ paid twice (measure, then emit), and the two passes are literally the same
 function driven by two sinks, so a measure/emit disagreement — which would be a
 buffer overrun — is not expressible.
 
+### 3.6 The neighbourhood automaton that walks it — task Z5
+
+The trie is a structure; this is the thing that walks it. `include/weave/uleven.h`
+takes a query term, an edit budget *k*, and *any* iterator over the vocabulary in
+ascending unsigned-byte order, and emits exactly the vocabulary terms within
+distance *k*. The iterator abstraction (`WeaveUlevVocab`, a `next` plus an
+optional `skip`) is why the same code is driven by a plain sorted array in
+`test/hegel/test_uleven.c` today and by the on-disk `WEAVE_PK_SURF` chain later,
+with nothing in the core needing PostgreSQL at all.
+
+Four properties, each of which is a decision and not an accident:
+
+1. **Exact, not one-sided.** Unlike §3.2's trie, which answers false positives
+   and never false negatives, this emits term *t* if and only if
+   `dist(query, t) ≤ k`. Exactness is what lets `term~k` skip a heap recheck.
+   The composition is only as exact as its iterator: driven by a *truncating*
+   SuRF enumeration it inherits SuRF's false positives — the safe direction —
+   and whoever wires the trie owes that recheck.
+
+2. **The dead-prefix skip is an optimization and must stay one.**
+   `weave_uleven_match()` reports `WEAVE_ULEVEN_DEAD` with the byte length of a
+   prefix no within-*k* string can extend, and the expander hands that to
+   `skip`. With `skip == NULL` the answer must be *identical*, only slower. A
+   dead prefix one byte too **short** covers more terms and silently drops rows,
+   which is hard rule 1's failure mode exactly: the property test asserts the
+   two runs emit identical sets, and that assertion is what catches it.
+
+3. **The edit unit is the character, not the byte.** `levenshtein()` from
+   `contrib/fuzzystrmatch` counts characters, and Z9's gate is a randomized
+   differential test against it, so a byte-unit automaton would fail that gate at
+   *k*=1 on any two-byte substitution — a false negative visible only to
+   non-ASCII users and invisible to every fixed-output test.
+   `WEAVE_ULEVEN_BYTE` is not a fallback but the correct mode on a single-byte
+   server encoding, where a byte *is* a character.
+
+4. **Levenshtein, not Damerau.** An adjacent transposition costs 2, so `~1` does
+   not match `hte` against `the`. This is for agreement with `levenshtein()`, per
+   the same Z9 gate. Damerau would be a new unit mode, not a change to this one:
+   it changes which rows a query returns.
+
+Malformed bytes decode one at a time to the pseudo-unit `0xDC00 + byte`, a range
+valid UTF-8 cannot produce because encoded surrogates are rejected, so the decode
+stays **injective** over all byte strings. Folding bad bytes to one replacement
+character would instead make two distinct terms compare at distance 0 — a wrong
+answer that surfaces as a *missing* row once a caller de-duplicates.
+
+That last property is where randomized testing was measurably not enough. With
+the injectivity offset removed, a pool of ~1.9 M random malformed-byte pairs
+produced **zero** failures; the collision it creates needs the specific pair
+(a truncated `0xC2` lead against the valid two-byte encoding of U+00C2), which is
+now a pinned directed case in the test. **A property test's random generator
+covers the space it is shaped like, and a needle-shaped bug survives it.** Six
+mutations were injected into the implementation and each was confirmed to fail
+the test; two of them were caught by exactly one property, which is why
+"skip == no-skip" and "expand == brute force" are separate assertions rather than
+one.
+
 ## 4. The boolean-gate shuttle — task Z7
 
 Fuzzy, regex, prefix, and LIKE are *predicates*, not scores. Under contract (C5)

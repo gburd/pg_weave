@@ -311,6 +311,9 @@ check-standalone:
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/surf test/hegel/test_surf.c \
 		src/query/surftrie.c; \
 	$$tmp/surf | tail -1; \
+	echo "== Z5 uleven: exact vocabulary neighbourhood, skip soundness, char units =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/ul test/hegel/test_uleven.c -lm; \
+	$$tmp/ul | tail -1; \
 	echo "== TRE d0e0c997 -> f864ed0 (pg_tre 1521662): backref wrong-answer fix =="; \
 	bash test/hegel/run_tre_bump.sh backref | tail -1; \
 	echo "== ALL STANDALONE CHECKS PASSED =="
