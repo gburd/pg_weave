@@ -114,8 +114,11 @@ safe once every change is committed.
 Two quirks a fresh worktree has that the main checkout does not, both discovered
 the hard way:
 
-- `make` tries to re-run bison on the Lime grammar, because fresh checkout mtimes
-  make `src/query/regex_grammar.c` look stale. `touch src/query/regex_grammar.c`.
+- ~~`make` tries to re-run bison on the Lime grammar~~ **Fixed.** The Makefile now
+  cancels PGXS's implicit `%.c: %.y` rule for `src/query/regex_grammar.c`, so
+  `touch src/query/regex_grammar.c` is no longer needed. The same nanosecond-level
+  mtime race is what made CI's `sanitize` leg fail while the other three legs
+  passed on the identical commit; see the comment in `Makefile`.
 - `nix build` sees only what git has indexed, so `git add` your new files before
   building or the flake builds without them.
 
