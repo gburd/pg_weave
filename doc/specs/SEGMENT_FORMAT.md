@@ -64,7 +64,7 @@ and extending `weave_check()` with an invariant for the new page type.
 | 18 | `WEAVE_PK_VCODES` | `kind` = 18 | vector | reserved |
 | 19 | `WEAVE_PK_VGRAPH` | `kind` = 19 | vector | reserved |
 | 20 | `WEAVE_PK_VRERANK` | `kind` = 20 | vector | reserved |
-| 21 | `WEAVE_PK_SURF` | `kind` = 21 | fuzzy (LOUDS-Sparse trie over the vocabulary) | **reserved; image format v1 specified and implemented (Z3), page writer owed** |
+| 21 | `WEAVE_PK_SURF` | `kind` = 21 | fuzzy (LOUDS-Sparse trie over the vocabulary) | **v7, exists** |
 | 22 | `WEAVE_PK_ULEV` | `kind` = 22 | fuzzy (universal-Levenshtein aux) | reserved |
 | 23 | `WEAVE_PK_REGEX` | `kind` = 23 | fuzzy (compiled-pattern cache) | reserved |
 | 24 | `WEAVE_PK_FUZZY_SPARE` | `kind` = 24 | fuzzy | reserved |
@@ -333,10 +333,10 @@ typedef struct WeaveChannelDesc		/* 12 bytes */
 } WeaveChannelDesc;
 ```
 
-`WeaveWeftKind` is `{ LEXICAL=1, VECTOR=2, FUZZY=3, DOCVALS=4, CGRAM=5 }`. Only
-`LEXICAL` is written today; the rest are reserved so the two remaining channels
-cannot collide, which is the same reason the page-kind ids are allocated in one
-table (§2).
+`WeaveWeftKind` is `{ LEXICAL=1, VECTOR=2, FUZZY=3, DOCVALS=4, CGRAM=5 }`.
+`LEXICAL` and — since v7 — `FUZZY` are written; the rest are reserved so the
+remaining channels cannot collide, which is the same reason the page-kind ids are
+allocated in one table (§2).
 
 Structural rules the decoder enforces, each of which exists for a reason:
 
@@ -401,6 +401,52 @@ recorded: which index attribute the lexical weft indexes.
   magic, version or count, which is not something an untrusted-bytes decoder can
   validate. v6 adds `WeaveChanDescPageData`.
 
+### The fuzzy weft — v7, EXISTS
+
+`WEAVE_WK_FUZZY` is the second weft kind a bolt can carry, and it is the first
+thing v6's design was actually asked to do: **`WeaveSegMeta` gained no field.**
+The trie's root is an ordinary descriptor entry, so a bolt that has no trie —
+every pre-v7 bolt, and any bolt whose vocabulary is empty — costs zero bytes for
+it, including zero descriptor slots.
+
+Three decisions worth recording next to the format rather than only in
+`doc/specs/FUZZY_CHANNEL.md` §3:
+
+- **The chain carries the image and nothing else, so there is no length field
+  anywhere.** Not in the descriptor, not in a per-chain header. The image length
+  is the sum of the chain pages' payloads, and `weave_surftrie_open()` refuses any
+  image whose length disagrees with what its own counts imply — so a torn chain is
+  caught with no second source of truth to keep in step. The reader computes the
+  length by walking the chain *before* it allocates, which also means the
+  allocation is bounded by pages that exist rather than by a count read out of a
+  possibly-corrupt header.
+- **It is not written with `weave_write_blob()`,** even though §3.3 of the fuzzy
+  spec said it would be. That writer hard-codes `WEAVE_PK_TRGM_DATA` (which is
+  why the livedocs blob lands on trigram-data pages and `WEAVE_PK_LIVEDOCS` has no
+  writer at all, §2), and `weave_read_blob()` validates no page kind: it follows
+  `nextblk` and trusts `pd_lower`. `weave_write_surf()` / `weave_read_surf()` in
+  `src/am/am.c` are the pair, and the reader checks `WeavePageHasKind(page,
+  WEAVE_PK_SURF)` on every page.
+- **`weave_free_segment()` is now driven by the descriptor** for every weft that
+  is not named by a `WeaveSegMeta` field. A free path written as a hard-coded list
+  of `WeaveSegMeta` chains cannot see a weft that lives only in the descriptor,
+  and the symptom is a leak of the whole structure on every merge with nothing but
+  `weave_check(deep)` to notice. The next weft is freed by that code as written.
+
+Measured cost, on a 200,000-row build of short text (`weave_index_size_detail()`
+plus `weave_surf_stats()`, one bolt after a full merge):
+
+| vocabulary | trie image | on disk | share of index | share of dictionary | per term |
+|---:|---:|---:|---:|---:|---:|
+| 274,244 terms | 1,514,433 B | 186 pages (1,523,712 B) | 6.89 % of 21 MB | 17.1 % | 5.52 B |
+| 74,244 terms | 410,061 B | 51 pages (417,792 B) | 5.15 % of 7,928 kB | 17.1 % | 5.52 B |
+
+The per-term figure is the number to carry forward: **~5.5 bytes per vocabulary
+term**, and it is flat across a 3.7× change in vocabulary size. The share of the
+index is not flat and is not a property of the trie — it falls as the corpus grows
+past the point where the vocabulary saturates (Heaps' law), because the postings
+keep growing and the trie does not.
+
 ## 7. Concurrency invariants — v4, EXISTS
 
 - Readers take `AccessShareLock` + `BUFFER_LOCK_SHARE`. Merge under
@@ -420,7 +466,7 @@ recorded: which index attribute the lexical weft indexes.
 
 ## 8. Compatibility policy
 
-1. **Versions read: v3, v4, v5, v6. Version written: v6.** `WEAVE_VERSION` is 6.
+1. **Versions read: v3, v4, v5, v6, v7. Version written: v7.** `WEAVE_VERSION` is 7.
    The range is one constant pair in `include/weave/am.h`
    (`WEAVE_VERSION_DOCLEN_INLINE` = 3 is the floor, `WEAVE_VERSION` the ceiling)
    and `weave_check_meta()` is the single gate; `weave_check()` reports the range
@@ -435,6 +481,19 @@ recorded: which index attribute the lexical weft indexes.
    | 4 | doclen sidecar, gap-coded docid column | per-**block** `WEAVE_DOCLEN_ABS` clear |
    | 5 | sidecar docid column is absolute offsets | per-**block** `WEAVE_DOCLEN_ABS` set |
    | 6 | per-bolt weft descriptors; extended page-kind space | per-**bolt** `segs[i].chandesc`; per-**page** `WEAVE_PAGE_KIND_EXT` |
+   | 7 | the fuzzy weft (SuRF trie over the vocabulary) | per-**bolt**: a `WEAVE_WK_FUZZY` entry on the bolt's descriptor page |
+
+   **v7 changed no struct, and bumped the version anyway.** A v6 metapage and a v7
+   metapage are byte-identical; a v6 `.so` would read a v7 bolt's descriptor page
+   without complaint. What it would *not* do is free a weft kind it has never
+   heard of, so every merge under that binary would leak the entire trie —
+   unreachable, unflagged, and reclaimable by nothing short of a REINDEX. That is
+   the same argument item 2 below makes for v5 → v6 ("that binary would read
+   `chandesc` as padding and leak one page per merged bolt"), and it reaches the
+   same conclusion: refusing is correct. The lesson generalizes — **a new weft kind
+   needs a version bump even when it moves no field,** because the discriminator
+   that matters is "does the reading build know how to free this?", not "can it
+   parse this?".
 
    Every one of those discriminators is per-object, never per-index, and that is
    deliberate: an index upgraded in place keeps its old objects while later inserts
@@ -452,7 +511,9 @@ recorded: which index attribute the lexical weft indexes.
      (`weave_check_meta()`, called on every metapage read).
    - A v6 index met by an older `.so` therefore **refuses**, which is the correct
      outcome and not merely conservative: that binary would read `chandesc` as
-     padding and leak one page per merged bolt.
+     padding and leak one page per merged bolt. A v7 index met by a v6 `.so`
+     refuses for the analogous reason: it would leak the whole SuRF trie per
+     merged bolt (item 1's table).
    - A pre-v6 metapage that nonetheless names a descriptor page is inconsistent —
      it cannot arise from any writer — and `weave_check()` reports it as a violated
      invariant (`chandesc_version_consistent`) rather than following the pointer.
@@ -534,6 +595,20 @@ cannot justify.
 - `chandesc_coverage` — informational: how many bolts self-describe. On an index
   upgraded in place this is 0 until the first merge, which is what makes
   "read a pre-v6 index with the new code" a meaningful test.
+- `surf_trie_matches_dictionary` — **(fuzzy, task Z3)** the SuRF trie's membership
+  is exactly the bolt's dictionary term set. Both directions, and it is the only
+  invariant here that compares two independent on-disk structures against each
+  other rather than checking one against its own header. See the fuzzy entry under
+  "Still owed" below for what makes both directions necessary; the mechanics are a
+  merge of two ascending streams (`weave_surftrie_enumerate()`'s lexicographic DFS
+  against a dictionary page walk), which settles set equality in one linear pass
+  with O(1) memory — materializing either side would be a vocabulary-scale
+  allocation inside a validator. A truncated terminal is allowed to cover a
+  nonempty run of dictionary terms sharing its bytes, which is the format's
+  deliberate one-sided error and not a hole in the check.
+- `surf_coverage` — informational: how many bolts carry a fuzzy weft. 0 on an
+  index upgraded in place until the first merge rewrites a bolt, the same shape as
+  `chandesc_coverage` and for the same reason.
 - `pages_reachable_or_freed` (`deep`) — every page is reachable from the metapage,
   or flagged `WEAVE_FREED`. An unreachable unflagged page is a leak. `deep` because
   it walks every chain and every page. Note that nothing short of a REINDEX
@@ -576,18 +651,31 @@ The following are specified and unimplemented:
   the one that actually catches a bad build, so it belongs behind `deep => true`.
 - (fuzzy) SuRF trie membership is exactly the bolt's dictionary term set. Both
   directions: a term the trie misses is a dropped row, and a term the trie invents
-  is a wasted recheck at best. The pure half is implemented --
-  `weave_surftrie_check()` (`include/weave/surftrie.h`) validates the image
-  structurally and then proves, by a lexicographic DFS, that the trie's terminals
-  carry ordinals `0 = ord0 < ord1 < ... < nterms`, which is the machine-checkable
-  form of "this trie is the sorted dictionary". What `weave_check()` still owes is
-  the other half of the set equality: walk the bolt's dictionary and confirm the
+  is a wasted recheck at best. **Implemented as `surf_trie_matches_dictionary`**
+  (see the list above); this entry stays because it is where the reasoning lives.
+  The pure half is `weave_surftrie_check()` (`include/weave/surftrie.h`), which
+  validates the image structurally and then proves, by a lexicographic DFS, that
+  the trie's terminals carry ordinals `0 = ord0 < ord1 < ... < nterms` — the
+  machine-checkable form of "this trie is the sorted dictionary". The other half
+  is the one `weave_check()` supplies: walk the bolt's dictionary and confirm the
   term *bytes* agree, since the pure validator sees no dictionary. Note that the
   trie is a filter with a deliberate one-sided error (terms longer than
   `WEAVE_SURFTRIE_MAX_DEPTH` are truncated, see
   `doc/specs/FUZZY_CHANNEL.md` sect. 3.2), so the check is "every dictionary term is
   present, and every *exact* trie terminal is a dictionary term" -- a truncated
   terminal is allowed to cover several.
+
+  **Why the image validator is not sufficient, demonstrated rather than argued.**
+  `t/013_surf_corruption.pl` bumps the header's `nterms` by one. No section length
+  depends on `nterms` (only `nslots`, `nnodes` and `nterminal` do), so the image is
+  still exactly as long as its own counts imply, every popcount identity holds,
+  every accelerator table still equals a recomputation, and the ordinal-range test
+  only got looser — both validation layers accept it. The same test then sets the
+  label byte of the *last* slot to `0xFF`, which preserves "labels strictly
+  ascending within a node" (`0xFF` is the largest byte and that slot ends its
+  node) and changes no bitmap, so that image is structurally perfect too and
+  semantically a different vocabulary. Only the comparison against the dictionary
+  sees either one.
 
 ## 10. WAL policy
 
@@ -606,3 +694,42 @@ exchange:
 Those three properties are a large part of why one would choose pg_weave over an
 AGPL extension embedding its own engine. The extra WAL volume is the price and it
 is not negotiable for a speedup.
+
+### A durability gap GenericXLog does not close by itself — found by task Z3
+
+100 % GenericXLog guarantees that every page change is *described* by a WAL
+record. It does not guarantee the record has been **written to a file** when the
+statement returns.
+
+`SELECT weave_merge('idx')` writes WAL through GenericXLog but touches no heap and
+no catalog, so its transaction never acquires a `TransactionId`. PostgreSQL's
+`RecordTransactionCommit()` calls `XLogFlush()` only when the transaction
+committed an XID, truncated a relation, or forced a sync commit — so the merge's
+records are left in the WAL buffers, in shared memory, written to nothing. A
+`pg_ctl stop -m immediate` then loses them and recovery rolls the entire merge
+back: the input bolts return, the merged bolt vanishes, and `weave_check()` is
+**clean**, because the pre-merge state is a perfectly consistent state.
+
+Reproducer, and it is two lines: build any index, `SELECT weave_merge(...)`, stop
+immediate, start, and compare `weave_index_nsegments()`. It was verified to behave
+identically on pre-v7 code, so it is not a v7 regression. The same shape applies
+to any maintenance SQL function that mutates pages without touching the heap
+(`weave_vacuum()` escapes it only because it truncates the relation, which sets
+`nrels > 0`).
+
+Consequences, in the order that matters:
+
+1. **No wrong answers and no corruption.** Recovery lands on an earlier
+   *consistent* state; the documents are still in the heap, and the pending list
+   or the pre-merge bolts still index them. This is lost work, not lost data.
+2. It is nonetheless surprising, because a statement that returned successfully
+   did not survive a crash, and nothing in the WAL policy above says it might not.
+3. The fix is one `XLogFlush()` (or `ForceSyncCommit()`) in the maintenance entry
+   points. Not done here: task Z3 owns the fuzzy weft, and changing the durability
+   of every maintenance function is a separate change with its own test.
+4. `t/012_surf_crash_recovery.pl` works around it by following the merge with a
+   trivial INSERT into an unrelated table — that transaction *does* acquire an XID,
+   and `XLogFlush()` flushes the WAL stream up to its commit LSN, which includes
+   every earlier record. A `CHECKPOINT` would also work and is the wrong tool: it
+   puts the pages on disk and leaves WAL replay, the thing the test exists to
+   exercise, untested.

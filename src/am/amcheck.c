@@ -18,6 +18,10 @@
  * lexical ones only"; before this file there was no weave_check() at all, only
  * weave_check_meta() on the metapage header.
  *
+ * Task Z3 added surf_trie_matches_dictionary, which is the fuzzy weft's gate and
+ * the only invariant here that compares two independent on-disk structures
+ * against each other rather than checking one against its own header.
+ *
  * REPORTING MODEL.  One row per invariant, with ok/violated and a detail string,
  * rather than an ERROR on the first violation.  Two reasons: a corruption test
  * wants to assert that a specific injected fault is detected (and that the others
@@ -391,6 +395,414 @@ wvck_chandesc(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 }
 
 /*
+ * Invariant: SuRF trie membership is EXACTLY the bolt's dictionary term set.
+ *
+ * doc/specs/SEGMENT_FORMAT.md sect. 9 (fuzzy) and doc/specs/FUZZY_CHANNEL.md
+ * sect. 3 name this as the Z3 gate, and both are explicit that it must be checked
+ * in BOTH DIRECTIONS.  The reason is asymmetric, and worth being precise about:
+ *
+ *	 a term the trie MISSES is a dropped row.  The trie is a filter with false
+ *	 positives and no false negatives (include/weave/surftrie.h); a query that
+ *	 funnels through it and finds a member absent returns a smaller, entirely
+ *	 plausible result set, and per AGENTS.md hard rule 1 no fixed-expected-output
+ *	 regression test can catch that.
+ *
+ *	 a term the trie INVENTS is a wasted recheck.  Not a wrong answer -- the
+ *	 caller rechecks -- but a trie that has drifted from its dictionary in that
+ *	 direction is a trie that may have drifted in the other, and the two are the
+ *	 same bug seen from two sides.
+ *
+ * HOW, without a second copy of the vocabulary.  The pure validator
+ * (weave_surftrie_validate) proves the trie's terminals carry ordinals
+ * 0 = ord0 < ord1 < ... < nterms under a lexicographic DFS, but it has never seen
+ * a dictionary, so it cannot compare BYTES.  This function supplies that half by
+ * running the DFS and the dictionary page walk as two ASCENDING STREAMS and
+ * merging them: weave_surftrie_enumerate() emits terminals in ascending
+ * lexicographic order, and the dictionary is written in cmp_buildterm order,
+ * which is the same order (unsigned-byte memcmp, then shorter-first -- the same
+ * comparator weave_surftrie_size() requires of its input).  A merge of two sorted
+ * streams settles set equality in one linear pass with O(1) memory, which matters
+ * because the alternative -- materializing either side -- is a vocabulary-scale
+ * allocation inside a validator.
+ *
+ * THE TRUNCATION EXCEPTION IS PART OF THE INVARIANT, NOT A HOLE IN IT.  A term
+ * longer than WEAVE_SURFTRIE_MAX_DEPTH is indexed truncated to that depth with
+ * its slot marked `trunc`, so ONE trie terminal legitimately covers several
+ * dictionary terms.  The check is therefore "every dictionary term is present,
+ * and every EXACT trie terminal is a dictionary term, and every TRUNCATED
+ * terminal covers a nonempty run of dictionary terms sharing its bytes" -- which
+ * is still equality of the sets, expressed at the resolution the format has.
+ * Skipping long terms instead would be a false negative wearing a build-time
+ * disguise (doc/specs/FUZZY_CHANNEL.md sect. 3.2).
+ */
+
+/*
+ * A pull cursor over one bolt's dictionary terms, in written order.  Copies one
+ * page at a time and releases the buffer, so no buffer lock is held while the
+ * caller compares -- and the copy is what makes the returned pointers safe to
+ * hold across a peek.
+ */
+typedef struct WvckDictCursor
+{
+	Relation	index;
+	BlockNumber nblocks;
+	BlockNumber blk;
+	int64		npages;
+	char	   *pagebuf;		/* BLCKSZ, palloc'd */
+	char	   *ptr;
+	char	   *end;
+
+	/* one-term pushback: the truncated-terminal case has to look before it eats */
+	const char *peek;
+	uint32		peeklen;
+	bool		havepeek;
+	bool		bad;			/* a structural problem; message in `why` */
+	const char *why;
+} WvckDictCursor;
+
+static void
+wvck_dict_open(WvckDictCursor *c, Relation index, BlockNumber nblocks,
+			   BlockNumber start)
+{
+	MemSet(c, 0, sizeof(*c));
+	c->index = index;
+	c->nblocks = nblocks;
+	c->blk = start;
+	c->pagebuf = (char *) palloc(BLCKSZ);
+	c->ptr = c->end = c->pagebuf;
+}
+
+static void
+wvck_dict_close(WvckDictCursor *c)
+{
+	pfree(c->pagebuf);
+	c->pagebuf = NULL;
+}
+
+/* Pull the next term, or return false at end of chain (or on a structural fault,
+ * which sets ->bad).  The bytes stay valid until the NEXT call. */
+static bool
+wvck_dict_pull(WvckDictCursor *c, const char **term, uint32 *len)
+{
+	for (;;)
+	{
+		if (c->ptr + offsetof(WeaveDictEntry, term) <= c->end)
+		{
+			WeaveDictEntry *de = (WeaveDictEntry *) c->ptr;
+			Size		esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+
+			if (c->ptr + esize > c->end)
+			{
+				c->bad = true;
+				c->why = "a dictionary entry runs past the end of its page";
+				return false;
+			}
+			*term = de->term;
+			*len = de->termlen;
+			c->ptr += esize;
+			return true;
+		}
+
+		/* next page */
+		if (c->blk == InvalidBlockNumber)
+			return false;
+		if (c->blk >= c->nblocks || ++c->npages > (int64) c->nblocks)
+		{
+			c->bad = true;
+			c->why = "the dictionary chain leaves the relation or cycles";
+			return false;
+		}
+		{
+			Buffer		buf = ReadBuffer(c->index, c->blk);
+			Page		page;
+			Size		contoff;
+			Size		avail;
+
+			CHECK_FOR_INTERRUPTS();
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			if (PageIsNew(page) || !WeavePageHasKind(page, WEAVE_PK_DICT))
+			{
+				UnlockReleaseBuffer(buf);
+				c->bad = true;
+				c->why = "a block on the dictionary chain is not a dictionary page";
+				return false;
+			}
+			contoff = (Size) ((char *) PageGetContents(page) - (char *) page);
+			avail = 0;
+			if ((Size) ((PageHeader) page)->pd_lower >= contoff)
+				avail = (Size) ((PageHeader) page)->pd_lower - contoff;
+			if (avail > BLCKSZ - contoff)
+				avail = BLCKSZ - contoff;
+			memcpy(c->pagebuf, PageGetContents(page), avail);
+			c->ptr = c->pagebuf;
+			c->end = c->pagebuf + avail;
+			c->blk = WeavePageGetOpaque(page)->nextblk;
+			UnlockReleaseBuffer(buf);
+		}
+	}
+}
+
+static bool
+wvck_dict_peek(WvckDictCursor *c, const char **term, uint32 *len)
+{
+	if (!c->havepeek)
+	{
+		if (!wvck_dict_pull(c, &c->peek, &c->peeklen))
+			return false;
+		c->havepeek = true;
+	}
+	*term = c->peek;
+	*len = c->peeklen;
+	return true;
+}
+
+static void
+wvck_dict_take(WvckDictCursor *c)
+{
+	Assert(c->havepeek);
+	c->havepeek = false;
+}
+
+typedef struct WvckSurfCmp
+{
+	WvckDictCursor *dict;
+	uint32		dictord;		/* ordinal of the next dictionary term */
+	StringInfo	err;
+	bool		ok;
+} WvckSurfCmp;
+
+static int
+wvck_surf_cb(void *arg, const char *term, uint32 termlen, uint32 ord, int exact)
+{
+	WvckSurfCmp *st = (WvckSurfCmp *) arg;
+	const char *dterm;
+	uint32		dlen;
+
+	if (!st->ok)
+		return 1;				/* already failed: stop the walk */
+	CHECK_FOR_INTERRUPTS();
+
+	if (exact)
+	{
+		if (!wvck_dict_peek(st->dict, &dterm, &dlen))
+		{
+			appendStringInfo(st->err,
+							 "the trie contains a term the dictionary does not (at trie ordinal %u)",
+							 ord);
+			st->ok = false;
+			return 1;
+		}
+		if (dlen != termlen || memcmp(dterm, term, termlen) != 0)
+		{
+			appendStringInfo(st->err,
+							 "trie term %u and dictionary term %u differ",
+							 ord, st->dictord);
+			st->ok = false;
+			return 1;
+		}
+		if (ord != st->dictord)
+		{
+			appendStringInfo(st->err,
+							 "trie term at dictionary position %u carries ordinal %u",
+							 st->dictord, ord);
+			st->ok = false;
+			return 1;
+		}
+		wvck_dict_take(st->dict);
+		st->dictord++;
+		return 0;
+	}
+
+	/*
+	 * A truncated terminal: it stands for every dictionary term whose first
+	 * `termlen` bytes are these.  There must be at least one -- a truncated
+	 * terminal covering nothing would mean the trie invented a path -- and its
+	 * ordinal must be the first one it covers, which is what
+	 * WeaveSurfHit.ord promises a caller doing the recheck.
+	 */
+	{
+		uint32		ncovered = 0;
+
+		while (wvck_dict_peek(st->dict, &dterm, &dlen))
+		{
+			if (dlen < termlen || memcmp(dterm, term, termlen) != 0)
+				break;
+			if (ncovered == 0 && ord != st->dictord)
+			{
+				appendStringInfo(st->err,
+								 "truncated trie terminal carries ordinal %u but its first dictionary term is %u",
+								 ord, st->dictord);
+				st->ok = false;
+				return 1;
+			}
+			wvck_dict_take(st->dict);
+			st->dictord++;
+			ncovered++;
+		}
+		if (ncovered == 0)
+		{
+			appendStringInfo(st->err,
+							 "a truncated trie terminal (ordinal %u) covers no dictionary term",
+							 ord);
+			st->ok = false;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Locate a bolt's fuzzy weft root, or InvalidBlockNumber.  Uses the NON-throwing
+ * descriptor reader for the same reason wvck_chandesc() does: a corrupt
+ * descriptor page is already reported by chandesc_reachable, and this invariant
+ * must not throw on it.
+ */
+static BlockNumber
+wvck_surf_root(WeaveCheckCtx *cx, const WeaveSegMeta *seg)
+{
+	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
+	int			nweft = 0;
+	int			i;
+
+	if (seg->chandesc == InvalidBlockNumber)
+		return InvalidBlockNumber;
+	if (weave_read_chandesc(cx->index, seg->chandesc, weft, WEAVE_MAX_WEFTS,
+							&nweft) != WEAVE_CD_OK)
+		return InvalidBlockNumber;
+	for (i = 0; i < nweft; i++)
+		if (weft[i].kind == (uint16) WEAVE_WK_FUZZY)
+			return weft[i].root;
+	return InvalidBlockNumber;
+}
+
+static void
+wvck_surf(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
+{
+	uint32		s;
+	int64		nwith = 0;
+	bool		ok = true;
+	StringInfoData d;
+
+	initStringInfo(&d);
+
+	for (s = 0; s < meta->nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		const WeaveSegMeta *seg = &meta->segs[s];
+		BlockNumber root;
+		uint8	   *img;
+		Size		len = 0;
+		const char *detail = NULL;
+		WeaveSurfError err;
+		WeaveSurfTrie t;
+		WvckSurfCmp st;
+		WvckDictCursor dc;
+		StringInfoData e;
+
+		if (seg->dictstart == InvalidBlockNumber)
+			continue;			/* consumed slot */
+		root = wvck_surf_root(cx, seg);
+		if (root == InvalidBlockNumber)
+			continue;			/* no fuzzy weft: a pre-v7 bolt, not a violation */
+
+		nwith++;
+		img = weave_read_surf(cx->index, root, &len, &detail);
+		if (img == NULL)
+		{
+			ok = false;
+			appendStringInfo(&d, "%sbolt %u: %s", d.len > 0 ? "; " : "", s,
+							 detail);
+			continue;
+		}
+
+		err = weave_surftrie_open(img, len, &t);
+		if (err == WEAVE_SURF_OK)
+			err = weave_surftrie_validate(&t);
+		if (err != WEAVE_SURF_OK)
+		{
+			ok = false;
+			appendStringInfo(&d, "%sbolt %u: %s", d.len > 0 ? "; " : "", s,
+							 weave_surftrie_errstr(err));
+			pfree(img);
+			continue;
+		}
+
+		initStringInfo(&e);
+		wvck_dict_open(&dc, cx->index, cx->nblocks, seg->dictstart);
+		st.dict = &dc;
+		st.dictord = 0;
+		st.err = &e;
+		st.ok = true;
+
+		err = weave_surftrie_enumerate(&t, NULL, 0, wvck_surf_cb, &st, NULL);
+		if (err != WEAVE_SURF_OK && st.ok)
+		{
+			st.ok = false;
+			appendStringInfo(&e, "enumeration failed: %s",
+							 weave_surftrie_errstr(err));
+		}
+		if (st.ok)
+		{
+			const char *dterm;
+			uint32		dlen;
+
+			/* the other end of the merge: neither stream may have terms left */
+			if (wvck_dict_peek(&dc, &dterm, &dlen))
+			{
+				st.ok = false;
+				appendStringInfo(&e,
+								 "the dictionary carries term(s) the trie does not, from position %u",
+								 st.dictord);
+			}
+			else if (dc.bad)
+			{
+				st.ok = false;
+				appendStringInfo(&e, "%s", dc.why);
+			}
+			else if (st.dictord != t.nterms)
+			{
+				st.ok = false;
+				appendStringInfo(&e,
+								 "the trie declares %u terms but covers %u dictionary terms",
+								 t.nterms, st.dictord);
+			}
+			else if (st.dictord != seg->nterms)
+			{
+				st.ok = false;
+				appendStringInfo(&e,
+								 "the bolt directory says %u terms, the trie and dictionary agree on %u",
+								 seg->nterms, st.dictord);
+			}
+		}
+		if (!st.ok)
+		{
+			ok = false;
+			appendStringInfo(&d, "%sbolt %u: %s", d.len > 0 ? "; " : "", s,
+							 e.data);
+		}
+
+		wvck_dict_close(&dc);
+		pfree(e.data);
+		pfree(img);
+	}
+
+	wvck_emit(cx, "surf_trie_matches_dictionary", ok, ok ? NULL : d.data);
+	pfree(d.data);
+
+	/* Not an invariant, a fact worth surfacing, and the same shape as
+	 * chandesc_coverage: how many bolts carry the fuzzy weft.  Zero on an index
+	 * upgraded in place until the first merge rewrites a bolt, which is what
+	 * makes "read a pre-v7 index with the new code" a meaningful state rather
+	 * than an unreachable one. */
+	{
+		initStringInfo(&d);
+		appendStringInfo(&d, "%lld bolt(s) carry a fuzzy weft", (long long) nwith);
+		wvck_emit(cx, "surf_coverage", true, d.data);
+		pfree(d.data);
+	}
+}
+
+/*
  * Bolt-directory invariants: every root block is in bounds and has the kind the
  * directory says it has.  This is the sect. 9 line "every segs[i] root block is
  * within relation bounds and has the expected kind", and walking the chains (not
@@ -521,6 +933,22 @@ wvck_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 		(void) wvck_walk_chain(cx, seg->livedocs, WEAVE_PK_TRGM_DATA, &e);
 		if (seg->chandesc != InvalidBlockNumber)
 			(void) wvck_walk_chain(cx, seg->chandesc, WEAVE_PK_CHANDESC, &e);
+
+		/*
+		 * v7: every weft the DESCRIPTOR names that is not already covered by a
+		 * WeaveSegMeta field.  Marking these is not optional bookkeeping -- an
+		 * unmarked surf chain would be reported by pages_reachable_or_freed as a
+		 * leak of the entire trie, which is both a false alarm and, if it were
+		 * ever silenced by exempting the kind instead, exactly the hole that would
+		 * hide a REAL leak of the same chain.
+		 */
+		if (seg->chandesc != InvalidBlockNumber)
+		{
+			BlockNumber surfroot = wvck_surf_root(cx, seg);
+
+			if (surfroot != InvalidBlockNumber)
+				(void) wvck_walk_chain(cx, surfroot, WEAVE_PK_SURF, &e);
+		}
 
 		/* the shared posting chain: named by the first dict entry */
 		if (seg->dictstart < cx->nblocks)
@@ -706,6 +1134,7 @@ weave_check(PG_FUNCTION_ARGS)
 	wvck_page_kinds(&cx);
 	wvck_segments(&cx, &meta);
 	wvck_chandesc(&cx, &meta);
+	wvck_surf(&cx, &meta);
 
 	if (deep)
 	{

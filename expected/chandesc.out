@@ -16,7 +16,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.6.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.7.0" of extension "pg_weave" is already installed
 CREATE TABLE cd (id serial, d wdoc);
 -- Three frequency bands so the index has a real dictionary and several posting
 -- blocks, not a degenerate one-page structure that no invariant can be wrong on.
@@ -39,8 +39,10 @@ SELECT invariant, ok FROM weave_check('cd_weave') ORDER BY invariant;
  nsegments_bound                  | t
  page_kinds_decodable             | t
  segment_roots_have_expected_kind | t
+ surf_coverage                    | t
+ surf_trie_matches_dictionary     | t
  uninitialized_page_count         | t
-(9 rows)
+(11 rows)
 
 -- The deep pass adds full-relation page reachability and the
 -- no-two-chains-overlap assertion (SEGMENT_FORMAT.md section 8 item 5).
@@ -57,8 +59,10 @@ SELECT invariant, ok FROM weave_check('cd_weave', true) ORDER BY invariant;
  page_kinds_decodable             | t
  pages_reachable_or_freed         | t
  segment_roots_have_expected_kind | t
+ surf_coverage                    | t
+ surf_trie_matches_dictionary     | t
  uninitialized_page_count         | t
-(11 rows)
+(13 rows)
 
 -- The only assertion that matters: nothing is violated.
 SELECT count(*) AS violations FROM weave_check('cd_weave', true) WHERE NOT ok;
@@ -72,7 +76,7 @@ SELECT detail FROM weave_check('cd_weave')
  WHERE invariant = 'metapage_version_recognized';
                      detail                     
 ------------------------------------------------
- format v6 (this build reads v3..v6, writes v6)
+ format v7 (this build reads v3..v7, writes v7)
 (1 row)
 
 -- Every bolt is self-describing on a fresh v6 build.

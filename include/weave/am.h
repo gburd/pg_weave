@@ -26,9 +26,24 @@
 
 #include "weave/chandesc.h"
 #include "weave/pagekind.h"
+#include "weave/surftrie.h"
 
 #define WEAVE_MAGIC			0x42324635	/* "B2F5" */
-#define WEAVE_VERSION		6		/* v6: every bolt SELF-DESCRIBES its wefts.
+#define WEAVE_VERSION		7		/* v7: a bolt carries the FUZZY weft -- the
+										 * LOUDS-Sparse SuRF trie over its vocabulary, on
+										 * a WEAVE_PK_SURF page chain, registered as a
+										 * WEAVE_WK_FUZZY descriptor.  The metapage is
+										 * BYTE-IDENTICAL to v6 (no struct changed), so
+										 * why bump at all: a v6 .so understands the
+										 * descriptor page and would happily read such a
+										 * bolt, but weave_free_segment() in that build
+										 * frees only the wefts it knows, so every merge
+										 * would LEAK the whole trie -- exactly the
+										 * reasoning doc/specs/SEGMENT_FORMAT.md sect. 8
+										 * item 2 used for v5 -> v6 ("that binary would
+										 * read chandesc as padding and leak one page per
+										 * merged bolt").  Refusing is correct.
+										 * v6: every bolt SELF-DESCRIBES its wefts.
 										 * WeaveSegMeta gains `chandesc`, naming a
 										 * WEAVE_CHANDESC page, and the page-kind space
 										 * stops being a flat uint16 bitmap (see
@@ -50,6 +65,7 @@
 #define WEAVE_VERSION_DOCLEN_SIDECAR 4	/* first version with the doclen sidecar */
 #define WEAVE_VERSION_DOCLEN_ABS 5	/* first version writing absolute-offset sidecars */
 #define WEAVE_VERSION_CHANDESC	6	/* first version with per-bolt weft descriptors */
+#define WEAVE_VERSION_SURF		7	/* first version writing the fuzzy (SuRF) weft */
 
 /*
  * Set in WeaveDoclenBlockHdr.count to mark a sidecar block whose docid column is
@@ -713,7 +729,71 @@ extern void weave_meta_upcast_page(Page page);
 extern bool weave_meta_add_segment(Relation index, const WeaveSegMeta *seg);
 extern void weave_add_segment_with_room(Relation index, const WeaveSegMeta *seg);
 
-extern void weave_attach_chandesc(Relation index, WeaveSegMeta *seg);
+extern void weave_attach_chandesc(Relation index, WeaveSegMeta *seg,
+								  BlockNumber surfroot);
+
+/* ---------------------------------------------------------------------------
+ * The fuzzy weft: the SuRF trie over the bolt vocabulary (task Z3)
+ *
+ * The image itself is format-defined and backend-independent
+ * (include/weave/surftrie.h, src/query/surftrie.c).  These three are the AM half:
+ * the page chain it lives on, and the two ways to get it back.
+ *
+ * WHY NOT weave_write_blob().  doc/specs/FUZZY_CHANNEL.md sect. 3.3 said "the AM
+ * lays it on a WEAVE_PK_SURF page chain with the existing blob writer", which
+ * cannot be done: weave_write_blob() hard-codes WEAVE_PK_TRGM_DATA (that is
+ * exactly why the livedocs blob lands on trigram-data pages and
+ * WEAVE_PK_LIVEDOCS has no writer -- see amcheck.c).  Reusing it would have put
+ * the trie on pages whose kind says "trigram data", and weave_check() and
+ * weave_index_size_detail() would then have had no way to tell the two apart.
+ * Worse, weave_read_blob() validates NO page kind at all: it follows nextblk and
+ * trusts pd_lower.  For a structure whose whole job is to be a filter that never
+ * produces a false negative, the reader must refuse bytes that are not
+ * demonstrably its own.
+ *
+ * WHY THERE IS NO LENGTH FIELD ANYWHERE.  The chain's pages carry exactly the
+ * image bytes and nothing else, so the image length is the sum of the pages'
+ * payloads -- which weave_read_surf() computes by walking the chain BEFORE it
+ * allocates.  The alternative (a length in the descriptor, or a per-chain
+ * header) is a second source of truth for a number the bytes already determine,
+ * and weave_surftrie_open() rejects any image whose declared counts disagree with
+ * its length, so a torn chain is caught with no extra field to keep in step.
+ * It also means the allocation is bounded by real relation pages rather than by
+ * a count read out of a possibly-corrupt header.
+ * ------------------------------------------------------------------------- */
+
+/* Image bytes one WEAVE_PK_SURF page carries.  In am.h rather than in am.c
+ * because weave_surf_stats() reports the page count and must derive it from the
+ * same constant the writer used -- two independent expressions for "how many
+ * pages does this image take" is how a report starts disagreeing with the
+ * relation. */
+#define WEAVE_SURFPAGE_PAYLOAD \
+	(BLCKSZ - (int) MAXALIGN(SizeOfPageHeaderData) - (int) MAXALIGN(sizeof(WeavePageOpaqueData)))
+
+extern BlockNumber weave_write_surf(Relation index, const uint8 *img, Size len);
+
+/*
+ * Read the image on the chain rooted at `root` into a palloc'd buffer.  Returns
+ * NULL and sets *detail to a constant explanatory string on any page-level
+ * problem (out of bounds, uninitialized, wrong kind, cyclic chain, empty).
+ * Does NOT validate the image -- that is weave_surftrie_check()'s job, and the
+ * split is deliberate: weave_check() must REPORT a bad image as a violated
+ * invariant while a scan must THROW, so neither half may ereport on its own.
+ */
+extern uint8 *weave_read_surf(Relation index, BlockNumber root, Size *len_out,
+							  const char **detail);
+
+/*
+ * The scan-side loader: resolve the bolt's WEAVE_WK_FUZZY descriptor, read the
+ * chain, and open+validate the image.  Returns false when the bolt carries no
+ * fuzzy weft (a pre-v7 bolt, which is not an error); ereports
+ * ERRCODE_INDEX_CORRUPTED when it carries one that does not validate.  *img
+ * receives the palloc'd buffer the returned handle aliases, so the caller frees
+ * it when done -- WeaveSurfTrie holds pointers INTO the image and copies
+ * nothing.
+ */
+extern bool weave_surf_load(Relation index, const WeaveSegMeta *seg,
+							WeaveSurfTrie *t, uint8 **img, Size *len);
 
 /*
  * The one posting decoder.  Every channel reads a term's postings through this:

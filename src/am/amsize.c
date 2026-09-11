@@ -112,6 +112,7 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 		{"trigram_data", WEAVE_PK_TRGM_DATA, 0, 0},
 		{"pending", WEAVE_PK_PENDING, 0, 0},
 		{"chandesc", WEAVE_PK_CHANDESC, 0, 0},
+		{"surf_trie", WEAVE_PK_SURF, 0, 0},
 	};
 	int			nbuckets = lengthof(buckets);
 	int64		unknown_pages = 0;
@@ -254,5 +255,111 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 
+	return (Datum) 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * weave_surf_stats(regclass) -- what the fuzzy weft costs, per bolt
+ *
+ * Two jobs, and the second is the load-bearing one.
+ *
+ * 1. SIZE HONESTY.  The trie costs bytes and this is where the raw number comes
+ *    from: `bytes` is the exact image length (which for this format is a pure
+ *    function of the header's counts, so it is not an estimate) and `npages` the
+ *    pages the chain occupies.  weave_index_size_detail() gained a 'surf_trie'
+ *    bucket in the same change, so no byte of a weave index is unattributed.
+ *
+ * 2. IT IS THE ONLY SQL-REACHABLE CALLER OF THE TRIE LOADER.  weave_surf_load()
+ *    is the path a prefix/fuzzy/regex scan will take (Z4-Z6), including its
+ *    refusal to use an image that does not validate.  An ERROR path with no
+ *    caller has never run: t/011_chandesc_corruption.pl records that
+ *    weave_chandesc_required() shipped with zero callers, so its ERROR was
+ *    reachable only from a C call nothing in the tree made.  Routing this
+ *    diagnostic through the real loader means t/013_surf_corruption.pl exercises
+ *    the production refusal rather than a test-only copy of it.
+ * ------------------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(weave_surf_stats);
+
+Datum
+weave_surf_stats(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	index;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext oldcontext;
+	WeaveMetaPageData meta;
+	Buffer		mb;
+	uint32		s;
+
+	if (rsinfo == NULL || !(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+	MemoryContextSwitchTo(oldcontext);
+
+	index = index_open(indexoid, AccessShareLock);
+	if (index->rd_rel->relam != get_index_am_oid("weave", true))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a weave index",
+						RelationGetRelationName(index))));
+
+	if (RelationGetNumberOfBlocks(index) == 0)
+	{
+		index_close(index, AccessShareLock);
+		return (Datum) 0;		/* buildempty(): no metapage, hence no bolts */
+	}
+
+	mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
+	LockBuffer(mb, BUFFER_LOCK_SHARE);
+	weave_check_meta(BufferGetPage(mb), index);
+	weave_meta_from_page(BufferGetPage(mb), &meta);
+	UnlockReleaseBuffer(mb);
+
+	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		WeaveSurfTrie t;
+		uint8	   *img = NULL;
+		Size		len = 0;
+		Datum		values[9];
+		bool		nulls[9] = {false, false, false, false, false,
+			false, false, false, false};
+
+		CHECK_FOR_INTERRUPTS();
+		if (meta.segs[s].dictstart == InvalidBlockNumber)
+			continue;			/* consumed slot */
+
+		/* No row for a bolt with no fuzzy weft, on purpose: a pre-v7 bolt is not
+		 * a bolt with an empty trie, and reporting a zero row would blur the
+		 * difference the whole self-description design exists to keep. */
+		if (!weave_surf_load(index, &meta.segs[s], &t, &img, &len))
+			continue;
+
+		values[0] = Int32GetDatum((int32) s);
+		values[1] = Int64GetDatum((int64) t.nterms);
+		values[2] = Int64GetDatum((int64) t.nslots);
+		values[3] = Int64GetDatum((int64) t.nnodes);
+		values[4] = Int64GetDatum((int64) t.nterminal);
+		values[5] = Int64GetDatum((int64) t.ntrunc);
+		values[6] = Int32GetDatum((int32) t.maxdepth);
+		values[7] = Int64GetDatum((int64) len);
+		values[8] = Int64GetDatum((int64) ((len + WEAVE_SURFPAGE_PAYLOAD - 1) /
+										   WEAVE_SURFPAGE_PAYLOAD));
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+		pfree(img);
+	}
+
+	index_close(index, AccessShareLock);
 	return (Datum) 0;
 }

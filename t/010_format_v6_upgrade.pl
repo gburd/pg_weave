@@ -67,7 +67,12 @@ use constant {
 	WEAVE_MAX_SEGMENTS    => 128,
 	INVALID_BLOCK         => 0xFFFFFFFF,
 	WEAVE_VERSION_V5      => 5,
-	WEAVE_VERSION_V6      => 6,
+	# The version this build WRITES.  v7 added the fuzzy weft; the metapage is
+	# byte-identical to v6, so everything this test manufactures is unaffected --
+	# but the version word it reads back is not, and hard-coding 6 here would have
+	# turned a correct version bump into a test failure.  See WEAVE_VERSION in
+	# include/weave/am.h for why a weft that changes no struct still bumps it.
+	WEAVE_VERSION_CUR     => 7,
 };
 
 # Rewrite the metapage of an index file into the v5 on-disk shape.  Server MUST be
@@ -222,7 +227,8 @@ is($node->safe_psql('postgres',
 # --- manufacture the pre-v6 image -----------------------------------------
 $node->stop;
 my ($oldver, $nsegments, @orphans) = downgrade_metapage_to_v5($abspath);
-is($oldver, WEAVE_VERSION_V6, 'the index really was written as format v6');
+is($oldver, WEAVE_VERSION_CUR,
+	'the index really was written as the current format');
 cmp_ok(scalar(@orphans), '>', 0,
 	'the v6 index had at least one channel-descriptor page to orphan');
 is(read_metapage_version($abspath), WEAVE_VERSION_V5,
@@ -279,12 +285,12 @@ $node->safe_psql('postgres', "SELECT weave_merge('docs_weave')");
 # CHECKPOINT first: the metapage lives in shared buffers until one, and reading
 # the file without it sees the pre-upgrade bytes.  (Learned the hard way here.)
 $node->safe_psql('postgres', 'CHECKPOINT');
-is(read_metapage_version($abspath), WEAVE_VERSION_V6,
-	'a directory change upcasts the metapage to format v6 ON DISK');
+is(read_metapage_version($abspath), WEAVE_VERSION_CUR,
+	'a directory change upcasts the metapage to the current format ON DISK');
 like($node->safe_psql('postgres',
 		q{SELECT detail FROM weave_check('docs_weave')
 		   WHERE invariant = 'metapage_version_recognized'}),
-	qr/^format v6 /, 'weave_check() now reports format v6');
+	qr/^format v7 /, 'weave_check() now reports format v7');
 
 my $cd_after = $node->safe_psql('postgres',
 	q{SELECT detail FROM weave_check('docs_weave')

@@ -1452,23 +1452,253 @@ weave_doclen_lookup(const WeaveDoclens *d, uint64 docid)
 	return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * The bolt VOCABULARY, and the SuRF trie over it -- task Z3
+ *
+ * WHY THE COLLECTOR HANGS OFF THE DICTIONARY WRITER AND NOT OFF ITS CALLERS.
+ * The trie is a function of the dictionary: its membership must equal the
+ * dictionary's, and weave_check() asserts exactly that in both directions.  There
+ * are two dictionary writers in this file -- an in-memory array (bolt flush) and
+ * a spilled stream (merge) -- so building the trie at each CALL SITE would mean
+ * two places that must independently agree with the term sequence the dictionary
+ * actually received.  Feeding a collector from inside
+ * weave_write_dictionary_iter() instead makes that agreement structural: there is
+ * one term sequence, and both structures are built from it.  This is the same
+ * argument weave_surftrie_build() makes internally about its measure and emit
+ * passes being one function.
+ *
+ * WHAT IT COSTS, STATED.  The merge path spills dictionary metadata to disk
+ * precisely so a merged bolt's vocabulary is never fully resident (see
+ * weave_merge_segments_streaming).  Collecting the terms here brings a resident
+ * copy back: the byte arena is the sum of the term lengths and the descriptor
+ * array is sizeof(WeaveSurfTerm) per term.  That is unavoidable for this
+ * structure, because weave_surftrie_build() needs RANDOM ACCESS to the sorted
+ * array -- at depth d it re-reads the d-byte prefix of every term -- so there is
+ * no streaming formulation of a LOUDS-Sparse build.  Both allocations therefore
+ * go through the huge-safe path, which is what `make check-alloc` is for: a
+ * vocabulary-scale palloc is the exact class behind four real crashes in this
+ * extension's ancestor.
+ * ------------------------------------------------------------------------- */
+
+typedef struct WeaveVocab
+{
+	WeaveSurfTerm *terms;		/* .s is filled in by weave_vocab_finish() */
+	uint32		nterms;
+	uint32		termcap;
+	char	   *bytes;			/* every term's bytes, back to back, in order */
+	Size		nbytes;
+	Size		bytecap;
+	bool		toobig;			/* above WEAVE_SURFTRIE_MAX_TERMS: no weft */
+} WeaveVocab;
+
+static void
+weave_vocab_init(WeaveVocab *v)
+{
+	MemSet(v, 0, sizeof(*v));
+}
+
+static void
+weave_vocab_free(WeaveVocab *v)
+{
+	if (v->terms != NULL)
+		pfree(v->terms);
+	if (v->bytes != NULL)
+		pfree(v->bytes);
+	weave_vocab_init(v);
+}
+
 /*
- * Write the dictionary: sorted (term, df, firstposting) entries packed into a
- * chain of dictionary pages.  Returns the first dictionary block, and via
- * *indexstart the first page of the sparse block index (Invalid if empty).
+ * Append one term.  Deliberately stores no pointer: the byte arena is grown with
+ * repalloc, which MOVES it, so a WeaveSurfTerm.s captured now would dangle.  The
+ * terms are appended in order and contiguously, so weave_vocab_finish() can
+ * reconstruct every pointer from the lengths alone -- no offset array, and hence
+ * no third vocabulary-scale allocation.
  */
+static void
+weave_vocab_add(WeaveVocab *v, const char *term, uint32 len)
+{
+	if (v->toobig)
+		return;
+	if (v->nterms >= WEAVE_SURFTRIE_MAX_TERMS)
+	{
+		v->toobig = true;
+		return;
+	}
+
+	if (v->nterms >= v->termcap)
+	{
+		uint32		want = v->termcap ? v->termcap * 2 : 1024;
+
+		v->terms = (WeaveSurfTerm *)
+			(v->terms == NULL
+			 ? WEAVE_ALLOC_MAYBE_HUGE((Size) want * sizeof(WeaveSurfTerm))
+			 : WEAVE_REALLOC_MAYBE_HUGE(v->terms,
+										(Size) want * sizeof(WeaveSurfTerm)));
+		v->termcap = want;
+	}
+	if (v->nbytes + len > v->bytecap)
+	{
+		Size		want = v->bytecap ? v->bytecap * 2 : 8192;
+
+		while (want < v->nbytes + len)
+			want *= 2;
+		v->bytes = (char *)
+			(v->bytes == NULL ? WEAVE_ALLOC_MAYBE_HUGE(want)
+			 : WEAVE_REALLOC_MAYBE_HUGE(v->bytes, want));
+		v->bytecap = want;
+	}
+
+	memcpy(v->bytes + v->nbytes, term, len);
+	v->nbytes += len;
+	v->terms[v->nterms].s = NULL;	/* finish() fills this in */
+	v->terms[v->nterms].len = len;
+	v->nterms++;
+}
+
+static void
+weave_vocab_finish(WeaveVocab *v)
+{
+	Size		off = 0;
+	uint32		i;
+
+	for (i = 0; i < v->nterms; i++)
+	{
+		v->terms[i].s = v->bytes + off;
+		off += v->terms[i].len;
+	}
+	Assert(off == v->nbytes);
+}
+
+/*
+ * Build the fuzzy weft from a collected vocabulary and lay it on a
+ * WEAVE_PK_SURF page chain.  Returns the chain's first block, or
+ * InvalidBlockNumber for "this bolt carries no fuzzy weft", which is a legal
+ * state that costs zero bytes (no descriptor slot either --
+ * weave_chandesc_for_segment in am.c).
+ *
+ * ABSENT IS SAFE; INCOMPLETE IS NOT.  The trie is a filter with false positives
+ * and no false negatives, and a caller that finds no fuzzy weft falls back to
+ * walking the dictionary, which is slower and correct.  A caller that finds a
+ * trie MISSING a term it should contain silently drops rows, and AGENTS.md hard
+ * rule 1 says no fixed-expected-output regression test can catch that.  So every
+ * refusal below omits the weft rather than writing a partial one.
+ */
+static BlockNumber
+weave_build_surf_weft(Relation index, WeaveVocab *voc)
+{
+	size_t		imglen = 0;
+	size_t		written = 0;
+	uint8	   *img;
+	WeaveSurfError err;
+	WeaveSurfTrie t;
+	BlockNumber root;
+	uint32		i;
+
+	if (voc == NULL || voc->nterms == 0)
+		return InvalidBlockNumber;	/* an empty bolt has no vocabulary */
+	if (voc->toobig)
+	{
+		ereport(WARNING,
+				(errmsg("index \"%s\": vocabulary exceeds the fuzzy weft's maximum size, so this segment carries none",
+						RelationGetRelationName(index)),
+				 errdetail("The prefix/fuzzy/regex paths will walk the dictionary for this segment instead.")));
+		return InvalidBlockNumber;
+	}
+
+	weave_vocab_finish(voc);
+
+	err = weave_surftrie_size(voc->terms, voc->nterms, &imglen);
+	if (err == WEAVE_SURF_UNSORTED)
+	{
+		/*
+		 * Not a user-data condition: the dictionary writer emits terms in
+		 * cmp_buildterm / merge_cmp_term order, which is unsigned-byte memcmp
+		 * then shorter-first -- exactly weave_surftrie_size()'s requirement.  If
+		 * this fires, the dictionary on disk is not sorted either, which breaks
+		 * the sparse block index and the k-way merge as well, so failing the
+		 * write is the containment.  This is the only free check the tree has of
+		 * the "dictionary terms are strictly ascending within a bolt" invariant
+		 * doc/specs/SEGMENT_FORMAT.md sect. 9 still owes.
+		 */
+		elog(ERROR, "weave: dictionary terms are not strictly ascending (%u terms)",
+			 voc->nterms);
+	}
+	if (err != WEAVE_SURF_OK)
+	{
+		ereport(WARNING,
+				(errmsg("index \"%s\": cannot build the fuzzy weft for this segment",
+						RelationGetRelationName(index)),
+				 errdetail("%s", weave_surftrie_errstr(err))));
+		return InvalidBlockNumber;
+	}
+
+	/* vocabulary-scale, hence huge-safe: see the header comment on this block */
+	img = (uint8 *) WEAVE_ALLOC_MAYBE_HUGE((Size) imglen);
+	err = weave_surftrie_build(voc->terms, voc->nterms, img, imglen, &written);
+	if (err != WEAVE_SURF_OK || written != imglen)
+		elog(ERROR, "weave: surf trie build failed: %s",
+			 weave_surftrie_errstr(err));
+
+	/*
+	 * THE ONE-SIDED ERROR IS A CONTRACT, SO PROVE IT ON THE IMAGE WE ARE ABOUT TO
+	 * WRITE -- do not assume it.  Re-open the freshly built bytes through the
+	 * same two-layer validator a reader will use, then assert the direction that
+	 * matters: every term of this bolt's dictionary MUST be reported present, and
+	 * an exact hit must carry that term's own ordinal.  The opposite direction
+	 * (the trie reporting a non-member) is permitted by design and is checked
+	 * against the dictionary by weave_check().
+	 *
+	 * Not an Assert(): Assert() compiles out, and this is the property whose
+	 * violation is invisible to every other test layer -- a dropped row with a
+	 * plausible-looking result set.  The cost is one membership probe per term
+	 * against a structure already in cache, next to a build that has just made
+	 * O(nterms * maxdepth) byte comparisons.
+	 */
+	err = weave_surftrie_open(img, imglen, &t);
+	if (err == WEAVE_SURF_OK)
+		err = weave_surftrie_validate(&t);
+	if (err != WEAVE_SURF_OK)
+		elog(ERROR, "weave: freshly built surf trie does not validate: %s",
+			 weave_surftrie_errstr(err));
+	for (i = 0; i < voc->nterms; i++)
+	{
+		WeaveSurfHit hit;
+
+		if ((i & 0xFFF) == 0)
+			CHECK_FOR_INTERRUPTS();
+		if (!weave_surftrie_may_contain(&t, voc->terms[i].s, voc->terms[i].len,
+										&hit))
+			elog(ERROR, "weave: surf trie omits dictionary term %u of %u (false negative)",
+				 i, voc->nterms);
+		if (hit.exact && hit.ord != i)
+			elog(ERROR, "weave: surf trie maps dictionary term %u to ordinal %u",
+				 i, hit.ord);
+	}
+
+	root = weave_write_surf(index, img, (Size) imglen);
+	pfree(img);
+	return root;
+}
 
 /*
  * Write a segment's on-disk dictionary (dict pages + sparse block index) by
- * pulling terms from an iterator in sorted order.  O(1) caller memory: the only
- * state retained across the stream is the per-DICT-PAGE block-index metadata
- * (one entry per ~8KB page, i.e. index_size/BLCKSZ entries -- tiny), including a
- * copy of each page's first term's bytes so the block-index pass needs no
- * random access back into the (possibly spilled) term stream.
+ * pulling terms from an iterator in sorted order.  Returns the first dictionary
+ * block, and via *indexstart the first page of the sparse block index (Invalid if
+ * empty).  O(1) caller memory: the only state retained across the stream is the
+ * per-DICT-PAGE block-index metadata (one entry per ~8KB page, i.e.
+ * index_size/BLCKSZ entries -- tiny), including a copy of each page's first term's
+ * bytes so the block-index pass needs no random access back into the (possibly
+ * spilled) term stream.
+ *
+ * `voc` (may be NULL) collects the term sequence for the fuzzy weft.  It is fed
+ * from HERE rather than from either caller so that the trie and the dictionary
+ * cannot be built from two different sequences -- see the block comment above
+ * WeaveVocab.  That is not free: it is the one thing in this function whose
+ * memory is vocabulary-scale rather than page-count-scale.
  */
 static BlockNumber
 weave_write_dictionary_iter(Relation index, DictNextFn next, void *nstate,
-						   BlockNumber *indexstart)
+						   BlockNumber *indexstart, WeaveVocab *voc)
 {
 	BlockNumber first = InvalidBlockNumber;
 	Buffer		buffer = InvalidBuffer;
@@ -1548,6 +1778,11 @@ weave_write_dictionary_iter(Relation index, DictNextFn next, void *nstate,
 			memcpy(de->term, r.term, r.len);
 		}
 		((PageHeader) page)->pd_lower += need;
+
+		/* AFTER the entry is laid down, so the trie is built from exactly the
+		 * terms that reached a dictionary page and in exactly that order */
+		if (voc != NULL)
+			weave_vocab_add(voc, r.term, (uint32) r.len);
 	}
 
 	if (buffer != InvalidBuffer)
@@ -1652,7 +1887,7 @@ dict_array_next(void *st, DictRec *r)
 static BlockNumber
 weave_write_dictionary(Relation index, WeaveBuildState *bs,
 					  BlockNumber *postings, uint32 *offsets,
-					  BlockNumber *indexstart)
+					  BlockNumber *indexstart, WeaveVocab *voc)
 {
 	DictArrayIter it;
 
@@ -1660,7 +1895,8 @@ weave_write_dictionary(Relation index, WeaveBuildState *bs,
 	it.postings = postings;
 	it.offsets = offsets;
 	it.i = 0;
-	return weave_write_dictionary_iter(index, dict_array_next, &it, indexstart);
+	return weave_write_dictionary_iter(index, dict_array_next, &it, indexstart,
+									  voc);
 }
 
 /*
@@ -1716,6 +1952,8 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 	uint32	   *offsets;
 	WeavePostWriter pw;
 	DoclenCollector dc;
+	WeaveVocab	voc;
+	BlockNumber surfroot;
 	int			i;
 
 	postings = (BlockNumber *) palloc(Max(bs->nterms, 1) * sizeof(BlockNumber));	/* alloc-ok: bs->nterms is a single build/pending segment, bounded by maintenance_work_mem (the merge path spills to disk instead) */
@@ -1741,7 +1979,9 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 
 	MemSet(seg, 0, sizeof(WeaveSegMeta));
 	seg->chandesc = InvalidBlockNumber;	/* set for real by weave_attach_chandesc */
-	seg->dictstart = weave_write_dictionary(index, bs, postings, offsets, &seg->dictindexstart);
+	weave_vocab_init(&voc);
+	seg->dictstart = weave_write_dictionary(index, bs, postings, offsets,
+										   &seg->dictindexstart, &voc);
 	seg->trgmstart = bs->want_trigrams ? weave_write_trigrams(index, bs)
 		: InvalidBlockNumber;	/* trigrams opt-in (WITH (trigrams=on)); see weave_index_wants_trigrams */
 	seg->doclenstart = bs->want_sidecar ? weave_write_doclen_sidecar(index, &dc) : InvalidBlockNumber;
@@ -1751,7 +1991,10 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 	seg->nterms = bs->nterms;
 	seg->ndeleted = 0;
 	seg->livedocslen = 0;
-	weave_attach_chandesc(index, seg);	/* v6: last, so every root is known */
+	/* v7 fuzzy weft, from the vocabulary the dictionary write just collected */
+	surfroot = weave_build_surf_weft(index, &voc);
+	weave_vocab_free(&voc);
+	weave_attach_chandesc(index, seg, surfroot);	/* v6: last, so every root is known */
 	doclen_collector_free(&dc);
 	pfree(postings);
 	pfree(offsets);
@@ -2085,6 +2328,8 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	WeavePostWriter pw;
 	DoclenCollector mergedc;		/* v4: docid->byte for the merged output segment */
 	DictSpill	spill;			/* per-output-term dict metadata, spilled to disk */
+	WeaveVocab	voc;
+	BlockNumber surfroot;
 	uint32		nout = 0;
 	uint32		i;
 	MemoryContext old = MemoryContextSwitchTo(bs->ctx);
@@ -2271,8 +2516,9 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	seg->doclenstart = bs->want_sidecar ? weave_write_doclen_sidecar(index, &mergedc) : InvalidBlockNumber;
 	doclen_collector_free(&mergedc);
 	dict_spill_rewind(&spill);
+	weave_vocab_init(&voc);
 	seg->dictstart = weave_write_dictionary_iter(index, dict_spill_next, &spill,
-												&seg->dictindexstart);
+												&seg->dictindexstart, &voc);
 	if (bs->want_trigrams)
 	{
 		dict_spill_rewind(&spill);
@@ -2289,7 +2535,21 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	seg->nterms = bs->nterms;
 	seg->ndeleted = 0;
 	seg->livedocslen = 0;
-	weave_attach_chandesc(index, seg);	/* v6: last, so every root is known */
+
+	/*
+	 * v7 fuzzy weft.  THE TRIE IS REBUILT, NOT MERGED, and that is not an
+	 * optimization left on the table: a merged bolt's vocabulary is the UNION of
+	 * its inputs' vocabularies minus terms whose every posting was tombstoned, so
+	 * its trie shape, its slot numbering, its rank/select tables and every one of
+	 * its term ordinals differ from both inputs.  Two LOUDS-Sparse images cannot
+	 * be concatenated or unioned in place -- the level-order slot indices that all
+	 * the navigation depends on renumber.  Rebuilding from the merged term
+	 * sequence is the only correct construction, and it is nearly free because
+	 * that sequence is what the dictionary writer above just emitted.
+	 */
+	surfroot = weave_build_surf_weft(index, &voc);
+	weave_vocab_free(&voc);
+	weave_attach_chandesc(index, seg, surfroot);	/* v6: last, so every root is known */
 
 	for (i = 0; i < nsel; i++)
 		weave_doclens_free(&srcv[i].doclens);

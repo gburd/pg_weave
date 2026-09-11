@@ -975,7 +975,7 @@ weave_meta_from_page(Page page, WeaveMetaPageData *out)
 }
 
 /*
- * Upcast a pre-v6 metapage to the current in-place layout under the caller's
+ * Upcast an older metapage to the current in-place layout under the caller's
  * exclusive lock, via GenericXLog, so subsequent in-place struct writes are
  * correct.  Idempotent: a no-op if the page is already current.  MUST be called
  * (under the metapage's exclusive lock, before read-modify-writing it) by every
@@ -986,7 +986,12 @@ weave_meta_from_page(Page page, WeaveMetaPageData *out)
  * chandesc (Invalid), because the stride did not move -- but it must still run,
  * or a v4/v5 metapage's padding bytes would be left as the chandesc of every
  * bolt and a merge would then write a real chandesc into a directory whose other
- * entries still hold padding.
+ * entries still hold padding.  For a v6 page it rewrites ONLY the version word,
+ * and it must still run for a reason that is not about layout at all: the moment
+ * a bolt in this directory carries a fuzzy weft, an older .so reading the
+ * relation would free every weft it knows and leak the trie on each merge.  The
+ * version word is what stops it (weave_check_meta), so the gate has to be tested
+ * against WEAVE_VERSION and not against the last version that moved a field.
  */
 void
 weave_meta_upcast_page(Page page)
@@ -994,7 +999,7 @@ weave_meta_upcast_page(Page page)
 	WeaveMetaPageData tmp;
 	WeaveMetaPageData *m;
 
-	if (WeavePageGetMeta(page)->version >= WEAVE_VERSION_CHANDESC)
+	if (WeavePageGetMeta(page)->version >= WEAVE_VERSION)
 		return;
 
 	weave_meta_from_page(page, &tmp);	/* read old into a current-shaped temp */
@@ -1792,7 +1797,7 @@ weave_read_chandesc(Relation index, BlockNumber blk,
 }
 
 /*
- * The descriptor array a freshly written lexical-only bolt gets.
+ * The descriptor array a freshly written bolt gets.
  *
  * Every v6 bolt gets a descriptor page, even one that carries nothing but the
  * lexical weft.  The alternative -- write the page only once a second channel
@@ -1801,10 +1806,16 @@ weave_read_chandesc(Relation index, BlockNumber blk,
  * channel lands, which is the failure mode blocking gate 5 exists to prevent.
  * The measured cost is one page per bolt (see doc/PHASES.md X2), and it buys one
  * thing v4 never recorded: WHICH index attribute the lexical weft indexes.
+ *
+ * Since v7 a second weft can appear here: the fuzzy one.  Note what did NOT
+ * happen -- WeaveSegMeta gained no field.  The whole point of the v6 descriptor
+ * page is that a weft's root is recorded in the bolt's self-description, so a
+ * new weft costs zero bytes in the metapage and zero bytes in a bolt that does
+ * not carry it (doc/specs/SEGMENT_FORMAT.md sect. 6).
  */
 static int
 weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
-						   WeaveChannelDesc *weft)
+						   BlockNumber surfroot, WeaveChannelDesc *weft)
 {
 	int			n = 0;
 
@@ -1815,18 +1826,289 @@ weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
 	weft[n].flags = 0;
 	weft[n].root = seg->dictstart;
 	n++;
+
+	/*
+	 * v7: the fuzzy weft, i.e. the SuRF trie over this bolt's vocabulary.  It is
+	 * absent -- and then costs literally zero bytes, including this descriptor
+	 * slot -- when the bolt has no vocabulary at all, or when the vocabulary is
+	 * one the format cannot represent completely (see weave_build_surf_weft() in
+	 * ambuild.c: an INCOMPLETE trie would be a false negative, and no descriptor
+	 * is the only safe way to say "there is nothing here to consult").
+	 *
+	 * Emitted after LEXICAL because weave_chandesc_check() requires the array to
+	 * be strictly ascending by (kind, attnum) and WEAVE_WK_FUZZY (3) is above
+	 * WEAVE_WK_LEXICAL (1).  Adding a weft with a kind BELOW an existing one
+	 * means sorting here, not appending.
+	 */
+	if (surfroot != InvalidBlockNumber)
+	{
+		weft[n].kind = (uint16) WEAVE_WK_FUZZY;
+		weft[n].attnum = 1;
+		weft[n].flags = 0;
+		weft[n].root = surfroot;
+		n++;
+	}
 	return n;
 }
 
 /* Attach a descriptor page to a just-written bolt.  Call AFTER every other
  * chain of the bolt has been written, so each root is known. */
 void
-weave_attach_chandesc(Relation index, WeaveSegMeta *seg)
+weave_attach_chandesc(Relation index, WeaveSegMeta *seg, BlockNumber surfroot)
 {
 	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
-	int			nweft = weave_chandesc_for_segment(index, seg, weft);
+	int			nweft = weave_chandesc_for_segment(index, seg, surfroot, weft);
 
 	seg->chandesc = weave_write_chandesc(index, weft, nweft);
+}
+
+/* ---------------------------------------------------------------------------
+ * The fuzzy weft's page chain (task Z3)
+ *
+ * See the block comment on these three in include/weave/am.h for why this is not
+ * weave_write_blob(), and why no length is stored anywhere.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Lay `len` bytes across a fresh chain of WEAVE_PK_SURF pages, one page per
+ * GenericXLog cycle so there is no page-count limit and no oversized WAL record.
+ * Returns the first block.
+ *
+ * 100% GenericXLog (AGENTS.md hard rule 2): every page is registered with
+ * GENERIC_XLOG_FULL_IMAGE because every page is brand new, so a delta against
+ * the pre-image would be the whole page anyway.  t/012_surf_crash_recovery.pl is
+ * the proof that the chain survives an immediate shutdown.
+ */
+BlockNumber
+weave_write_surf(Relation index, const uint8 *img, Size len)
+{
+	BlockNumber first = InvalidBlockNumber;
+	Buffer		prevbuf = InvalidBuffer;
+	Page		prevpage = NULL;
+	GenericXLogState *prevstate = NULL;
+	Size		off = 0;
+
+	Assert(len > 0);
+
+	do
+	{
+		Buffer		buf = weave_new_buffer(index);
+		BlockNumber blk = BufferGetBlockNumber(buf);
+		GenericXLogState *state = GenericXLogStart(index);
+		Page		page = GenericXLogRegisterBuffer(state, buf,
+													 GENERIC_XLOG_FULL_IMAGE);
+		Size		chunk = Min(len - off, (Size) WEAVE_SURFPAGE_PAYLOAD);
+
+		weave_init_page(page, WEAVE_PK_SURF);
+		memcpy((char *) PageGetContents(page), img + off, chunk);
+		((PageHeader) page)->pd_lower =
+			((char *) PageGetContents(page) - (char *) page) + chunk;
+
+		if (prevbuf != InvalidBuffer)
+		{
+			WeavePageGetOpaque(prevpage)->nextblk = blk;
+			GenericXLogFinish(prevstate);
+			UnlockReleaseBuffer(prevbuf);
+		}
+		else
+			first = blk;
+
+		prevbuf = buf;
+		prevpage = page;
+		prevstate = state;
+		off += chunk;
+	} while (off < len);
+
+	GenericXLogFinish(prevstate);
+	UnlockReleaseBuffer(prevbuf);
+	return first;
+}
+
+/*
+ * One pass over the chain from `root`.  With `dst` NULL it only measures and
+ * validates the pages; with `dst` set it copies at most `cap` bytes into it.
+ * Returns the payload byte count, or -1 with *detail set.
+ *
+ * ONE walker, TWO modes, for the same reason weave_surftrie_build() has one:
+ * the measure pass sizes the buffer the copy pass fills, and a disagreement
+ * between two separately-written walkers is a buffer overrun.
+ */
+static int64
+weave_surf_walk(Relation index, BlockNumber root, uint8 *dst, Size cap,
+				const char **detail)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	BlockNumber blk = root;
+	int64		total = 0;
+	int64		npages = 0;
+
+	*detail = NULL;
+	if (blk == InvalidBlockNumber || blk == WEAVE_METAPAGE_BLKNO)
+	{
+		*detail = "fuzzy weft root block is invalid";
+		return -1;
+	}
+
+	while (blk != InvalidBlockNumber)
+	{
+		Buffer		buf;
+		Page		page;
+		Size		avail;
+		Size		contoff;
+
+		CHECK_FOR_INTERRUPTS();	/* between pages, no buffer lock held */
+		if (blk >= nblocks)
+		{
+			*detail = "surf trie chain leaves the relation";
+			return -1;
+		}
+		if (++npages > (int64) nblocks)
+		{
+			*detail = "surf trie chain exceeds the relation length (cycle?)";
+			return -1;
+		}
+
+		buf = ReadBuffer(index, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (PageIsNew(page))
+		{
+			UnlockReleaseBuffer(buf);
+			*detail = "surf trie chain reaches an uninitialized page";
+			return -1;
+		}
+
+		/*
+		 * WeavePageHasKind(), never `flags & WEAVE_SURF_PAGE`: WEAVE_PK_SURF is
+		 * an INTEGER id under the escape bit, so a bitwise AND compiles and is
+		 * always false (weave/pagekind.h).  This is the L17 class of bug and it
+		 * has already been made twice in this tree.
+		 */
+		if (!WeavePageHasKind(page, WEAVE_PK_SURF))
+		{
+			UnlockReleaseBuffer(buf);
+			*detail = "a block on the surf trie chain is not a surf page";
+			return -1;
+		}
+
+		contoff = (Size) ((char *) PageGetContents(page) - (char *) page);
+		avail = 0;
+		if ((Size) ((PageHeader) page)->pd_lower >= contoff)
+			avail = (Size) ((PageHeader) page)->pd_lower - contoff;
+		if (avail > (Size) WEAVE_SURFPAGE_PAYLOAD)
+			avail = (Size) WEAVE_SURFPAGE_PAYLOAD;	/* a torn pd_lower cannot make us
+												 * read into the opaque area */
+		if (dst != NULL)
+		{
+			if ((Size) total + avail > cap)
+			{
+				UnlockReleaseBuffer(buf);
+				*detail = "surf trie chain grew between the measure and copy passes";
+				return -1;
+			}
+			memcpy(dst + total, PageGetContents(page), avail);
+		}
+		total += (int64) avail;
+		blk = WeavePageGetOpaque(page)->nextblk;
+		UnlockReleaseBuffer(buf);
+	}
+
+	if (total == 0)
+	{
+		*detail = "surf trie chain carries no bytes";
+		return -1;
+	}
+	return total;
+}
+
+uint8 *
+weave_read_surf(Relation index, BlockNumber root, Size *len_out,
+				const char **detail)
+{
+	int64		len;
+	uint8	   *img;
+
+	*len_out = 0;
+	len = weave_surf_walk(index, root, NULL, 0, detail);
+	if (len < 0)
+		return NULL;
+
+	/*
+	 * Vocabulary-scale: a trie over the whole vocabulary is precisely the
+	 * allocation class behind four real crashes in this extension's ancestor
+	 * (AGENTS.md's lint table, `make check-alloc`).  The size here is bounded by
+	 * pages that actually exist rather than by a count read out of the image, so
+	 * a corrupt header cannot ask for 1.3 GB -- but the honest bound is still the
+	 * relation, so this goes through the huge-safe path.
+	 */
+	img = (uint8 *) WEAVE_ALLOC_MAYBE_HUGE((Size) len);
+	if (weave_surf_walk(index, root, img, (Size) len, detail) != len)
+	{
+		pfree(img);
+		if (*detail == NULL)
+			*detail = "surf trie chain length changed between passes";
+		return NULL;
+	}
+	*len_out = (Size) len;
+	return img;
+}
+
+bool
+weave_surf_load(Relation index, const WeaveSegMeta *seg, WeaveSurfTrie *t,
+				uint8 **img, Size *len)
+{
+	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
+	int			nweft;
+	int			i;
+	BlockNumber root = InvalidBlockNumber;
+	const char *detail = NULL;
+	WeaveSurfError err;
+
+	*img = NULL;
+	*len = 0;
+	if (seg->chandesc == InvalidBlockNumber)
+		return false;			/* pre-v6 bolt: lexical only, by definition */
+
+	nweft = weave_chandesc_required(index, seg->chandesc, weft, WEAVE_MAX_WEFTS);
+	for (i = 0; i < nweft; i++)
+		if (weft[i].kind == (uint16) WEAVE_WK_FUZZY)
+			root = weft[i].root;
+	if (root == InvalidBlockNumber)
+		return false;			/* v6 bolt, or a v7 bolt whose vocabulary the
+								 * format cannot represent: nothing to consult */
+
+	*img = weave_read_surf(index, root, len, &detail);
+	if (*img == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("corrupt surf trie page chain in index \"%s\"",
+						RelationGetRelationName(index)),
+				 errdetail("%s (block %u)", detail, root),
+				 errhint("REINDEX the index to rebuild it.")));
+
+	/*
+	 * open() + validate(), never open() alone.  open() is the memory-safety
+	 * layer; validate() is the one that catches a corrupt accelerator table,
+	 * whose symptom is navigation to the WRONG NODE -- a false negative, which is
+	 * a silently dropped row rather than an error (weave/surftrie.h).
+	 */
+	err = weave_surftrie_open(*img, *len, t);
+	if (err == WEAVE_SURF_OK)
+		err = weave_surftrie_validate(t);
+	if (err != WEAVE_SURF_OK)
+	{
+		pfree(*img);
+		*img = NULL;
+		*len = 0;
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("corrupt surf trie image in index \"%s\"",
+						RelationGetRelationName(index)),
+				 errdetail("%s (chain at block %u)",
+						   weave_surftrie_errstr(err), root),
+				 errhint("REINDEX the index to rebuild it.")));
+	}
+	return true;
 }
 
 /*
@@ -2093,8 +2375,43 @@ weave_free_segment(Relation index, const WeaveSegMeta *seg)
 		weave_free_chain(index, seg->dictindexstart);
 	if (seg->doclenstart != InvalidBlockNumber)
 		weave_free_chain(index, seg->doclenstart);	/* v4 doclen sidecar */
+
+	/*
+	 * v7: every weft the descriptor page names, then the descriptor page itself.
+	 *
+	 * DRIVEN BY THE DESCRIPTOR, not by a hard-coded list, and that is the point.
+	 * Every chain above is named by a WeaveSegMeta field, so a new weft that is
+	 * NOT in WeaveSegMeta -- which is every weft from v6 onward -- would be
+	 * invisible to a free path written that way, and the symptom is a leak of the
+	 * whole structure on every merge with nothing but weave_check(deep)'s
+	 * pages_reachable_or_freed to notice.  Walking the descriptor means the next
+	 * weft is freed by this code as written.
+	 *
+	 * The read is deliberately the non-throwing one: freeing a bolt whose
+	 * descriptor page is corrupt must still free everything it can rather than
+	 * abort the merge, and the reachability invariant reports what was left
+	 * behind.
+	 */
 	if (seg->chandesc != InvalidBlockNumber)
+	{
+		WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
+		int			nweft = 0;
+		int			i;
+
+		if (weave_read_chandesc(index, seg->chandesc, weft, WEAVE_MAX_WEFTS,
+								&nweft) == WEAVE_CD_OK)
+		{
+			for (i = 0; i < nweft; i++)
+			{
+				/* LEXICAL's root is dictstart, freed above; freeing it twice
+				 * would push the same block on the free list twice. */
+				if (weft[i].kind == (uint16) WEAVE_WK_LEXICAL)
+					continue;
+				weave_free_chain(index, weft[i].root);
+			}
+		}
 		weave_free_chain(index, seg->chandesc);	/* v6 weft descriptor page */
+	}
 }
 
 static void
