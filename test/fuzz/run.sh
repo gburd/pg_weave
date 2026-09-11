@@ -28,6 +28,10 @@ echo "== building fuzzers ($CC, ASan+UBSan) =="
 for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc; do
     $CC $CFLAGS "$here/$f.c" -o "$out/$f"
 done
+# fuzz_surftrie is the one fuzzer with a companion .c: the Z3 trie's builder and
+# reader are too big to live in a header, so the target links the REAL
+# src/query/surftrie.c (no transcription, no modeling gap).
+$CC $CFLAGS "$here/fuzz_surftrie.c" "$root/src/query/surftrie.c" -o "$out/fuzz_surftrie"
 # planted-bug binaries: fuzz_block with (a) the count clamp reverted, (b) the
 # shipped ONE-SIDED clamp (misses count>INT_MAX -> negative int -> wild read),
 # and (c) a fully-random FOR stream (corrupt width -> read past page).  All MUST
@@ -39,10 +43,18 @@ $CC $CFLAGS -DFUZZ_NO_SUMTF_GUARD=1 "$here/fuzz_block.c" -o "$out/fuzz_block_nos
 # planted-bug binary for the v6 channel-descriptor decoder: the "descriptor array
 # must fit the readable bytes" guard removed.  MUST abort under ASan.
 $CC $CFLAGS -DFUZZ_NO_ARRAY_GUARD=1 "$here/fuzz_chandesc.c" -o "$out/fuzz_chandesc_noarray"
+# planted-bug binaries for the Z3 surf trie.  Unlike the ones above these are
+# compile-time removals in the REAL validator (-DWEAVE_SURF_PLANT_*) rather than a
+# weakened transcription of it, because a transcribed copy drifts out of step with
+# the code it models and then proves nothing.  Both MUST abort.
+$CC $CFLAGS -DWEAVE_SURF_PLANT_NO_SIZE_GUARD=1 "$here/fuzz_surftrie.c" \
+    "$root/src/query/surftrie.c" -o "$out/fuzz_surftrie_nosize"
+$CC $CFLAGS -DWEAVE_SURF_PLANT_NO_SELECT_GUARD=1 "$here/fuzz_surftrie.c" \
+    "$root/src/query/surftrie.c" -o "$out/fuzz_surftrie_nosel"
 
 echo "== running fuzzers =="
 rc=0
-for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc; do
+for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_surftrie; do
     if "$out/$f"; then
         echo "PASS: $f"
     else
@@ -101,6 +113,28 @@ if "$out/fuzz_chandesc_noarray" >/dev/null 2>&1; then
     rc=1
 else
     echo "PASS: fuzz_chandesc_noarray aborted as expected (descriptor-array teeth)"
+fi
+
+# The surf-trie no-size-guard build lets a corrupt count put a whole section past
+# the buffer; ASan must abort it -- proving the harness detects the
+# missing-length-guard class on the Z3 trie image.
+if "$out/fuzz_surftrie_nosize" >/dev/null 2>&1; then
+    echo "FAIL: fuzz_surftrie_nosize exited 0 -- harness did NOT catch the missing size guard!"
+    rc=1
+else
+    echo "PASS: fuzz_surftrie_nosize aborted as expected (image-size teeth)"
+fi
+
+# The no-select-guard build trusts a corrupt select sample, which is a WRONG
+# ANSWER (navigation to a node that is not there) before it is an out-of-bounds
+# read.  The harness's independent brute-force postcondition is what fires first;
+# either that assert or ASan must abort -- a wrong answer is exactly what a
+# sanitizer alone cannot see.
+if "$out/fuzz_surftrie_nosel" >/dev/null 2>&1; then
+    echo "FAIL: fuzz_surftrie_nosel exited 0 -- harness did NOT catch the unvalidated select sample!"
+    rc=1
+else
+    echo "PASS: fuzz_surftrie_nosel aborted as expected (select-sample teeth)"
 fi
 
 if [ "$rc" -eq 0 ]; then
