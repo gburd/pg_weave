@@ -380,9 +380,20 @@ ASan/UBSan on the full suite (gate 10), a fuzz target per on-disk structure
 (gate 8), `weave_check()` covering all ~20 `SEGMENT_FORMAT.md` §9 invariants
 (gate 4 — `weave_check()` now exists and covers 11; before phase X there was only
 `weave_check_meta()`), and documented resource behaviour (gate 14 — pg_tre shipped
-without it and a user hit a temp-disk wall the docs did not predict). Also: **a
-Codeberg CI runner is still not registered**, so `.forgejo/workflows/ci.yml` has
-never run. That is a repo-settings action and it gates everything above.
+without it and a user hit a temp-disk wall the docs did not predict). **CI: corrected 2026-09-10.** This used to say "a Codeberg CI runner is still not
+registered, so `.forgejo/workflows/ci.yml` has never run", and it gated everything
+above. Half of that is true and the wrong half mattered: the Forgejo runner does not
+exist, but **Codeberg push-mirrors to `github.com/gburd/pg_weave` where Actions is
+enabled**, so gates have been running since 2026-09-08 and nobody was reading them.
+What they showed: `standalone` green, `sanitize` failing on a workflow bug, and the
+`test` matrix **queued for 21+ hours** across four pushes because it asked for a
+runner label GitHub does not have. A queued job is worse than a failing one, because
+the absence of a signal reads exactly like success.
+
+`.github/workflows/ci.yml` is therefore **the gate that is watched**, and it now also
+runs the full TAP suite (the Forgejo container job can only manage t/003 and t/004).
+The Forgejo file is kept in sync for the day a runner is registered. Registering one
+is still worth doing, but it no longer gates anything.
 
 ## A lexical-only 1.0 is a worse idea than it was this morning
 
