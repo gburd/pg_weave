@@ -5,7 +5,16 @@ name: CI
 # unrun for six days while the FOR codec was modified twice, and how a
 # wrong-answer phrase bug shipped as the default.
 #
-# Codeberg (Forgejo Actions) is canonical; .github/workflows/ci.yml mirrors this.
+# Codeberg (Forgejo Actions) is the canonical remote's workflow, but as of
+# 2026-09-10 THE FORGEJO RUNNER HAS NEVER BEEN REGISTERED, so this file has never
+# executed.  Codeberg push-mirrors to github.com/gburd/pg_weave where Actions is
+# enabled, so .github/workflows/ci.yml is the gate that is actually watched, and
+# this one is kept in sync against the day a runner appears.
+#
+# The two files share text but not runtime, and that is exactly where a mirrored
+# workflow rots: the GitHub copy sat with `runs-on: docker` (a Forgejo label GitHub
+# has no runner for) and queued four full matrices for 21+ hours without ever
+# starting or turning anything red.  When editing either file, diff both.
 # Codeberg runners use `runs-on: docker` with a `container:` image, not GitHub's
 # `ubuntu-latest`.  Each matrix leg runs inside the official postgres:<major>
 # image, so server and client are present; we add server headers and a toolchain,
