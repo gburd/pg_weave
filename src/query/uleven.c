@@ -12,12 +12,42 @@
  */
 
 /*
- * src/query/uleven.c - universal Levenshtein expansion for small k.
+ * src/query/uleven.c - byte-alphabet neighbourhood of a fixed 3-byte trigram.
  *
- * Given a trigram t and local edit budget k, enumerate all trigrams
- * t' with edit distance <= k (Mihov-Schulz universal Levenshtein
- * automaton).  Phase 5 uses this to OR posting lists of near-neighbor
- * trigrams when the regex is nearly literal.
+ * WHAT THIS ACTUALLY IS, because the comment it arrived with was wrong.  It
+ * said "Mihov-Schulz universal Levenshtein automaton"; there is no automaton
+ * here.  It brute-force enumerates the byte-alphabet neighbourhood of a
+ * three-byte trigram (3*255 substitutions, 3*256 insertions truncated back to
+ * three bytes, 3 deletions padded with a trailing 0) and de-duplicates the
+ * result in O(n^2).  For k=2 it applies the k=1 transformation to every k=1
+ * result.  Nothing in it is parameterized by a query, so nothing in it can
+ * prune a vocabulary.
+ *
+ * Nor is the set it emits exactly "the trigrams within edit distance k": the
+ * deletion cases emit a two-byte string zero-padded to three bytes, and the
+ * insertion cases emit the first three bytes of a four-byte string, so the
+ * output is a *funnel* -- deliberately over-generating, with the authoritative
+ * TRE recheck at the heap behind it (see pg_weave_uleven_expand_cp's comment,
+ * which states that soundness argument correctly).
+ *
+ * It stays, unchanged in behaviour, because src/query/tiling.c widens a regex
+ * trigram spine with pg_weave_uleven_expand_cp() and a regex has no single
+ * query term to build an automaton for.  What answers `term~k` is the
+ * vocabulary-level automaton in include/weave/uleven.h (task Z5), which is
+ * exact, prunes, and counts CHARACTERS rather than bytes.
+ *
+ * Two things a reader should know before trusting this file, both found while
+ * writing that core and both left as they are rather than "improved", since
+ * the on-disk trigram hashes and tiling's behaviour depend on it:
+ *
+ * 1. The k=2 path cannot succeed at any max_out a caller currently passes.  A
+ *	  k=1 expansion is ~1537 trigrams before dedup, so the k=2 loop reaches
+ *	  ~1537^2 = 2.36M and returns -1 (overflow) for any max_out below that.
+ *	  tiling.c passes 4096, so a k>=2 tile ALWAYS falls back to always_true --
+ *	  correct (always_true is the safe direction) but not what its comment
+ *	  implies.
+ * 2. It costs 48 KB of stack (uint8 temp[16384][3]) on every call, k=0
+ *	  included.
  *
  * Implementation notes:
  * - For k=0: return the input trigram only.
@@ -252,7 +282,19 @@ pg_weave_uleven_expand(const uint8 tri[3], int k, uint8 (*out)[3], int max_out)
             
             /* Copy batch results into temp at a safe offset to avoid overlap */
             int j;
-            for (j = 0; j < batch && (n + j) < 16384; j++)
+
+            /*
+             * The copy loop used to stop at 16384 while `n` kept advancing by
+             * `batch`, so a caller passing max_out > 16384 got a dedupe pass
+             * over entries that were never written: an out-of-bounds read of
+             * its buffer.  No caller does (tiling.c passes 4096, and this path
+             * returns -1 there long before), which is why nothing noticed.
+             * Refusing up front keeps every reachable return value identical
+             * and makes the unreachable one safe rather than undefined.
+             */
+            if (n > 16384 - batch || (max_out >= batch && n > max_out - batch))
+                return -1;      /* would overrun `out` or the dedupe input */
+            for (j = 0; j < batch; j++)
             {
                 if (n + j >= max_out)
                     return -1;
