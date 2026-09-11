@@ -113,6 +113,41 @@ each weft's `root` becomes a `ReadBuffer` argument).
 - Iterations: 856,784 (32 + 1,089 truncations + 400,000 + 400,000 + 50,000).
 - Seed: splitmix64 from `0x9E3779B97F4A7C15`.
 
+### `fuzz_surftrie.c` -- the Z3 SuRF vocabulary trie (`weave/surftrie.h`)
+Exercises `weave_surftrie_open()` / `weave_surftrie_validate()` and then every
+query path -- **the real code, not a model**, linked from
+`src/query/surftrie.c` (the one fuzz target with a companion `.c`, because the
+builder and reader are too large to live in a header).
+
+The image is nothing but lengths and indices: `nslots` sizes four bitmaps and a
+label array, `nnodes` sizes the select-sample array, every rank superblock is a
+count later used to index a node, and every select sample **is** a slot index the
+reader dereferences. One wrong number walks off the page.
+
+- **(1)** 240 well-formed images across four term-length shapes (including terms
+  past `WEAVE_SURFTRIE_MAX_DEPTH`, so the truncated-slot path is in the corpus)
+  and five alphabet sizes, each accepted and each postcondition **re-derived by
+  brute force** -- naive popcounts and a naive louds scan, using none of the
+  validator's code and none of the accelerators it validates. A validator that
+  returns OK on an image it should have rejected is a wrong answer, and no
+  sanitizer can see a wrong answer;
+- **(2)** those images truncated to every length in `[0, len]`;
+- **(3)** 120,000 random smashes with the *declared* length corrupted
+  independently of the buffer handed over (a torn blob length), half of them
+  targeted past the header so the deep checks are reached rather than bailing at
+  the magic;
+- **(4)** 120,000 fully random byte strings, half with a plausible header;
+- **(5)** 20,000 hostile *inputs* rather than hostile bytes: unsorted,
+  duplicated and zero-length terms handed to the builder, which must refuse
+  rather than silently mis-index (a dropped term is a false negative, which is
+  the one error direction a SuRF may not have).
+- On every accepted image, point queries and a full prefix enumeration run to
+  completion: that is where "after `open()` succeeds, no query can overread or
+  fail to terminate" is tested rather than asserted.
+- Buffers are sized **exactly** to the declared length, so ASan's redzone sits
+  immediately past the last readable byte.
+- Iterations: 278,387. Seed: splitmix64 from `0x5A5FF00DDEADBEEF`.
+
 ## The extraction (one non-test change, behavior-identical)
 
 To fuzz `weave_doc_is_valid` standalone (it lives in `pg_weave_doc.c` which
@@ -180,3 +215,13 @@ whole run fails:
 | `FUZZ_NO_CLAMP` | the v0.3.4 count clamp reverted | count>128 overflowing `gaps[128]` (the original v0.3.4 bug) |
 | `FUZZ_SIGNED_COUNT` | the shipped one-sided clamp | finding #2 (negative-cast count -> wild read) |
 | `FUZZ_RANDOM_STREAM` | a fully-random FOR stream | finding #3 (corrupt width -> read past page) |
+| `FUZZ_NO_SUMTF_GUARD` | the 1.0.1 positions-decode guard reverted | an inflated `Sum(tf)` reading past the block |
+| `FUZZ_NO_ARRAY_GUARD` | the chandesc array-fits-avail guard deleted | a corrupt `nweft` walking the descriptor array past the buffer |
+| `WEAVE_SURF_PLANT_NO_SIZE_GUARD` | the surf trie's "length must equal what the counts imply" guard | a corrupt count putting a whole section past the buffer |
+| `WEAVE_SURF_PLANT_NO_SELECT_GUARD` | the surf trie's select-sample recomputation | an unvalidated sample: a wrong answer first (caught by the independent postcondition), an out-of-bounds read second |
+
+The last two differ from the rest in kind, and deliberately: they are
+**compile-time removals in the real validator**, not a weakened transcription of
+it the way `fuzz_chandesc.c`'s `weak_check()` is. A transcribed copy drifts out of
+step with the code it models, and then the teeth check proves something about a
+function nobody ships.

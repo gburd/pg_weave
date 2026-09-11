@@ -64,7 +64,7 @@ and extending `weave_check()` with an invariant for the new page type.
 | 18 | `WEAVE_PK_VCODES` | `kind` = 18 | vector | reserved |
 | 19 | `WEAVE_PK_VGRAPH` | `kind` = 19 | vector | reserved |
 | 20 | `WEAVE_PK_VRERANK` | `kind` = 20 | vector | reserved |
-| 21 | `WEAVE_PK_SURF` | `kind` = 21 | fuzzy (LOUDS-Sparse trie over the vocabulary) | reserved |
+| 21 | `WEAVE_PK_SURF` | `kind` = 21 | fuzzy (LOUDS-Sparse trie over the vocabulary) | **reserved; image format v1 specified and implemented (Z3), page writer owed** |
 | 22 | `WEAVE_PK_ULEV` | `kind` = 22 | fuzzy (universal-Levenshtein aux) | reserved |
 | 23 | `WEAVE_PK_REGEX` | `kind` = 23 | fuzzy (compiled-pattern cache) | reserved |
 | 24 | `WEAVE_PK_FUZZY_SPARE` | `kind` = 24 | fuzzy | reserved |
@@ -574,7 +574,20 @@ The following are specified and unimplemented:
   warp position `>= nnodes`; no edge to a tombstoned node; entry point live; every
   live node reachable from the entry point. The last is the expensive check and
   the one that actually catches a bad build, so it belongs behind `deep => true`.
-- (fuzzy) SuRF trie membership is exactly the bolt's dictionary term set.
+- (fuzzy) SuRF trie membership is exactly the bolt's dictionary term set. Both
+  directions: a term the trie misses is a dropped row, and a term the trie invents
+  is a wasted recheck at best. The pure half is implemented --
+  `weave_surftrie_check()` (`include/weave/surftrie.h`) validates the image
+  structurally and then proves, by a lexicographic DFS, that the trie's terminals
+  carry ordinals `0 = ord0 < ord1 < ... < nterms`, which is the machine-checkable
+  form of "this trie is the sorted dictionary". What `weave_check()` still owes is
+  the other half of the set equality: walk the bolt's dictionary and confirm the
+  term *bytes* agree, since the pure validator sees no dictionary. Note that the
+  trie is a filter with a deliberate one-sided error (terms longer than
+  `WEAVE_SURFTRIE_MAX_DEPTH` are truncated, see
+  `doc/specs/FUZZY_CHANNEL.md` sect. 3.2), so the check is "every dictionary term is
+  present, and every *exact* trie terminal is a dictionary term" -- a truncated
+  terminal is allowed to cover several.
 
 ## 10. WAL policy
 

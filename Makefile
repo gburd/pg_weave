@@ -52,6 +52,7 @@ FUZZY_OBJS = \
 	src/query/fuzzy_guc.o \
 	src/query/hash.o \
 	src/query/surf.o \
+	src/query/surftrie.o \
 	src/query/uleven.o \
 	src/query/regex_ast.o \
 	src/query/regex_grammar.o \
@@ -293,6 +294,10 @@ check-standalone:
 	echo "== V5 32-lane packing: round-trip, lane isolation, move_lane/zero_lane, bounds =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/pack test/hegel/test_pack.c src/vector/pack.c; \
 	$$tmp/pack | tail -1; \
+	echo "== Z3 surf trie: trie membership == dictionary membership, prefix enumeration =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/surf test/hegel/test_surf.c \
+		src/query/surftrie.c; \
+	$$tmp/surf | tail -1; \
 	echo "== TRE d0e0c997 -> f864ed0 (pg_tre 1521662): backref wrong-answer fix =="; \
 	bash test/hegel/run_tre_bump.sh backref | tail -1; \
 	echo "== ALL STANDALONE CHECKS PASSED =="

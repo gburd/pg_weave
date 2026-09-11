@@ -85,15 +85,18 @@ acceptor would be slow; using the acceptor as a generator is impossible.
 
 ## 3. SuRF over the vocabulary — task Z3
 
-New page kind `WEAVE_SURF` (bit 14; see the allocation table in
-`doc/specs/SEGMENT_FORMAT.md`, and note the bit-exhaustion problem recorded there
-that v5 must resolve first).
+Page kind `WEAVE_PK_SURF`, **id 21 in the extended kind space** — already reserved
+by X1, see the authoritative table in `doc/specs/SEGMENT_FORMAT.md` §2. It is an
+integer id in `WeavePageOpaqueData.kind` under the escape bit, **not a bit**:
+read it with `WeavePageHasKind()`, never with `flags & ...`, which compiles and
+is always false. (This section previously said "bit 14"; that predates the v6
+kind space and was wrong by the time it was written.)
 
 Built during bolt flush and merge, from the dictionary, which is already sorted —
-so construction is a single ordered pass with no sort. Keys are dictionary terms;
-values are term ordinals. A LOUDS-Sparse encoding is succinct: close to the
-information-theoretic minimum for the trie shape, with rank/select over bitvectors
-supplying navigation.
+so construction needs no sort. Keys are dictionary terms; values are term
+ordinals. A LOUDS-Sparse encoding is succinct: close to the information-theoretic
+minimum for the trie shape, with rank/select over bitvectors supplying
+navigation.
 
 What it answers that the existing dictionary walk does not do as well: prefix
 enumeration (`term*`) without scanning a dictionary page chain, and range
@@ -102,6 +105,163 @@ predicates, and the anchored case of a regex (`/^foo/`) directly.
 Invariant for `weave_check()`: trie membership is **exactly** the bolt's
 dictionary term set. Not a subset, not a superset. A one-sided error here silently
 changes results, so the check must compare both directions.
+
+### 3.1 The Z3 deliverable: a pure core
+
+`include/weave/surftrie.h` + `src/query/surftrie.c` are the backend-independent
+builder, reader and validator; `test/hegel/test_surf.c` is the property test and
+`test/fuzz/fuzz_surftrie.c` the corruption harness. Nothing in `src/am/` calls
+them yet — **the AM wiring is deliberately a follow-up task**, sequenced after L1
+splits the `src/am/am.c` unity build, because Z3 landing inside that file at the
+same time is a guaranteed conflict.
+
+Note what is *not* here: `include/weave/surf.h` / `src/query/surf.c` are the
+imported pg_tre SuRF over **uint64 trigram keys** (`pg_weave_surf_*`, palloc,
+`ereport`). That is a different structure over a different key space and it stays.
+Z3's trie is over **variable-length vocabulary terms**, which is the substitution
+§1 rests on, and it is a separate file so it can be linked into a plain `gcc`
+invocation (`include/weave/for.h` is the house exemplar and `doc/TESTING.md` says
+why).
+
+### 3.2 The error is one-sided, and that is a correctness contract
+
+SuRF answers **false positives, never false negatives**. `weave_surftrie_may_contain()`
+returning false means *definitely absent*; returning true means *possibly present*.
+A false negative silently drops rows and, per `AGENTS.md` hard rule 1, no
+fixed-expected-output regression test catches it. The direction is stated in the
+header next to the function and asserted directionally by the property test:
+every dictionary term **must** report present; a non-member **may** report present.
+
+Where the one-sidedness actually bites is term length. The format represents the
+first `WEAVE_SURFTRIE_MAX_DEPTH` (255) bytes of a term. A longer term is indexed
+**truncated** to that depth and its slot is marked `trunc`, so every query key
+sharing those 255 bytes reports present — a false positive requiring recheck. The
+alternative designs are both worse:
+
+- *Reject the build.* A vocabulary containing one 300-byte token (base64, a URL, a
+  DNA string) then has no fuzzy channel at all.
+- *Skip the long term.* That is precisely a false negative, wearing a build-time
+  disguise.
+
+For the same reason a **zero-length term is an error, not a skip**: the slot-based
+terminal marking has no slot at depth 0 to hang it on, so the builder returns
+`WEAVE_SURF_EMPTY_TERM` and makes the caller deal with it rather than dropping a
+term the dictionary contains.
+
+### 3.3 On-disk layout, v1
+
+One contiguous little-endian image, `WEAVE_SURFTRIE_MAGIC` = `"WST1"`. The AM
+lays it on a `WEAVE_PK_SURF` page chain with the existing blob writer; the image
+is position-independent and length-checked, so page chaining is not part of this
+format.
+
+Every multi-byte integer is written **byte-wise little-endian** and every read
+goes through a shift-assembly helper. There is no struct overlay, no padding, and
+no alignment requirement — a decision, not laziness: the image is parsed straight
+out of a buffer page at an offset the writer chose, so a struct overlay would make
+correctness depend on that offset, and `-fsanitize=undefined` would be right to
+complain. It also makes the format identical on every architecture.
+
+| offset | field | notes |
+|---:|---|---|
+| 0 | `magic` u32 | `0x57535431` |
+| 4 | `version` u16 | 1; anything else is an ERROR (`doc/CONVENTIONS.md` decision 3) |
+| 6 | `flags` u16 | must be 0 |
+| 8 | `nterms` u32 | vocabulary size; 0 is legal (header-only 32-byte image) |
+| 12 | `nslots` u32 | trie slots = distinct term prefixes, ≤ 2^28−1 |
+| 16 | `nnodes` u32 | trie nodes |
+| 20 | `nterminal` u32 | slots that end a term (or a truncated run) |
+| 24 | `ntrunc` u32 | terminal slots at max depth that collapsed longer terms |
+| 28 | `maxdepth` u16 | deepest slot, 1..255 |
+| 30 | `reserved` u16 | must be 0 |
+
+then, back to back, with `BW = 8·⌈nslots/64⌉`, `NSB = ⌈nslots/512⌉`,
+`NSEL = ⌈nnodes/64⌉`:
+
+| section | bytes | meaning |
+|---|---:|---|
+| `labels` | `nslots` | one byte per slot, level-order (BFS) |
+| `haschild` | `BW` | bit per slot: this slot has a child node |
+| `louds` | `BW` | bit per slot: this slot is the first of its node |
+| `terminal` | `BW` | bit per slot: the path ending here is a member |
+| `trunc` | `BW` | bit per slot: terminal by truncation, so a *maybe* |
+| `rank_haschild` | `4·NSB` | ones in `haschild` before each 512-bit superblock |
+| `rank_terminal` | `4·NSB` | same for `terminal`; maps a terminal slot to its ordinal index |
+| `select_louds` | `4·NSEL` | slot index of every 64th set `louds` bit |
+| `ords` | `4·nterminal` | first vocabulary ordinal each terminal slot covers |
+
+Total size is a pure function of the counts, and the reader requires
+`len == that total` exactly. No slack, no offset table: an offset table is a
+second source of truth for where a section starts, and the fuzz corpus would
+then contain images that are internally consistent but disagree with the counts.
+
+Four design points worth the words:
+
+1. **A separate `terminal` bitmap instead of SuRF's terminator label.** Upstream
+   SuRF marks "a key ends here and also continues" by inserting a reserved
+   terminator byte (`0xFF`) as a label. pg_weave cannot: on a non-UTF-8 server a
+   term may legitimately contain `0xFF`, and the collision is a wrong answer in
+   the false-negative direction. One bit per slot buys the hazard away.
+2. **`ords` is per terminal slot, indexed by `rank_terminal`.** Term ordinals are
+   what Z4 needs to reach posting lists without a dictionary lookup. In level
+   order the terminal ranks are *not* lexicographic, so the array is indexed by
+   rank rather than assumed to be sorted — and the deep validator asserts that a
+   lexicographic DFS *does* see the ordinals strictly ascending starting at 0,
+   which is the machine-checkable statement of "this trie is the sorted dictionary".
+3. **Rank and select accelerators are validated against a recomputation, not
+   trusted.** A corrupt superblock counter does not crash; it navigates to the
+   wrong node and returns a wrong answer, i.e. a false negative. `open()`
+   recomputes both tables in one pass and rejects a mismatch.
+4. **Acyclicity is a validated field, not an assumption.** For every `haschild`
+   slot the child node must start *after* the slot. That single inequality is what
+   makes every walk terminate on hostile bytes; without it a corrupt image can
+   make enumeration spin forever, which no timeout in a validator would explain.
+
+### 3.4 Validation, in two layers
+
+`weave_surftrie_open()` is the memory-safety layer: header, exact size, tail bits
+zero, `popcount(louds) == nnodes`, `popcount(haschild) == nnodes − 1` (every
+non-root node is the child of exactly one slot), `popcount(terminal) == nterminal`,
+`trunc ⊆ terminal`, labels strictly ascending within each node, rank tables and
+select samples equal to a recomputation, and the acyclicity inequality above.
+**After `open()` returns `WEAVE_SURF_OK`, no query can read outside the image or
+fail to terminate.** That is the property the fuzz target asserts.
+
+`weave_surftrie_validate()` is the semantic layer `weave_check()` calls: a full
+lexicographic DFS proving every slot and node is reachable from the root, the
+terminal count is exactly what the header claims, the observed maximum depth
+equals `maxdepth`, and the ordinals are `0 = ord₀ < ord₁ < … < nterms`. Together
+with a dictionary walk that is set equality in both directions, which is the Z3
+gate.
+
+One of those checks is provably redundant, and it is recorded rather than removed.
+Mutation testing showed that deleting the reachability comparison changes no test
+outcome, because `popcount(haschild) = nnodes − 1` makes the rank-derived child
+index a bijection onto nodes `1..nnodes−1`, so every node has exactly one parent
+slot; acyclicity then forces node starts to increase along any parent chain, so
+induction gives reachability from node 0. It stays because §9 asks for
+reachability by name, it costs two comparisons on a pass that is already walking
+the trie, and a future change to any of the three premises would otherwise take
+the property with it silently. The general point: an uncaught mutation is either a
+missing test or a redundant check, and which one it is has to be established.
+
+### 3.5 Allocation, because this is vocabulary-scale
+
+`make check-alloc` exists because four real pg_fts crashes were one allocation
+sized from a corpus- or vocabulary-scale quantity without the huge-safe variant, and
+a trie over the vocabulary is exactly that. So the core allocates **nothing at
+all**: `weave_surftrie_size()` returns the exact image length and
+`weave_surftrie_build()` writes into a caller-supplied buffer, refusing with
+`WEAVE_SURF_NOSPACE` rather than growing it. The AM's future writer allocates that
+one buffer through `WEAVE_ALLOC_MAYBE_HUGE`.
+
+The builder also uses no scratch memory. Construction is one pass per depth over
+the sorted term array — at depth *d* the nodes are exactly the maximal runs of
+terms sharing a *d*-byte prefix, and sortedness makes those runs contiguous — so
+there is no BFS queue to size. The cost is O(nterms · maxdepth) byte-comparisons,
+paid twice (measure, then emit), and the two passes are literally the same
+function driven by two sinks, so a measure/emit disagreement — which would be a
+buffer overrun — is not expressible.
 
 ## 4. The boolean-gate shuttle — task Z7
 
