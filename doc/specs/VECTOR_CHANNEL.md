@@ -48,13 +48,59 @@ Per vector *v* of dimension *d*, in `src/vector/quantize.c`:
 toward the origin, so `⟨q, dequant(code)⟩` underestimates `⟨q, u⟩`. Dividing by
 the projection `⟨x, x̂⟩` forces the reconstruction's component along the true
 direction to equal `norm` exactly. The result is an *unbiased* compressed-domain
-inner-product estimator, which is what removes the need for a float32 rerank pass
-at moderate *k*.
+inner-product estimator.
 
 This is asserted, not assumed: `test/hegel/test_quantize.c` property P6 checks
 both that `⟨v, rec⟩ ≈ ‖v‖²` per vector and that the mean signed error over random
-query directions is small relative to the mean `|⟨q,v⟩|`. If P6 ever fails, this
-paragraph is wrong and the rerank sidecar (§11) stops being optional.
+query directions is small relative to the mean `|⟨q,v⟩|`.
+
+### 2.1 What unbiasedness does not buy — measured 2026-09-10
+
+This section used to end "...which is what removes the need for a float32 rerank
+pass at moderate *k*", and it said that if P6 ever failed, the rerank sidecar
+"stops being optional". **P6 passes and the claim was still false.** That is the
+most useful thing in this section, so it is stated before the numbers:
+unbiasedness constrains the *mean* signed error, while recall@10 depends on the
+*ranking* under per-vector error. An unbiased estimator with nonzero variance
+still permutes a top-10 list. P6 was not a weak test of the right property; it was
+a correct test of a property that was never sufficient.
+
+`bench/RESULTS_IVF_RECALL.md` measured recall@10 at **full probe** — every cluster
+probed, so probe-miss error is exactly zero and what remains is quantization
+error alone. Full probe is the ceiling over all `nprobe`, so these are upper
+bounds on any IVF configuration:
+
+| corpus | 2 bits | 3 bits | 4 bits |
+|---|---:|---:|---:|
+| GloVe 6B, 200-d, 200k vectors | 0.7345 | 0.8515 | 0.9205 |
+| TEXMEX GIST-1M, 960-d, 100k vectors | 0.6130 | 0.7880 | 0.8780 |
+
+Phase V's gate is `recall@10 >= 0.99`. **It is unreachable in the
+compressed-domain-only configuration at any probe count and any bit width tested,
+on two real corpora at their native dimensionality.** A rerank window of 100 over
+full-precision vectors closed the gap on both (window 1000 at 2 bits).
+
+Three consequences, all load-bearing:
+
+1. **`WEAVE_VRERANK` is required, not optional.** Task V10's "optional
+   full-precision rerank sidecar" is a 0.99 prerequisite. §12's page table is
+   updated accordingly.
+2. **The recall gate and the storage gate are in tension and may be jointly
+   unsatisfiable.** A full-coverage float32 sidecar costs `4 * dim` bytes per
+   vector — 4,096 at 1024-d — which is by itself about what pgvector HNSW spends
+   on the vector it stores. Phase V's `size <= 0.15× pgvector HNSW` assumed the
+   codes were the whole index. They are not, if 0.99 is required. This needs
+   measuring against a real pgvector HNSW index before either gate is trusted.
+3. **TQ+ affine calibration is not the missing fix.** It moved recall the *wrong*
+   way at 3 of 4 measured points (GloVe 4-bit 0.9205 → 0.8620; GIST 4-bit 0.8780
+   → 0.6850).
+
+What this does **not** show: these are 200k × 200-d and 100k × 960-d, not the
+gate's 1M × 1024-d Cohere-wiki, and k=10 cosine only. The *quantization* ceiling
+is the robust half — it is a property of the codebook and the estimator, measured
+with probe-miss eliminated by construction, and a better partition cannot raise
+it. The probe-miss half of the same measurement is pessimistically biased, because
+the harness k-means is deliberately crude.
 
 Borrowed from RaBitQ's length-renormalization step, adapted to a Lloyd–Max
 codebook rather than a sign code.
@@ -217,7 +263,7 @@ Page kinds, from the allocation table in `doc/specs/SEGMENT_FORMAT.md` (bits
 | 10 | `WEAVE_VMETA` | `WeaveVecMeta`: dim, bits, metric, pack layout, block directory root, calibration pointer, calibration sample size and date |
 | 11 | `WEAVE_VCODES` | 32-lane code blocks, each preceded by `WeaveVecBlockHdr` |
 | 12 | `WEAVE_VGRAPH` | IVF centroids + cluster directory; optionally a centroid graph (`include/weave/graph.h`, §8a) |
-| 13 | `WEAVE_VRERANK` | optional full-precision sidecar for `recall=exact` |
+| 13 | `WEAVE_VRERANK` | full-precision sidecar. **Required for `recall@10 >= 0.99`, not just for `recall=exact`** — §2.1 measured the compressed-domain ceiling at 0.9205/0.8780 |
 
 Two pack layouts, recorded in `WeaveVecMeta` because a reader that guesses wrong
 returns wrong distances rather than an error: `WEAVE_PACK_LANE`

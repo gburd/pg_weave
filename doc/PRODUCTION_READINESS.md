@@ -236,30 +236,63 @@ not fit the padding and at that moment the reader has to already be right.
 upgrade-over-an-index-with-data half of gate 6 is closed by
 `t/010_format_v6_upgrade.pl`.
 
-### Stage 3 — the V9 recall de-risk, before either channel (an afternoon)
+### Stage 3 — the V9 recall de-risk — DONE 2026-09-10, and it found something
 
-Out of phase order on purpose, and the cheapest high-value work left in the project.
+This was scheduled out of phase order as an afternoon's measurement, on hard rule 9's
+logic that a design assumption should be checked before months of work rest on it.
+It was worth it. `bench/RESULTS_IVF_RECALL.md`.
 
-Phase V's gate is `recall@10 >= 0.99` and V9 chose IVF to reach it. pg_turbovec then
-measured IVF's probe count imposing a **hard recall ceiling** that no widening of the
-rerank window moves — 0.846/0.906/0.954/0.978/0.984 at probes 8/16/32/64/128 at
-`lists=512` — because probe count and rerank window fix different failure modes. That
-is a property of IVF, not of their 1-bit codes, so it applies to ours. And on their
-500k × 1024-d corpus, **pgvector HNSW never reached 0.99 either**, which would make
-the comparator half of the gate undefined on that corpus.
+**The finding.** Measured at **full probe** — every cluster probed, so probe-miss
+error is exactly zero and only quantization error remains — compressed-domain-only
+recall@10 tops out at:
 
-So before any vector page is written: measure probes-vs-recall against **our own**
-Lloyd–Max codebook and rotation, standalone, no backend, the way
-`bench/bound_pruning.c` measured the block bound. Three outcomes, all useful:
+| corpus | 2 bits | 3 bits | 4 bits |
+|---|---:|---:|---:|
+| GloVe 6B, 200-d, 200k vectors | 0.7345 | 0.8515 | 0.9205 |
+| TEXMEX GIST-1M, 960-d, 100k vectors | 0.6130 | 0.7880 | 0.8780 |
 
-- 0.99 is reachable at a probe count whose latency fits → build V7–V14 as specified.
-- 0.99 is reachable only at a probe count that is effectively a linear scan → V9's
-  design changes, or the gate does, **before** months of disk work assume it.
-- 0.99 is unreachable → `doc/ARCHITECTURE.md` §9 gains a permanent limitation and the
-  README says so, which is hard rule 8's whole point.
+Full probe is the ceiling over every `nprobe`, so **`recall@10 >= 0.99` is
+unreachable in the compressed-domain-only configuration at any probe count, at any
+bit width tested, on two real corpora at native dimensionality.** A rerank window of
+100 over full-precision vectors closed the gap on both.
 
-This is hard rule 9 applied verbatim: `bench/RESULTS_BOUND_PRUNING.md` cost an
-afternoon and would otherwise have surfaced months in. Same shape, same cost.
+**What it refuted, and how.** `include/weave/quantize.h` and
+`doc/specs/VECTOR_CHANNEL.md` §2 both claimed the unbiased compressed-domain estimator
+"removes the need for a float32 rerank pass at moderate k". §2 went further and said
+that if property test P6 ever failed, the claim was wrong and the rerank sidecar
+"stops being optional". **P6 passes and the claim was false anyway** — unbiasedness
+constrains the *mean* signed error, while recall@10 depends on the *ranking* under
+per-vector error, and an unbiased estimator with nonzero variance still permutes a
+top-10 list. P6 was a correct test of a property that was never sufficient. All three
+places are corrected; §2.1 now derives it.
+
+**What it costs the plan.**
+
+1. **V10's rerank sidecar is promoted from optional to a 0.99 prerequisite**, and
+   `WEAVE_PK_VRERANK` from an extra to required.
+2. **The recall gate and the storage gate may be jointly unsatisfiable.** A
+   full-coverage float32 sidecar costs `4 * dim` bytes per vector — 4,096 at 1024-d —
+   about what pgvector HNSW spends on the vector it stores, while `size <= 0.15×
+   pgvector HNSW` assumed the codes were the whole index. `doc/PHASES.md`'s Phase V
+   gate now states the three possible resolutions and marks the choice as the
+   maintainer's, not an engineering task: prove a cheaper rerank representation, keep
+   the storage claim and lower the recall claim ("0.92 at ~0.12×" is a real product
+   position), or keep the recall claim and drop the storage claim.
+3. **TQ+ affine calibration is not the fix.** It moved recall the wrong way at 3 of 4
+   measured points.
+4. `doc/ARCHITECTURE.md` §8 no longer implies "0.99 at 10× storage savings", because
+   nothing measured supports it.
+
+**What it does not show.** 200k × 200-d and 100k × 960-d, not the gate's 1M × 1024-d
+Cohere-wiki; k=10 cosine only. The quantization ceiling is the robust half — taken at
+full probe, so no partition quality can raise it. The probe-miss half of the same run
+is *pessimistically* biased by a deliberately crude harness k-means and must not be
+quoted as a ceiling.
+
+Compare the cost of learning this now against the counterfactual: V7, V8 and V9 built
+on disk, all correct, and then a recall gate that no configuration reaches. That is
+the second time hard rule 9 has paid for itself, after
+`bench/RESULTS_BOUND_PRUNING.md`.
 
 ### Stage 4 — Z: fuzzy, approximate regex, prefix routing, n-gram (months)
 
