@@ -213,9 +213,26 @@ jobs:
           sudo pg_ctlcluster 17 main stop 2>/dev/null || true
 
       - name: Build with ASan + UBSan
+        # PG_LDFLAGS="-shared-libasan" is load-bearing, and its absence is why
+        # this leg's regression stage failed the first time it ever ran.  PGXS
+        # does put COPT on the link line as well as in CFLAGS, so -fsanitize is
+        # there -- but for a *shared library* clang links only the static
+        # interceptor stub by default and leaves the runtime proper undefined,
+        # expecting the executable to supply it.  Measured on the same flags:
+        #
+        #   without -shared-libasan: 13 undefined __asan_* symbols, no DT_NEEDED
+        #   with    -shared-libasan: same 13 symbols, DT_NEEDED on the runtime
+        #
+        # The postmaster is a stock PGDG binary and supplies nothing, so without
+        # the flag dlopen() fails with "undefined symbol: __asan_register_elf_globals",
+        # CREATE EXTENSION fails, and every later statement in every test file
+        # fails too.  The resulting regression.diffs is hundreds of lines of
+        # "function weave_check(...) does not exist" cascade with the actual
+        # cause off the top of the file.
         run: |
           make CC=clang with_llvm=no \
-            COPT="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1"
+            COPT="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
+            PG_LDFLAGS="-shared-libasan"
           sudo make install with_llvm=no PG_CONFIG="$PG_CONFIG"
 
       - name: Regression under sanitizers
@@ -229,12 +246,42 @@ jobs:
           PGHOST: /tmp
           # See the note in the `test` job: PGUSER must not be set here either.
         run: |
+          # Once the runtime is a DT_NEEDED of a dlopen'd library rather than of
+          # the executable, ASan refuses to initialize -- "ASan runtime does not
+          # come first in initial library list" -- and aborts the backend.  The
+          # documented remedy is to preload it into the process that will do the
+          # dlopen, i.e. the postmaster.  Preloading is correct where
+          # verify_asan_link_order=0 is not: that option only silences the check
+          # and leaves malloc and free split across two allocators.
+          #
+          # Resolve the path from the compiler rather than hardcoding a version,
+          # and fail here rather than 30 lines of cascade later if it is missing.
+          ASAN_RT=$(clang -print-file-name=libclang_rt.asan-x86_64.so)
+          if [ ! -f "$ASAN_RT" ]; then
+            echo "cannot locate the ASan runtime (clang said: $ASAN_RT)" >&2
+            exit 1
+          fi
+          echo "preloading $ASAN_RT into the postmaster"
+
           "$PGBIN/initdb" -D /tmp/pgdata --no-locale --encoding=UTF8
-          "$PGBIN/pg_ctl" -D /tmp/pgdata -o "-k /tmp -c listen_addresses=localhost" -w start
+          # -l is diagnostics, not decoration: without it the postmaster's stderr
+          # goes to this step's stdout, logging_collector is off so /tmp/pgdata/log
+          # never exists, and a sanitizer report can be lost to log truncation.
+          LD_PRELOAD="$ASAN_RT" \
+            "$PGBIN/pg_ctl" -D /tmp/pgdata -l /tmp/postmaster.log \
+              -o "-k /tmp -c listen_addresses=localhost" -w start
           make installcheck PROVE_TESTS=ci/noop.pl
 
       - name: Show diffs and sanitizer output on failure
         if: failure()
         run: |
-          [ -f regression.diffs ] && cat regression.diffs
+          # The HEAD of regression.diffs, not the tail.  When CREATE EXTENSION
+          # fails, every later statement fails as a consequence and the tail is
+          # pure cascade; the first failure is the only one that means anything.
+          if [ -f regression.diffs ]; then
+            echo "===== regression.diffs (first 200 lines) ====="
+            head -200 regression.diffs
+          fi
+          echo "===== postmaster log (sanitizer reports land here) ====="
+          cat /tmp/postmaster.log 2>/dev/null || true
           cat /tmp/pgdata/log/* 2>/dev/null | tail -200 || true

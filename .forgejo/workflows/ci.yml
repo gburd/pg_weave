@@ -171,9 +171,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build with ASan + UBSan
+        # PG_LDFLAGS="-shared-libasan" is load-bearing; see the long comment on
+        # the same step in .github/workflows/ci.yml.  Short version: for a shared
+        # library clang leaves the ASan runtime undefined by default, so the
+        # postmaster's dlopen() fails and every test cascades from a failed
+        # CREATE EXTENSION.
         run: |
           make CC=clang with_llvm=no \
             COPT="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
+            PG_LDFLAGS="-shared-libasan" \
             PG_CONFIG=/usr/bin/pg_config
           make install with_llvm=no PG_CONFIG=/usr/bin/pg_config
 
@@ -186,10 +192,21 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1
         run: |
+          # The runtime has to be preloaded into the postmaster, or ASan aborts
+          # the backend with "ASan runtime does not come first in initial library
+          # list".  Resolve it from the compiler, and fail here rather than in a
+          # cascade if it is missing.
+          ASAN_RT=$(clang -print-file-name=libclang_rt.asan-x86_64.so)
+          if [ ! -f "$ASAN_RT" ]; then
+            echo "cannot locate the ASan runtime (clang said: $ASAN_RT)" >&2
+            exit 1
+          fi
           chown -R postgres:postgres .
+          touch /tmp/postmaster.log && chown postgres:postgres /tmp/postmaster.log
           su postgres -c '
             /usr/lib/postgresql/17/bin/initdb -D /tmp/pgdata --no-locale --encoding=UTF8 &&
-            /usr/lib/postgresql/17/bin/pg_ctl -D /tmp/pgdata \
+            LD_PRELOAD='"$ASAN_RT"' /usr/lib/postgresql/17/bin/pg_ctl -D /tmp/pgdata \
+              -l /tmp/postmaster.log \
               -o "-k /tmp -c listen_addresses=localhost" -w start &&
             make installcheck PROVE_TESTS=ci/noop.pl \
               PG_CONFIG=/usr/bin/pg_config PGHOST=/tmp PGUSER=postgres
@@ -198,5 +215,13 @@ jobs:
       - name: Show diffs and sanitizer output on failure
         if: failure()
         run: |
-          [ -f regression.diffs ] && cat regression.diffs
+          # The HEAD of regression.diffs, not the tail: when CREATE EXTENSION
+          # fails, the tail is pure cascade and the first failure is the only
+          # one that means anything.
+          if [ -f regression.diffs ]; then
+            echo "===== regression.diffs (first 200 lines) ====="
+            head -200 regression.diffs
+          fi
+          echo "===== postmaster log (sanitizer reports land here) ====="
+          cat /tmp/postmaster.log 2>/dev/null || true
           cat /tmp/pgdata/log/* 2>/dev/null | tail -200 || true
