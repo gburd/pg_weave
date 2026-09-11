@@ -338,7 +338,7 @@ pg_trgm schema to pg_weave with **zero application query changes**.
 | id | task | gate |
 |---|---|---|
 | ~~**P1**~~ | **DONE.** `bench/` harness: corpus loaders (Wikipedia 20231101.en, MS MARCO, Cohere-wiki, BEIR subset), latency driver, nDCG scorer | one command reproduces every recorded result |
-| ~~**P2**~~ | **DONE.** EC2 harness (`bench/aws/`) using the `bene` profile: launch, tune, measure, terminate | `bench/aws/run.sh` produces a `RESULTS_*.md` and terminates the instance even on failure |
+| ~~**P2**~~ | **DONE.** EC2 harness (`bench/aws/`) using the burner profile (`lava` as of 2026-09-11; `bene` before it, and `bene` expired mid-session with its credentials already dead when the switch was made — which is the argument for the harness never hardcoding an account id): launch, tune, measure, terminate | `bench/aws/run.sh` produces a `RESULTS_*.md` and terminates the instance even on failure |
 | P3 | The competitive matrix: pg_weave vs pgvector(HNSW,IVFFlat), pg_search, pg_textsearch, VectorChord, tsvector+GIN, pg_trgm, pg_tre, pg_turbovec | `bench/RESULTS_MATRIX.md`, with every loss stated as plainly as every win |
 | P4 | Cost model calibration against measured latencies so the planner picks the right channel | planner chooses the faster plan on ≥90% of a query workload |
 

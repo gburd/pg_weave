@@ -271,7 +271,7 @@ server for the same 16 vCPUs — which silently caps measured throughput.
 - **Driver hosts**, `c7i.4xlarge`, same AZ and placement group as their engine
   host to keep network latency out of the comparison. One driver per engine for
   concurrency sweeps.
-- **Cost is not a constraint** on the `bene` account, so parallelism is bounded by
+- **Cost is not a constraint** on the `lava` account, so parallelism is bounded by
   API limits and correctness, not spend. Every resource is tagged
   `Project=pg_weave,Run=<id>` and the orchestrator terminates on **every** exit
   path, then verifies termination rather than assuming the API call worked.

@@ -20,7 +20,7 @@
 #	 NDOCS / VOCAB environment variables size the lexical corpus (default 1M /
 #	 200k).  A 1M-document run takes a few minutes to generate.
 #
-# The AWS profile is `bene`.  Everything this script creates is tagged
+# The AWS profile is `lava`.  Everything this script creates is tagged
 # Project=pg_weave and named with the run id, so a stray is identifiable.
 #
 # TERMINATION IS NOT OPTIONAL.  The trap fires on EXIT, which covers success,
@@ -30,7 +30,7 @@
 #
 set -uo pipefail
 
-PROFILE=${AWS_PROFILE:-bene}
+PROFILE=${AWS_PROFILE:-lava}
 ITYPE=${1:-c7i.4xlarge}
 JOB=${2:-smoke}
 REGION=$(aws configure get region --profile "$PROFILE")

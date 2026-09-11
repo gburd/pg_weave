@@ -1,6 +1,6 @@
 ---
 name: weave-bench
-description: Use when benchmarking pg_weave or recording a performance result — choosing a corpus, warm vs cold methodology, writing a RESULTS file, or running on EC2 with the bene AWS profile. Load this before producing any number that will end up in a document, and before launching any cloud instance.
+description: Use when benchmarking pg_weave or recording a performance result — choosing a corpus, warm vs cold methodology, writing a RESULTS file, or running on EC2 with the burner AWS profile. Load this before producing any number that will end up in a document, and before launching any cloud instance.
 ---
 
 # Benchmarking pg_weave credibly
@@ -83,12 +83,29 @@ is about an algorithm rather than about PostgreSQL: seconds to run, reproducible
 a laptop, and it answered a design question that would otherwise have surfaced
 months into implementation.
 
-## EC2, with the bene profile
+## EC2, with the burner profile
 
-Profile `bene`, account 292759875395. Verify first:
+**The profile is a burner and it changes.** As of 2026-09-11 it is `lava`
+(account 769093516156, `us-east-2`). Before that it was `bene`
+(account 292759875395), which **expired with its credentials already dead** — a
+`describe-instances` at transition time returned `InvalidClientTokenId`, so
+nothing in it could be enumerated or terminated any more.
+
+Two consequences worth carrying:
+
+1. **Never hardcode an account id or an AMI id.** The harness resolves the region
+   from the profile and the AMI from the SSM public parameter, so switching burners
+   is a one-line default change. That is why the switch cost minutes rather than a
+   rewrite.
+2. **A burner can die before you notice.** Terminate on every exit path and verify
+   it, because "I will clean up later" has a deadline you do not control. If a burner
+   expires while one of our instances is running, that instance is unreachable and
+   billing is someone else's problem to unwind.
+
+Verify the current profile before doing anything:
 
 ```sh
-aws sts get-caller-identity --profile bene
+aws sts get-caller-identity --profile lava
 ```
 
 Workflow: launch, tune, load, measure, record, **terminate**.
@@ -109,20 +126,20 @@ measure, so an unrecorded setting makes the result unusable.
 instance dies on the error path too:
 
 ```sh
-trap 'aws ec2 terminate-instances --profile bene --instance-ids "$IID"' EXIT
+trap 'aws ec2 terminate-instances --profile lava --instance-ids "$IID"' EXIT
 ```
 
 Then verify it actually died:
 
 ```sh
-aws ec2 describe-instances --profile bene --instance-ids "$IID" \
+aws ec2 describe-instances --profile lava --instance-ids "$IID" \
   --query 'Reservations[].Instances[].State.Name'
 ```
 
 Check for strays before finishing a session:
 
 ```sh
-aws ec2 describe-instances --profile bene \
+aws ec2 describe-instances --profile lava \
   --filters Name=instance-state-name,Values=running \
   --query 'Reservations[].Instances[].[InstanceId,InstanceType,LaunchTime]'
 ```
