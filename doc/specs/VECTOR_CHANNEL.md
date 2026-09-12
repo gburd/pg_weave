@@ -70,15 +70,24 @@ probed, so probe-miss error is exactly zero and what remains is quantization
 error alone. Full probe is the ceiling over all `nprobe`, so these are upper
 bounds on any IVF configuration:
 
-| corpus | 2 bits | 3 bits | 4 bits |
-|---|---:|---:|---:|
-| GloVe 6B, 200-d, 200k vectors | 0.7345 | 0.8515 | 0.9205 |
-| TEXMEX GIST-1M, 960-d, 100k vectors | 0.6130 | 0.7880 | 0.8780 |
+| corpus | 2 bits | 3 bits | 4 bits | 5 bits | 6 bits | 7 bits | 8 bits |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GloVe 6B, 200-d, 200k vectors | 0.7345 | 0.8515 | 0.9225 | 0.9570 | 0.9750 | 0.9860 | **0.9950** |
+| TEXMEX GIST-1M, 960-d, 100k vectors | 0.6130 | 0.7880 | 0.8680 | 0.9200 | 0.9660 | 0.9780 | 0.9860 |
 
-Phase V's gate is `recall@10 >= 0.99`. **It is unreachable in the
-compressed-domain-only configuration at any probe count and any bit width tested,
-on two real corpora at their native dimensionality.** A rerank window of 100 over
-full-precision vectors closed the gap on both (window 1000 at 2 bits).
+Widths 5–8 and the corrected 4-bit column come from
+`bench/RESULTS_BITWIDTH_SWEEP.md` (2026-09-12, converged codebook). The 4-bit
+figures previously read 0.9205 and 0.8780, from a codebook 200 Lloyd sweeps short
+of its fixed point; correcting it moved GloVe **up** 0.0020 and GIST **down**
+0.0100 — a lower-MSE codebook is not obliged to score better on a ranking metric.
+
+Phase V's gate is `recall@10 >= 0.99`. **Only GloVe reaches it, and only at 8
+bits; GIST-960d does not reach it at any supported width**, with decaying
+increments (0.0180, 0.0120, 0.0080 over the last three) that put it past 8 bits.
+Since 8 bits is 1,024 B/vector at 1024-d — 0.18× HNSW against a 0.15× budget — the
+width that clears 0.99 on the easier corpus already misses the storage claim. A
+rerank window of 100 over full-precision vectors reaches **1.0000 from 3 bits** on
+both corpora, which is the shape that survives; see §2.1.1 and the results file.
 
 Three consequences, all load-bearing:
 
@@ -115,8 +124,8 @@ shape before any benchmark runs.
 **A rerank representation cannot lift recall above its own ceiling.** Reranking a
 top-*W* window with a *b*-bit representation produces the *b*-bit ranking of that
 window. The numbers above are therefore not just a statement about a scan — they
-are a statement about reranking: a 4-bit rerank tops out at the same 0.9205 and
-0.8780. So the minimum viable *b* is the smallest whose full-probe recall@10
+are a statement about reranking: a 4-bit rerank tops out at the same 0.9225 and
+0.8680. So the minimum viable *b* is the smallest whose full-probe recall@10
 reaches 0.99, and the size budget has to cover *b*, not *b* plus a scan width.
 
 **The budget is about 6.68 bits per coordinate.** At 1M × 1024-d, HNSW spends
@@ -128,12 +137,32 @@ An 8-bit sidecar alone is 1,024 B (0.18×) and 4-bit codes plus that sidecar are
 
 What survives is **one code width serving both the scan and the final ranking,
 with `b ≤ 6`** — which would collapse V10's `WEAVE_PK_VRERANK` sidecar into a
-wider code rather than a second structure. Whether such a *b* exists is the next
-measurement: sweep *b* = 5, 6, 7, 8 at full probe on both corpora and report the
-smallest reaching 0.99. Extrapolating the 2/3/4-bit points suggests ~7 for
-GloVe-200d and possibly unreachable at 8 for GIST-960d, which would fail the
-storage claim — but extrapolation is not measurement, and the extrapolation is
-exactly why the sweep is worth its cost rather than a formality.
+wider code rather than a second structure. **Measured 2026-09-12
+(`bench/RESULTS_BITWIDTH_SWEEP.md`): no such *b* exists.** GloVe-200d needs 8 bits
+(0.9950) and GIST-960d does not reach 0.99 at any supported width (0.9860 at 8
+bits, with increments decaying 0.0180 / 0.0120 / 0.0080). 8 bits is 1,024 B at
+1024-d = 0.18×, so the width that clears the easier corpus already misses the
+budget. The extrapolation above said ~7 for GloVe and "possibly unreachable at 8"
+for GIST: optimistic by one width on GloVe, right about GIST. Close enough to have
+been tempting, and wrong enough to have justified the sweep.
+
+**What survives instead: 3 bits plus an exact rerank of a top-100 window, which is
+1.0000 on both corpora at 384 B/vector.** That does not violate the rule above,
+because the rerank is done at float32 rather than in a *b*-bit representation — so
+the ceiling that binds is float32's, which is 1.0. But it does mean the rerank data
+cannot be a cheap quantized sidecar; it has to be full precision, and a stored
+float32 sidecar is `4 * dim` = 4,096 B/vector, worse than HNSW. The only shape in
+which both claims survive therefore reads full precision from the **heap**, where
+the original vector already lives and the index pays nothing for it:
+
+- index bytes: **0.067× HNSW** at 1024-d (codes only);
+- recall@10: **1.0000**;
+- query cost: up to 100 heap fetches, against `p50 ≤ 2× pgvector HNSW` —
+  **unmeasured**, and the cold-cache figure is the one that decides it.
+
+Task V10 changes shape accordingly: `WEAVE_PK_VRERANK` as a stored sidecar is no
+longer the plan, and the rerank source becomes the heap. That is a maintainer
+decision, recorded in `doc/PHASES.md`'s Phase V gate.
 
 ## 3. The rotation
 
