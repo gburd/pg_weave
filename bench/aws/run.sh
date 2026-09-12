@@ -470,14 +470,38 @@ DROP TABLE IF EXISTS p0src;
 -- gives millions of term boundaries in the merge, which is one of the two
 -- conditions the pathology needs.  Natural text would not: its Zipf
 -- distribution yields far fewer distinct terms for the same row count.
+--
+-- The ten tokens are spelled out rather than built with
+--   (SELECT string_agg(...) FROM generate_series(1,10))
+-- because that sublink is UNCORRELATED, so PostgreSQL hoists it to an InitPlan
+-- and evaluates it ONCE for the whole statement -- volatility of random() does
+-- not prevent it.  The first run of this job produced 2,000,000 identical rows
+-- and nterms=10, and reported a 3.2 s VACUUM as though it meant something.
 -- CREATE TABLE AS, never INSERT ... SELECT -- the latter silently loses the
 -- parallel plan (measured 12x upstream in pg_turbovec b34f22c).
 CREATE TABLE p0src AS
   SELECT i AS id,
-         to_wdoc((SELECT string_agg('t' || ((random() * 5000000)::int), ' ')
-                    FROM generate_series(1, 10))) AS d
+         to_wdoc(
+           't' || ((random() * 5000000)::int) || ' ' ||
+           't' || ((random() * 5000000)::int) || ' ' ||
+           't' || ((random() * 5000000)::int) || ' ' ||
+           't' || ((random() * 5000000)::int) || ' ' ||
+           't' || ((random() * 5000000)::int) || ' ' ||
+           't' || ((random() * 5000000)::int) || ' ' ||
+           't' || ((random() * 5000000)::int) || ' ' ||
+           't' || ((random() * 5000000)::int) || ' ' ||
+           't' || ((random() * 5000000)::int) || ' ' ||
+           't' || ((random() * 5000000)::int)) AS d
     FROM generate_series(1, $n) i;
 SQL" 2>&1 | tail -2 | tee -a "$OUT/p0_merge.log"
+
+		# Assert the corpus is the shape the pathology needs, BEFORE spending a
+		# build and a VACUUM on it.  Without this the degenerate corpus above
+		# produced a fast VACUUM that looked like a passing measurement.
+		NDISTINCT=$($SSH "psql -tAc \"select count(distinct d) from p0src\"")
+		say "n=$n distinct documents: $NDISTINCT"
+		[ "${NDISTINCT:-0}" -ge $(( n / 2 )) ] \
+			|| die "corpus is degenerate ($NDISTINCT distinct rows of $n) -- refusing to measure"
 
 		for variant in fixed before; do
 			say "p0 merge: n=$n variant=$variant"
@@ -503,6 +527,7 @@ SQL
 				echo \"--- n=$n variant=$variant ---\"
 				psql -tAc \"SELECT 'nterms=' || nterms FROM weave_index_stats('p0doc_weave')\" || true
 				psql -tAc \"SELECT 'idxsize=' || pg_size_pretty(pg_relation_size('p0doc_weave'))\" || true
+				psql -tAc \"SELECT 'tombstones=' || count(*) FROM p0src WHERE id % 7 = 0\" || true
 				# A timeout so genuine non-termination reports as a bound instead
 				# of hanging the whole run.
 				start=\$(date +%s.%N)
