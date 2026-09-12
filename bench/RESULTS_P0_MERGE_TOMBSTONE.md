@@ -65,14 +65,70 @@ the *appearance* of coverage without the substance — which is worse than a
 documented gap, and is the same failure mode as a queued CI job reading like a
 passing one.
 
-## pg_weave's own A/B — status: PENDING
+## pg_weave's own A/B — ATTEMPTED 2026-09-12, DID NOT REPRODUCE, and why
 
-Owed: an out-of-CI scale reproduction on EC2, A/B against the same binary with and
-without the fix, on the shape above. A hang cannot be waited out, so the
-measurement is a **scaling curve**, not a single number: VACUUM wall-clock at
-increasing term counts and tombstone counts, showing superlinear growth before the
-fix and near-linear growth after.
+Run `pgweave-20260912-145106` on EC2 (`c7i.8xlarge`, us-east-2) A/B'd the fix
+against a reverse-applied patch of exactly this commit, at n = 250k / 750k / 2M.
+**It did not reproduce the pathology, and the reason is that it drove the wrong
+code path.** Recording the failed attempt because a benchmark that measured the
+wrong thing is worth more as a documented dead end than as a silently discarded
+run.
 
-Until that curve exists, the justification for this change is upstream's
-measurement plus the mechanism above, and this section says so rather than implying
-we measured something we did not.
+The corpus was right by the last attempt. At n = 2M:
+
+| | |
+|---|---|
+| distinct documents | 2,000,000 |
+| distinct terms | 4,908,673 |
+| tombstones after `DELETE ... WHERE id % 7 = 0` | 285,714 |
+| index size | 400 MB |
+
+That is close to the shape upstream measured as fatal (2.19M docs, 312k
+tombstones, ~7.4M terms). So the corpus generation is not the problem.
+
+**The problem is that plain `VACUUM` never calls
+`weave_merge_segments_streaming()`.** That function is reached from
+`weave_merge_selected()` and `weave_merge_group_to_seg()`
+(`src/am/ambuild.c:2771`, `:2745`), which are reached from the *user-callable*
+`weave_merge(regclass)` and `weave_vacuum(regclass)` (`src/am/amvacuum.c:910`) —
+not from `amvacuumcleanup`. Compounding it, **`nsegments = 1` is enforced by
+insert-time tiered merge**, so an index built by a single `CREATE INDEX` has
+exactly one segment and a merge has nothing to merge even when it is called.
+
+The measurement said so, and it is worth seeing how:
+
+| n | fixed | before |
+|---|---|---|
+| 250,000 | 1.0728 s | — |
+| 750,000 | **2.789516900 s** | **2.789527626 s** |
+| 2,000,000 | 6.3173 s | no result (see below) |
+
+Two independent VACUUMs of 2.79 s agreeing to **10 microseconds** — a relative
+difference of 4e-6 — are not two runs of different code. They are the same work
+done twice, which is exactly what you get when the only difference between the
+binaries lies on a path neither run enters. The `ccur` hoist in `weave_bulkdelete`
+*is* on the VACUUM path, and its effect at this scale is evidently below noise.
+
+The 2M `before` arm produced no number at all: the driver process died mid-arm, so
+the ~20 minutes it had been running when that was noticed **cannot be attributed**
+to the VACUUM rather than to a dropped ssh session, and it is not evidence of
+anything. The instance was terminated by hand.
+
+### What the correct reproducer requires
+
+1. **Several segments, each carrying tombstones** — so the merge has multiple
+   sources whose tombstone maps must be probed. Build the index, then `INSERT` in
+   batches so insert-time tiered merge leaves more than one segment behind.
+2. **`DELETE` spread across the whole docid space**, so each source's sparsemap has
+   a long chunk chain rather than a few dense chunks.
+3. **An explicit `SELECT weave_merge('p0doc_weave')`** — or `weave_vacuum()` — as
+   the timed operation. Not `VACUUM`.
+4. The corpus assertions the job now makes (distinct documents ≥ n/2, term count
+   and tombstone count reported) plus one more it does not yet make: **assert the
+   index holds more than one segment before timing the merge**, since a
+   single-segment index makes the whole measurement vacuous.
+
+Until that exists, the justification for this change remains upstream's
+measurement plus the mechanism above — which is what the previous section says,
+and it has not been upgraded by this attempt.
+

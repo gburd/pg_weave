@@ -463,8 +463,11 @@ run_p0merge() {
 		$SSH "psql -q -v ON_ERROR_STOP=1 <<SQL
 DROP TABLE IF EXISTS p0src;
 -- The indexed column must be wdoc, not text: the weave AM has no default
--- operator class for text, and \`CREATE INDEX ... USING weave (body)\` on a text
--- column fails with 'data type text has no default operator class'.
+-- operator class for text, and CREATE INDEX ... USING weave (body) on a text
+-- column fails with 'data type text has no default operator class'.  Note: no
+-- backticks anywhere in these heredocs -- they are inside a double-quoted \$SSH
+-- string, so the REMOTE shell treats them as command substitution and emits
+-- 'bash: command substitution: ...' into the middle of the SQL.
 --
 -- High distinct-term count is the point: ~10 tokens/row from a 5M-token space
 -- gives millions of term boundaries in the merge, which is one of the two
