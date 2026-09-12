@@ -255,11 +255,46 @@ something that puts two of those three in direct tension:
 
 So `recall@10 ≥ 0.99` **and** `size ≤ 0.15× pgvector HNSW` may be jointly
 unsatisfiable, and that is a maintainer decision rather than an engineering task.
-The three honest resolutions, none yet chosen:
+**MAINTAINER DECISION 2026-09-11: resolution 1 — keep both claims and find a
+rerank representation cheaper than float32.** The other two remain recorded below
+as what we fall back to if the measurement below refuses.
 
-1. **Keep both, prove them.** Requires a rerank representation cheaper than float32
-   that still lifts recall to 0.99 — unmeasured, and TQ+ calibration already moved
-   recall the *wrong* way at 3 of 4 points, so it is not the candidate.
+That decision is not yet an engineering task, because arithmetic on the gate's own
+corpus narrows it to one shape and rules out the obvious candidate. At
+1M × 1024-d, pgvector HNSW spends `4 · 1024` = 4,096 B on the vector plus its graph
+links; at `m = 16` the total is on the order of 5,700 B per vector (**and that
+baseline has never been measured on this corpus — measure it before quoting the
+ratio**). A `0.15×` budget is therefore about **855 B per vector, which at 1024-d is
+6.68 bits per coordinate for everything the index stores.** Consequences:
+
+- **A rerank representation cannot lift recall above its own compressed-domain
+  ceiling.** Reranking a top-*W* window with a *b*-bit representation yields the
+  *b*-bit ranking of that window, so the minimum viable *b* is the smallest one
+  whose full-probe compressed-domain recall@10 reaches 0.99 — and `§2.1` of
+  `doc/specs/VECTOR_CHANNEL.md` has already measured *b* = 2/3/4 at
+  0.7345/0.8515/0.9205 (GloVe-200d) and 0.6130/0.7880/0.8780 (GIST-960d). This is
+  why "rerank with 4-bit codes" is not a candidate: 4 bits *is* the 0.9205 ceiling.
+- **"4-bit codes plus an 8-bit sidecar" is refuted without a benchmark.** An
+  8-bit-per-coordinate sidecar is 1,024 B by itself — 0.18× HNSW before the scan
+  codes exist — and with 4-bit codes the total is 1,536 B, **0.27×**. Arithmetic,
+  not measurement, kills it.
+- **So the surviving shape is a single code width used for both the scan and the
+  final ranking, with `b ≤ 6`,** not codes plus a sidecar. That is a design
+  simplification the budget forces rather than a preference.
+
+**The one measurement that now decides the phase:** the smallest *b* whose
+full-probe compressed-domain recall@10 reaches 0.99 on both corpora, swept at
+*b* = 5, 6, 7, 8. If that *b* ≤ 6, both claims hold and V10's sidecar collapses
+into a wider code. If it is 7 or 8, the storage claim fails on arithmetic and we
+fall back to resolution 2 or 3 below. Extrapolating the measured points suggests
+GloVe-200d needs ~7 and GIST-960d may not reach 0.99 even at 8 — **extrapolation is
+not measurement, and this project's rule is to measure the thing the design rests
+on, so the sweep is the next V task.** It needs codec work first:
+`include/weave/quantize.h` validates the Lloyd-Max solver only for 2..4 bits, and
+`bench/ivf_recall.c` accepts only `bits=2,3,4`.
+
+The two resolutions not chosen, kept because the measurement may force one:
+
 2. **Keep the storage claim, lower the recall claim.** "0.92 recall at ~0.12× the
    storage" is a real product position and a defensible one. It is not the position
    `doc/ARCHITECTURE.md` §8 currently implies.

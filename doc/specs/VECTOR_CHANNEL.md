@@ -105,6 +105,36 @@ the harness k-means is deliberately crude.
 Borrowed from RaBitQ's length-renormalization step, adapted to a Lloyd–Max
 codebook rather than a sign code.
 
+#### 2.1.1 What the storage budget then forces — derived 2026-09-11
+
+The maintainer's resolution of the reopened Phase V gate (see `doc/PHASES.md`) is
+to keep both `recall@10 ≥ 0.99` and `size ≤ 0.15× pgvector HNSW` and find a rerank
+representation cheaper than float32. Two steps of arithmetic narrow that to one
+shape before any benchmark runs.
+
+**A rerank representation cannot lift recall above its own ceiling.** Reranking a
+top-*W* window with a *b*-bit representation produces the *b*-bit ranking of that
+window. The numbers above are therefore not just a statement about a scan — they
+are a statement about reranking: a 4-bit rerank tops out at the same 0.9205 and
+0.8780. So the minimum viable *b* is the smallest whose full-probe recall@10
+reaches 0.99, and the size budget has to cover *b*, not *b* plus a scan width.
+
+**The budget is about 6.68 bits per coordinate.** At 1M × 1024-d, HNSW spends
+4,096 B on the vector plus graph links, on the order of 5,700 B per vector at
+`m = 16` (unmeasured on this corpus — measure before quoting it). 0.15× is ≈ 855 B
+per vector, which at 1024-d is 6.68 bits per coordinate for everything on disk.
+An 8-bit sidecar alone is 1,024 B (0.18×) and 4-bit codes plus that sidecar are
+1,536 B (**0.27×**), so the codes-plus-sidecar shape is refuted by arithmetic.
+
+What survives is **one code width serving both the scan and the final ranking,
+with `b ≤ 6`** — which would collapse V10's `WEAVE_PK_VRERANK` sidecar into a
+wider code rather than a second structure. Whether such a *b* exists is the next
+measurement: sweep *b* = 5, 6, 7, 8 at full probe on both corpora and report the
+smallest reaching 0.99. Extrapolating the 2/3/4-bit points suggests ~7 for
+GloVe-200d and possibly unreachable at 8 for GIST-960d, which would fail the
+storage claim — but extrapolation is not measurement, and the extrapolation is
+exactly why the sweep is worth its cost rather than a formality.
+
 ## 3. The rotation
 
 One round, in order:

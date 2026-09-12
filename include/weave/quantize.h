@@ -105,6 +105,15 @@ typedef uint8 weave_uint8;
  * explicit error term is the better design (not implemented; see
  * doc/specs/VECTOR_CHANNEL.md sect. 11).
  *
+ * The 4-bit ceiling is now a BLOCKER, not just a validation boundary.  The
+ * Phase V gate turns on the smallest width whose full-probe compressed-domain
+ * recall@10 reaches 0.99, and the measured 2/3/4-bit points (0.7345/0.8515/0.9205
+ * GloVe-200d, 0.6130/0.7880/0.8780 GIST-960d) do not reach it, while the 0.15x
+ * storage budget allows at most ~6.68 bits per coordinate at 1024-d.  Deciding
+ * the phase therefore requires validating this solver at 5, 6, 7 and 8 bits --
+ * see doc/specs/VECTOR_CHANNEL.md sect. 2.1.1 for the derivation and
+ * doc/PHASES.md's Phase V gate for what each outcome means.
+ *
  * A second, independent reason to gate 1 bit if it is ever added: pg_turbovec's
  * OWN 1-bit sign code (a different design from this file's renormalization
  * trick -- corpus-mean-centered sign, not a Lloyd-Max cell) measured that its
