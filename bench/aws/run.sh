@@ -16,6 +16,13 @@
 #					  bound	   the block-bound pruning sweep (bench/bound_pruning.c)
 #					  lexical  smoke, then pg_weave vs tsvector+GIN on a real corpus
 #					  all	   all of the above
+#					  winsweep   rerank window at n=1M, the Phase V frontier's
+#							     fragile number (CPU only, no server)
+#					  rerankcold winsweep, then cold p50 of a heap rerank with
+#							     the real wvec type (bench/rerank_cold.sh)
+#					  hnswbase   the pgvector HNSW baseline: bytes/vector,
+#							     recall@10 vs ef, warm+cold p50. SEPARATE HOST
+#							     from rerankcold -- one engine per host.
 #
 #	 NDOCS / VOCAB environment variables size the lexical corpus (default 1M /
 #	 200k).  A 1M-document run takes a few minutes to generate.
@@ -41,6 +48,11 @@ JOB=${2:-smoke}
 VOLGB=${VOLGB:-80}
 case "$JOB" in
 	bitsweep|p0merge|vall) VOLGB=${VOLGB_OVERRIDE:-250} ;;
+	# The cold jobs are the disk-hungry ones: GIST's base set is ~4 GB of fvecs,
+	# a 1M x 960-d wvec table is ~4 GB of toast plus heap, and an HNSW index over
+	# the same corpus is ~5 GB again.  400 leaves room to hold all of it at once
+	# without the load failing halfway through a two-hour run.
+	winsweep|rerankcold|hnswbase) VOLGB=${VOLGB_OVERRIDE:-400} ;;
 esac
 REGION=$(aws configure get region --profile "$PROFILE")
 RUN=pgweave-$(date -u +%Y%m%d-%H%M%S)
@@ -406,6 +418,100 @@ run_bitsweep() {
 	fi
 }
 
+# ---------------------------------------------------------------------------
+# Corpus fetch shared by the three vector-gate jobs.  GloVe is skipped: all three
+# concern the 1M x ~1024-d regime the Phase V gate is written against, and GIST is
+# the only corpus at hand with a million vectors at that width.
+fetch_gist() {
+	say "fetching GIST-1M"
+	$SSH 'set -e
+		sudo apt-get -qq install -y bc >/dev/null 2>&1 || true
+		mkdir -p /scratch/corpus && cd /scratch/corpus
+		if [ ! -f gist/gist_base.fvecs ]; then
+			curl -sS --connect-timeout 30 -O \
+				ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz
+			tar xzf gist.tar.gz && rm -f gist.tar.gz
+		fi
+		ls -l gist/gist_base.fvecs gist/gist_query.fvecs' \
+		2>&1 | tee "$OUT/corpus.log" || die "GIST fetch failed"
+}
+
+run_winsweep() {
+	# The fragile half of the Phase V frontier, re-measured at the gate's own
+	# corpus size.
+	#
+	# bench/RESULTS_BITWIDTH_SWEEP.md establishes the window a b-bit code needs
+	# for recall@10 >= 0.99 -- 20 at 4 bits -- but it does so at n = 100k-200k,
+	# and the whole rerank cost is linear in that window.  A window has to be wide
+	# enough to still contain the true top-10 after quantization perturbs the
+	# ordering, and nothing makes that requirement invariant in n: ten times the
+	# vectors put roughly ten times more near-neighbours in range to displace
+	# them.  So the published 20 is a LOWER BOUND for the 1M gate corpus, and
+	# every page-read figure derived from it inherits that.
+	#
+	# Full probe (probes == lists) throughout, which makes probe-miss error zero
+	# and the recall a property of the codebook and the estimator alone.  The
+	# harness self-check must PASS or the numbers are not a ceiling.
+	fetch_gist
+	say "building ivf_recall"
+	$SSH 'cd pg_weave && gcc -O2 -march=native -std=gnu99 -I include \
+			-o /scratch/ivf_recall bench/ivf_recall.c \
+			src/vector/quantize.c src/vector/pack.c -lm && echo built' \
+		2>&1 | tee -a "$OUT/corpus.log" || die "ivf_recall build failed"
+
+	# n = 1M, the gate corpus size, against the same widths and windows the
+	# published frontier was drawn from so the two are directly comparable.
+	say "GIST-1M 960-d, n=1M: bits 3..5 x windows 10..200, full probe"
+	$SSH 'cd /scratch && ./ivf_recall fvecs corpus/gist/gist_base.fvecs 1000000 100 \
+			lists=1024 bits=3,4,5 probes=1024 windows=10,15,20,25,30,40,50,75,100,150,200 k=10' \
+		2>&1 | tee "$OUT/winsweep_1m.log"
+
+	# The n = 100k row from the published frontier, re-run on THIS host with THIS
+	# binary.  Without it, an n=1M window that differs from the published one
+	# cannot be attributed to n rather than to the machine or the build.
+	say "control: same binary at n=100k, the published operating point"
+	$SSH 'cd /scratch && ./ivf_recall fvecs corpus/gist/gist_base.fvecs 100000 100 \
+			lists=512 bits=3,4,5 probes=512 windows=10,15,20,25,30,40,50,75,100 k=10' \
+		2>&1 | tee "$OUT/winsweep_100k.log"
+}
+
+run_rerankcold() {
+	# Cold p50 of a heap rerank with the real wvec type.  See bench/rerank_cold.sh
+	# for the method and its guards.  pgvector's half runs on a SEPARATE instance
+	# (job hnswbase): one engine per host.
+	fetch_gist
+	say "build + install pg_weave"
+	$SSH 'cd pg_weave && make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1 \
+		&& sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null \
+		&& echo installed' 2>&1 | tee "$OUT/build.log" || die "build/install failed"
+
+	say "cold rerank latency"
+	$SSH "cd pg_weave && OUT=\$HOME/out NROWS=${NROWS:-1000000} NSAMP=${NSAMP:-25} \
+			bash bench/rerank_cold.sh" 2>&1 | tee "$OUT/rerankcold.log"
+	$SSH 'cd ~/out && tar cf - .' | tar xf - -C "$OUT" 2>/dev/null || true
+}
+
+run_hnswbase() {
+	# The baseline, measured rather than estimated: HNSW bytes/vector (the
+	# denominator of every "x HNSW" figure in Phase V), whether it reaches
+	# recall@10 0.99 at any ef, and its warm and cold p50.
+	fetch_gist
+	say "installing pgvector"
+	# Presence is checked by looking for the module file, not by asking the
+	# server: a SQL string literal here would have to survive a single-quoted ssh
+	# argument and two shells, and that quoting has already cost this harness two
+	# debugging rounds (see the tuning step).
+	$SSH 'set -e
+		sudo apt-get -qq install -y postgresql-17-pgvector >/dev/null
+		ls -l /usr/lib/postgresql/17/lib/vector.so' \
+		2>&1 | tee "$OUT/pgvector.log" || die "pgvector install failed"
+
+	say "HNSW baseline"
+	$SSH "cd pg_weave && OUT=\$HOME/out NROWS=${NROWS:-1000000} NSAMP=${NSAMP:-25} \
+			bash bench/hnsw_base.sh" 2>&1 | tee "$OUT/hnswbase.log"
+	$SSH 'cd ~/out && tar cf - .' | tar xf - -C "$OUT" 2>/dev/null || true
+}
+
 run_p0merge() {
 	# A/B for the merge tombstone P0 (bench/RESULTS_P0_MERGE_TOMBSTONE.md).
 	#
@@ -568,6 +674,9 @@ case "$JOB" in
 	bitsweep) run_bitsweep ;;
 	p0merge) run_p0merge ;;
 	vall)    run_bitsweep; run_p0merge ;;
+	winsweep)   run_winsweep ;;
+	rerankcold) run_winsweep; run_rerankcold ;;
+	hnswbase)   run_hnswbase ;;
 	all)     run_smoke; run_bound; run_lexical ;;
 	*)     die "unknown job: $JOB" ;;
 esac
