@@ -695,13 +695,24 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			uint64	   *newdead = NULL;
 			int			nnew = 0,
 						newcap = 0;
+			sm_cursor_t ccur = SM_CURSOR_INIT;
 
+			/*
+			 * ccur is declared OUT here on purpose.  `v` ascends monotonically
+			 * across this loop, which is exactly the access pattern the forward
+			 * cursor is for -- but the cursor used to be declared inside the loop
+			 * body, so it was reset to the head on every iteration and each
+			 * sm_contains() walked O(chunks) from the start.  That made this loop
+			 * O(n * chunks) instead of O(n + chunks).  Same class of defect as the
+			 * merge P0 in ambuild.c's merge_source_open(), and hoisted for the same
+			 * reason (see bench/RESULTS_P0_MERGE_TOMBSTONE.md).  Unlike the merge,
+			 * this one is merely slow: the answer was always right.
+			 */
 			for (v = sm_next_member(seen, (uint64_t) -1, &cur);
 				 v != SM_IDX_MAX;
 				 v = sm_next_member(seen, v, &cur))
 			{
 				ItemPointerData tid;
-				sm_cursor_t ccur = SM_CURSOR_INIT;
 
 				num_index_tuples++;
 				if (sm_contains(dead, v, &ccur))
