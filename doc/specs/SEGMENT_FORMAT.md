@@ -695,7 +695,7 @@ Those three properties are a large part of why one would choose pg_weave over an
 AGPL extension embedding its own engine. The extra WAL volume is the price and it
 is not negotiable for a speedup.
 
-### A durability gap GenericXLog does not close by itself — found by task Z3
+### A durability gap GenericXLog does not close by itself — FIXED 2026-09-12
 
 100 % GenericXLog guarantees that every page change is *described* by a WAL
 record. It does not guarantee the record has been **written to a file** when the
@@ -705,31 +705,54 @@ statement returns.
 no catalog, so its transaction never acquires a `TransactionId`. PostgreSQL's
 `RecordTransactionCommit()` calls `XLogFlush()` only when the transaction
 committed an XID, truncated a relation, or forced a sync commit — so the merge's
-records are left in the WAL buffers, in shared memory, written to nothing. A
-`pg_ctl stop -m immediate` then loses them and recovery rolls the entire merge
-back: the input bolts return, the merged bolt vanishes, and `weave_check()` is
-**clean**, because the pre-merge state is a perfectly consistent state.
+records were left in the WAL buffers, in shared memory, written to nothing. A
+`pg_ctl stop -m immediate` then lost them.
 
-Reproducer, and it is two lines: build any index, `SELECT weave_merge(...)`, stop
-immediate, start, and compare `weave_index_nsegments()`. It was verified to behave
-identically on pre-v7 code, so it is not a v7 regression. The same shape applies
-to any maintenance SQL function that mutates pages without touching the heap
-(`weave_vacuum()` escapes it only because it truncates the relation, which sets
-`nrels > 0`).
+**Fixed by `ForceSyncCommit()` in `weave_merge()` and `weave_vacuum()`**
+(`src/am/amvacuum.c`). `ForceSyncCommit()` is what core uses for the same
+situation. `GetCurrentTransactionId()` would also work, by making the commit a
+real XID commit, but it burns an XID and moves the wraparound horizon for an
+operation that modifies no tuples — a worse trade.
 
-Consequences, in the order that matters:
+Covered by `t/014_merge_durability.pl`, which runs each maintenance function and
+crashes **immediately**, with no XID-acquiring statement in between. Verified
+wrong-before/right-after: with the `ForceSyncCommit()` calls removed, that file
+fails two assertions; with them, the whole TAP suite passes.
 
-1. **No wrong answers and no corruption.** Recovery lands on an earlier
-   *consistent* state; the documents are still in the heap, and the pending list
-   or the pre-merge bolts still index them. This is lost work, not lost data.
-2. It is nonetheless surprising, because a statement that returned successfully
-   did not survive a crash, and nothing in the WAL policy above says it might not.
-3. The fix is one `XLogFlush()` (or `ForceSyncCommit()`) in the maintenance entry
-   points. Not done here: task Z3 owns the fuzzy weft, and changing the durability
-   of every maintenance function is a separate change with its own test.
-4. `t/012_surf_crash_recovery.pl` works around it by following the merge with a
-   trivial INSERT into an unrelated table — that transaction *does* acquire an XID,
-   and `XLogFlush()` flushes the WAL stream up to its commit LSN, which includes
-   every earlier record. A `CHECKPOINT` would also work and is the wrong tool: it
-   puts the pages on disk and leaves WAL replay, the thing the test exists to
-   exercise, untested.
+#### Two things this section used to claim that the fix's test disproved
+
+Recorded because both were wrong in the reassuring direction.
+
+1. **"No wrong answers and no corruption — this is lost work, not lost data."**
+   Not true in general. With the fix removed, `weave_check()` after recovery
+   reports
+
+       105 unreachable page(s) not flagged freed; first is block 1828
+
+   so the rolled-back merge leaves pages **allocated but unreachable** — a leak the
+   validator flags as a failed invariant, not a clean earlier state. The original
+   claim came from observing a simpler index, where a rolled-back merge happened to
+   leave nothing behind; it does not generalize to a merge that had already
+   extended the relation.
+
+2. **"`weave_vacuum()` escapes it only because it truncates the relation, which
+   sets `nrels > 0`."** Half right, and the half that is wrong matters. The
+   truncation *does* survive — that assertion passes even with the fix removed —
+   but `weave_check()` still fails after the crash, so escaping the flush condition
+   is not the same as being durable. `weave_vacuum()` needed the fix too.
+
+The general lesson is the one this project keeps relearning: a consistency check
+that passes on the case you happened to try is not the same as a guarantee, and
+"lost work, not lost data" is exactly the kind of reassurance worth re-testing.
+
+#### Why `t/012` no longer needs its WAL anchor
+
+`t/012_surf_crash_recovery.pl` worked around the gap by following each merge with
+a trivial INSERT into an unrelated table — a transaction that *does* acquire an XID,
+whose commit flushes the WAL stream up to its LSN, including every earlier record.
+That anchor is now redundant. It is left in place deliberately: `t/012` exists to
+exercise WAL replay of the SuRF chain, and an extra durable commit does not weaken
+that, whereas removing it would make `t/012` fail for a durability reason if this
+fix ever regressed — duplicating what `t/014` says more directly. A `CHECKPOINT`
+would also have worked and is the wrong tool: it puts the pages on disk and leaves
+WAL replay, the thing the test exists to exercise, untested.

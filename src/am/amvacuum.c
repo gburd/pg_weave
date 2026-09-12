@@ -53,6 +53,7 @@
 #include "access/generic_xlog.h"
 #include "access/transam.h"		/* ReadNextTransactionId (recycle gate) */
 #include "access/xlog.h"			/* RecoveryInProgress (maintenance-fn guard) */
+#include "access/xact.h"			/* ForceSyncCommit (durability of the maintenance fns) */
 #include "access/parallel.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
@@ -944,6 +945,28 @@ weave_merge(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 	index_close(index, ShareUpdateExclusiveLock);
 
+	/*
+	 * Make this transaction's commit durable.
+	 *
+	 * Everything above is WAL-logged through GenericXLog, so the records exist --
+	 * but a transaction that writes WAL without ever acquiring an XID does not get
+	 * an XLogFlush() at commit.  RecordTransactionCommit() only flushes when the
+	 * XID was marked committed, or relations were dropped, or forceSyncCommit is
+	 * set; a pure index-maintenance call satisfies none of those.  The observable
+	 * consequence, and the reason this is not theoretical: `pg_ctl stop -m
+	 * immediate` after a successful weave_merge() rolled the merge back.
+	 *
+	 * ForceSyncCommit() is the idiomatic remedy and is what core uses for the same
+	 * situation.  GetCurrentTransactionId() would also work by making the commit a
+	 * real XID commit, but it burns an XID and moves the wraparound horizon for a
+	 * read-only-by-MVCC operation, which is a worse trade.
+	 *
+	 * This loses work rather than data -- an unflushed merge leaves the previous
+	 * segment directory intact -- but "the optimize I just ran silently did not
+	 * happen" is not a defensible thing to ship.
+	 */
+	ForceSyncCommit();
+
 	PG_RETURN_BOOL(done);
 }
 
@@ -994,6 +1017,9 @@ weave_vacuum(PG_FUNCTION_ARGS)
 	}
 	PG_END_TRY();
 	index_close(index, AccessExclusiveLock);
+
+	/* Same durability requirement as weave_merge(); see the comment there. */
+	ForceSyncCommit();
 
 	PG_RETURN_BOOL(done);
 }
