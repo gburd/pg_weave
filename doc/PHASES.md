@@ -258,70 +258,75 @@ which is what resolution 1 ("keep both claims, find a rerank representation chea
 than float32") required. The result:
 
 - **No supported width reaches 0.99 on GIST-960d.** GloVe needs **8 bits**
-  (0.9950); GIST tops out at 0.9860 at 8 bits with decaying increments. 8 bits is
-  1,024 B/vector at 1024-d = **0.18×** HNSW against a 0.15× budget, so the width
-  that clears 0.99 on the *easier* corpus already misses the storage claim.
-  `recall@10 ≥ 0.99` and `size ≤ 0.15×` are **jointly unsatisfiable with a single
-  code width** — measured, not extrapolated.
+  (0.9950); GIST tops out at 0.9860 at 8 bits with decaying increments.
+  `recall@10 ≥ 0.99` is **unreachable with a single code width** — measured, not
+  extrapolated. (This bullet used to add that 8 bits is "0.18× HNSW against a 0.15×
+  budget, so the width that clears 0.99 on the easier corpus already misses the
+  storage claim". That half is **withdrawn**: it divided by an estimated
+  denominator. Measured, 8 bits is 0.127× and fits — see the HNSW denominator
+  bullet below. The single-width conclusion stands on recall alone.)
 - **But codes plus an exact float32 rerank of a top-*w* window, read from the
   heap, satisfies both.** The rerank has to be full precision (§2.1.1's rule: a
   *b*-bit rerank cannot beat the *b*-bit ceiling), and a stored float32 sidecar
   costs `4 * dim` = 4,096 B/vector, worse than HNSW — so the rerank source is the
   **heap**, where the original vector already is and the index pays nothing for it.
-- **Both *b* and *w* are now measured, and the answer is not the narrowest width.**
-  With rerank I/O priced at 2.388 page reads per candidate at 1024-d
-  (`bench/RESULTS_RERANK_IO.md`) and the window swept alongside the width
-  (`bench/RESULTS_BITWIDTH_SWEEP.md`), binding window being the harder corpus:
+- **Both *b* and *w* are now measured at the gate's own corpus size, and the answer
+  is not the narrowest width.** `bench/RESULTS_PHASE_V_COLD.md`, two `r7i.2xlarge`,
+  one engine per host. Windows at **n = 1M** on GIST-960d, index bytes at 1024-d,
+  against a **measured** HNSW denominator of 8,056 B/vector:
 
-  | bits | window @ 0.99 | index B/vec | ×HNSW | reads/query | SIMD kernel |
-  |---|---|---:|---:|---:|---|
-  | 2 | > 75 | 256 | 0.045 | > 179 | yes |
-  | 3 | 40 | 384 | 0.067 | 96 | yes |
-  | **4** | **20** | **512** | **0.090** | **48** | **yes** |
-  | 5 | 15 | 640 | 0.112 | 36 | no |
-  | 6 | 15 | 768 | 0.135 | 36 | no |
+  | bits | window @ 0.99 (n=1M) | index B/vec | × HNSW | SIMD kernel |
+  |---|---|---:|---:|---|
+  | 3 | 50 | 384 | 0.048 | yes |
+  | **4** | **25** | **512** | **0.064** | **yes** |
+  | 5 | 20 | 640 | 0.079 | no |
+  | 8 | — (0.9860 ceiling) | 1024 | 0.127 | no |
 
-  **Every width from 3 to 6 clears the 0.15× budget once the rerank comes from the
-  heap.** Storage stops being the binding constraint and I/O becomes it, which
-  inverts the selection rule: pick the width that minimizes reads inside the
-  budget, not the narrowest that fits.
-- **RECOMMENDED SHAPE: 4 bits + exact rerank of a top-20 window.** recall@10
-  0.9940 (GIST) / 0.9970 (GloVe); index 512 B/vector = **0.090× HNSW**; **48
-  random page reads per query**, 5× less than 3-bit/100-window; and the widest
-  width that keeps the SIMD code-scan kernel, since 5–8 bits fall back to the
-  scalar oracle. Two bits is off the frontier entirely — it misses 0.99 even at
-  window 75 on GIST (0.9790).
-- **The window is the fragile number and the frontier rests on it.** Measured at
-  n = 100k–200k, it is a **lower bound** for the 1M gate corpus: 10× the vectors
-  put ~10× more near-neighbours in range to displace the true top-10, so 20 could
-  be 30 or 50 there. Re-measure at n = 1M before committing the shape to an
-  on-disk format; the page-read budget tracks the window one-for-one.
-
-That converts the problem from storage to latency, against `p50 ≤ 2× pgvector
-HNSW`. **The I/O half of that is now measured** (`bench/RESULTS_RERANK_IO.md`,
-2026-09-12): a 100-candidate window at 1024-d costs **~239 random page reads**,
-i.e. ~2.4 per candidate, because `wvec` is `STORAGE = external` and every
-candidate is a toast-index descent plus chunk reads rather than one heap fetch.
-The earlier "up to 100 heap fetches" understated it by 2.4×. It is *not* the 5×
-that per-chunk arithmetic predicts — a value's chunks pack into one page — and
-1024-d is measurably worse than 1536-d (2.388 vs 2.043 pages/candidate) because
-3 chunks straddle a page boundary while 4 fill one exactly.
-
-**What is still unmeasured is the conversion to latency, and it turns on queue
-depth, not on page count.** Detoasting is serialized by construction in PostgreSQL
-17 — lazy per-datum, `heap_fetch_toast_slice()` walking the toast index with a
-synchronous systable scan, no AIO or read-stream path — so the recommended shape's
-48 reads is on the order of **17 ms cold** on EBS gp3, probably still over
-`p50 ≤ 2× pgvector HNSW`. Prefetching needs **two dependent rounds** (heap pages →
-toast pointers → toast pages), since round 2's page numbers are unknowable until
-round 1 lands. The 5× window cut moves this within reach of a modest prefetch
-rather than an ambitious one; it does not close the gate by itself.
-
-The cost is also **bimodal**: it goes to zero whenever the vectors fit in the
-buffer pool, and since the codes are 0.090× of what HNSW must keep resident there
-is a corpus range where ours fits and HNSW's does not. That regime is where this
-shape wins, and it is the one the local run cannot measure. The cold EC2 run is the
-next V task, and it now has a prediction to be checked against rather than a guess.
+- **RECOMMENDED SHAPE: 4 bits + exact rerank of a top-25 window.** recall@10
+  **0.9920** at n = 1M; index **0.064× HNSW**; widest width that keeps the SIMD
+  code-scan kernel.
+- **The window grows with n, by ~+25% per decade, uniformly across widths** (40→50,
+  20→25, 15→20). The flagged risk was real and is now bounded. Two controls make it
+  attributable to n: the same binary reproduced the n=100k row exactly on the same
+  host, and the n=1M 3-bit row reproduced **bit-identically on a second machine
+  with `lists=1` instead of `lists=1024`**, confirming the full-probe column is
+  partition-independent. `lists=1 probes=1` is now the cheap way to measure a
+  ceiling — it skips k-means entirely.
+- **THE HNSW DENOMINATOR WAS A GUESS AND IT WAS 30% LOW.** §2.1.1 priced the 0.15×
+  budget from "on the order of 5,700 B per vector (unmeasured — measure before
+  quoting it)" and it was quoted repeatedly. Measured at m=16, ef_construction=64
+  on 999,990 × 960-d: **8,056 B/vector**, 7,683 MB, built in 277 s. **0.15× is
+  ~1,208 B/vector, not ~855.** This overturns the sweep's argument that 8 bits at
+  0.18× "already misses the storage claim" — it is **0.127×** and fits. The
+  single-width conclusion survives on **recall** (8 bits tops out at 0.9860), not
+  on storage.
+- **THE BASELINE HAS NO OPERATING POINT AT THE RECALL THE GATE NAMES.** pgvector
+  HNSW recall@10 against an exact sequential scan: 0.4400 / 0.7200 / 0.8560 /
+  0.9160 / 0.9600 / **0.9760** at ef = 10 / 40 / 100 / 200 / 400 / 800. It never
+  reaches 0.99, independently reproducing what `VECTOR_CHANNEL.md` §8a imported
+  from pg_turbovec. **So `p50 ≤ 2× pgvector HNSW at recall@10 ≥ 0.99` has nothing
+  to be 2× of, and needs restating rather than passing or failing.** Caveat that
+  limits it: m=16 is modest for 960-d and pgvector's guidance is to raise it, so
+  this is a ceiling for *these build parameters*. An m / ef_construction sweep is
+  the next measurement, and it could move the number materially.
+- **Cold, the rerank is not what decides the gate.** A 20-candidate window is
+  **86 ms** p50 cold at n = 1M (~100 ms at 25), against **6.2 s** for HNSW at
+  ef = 400 and 11.5 s at ef = 800. Mechanism as predicted: HNSW's traversal is
+  dependent random I/O; a rerank window's TIDs are all known before the first
+  fetch. Warm, the two arms that were verifiably warm (zero reads) are 0.598 ms for
+  a 10-candidate rerank and 3.548 ms for HNSW at ef = 10.
+- **The local page-count prediction was wrong by 7×, and its stated basis was
+  false.** `bench/RESULTS_RERANK_IO.md` predicted ~48 reads / ~12 ms for a
+  20-candidate window and called page counts "device-independent" because they
+  follow from layout. Measured 86 ms. At 250k rows with a 32 MB pool the toast
+  *index* stays resident and descents are nearly free; at 1M rows genuinely cold,
+  every descent pays full depth. Page counts depend on cache state and scale.
+- **WHAT IS STILL UNMEASURED IS NOW THE CODE SCAN, AND IT IS THE DECIDING HALF.**
+  V7 and V8 are not implemented, so no pg_weave vector query exists to time; what
+  was measured is the rerank component in isolation. At 4 bits, 1M codes is 512 MB
+  to read and score. Nothing here licenses a claim that this channel beats
+  pgvector — only that the heap rerank, which reopened this gate, is not what will
+  close it.
 
 - Compressed-domain-only recall@10 at **full probe** is 0.9225 (GloVe-200d) and
   0.8680 (GIST-960d) at 4 bits. Full probe means zero probe-miss error, so that

@@ -155,40 +155,86 @@ is `4 * dim` = 4,096 B/vector, worse than HNSW. The only shape in which both cla
 survive therefore reads full precision from the **heap**, where the original vector
 already lives and the index pays nothing for it.
 
-**Both `b` and `w` were then measured, and the answer is not the narrowest width.**
-`bench/RESULTS_BITWIDTH_SWEEP.md` swept the window as well as the width; rerank I/O
-is priced at 2.388 page reads per candidate at 1024-d from
-`bench/RESULTS_RERANK_IO.md`. Binding window is the larger of the two corpora':
+**Both `b` and `w` were then measured, at the gate's own corpus size, and the
+answer is not the narrowest width.** `bench/RESULTS_BITWIDTH_SWEEP.md` swept the
+window as well as the width; `bench/RESULTS_PHASE_V_COLD.md` re-measured the window
+at n = 1M and measured the HNSW denominator instead of estimating it. Windows are at
+**n = 1M on GIST-960d**, index bytes at 1024-d:
 
-| bits | window @ 0.99 | index B/vector | ×HNSW | page reads/query | SIMD kernel |
-|---|---|---:|---:|---:|---|
-| 2 | > 75 | 256 | 0.045 | > 179 | yes |
-| 3 | 40 | 384 | 0.067 | 96 | yes |
-| **4** | **20** | **512** | **0.090** | **48** | **yes** |
-| 5 | 15 | 640 | 0.112 | 36 | no |
-| 6 | 15 | 768 | 0.135 | 36 | no |
+| bits | window @ 0.99 | index B/vector | × HNSW | SIMD kernel |
+|---|---|---:|---:|---|
+| 3 | 50 | 384 | 0.048 | yes |
+| **4** | **25** | **512** | **0.064** | **yes** |
+| 5 | 20 | 640 | 0.079 | no |
+| 6 | ~20 | 768 | 0.095 | no |
+| 8 | — (0.9860 ceiling) | 1024 | 0.127 | no |
 
-Once the rerank comes from the heap, **every width from 3 to 6 clears the 0.15×
-budget**, so storage stops binding and I/O starts. The right width is therefore the
-one that minimizes reads while staying inside the budget — the opposite of the
-"narrowest width that fits" instinct that produced the 3-bit reading of this
-section. **The recommended shape is 4 bits with a top-20 window:**
+**The recommended shape is 4 bits with a top-25 window:** recall@10 **0.9920** at
+n = 1M, index **512 B/vector = 0.064× HNSW**, and the widest width that keeps the
+SIMD code-scan kernel (§9: 5–8 bits fall back to the scalar oracle). The code scan
+touches every vector while the rerank touches twenty-five, so giving up vectorized
+scoring to save five candidates is the wrong trade. Two bits is off the frontier
+entirely: it misses 0.99 even at window 75.
 
-- recall@10 **0.9940** (GIST-960d), 0.9970 (GloVe-200d);
-- index **512 B/vector = 0.090× HNSW** at 1024-d;
-- **48 random page reads per query**, a 5× cut from 3-bit/100-window's 239;
-- the widest width that keeps the SIMD code-scan kernel (§9: 5–8 bits fall back to
-  the scalar oracle). Five bits saves 12 reads per query and gives up vectorized
-  scoring to do it — the wrong trade, because the code scan touches every vector
-  while the rerank touches twenty.
+**The window does grow with n, by about +25% per decade, uniformly across widths.**
+The concern was that a window measured at n = 100k–200k is a lower bound for the
+gate corpus, since ten times the vectors put ten times more near-neighbours in
+range to displace the true top-10. Measured: 40 → 50 at 3 bits, 20 → 25 at 4,
+15 → 20 at 5. Real, modest, and it does not reorder the frontier. Two controls make
+it attributable to n rather than to the machine: the same binary reproduced the
+n = 100k row exactly on the same host, and the n = 1M 3-bit row reproduced
+**bit-identically on a second machine with `lists=1` instead of `lists=1024`** — a
+direct confirmation that the full-probe column is partition-independent, and the
+reason `lists=1 probes=1` is now the cheap way to measure a ceiling.
 
-**The window is the fragile number, and it is the one the frontier rests on.** A
-window must be wide enough to still contain the true top-10 after quantization
-perturbs the ordering, and nothing makes that requirement invariant in corpus size
-— 1M vectors put roughly 10× more near-neighbours in range to displace them. So
-`window @ 0.99` measured at n = 100k–200k is a **lower bound** for the 1M gate
-corpus, and 20 could be 30 or 50 there. Re-measure at n = 1M before this shape is
-committed to an on-disk format, because the page-read budget tracks it one-for-one.
+**The 0.15× budget is looser than every earlier figure assumed, because the
+denominator was a guess.** This section used to price it from "on the order of
+5,700 B per vector at m = 16 (unmeasured on this corpus — measure before quoting
+it)", and it was then quoted repeatedly. Measured on 999,990 × 960-d at m = 16,
+ef_construction = 64: **8,056 B/vector** (7,683 MB index). So 0.15× is
+~1,208 B/vector, not ~855.
+
+**That overturns a stated conclusion.** The bit-width sweep argued that 8 bits at
+1,024 B/vector is "0.18× HNSW against a 0.15× budget, so the width that clears 0.99
+on the easier corpus already misses the storage claim". Against the measured
+denominator, 8 bits is **0.127×** and fits comfortably. The single-width conclusion
+survives, but on **recall** rather than storage — 8 bits reaches only 0.9860 on
+GIST at full probe. Any "jointly unsatisfiable" argument that leaned on the storage
+half was leaning on an estimate.
+
+**And the baseline has no operating point at the recall the gate names.** pgvector
+HNSW at m = 16, ef_construction = 64 on this corpus reaches 0.4400 / 0.7200 /
+0.8560 / 0.9160 / 0.9600 / **0.9760** at ef = 10 / 40 / 100 / 200 / 400 / 800,
+against an exact sequential scan. It never reaches 0.99, independently reproducing
+what §8a imported from pg_turbovec. So `p50 ≤ 2× pgvector HNSW at recall@10 ≥ 0.99`
+has nothing to be 2× of, and needs restating rather than passing or failing. The
+limiting caveat: m = 16 is modest for 960 dimensions and pgvector's own guidance is
+to raise it, so this is a ceiling for *these build parameters*. An `m` /
+`ef_construction` sweep is the next measurement.
+
+**Cold, the rerank is not what decides the gate.** Measured at n = 1M
+(`bench/RESULTS_PHASE_V_COLD.md`): a 20-candidate window is **86 ms** p50 cold,
+interpolating to ~100 ms at 25, against **6.2 s** for pgvector HNSW at ef = 400
+(recall 0.9600) and 11.5 s at ef = 800. The mechanism is the predicted one — HNSW's
+traversal is dependent random I/O, unable to know its next node until the current
+one is scored, while a rerank window's TIDs are all known before the first fetch.
+Warm, both sides are fast and HNSW is the slower of the two measured points
+(0.598 ms for a 10-candidate rerank versus 3.548 ms at ef = 10, both verified warm
+by reading zero pages).
+
+**What is still unmeasured is the half that matters now: the code scan.** V7 and V8
+are not implemented, so no pg_weave vector query exists to time. At 4 bits, 1M
+codes is 512 MB to read and score. Nothing above licenses a claim that this channel
+beats pgvector; it licenses only that the heap rerank, which is what reopened the
+Phase V gate, is not what will close it.
+
+**The page counts below are cache-state- and scale-dependent, not layout alone.**
+`bench/RESULTS_RERANK_IO.md` called them "device-independent" because they follow
+from the storage layout; `bench/RESULTS_PHASE_V_COLD.md` falsified that. It
+predicted ~48 reads and ~12 ms for a 20-candidate window; measured cold p50 at
+n = 1M is **86 ms**, about 7×. Mechanism: at 250k rows with a 32 MB pool the toast
+*index* stays largely resident and descents are nearly free, while at 1M rows on a
+genuinely cold cache every descent pays its full depth.
 
 **Read the cost through TOAST, not through "a heap fetch".** `wvec` is
 `STORAGE = external`, so past about 490 dimensions the vector is out of line and a
