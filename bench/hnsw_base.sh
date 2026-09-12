@@ -143,23 +143,41 @@ for ef in $EFS; do
 		q=$(sed -n "${s}p" "$WORK/q.tsv" | cut -f2)
 		printf "SET hnsw.ef_search = %s;\nEXPLAIN (ANALYZE, BUFFERS) SELECT id FROM vec ORDER BY v <=> '%s'::vector LIMIT 10;\n" \
 			"$ef" "$q" >"$WORK/p-$ef-$s.sql"
-		printf "SET hnsw.ef_search = %s;\nSELECT id FROM vec ORDER BY v <=> '%s'::vector LIMIT 10;\n" \
-			"$ef" "$q" >"$WORK/r-$ef-$s.sql"
+		printf "SET hnsw.ef_search = %s;\nINSERT INTO res SELECT %s, %s, id FROM (SELECT id FROM vec ORDER BY v <=> '%s'::vector LIMIT 10) t;\n" \
+			"$ef" "$ef" "$s" "$q" >"$WORK/i-$ef-$s.sql"
 	done
 done
 
+# GUARD, before any recall number is computed: the index must actually be used.
+# A sequential scan answers these queries exactly, so a planner that declines the
+# index reports recall@10 = 1.0000 at every ef -- indistinguishable from a perfect
+# index by inspection, and wrong. This is the same failure shape as the local
+# guard that could not see what it was asserting about, so it is checked rather
+# than assumed.
+say "plan guard: the HNSW index must be used"
+$PSQL -f "$WORK/p-$(echo $EFS | awk '{print $1}')-1.sql" >"$WORK/plan.txt" 2>&1
+if ! grep -q 'vec_hnsw' "$WORK/plan.txt"; then
+	echo "GUARD FAILED: the plan does not use vec_hnsw -- every recall figure would be 1.0000 by seq scan" >&2
+	head -20 "$WORK/plan.txt" >&2
+	exit 1
+fi
+say "plan guard ok: $(grep -m1 'Index Scan\|Scan using' "$WORK/plan.txt" | sed 's/^ *//')"
+
 say "recall@10 by ef (warm, against the exact scan)"
-: >"$OUT/recall.tsv"
+# Computed in SQL, not with comm(1): comm requires collation order while the ids
+# are numeric, so `sort -n | comm` fails outright ("file 1 is not in sorted
+# order") and `sort | comm` would silently compare 10 against 100 as strings.
+$PSQL -c "DROP TABLE IF EXISTS res; CREATE TABLE res (ef int, s int, id int)"
 for ef in $EFS; do
-	tot=0
-	for s in $(seq 1 "$NSAMP"); do
-		hits=$($PSQL -tA -f "$WORK/r-$ef-$s.sql" 2>/dev/null | tail -n +1 | sort -n \
-			| comm -12 - <($PSQL -tAc "SELECT id FROM gt WHERE s=$s ORDER BY id") | wc -l)
-		tot=$((tot + hits))
-	done
-	awk -v ef="$ef" -v t="$tot" -v n="$NSAMP" \
-		'BEGIN{ printf "%d\t%.4f\n", ef, t / (n * 10) }' | tee -a "$OUT/recall.tsv"
+	for s in $(seq 1 "$NSAMP"); do $PSQL -f "$WORK/i-$ef-$s.sql" >/dev/null; done
 done
+$PSQL -tA -F$'\t' <<-SQL | tee "$OUT/recall.tsv"
+	SELECT r.ef,
+	       round(count(g.id)::numeric / (count(DISTINCT r.s) * 10), 4) AS recall_at_10,
+	       count(*) / count(DISTINCT r.s) AS rows_returned_per_query
+	FROM res r LEFT JOIN gt g ON g.s = r.s AND g.id = r.id
+	GROUP BY r.ef ORDER BY r.ef;
+SQL
 
 sample() {
 	local ef=$1 arm=$2 s=$3 f=$WORK/p-$1-$3.sql log=$WORK/last.txt
@@ -198,8 +216,10 @@ sort -t$'\t' -k1,1n -k2,2 -k4,4g "$OUT/samples.tsv" | awk -F'\t' '
 
 say "recall by ef"
 cat "$OUT/recall.tsv"
-awk -F'\t' '$2 >= 0.99 { found = 1; printf "pgvector HNSW reaches recall@10 %.4f at ef=%d\n", $2, $1; exit }
-	END { if (!found) print "pgvector HNSW NEVER reaches recall@10 0.99 at any ef measured -- the gate compares against an operating point the baseline does not have" }' \
+awk -F'\t' '
+	$3 != 10 { printf "WARNING ef=%d returned %s rows per query, not 10\n", $1, $3 }
+	$2 >= 0.99 && !found { found = 1; printf "pgvector HNSW reaches recall@10 %.4f at ef=%d\n", $2, $1 }
+	END { if (!found) print "pgvector HNSW NEVER reaches recall@10 0.99 at any ef measured -- so the gate p50 <= 2x HNSW at recall >= 0.99 compares against an operating point the baseline does not have" }' \
 	"$OUT/recall.tsv" | tee "$OUT/verdict.txt"
 
 say "artifacts in $OUT"
