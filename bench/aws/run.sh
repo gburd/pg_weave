@@ -249,9 +249,13 @@ $SSH 'sudo -u postgres createuser -s $(whoami) 2>/dev/null || true
 	# with `database "ubuntu" does not exist`.
 	sudo -u postgres createdb -O $(whoami) $(whoami) 2>/dev/null || true
 	sudo install -d -o $(whoami) -g $(whoami) /scratch
-	psql -tAc "select name || $$ = $$ || setting from pg_settings where name in
-	  ($$shared_buffers$$,$$maintenance_work_mem$$,$$work_mem$$,
-	   $$effective_cache_size$$,$$jit$$)"' \
+	# SHOW rather than a select over pg_settings: quoting SQL string literals
+	# through ssh + two shells cost two debugging rounds ($$-quoting was expanded
+	# to the remote shell PID, and escaped double quotes closed the outer string).
+	# There is nothing to quote this way.
+	for s in shared_buffers maintenance_work_mem work_mem effective_cache_size jit; do
+		printf "%s = %s\n" "$s" "$(psql -tAc "show $s")"
+	done' \
 	2>&1 | tee "$OUT/tuning.log"
 
 grep -q 'shared_buffers = ' "$OUT/tuning.log" \
