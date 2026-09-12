@@ -179,6 +179,8 @@ $PSQL -tA -F$'\t' <<-SQL | tee "$OUT/recall.tsv"
 	GROUP BY r.ef ORDER BY r.ef;
 SQL
 
+# See bench/rerank_cold.sh for why buffer counts are split at `Planning:` and why
+# one plan per (ef, arm) is kept.
 sample() {
 	local ef=$1 arm=$2 s=$3 f=$WORK/p-$1-$3.sql log=$WORK/last.txt
 	if [ "$arm" = cold ]; then
@@ -188,31 +190,77 @@ sample() {
 		$PSQL -tAc 'SELECT 1' >/dev/null
 	fi
 	$PSQL -f "$f" >"$log" 2>&1 || { cat "$log"; return 1; }
+	[ -f "$OUT/plan-$ef-$arm.txt" ] || cp "$log" "$OUT/plan-$ef-$arm.txt"
 	awk -v ef="$ef" -v arm="$arm" -v s="$s" '
-		/Execution Time:/ { ms = $3 }
+		/^ *Planning:/    { planning = 1 }
 		/Buffers: shared/ { for (i = 1; i <= NF; i++) {
-		                      if ($i ~ /^hit=/)  { sub(/hit=/, "", $i);  hit += $i }
-		                      if ($i ~ /^read=/) { sub(/read=/, "", $i); rd  += $i } } }
-		END { printf "%s\t%s\t%s\t%.3f\t%d\t%d\n", ef, arm, s, ms, rd, hit }
+		                      if ($i ~ /^hit=/)  { sub(/hit=/, "", $i)
+		                        if (planning) phit += $i; else hit += $i }
+		                      if ($i ~ /^read=/) { sub(/read=/, "", $i)
+		                        if (planning) prd += $i; else rd += $i } } }
+		/Execution Time:/ { ms = $3 }
+		END { printf "%s\t%s\t%s\t%.3f\t%d\t%d\t%d\n", ef, arm, s, ms, rd, hit, prd }
 	' "$log"
+}
+
+# Prewarm and VERIFY. pg_prewarm is an extension that has to be created; the
+# first version of this script called it without doing so, the call failed, the
+# failure was swallowed by `|| true`, and the resulting "warm" arm read 2,136
+# pages per query at ef=40 and reported 879 ms as a warm latency. The index is
+# what matters here, but the heap is prewarmed too because the final rows are
+# fetched from it.
+prewarm() {
+	$PSQL -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm" >/dev/null
+	$PSQL -tA -F$'\t' <<-SQL >"$WORK/prewarm.tsv"
+		SELECT c.relname, pg_prewarm(c.oid), pg_relation_size(c.oid) / 8192
+		FROM pg_class c
+		WHERE c.oid IN ('vec'::regclass, 'vec_hnsw'::regclass,
+		                (SELECT reltoastrelid FROM pg_class WHERE oid = 'vec'::regclass));
+	SQL
+	cat "$WORK/prewarm.tsv"
+	awk -F'\t' '$2 + 0 < $3 * 0.99 {
+		printf "GUARD FAILED: pg_prewarm(%s) loaded %d of %d pages\n", $1, $2, $3; bad = 1 }
+		END { exit bad }' "$WORK/prewarm.tsv" \
+		|| { echo "prewarm incomplete -- the warm arm would not be warm" >&2; exit 1; }
 }
 
 : >"$OUT/samples.tsv"
 for ef in $EFS; do
 	say "ef=$ef: $NSAMP warm + $NSAMP cold"
-	$PSQL -c "SELECT pg_prewarm('vec_hnsw')" >/dev/null 2>&1 || true
+	prewarm
 	for s in $(seq 1 "$NSAMP"); do sample "$ef" warm "$s" >>"$OUT/samples.tsv"; done
 	for s in $(seq 1 "$NSAMP"); do sample "$ef" cold "$s" >>"$OUT/samples.tsv"; done
 done
 
 say "results"
-printf 'ef\tarm\tn\tp50_ms\tp99_ms\tmean_reads\tmean_hits\n' | tee "$OUT/summary.tsv"
+printf 'ef\tarm\tn\tp50_ms\tp99_ms\tmean_reads\tmean_hits\tmean_plan_reads\n' | tee "$OUT/summary.tsv"
+# The ternary is assigned to a variable before use: inside a printf argument list
+# mawk rejects it as a syntax error, which is how the first run of this script
+# lost its summary after taking all 300 samples.  gawk accepts it, so this is
+# invisible on a workstation and fatal on Ubuntu.
 sort -t$'\t' -k1,1n -k2,2 -k4,4g "$OUT/samples.tsv" | awk -F'\t' '
-	{ key = $1 "\t" $2; ms[key][++c[key]] = $4; rd[key] += $5; ht[key] += $6 }
+	{ key = $1 "\t" $2; ms[key][++c[key]] = $4; rd[key] += $5; ht[key] += $6; pr[key] += $7 }
 	END { for (k in c) { n = c[k]
-		printf "%s\t%d\t%.3f\t%.3f\t%.1f\t%.1f\n", k, n, ms[k][int((n+1)/2)],
-		       ms[k][n > 1 ? int(n * 0.99 + 0.5) : 1], rd[k] / n, ht[k] / n } }' \
+		p50 = ms[k][int((n + 1) / 2)]
+		hi = n > 1 ? int(n * 0.99 + 0.5) : 1
+		p99 = ms[k][hi]
+		printf "%s\t%d\t%.3f\t%.3f\t%.1f\t%.1f\t%.1f\n", k, n, p50, p99, rd[k] / n, ht[k] / n, pr[k] / n } }' \
 	| sort -t$'\t' -k1,1n -k2,2r | tee -a "$OUT/summary.tsv"
+
+# Same absolute guards as bench/rerank_cold.sh: a warm arm that reads is not
+# warm, a cold arm that does not read was not cold.
+awk -F'\t' 'NR > 1 {
+		if ($2 == "cold") crd[$1] = $6
+		if ($2 == "warm") wrd[$1] = $6
+	}
+	END { bad = 0
+		for (e in crd) {
+			if (wrd[e] > 1) { printf "GUARD FAILED ef=%s: warm arm read %.1f pages/query -- warm number invalid\n", e, wrd[e]; bad = 1 }
+			if (crd[e] < 2) { printf "GUARD FAILED ef=%s: cold arm read %.1f pages/query -- not cold\n", e, crd[e]; bad = 1 }
+		}
+		if (!bad) print "latency guards ok"
+		exit bad
+	}' "$OUT/summary.tsv"
 
 say "recall by ef"
 cat "$OUT/recall.tsv"
