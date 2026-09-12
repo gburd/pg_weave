@@ -39,8 +39,16 @@ HNSW` — 8 bits is 1024 B, or **0.18x**. So the width that clears 0.99 on the
 easier corpus already misses the storage claim, and the harder corpus is not
 reachable at all.
 
-**`recall@10 >= 0.99` and `size <= 0.15x HNSW` are therefore jointly unsatisfiable
-with a single code width.** That was the question the phase turned on, and it is
+> **WITHDRAWN 2026-09-12, storage half only.** The 855 B budget divides by an
+> ESTIMATED HNSW size of ~5,700 B/vector, which §2.1.1 flagged as unmeasured.
+> Measured (`bench/RESULTS_PHASE_V_COLD.md`): pgvector HNSW is **8,056 B/vector**
+> at m=16, ef_construction=64 on 999,990 x 960-d, so 0.15x is ~1,208 B/vector and
+> 8 bits is **0.127x** -- it fits. The recall half stands: 8 bits reaches only
+> 0.9860 on GIST. So a single code width fails on RECALL, not on size, and the
+> paragraph below should be read with its storage clause struck out.
+
+**`recall@10 >= 0.99` is therefore unreachable with a single code width** (the
+`size <= 0.15x HNSW` half of this sentence is withdrawn -- see the note above). That was the question the phase turned on, and it is
 now answered by measurement rather than extrapolation. (The extrapolation in
 §2.1.1 predicted ~7 bits for GloVe and "possibly unreachable at 8" for GIST. It
 was optimistic on GloVe by one width and right about GIST — which is the argument
