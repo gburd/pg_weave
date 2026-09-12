@@ -215,7 +215,8 @@ grep -q 'pg_config: PostgreSQL 17' "$OUT/provision.log" \
 say "tuning postgresql"
 MEMKB=$($SSH "awk '/MemTotal/{print \$2}' /proc/meminfo")
 SB=$(( MEMKB / 1024 / 1024 * 40 / 100 ))       # 40% of RAM, in MB
-$SSH "sudo tee -a /etc/postgresql/17/main/conf.d/bench.conf >/dev/null <<EOF
+$SSH "sudo mkdir -p /etc/postgresql/17/main/conf.d
+sudo tee -a /etc/postgresql/17/main/conf.d/bench.conf >/dev/null <<EOF
 shared_buffers = ${SB}MB
 maintenance_work_mem = 2GB
 work_mem = 256MB
@@ -227,11 +228,30 @@ max_wal_size = 8GB
 random_page_cost = 1.1
 jit = off
 EOF
-sudo mkdir -p /etc/postgresql/17/main/conf.d
-sudo pg_ctlcluster 17 main restart || sudo pg_ctlcluster 17 main start
-psql -U postgres -tAc \"select name||' = '||setting from pg_settings where name in
-  ('shared_buffers','maintenance_work_mem','work_mem','effective_cache_size','jit')\"" \
+sudo pg_ctlcluster 17 main restart || sudo pg_ctlcluster 17 main start"
+
+# Deliberately a separate, single-quoted step: nothing here needs local
+# expansion, and folding it into the double-quoted heredoc above cost a
+# debugging round on escaping.
+#
+# The superuser role exists because PGDG's default pg_hba uses peer auth for
+# local connections, so running psql as -U postgres from the ubuntu account
+# fails with "Peer authentication failed".  Every psql in this script is
+# therefore unqualified.  The readback below used to run as -U postgres and so
+# never worked at all: the harness recorded no tuning, and an unrecorded setting
+# makes a result unusable, which is the entire reason this step exists.
+#
+# /scratch does not exist on the instance and an unprivileged mkdir cannot
+# create one.
+$SSH 'sudo -u postgres createuser -s $(whoami) 2>/dev/null || true
+	sudo install -d -o $(whoami) -g $(whoami) /scratch
+	psql -tAc "select name || $$ = $$ || setting from pg_settings where name in
+	  ($$shared_buffers$$,$$maintenance_work_mem$$,$$work_mem$$,
+	   $$effective_cache_size$$,$$jit$$)"' \
 	2>&1 | tee "$OUT/tuning.log"
+
+grep -q 'shared_buffers = ' "$OUT/tuning.log" \
+	|| die "tuning could not be read back (see $OUT/tuning.log)"
 
 say "uploading source"
 # git archive of HEAD: only committed state is measured, so a result can always
@@ -310,19 +330,29 @@ run_bitsweep() {
 	# property of the codebook and the estimator alone.  A better partition
 	# cannot raise it, which is what makes it a valid gate.
 	say "fetching corpora"
+	# Two independent fetches, deliberately not one `set -e` block: GIST comes
+	# over FTP from ftp.irisa.fr and is ~2.6 GB, so it is the likely failure, and
+	# losing it must not also lose the GloVe half of the sweep.
 	$SSH 'set -e
-		sudo apt-get install -y unzip >/dev/null 2>&1 || true
+		sudo apt-get install -y unzip bc >/dev/null 2>&1 || true
 		mkdir -p /scratch/corpus && cd /scratch/corpus
 		if [ ! -f glove.6B.200d.txt ]; then
 			curl -sSLO https://nlp.stanford.edu/data/glove.6B.zip
 			unzip -o -q glove.6B.zip glove.6B.200d.txt && rm -f glove.6B.zip
 		fi
+		ls -l glove.6B.200d.txt' \
+		2>&1 | tee "$OUT/corpus.log" || die "GloVe fetch failed"
+	GIST_OK=yes
+	$SSH 'set -e
+		cd /scratch/corpus
 		if [ ! -f gist/gist_base.fvecs ]; then
-			curl -sSO ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz
+			curl -sS --connect-timeout 30 -O \
+				ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz
 			tar xzf gist.tar.gz && rm -f gist.tar.gz
 		fi
-		ls -l glove.6B.200d.txt gist/gist_base.fvecs' \
-		2>&1 | tee "$OUT/corpus.log" || die "corpus fetch failed"
+		ls -l gist/gist_base.fvecs' \
+		2>&1 | tee -a "$OUT/corpus.log" || GIST_OK=no
+	[ "$GIST_OK" = yes ] || say "WARNING: GIST unavailable; GloVe half only"
 
 	say "building ivf_recall"
 	$SSH 'cd pg_weave && gcc -O2 -march=native -std=gnu99 -I include \
@@ -338,9 +368,13 @@ run_bitsweep() {
 		2>&1 | tee "$OUT/bitsweep_glove.log"
 
 	say "GIST-960d: bits 2..8, full probe"
-	$SSH '/scratch/ivf_recall fvecs /scratch/corpus/gist/gist_base.fvecs 100000 100 \
-			lists=512 bits=2,3,4,5,6,7,8 probes=1,8,32,128,512 windows=10,100 k=10' \
-		2>&1 | tee "$OUT/bitsweep_gist.log"
+	if [ "$GIST_OK" = yes ]; then
+		$SSH '/scratch/ivf_recall fvecs /scratch/corpus/gist/gist_base.fvecs 100000 100 \
+				lists=512 bits=2,3,4,5,6,7,8 probes=1,8,32,128,512 windows=10,100 k=10' \
+			2>&1 | tee "$OUT/bitsweep_gist.log"
+	else
+		say "skipped: GIST corpus unavailable"
+	fi
 }
 
 run_p0merge() {
@@ -358,8 +392,21 @@ run_p0merge() {
 	# checking out an older tree, so the two binaries differ in exactly that
 	# commit and nothing else.
 	say "p0 merge A/B: preparing both builds"
-	$SSH 'cd pg_weave && git rev-parse --short HEAD && git log --oneline -1 --grep="P0: VACUUM"' \
-		2>&1 | tee "$OUT/p0_setup.log"
+	# The remote tree comes from `git archive HEAD` followed by a bare `git init`,
+	# so it has NO HISTORY: `git revert`/`git log --grep` cannot work there, and an
+	# earlier version of this job that used them would have silently measured the
+	# same binary twice.  Instead the fix's diff is extracted HERE, where the
+	# history exists, uploaded once, and applied in reverse to produce the
+	# "before" arm.  The two binaries then differ in exactly that diff.
+	P0SHA=$(git -C "$ROOT" log --format=%H --grep='^P0: VACUUM' -1)
+	[ -n "$P0SHA" ] || die "cannot find the P0 commit to A/B against"
+	git -C "$ROOT" show "$P0SHA" -- src/am/ambuild.c src/am/amvacuum.c \
+		> "$OUT/p0.patch" || die "could not extract the P0 diff"
+	say "A/B against $(git -C "$ROOT" log --oneline -1 "$P0SHA")"
+	$SSH 'cat > /tmp/p0.patch' < "$OUT/p0.patch" || die "patch upload failed"
+	# Prove the patch reverses cleanly before spending an hour of instance time.
+	$SSH 'cd pg_weave && git apply --reverse --check /tmp/p0.patch && echo "patch reverses cleanly"' \
+		2>&1 | tee "$OUT/p0_setup.log" || die "the P0 patch does not reverse against the uploaded tree"
 
 	# Alternate variants at each scale point (skill rule: A/B alternate, never
 	# all-A then all-B) so thermal and neighbour drift cannot bias one arm.  One
@@ -373,7 +420,7 @@ run_p0merge() {
 		# part and it is identical for both arms; only the index build, the
 		# delete and the VACUUM have to be repeated per variant.
 		say "p0 merge: generating source corpus n=$n"
-		$SSH "psql -q -U postgres -v ON_ERROR_STOP=1 <<SQL
+		$SSH "psql -q -v ON_ERROR_STOP=1 <<SQL
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 DROP TABLE IF EXISTS p0src;
 -- High distinct-term count is the point: ~10 tokens/row from a 5M-token space
@@ -393,15 +440,16 @@ SQL" 2>&1 | tail -2 | tee -a "$OUT/p0_merge.log"
 			say "p0 merge: n=$n variant=$variant"
 			$SSH "set -e
 				cd pg_weave
-				git checkout -- . 2>/dev/null || true
 				if [ '$variant' = before ]; then
-					git revert --no-commit \$(git log --format=%H --grep='P0: VACUUM' -1)
+					git apply --reverse /tmp/p0.patch
 				fi
 				make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
 				sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
-				git checkout -- . 2>/dev/null || true
+				if [ '$variant' = before ]; then
+					git apply /tmp/p0.patch   # restore the tree for the next arm
+				fi
 				sudo -u postgres pg_ctlcluster 17 main restart 2>/dev/null || true
-				psql -q -U postgres -v ON_ERROR_STOP=1 <<SQL
+				psql -q -v ON_ERROR_STOP=1 <<SQL
 DROP TABLE IF EXISTS p0doc;
 CREATE TABLE p0doc AS SELECT * FROM p0src;
 CREATE INDEX p0doc_weave ON p0doc USING weave (body);
@@ -410,14 +458,12 @@ CREATE INDEX p0doc_weave ON p0doc USING weave (body);
 DELETE FROM p0doc WHERE id % 7 = 0;
 SQL
 				echo \"--- n=$n variant=$variant ---\"
-				psql -tA -U postgres -c \
-					\"SELECT 'nterms=' || nterms FROM weave_index_stats('p0doc_weave')\" || true
-				psql -tA -U postgres -c \
-					\"SELECT 'idxsize=' || pg_size_pretty(pg_relation_size('p0doc_weave'))\" || true
-				# timeout so a genuine non-termination reports as a bound rather
-				# than hanging the whole run
+				psql -tAc \"SELECT 'nterms=' || nterms FROM weave_index_stats('p0doc_weave')\" || true
+				psql -tAc \"SELECT 'idxsize=' || pg_size_pretty(pg_relation_size('p0doc_weave'))\" || true
+				# A timeout so genuine non-termination reports as a bound instead
+				# of hanging the whole run.
 				start=\$(date +%s.%N)
-				if timeout 3600 psql -q -U postgres -c 'VACUUM p0doc'; then
+				if timeout 3600 psql -q -c 'VACUUM p0doc'; then
 					end=\$(date +%s.%N)
 					echo \"VACUUM_SECONDS \$(echo \"\$end - \$start\" | bc)\"
 				else

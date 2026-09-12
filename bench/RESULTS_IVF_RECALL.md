@@ -1,5 +1,35 @@
 # Result: is Phase V's `recall@10 >= 0.99` reachable with an IVF over pg_weave's own codes?
 
+> **THE 4-BIT FIGURES ON THIS PAGE WERE MEASURED AGAINST AN UNCONVERGED
+> CODEBOOK. Superseded numbers pending — 2026-09-12.**
+>
+> `weave_codebook_solve()` capped its Lloyd iteration at 200 sweeps. Measured
+> sweep counts to reach the fixed point are ~54 at 4 levels, ~700 at 16 levels,
+> ~10k at 64 and ~130k at 256 — so the cap was only sufficient for 2 and 3 bits.
+> Verified directly by re-solving with the cap raised to 200,000 at dim=1024:
+>
+> | bits | levels | absmax at cap 200 | at cap 200,000 | converged? |
+> |---|---|---|---|---|
+> | 2 | 4 | 0.0471801310778 | 0.0471801310778 | yes, bit-identical |
+> | 3 | 8 | 0.0671677812934 | 0.0671677812934 | yes, bit-identical |
+> | 4 | 16 | 0.0852635353804 | 0.0852204412222 | **no — 5.1e-4 relative** |
+>
+> So **0.7345 and 0.8515 (GloVe 2- and 3-bit) and 0.6130 / 0.7880 (GIST) stand**,
+> and every **4-bit** figure here — 0.9205, 0.8780, and the TQ+ comparison rows —
+> was produced by a codebook 200 sweeps short of its own fixed point. Fixing the
+> solver changed every 4-bit float, moving 0.28 % of probability mass across a
+> cell boundary.
+>
+> **What does not change:** the qualitative conclusion. A 0.3 %-of-mass
+> perturbation cannot close a gap from ~0.92 to 0.99, so "4 bits alone does not
+> reach 0.99, therefore a rerank is required" survives, and so does the Phase V
+> gate reopening that followed from it. What must not be quoted until re-measured
+> is the *number*.
+>
+> The replacement is a full sweep over widths **2..8** on both corpora at full
+> probe (`bench/aws/run.sh <type> bitsweep`), which regenerates the 2- and 3-bit
+> rows too so the whole table comes from one converged codec.
+
 Date: 2026-09-10. Harness: `bench/ivf_recall.c`. No PostgreSQL backend; the
 shipping codec (`src/vector/quantize.c`, `src/vector/pack.c`) is linked in
 unmodified and nothing in `src/` was touched. Reproduce with
