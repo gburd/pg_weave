@@ -128,7 +128,15 @@ for w in $WINDOWS; do
 	done
 done
 
-# One sample. Emits: window arm sample ms shared_read shared_hit
+# One sample. Emits: window arm sample ms exec_reads exec_hits plan_reads
+#
+# Buffer counts are split at the `Planning:` line. Everything above it belongs to
+# plan nodes; everything below is the planner's own catalog access, which on a
+# freshly restarted server is hundreds of cold reads that have nothing to do with
+# the rerank. `Execution Time` already excludes planning, so summing all
+# `Buffers:` lines into one figure -- which the first version of this script did
+# -- pairs an execution-only latency with a latency-plus-planning read count and
+# makes reads-per-candidate look far worse than it is.
 sample() {
 	local w=$1 arm=$2 s=$3 f=$WORK/p-$1-$3.sql log=$WORK/last.txt
 
@@ -136,59 +144,96 @@ sample() {
 		sync
 		echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 		sudo pg_ctlcluster 17 main restart
-		# The restart's own first connection would otherwise be part of the
-		# sample; spend it on something that touches nothing under test.
 		$PSQL -tAc 'SELECT 1' >/dev/null
 	fi
 	$PSQL -f "$f" >"$log" 2>&1 || { cat "$log"; return 1; }
+	# Keep one plan per (window, arm). Not having done this cost a whole run:
+	# 18 reads per candidate could not be attributed to a plan node, a toast
+	# descent, or the planner, because no plan had been kept.
+	[ -f "$OUT/plan-$w-$arm.txt" ] || cp "$log" "$OUT/plan-$w-$arm.txt"
 	awk -v w="$w" -v arm="$arm" -v s="$s" '
-		/Execution Time:/            { ms = $3 }
+		/^ *Planning:/               { planning = 1 }
 		/Buffers: shared/            { for (i = 1; i <= NF; i++) {
-		                                 if ($i ~ /^hit=/)  { sub(/hit=/, "", $i);  hit += $i }
-		                                 if ($i ~ /^read=/) { sub(/read=/, "", $i); rd  += $i } } }
-		END { printf "%s\t%s\t%s\t%.3f\t%d\t%d\n", w, arm, s, ms, rd, hit }
+		                                 if ($i ~ /^hit=/)  { sub(/hit=/, "", $i)
+		                                   if (planning) phit += $i; else hit += $i }
+		                                 if ($i ~ /^read=/) { sub(/read=/, "", $i)
+		                                   if (planning) prd += $i; else rd += $i } } }
+		/Execution Time:/            { ms = $3 }
+		END { printf "%s\t%s\t%s\t%.3f\t%d\t%d\t%d\n", w, arm, s, ms, rd, hit, prd }
 	' "$log"
+}
+
+# Prewarm, and VERIFY it. pg_prewarm lives in an extension that was never
+# created, so every call was failing and being swallowed by `|| true`: the warm
+# arm of the first run was not warm, and read 231 pages while claiming to be.
+# All four relations matter -- for a rerank the TOAST relation is the one that
+# does, and prewarming only the heap warms the 50 MB that was never the cost.
+prewarm() {
+	$PSQL -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm" >/dev/null
+	$PSQL -tA -F$'\t' <<-SQL >"$WORK/prewarm.tsv"
+		SELECT c.relname, pg_prewarm(c.oid), pg_relation_size(c.oid) / 8192
+		FROM pg_class c
+		WHERE c.oid IN ('vec'::regclass, 'vec_pkey'::regclass,
+		                (SELECT reltoastrelid FROM pg_class WHERE oid = 'vec'::regclass),
+		                (SELECT i.indexrelid FROM pg_index i
+		                 WHERE i.indrelid = (SELECT reltoastrelid FROM pg_class
+		                                     WHERE oid = 'vec'::regclass)));
+	SQL
+	cat "$WORK/prewarm.tsv"
+	awk -F'\t' '$2 + 0 < $3 * 0.99 {
+		printf "GUARD FAILED: pg_prewarm(%s) loaded %d of %d pages\n", $1, $2, $3; bad = 1 }
+		END { exit bad }' "$WORK/prewarm.tsv" \
+		|| { echo "prewarm incomplete -- the warm arm would not be warm" >&2; exit 1; }
 }
 
 : >"$OUT/samples.tsv"
 for w in $WINDOWS; do
 	say "window $w: $NSAMP cold + $NSAMP warm"
 	# Warm arm first, prewarmed deliberately, so the cold arm is not warmed by it.
-	$PSQL -c "SELECT pg_prewarm('vec'), pg_prewarm('vec_pkey')" >/dev/null 2>&1 || true
+	prewarm
 	for s in $(seq 1 "$NSAMP"); do sample "$w" warm "$s" >>"$OUT/samples.tsv"; done
 	for s in $(seq 1 "$NSAMP"); do sample "$w" cold "$s" >>"$OUT/samples.tsv"; done
 done
 
 # ---------------------------------------------------------------- report
 say "results"
-printf 'window\tarm\tn\tp50_ms\tp99_ms\tmean_reads\tmean_hits\n' | tee "$OUT/summary.tsv"
+printf 'window\tarm\tn\tp50_ms\tp99_ms\tmean_reads\tmean_hits\tmean_plan_reads\n' | tee "$OUT/summary.tsv"
 sort -t$'\t' -k1,1n -k2,2 -k4,4g "$OUT/samples.tsv" | awk -F'\t' '
-	{ key = $1 "\t" $2; ms[key][++c[key]] = $4; rd[key] += $5; ht[key] += $6 }
+	{ key = $1 "\t" $2; ms[key][++c[key]] = $4; rd[key] += $5; ht[key] += $6; pr[key] += $7 }
 	END {
 		for (k in c) {
 			n = c[k]
 			p50 = ms[k][int((n + 1) / 2)]
-			p99 = ms[k][n > 1 ? int(n * 0.99 + 0.5) : 1]
-			printf "%s\t%d\t%.3f\t%.3f\t%.1f\t%.1f\n", k, n, p50, p99, rd[k] / n, ht[k] / n
+			hi = n > 1 ? int(n * 0.99 + 0.5) : 1
+			p99 = ms[k][hi]
+			printf "%s\t%d\t%.3f\t%.3f\t%.1f\t%.1f\t%.1f\n", k, n, p50, p99, rd[k] / n, ht[k] / n, pr[k] / n
 		}
 	}' | sort -t$'\t' -k1,1n -k2,2r | tee -a "$OUT/summary.tsv"
 
-# GUARD: a cold sample must actually have read pages, and must have read more
-# than the warm arm. Equal read counts mean the cache was not dropped and every
-# cold number is a warm number with a restart in front of it.
+# GUARDS. The first version checked only that cold read MORE than warm, which is
+# a RELATIVE property, and it passed cleanly on a run where the warm arm read 231
+# pages per query because pg_prewarm had never worked. A relative guard cannot see
+# an absolute failure -- the third time this exact shape has appeared this cycle.
 awk -F'\t' 'NR > 1 {
-		if ($2 == "cold") { cold[$1] = $6; cms[$1] = $4 }
-		if ($2 == "warm") { warm[$1] = $6; wms[$1] = $4 }
+		if ($2 == "cold") { crd[$1] = $6; cms[$1] = $4 }
+		if ($2 == "warm") { wrd[$1] = $6; wms[$1] = $4 }
 	}
 	END {
 		bad = 0
-		for (w in cold) {
-			if (cold[w] < 2) {
-				printf "GUARD FAILED window=%s: cold arm read %.1f pages -- cache was not dropped\n", w, cold[w]; bad = 1
-			} else if (cold[w] <= warm[w]) {
-				printf "GUARD FAILED window=%s: cold reads %.1f <= warm reads %.1f -- arms are not distinct\n", w, cold[w], warm[w]; bad = 1
-			} else
-				printf "window=%s: guard ok (cold %.1f reads / %.3f ms vs warm %.1f reads / %.3f ms)\n", w, cold[w], cms[w], warm[w], wms[w]
+		for (w in crd) {
+			# ABSOLUTE: a warm arm that reads is not warm.  One page of slack for
+			# a stray catalog touch inside a plan node.
+			if (wrd[w] > 1) {
+				printf "GUARD FAILED window=%s: warm arm read %.1f pages/query -- prewarm did not hold, warm number is invalid\n", w, wrd[w]
+				bad = 1
+			}
+			# ABSOLUTE: a cold arm that does not read was not cold.
+			if (crd[w] < 2) {
+				printf "GUARD FAILED window=%s: cold arm read %.1f pages/query -- cache was not dropped\n", w, crd[w]
+				bad = 1
+			}
+			if (!bad)
+				printf "window=%s: guards ok (cold %.1f reads / %.3f ms; warm %.1f reads / %.3f ms)\n", w, crd[w], cms[w], wrd[w], wms[w]
 		}
 		exit bad
 	}' "$OUT/summary.tsv"
