@@ -437,6 +437,17 @@ run_p0merge() {
 	$SSH 'cd pg_weave && git apply --reverse --check /tmp/p0.patch && echo "patch reverses cleanly"' \
 		2>&1 | tee "$OUT/p0_setup.log" || die "the P0 patch does not reverse against the uploaded tree"
 
+	# Install once up front.  The corpus generation below calls to_wdoc(), which
+	# needs the extension present -- an earlier version generated the corpus first
+	# and every scale point died on "Could not open extension control file".
+	say "p0 merge: installing the extension so the corpus can be built"
+	$SSH 'cd pg_weave && make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
+		sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
+		sudo -u postgres pg_ctlcluster 17 main restart 2>/dev/null || true
+		psql -q -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_weave"
+		echo "extension present:"; psql -tAc "\dx pg_weave" ' \
+		2>&1 | tee -a "$OUT/p0_setup.log" || die "extension install failed"
+
 	# Alternate variants at each scale point (skill rule: A/B alternate, never
 	# all-A then all-B) so thermal and neighbour drift cannot bias one arm.  One
 	# run per arm per point rather than three: the expected effect is a
@@ -450,8 +461,11 @@ run_p0merge() {
 		# delete and the VACUUM have to be repeated per variant.
 		say "p0 merge: generating source corpus n=$n"
 		$SSH "psql -q -v ON_ERROR_STOP=1 <<SQL
-CREATE EXTENSION IF NOT EXISTS pg_weave;
 DROP TABLE IF EXISTS p0src;
+-- The indexed column must be wdoc, not text: the weave AM has no default
+-- operator class for text, and \`CREATE INDEX ... USING weave (body)\` on a text
+-- column fails with 'data type text has no default operator class'.
+--
 -- High distinct-term count is the point: ~10 tokens/row from a 5M-token space
 -- gives millions of term boundaries in the merge, which is one of the two
 -- conditions the pathology needs.  Natural text would not: its Zipf
@@ -460,8 +474,8 @@ DROP TABLE IF EXISTS p0src;
 -- parallel plan (measured 12x upstream in pg_turbovec b34f22c).
 CREATE TABLE p0src AS
   SELECT i AS id,
-         (SELECT string_agg('t' || ((random() * 5000000)::int), ' ')
-            FROM generate_series(1, 10)) AS body
+         to_wdoc((SELECT string_agg('t' || ((random() * 5000000)::int), ' ')
+                    FROM generate_series(1, 10))) AS d
     FROM generate_series(1, $n) i;
 SQL" 2>&1 | tail -2 | tee -a "$OUT/p0_merge.log"
 
@@ -481,7 +495,7 @@ SQL" 2>&1 | tail -2 | tee -a "$OUT/p0_merge.log"
 				psql -q -v ON_ERROR_STOP=1 <<SQL
 DROP TABLE IF EXISTS p0doc;
 CREATE TABLE p0doc AS SELECT * FROM p0src;
-CREATE INDEX p0doc_weave ON p0doc USING weave (body);
+CREATE INDEX p0doc_weave ON p0doc USING weave (d);
 -- Delete ~15% spread across the whole docid space, so the tombstone sparsemap
 -- has a long chunk chain rather than a few dense chunks.
 DELETE FROM p0doc WHERE id % 7 = 0;

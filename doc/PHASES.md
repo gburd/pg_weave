@@ -240,14 +240,37 @@ checks),
 no verified vector ISA outside x86-64 AVX2, no approximate kernel family, and
 no per-host A/B. V7–V14 not started.
 
-**Phase V gate — REOPENED AS A QUESTION 2026-09-10.** The gate was: on
+**Phase V gate — ANSWERED BY MEASUREMENT 2026-09-12. Resolution 1 is refuted; a
+maintainer decision is needed on the shape that replaces it.** The gate was: on
 1M × 1024-d Cohere-wiki, all three of `recall@10 ≥ 0.99`, `p50 ≤ 2× pgvector HNSW`,
-`size ≤ 0.15× pgvector HNSW` simultaneously. `bench/RESULTS_IVF_RECALL.md` measured
-something that puts two of those three in direct tension:
+`size ≤ 0.15× pgvector HNSW` simultaneously.
 
-- Compressed-domain-only recall@10 at **full probe** tops out at 0.9205 (GloVe-200d)
-  and 0.8780 (GIST-960d) at 4 bits. Full probe means zero probe-miss error, so that
-  is the ceiling over every `nprobe`, and **0.99 is unreachable without a
+`bench/RESULTS_BITWIDTH_SWEEP.md` swept widths 2..8 at full probe on both corpora,
+which is what resolution 1 ("keep both claims, find a rerank representation cheaper
+than float32") required. The result:
+
+- **No supported width reaches 0.99 on GIST-960d.** GloVe needs **8 bits**
+  (0.9950); GIST tops out at 0.9860 at 8 bits with decaying increments. 8 bits is
+  1,024 B/vector at 1024-d = **0.18×** HNSW against a 0.15× budget, so the width
+  that clears 0.99 on the *easier* corpus already misses the storage claim.
+  `recall@10 ≥ 0.99` and `size ≤ 0.15×` are **jointly unsatisfiable with a single
+  code width** — measured, not extrapolated.
+- **But 3 bits plus an exact rerank of a top-100 window is 1.0000 on both
+  corpora**, at 384 B/vector. The rerank has to be full precision (§2.1.1's rule:
+  a *b*-bit rerank cannot beat the *b*-bit ceiling), and a stored float32 sidecar
+  costs `4 * dim` = 4,096 B/vector, worse than HNSW. So the only shape in which
+  both claims survive is one where the rerank reads full precision **from the
+  heap**, where the original vector already is and the index pays nothing for it:
+  **0.067× HNSW on codes, 1.0000 recall, and up to 100 heap fetches per query.**
+
+That converts the problem from storage to latency, against `p50 ≤ 2× pgvector
+HNSW`, and the latency is **unmeasured** — 100 random heap fetches is plausibly
+sub-millisecond warm and several milliseconds cold, and the cold number is the one
+that matters. Measuring it is the next V task.
+
+- Compressed-domain-only recall@10 at **full probe** is 0.9225 (GloVe-200d) and
+  0.8680 (GIST-960d) at 4 bits. Full probe means zero probe-miss error, so that
+  is the ceiling over every `nprobe`, and **0.99 is unreachable at 4 bits without a
   full-precision rerank** (§2.1 of `doc/specs/VECTOR_CHANNEL.md`).
 - A full-coverage float32 rerank sidecar costs `4 * dim` bytes per vector — 4,096 at
   1024-d — which is roughly what pgvector HNSW spends on the vector it stores. The
@@ -271,9 +294,10 @@ ratio**). A `0.15×` budget is therefore about **855 B per vector, which at 1024
   ceiling.** Reranking a top-*W* window with a *b*-bit representation yields the
   *b*-bit ranking of that window, so the minimum viable *b* is the smallest one
   whose full-probe compressed-domain recall@10 reaches 0.99 — and `§2.1` of
-  `doc/specs/VECTOR_CHANNEL.md` has already measured *b* = 2/3/4 at
-  0.7345/0.8515/0.9205 (GloVe-200d) and 0.6130/0.7880/0.8780 (GIST-960d). This is
-  why "rerank with 4-bit codes" is not a candidate: 4 bits *is* the 0.9205 ceiling.
+  `doc/specs/VECTOR_CHANNEL.md` has now measured *b* = 2..8 at
+  0.7345/0.8515/0.9225/0.9570/0.9750/0.9860/0.9950 (GloVe-200d) and
+  0.6130/0.7880/0.8680/0.9200/0.9660/0.9780/0.9860 (GIST-960d). This is
+  why "rerank with 4-bit codes" is not a candidate: 4 bits *is* the 0.9225 ceiling.
 - **"4-bit codes plus an 8-bit sidecar" is refuted without a benchmark.** An
   8-bit-per-coordinate sidecar is 1,024 B by itself — 0.18× HNSW before the scan
   codes exist — and with 4-bit codes the total is 1,536 B, **0.27×**. Arithmetic,

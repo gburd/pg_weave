@@ -31,11 +31,12 @@
  * Unbiasedness constrains the MEAN signed error; recall@10 depends on the RANKING
  * under per-vector error, and an unbiased estimator with nonzero variance still
  * permutes a top-10 list.  Measured at full probe, so with zero probe-miss error,
- * compressed-domain-only recall@10 tops out at 0.7345 / 0.8515 / 0.9205 at 2 / 3 / 4
- * bits on GloVe-200d and 0.6130 / 0.7880 / 0.8780 on GIST-960d.  Phase V's gate is
+ * compressed-domain-only recall@10 tops out at 0.7345 / 0.8515 / 0.9225 at 2 / 3 / 4
+ * bits on GloVe-200d and 0.6130 / 0.7880 / 0.8680 on GIST-960d.  Phase V's gate is
  * 0.99.  So a full-precision rerank pass is REQUIRED at k=10, not optional, and
- * WEAVE_VRERANK is not an extra.  A rerank window of 100 closed the gap on both
- * corpora.  See doc/specs/VECTOR_CHANNEL.md sect. 2.
+ * WEAVE_VRERANK is not an extra.  A rerank window of 100 reaches 1.0000 from 3
+ * bits on both corpora.  See doc/specs/VECTOR_CHANNEL.md sect. 2 and
+ * bench/RESULTS_BITWIDTH_SWEEP.md.
  *
  * DETERMINISM IS PART OF THE CONTRACT.  Encoding the same vector must produce
  * byte-identical codes on x86-64 and aarch64, under any thread count, forever.
@@ -107,12 +108,13 @@ typedef uint8 weave_uint8;
  *
  * The 4-bit ceiling WAS a BLOCKER, and is now lifted to 8.  The Phase V gate
  * turns on the smallest width whose full-probe compressed-domain recall@10
- * reaches 0.99, and the measured 2/3/4-bit points (0.7345/0.8515/0.9205
- * GloVe-200d, 0.6130/0.7880/0.8780 GIST-960d) do not reach it, while the 0.15x
- * storage budget allows at most ~6.68 bits per coordinate at 1024-d.  Deciding
- * the phase therefore requires a solver valid at 5, 6, 7 and 8 bits -- see
- * doc/specs/VECTOR_CHANNEL.md sect. 2.1.1 for the derivation and
- * doc/PHASES.md's Phase V gate for what each outcome means.
+ * reaches 0.99, and the sweep answered it: 8 bits on GloVe-200d (0.9950) and NO
+ * supported width on GIST-960d (0.9860 at 8 bits).  Since the 0.15x storage budget
+ * allows at most ~6.68 bits per coordinate at 1024-d, a single code width cannot
+ * satisfy the recall claim and the storage claim together -- see
+ * bench/RESULTS_BITWIDTH_SWEEP.md, doc/specs/VECTOR_CHANNEL.md sect. 2.1.1 and
+ * doc/PHASES.md's Phase V gate.  Widths 5-8 are supported and correct but have NO
+ * SIMD kernel (KERNEL_GROUP_BITS_MAX, src/vector/kernels.c), so they run scalar.
  *
  * RAISING THIS CONSTANT ALONE PRODUCED A WRONG CODEBOOK, which is why this
  * paragraph is here and not in a commit message.  The solver seeded centroids
