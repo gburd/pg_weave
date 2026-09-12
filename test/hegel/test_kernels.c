@@ -466,9 +466,16 @@ test_rejects(void)
 		CHECK(kernels[k]->score_block(&bad, out) == -1,
 			  "K4 %s accepted nlevels=2 (1-bit codes are not supported)",
 			  kernels[k]->name);
-		lut.nlevels = 32;
+		/* One power of two ABOVE the supported ceiling.  This used to be 32,
+		 * which was correct while WEAVE_BITS_MAX was 4 and is wrong now that it
+		 * is 8 -- 32 levels is a legitimate 5-bit table.  Derived from the
+		 * constant rather than written as a literal so it cannot go stale the
+		 * same way twice; the widths that ARE supported are covered positively by
+		 * the randomized grid, which sweeps WEAVE_BITS_MIN..WEAVE_BITS_MAX. */
+		lut.nlevels = 1 << (WEAVE_BITS_MAX + 1);
 		CHECK(kernels[k]->score_block(&bad, out) == -1,
-			  "K4 %s accepted nlevels=32", kernels[k]->name);
+			  "K4 %s accepted nlevels=%d, above WEAVE_BITS_MAX",
+			  kernels[k]->name, 1 << (WEAVE_BITS_MAX + 1));
 		lut.nlevels = 16;
 
 		bad = blk;

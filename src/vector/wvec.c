@@ -851,7 +851,10 @@ weave_quantize_roundtrip(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("bits must be between %d and %d",
 						WEAVE_BITS_MIN, WEAVE_BITS_MAX),
-				 errhint("Use 4 for best recall, 2 for the smallest index.")));
+				 errhint("Wider codes have lower quantization error at "
+						 "proportionally larger size; %d is the smallest and %d the "
+						 "widest supported.",
+						 WEAVE_BITS_MIN, WEAVE_BITS_MAX)));
 
 	if (weave_quantizer_init(&q, v->dim, bits, NULL,
 							 wvec_palloc, wvec_pfree) != 0)

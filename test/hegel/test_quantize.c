@@ -18,6 +18,15 @@
  *	 P2  rotation is invertible (inverse . forward == identity)
  *	 P3  rotation is deterministic across repeated construction
  *	 P4  codebook centroids are sorted, symmetric, and inside the domain
+ *	 P4b boundaries are the midpoints of neighbouring centroids (nearest
+ *	     neighbour), and strictly interleave them
+ *	 P4c every centroid is the conditional mean of its own cell (Lloyd-Max
+ *	     stationarity -- catches a solver that stops iterating too early)
+ *	 P4d no dead levels: every cell carries mass consistent with the
+ *	     high-resolution companding law (catches levels stranded in the tail)
+ *	 P4e absmax is bounded by a LEVEL-COUNT-AWARE ceiling, not a fixed sd
+ *	     multiple, so the bound tightens as bits rises
+ *	 P4f distortion strictly decreases as bits rises at fixed dim
  *	 P5  encode/decode round-trips to a bounded relative error
  *	 P6  the renormalization scale makes the IP estimator unbiased
  *	 P7  pack/unpack round-trips in both layouts
@@ -228,26 +237,134 @@ test_rotation(int dim)
 	weave_rotation_free(&rot2, free);
 }
 
+/* ---------------------------------------------------------------------------
+ * Test-local quadrature against the sphere marginal.
+ *
+ * Deliberately NOT the solver's adaptive Simpson: an assertion computed with the
+ * arithmetic under test cannot fail for the reason the assertion exists.  This
+ * is fixed-panel composite Simpson evaluated cell-by-cell with EXACT cell
+ * endpoints, which is the part that matters -- classifying samples from one
+ * global grid into cells puts an O(h) error in each cell's mass, and at 8 bits a
+ * central cell is only ~0.017 sd wide, so that error would swamp the centroid
+ * condition below.
+ *
+ * Integrated over the true support [-1, 1] rather than the solver's clipped
+ * domain, so these checks do not inherit beta_domain()'s -80 log-density cutoff.
+ * That is safe rather than sloppy: by construction the density beyond the cutoff
+ * is e^-80 ~ 2e-35 of its peak, which is 28 orders below the smallest cell share
+ * any assertion here uses.
+ *
+ * The panel count is chosen from the interval width in units of the coordinate
+ * standard deviation, not fixed.  That is not tidiness: the OUTERMOST cell runs
+ * from its boundary out to 1, which at dim=1536 is 35 sd wide against a central
+ * cell 0.017 sd wide, and a fixed 512 panels there gives a step of 0.07 sd and a
+ * conditional mean wrong by 5e-5 sd -- enough to fail the centroid condition on
+ * a solver that is actually correct.  A test whose own quadrature error exceeds
+ * the tolerance it asserts is worse than no test.
+ * ------------------------------------------------------------------------- */
+
+#define CELLQ_MIN_PANELS		512
+#define CELLQ_MAX_PANELS		32768
+#define CELLQ_STEP_SD			0.004	/* target step, in units of sd */
+
+/* moment 0: f(x).  1: x*f(x).  2: (x - ref)^2 * f(x). */
+static double
+sphere_integrate(double a, double b, double shape, double sd,
+				 int moment, double ref)
+{
+	double		h,
+				sum = 0.0;
+	int			np,
+				k;
+
+	if (b <= a)
+		return 0.0;
+
+	np = (int) ((b - a) / (CELLQ_STEP_SD * sd)) + 1;
+	if (np < CELLQ_MIN_PANELS)
+		np = CELLQ_MIN_PANELS;
+	if (np > CELLQ_MAX_PANELS)
+		np = CELLQ_MAX_PANELS;
+	np += (np & 1);				/* Simpson needs an even panel count */
+
+	h = (b - a) / (double) np;
+	for (k = 0; k <= np; k++)
+	{
+		double		x = (k == np) ? b : a + (double) k * h;
+		double		t = 1.0 - x * x;
+		double		f,
+					lg,
+					w;
+
+		if (t <= 0.0)
+			continue;
+		lg = shape * log(t);
+		if (lg < -700.0)
+			continue;
+		f = exp(lg);
+		if (moment == 1)
+			f *= x;
+		else if (moment == 2)
+			f *= (x - ref) * (x - ref);
+		w = (k == 0 || k == np) ? 1.0 : ((k & 1) ? 4.0 : 2.0);
+		sum += w * f;
+	}
+	return sum * h / 3.0;
+}
+
+/*
+ * Mean squared quantization error of a codebook against the sphere marginal, in
+ * units of the coordinate variance 1/dim.  Used for the monotone-distortion
+ * property; returns -1 on a degenerate codebook.
+ */
+static double
+codebook_distortion(const WeaveCodebook *cb)
+{
+	double		shape = 0.5 * ((double) cb->dim - 3.0);
+	double		sd = 1.0 / sqrt((double) cb->dim);
+	double		total = 0.0,
+				dist = 0.0;
+	int			i;
+
+	for (i = 0; i < cb->nlevels; i++)
+	{
+		double		a = (i == 0) ? -1.0 : cb->boundary[i - 1];
+		double		b = (i == cb->nlevels - 1) ? 1.0 : cb->boundary[i];
+
+		total += sphere_integrate(a, b, shape, sd, 0, 0.0);
+		dist += sphere_integrate(a, b, shape, sd, 2, cb->centroid[i]);
+	}
+	if (total <= 0.0)
+		return -1.0;
+	return (dist / total) * (double) cb->dim;
+}
+
 static void
 test_codebook(int bits, int dim)
 {
 	WeaveCodebook cb;
+	double		shape = 0.5 * ((double) dim - 3.0);
+	double		sd = 1.0 / sqrt((double) dim);
+	double		total;
+	double		minshare = 1e300;
+	int			n;
 	int			i;
 
 	CHECK(weave_codebook_solve(bits, dim, &cb) == 0,
 		  "codebook_solve failed bits=%d dim=%d", bits, dim);
+	n = cb.nlevels;
 
 	/* P4: sorted */
-	for (i = 0; i + 1 < cb.nlevels; i++)
+	for (i = 0; i + 1 < n; i++)
 		CHECK(cb.centroid[i] < cb.centroid[i + 1],
 			  "bits=%d dim=%d centroids not sorted at %d: %.9g >= %.9g",
 			  bits, dim, i, (double) cb.centroid[i], (double) cb.centroid[i + 1]);
 
 	/* P4: symmetric about zero */
-	for (i = 0; i < cb.nlevels / 2; i++)
+	for (i = 0; i < n / 2; i++)
 	{
 		double		lo = cb.centroid[i];
-		double		hi = cb.centroid[cb.nlevels - 1 - i];
+		double		hi = cb.centroid[n - 1 - i];
 
 		CHECK(fabs(lo + hi) <= 1e-6 * (1.0 + fabs(hi)),
 			  "bits=%d dim=%d codebook not symmetric at %d: %.9g vs %.9g",
@@ -260,22 +377,202 @@ test_codebook(int bits, int dim)
 		  bits, dim, (double) cb.absmax);
 
 	/*
-	 * Scale sanity: a coordinate of a random unit vector has sd 1/sqrt(dim), so
-	 * the outermost centroid must land within a few sd of zero.  This is the
-	 * check that catches the "adaptive Simpson missed the spike" failure the
-	 * domain clipping in beta_domain() exists to prevent -- without it, absmax
-	 * comes out near 0.5 for every dim, which looks fine in isolation.
+	 * P4b: THE NEAREST-NEIGHBOUR CONDITION.  weave/quantize.h promises that
+	 * boundary[i] is the midpoint of centroid[i] and centroid[i+1] -- that is
+	 * what makes the branchless comparison ladder in quantize_one() equivalent
+	 * to the distance search it replaces.  A boundary that is merely "between"
+	 * its neighbours yields a quantizer that is sorted, plausible, and not
+	 * nearest-neighbour, and nothing else in this suite would notice.
+	 * Boundaries must also strictly interleave the centroids.
+	 */
+	for (i = 0; i + 1 < n; i++)
+	{
+		double		mid = 0.5 * ((double) cb.centroid[i] + (double) cb.centroid[i + 1]);
+
+		CHECK(fabs((double) cb.boundary[i] - mid) <= 1e-6 * (sd + fabs(mid)),
+			  "bits=%d dim=%d boundary %d is not the midpoint: %.9g vs %.9g",
+			  bits, dim, i, (double) cb.boundary[i], mid);
+		CHECK(cb.centroid[i] < cb.boundary[i] && cb.boundary[i] < cb.centroid[i + 1],
+			  "bits=%d dim=%d boundary %d does not interleave: %.9g not in (%.9g, %.9g)",
+			  bits, dim, i, (double) cb.boundary[i],
+			  (double) cb.centroid[i], (double) cb.centroid[i + 1]);
+	}
+
+	/*
+	 * P4c: THE CENTROID CONDITION.  Each centroid must equal the conditional
+	 * mean of its own cell.  Together with P4b this is the full statement of
+	 * Lloyd-Max stationarity, so between them they say "this is the optimal
+	 * fixed-rate quantizer for this source", not merely "this is a sorted
+	 * ladder".
+	 *
+	 * Tolerance 1e-5 sd.  Derivation: the solve runs in double and terminates on
+	 * a step below 1e-11 of the integration domain, and the codebook is then
+	 * STORED AS FLOAT32, whose 24-bit mantissa puts a 6e-8 relative floor on any
+	 * centroid -- about 2e-8 sd at these magnitudes.  This quadrature adds its
+	 * own error, empirically under 1e-8 sd.  1e-5 sd is therefore ~500x above the
+	 * float32 representation floor and still 100x below the 1e-3 sd residual that
+	 * the previous Lloyd-iteration solver left behind at 5 bits when it exited on
+	 * its 200-sweep cap.  This is the assertion that catches a solver which stops
+	 * iterating too early -- a failure mode that leaves every other property in
+	 * this function satisfied.
+	 */
+	total = 0.0;
+	for (i = 0; i < n; i++)
+	{
+		double		a = (i == 0) ? -1.0 : cb.boundary[i - 1];
+		double		b = (i == n - 1) ? 1.0 : cb.boundary[i];
+		double		m0 = sphere_integrate(a, b, shape, sd, 0, 0.0);
+		double		m1 = sphere_integrate(a, b, shape, sd, 1, 0.0);
+
+		total += m0;
+		CHECK(m0 > 0.0, "bits=%d dim=%d cell %d has zero mass", bits, dim, i);
+		if (m0 > 0.0)
+			CHECK(fabs(m1 / m0 - (double) cb.centroid[i]) <= 1e-5 * sd,
+				  "bits=%d dim=%d centroid %d is not its cell mean: %.9g vs %.9g "
+				  "(residual %.3g sd -- solver not converged?)",
+				  bits, dim, i, (double) cb.centroid[i], m1 / m0,
+				  fabs(m1 / m0 - (double) cb.centroid[i]) / sd);
+	}
+
+	/*
+	 * P4d: NO DEAD LEVELS.  This is the assertion that matters, and it replaced
+	 * a hardcoded `absmax < 6.0 * sd` plausibility heuristic that was calibrated
+	 * at 2-4 bits and hid a real defect at 6-8.
+	 *
+	 * A level whose cell carries no probability mass is a level no coordinate
+	 * ever maps to, so it costs a code point and buys nothing: an "8-bit" code
+	 * with 168 unreachable levels carries under 6.5 bits of real resolution.
+	 * Measured with the previous uniform centroid seed, which spread levels over
+	 * beta_domain() -- a domain that depends on the distribution shape but not on
+	 * the level count -- at dim=1536, counting a level UNREACHABLE when its cell
+	 * holds under 1e-6 of the fair share 1/n:
+	 *
+	 *		bits  unreachable  smallest cell share, x fair share 1/n
+	 *		----  -----------  -------------------------------------
+	 *		   4        0/16                              1.3e-01
+	 *		   5        0/32                              1.9e-02
+	 *		   6        2/64                              8.5e-09
+	 *		   7       42/128                             4.1e-14
+	 *		   8      122/256                             5.4e-25
+	 *
+	 * At 8 bits that is 122 of 256 levels that no coordinate would ever select,
+	 * and 168 of 256 holding under 1 % of their fair share.  After the fix the
+	 * unreachable count is 0 at every (bits, dim) and the smallest share is
+	 * 1.4e-03 of fair share.
+	 *
+	 * THE BOUND IS DERIVED, not picked.  Under the high-resolution (Bennett /
+	 * Panter-Dite) approximation the optimal level density is proportional to
+	 * f(x)^(1/3), normalized to n levels, so a cell's width is 1/lambda(x) and
+	 * its mass is f(x)/lambda(x) = K f(x)^(2/3) / n with K = integral of
+	 * f^(1/3).  For a Gaussian of standard deviation s the constants cancel:
+	 *
+	 *		n * share(x) = sqrt(3) * exp(-x^2 / (3 s^2))
+	 *
+	 * and the sphere marginal is Gaussian to O(1/d).  The SMALLEST share is the
+	 * outermost cell's, at x = absmax, so the floor below is that law evaluated
+	 * at the codebook's own absmax with a 4x allowance for the approximation
+	 * being asymptotic in n.  Measured ratio of actual to predicted across all
+	 * (bits, dim) here: 0.72 to 0.93, so the 4x is ~4-5x of real margin -- while
+	 * the broken codebook above misses it by nine orders of magnitude at 6 bits
+	 * and thirteen at 8.  Unlike a fixed multiple of sd, this tightens
+	 * automatically as bits rises.
+	 */
+	CHECK(total > 0.0, "bits=%d dim=%d total mass is zero", bits, dim);
+	for (i = 0; i < n && total > 0.0; i++)
+	{
+		double		a = (i == 0) ? -1.0 : cb.boundary[i - 1];
+		double		b = (i == n - 1) ? 1.0 : cb.boundary[i];
+		double		share = sphere_integrate(a, b, shape, sd, 0, 0.0) / total;
+
+		if (share * (double) n < minshare)
+			minshare = share * (double) n;
+	}
+	{
+		double		a = (double) cb.absmax / sd;
+		double		predicted = sqrt(3.0) * exp(-a * a / 3.0);
+
+		CHECK(minshare >= 0.25 * predicted,
+			  "bits=%d dim=%d DEAD LEVEL: smallest cell share is %.4g x 1/n, "
+			  "companding law predicts %.4g (absmax=%.4g sd)",
+			  bits, dim, minshare, predicted, a);
+	}
+
+	/*
+	 * P4e: absmax must track the DISTRIBUTION, not the integration domain.  The
+	 * old form of this was `absmax < 6.0 * sd`, a constant calibrated when the
+	 * ceiling was 4 bits; at 8 bits the true Lloyd-Max outermost centroid is
+	 * 4.59 sd, so 6.0 was simultaneously too loose to catch a codebook whose
+	 * levels had escaped into the dead tail at 6 bits (measured 7.46 sd at
+	 * dim=1536, would have passed at 5.39 sd at dim=1024) and on course to become
+	 * too tight had the true value kept climbing.  Both problems come from the
+	 * bound not knowing n.
+	 *
+	 * Derived from the same companding law: the outermost cell's share obeys
+	 * n * share = sqrt(3) exp(-a^2 / 3) with a = absmax / sd, and a level whose
+	 * cell holds less than 1/n of its fair share 1/n -- i.e. less than 1/n^2 of
+	 * the whole distribution -- is a level not worth its code point.  Requiring
+	 * n * share >= 1/n gives a <= sqrt(3 ln(sqrt(3) n^2)).  That is 3.16 sd at
+	 * n=4, 4.28 at n=16, 5.16 at n=64 and 5.91 at n=256, against measured 1.50,
+	 * 2.73, 3.73 and 4.59 -- roughly 1.3x margin at the top end, and it rejects
+	 * every broken point from 6 bits up.
 	 */
 	{
-		double		sd = 1.0 / sqrt((double) dim);
+		double		ceil_sd = sqrt(3.0 * log(sqrt(3.0) * (double) n * (double) n));
 
-		CHECK((double) cb.absmax < 6.0 * sd,
-			  "bits=%d dim=%d absmax=%.6g implausible vs sd=%.6g "
-			  "(codebook domain likely wrong)",
-			  bits, dim, (double) cb.absmax, sd);
+		CHECK((double) cb.absmax < ceil_sd * sd,
+			  "bits=%d dim=%d absmax=%.6g is %.4g sd, above the level-count "
+			  "ceiling %.4g sd (levels in dead space, or domain tracking)",
+			  bits, dim, (double) cb.absmax, (double) cb.absmax / sd, ceil_sd);
 		CHECK((double) cb.absmax > 0.2 * sd,
 			  "bits=%d dim=%d absmax=%.6g collapsed vs sd=%.6g",
 			  bits, dim, (double) cb.absmax, sd);
+	}
+}
+
+/*
+ * P4f: MONOTONE DISTORTION.  Mean squared quantization error must strictly
+ * decrease as bits rises at fixed dim.  This is the single best end-to-end check
+ * that a wider code is genuinely wider: a codebook can be sorted, symmetric,
+ * stationary and still be a waste of bits if a chunk of its levels sit where
+ * nothing lands, and distortion is the one number that notices.  With the
+ * previous solver, distortion at dim=1536 went 6.4e-2 (4 bits), 5.4e-2 (5),
+ * 1.5e-1 (6) -- it got WORSE from 5 to 6 bits, i.e. a wider code that stored
+ * less.  Nothing else in this suite failed on that.
+ *
+ * A ratio gate as well as strict decrease: high-resolution theory says
+ * distortion falls by 4x per added bit (6.02 dB), so anything above 0.5x per bit
+ * means levels are being wasted even if the sequence is technically decreasing.
+ */
+static void
+test_distortion_monotone(int dim)
+{
+	double		prev = -1.0;
+	int			bits;
+
+	for (bits = WEAVE_BITS_MIN; bits <= WEAVE_BITS_MAX; bits++)
+	{
+		WeaveCodebook cb;
+		double		d;
+
+		CHECK(weave_codebook_solve(bits, dim, &cb) == 0,
+			  "codebook_solve failed bits=%d dim=%d", bits, dim);
+		d = codebook_distortion(&cb);
+		CHECK(d > 0.0, "bits=%d dim=%d distortion not positive: %.6g", bits, dim, d);
+		printf("  dim=%d bits=%d: MSE = %.6g of coordinate variance", dim, bits, d);
+		if (prev > 0.0)
+		{
+			printf("  (%.3fx)", d / prev);
+			CHECK(d < prev,
+				  "dim=%d distortion NOT monotone in bits: %d bits gives %.6g, "
+				  "%d bits gives %.6g -- a wider code that stores less",
+				  dim, bits - 1, prev, bits, d);
+			CHECK(d < 0.5 * prev,
+				  "dim=%d distortion barely improved from %d to %d bits: "
+				  "%.6g -> %.6g (%.3fx, theory says 0.25x) -- wasted levels",
+				  dim, bits - 1, bits, prev, d, d / prev);
+		}
+		printf("\n");
+		prev = d;
 	}
 }
 
@@ -627,6 +924,10 @@ main(void)
 	for (bits = WEAVE_BITS_MIN; bits <= WEAVE_BITS_MAX; bits++)
 		for (i = 0; i < ndims; i++)
 			test_codebook(bits, dims[i]);
+
+	printf("codebook distortion vs bits (must strictly decrease)\n");
+	for (i = 0; i < ndims; i++)
+		test_distortion_monotone(dims[i]);
 
 	printf("encode/decode\n");
 	for (bits = WEAVE_BITS_MIN; bits <= WEAVE_BITS_MAX; bits++)

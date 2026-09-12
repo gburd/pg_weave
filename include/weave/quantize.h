@@ -105,14 +105,28 @@ typedef uint8 weave_uint8;
  * explicit error term is the better design (not implemented; see
  * doc/specs/VECTOR_CHANNEL.md sect. 11).
  *
- * The 4-bit ceiling is now a BLOCKER, not just a validation boundary.  The
- * Phase V gate turns on the smallest width whose full-probe compressed-domain
- * recall@10 reaches 0.99, and the measured 2/3/4-bit points (0.7345/0.8515/0.9205
+ * The 4-bit ceiling WAS a BLOCKER, and is now lifted to 8.  The Phase V gate
+ * turns on the smallest width whose full-probe compressed-domain recall@10
+ * reaches 0.99, and the measured 2/3/4-bit points (0.7345/0.8515/0.9205
  * GloVe-200d, 0.6130/0.7880/0.8780 GIST-960d) do not reach it, while the 0.15x
  * storage budget allows at most ~6.68 bits per coordinate at 1024-d.  Deciding
- * the phase therefore requires validating this solver at 5, 6, 7 and 8 bits --
- * see doc/specs/VECTOR_CHANNEL.md sect. 2.1.1 for the derivation and
+ * the phase therefore requires a solver valid at 5, 6, 7 and 8 bits -- see
+ * doc/specs/VECTOR_CHANNEL.md sect. 2.1.1 for the derivation and
  * doc/PHASES.md's Phase V gate for what each outcome means.
+ *
+ * RAISING THIS CONSTANT ALONE PRODUCED A WRONG CODEBOOK, which is why this
+ * paragraph is here and not in a commit message.  The solver seeded centroids
+ * uniformly across beta_domain() -- a domain fixed by the distribution shape and
+ * blind to the level count -- and skipped cells with no mass.  Up to 4 bits every
+ * cell has mass; at 8 bits, 74-122 of the 256 levels (29-48 %, over dims
+ * 64..1536) were seeded in the dead tail and never moved, so an "8-bit" code
+ * carried under 6.5 bits of real resolution and absmax tracked the DOMAIN
+ * (10.6 sd at dim=1536) rather than the distribution (4.59 sd).  Separately and independently, the Lloyd iteration was
+ * capped at 200 sweeps where it needs O(n^2) of them, so it had never converged
+ * at ANY width.  Both are fixed in src/vector/quantize.c, and the properties
+ * that hold the fix in place are test_quantize.c's P4b-P4f -- in particular "no
+ * dead levels", which is what the old `absmax < 6.0 * sd` heuristic was a weak
+ * and, above 4 bits, failing proxy for.
  *
  * A second, independent reason to gate 1 bit if it is ever added: pg_turbovec's
  * OWN 1-bit sign code (a different design from this file's renormalization
@@ -130,7 +144,7 @@ typedef uint8 weave_uint8;
  * dim RaBitQ nominally supports.  See doc/specs/VECTOR_CHANNEL.md sect. 11
  * item 3 for the numbers and the full non-transfer argument. */
 #define WEAVE_BITS_MIN			2
-#define WEAVE_BITS_MAX			4
+#define WEAVE_BITS_MAX			8
 
 /* Vectors per SIMD block.  The scan kernels process this many lanes at a time
  * and the block bound in weave/channel.h terms covers exactly this range. */
@@ -152,20 +166,30 @@ typedef uint8 weave_uint8;
  * no codebook page, and no build-time sample: two indexes over different
  * corpora with the same (bits, d) have bit-identical codebooks.
  *
- * The solver is Lloyd-Max: alternate (centroid = conditional mean of its cell,
- * boundary = midpoint between neighbouring centroids) to convergence, with the
- * conditional means computed by adaptive Simpson quadrature against the Beta
- * density.  Lloyd-Max is optimal for a fixed-rate scalar quantizer, and the
- * literature puts fixed-rate scalar quantization of a smooth source within
- * roughly 2.7x of the Shannon rate-distortion bound.  That factor is cited, not
- * measured by us; see doc/specs/VECTOR_CHANNEL.md sect. 4.
+ * The solver targets the Lloyd-Max stationarity conditions -- centroid =
+ * conditional mean of its cell, boundary = midpoint between neighbouring
+ * centroids -- with the conditional means computed by adaptive Simpson quadrature
+ * against the Beta density.  Lloyd-Max is optimal for a fixed-rate scalar
+ * quantizer, and the literature puts fixed-rate scalar quantization of a smooth
+ * source within roughly 2.7x of the Shannon rate-distortion bound.  That factor
+ * is cited, not measured by us; see doc/specs/VECTOR_CHANNEL.md sect. 4.
+ *
+ * Two things about HOW it is solved are load-bearing, both argued at length at
+ * the code that enforces them:
+ *
+ *	- Centroids are seeded at the QUANTILES of the Beta, so every initial cell
+ *	  carries mass ~1/n at every n.  A uniform seed over the integration domain
+ *	  strands most of the levels in the dead tail above 4 bits.
+ *	- The conditions are then solved by NEWTON on a tridiagonal system, not by
+ *	  Lloyd's alternating iteration, which needs O(n^2) sweeps here -- 130k at
+ *	  256 levels, against a 200-sweep cap.  Newton takes 3-7.
  * ------------------------------------------------------------------------- */
 
 #define WEAVE_MAX_LEVELS		(1 << WEAVE_BITS_MAX)
 
 typedef struct WeaveCodebook
 {
-	int			bits;			/* 2..4 */
+	int			bits;			/* WEAVE_BITS_MIN..WEAVE_BITS_MAX */
 	int			dim;			/* the d the Beta shape was derived from */
 	int			nlevels;		/* 1 << bits */
 
@@ -185,9 +209,19 @@ typedef struct WeaveCodebook
 
 /*
  * Solve (or fetch from the process-local memo) the codebook for (bits, dim).
- * The solve costs 25-100 ms, so it is memoized; the memo is keyed on the pair
- * and is safe to consult from multiple backends because the result is a pure
- * function of the key.
+ * The solve costs a few ms at 2 bits and ~20 ms at 8, so it is memoized; the memo
+ * is keyed on the pair and is safe to consult from multiple backends because the
+ * result is a pure function of the key.
+ *
+ * A WeaveCodebook IS NOT A FORMAT.  It is never written to a page, a file, or a
+ * WAL record: grep the type and every use is a stack local, a static memo slot,
+ * or an embedded field of a stack-resident WeaveQuantizer.  It is derived from
+ * (bits, dim), both of which the segment already records, so changing the solver
+ * requires no format version bump.  What changing the solver DOES change is the
+ * code a coordinate maps to, so an index built before a solver change is read
+ * afterwards against a different codebook than it was written with -- an upgrade
+ * concern, not a format concern.  This is also why WEAVE_MAX_LEVELS growing from
+ * 16 to 256, which makes this struct 16x larger, has no on-disk consequence.
  *
  * Returns 0 on success, -1 if bits or dim is out of range.
  */

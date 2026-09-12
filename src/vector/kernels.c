@@ -86,17 +86,35 @@
 static inline int
 bits_from_nlevels(int nlevels)
 {
-	switch (nlevels)
+	int			bits;
+
+	for (bits = WEAVE_BITS_MIN; bits <= WEAVE_BITS_MAX; bits++)
 	{
-		case 4:
-			return 2;
-		case 8:
-			return 3;
-		case 16:
-			return 4;
+		if (nlevels == (1 << bits))
+			return bits;
 	}
 	return -1;
 }
+
+/*
+ * Widest code the group-gather fast paths can address.
+ *
+ * This is a STRUCTURAL limit of the addressing scheme, not a validation
+ * boundary, so it is a separate constant from WEAVE_BITS_MAX and does not move
+ * when that one does.  group_word() reads the `bits` bytes that hold the codes of
+ * EIGHT lanes for one coordinate into a weave_uint32 and wide_group()/avx2_group()
+ * shift them out at 8 * bits; 8 * 4 == 32, so 4 bits exactly fills the word and
+ * 5 does not fit.  Supporting wider codes there means a 64-bit gather word and a
+ * second set of shift constants -- a real kernel change with its own
+ * bit-identity argument to make -- not a bumped constant.
+ *
+ * Until that exists, 5-8 bit blocks go to weave_score_block_scalar(), which
+ * reaches codes only through the pack API and is width-agnostic.  That is a
+ * throughput decision with no correctness content: the scalar path IS the oracle
+ * the fast paths are required to match, so falling back to it cannot change an
+ * answer.  See doc/PHASES.md V6.
+ */
+#define KERNEL_GROUP_BITS_MAX	4
 
 /*
  * The 32 `allow` bits covering this block, as a lane-indexed mask, plus the
@@ -399,8 +417,12 @@ weave_score_block_wide(const WeaveScoreBlock *blk, float *out)
 	 * reaches codes only through the pack API and so handles either layout --
 	 * rather than to a second, less-tested addressing scheme here.  int8-dot
 	 * kernels are what VECMAJOR is for, and none exists.
+	 *
+	 * Codes wider than KERNEL_GROUP_BITS_MAX are declined the same way and for a
+	 * reason of the same kind: the gather word is 32 bits and holds 8 lanes, so
+	 * it runs out at 4 bits per lane.  See the comment on that constant.
 	 */
-	if (blk->layout != WEAVE_PACK_LANE)
+	if (blk->layout != WEAVE_PACK_LANE || bits > KERNEL_GROUP_BITS_MAX)
 		return weave_score_block_scalar(blk, out);
 
 	avail = lane_avail_mask(blk);
@@ -526,10 +548,11 @@ weave_score_block_avx2(const WeaveScoreBlock *blk, float *out)
 	if (bits < 0)
 		return -1;
 
-	/* Declined explicitly, for the reason spelled out in
+	/* Declined explicitly, for the two reasons spelled out in
 	 * weave_score_block_wide(): this path assumes the LANE layout's byte-aligned
-	 * 8-lane groups, and the oracle is the one that reads either layout. */
-	if (blk->layout != WEAVE_PACK_LANE)
+	 * 8-lane groups, and its gather word holds only KERNEL_GROUP_BITS_MAX bits per
+	 * lane.  The oracle reads either layout at any width. */
+	if (blk->layout != WEAVE_PACK_LANE || bits > KERNEL_GROUP_BITS_MAX)
 		return weave_score_block_scalar(blk, out);
 
 	avail = lane_avail_mask(blk);
