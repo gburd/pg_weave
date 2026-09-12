@@ -486,9 +486,16 @@ run_rerankcold() {
 		&& echo installed' 2>&1 | tee "$OUT/build.log" || die "build/install failed"
 
 	say "cold rerank latency"
+	# `|| die`, because run.sh runs without `set -e`: the first version of this
+	# job died on its first SQL statement and the driver still printed
+	# "done -- artifacts in ...", which is exactly the class of failure this
+	# harness keeps producing.  Artifacts are collected BEFORE the check so a
+	# failed run still yields its logs.
 	$SSH "cd pg_weave && OUT=\$HOME/out NROWS=${NROWS:-1000000} NSAMP=${NSAMP:-25} \
 			bash bench/rerank_cold.sh" 2>&1 | tee "$OUT/rerankcold.log"
+	rc=${PIPESTATUS[0]}
 	$SSH 'cd ~/out && tar cf - .' | tar xf - -C "$OUT" 2>/dev/null || true
+	[ "$rc" = 0 ] || die "rerank_cold.sh failed (see $OUT/rerankcold.log)"
 }
 
 run_hnswbase() {
@@ -509,7 +516,9 @@ run_hnswbase() {
 	say "HNSW baseline"
 	$SSH "cd pg_weave && OUT=\$HOME/out NROWS=${NROWS:-1000000} NSAMP=${NSAMP:-25} \
 			bash bench/hnsw_base.sh" 2>&1 | tee "$OUT/hnswbase.log"
+	rc=${PIPESTATUS[0]}
 	$SSH 'cd ~/out && tar cf - .' | tar xf - -C "$OUT" 2>/dev/null || true
+	[ "$rc" = 0 ] || die "hnsw_base.sh failed (see $OUT/hnswbase.log)"
 }
 
 run_p0merge() {
