@@ -146,19 +146,72 @@ budget. The extrapolation above said ~7 for GloVe and "possibly unreachable at 8
 for GIST: optimistic by one width on GloVe, right about GIST. Close enough to have
 been tempting, and wrong enough to have justified the sweep.
 
-**What survives instead: 3 bits plus an exact rerank of a top-100 window, which is
-1.0000 on both corpora at 384 B/vector.** That does not violate the rule above,
-because the rerank is done at float32 rather than in a *b*-bit representation — so
-the ceiling that binds is float32's, which is 1.0. But it does mean the rerank data
-cannot be a cheap quantized sidecar; it has to be full precision, and a stored
-float32 sidecar is `4 * dim` = 4,096 B/vector, worse than HNSW. The only shape in
-which both claims survive therefore reads full precision from the **heap**, where
-the original vector already lives and the index pays nothing for it:
+**What survives instead: b-bit codes plus an exact float32 rerank of a top-w
+window, read from the heap.** That does not violate the rule above, because the
+rerank is done at float32 rather than in a *b*-bit representation — so the ceiling
+that binds is float32's, which is 1.0. But it does mean the rerank data cannot be a
+cheap quantized sidecar; it has to be full precision, and a stored float32 sidecar
+is `4 * dim` = 4,096 B/vector, worse than HNSW. The only shape in which both claims
+survive therefore reads full precision from the **heap**, where the original vector
+already lives and the index pays nothing for it.
 
-- index bytes: **0.067× HNSW** at 1024-d (codes only);
-- recall@10: **1.0000**;
-- query cost: up to 100 heap fetches, against `p50 ≤ 2× pgvector HNSW` —
-  **unmeasured**, and the cold-cache figure is the one that decides it.
+**Both `b` and `w` were then measured, and the answer is not the narrowest width.**
+`bench/RESULTS_BITWIDTH_SWEEP.md` swept the window as well as the width; rerank I/O
+is priced at 2.388 page reads per candidate at 1024-d from
+`bench/RESULTS_RERANK_IO.md`. Binding window is the larger of the two corpora':
+
+| bits | window @ 0.99 | index B/vector | ×HNSW | page reads/query | SIMD kernel |
+|---|---|---:|---:|---:|---|
+| 2 | > 75 | 256 | 0.045 | > 179 | yes |
+| 3 | 40 | 384 | 0.067 | 96 | yes |
+| **4** | **20** | **512** | **0.090** | **48** | **yes** |
+| 5 | 15 | 640 | 0.112 | 36 | no |
+| 6 | 15 | 768 | 0.135 | 36 | no |
+
+Once the rerank comes from the heap, **every width from 3 to 6 clears the 0.15×
+budget**, so storage stops binding and I/O starts. The right width is therefore the
+one that minimizes reads while staying inside the budget — the opposite of the
+"narrowest width that fits" instinct that produced the 3-bit reading of this
+section. **The recommended shape is 4 bits with a top-20 window:**
+
+- recall@10 **0.9940** (GIST-960d), 0.9970 (GloVe-200d);
+- index **512 B/vector = 0.090× HNSW** at 1024-d;
+- **48 random page reads per query**, a 5× cut from 3-bit/100-window's 239;
+- the widest width that keeps the SIMD code-scan kernel (§9: 5–8 bits fall back to
+  the scalar oracle). Five bits saves 12 reads per query and gives up vectorized
+  scoring to do it — the wrong trade, because the code scan touches every vector
+  while the rerank touches twenty.
+
+**The window is the fragile number, and it is the one the frontier rests on.** A
+window must be wide enough to still contain the true top-10 after quantization
+perturbs the ordering, and nothing makes that requirement invariant in corpus size
+— 1M vectors put roughly 10× more near-neighbours in range to displace them. So
+`window @ 0.99` measured at n = 100k–200k is a **lower bound** for the 1M gate
+corpus, and 20 could be 30 or 50 there. Re-measure at n = 1M before this shape is
+committed to an on-disk format, because the page-read budget tracks it one-for-one.
+
+**Read the cost through TOAST, not through "a heap fetch".** `wvec` is
+`STORAGE = external`, so past about 490 dimensions the vector is out of line and a
+candidate costs a toast-index descent plus chunk reads. An earlier draft of this
+section priced the window at "up to 100 heap fetches"; the measured figure is 2.4×
+that. It is not the 5× that one-page-per-chunk arithmetic predicts, because a
+value's chunks are written consecutively and about four pack into one 8 KB page —
+at 1536-d the toast relation holds exactly 1.000 pages per value. Two consequences
+worth carrying:
+
+- the cost is **bimodal**, not linear: when the vectors fit in the buffer pool
+  these reads go to zero and the rerank is pure CPU. Since the codes are 0.067× of
+  what HNSW must keep resident, there is a corpus range where the codes fit and
+  HNSW's index does not;
+- 1024-d reads **more** pages per candidate than 1536-d (2.388 vs 2.043), because
+  3 chunks straddle page boundaries while 4 chunks fill a page exactly. If rerank
+  data is ever stored deliberately, size it to land on that boundary.
+
+The whole window's TIDs are known before the first fetch, since the fused top-k
+produces them together, so the reads can be issued concurrently — where HNSW's
+traversal cannot, being dependent by construction. **The gate turns on prefetch
+depth**, which is a property of this shape rather than a tuning knob, and that is
+what the cold EC2 run has to measure.
 
 Task V10 changes shape accordingly: `WEAVE_PK_VRERANK` as a stored sidecar is no
 longer the plan, and the rerank source becomes the heap. That is a maintainer
