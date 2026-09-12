@@ -69,6 +69,17 @@ typedef struct TokenizerState
 	TokenizerMode mode;
 	int         bracket_depth;
 	int         brace_depth;
+	/*
+	 * Byte offset of the first member position of the current bracket
+	 * expression (just past '[', or past a leading '^' if the class is
+	 * negated), or -1 when not inside one.  A '-' is a range operator only
+	 * when it sits BETWEEN two members; POSIX makes it a literal when it is
+	 * the first or last member instead, so `[-_]`, `[abc-]` and `[-]` all
+	 * denote a literal dash.  Without this, the tokenizer has no way to
+	 * tell "first member" from "range operator" and must guess -- see the
+	 * '-' case in weave_tokenize_next() for the guess it used to make.
+	 */
+	int         bracket_first;
 } TokenizerState;
 
 /*
@@ -83,6 +94,7 @@ init_tokenizer(TokenizerState *ts, const char *input, int len)
 	ts->mode = MODE_NORMAL;
 	ts->bracket_depth = 0;
 	ts->brace_depth = 0;
+	ts->bracket_first = -1;
 }
 
 /*
@@ -240,12 +252,37 @@ weave_tokenize_next(WeaveParseCtx *ctx, WeaveToken *out)
 		}
 		else if (c == '-')
 		{
+			/*
+			 * Only a '-' strictly between two other members is a range
+			 * operator.  ts->pos already points past this '-' (next_char()
+			 * consumed it above), so "first" means it sits right at
+			 * bracket_first and "last" means the very next byte closes the
+			 * expression.
+			 */
+			bool at_first = (ts->bracket_first >= 0 &&
+							  ts->pos - 1 == ts->bracket_first);
+			bool at_last = (ts->pos < ts->len &&
+							 ts->input[ts->pos] == ']');
+
+			if (at_first || at_last)
+			{
+				out->cp = '-';
+				return TOK_LITERAL;
+			}
 			return TOK_DASH;
 		}
 		else if (c == '^')
 		{
 			/* ^ is CARET only at the start of the bracket expression */
 			/* We'll let the parser handle the context */
+			/*
+			 * A negating '^' is itself the first byte of the bracket
+			 * expression; POSIX still treats the byte after it as "first"
+			 * (e.g. '-' in `[^-x]` is a literal), so shift bracket_first
+			 * past the caret rather than leaving it pointed at the caret.
+			 */
+			if (ts->bracket_first >= 0 && ts->pos - 1 == ts->bracket_first)
+				ts->bracket_first = ts->pos;
 			return TOK_CARET;
 		}
 		else if (c == '\\')
@@ -338,6 +375,7 @@ weave_tokenize_next(WeaveParseCtx *ctx, WeaveToken *out)
 		case '[':
 			ts->bracket_depth++;
 			ts->mode = MODE_BRACKET;
+			ts->bracket_first = ts->pos; /* first member starts right here */
 			return TOK_LBRACKET;
 
 		case '{':

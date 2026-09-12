@@ -326,6 +326,10 @@ check-standalone:
 	$$tmp/ul | tail -1; \
 	echo "== TRE d0e0c997 -> f864ed0 (pg_tre 1521662): backref wrong-answer fix =="; \
 	bash test/hegel/run_tre_bump.sh backref | tail -1; \
+	echo "== pg_tre 2be8dbf (v3.2.5): literal '-' first/last in a bracket expression =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -I test/hegel/pgshim_regex -I src/query \
+		-o $$tmp/rxdash test/hegel/test_regex_dash.c src/query/regex_tokens.c; \
+	$$tmp/rxdash | tail -1; \
 	echo "== ALL STANDALONE CHECKS PASSED =="
 
 # The INT_MAX crash fix (pg_tre 1521662 / upstream ad26b6d) needs an actual
