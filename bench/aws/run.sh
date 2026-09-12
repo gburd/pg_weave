@@ -214,7 +214,15 @@ grep -q 'pg_config: PostgreSQL 17' "$OUT/provision.log" \
 # result unusable (.agent/skills/weave-bench).
 say "tuning postgresql"
 MEMKB=$($SSH "awk '/MemTotal/{print \$2}' /proc/meminfo")
-SB=$(( MEMKB / 1024 / 1024 * 40 / 100 ))       # 40% of RAM, in MB
+# 40% of RAM, in MB.  MEMKB is KILOBYTES, so ONE division by 1024 gives MB.
+# This line used to divide twice and then label the result MB, so every tuned
+# run this harness ever produced had shared_buffers set to 24 MB on a 61 GB box
+# -- a 1000x under-allocation, in the step that exists specifically to stop an
+# untuned number being mistaken for a tuned one.  It went unnoticed because the
+# readback that would have shown it was itself broken (it ran as -U postgres and
+# always failed), which is why the plausibility check below is not optional:
+# a guard that cannot fail is not a guard.
+SB=$(( MEMKB / 1024 * 40 / 100 ))
 $SSH "sudo mkdir -p /etc/postgresql/17/main/conf.d
 sudo tee -a /etc/postgresql/17/main/conf.d/bench.conf >/dev/null <<EOF
 shared_buffers = ${SB}MB
@@ -260,6 +268,19 @@ $SSH 'sudo -u postgres createuser -s $(whoami) 2>/dev/null || true
 
 grep -q 'shared_buffers = ' "$OUT/tuning.log" \
 	|| die "tuning could not be read back (see $OUT/tuning.log)"
+
+# Plausibility, not just presence.  shared_buffers is meant to be ~40% of RAM,
+# so anything reported in MB below four figures means the arithmetic or the unit
+# suffix is wrong again and the run would measure an untuned server.
+SBSEEN=$(sed -n 's/^shared_buffers = \([0-9]*\).*/\1/p' "$OUT/tuning.log")
+SBUNIT=$(sed -n 's/^shared_buffers = [0-9]*\([A-Za-z]*\).*/\1/p' "$OUT/tuning.log")
+case "$SBUNIT" in
+	GB) : ;;
+	MB) [ "${SBSEEN:-0}" -ge 1024 ] \
+			|| die "shared_buffers came back as ${SBSEEN}${SBUNIT} -- untuned; refusing to measure" ;;
+	*)  die "shared_buffers came back as '${SBSEEN}${SBUNIT}', which is not a size this check understands" ;;
+esac
+say "shared_buffers = ${SBSEEN}${SBUNIT} (of $(( MEMKB / 1024 / 1024 )) GB RAM)"
 
 say "uploading source"
 # git archive of HEAD: only committed state is measured, so a result can always
