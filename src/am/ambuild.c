@@ -2057,7 +2057,26 @@ typedef struct MergeSource
 	uint8	   *tombbuf;			/* tombstone bitmap blob, or NULL */
 	sm_t		tomb;
 	bool		hastomb;
-	sm_cursor_cached_t tombcache;
+
+	/*
+	 * Tombstones as a DENSE bitmap, decoded once when the source is opened.
+	 *
+	 * This replaced an `sm_cursor_cached_t tombcache` passed to
+	 * sm_contains_cached() per posting, and the replacement is a P0 fix rather
+	 * than an optimization -- see the long comment in merge_source_open().
+	 * Short version: the merge walks TERMS in sorted order and each term's
+	 * postings restart from a low docid, so the docid sequence is not globally
+	 * monotonic.  It resets at every term boundary, which defeats both the MRU
+	 * cache and any forward cursor and forces an O(chunks) head-walk per
+	 * posting.  Over millions of terms that is O(terms * chunks) and VACUUM
+	 * never finishes on a delete-heavy index.
+	 *
+	 * `tombdense` is NULL and `tombdense_n` is 0 when there are no tombstones,
+	 * which makes the `dv < tombdense_n` guard in the merge loop both the
+	 * bounds check and the NULL check.
+	 */
+	uint8	   *tombdense;
+	uint64		tombdense_n;		/* bits addressable in tombdense, 0 if none */
 	WeaveDoclens doclens;			/* v4 source doclen sidecar (empty for v3) */
 	bool		has_doclen_col;		/* v3 source: doclen inline in postings */
 } MergeSource;
@@ -2192,7 +2211,8 @@ merge_source_open(Relation index, const WeaveSegMeta *seg, MergeSource *src,
 	src->valid = false;
 	src->tombbuf = NULL;
 	src->hastomb = false;
-	memset(&src->tombcache, 0, sizeof(src->tombcache));
+	src->tombdense = NULL;
+	src->tombdense_n = 0;
 
 	/* v4 source: doclen lives in the segment sidecar, not the postings.  Load it
 	 * once so the merge can re-attach each posting's exact length.  A v3 source
@@ -2205,6 +2225,79 @@ merge_source_open(Relation index, const WeaveSegMeta *seg, MergeSource *src,
 		src->tombbuf = weave_read_blob(index, seg->livedocs, seg->livedocslen);
 		sm_open(&src->tomb, (uint8_t *) src->tombbuf, seg->livedocslen);
 		src->hastomb = true;
+
+		/*
+		 * Decode the sparsemap ONCE into a dense bitmap.  This is a P0 fix: a
+		 * delete-heavy index could make VACUUM run without ever finishing.  The
+		 * upstream commit this is ported from, and the reason no CI-scale test can
+		 * catch a regression here, are in bench/RESULTS_P0_MERGE_TOMBSTONE.md.
+		 *
+		 * The mechanism is worth stating exactly, because the code it replaces
+		 * looks correct and *is* correct -- it is only the cost that is wrong.
+		 * weave_merge_segments_streaming() iterates TERMS in sorted order, and
+		 * each term's postings ascend from a low docid, so the sequence of docids
+		 * tested against this map is NOT globally monotonic: it resets at every
+		 * term boundary.  sm_contains_cached()'s MRU cache and sm_contains()'s
+		 * forward cursor both assume near-monotonic access; a reset sends them
+		 * back to an O(chunks) head-walk.  Per posting that is invisible, but the
+		 * merge does it once per (term, posting), so the total is
+		 * O(terms * chunks).  Upstream measured the shape that kills it: 2.19M
+		 * docs with 312k tombstones is ~1,068 chunks against ~7.4M terms.
+		 *
+		 * A dense bitmap is O(1) per test and costs one forward pass to build,
+		 * so the whole per-source cost is O(tombstones + chunks) -- paid once
+		 * instead of once per term.
+		 *
+		 * NOTE FOR TESTING: no CI-scale test can catch the regression if this is
+		 * reverted.  Upstream reverted its own fix and its new delete-heavy VACUUM
+		 * test still PASSED, because at ~60k docs the chunk chain stays short
+		 * enough that O(terms * chunks) never dominates inside a timeout.
+		 * Exposure needs a long chunk chain AND millions of term boundaries at the
+		 * same time.  See bench/RESULTS_P0_MERGE_TOMBSTONE.md.
+		 */
+		{
+			uint64		mx = sm_maximum(&src->tomb);
+			uint64		cap;
+			sm_cursor_t cur = SM_CURSOR_INIT;
+			uint64		v;
+
+			/*
+			 * Size by the LARGEST TOMBSTONED DOCID, not by the segment's live-doc
+			 * count.  A docid is heap_block * MaxHeapTuplesPerPage + offset (see
+			 * weave_tid_to_docid), i.e. a sparse GLOBAL address unrelated to how
+			 * many docs this segment holds.  Sizing by ndocs would silently drop
+			 * most tombstones -- and dropping a tombstone resurrects a deleted
+			 * row, which is a wrong answer, not a slow one.
+			 */
+			cap = (mx == SM_IDX_MAX) ? 0 : mx + 1;
+			if (cap > 0)
+			{
+				Size		nbytes = (Size) ((cap + 7) / 8);
+				MemoryContext oldctx = MemoryContextSwitchTo(src->ctx);
+
+				/*
+				 * MaxAllocSize is reachable here, which is why this is the
+				 * huge-safe variant rather than palloc0: cap is bounded by
+				 * nblocks * MaxHeapTuplesPerPage, so the bitmap is ~36 bytes per
+				 * heap block, and 1 GB corresponds to a heap of roughly 236 GB.
+				 * Large, but not hypothetical, and `make check-alloc` exists
+				 * because four real crashes in the project this was forked from
+				 * were exactly this class.
+				 */
+				src->tombdense = (uint8 *) WEAVE_ALLOC_MAYBE_HUGE(nbytes);
+				memset(src->tombdense, 0, nbytes);
+				MemoryContextSwitchTo(oldctx);
+			}
+			src->tombdense_n = cap;
+
+			for (v = sm_next_member(&src->tomb, (uint64_t) -1, &cur);
+				 v != SM_IDX_MAX;
+				 v = sm_next_member(&src->tomb, v, &cur))
+			{
+				if (v < cap)
+					src->tombdense[v >> 3] |= (uint8) (1u << (v & 7));
+			}
+		}
 	}
 
 	merge_source_load_page(src);	/* position on the first term */
@@ -2441,11 +2534,21 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 			{
 				uint32		doclen = post[k].doclen;
 
-				if (s->hastomb &&
-					sm_contains_cached(&s->tomb,
-									   weave_tid_to_docid(&post[k].tid),
-									   &s->tombcache))
-					continue;	/* tombstoned: physically drop */
+				if (s->hastomb)
+				{
+					uint64		dv = weave_tid_to_docid(&post[k].tid);
+
+					/*
+					 * O(1) bit test.  This used to be sm_contains_cached()
+					 * against the sparsemap, which is O(chunks) here because
+					 * the enclosing loop is term-major and the docid sequence
+					 * therefore resets at every term boundary.  See
+					 * merge_source_open().
+					 */
+					if (dv < s->tombdense_n &&
+						(s->tombdense[dv >> 3] & (uint8) (1u << (dv & 7))) != 0)
+						continue;	/* tombstoned: physically drop */
+				}
 				/* v4 source: post[k].doclen is 0 (no inline column); recover the
 				 * exact length from the source's sidecar so the merged segment
 				 * carries correct doclen (and re-quantizes it into its own sidecar). */

@@ -247,6 +247,16 @@ check-alloc:
 # and the literal variant strings "bm25+"/"bm25l"/"bm25f"/"bm25s" are all
 # legitimate). Only a bare bm25_ prefix at a word boundary (the OLD C symbol
 # prefix, e.g. a stray "bm25_foo") is treated as a residual.
+#
+# The ban on the bare upstream project name under src/ and include/ is absolute
+# on purpose, and it costs something: a ported fix cannot cite its upstream SHA
+# in the code comment. That citation goes in the commit message and in the
+# bench/RESULTS_*.md or doc/specs/ page the comment points at, which is where
+# this project keeps provenance anyway (doc/LICENSING.md,
+# doc/specs/IMPORT_pg_tre.md). Discovered while porting the merge tombstone P0:
+# three prose citations tripped the lint, and loosening it to recognize prose
+# would have meant distinguishing a comment from a string literal in a shell
+# grep, which is how a guard stops guarding.
 .PHONY: check-rename
 check-rename:
 	@fail=0; \
