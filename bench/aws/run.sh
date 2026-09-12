@@ -33,6 +33,15 @@ set -uo pipefail
 PROFILE=${AWS_PROFILE:-lava}
 ITYPE=${1:-c7i.4xlarge}
 JOB=${2:-smoke}
+# Root volume size in GiB.  80 is fine for the code-only jobs; the corpus jobs
+# need far more (GloVe unzips to ~2 GB, GIST's base set to ~4 GB, and the P0
+# job's 2M-row index plus its heap does not fit alongside them in 80).  gp3
+# IOPS and throughput are set explicitly because the defaults throttle, which
+# would turn a merge measurement into a measurement of EBS.
+VOLGB=${VOLGB:-80}
+case "$JOB" in
+	bitsweep|p0merge|vall) VOLGB=${VOLGB_OVERRIDE:-250} ;;
+esac
 REGION=$(aws configure get region --profile "$PROFILE")
 RUN=pgweave-$(date -u +%Y%m%d-%H%M%S)
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -123,7 +132,7 @@ say "ami $AMI"
 IID=$(aws ec2 run-instances --profile "$PROFILE" \
 	--image-id "$AMI" --instance-type "$ITYPE" --key-name "$KEYNAME" \
 	--security-group-ids "$SGID" --count 1 \
-	--block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=80,VolumeType=gp3,DeleteOnTermination=true}' \
+	--block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$VOLGB,VolumeType=gp3,Iops=8000,Throughput=500,DeleteOnTermination=true}" \
 	--instance-initiated-shutdown-behavior terminate \
 	--tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$RUN},{Key=Project,Value=pg_weave}]" \
 	--query 'Instances[0].InstanceId' --output text) || die "run-instances"
@@ -285,6 +294,141 @@ run_lexical() {
 		2>&1 | tee "$OUT/lexical.log"
 }
 
+run_bitsweep() {
+	# THE measurement the Phase V gate turns on: the smallest code width whose
+	# full-probe compressed-domain recall@10 reaches 0.99.  See doc/PHASES.md's
+	# Phase V gate block and doc/specs/VECTOR_CHANNEL.md sect. 2.1.1 for why the
+	# answer decides whether the `size <= 0.15x pgvector HNSW` claim survives.
+	#
+	# Widths 2, 3 and 4 are re-measured, not assumed: the codebook solver was
+	# found to have never converged (a 200-sweep cap against the ~700 sweeps a
+	# 16-level solve needs), so the previously published 0.9205 / 0.8780 figures
+	# came from an unconverged 4-bit codebook.  This run replaces them.
+	#
+	# FULL PROBE is the point.  probes == lists means zero probe-miss error, so
+	# the recall reported on that row is the ceiling over every nprobe -- a
+	# property of the codebook and the estimator alone.  A better partition
+	# cannot raise it, which is what makes it a valid gate.
+	say "fetching corpora"
+	$SSH 'set -e
+		sudo apt-get install -y unzip >/dev/null 2>&1 || true
+		mkdir -p /scratch/corpus && cd /scratch/corpus
+		if [ ! -f glove.6B.200d.txt ]; then
+			curl -sSLO https://nlp.stanford.edu/data/glove.6B.zip
+			unzip -o -q glove.6B.zip glove.6B.200d.txt && rm -f glove.6B.zip
+		fi
+		if [ ! -f gist/gist_base.fvecs ]; then
+			curl -sSO ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz
+			tar xzf gist.tar.gz && rm -f gist.tar.gz
+		fi
+		ls -l glove.6B.200d.txt gist/gist_base.fvecs' \
+		2>&1 | tee "$OUT/corpus.log" || die "corpus fetch failed"
+
+	say "building ivf_recall"
+	$SSH 'cd pg_weave && gcc -O2 -march=native -std=gnu99 -I include \
+			-o /scratch/ivf_recall bench/ivf_recall.c \
+			src/vector/quantize.c src/vector/pack.c -lm && echo built' \
+		2>&1 | tee -a "$OUT/corpus.log" || die "ivf_recall build failed"
+
+	# One invocation per corpus walks every (lists, bits, probes) cell, so the
+	# whole width sweep is two commands rather than fourteen.
+	say "GloVe-200d: bits 2..8, full probe"
+	$SSH '/scratch/ivf_recall glove /scratch/corpus/glove.6B.200d.txt 200000 200 \
+			lists=512 bits=2,3,4,5,6,7,8 probes=1,8,32,128,512 windows=10,100 k=10' \
+		2>&1 | tee "$OUT/bitsweep_glove.log"
+
+	say "GIST-960d: bits 2..8, full probe"
+	$SSH '/scratch/ivf_recall fvecs /scratch/corpus/gist/gist_base.fvecs 100000 100 \
+			lists=512 bits=2,3,4,5,6,7,8 probes=1,8,32,128,512 windows=10,100 k=10' \
+		2>&1 | tee "$OUT/bitsweep_gist.log"
+}
+
+run_p0merge() {
+	# A/B for the merge tombstone P0 (bench/RESULTS_P0_MERGE_TOMBSTONE.md).
+	#
+	# A hang cannot be waited out, so this measures a SCALING CURVE rather than a
+	# single number: VACUUM wall-clock at increasing corpus size, which should
+	# grow superlinearly before the fix and near-linearly after.  Exposure needs
+	# a long sparsemap chunk chain AND millions of term boundaries at the same
+	# time, so the corpus is generated with a deliberately huge vocabulary --
+	# ~10 tokens per row drawn from a 5M-token space -- rather than natural text,
+	# whose Zipf distribution would give far fewer distinct terms per row.
+	#
+	# The "before" build is produced by reverting the fix commit rather than by
+	# checking out an older tree, so the two binaries differ in exactly that
+	# commit and nothing else.
+	say "p0 merge A/B: preparing both builds"
+	$SSH 'cd pg_weave && git rev-parse --short HEAD && git log --oneline -1 --grep="P0: VACUUM"' \
+		2>&1 | tee "$OUT/p0_setup.log"
+
+	# Alternate variants at each scale point (skill rule: A/B alternate, never
+	# all-A then all-B) so thermal and neighbour drift cannot bias one arm.  One
+	# run per arm per point rather than three: the expected effect is a
+	# superlinear blow-up, not a few percent, so run-to-run variance is not the
+	# limiting factor here -- and an operation that does not terminate has no
+	# variance to average in the first place.  If the curves come out close, that
+	# is itself the finding and it gets repeated properly.
+	for n in 250000 750000 2000000; do
+		# Generate the random text ONCE per scale point.  It is the expensive
+		# part and it is identical for both arms; only the index build, the
+		# delete and the VACUUM have to be repeated per variant.
+		say "p0 merge: generating source corpus n=$n"
+		$SSH "psql -q -U postgres -v ON_ERROR_STOP=1 <<SQL
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+DROP TABLE IF EXISTS p0src;
+-- High distinct-term count is the point: ~10 tokens/row from a 5M-token space
+-- gives millions of term boundaries in the merge, which is one of the two
+-- conditions the pathology needs.  Natural text would not: its Zipf
+-- distribution yields far fewer distinct terms for the same row count.
+-- CREATE TABLE AS, never INSERT ... SELECT -- the latter silently loses the
+-- parallel plan (measured 12x upstream in pg_turbovec b34f22c).
+CREATE TABLE p0src AS
+  SELECT i AS id,
+         (SELECT string_agg('t' || ((random() * 5000000)::int), ' ')
+            FROM generate_series(1, 10)) AS body
+    FROM generate_series(1, $n) i;
+SQL" 2>&1 | tail -2 | tee -a "$OUT/p0_merge.log"
+
+		for variant in fixed before; do
+			say "p0 merge: n=$n variant=$variant"
+			$SSH "set -e
+				cd pg_weave
+				git checkout -- . 2>/dev/null || true
+				if [ '$variant' = before ]; then
+					git revert --no-commit \$(git log --format=%H --grep='P0: VACUUM' -1)
+				fi
+				make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
+				sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
+				git checkout -- . 2>/dev/null || true
+				sudo -u postgres pg_ctlcluster 17 main restart 2>/dev/null || true
+				psql -q -U postgres -v ON_ERROR_STOP=1 <<SQL
+DROP TABLE IF EXISTS p0doc;
+CREATE TABLE p0doc AS SELECT * FROM p0src;
+CREATE INDEX p0doc_weave ON p0doc USING weave (body);
+-- Delete ~15% spread across the whole docid space, so the tombstone sparsemap
+-- has a long chunk chain rather than a few dense chunks.
+DELETE FROM p0doc WHERE id % 7 = 0;
+SQL
+				echo \"--- n=$n variant=$variant ---\"
+				psql -tA -U postgres -c \
+					\"SELECT 'nterms=' || nterms FROM weave_index_stats('p0doc_weave')\" || true
+				psql -tA -U postgres -c \
+					\"SELECT 'idxsize=' || pg_size_pretty(pg_relation_size('p0doc_weave'))\" || true
+				# timeout so a genuine non-termination reports as a bound rather
+				# than hanging the whole run
+				start=\$(date +%s.%N)
+				if timeout 3600 psql -q -U postgres -c 'VACUUM p0doc'; then
+					end=\$(date +%s.%N)
+					echo \"VACUUM_SECONDS \$(echo \"\$end - \$start\" | bc)\"
+				else
+					echo 'VACUUM_SECONDS >3600 (timed out)'
+				fi" \
+				2>&1 | tee -a "$OUT/p0_merge.log"
+		done
+	done
+	say "p0 merge A/B done -- see $OUT/p0_merge.log"
+}
+
 run_bound() {
 	# The measurement from bench/RESULTS_BOUND_PRUNING.md, on real hardware and
 	# over more dimensions than a laptop run covers.  This is the number the
@@ -301,6 +445,9 @@ case "$JOB" in
 	smoke)   run_smoke ;;
 	bound)   run_bound ;;
 	lexical) run_smoke; run_lexical ;;
+	bitsweep) run_bitsweep ;;
+	p0merge) run_p0merge ;;
+	vall)    run_bitsweep; run_p0merge ;;
 	all)     run_smoke; run_bound; run_lexical ;;
 	*)     die "unknown job: $JOB" ;;
 esac
