@@ -181,6 +181,46 @@ terminal marking has no slot at depth 0 to hang it on, so the builder returns
 `WEAVE_SURF_EMPTY_TERM` and makes the caller deal with it rather than dropping a
 term the dictionary contains.
 
+#### The precondition on that contract: the trie speaks the analyzer's alphabet
+
+The one-sided-error contract above holds **only when the probe key has been put
+through the same analysis pipeline as the terms in the dictionary.** Every
+consumer that uses the trie to *reject* owes this check. Stated as the rule to
+apply:
+
+> If the query's matching semantics differ from the analyzer's folding in any way,
+> the trie says **nothing**. Do not reject.
+
+This is imported wisdom, and expensive wisdom. pg_tre shipped the identical
+structure for two releases with a defect in exactly this shape: `amrescan` marked
+the case-insensitive strategies `always_true` (the index stores trigrams as
+written, so `~*`/`ILIKE` cannot be trigram-accelerated) but did so *after*
+extraction had already published an anchored-prefix key range, and the SuRF
+prefilter consulted only the range. The range described the pattern's literal
+codepoints with no case folding, so `name ~* '^GIT'` carried the key for `"GIT"`
+against an index legitimately holding `"git"`. The filter correctly answered "no
+such key" and **the scan returned zero rows — no error, no warning, for two
+releases**, because the only regression test exercised the case-*sensitive*
+operator. Fixed upstream in the shared prefilter plus extraction; pg_weave has
+ported the extraction half (`src/query/extract.c:545`) and still owes the
+scan-side half, which is blocked only because nothing consumes the range yet.
+
+**pg_weave's exposure is not the same as pg_tre's, and is arguably worse.** pg_tre
+stores trigrams verbatim, so its hazard is a folded query against unfolded storage.
+pg_weave's trie is built over the **bolt vocabulary**, i.e. over terms the text
+search configuration has already normalized — usually case-folded, and possibly
+stemmed. So:
+
+- a case-**insensitive** query is fine *provided* its key goes through the same
+  configuration, because both sides are folded identically;
+- a case-**sensitive** query (`LIKE 'GIT%'`) cannot be answered by the trie at all,
+  because the dictionary has already discarded the distinction the query depends on.
+  The trie will happily report that `GIT` is absent while the document contains it.
+
+That is the inverse of upstream's bug and it fails in the same silent direction.
+Whichever way round it is, the discipline is one line at every consumer, and
+`doc/PHASES.md` Z4 and Z6 both inherit it.
+
 ### 3.3 On-disk layout, v1
 
 One contiguous little-endian image, `WEAVE_SURFTRIE_MAGIC` = `"WST1"`. The AM
