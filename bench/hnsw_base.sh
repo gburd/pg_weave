@@ -48,6 +48,8 @@ DIM=${DIM:-960}
 EFS=${EFS:-"10 40 100 200 400 800"}
 M=${M:-16}
 EFC=${EFC:-64}
+MWM=${MWM:-24GB}
+PARW=${PARW:-7}
 OUT=${OUT:-$HOME/out}
 WORK=${WORK:-/scratch/hnswbase}
 PSQL="psql -X -q -v ON_ERROR_STOP=1"
@@ -69,9 +71,14 @@ if [ "$($PSQL -tAc "SELECT count(*) FROM pg_class WHERE relname='vec'")" = 0 ]; 
 fi
 
 say "load integrity"
+# The norm is computed as sqrt(-(v <#> v)) rather than with l2_norm(): pgvector
+# defines l2_norm for halfvec and sparsevec, so calling it on a `vector` is
+# reachable only through implicit casts and errors with "function l2_norm(vector)
+# is not unique". `<#>` is negative inner product, so -(v <#> v) is v.v.
 $PSQL -tA -F$'\t' -c \
 	"SELECT count(*), count(v), min(vector_dims(v)), max(vector_dims(v)),
-	        round(min(l2_norm(v))::numeric,6), round(max(l2_norm(v))::numeric,6) FROM vec" \
+	        round(min(sqrt(-(v <#> v)))::numeric,6),
+	        round(max(sqrt(-(v <#> v)))::numeric,6) FROM vec" \
 	| tee "$OUT/integrity.tsv"
 read -r n nv dmin dmax nmin nmax < <(tr '\t' ' ' < "$OUT/integrity.tsv")
 [ "$n" = "$nv" ] || { echo "FAIL: NULL vectors" >&2; exit 1; }
@@ -101,10 +108,21 @@ fi
 
 # ---------------------------------------------------------------- build
 if [ "$($PSQL -tAc "SELECT count(*) FROM pg_class WHERE relname='vec_hnsw'")" = 0 ]; then
+	# maintenance_work_mem must hold the whole graph or pgvector falls back to an
+	# on-disk build that is far slower and, more importantly, is not the
+	# configuration anyone deploys.  A 1M x 960-d graph is ~5 GB, so the harness
+	# default of 2 GB would have measured the fallback path and called it HNSW.
+	# pgvector emits a NOTICE when it switches; it is kept in the log deliberately
+	# so that a build which did fall back is visible rather than inferred.
 	say "building HNSW (m=$M, ef_construction=$EFC) -- this is the slow step"
 	/usr/bin/time -f 'hnsw_build_seconds %e' \
-		$PSQL -c "CREATE INDEX vec_hnsw ON vec USING hnsw (v vector_cosine_ops)
+		$PSQL -c "SET maintenance_work_mem = '$MWM';
+		          SET max_parallel_maintenance_workers = $PARW;
+		          CREATE INDEX vec_hnsw ON vec USING hnsw (v vector_cosine_ops)
 		          WITH (m = $M, ef_construction = $EFC)" 2>&1 | tee "$OUT/build.log"
+	if grep -qi 'hnsw graph no longer fits\|building index in-memory\|external' "$OUT/build.log"; then
+		grep -i 'notice\|warning' "$OUT/build.log" | head -5
+	fi
 fi
 
 say "index size -- THE DENOMINATOR every x-HNSW figure divides by"
