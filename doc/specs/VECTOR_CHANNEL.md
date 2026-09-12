@@ -186,29 +186,74 @@ data**. There is no k-means, no codebook page, and no build-time sample: two
 indexes over unrelated corpora with the same `(bits, d)` have bit-identical
 codebooks. That is what "data-oblivious" buys.
 
-Solved by Lloyd–Max — alternate (centroid = conditional mean of its cell,
-boundary = midpoint of neighbouring centroids) — with conditional means from
-adaptive Simpson quadrature against the Beta density, ≤ 200 iterations, memoized
-per `(bits, d)` in an 8-slot process-local table. The memo needs no locking: the
-result is a pure function of the key, so a racing writer can only store the same
-bytes.
+The stationarity conditions are Lloyd–Max: centroid = conditional mean of its
+cell, boundary = midpoint of neighbouring centroids, with conditional means from
+adaptive Simpson quadrature against the Beta density. Memoized per `(bits, d)` in
+an 8-slot process-local table. The memo needs no locking: the result is a pure
+function of the key, so a racing writer can only store the same bytes. Nothing
+about the codebook is on disk — it is derived from `(bits, d)`, both already
+recorded in the segment — so a solver change needs no format version bump.
 
-Two implementation notes that are the difference between a correct codebook and a
-plausible one:
+Four implementation notes that are the difference between a correct codebook and a
+plausible one. The first two were known; the last two were found on 2026-09-11
+when the width ceiling was raised from 4 to 8, and each of them **silently
+degraded the wide codebooks while every existing assertion passed**:
 
 - **Clip the integration domain.** The density concentrates in `|x| ≲ 1/√d`; at
   d = 1024 the exponent is 510.5 and `(1−x²)^510.5` is zero beyond |x| > 0.4.
   Adaptive Simpson seeded on [−1, 1] with three points sees `f(−1)=f(1)=0`,
   `f(0)=1`, and a smooth-looking estimate — it misses the spike. So clip to where
-  the log-density exceeds −80 and treat the rest as exactly zero. Without this,
-  `absmax` comes out near 0.5 for every dimension, which looks fine in isolation;
-  `test_quantize.c` catches it by requiring `absmax < 6/√d`.
+  the log-density exceeds −80 and treat the rest as exactly zero.
 - **Cap the recursion depth at 14, not 40.** With a tolerance tight enough to
   resolve the spike, depth 40 is 2⁴⁰ evaluations and the solve never returns.
+- **Seed the centroids at the Beta's quantiles, not uniformly over the clipped
+  domain.** The clipped domain depends on the distribution shape but *not* on the
+  level count: at d = 1536 it is 12.3 σ wide, because −80 log-density is all it
+  means. At 4–16 levels every uniform cell still catches mass. At 64–256 levels
+  the outer cells land in the dead tail, their mass underflows, and the solver's
+  empty-cell guard — which exists to keep the ladder sorted for the branchless
+  quantizer — pins them exactly where they were seeded, forever:
 
-Bit widths 2–4. Fixed-rate scalar quantization of a smooth source is within
+  Counting a level **unreachable** when its cell holds under 1e−6 of the fair
+  share 1/n — so under one coordinate in 1e6/n would ever select it — at d = 1536:
+
+  | bits | levels | unreachable | under 1 % of fair share | smallest cell mass, ×(1/n) |
+  |---:|---:|---:|---:|---:|
+  | 4 | 16 | 0 | 0 | 1.3e−01 |
+  | 5 | 32 | 0 | 0 | 1.9e−02 |
+  | 6 | 64 | 2 | 20 | 8.5e−09 |
+  | 7 | 128 | 42 (33 %) | 72 | 4.1e−14 |
+  | 8 | 256 | 122 (48 %) | 168 (66 %) | 5.4e−25 |
+
+  A level in dead space is a level no coordinate ever maps to, so an "8-bit" code
+  carried under 6.5 bits of real resolution, and `absmax` reported 10.6 σ where
+  the true Lloyd–Max outermost centroid is 4.59 σ. An equiprobable seed gives
+  every initial cell mass ≈ 1/n at every *n* and every *d*, which removes the
+  dependence on the domain being level-count-aware. After the fix: **zero
+  unreachable levels at every `(bits, d)`**, and smallest cell mass 1.4e−03 ×(1/n)
+  at 8 bits — the outermost cell of a correct Lloyd–Max quantizer, whose share the
+  companding law asserted by `test_quantize.c` P4d independently predicts at
+  1.6e−03.
+
+- **Solve the conditions by Newton, not by Lloyd's alternating iteration.**
+  Lloyd's map propagates a correction one cell per sweep along a chain of *n*
+  cells, so it needs O(n²) sweeps: measured 54 at n = 4, 700 at n = 16, 10k at
+  n = 64, 130k at n = 256. The 200-sweep cap therefore meant the solver had
+  **never converged at any width**, and the shortfall grows with *n* — at 8 bits
+  the 200-sweep answer put the outermost centroid at 3.86 σ against a true 4.59 σ.
+  Over-relaxation (ω ≤ 1.9) buys 1.4×; Gauss–Seidel is 3× *worse*. But the cell
+  depends only on `c[i−1], c[i], c[i+1]`, so the Jacobian of
+  `F_i(c) = E[X | cell_i] − c_i` is **tridiagonal** and one Newton step is a
+  Thomas solve: 3–7 iterations at every `(bits, d)`, reaching the same fixed
+  point as 130k Lloyd sweeps.
+
+Bit widths 2–8. Fixed-rate scalar quantization of a smooth source is within
 roughly 2.7× of the Shannon rate–distortion bound; that factor is **cited from
-the literature, not measured here.**
+the literature, not measured here.** What *is* measured here, by
+`test_quantize.c`, is that the mean squared quantization error falls by
+0.252–0.294× per added bit across 2–8 bits and 64–1536 d, against the 0.25×
+high-resolution theory predicts — which is the end-to-end evidence that each
+added bit is real.
 
 ## 5. TQ+ calibration
 
@@ -615,7 +660,7 @@ lanes. That is task V11 and its gate is a torn-write injection TAP test.
    corpus distribution moves away from the sample, recall degrades silently.
    Mitigation is weak: `WeaveVecMeta` records the sample size and fit timestamp so
    `weave_check()` can at least report staleness.
-3. **Bit widths 2–4 only.** 1-bit is deliberately excluded, and pg_turbovec's
+3. **Bit widths 2–8 only.** 1-bit is deliberately excluded, and pg_turbovec's
    sign-BQ work across v2.6.0–v2.8.1 (2026-09-08 through 2026-09-10) supports
    that while adding constraints worth adopting now rather than rediscovering:
 
@@ -694,7 +739,7 @@ lanes. That is task V11 and its gate is a torn-write injection TAP test.
 | gate | test | status |
 |---|---|---|
 | V2 rotation determinism | `test/hegel/test_quantize.c` P1–P3 + committed cross-arch fixture hash | properties pass; fixture owed |
-| V3 codebook | `test_quantize.c` P4 (sorted, symmetric, `absmax < 6/√d`) + fixture | passing |
+| V3 codebook | `test_quantize.c` P4 (sorted, symmetric, in range), P4b (nearest-neighbour boundaries), P4c (centroid condition), P4d (no dead levels), P4e (level-count-aware `absmax` ceiling), P4f (monotone distortion) + fixture | passing, 2–8 bits |
 | V4 encode round-trip and unbiasedness | `test_quantize.c` P5, P6 | passing |
 | V5 packing | `test/hegel/test_pack.c`: round-trip, lane isolation, `move_lane`/`zero_lane`, guard-byte bounds | passing, 1,909,440 checks |
 | V6 kernel equivalence | `test/hegel/test_kernels.c`: every ISA path == scalar | passing, 308,278 checks over `scalar`, `lut-wide`, `lut-avx2`, including ⟨q, reconstruct(code)⟩ agreement (K5) and rejection of an out-of-range `firstwarp` (K4, under ASan); **the rest of the ISA matrix is unmet, tabulated as unmet in §8** |

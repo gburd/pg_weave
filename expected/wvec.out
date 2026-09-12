@@ -319,12 +319,28 @@ SELECT wvec_l2_distance(x, weave_quantize_roundtrip(x, 4))
 SELECT weave_quantize_roundtrip('[0,0,0,0]'::wvec, 4);   -- zero vector must fail
 ERROR:  cannot quantize a zero wvec
 DETAIL:  A zero vector has no direction, so its renormalization scale is undefined.
-SELECT weave_quantize_roundtrip('[1,2,3,4]'::wvec, 1);   -- bits out of range
-ERROR:  bits must be between 2 and 4
-HINT:  Use 4 for best recall, 2 for the smallest index.
-SELECT weave_quantize_roundtrip('[1,2,3,4]'::wvec, 5);
-ERROR:  bits must be between 2 and 4
-HINT:  Use 4 for best recall, 2 for the smallest index.
+SELECT weave_quantize_roundtrip('[1,2,3,4]'::wvec, 1);   -- below WEAVE_BITS_MIN
+ERROR:  bits must be between 2 and 8
+HINT:  Wider codes have lower quantization error at proportionally larger size; 2 is the smallest and 8 the widest supported.
+SELECT weave_quantize_roundtrip('[1,2,3,4]'::wvec, 9);   -- above WEAVE_BITS_MAX
+ERROR:  bits must be between 2 and 8
+HINT:  Wider codes have lower quantization error at proportionally larger size; 2 is the smallest and 8 the widest supported.
+-- 5..8 bits became legal when WEAVE_BITS_MAX rose from 4 to 8; the widest width
+-- must round-trip like any other, and more bits must not be worse than fewer.
+SELECT wvec_dims(weave_quantize_roundtrip('[1,2,3,4,5,6,7,8]'::wvec, 8)) AS rt_dims_8bit;
+ rt_dims_8bit 
+--------------
+            8
+(1 row)
+
+SELECT wvec_l2_distance(x, weave_quantize_roundtrip(x, 8))
+       <= wvec_l2_distance(x, weave_quantize_roundtrip(x, 4)) AS bits8_not_worse_than_4
+  FROM (SELECT '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]'::wvec AS x) s;
+ bits8_not_worse_than_4 
+------------------------
+ t
+(1 row)
+
 SELECT weave_quantize_size(768, 4) AS bytes_768_4bit;     -- 384 codes + 8 lane
  bytes_768_4bit 
 ----------------

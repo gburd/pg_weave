@@ -96,7 +96,10 @@
 #define MAXPROBES		64
 #define MAXWIN			8
 #define MAXLISTS_CFG	8
-#define MAXBITS_CFG		4
+/* All widths WEAVE_BITS_MIN..WEAVE_BITS_MAX must fit in one sweep, so that
+ * `bits=2,3,4,5,6,7,8` is a single run rather than silently truncated by
+ * parse_list().  Sized from the header so it tracks the header. */
+#define MAXBITS_CFG		(WEAVE_BITS_MAX - WEAVE_BITS_MIN + 1)
 
 /* xoshiro256**, same generator bench/bound_pruning.c uses, so the two harnesses
  * draw the same streams for the same seed. */
@@ -620,7 +623,8 @@ usage(void)
 			"usage: ivf_recall glove <path> <nbase> <nq> [k=v ...]\n"
 			"       ivf_recall fvecs <path> <nbase> <nq> [k=v ...]\n"
 			"       ivf_recall synth <dim> <nclust> <sigma> <nbase> <nq> [k=v ...]\n"
-			"options: lists=256,512,1024 bits=2,3,4 probes=1,2,4,... windows=10,100,1000\n"
+			"options: lists=256,512,1024 bits=2,3,4,5,6,7,8 probes=1,2,4,...\n"
+			"         windows=10,100,1000\n"
 			"         k=10 iters=12 sampleper=32 seed=7 calib=0\n");
 	exit(2);
 }
@@ -724,6 +728,12 @@ main(int argc, char **argv)
 	for (pi = 1; pi < nprobecfg; pi++)
 		if (probecfg[pi] <= probecfg[pi - 1])
 			die("probes must be ascending");
+
+	/* Reject an out-of-range width here rather than at weave_quantizer_init(),
+	 * which only fires after the corpus has been read and clustered. */
+	for (bi = 0; bi < nbitcfg; bi++)
+		if (bitcfg[bi] < WEAVE_BITS_MIN || bitcfg[bi] > WEAVE_BITS_MAX)
+			die("each bits= value must be within [WEAVE_BITS_MIN, WEAVE_BITS_MAX]");
 
 	if (strcmp(mode, "synth") == 0)
 	{

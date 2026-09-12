@@ -118,8 +118,14 @@ SELECT wvec_l2_distance(x, weave_quantize_roundtrip(x, 4))
   FROM v;
 
 SELECT weave_quantize_roundtrip('[0,0,0,0]'::wvec, 4);   -- zero vector must fail
-SELECT weave_quantize_roundtrip('[1,2,3,4]'::wvec, 1);   -- bits out of range
-SELECT weave_quantize_roundtrip('[1,2,3,4]'::wvec, 5);
+SELECT weave_quantize_roundtrip('[1,2,3,4]'::wvec, 1);   -- below WEAVE_BITS_MIN
+SELECT weave_quantize_roundtrip('[1,2,3,4]'::wvec, 9);   -- above WEAVE_BITS_MAX
+-- 5..8 bits became legal when WEAVE_BITS_MAX rose from 4 to 8; the widest width
+-- must round-trip like any other, and more bits must not be worse than fewer.
+SELECT wvec_dims(weave_quantize_roundtrip('[1,2,3,4,5,6,7,8]'::wvec, 8)) AS rt_dims_8bit;
+SELECT wvec_l2_distance(x, weave_quantize_roundtrip(x, 8))
+       <= wvec_l2_distance(x, weave_quantize_roundtrip(x, 4)) AS bits8_not_worse_than_4
+  FROM (SELECT '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]'::wvec AS x) s;
 
 SELECT weave_quantize_size(768, 4) AS bytes_768_4bit;     -- 384 codes + 8 lane
 SELECT weave_quantize_size(768, 2) AS bytes_768_2bit;
