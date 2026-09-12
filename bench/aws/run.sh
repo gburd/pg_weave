@@ -480,25 +480,28 @@ DROP TABLE IF EXISTS p0src;
 -- CREATE TABLE AS, never INSERT ... SELECT -- the latter silently loses the
 -- parallel plan (measured 12x upstream in pg_turbovec b34f22c).
 CREATE TABLE p0src AS
-  SELECT i AS id,
-         to_wdoc(
-           't' || ((random() * 5000000)::int) || ' ' ||
-           't' || ((random() * 5000000)::int) || ' ' ||
-           't' || ((random() * 5000000)::int) || ' ' ||
-           't' || ((random() * 5000000)::int) || ' ' ||
-           't' || ((random() * 5000000)::int) || ' ' ||
-           't' || ((random() * 5000000)::int) || ' ' ||
-           't' || ((random() * 5000000)::int) || ' ' ||
-           't' || ((random() * 5000000)::int) || ' ' ||
-           't' || ((random() * 5000000)::int) || ' ' ||
-           't' || ((random() * 5000000)::int)) AS d
-    FROM generate_series(1, $n) i;
+  SELECT id, body, to_wdoc(body) AS d
+    FROM (SELECT i AS id,
+                 't' || ((random() * 5000000)::int) || ' ' ||
+                 't' || ((random() * 5000000)::int) || ' ' ||
+                 't' || ((random() * 5000000)::int) || ' ' ||
+                 't' || ((random() * 5000000)::int) || ' ' ||
+                 't' || ((random() * 5000000)::int) || ' ' ||
+                 't' || ((random() * 5000000)::int) || ' ' ||
+                 't' || ((random() * 5000000)::int) || ' ' ||
+                 't' || ((random() * 5000000)::int) || ' ' ||
+                 't' || ((random() * 5000000)::int) || ' ' ||
+                 't' || ((random() * 5000000)::int) AS body
+            FROM generate_series(1, $n) i) s;
 SQL" 2>&1 | tail -2 | tee -a "$OUT/p0_merge.log"
 
 		# Assert the corpus is the shape the pathology needs, BEFORE spending a
-		# build and a VACUUM on it.  Without this the degenerate corpus above
-		# produced a fast VACUUM that looked like a passing measurement.
-		NDISTINCT=$($SSH "psql -tAc \"select count(distinct d) from p0src\"")
+		# build and a VACUUM on it.  Without this the degenerate corpus produced by
+		# the first attempt gave a fast VACUUM that looked like a passing
+		# measurement.  The distinct count is taken on the TEXT column, which is why
+		# `body` is kept alongside `d`: wdoc has no equality operator, so
+		# `count(distinct d)` fails outright.
+		NDISTINCT=$($SSH "psql -tAc \"select count(distinct body) from p0src\"")
 		say "n=$n distinct documents: $NDISTINCT"
 		[ "${NDISTINCT:-0}" -ge $(( n / 2 )) ] \
 			|| die "corpus is degenerate ($NDISTINCT distinct rows of $n) -- refusing to measure"
