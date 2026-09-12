@@ -244,6 +244,10 @@ sudo pg_ctlcluster 17 main restart || sudo pg_ctlcluster 17 main start"
 # /scratch does not exist on the instance and an unprivileged mkdir cannot
 # create one.
 $SSH 'sudo -u postgres createuser -s $(whoami) 2>/dev/null || true
+	# ...and a database of the same name, because psql with no -d connects to a
+	# database named after the user.  Without this every unqualified psql fails
+	# with `database "ubuntu" does not exist`.
+	sudo -u postgres createdb -O $(whoami) $(whoami) 2>/dev/null || true
 	sudo install -d -o $(whoami) -g $(whoami) /scratch
 	psql -tAc "select name || $$ = $$ || setting from pg_settings where name in
 	  ($$shared_buffers$$,$$maintenance_work_mem$$,$$work_mem$$,
