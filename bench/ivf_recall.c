@@ -94,7 +94,10 @@
 
 #define MAXK			32
 #define MAXPROBES		64
-#define MAXWIN			8
+/* Raised from 8 when parse_list() stopped truncating: a window sweep wants
+ * 10..200 in one pass, and windows are nested prefixes so each extra one is a
+ * single accumulator slot, not another scoring pass. */
+#define MAXWIN			16
 #define MAXLISTS_CFG	8
 /* All widths WEAVE_BITS_MIN..WEAVE_BITS_MAX must fit in one sweep, so that
  * `bits=2,3,4,5,6,7,8` is a single run rather than silently truncated by
@@ -596,18 +599,35 @@ kmeans(const Corpus *c, int lists, int iters, int sample, float *cen)
  * main
  * ------------------------------------------------------------------------- */
 
+/*
+ * Parse a comma-separated int list.  FATAL on more items than fit, never
+ * truncating: this function used to stop at maxn and return, so
+ * `windows=10,...,200` quietly became the first eight windows and a sweep could
+ * report that no window reached a recall target while never having tested the
+ * windows that would have.  MAXBITS_CFG above is sized from the header
+ * specifically to dodge that for `bits=`, which is a fix at one call site for a
+ * hazard that lives in this function -- so it is fixed here instead, for all
+ * four lists.
+ */
 static int
-parse_list(const char *s, int *out, int maxn)
+parse_list(const char *s, int *out, int maxn, const char *what)
 {
 	int			n = 0;
 
-	while (*s && n < maxn)
+	while (*s)
 	{
 		char	   *end;
 		long		v = strtol(s, &end, 10);
 
 		if (end == s)
 			break;
+		if (n == maxn)
+		{
+			fprintf(stderr, "ivf_recall: %s= has more than %d values; "
+					"raise its MAX and rebuild rather than measuring a "
+					"silently shortened sweep\n", what, maxn);
+			exit(2);
+		}
 		out[n++] = (int) v;
 		s = end;
 		if (*s == ',')
@@ -692,13 +712,13 @@ main(int argc, char **argv)
 		const char *a = argv[ai];
 
 		if (strncmp(a, "lists=", 6) == 0)
-			nlistcfg = parse_list(a + 6, listcfg, MAXLISTS_CFG);
+			nlistcfg = parse_list(a + 6, listcfg, MAXLISTS_CFG, "lists");
 		else if (strncmp(a, "bits=", 5) == 0)
-			nbitcfg = parse_list(a + 5, bitcfg, MAXBITS_CFG);
+			nbitcfg = parse_list(a + 5, bitcfg, MAXBITS_CFG, "bits");
 		else if (strncmp(a, "probes=", 7) == 0)
-			nprobecfg = parse_list(a + 7, probecfg, MAXPROBES);
+			nprobecfg = parse_list(a + 7, probecfg, MAXPROBES, "probes");
 		else if (strncmp(a, "windows=", 8) == 0)
-			nwincfg = parse_list(a + 8, wincfg, MAXWIN);
+			nwincfg = parse_list(a + 8, wincfg, MAXWIN, "windows");
 		else if (strncmp(a, "k=", 2) == 0)
 			K = atoi(a + 2);
 		else if (strncmp(a, "iters=", 6) == 0)
