@@ -250,15 +250,24 @@ sort -t$'\t' -k1,1n -k2,2 -k4,4g "$OUT/samples.tsv" | awk -F'\t' '
 # Same absolute guards as bench/rerank_cold.sh: a warm arm that reads is not
 # warm, a cold arm that does not read was not cold.
 awk -F'\t' 'NR > 1 {
-		if ($2 == "cold") crd[$1] = $6
-		if ($2 == "warm") wrd[$1] = $6
+		if ($2 == "cold") { crd[$1] = $6; chit[$1] = $7 }
+		if ($2 == "warm") { wrd[$1] = $6; whit[$1] = $7 }
 	}
 	END { bad = 0
 		for (e in crd) {
-			if (wrd[e] > 1) { printf "GUARD FAILED ef=%s: warm arm read %.1f pages/query -- warm number invalid\n", e, wrd[e]; bad = 1 }
-			if (crd[e] < 2) { printf "GUARD FAILED ef=%s: cold arm read %.1f pages/query -- not cold\n", e, crd[e]; bad = 1 }
+			# A FRACTION, not an absolute page count.  The first version failed a
+			# warm arm at >1 page, which rejected a run whose warm arms read 19
+			# pages against ~30,000 buffer hits -- 0.06%, i.e. warm.  It was
+			# written to catch the 2,136-pages-per-query case that a missing
+			# pg_prewarm produced, and 2% separates those two by two orders of
+			# magnitude.  Absolute in spirit, tolerant of noise in practice: a
+			# genuinely cold arm reads >90% and cannot pass this.
+			wf = whit[e] + wrd[e] > 0 ? wrd[e] / (whit[e] + wrd[e]) : 0
+			cf = chit[e] + crd[e] > 0 ? crd[e] / (chit[e] + crd[e]) : 0
+			if (wf > 0.02) { printf "GUARD FAILED ef=%s: warm arm read %.1f pages/query = %.2f%% of accesses -- not warm\n", e, wrd[e], 100 * wf; bad = 1 }
+			if (cf < 0.5)  { printf "GUARD FAILED ef=%s: cold arm read only %.2f%% of accesses -- not cold\n", e, 100 * cf; bad = 1 }
+			if (!bad) printf "ef=%s: guards ok (warm %.2f%% reads, cold %.2f%% reads)\n", e, 100 * wf, 100 * cf
 		}
-		if (!bad) print "latency guards ok"
 		exit bad
 	}' "$OUT/summary.tsv"
 
