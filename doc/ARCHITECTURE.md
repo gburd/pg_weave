@@ -229,21 +229,35 @@ fundamental and no amount of engineering removes them; they are knobs, not bugs.
    ef = 400 and 3.548 ms warm at ef = 10. HNSW's traversal is dependent random I/O;
    a rerank window's TIDs are all known before the first fetch.
 
-   **What is unmeasured is now the code scan, and it is the half that decides
-   everything.** V7 and V8 do not exist, so no pg_weave vector query can be timed end
-   to end; at 4 bits, one million codes is 512 MB to read and score. So the honest
-   position has improved on two axes and is unknown on the third:
+   **The code scan is now measured too** (`bench/RESULTS_CODE_SCAN.md`). A flat scan
+   of 1M 960-d 4-bit codes is 293 ms, and the per-block bound that was supposed to
+   prune it prunes **0.00%** on real corpora. What makes it affordable is a
+   **two-stage prefix scan** (task V15): score every vector on the first quarter of
+   the coordinates, rescore the best 8,000 fully, then exact-rerank the top 25 —
+   recall@10 0.9800 for 111.2 ms, which is **1.51× pgvector HNSW at matched
+   recall**, inside the 2× bar. So the honest position is:
 
-   - **recall and storage:** 0.9920 at 0.064× is measured, on one corpus at n = 1M.
-     The earlier fallback framing — "~0.92 recall at ~0.12× storage, or ~1.00 recall
-     at 0.067× plus an untimed heap-fetch cost" — is superseded.
-   - **latency:** no end-to-end number exists, in either direction.
+   - **recall and storage:** 0.9920 at 0.064× measured, one corpus, n = 1M. The
+     earlier fallback framing — "~0.92 recall at ~0.12× storage, or ~1.00 recall at
+     0.067× plus an untimed heap-fetch cost" — is superseded.
+   - **latency:** the *scan* is measured and passes at iso-recall. A whole query is
+     still not, because V7, V8 and V15 are unimplemented, so no pg_weave vector
+     query exists to time end to end.
 
-   So the storage and recall halves of "0.99 at 0.15×" are now supported by
-   measurement on one corpus, and **nothing licenses a performance claim.** Do not
-   write a latency or throughput comparison against pgvector in the README until a
-   pg_weave vector query has actually been timed, and do not write "0.99 at 0.15×"
-   as a headline until a second corpus at a different dimensionality agrees.
+   So the storage and recall halves of "0.99 at 0.15×" are supported by measurement
+   on one corpus, and the latency half is supported **for the scan in isolation**,
+   at matched recall, on one corpus. **That still does not license a performance
+   claim in the README**, for a specific reason rather than a cautious one: no
+   pg_weave vector query exists, so nothing has been measured that includes page
+   reads, visibility checks or tuple machinery. Do not write a latency or throughput
+   comparison against pgvector until a real query has been timed, and do not write
+   "0.99 at 0.15×" as a headline until a second corpus at a different dimensionality
+   agrees.
+
+   Note also what the comparison depends on: pgvector HNSW's recall ceiling of
+   0.9760 at m = 16 sets the matched-recall point. A better-built graph would raise
+   that ceiling **and** its own latency, moving both sides. Until that sweep is run,
+   every "×HNSW" latency figure here is conditional on those build parameters.
 
 2. **Unanchored cross-token substring search.** See §7. With `cgram` off we
    cannot answer it from the index; with `cgram` on we are not smaller than

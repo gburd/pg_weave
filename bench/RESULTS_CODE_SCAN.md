@@ -210,30 +210,94 @@ structurally limited to 4 bits (`KERNEL_GROUP_BITS_MAX`). The ratified shape's
 "widest width that keeps the SIMD kernel" argument was made qualitatively; this is
 the quantity.
 
-## What this means for the gate, plainly
+## The two-stage prefix scan: 293 ms -> 111 ms at recall 0.98
 
-The restated Phase V gate's latency term is `p50 ≤ 2× pgvector HNSW` at matched
-recall, warm and cold. Warm, pgvector HNSW measured **3.548 ms** at ef = 10
-(`bench/RESULTS_PHASE_V_COLD.md`), so the bar is ~7.1 ms. A flat scan is **291 ms**
-before the rerank is added.
+Since the cost is `O(dim x nvec)`, there are two levers: scan fewer vectors, or
+score fewer **coordinates**. The second is measured here and it costs no new
+machinery, which is why it was tried first.
 
-**The vector channel misses the latency term by roughly 40×, and no choice of code
-width changes that.** This is the same order as the 490× loss pg_turbovec measured
-for their flat scan against pgvector HNSW, reached independently.
+Stage 1 scores every vector against the first `m` of `dim` coordinates and keeps
+the best `W`. Stage 2 rescores those `W` over all `dim`. Stage 3 is the exact
+float32 rerank of the top 25 the ratified shape already pays for. Recall below is
+therefore **end-to-end against brute force**, not an intermediate agreement rate.
 
-Because the cost is `O(dim × nvec)` with no bandwidth component, only two things
-can move it:
+Two facts make stage 1 free to implement, neither arranged for this purpose:
 
-1. **Scan fewer vectors.** Candidate reduction: IVF (task V9, demoted 2026-09-12)
-   or a proximity graph (withdrawn earlier). The block bound was the third option
-   and it does not prune. **V9's demotion rested partly on the flat scan being
-   cheap once the bound pruned it; that premise is now measured false, so the
-   demotion should be reconsidered.**
-2. **Score fewer coordinates.** Dimensionality reduction before quantization, or a
-   two-stage scan over a prefix of coordinates. Neither is in the ledger.
+- The rotation (§3 of `VECTOR_CHANNEL.md`) applies a global permutation and a
+  Walsh-Hadamard transform, so coordinates are exchangeable and carry equal energy
+  in expectation. A prefix is therefore a uniform random subsample and
+  `<q[0:m], r[0:m]>` is an unbiased estimate of the full inner product. Without the
+  rotation, a prefix of an energy-ordered embedding would be biased — better on an
+  MRL model, far worse on a reversed one. The rotation makes it predictable.
+- In `WEAVE_PACK_LANE` the code index is `j * 32 + slot`, **independent of dim**
+  (`src/vector/pack.c` `code_index()`), so coordinates `0..m-1` of all 32 lanes are
+  a contiguous prefix of the block; and the LUT is row-major by coordinate, so its
+  first `m` rows are a prefix too. Stage 1 is the **existing kernel** called with a
+  shallow-copied LUT whose `dim` is `m`. No new kernel, no repacking, no extra
+  bytes on disk, no build-time step.
 
-What will *not* help: narrower codes, a different SIMD kernel (the best available
-is already 291 ms, and the portable one at that), or better warp ordering.
+The trick is layout-specific: under `WEAVE_PACK_VECMAJOR` the index is
+`slot * dim + j`, so truncating the LUT would read wrong bits rather than fewer of
+them. `bench/code_scan.c` refuses to run the prefix mode in that layout.
+
+Measured, n = 1M, GIST-960d, 4 bits, `lut-wide`, **r7i.2xlarge — the same instance
+type and CPU model as the pgvector baseline below**:
+
+| m/dim | W | recall@10 | stage 1 | stage 2 | **total** |
+|---|---|---|---:|---:|---:|
+| 1.000 (flat) | — | 1.0000 | 293 ms | — | **293 ms** |
+| 0.500 | 8000 | 1.0000 | 156.9 | 25.6 | **182.5** |
+| 0.250 | 8000 | 0.9800 | 85.4 | 25.8 | **111.2** |
+| 0.250 | 20000 | 0.9900 | 90.3 | 64.0 | **154.2** |
+| 0.125 | 8000 | 0.8300 | 46.5 | 25.4 | 71.9 |
+| 0.125 | 20000 | 0.9300 | 50.8 | 62.1 | 112.9 |
+
+`W` scales **sublinearly** in n — 8000 at n = 100k reaches the same recall as
+20000 at n = 1M — so the work ratio improves as the corpus grows rather than
+degrading. Stage 2 is an overestimate: the harness rescores each survivor with a
+single-lane mask, and the fast kernels skip at 8-lane granularity, so it charges
+about 4x what a batched implementation would.
+
+## The gate's latency term is MET, and my earlier "misses by 40x" was wrong
+
+**RETRACTED.** An earlier revision of this file concluded that the vector channel
+"misses the latency term by roughly 40x", by comparing a flat scan against
+pgvector HNSW's **4.541 ms warm p50 at ef = 10**. That HNSW setting has
+**recall@10 = 0.4280**. Comparing our full-recall scan against the baseline's
+latency at recall 0.43 is exactly the unmatched-recall error that
+`doc/PHASES.md`'s restated gate term 3 exists to forbid, and it was made two
+commits after writing that term. It is the pg_turbovec retraction in miniature: a
+fast wrong answer beats a slow right one on every clock.
+
+The gate says compare at `R* = min(0.99, the comparator's best achievable
+recall)`. pgvector HNSW tops out at **0.9760** (ef = 800, m = 16,
+ef_construction = 64), so `R* = 0.9760`, and the valid warm p50 there — prewarm
+verified, 0.06% of buffer accesses were reads — is **73.764 ms**. The bar is 2x
+that: **147.5 ms**.
+
+| at recall >= R* = 0.9760 | recall@10 | warm p50 | vs HNSW |
+|---|---|---:|---:|
+| pgvector HNSW, ef = 800 | 0.9760 | 73.8 ms | 1.00x |
+| **pg_weave, prefix 0.25 / W 8000** | **0.9800** | **111.2 ms** | **1.51x** |
+| pg_weave, prefix 0.25 / W 20000 | 0.9900 | 154.2 ms | 2.09x |
+| pg_weave, flat scan | 1.0000 | 293 ms | 3.97x |
+
+**At matched recall the vector channel is 1.51x pgvector HNSW warm, inside the 2x
+bar, at slightly higher recall than the comparator reaches.** Cold, HNSW at
+ef = 800 is 11,016 ms against our roughly 440 ms (115 MB of codes to read plus
+compute plus the rerank), so the cold arm passes by more than an order of
+magnitude — HNSW's traversal is dependent random I/O and ours is not.
+
+Note what the honest comparison did to the flat scan too: **3.97x, not 40x.** The
+prefix scan is what turns that into a pass, but the 40x was never real.
+
+**This does not restore claim 2.** The prefix scan is a two-stage approximation
+with an exact rescore, not a *threshold* mechanism: it does not bound a block's
+best possible score, it estimates every vector's score cheaply and repairs the
+ranking. `ARCHITECTURE.md` §9 claim 2's vector half stays unsupported, and the
+block bound still prunes 0.00%. A latency pass and a fused-threshold claim are
+different things, and conflating them is how the fifth claim gets made by
+accident.
 
 ## What is still unmeasured
 
@@ -242,5 +306,12 @@ is already 291 ms, and the portable one at that), or better warp ordering.
   corpora here fail it, for opposite reasons, which is what makes the failure look
   structural — but "no real corpus we tried" is not "no corpus".
 - Any end-to-end pg_weave vector query, since V7 and V8 still do not exist. The
-  291 ms is the scan in isolation, measured through the shipping kernels on
+  figures here are the scan in isolation, measured through the shipping kernels on
   shipping-format packed codes, which is the closest proxy available without them.
+  A real query adds page reads, visibility checks and the tuple machinery.
+- pgvector HNSW at larger `m` / `ef_construction`. Its 0.9760 ceiling sets `R*`,
+  and a better-built graph would raise `R*`, raise its own latency, and change both
+  sides of the comparison. This is the single measurement most likely to move the
+  verdict, in either direction, and it has not been run.
+- The prefix scan's recall on a second corpus at a different dimensionality. Every
+  prefix figure here is GIST-960d.
