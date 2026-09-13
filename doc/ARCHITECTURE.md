@@ -197,31 +197,53 @@ fundamental and no amount of engineering removes them; they are knobs, not bugs.
    — but it cannot abolish the frontier. `vec_recall` is a per-query GUC and
    `recall=exact` will always cost a scan.
 
-   **Measured 2026-09-10, refined 2026-09-12, and it costs us part of that
-   ambition** (`bench/RESULTS_BITWIDTH_SWEEP.md`): quantized codes alone do not
-   reach 0.99 at k=10 at any width we support. At full probe — zero probe-miss
-   error, so this is the ceiling over every `nprobe` — recall@10 is 0.9225
-   (GloVe-200d) and 0.8680 (GIST-960d) at 4 bits, and even at **8 bits** it is
-   0.9950 on GloVe but only **0.9860 on GIST**. Since 8 bits costs 1,024 B/vector
-   at 1024-d — 0.18× HNSW — the width that clears 0.99 on the easier corpus already
-   misses the storage claim, and the harder corpus never clears it. **A single code
-   width cannot deliver 0.99 recall and 0.15× storage. That is measured, not
-   feared.**
+   **Measured 2026-09-10, refined through 2026-09-13, and it still costs us part
+   of that ambition** — though less than the first reading of it suggested.
 
-   What does work: **3-bit codes plus an exact rerank of a top-100 window reach
-   1.0000 on both corpora**, at 384 B/vector. But the rerank must be full
-   precision, and a *stored* float32 sidecar costs `4 * dim` bytes per vector —
-   worse than what pgvector HNSW spends on the vector it stores. So the surviving
-   shape reads full precision from the **heap**, where the vector already is:
-   0.067× HNSW on codes, 1.0000 recall, and up to 100 heap fetches per query — a
-   latency cost that is **not yet measured**, and the cold-cache number is the one
-   that will decide it.
+   Quantized codes alone do not reach 0.99 at k=10 at any width we support. At full
+   probe — zero probe-miss error, so this is the ceiling over every `nprobe` —
+   recall@10 is 0.9225 (GloVe-200d) and 0.8680 (GIST-960d) at 4 bits, and even at
+   **8 bits** it is 0.9950 on GloVe but only **0.9860 on GIST**
+   (`bench/RESULTS_BITWIDTH_SWEEP.md`). **A single code width cannot deliver 0.99
+   recall. That is measured, not feared.**
 
-   So the "10× storage win *at* 0.99" formulation is still not supported by
-   anything we have measured, and the honest position until the heap-rerank latency
-   is known: **pg_weave can offer ~0.92 recall at roughly 0.12× the storage, or
-   ~1.00 recall at 0.067× the storage plus a per-query heap-fetch cost nobody has
-   timed.** Do not write "0.99 at 0.15×" in the README until a measurement says so.
+   An earlier version of this paragraph added that 8 bits "costs 1,024 B/vector at
+   1024-d — 0.18× HNSW — so the width that clears 0.99 on the easier corpus already
+   misses the storage claim". **That half is withdrawn.** It divided by an estimated
+   HNSW size of ~5,700 B/vector; measured, pgvector HNSW is **8,056 B/vector** at
+   m=16, ef_construction=64 on 999,990 × 960-d (`bench/RESULTS_PHASE_V_COLD.md`), so
+   8 bits is 0.127× and fits the budget comfortably. The single-width limit is a
+   **recall** limit, not a storage one. Correcting it does not rescue the ambition,
+   but a wrong reason for a right conclusion is still a wrong reason.
+
+   What does work, and is now the ratified shape (`doc/PHASES.md`): **4-bit codes
+   plus an exact float32 rerank of a top-25 window, read from the heap** — recall@10
+   **0.9920** at n = 1M on GIST-960d, at **512 B/vector = 0.064× HNSW**. The rerank
+   must be full precision, and a *stored* float32 sidecar costs `4 * dim` bytes per
+   vector, half of what HNSW spends per vector, so it would forfeit the storage
+   budget by itself. The heap already holds the vector; the index pays nothing.
+
+   The heap-rerank latency this paragraph used to call unmeasured **is now
+   measured**, and it is not the obstacle: a 20-candidate window is **86 ms p50
+   cold** at n = 1M and **0.598 ms warm**, against 6.2 s cold for pgvector HNSW at
+   ef = 400 and 3.548 ms warm at ef = 10. HNSW's traversal is dependent random I/O;
+   a rerank window's TIDs are all known before the first fetch.
+
+   **What is unmeasured is now the code scan, and it is the half that decides
+   everything.** V7 and V8 do not exist, so no pg_weave vector query can be timed end
+   to end; at 4 bits, one million codes is 512 MB to read and score. So the honest
+   position has improved on two axes and is unknown on the third:
+
+   - **recall and storage:** 0.9920 at 0.064× is measured, on one corpus at n = 1M.
+     The earlier fallback framing — "~0.92 recall at ~0.12× storage, or ~1.00 recall
+     at 0.067× plus an untimed heap-fetch cost" — is superseded.
+   - **latency:** no end-to-end number exists, in either direction.
+
+   So the storage and recall halves of "0.99 at 0.15×" are now supported by
+   measurement on one corpus, and **nothing licenses a performance claim.** Do not
+   write a latency or throughput comparison against pgvector in the README until a
+   pg_weave vector query has actually been timed, and do not write "0.99 at 0.15×"
+   as a headline until a second corpus at a different dimensionality agrees.
 
 2. **Unanchored cross-token substring search.** See §7. With `cgram` off we
    cannot answer it from the index; with `cgram` on we are not smaller than
