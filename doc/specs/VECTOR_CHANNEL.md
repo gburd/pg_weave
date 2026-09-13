@@ -246,7 +246,7 @@ at 1536-d the toast relation holds exactly 1.000 pages per value. Two consequenc
 worth carrying:
 
 - the cost is **bimodal**, not linear: when the vectors fit in the buffer pool
-  these reads go to zero and the rerank is pure CPU. Since the codes are 0.067× of
+  these reads go to zero and the rerank is pure CPU. Since the codes are 0.064× of
   what HNSW must keep resident, there is a corpus range where the codes fit and
   HNSW's index does not;
 - 1024-d reads **more** pages per candidate than 1536-d (2.388 vs 2.043), because
