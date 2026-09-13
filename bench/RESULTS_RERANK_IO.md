@@ -1,5 +1,24 @@
 # Result: what does one heap-rerank candidate cost in page reads?
 
+> **SUPERSEDED IN PART by `bench/RESULTS_PHASE_V_COLD.md` (EC2, n = 1M).** Two
+> things below did not survive contact with the gate corpus:
+>
+> - **The page counts are called "device-independent" here, and they are not.**
+>   They are a function of cache state and scale as well as layout: at 250k rows
+>   with a 32 MB pool the toast *index* stays largely resident so descents are
+>   nearly free, while at 1M rows on a genuinely cold cache every descent pays its
+>   full depth. This file predicted ~48 reads and ~12 ms for a 20-candidate window;
+>   the measured cold p50 at n = 1M is **86 ms**, about 7×.
+> - **The shape has moved on.** The 3-bit/top-100 framing below was the
+>   maximum-recall shape. The ratified shape is **4 bits with a top-25 window**
+>   (0.064× HNSW, recall@10 0.9920 at n = 1M), and the HNSW denominator every ×
+>   figure below divides by has since been measured at 8,056 B/vector rather than
+>   estimated at ~5,700.
+>
+> What stands: the TOAST mechanics, the packing finding (chunks of one value share
+> a page, so pages are not chunks), the 1024-d-vs-1536-d straddle effect, and the
+> guard discipline in the closing section.
+
 Date: 2026-09-12. Harness: `bench/rerank_io.sh` (self-contained: builds its own
 cluster, loads its own corpus, runs its own guards). PostgreSQL 17.11,
 `shared_buffers = 32MB`, 250,000 rows per configuration, rerank window 100,
