@@ -203,14 +203,24 @@ hitcmp(const void *a, const void *b)
 	return ((const Hit *) a)->id - ((const Hit *) b)->id;
 }
 
-/* Insert into a k-sized min-at-top list kept as an unsorted array + running
- * threshold. Simple and honest: the scan's cost is the block loop, not this. */
+/*
+ * Top-k as a binary MIN-HEAP: the root is the weakest survivor, so the running
+ * threshold is h[0].score and an accepted insert costs O(log k).
+ *
+ * This was a sorted array with a qsort per accepted insert, which is fine at
+ * k = 10 and catastrophic at the k = 8000-20000 a prefix scan's stage-1 window
+ * needs: accepted inserts run to about k*ln(n/k), so at n = 1M and k = 8000 the
+ * bookkeeping was ~4e9 operations and it reported 7.6 SECONDS for a stage that
+ * should cost ~70 ms. The recall numbers were unaffected -- they do not depend on
+ * how the set is maintained -- but every timing was the harness measuring itself.
+ * Worth stating because the failure looked exactly like a slow algorithm.
+ */
 typedef struct
 {
 	Hit		   *h;
 	int			k,
 				n;
-	float		theta;			/* k-th best so far, or -inf while n < k */
+	float		theta;			/* weakest survivor, or -inf while n < k */
 } TopK;
 
 static void
@@ -225,24 +235,62 @@ topk_init(TopK *t, int k)
 static void
 topk_push(TopK *t, float s, int id)
 {
+	int			i;
+
 	if (t->n < t->k)
 	{
-		t->h[t->n].score = s;
-		t->h[t->n].id = id;
-		t->n++;
-		if (t->n == t->k)
+		/* sift up toward the root, which holds the minimum */
+		i = t->n++;
+		t->h[i].score = s;
+		t->h[i].id = id;
+		while (i > 0)
 		{
-			qsort(t->h, t->n, sizeof(Hit), hitcmp);
-			t->theta = t->h[t->k - 1].score;
+			int			par = (i - 1) / 2;
+
+			if (t->h[par].score <= t->h[i].score)
+				break;
+			Hit			tmp = t->h[par];
+
+			t->h[par] = t->h[i];
+			t->h[i] = tmp;
+			i = par;
 		}
+		if (t->n == t->k)
+			t->theta = t->h[0].score;
 		return;
 	}
 	if (s <= t->theta)
 		return;
-	t->h[t->k - 1].score = s;
-	t->h[t->k - 1].id = id;
-	qsort(t->h, t->k, sizeof(Hit), hitcmp);
-	t->theta = t->h[t->k - 1].score;
+	t->h[0].score = s;
+	t->h[0].id = id;
+	for (i = 0;;)
+	{
+		int			l = 2 * i + 1,
+					r = l + 1,
+					m = i;
+
+		if (l < t->n && t->h[l].score < t->h[m].score)
+			m = l;
+		if (r < t->n && t->h[r].score < t->h[m].score)
+			m = r;
+		if (m == i)
+			break;
+		Hit			tmp = t->h[m];
+
+		t->h[m] = t->h[i];
+		t->h[i] = tmp;
+		i = m;
+	}
+	t->theta = t->h[0].score;
+}
+
+/* Heap order is not rank order.  Anything that reads h[] positionally -- an
+ * elementwise comparison of two arms, or h[0] as the best hit -- must call this
+ * first. */
+static void
+topk_finish(TopK *t)
+{
+	qsort(t->h, (size_t) t->n, sizeof(Hit), hitcmp);
 }
 
 /* ---------------------------------------------------------------- k-means */
@@ -889,8 +937,10 @@ main(int argc, char **argv)
 				topk_push(&a, out[s], lanevec[b * LANES + s]);
 		}
 		t_flat += now() - t0;
+		float		theta_final = a.theta;	/* k-th best: the heap root, before sorting */
+
+		topk_finish(&a);
 		memcpy(ref, a.h, sizeof(Hit) * a.n);
-		float		theta_final = a.theta;
 
 		/* --- arm B: bound-pruned, running theta ----------------------- */
 		TopK		p;
@@ -931,6 +981,7 @@ main(int argc, char **argv)
 		t_prune += now() - t0;
 
 		/* --- soundness, before any number is believed ----------------- */
+		topk_finish(&p);
 		if (p.n != a.n)
 			mismatches++;
 		else
