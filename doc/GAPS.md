@@ -145,6 +145,48 @@ dynahash left; `simplehash.h` might recover a third of it and is not the next
 thing). Parallel merge (L4) and parallel scan (L11) are withdrawn on upstream
 evidence. `bench/RESULTS_L15.md`.
 
+### G12 — a single-segment index never reclaims deleted space — **OPEN, found 2026-09-13**
+
+Delete 90% of a 120,000-row corpus, `VACUUM`, then `weave_vacuum()` twice, and the
+index goes **2289 → 2296 pages**: it grows by 7 and reclaims nothing.
+`weave_vacuum()` returns **false** both times and `weave_index_nsegments()` is
+**1**.
+
+**Mechanism.** Compaction is implemented as a *merge* of segments
+(`weave_merge_segments_streaming()`, reached only via `weave_merge_selected()`),
+and a merge of one segment is a no-op guarded by an `nsegments > 1` precondition.
+Insert-time tiered merge drives every index toward exactly one segment. **So the
+steady state of a weave index is the state that cannot reclaim.** The 7-page growth
+is `weave_bulkdelete` adding tombstone bookkeeping that nothing later removes.
+
+**Why no test caught it.** `t/008_vacuum_reclaim.pl` existed for exactly this
+requirement — its header says "must SHRINK a bloated index, not grow it" — but it
+ran `weave_vacuum()` on a **freshly built index with no deletes**, where after
+L8/L12 the file is already compact and the call correctly does nothing. Its
+assertions were `v1 <= built` and `v2 <= v1 + 1`, both satisfied by doing nothing.
+It could catch a vacuum that *grew* the index, which is the bug it was written for,
+and could not catch one that never shrinks.
+
+The delete-then-reclaim arm that found this came from reviewing **pg_fts `2605d00`**,
+which hit the growth half of this bug class (35 → 52 → 69 MB across cleanups with
+no rows added), fixed it by skipping a compaction pass whose free space is not yet
+reusable, and then had its own new test catch that fix degrading into never
+reclaiming (18 → 22 MB) because a stale free-space map overstates the live size.
+The lesson transferred even though the root cause did not: **a no-growth assertion
+cannot see a no-reclaim regression, and a fix for one produces the other.**
+
+**Consequence.** An append-then-delete workload has no way to reclaim index space
+short of `REINDEX`. That is a production-readiness problem, not a benchmark
+problem: a table whose rows are replaced over time grows an index monotonically.
+
+**Fix direction** (task L18): `weave_vacuum()` must rewrite a *single* segment when
+its tombstone fraction exceeds a threshold — a compaction that is not a merge.
+`weave_page_recyclable()` gates free-page reuse on `GlobalVisCheckRemovableXid()`
+(`src/am/am.c:2252`), so pages freed by that rewrite are not reusable in the same
+transaction; pg_fts's experience says the honest handling is to let the *next*
+cycle reclaim them rather than to extend the relation, and to refresh the FSM
+before deciding, or the pass gets skipped forever.
+
 ## 4. Gaps against the rest of the stack
 
 These are absences rather than regressions, and they are larger than everything in
