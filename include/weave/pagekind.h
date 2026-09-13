@@ -165,7 +165,12 @@ typedef enum WeavePageKind
 	WEAVE_PK_VMETA = 17,		/* reserved, vector: WeaveVecMeta */
 	WEAVE_PK_VCODES = 18,		/* reserved, vector: packed quantized codes */
 	WEAVE_PK_VGRAPH = 19,		/* reserved, vector: Vamana CSR adjacency */
-	WEAVE_PK_VRERANK = 20,		/* reserved, vector: full-precision sidecar */
+	/* WITHDRAWN 2026-09-13, id left reserved so it is never reused and never
+	 * revived from a stale comment.  The Phase V shape reranks from the HEAP: a
+	 * stored float32 sidecar is 4*dim = 4,096 B/vector at 1024-d, half of what a
+	 * measured pgvector HNSW index spends per vector (8,056 B), so it forfeits the
+	 * storage gate on its own.  doc/PHASES.md task V10. */
+	WEAVE_PK_VRERANK = 20,		/* WITHDRAWN: full-precision sidecar */
 	WEAVE_PK_SURF = 21,			/* reserved, fuzzy: LOUDS-Sparse vocabulary trie */
 	WEAVE_PK_ULEV = 22,			/* reserved, fuzzy: universal-Levenshtein aux */
 	WEAVE_PK_REGEX = 23,		/* reserved, fuzzy: compiled-pattern cache */

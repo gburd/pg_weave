@@ -27,6 +27,15 @@
 int			weave_vec_oversample = 4;
 int			weave_vec_recall = WEAVE_RECALL_GRAPH;
 
+/*
+ * 25 is the ratified Phase V shape's rerank window at 4 bits (doc/PHASES.md,
+ * "the committed shape"): recall@10 0.9920 at n = 1M on GIST-960d, against
+ * 0.9810 at 20 and 0.9980 at 30.  See include/weave/vector.h for why it belongs
+ * to a GUC rather than a reloption, and for the +25%-per-decade growth an
+ * operator above 1M rows has to allow for.
+ */
+int			weave_vec_rerank_window = 25;
+
 #define WEAVE_VEC_TODO(task) \
 	ereport(ERROR, \
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), \

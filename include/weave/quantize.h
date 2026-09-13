@@ -33,8 +33,10 @@
  * permutes a top-10 list.  Measured at full probe, so with zero probe-miss error,
  * compressed-domain-only recall@10 tops out at 0.7345 / 0.8515 / 0.9225 at 2 / 3 / 4
  * bits on GloVe-200d and 0.6130 / 0.7880 / 0.8680 on GIST-960d.  Phase V's gate is
- * 0.99.  So a full-precision rerank pass is REQUIRED at k=10, not optional, and
- * WEAVE_VRERANK is not an extra.  A rerank window of 100 reaches 1.0000 from 3
+ * 0.99.  So a full-precision rerank pass is REQUIRED at k=10, not optional.  It
+ * reads the heap; the WEAVE_VRERANK sidecar is withdrawn (pagekind.h).  The
+ * ratified shape is 4 bits with a top-25 window, which is recall@10 0.9920 at
+ * n = 1M on GIST-960d.  A window of 100 reaches 1.0000 from 3
  * bits on both corpora.  See doc/specs/VECTOR_CHANNEL.md sect. 2 and
  * bench/RESULTS_BITWIDTH_SWEEP.md.
  *
