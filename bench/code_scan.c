@@ -548,11 +548,39 @@ main(int argc, char **argv)
 	if (nqv < nq)
 		die("too few query vectors");
 
-	const WeaveScoreKernel *kern = kernelname ? weave_score_kernel_lookup(kernelname)
-		: weave_score_kernel_best();
+	/*
+	 * kernel=all times every kernel this host has, on ONE prepared corpus.
+	 *
+	 * That is not a convenience.  The first EC2 run of this harness invoked it
+	 * once per kernel, so it re-read the corpus, re-ran k-means and re-encoded
+	 * for each -- and the clustering does not depend on the kernel at all.  At
+	 * n = 1M with lists = n/32 the k-means alone is O(n * lists * dim) ~ 3e13
+	 * flops per iteration, which would not have finished, times three kernels.
+	 * Preparation is per-corpus; timing is per-kernel; the loop belongs inside.
+	 */
+	const WeaveScoreKernel *kall[8];
+	int			nkern = 0;
 
-	if (!kern)
-		die("no such kernel on this host");
+	if (kernelname && strcmp(kernelname, "all") != 0)
+	{
+		kall[0] = weave_score_kernel_lookup(kernelname);
+		if (!kall[0])
+			die("no such kernel on this host");
+		nkern = 1;
+	}
+	else if (kernelname)
+	{
+		const WeaveScoreKernel *list[8];
+
+		nkern = weave_score_kernel_list(list, 8);
+		for (int i = 0; i < nkern; i++)
+			kall[i] = list[i];
+	}
+	else
+	{
+		kall[0] = weave_score_kernel_best();
+		nkern = 1;
+	}
 
 	/* ---- scan ---------------------------------------------------------- */
 	float	   *out = xmalloc(sizeof(float) * LANES);
@@ -577,6 +605,15 @@ main(int argc, char **argv)
 				sum_cens = 0,
 				sum_best = 0;
 	Hit		   *ref = xmalloc(sizeof(Hit) * K);
+
+  for (int ki = 0; ki < nkern; ki++)
+  {
+	const WeaveScoreKernel *kern = kall[ki];
+
+	t_flat = t_prune = 0;
+	sum_pruned_run = sum_pruned_oracle = sum_lanes = 0;
+	sum_theta = sum_b1 = sum_b2 = sum_b3 = sum_bmin = sum_rad = sum_cens = sum_best = 0;
+	violations = mismatches = 0;
 
 	for (int t = 0; t < nq; t++)
 	{
@@ -793,5 +830,9 @@ main(int argc, char **argv)
 	printf("pruned scan p50-ish mean     : %8.3f ms   (%.1f MB touched)\n",
 		   1000 * t_prune / nq, prune_mb);
 	printf("speedup                      : %8.2fx\n", t_flat / t_prune);
+	printf("per vector                   : %8.1f ns   (flat)\n",
+		   1e9 * t_flat / nq / n);
+	printf("\n");
+  }
 	return 0;
 }
