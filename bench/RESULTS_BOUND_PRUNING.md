@@ -1,5 +1,21 @@
 # Result: does the vector-channel block bound actually prune?
 
+> **SYNTHETIC ONLY — REFUTED ON REAL CORPORA 2026-09-13.** The 99.6% below is a
+> property of this file's synthetic construction, not of the channel.
+> `bench/RESULTS_CODE_SCAN.md` re-ran the same bound over real GIST-960d and
+> GloVe-200d vectors with a real k-means clustering and real held-out queries and
+> measured **0.00% and 0.01%** of blocks pruned, even against an oracle threshold.
+>
+> The setup section below describes the coherent case as "32 perturbations of a
+> shared direction, σ = 0.35" and asserts that this "is what ordering the warp by
+> the Vamana build's k-means partition produces". That assertion is false, and it
+> is the load-bearing one. Real k-means blocks have mean radius 0.585 (GIST) to
+> 1.018 (GloVe) on a unit sphere, and `‖q‖·R` alone then exceeds θ.
+>
+> Do not quote the 99.6%, the 0.004 `score()` call ratio, or the coherent/random
+> contrast as evidence about pg_weave. What still stands from this file is the
+> *soundness* check and the observation that (B1) is nearly useless.
+
 Date: 2026-09-06. Harness: `bench/bound_pruning.c`. Reproduce with
 
 ```

@@ -44,7 +44,19 @@ document in a block can achieve.
   128-document block (`include/weave/am.h`). Substituting them into the BM25
   saturation function gives the block's maximum possible contribution. This is
   exactly block-max WAND, and the forked lexical channel already does it.
-- **Vector, quantized.** A code block stores 32 vectors, and its header stores
+- **Vector, quantized. MEASURED 2026-09-13: THIS BOUND DOES NOT PRUNE ON REAL
+  CORPORA.** It is sound, and it is useless — 0.00% of blocks skipped on
+  GIST-960d, 0.01% on GloVe-200d, against 99.6% on the synthetic corpus it was
+  first measured on (`bench/RESULTS_CODE_SCAN.md`). Two reasons, both structural:
+  for L2-normalized data the Cauchy–Schwarz term `max‖rec‖·‖q‖` is ≈ 1.0 by
+  construction while θ is always under 1.0, and the residual term is derived from
+  `⟨q, rₛ − c⟩ ≤ ‖q‖·‖rₛ − c‖`, which assumes the residual points along `q` and is
+  therefore loose by a factor growing with `√dim`. Real k-means blocks have mean
+  radius 0.585 (GIST) to 1.018 (GloVe) on a unit sphere, so `‖q‖·R` alone clears θ.
+  The description below is retained because the bound is still what the code
+  computes and its soundness is asserted in `bench/code_scan.c`; it is no longer a
+  claim that the vector channel prunes. A code block stores 32 vectors, and its
+  header stores
   the block's centroid (itself as a quantized code) plus a radius
   `R = maxₛ‖rₛ − c‖`. Then `⟨q,rₛ⟩ ≤ ⟨q,c⟩ + ‖q‖₂·R` for every member. One
   lookup-table gather per block; no page reads beyond the header the shuttle is
