@@ -576,6 +576,19 @@ run_codescan() {
 			queries=corpus/gist/gist_query.fvecs" \
 		2>&1 | tee -a "$OUT/codescan.log" || die "code_scan 3-bit failed"
 
+	# The two-stage prefix scan, timed on THIS host.  It is the candidate answer to
+	# the scan cost, and the number it has to be compared against -- pgvector HNSW
+	# warm p50 at matched recall -- comes from bench/hnsw_base.sh on a different
+	# instance.  Same CPU model and a single-threaded scan make that defensible,
+	# but a favourable result on a cross-host comparison is exactly what a skeptic
+	# should attack, so pass ITYPE=r7i.2xlarge to put both sides on the same type.
+	say "two-stage prefix scan, n=1M, timed"
+	$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs 1000000 \
+			${CSNQ:-10} bits=4 k=10 order=natural kernel=lut-wide \
+			prefix=480,240,120 pwin=8000,20000 \
+			queries=corpus/gist/gist_query.fvecs" \
+		2>&1 | tee -a "$OUT/prefix.log" || die "prefix scan failed"
+
 	say "n=200000 clustered -- does the bound prune at scale on a clean host?"
 	$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs 200000 \
 			${CSNQ:-10} bits=4 k=10 order=clustered lists=6250 iters=6 \

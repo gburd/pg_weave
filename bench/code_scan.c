@@ -353,6 +353,10 @@ main(int argc, char **argv)
 				clustered = 1;
 	const char *kernelname = NULL,
 			   *qpath = NULL;
+	int			prefix[8],
+				nprefix = 0;
+	int			pwin[8],
+				npwin = 0;
 
 	for (int i = 4; i < argc; i++)
 	{
@@ -370,6 +374,32 @@ main(int argc, char **argv)
 			kernelname = a + 7;
 		else if (!strncmp(a, "queries=", 8))
 			qpath = a + 8;
+		else if (!strncmp(a, "prefix=", 7))
+		{
+			char	   *t = a + 7;
+
+			while (*t && nprefix < 8)
+			{
+				prefix[nprefix++] = atoi(t);
+				while (*t && *t != ',')
+					t++;
+				if (*t == ',')
+					t++;
+			}
+		}
+		else if (!strncmp(a, "pwin=", 5))
+		{
+			char	   *t = a + 5;
+
+			while (*t && npwin < 8)
+			{
+				pwin[npwin++] = atoi(t);
+				while (*t && *t != ',')
+					t++;
+				if (*t == ',')
+					t++;
+			}
+		}
 		else if (!strncmp(a, "order=", 6))
 			clustered = !strcmp(a + 6, "clustered");
 		else
@@ -411,6 +441,7 @@ main(int argc, char **argv)
 	if (weave_quantizer_init(&q, dim, bits, NULL, malloc, free) != 0)
 		die("quantizer_init");
 
+	const int	layout_is_vecmajor = 0;	/* this harness packs WEAVE_PACK_LANE */
 	long		nblk = (n + LANES - 1) / LANES;
 	size_t		blkbytes = (size_t) weave_block_codebytes(dim, bits);
 	size_t		lanebytes = ((size_t) dim * bits + 7) / 8;
@@ -433,6 +464,10 @@ main(int argc, char **argv)
 	float	   *smax = xmalloc((size_t) nblk * sizeof(float));
 	float	   *mrec = xmalloc((size_t) nblk * sizeof(float));
 	int		   *lanevec = xmalloc((size_t) nblk * LANES * sizeof(int));
+	/* Inverse of lanevec: where vector i lives, as block*LANES + lane.  Stage 2
+	 * of the prefix scan needs to rescore a specific vector, and searching
+	 * lanevec for it would make the harness O(n) per candidate. */
+	long	   *vipos = xmalloc((size_t) n * sizeof(long));
 	int		   *nlanes = xmalloc((size_t) nblk * sizeof(int));
 
 	for (long b = 0; b < nblk; b++)
@@ -457,6 +492,7 @@ main(int argc, char **argv)
 							s, code);
 			scales[b * LANES + s] = scale;
 			lanevec[b * LANES + s] = vi;
+			vipos[vi] = b * LANES + s;
 			weave_decode(&q, code, scale, rec + (size_t) s * dim);
 
 			if (scale > smax[b])
@@ -580,6 +616,211 @@ main(int argc, char **argv)
 	{
 		kall[0] = weave_score_kernel_best();
 		nkern = 1;
+	}
+
+	/* ---- two-stage prefix scan ----------------------------------------
+	 *
+	 * The other lever on an O(dim * nvec) scan: score fewer COORDINATES.
+	 *
+	 * Stage 1 scores every vector against only the first `m` of `dim`
+	 * coordinates, keeps the best `W`, and stage 2 rescores those W over all
+	 * `dim` coordinates.  Stage 3 is the exact float32 rerank of the top 25 that
+	 * the ratified shape already pays for, so the recall reported here is
+	 * END-TO-END against brute force -- the number the gate actually cares about,
+	 * not an intermediate agreement rate.
+	 *
+	 * WHY A PREFIX IS A VALID SUBSAMPLE, AND WHY IT IS FREE HERE.  Two facts line
+	 * up, neither of them arranged for this purpose:
+	 *
+	 *  - The rotation (sect. 3) applies a global permutation and a Walsh-Hadamard
+	 *    transform, so the coordinates of any input are exchangeable and carry
+	 *    equal energy in expectation.  A prefix is therefore a uniform random
+	 *    subsample of coordinates, and <q[0:m], r[0:m]> * (dim/m) is an unbiased
+	 *    estimate of the full inner product.  Without the rotation, a prefix of an
+	 *    energy-ordered embedding would be a biased and much better estimate --
+	 *    and of a reversed one, far worse.  The rotation makes it predictable.
+	 *  - In WEAVE_PACK_LANE the code index is `j * 32 + slot`, INDEPENDENT of dim
+	 *    (src/vector/pack.c code_index()).  So coordinates 0..m-1 of all 32 lanes
+	 *    are a contiguous PREFIX of the block, and the LUT is row-major by
+	 *    coordinate, so its first m rows are a prefix too.  Stage 1 is therefore
+	 *    the existing kernel called with a shallow-copied LUT whose dim is m: no
+	 *    new kernel, no repacking, no extra bytes on disk.
+	 *
+	 * THIS TRICK IS LAYOUT-SPECIFIC.  In WEAVE_PACK_VECMAJOR the index is
+	 * `slot * dim + j`, which DOES depend on dim, so truncating the LUT there
+	 * would silently read the wrong bits rather than fewer of them.  Asserted
+	 * below rather than commented.
+	 */
+	if (nprefix > 0)
+	{
+		if (layout_is_vecmajor)
+			die("prefix scan requires WEAVE_PACK_LANE: in VECMAJOR the code index "
+				"depends on dim, so a truncated LUT reads wrong bits, not fewer");
+		if (npwin == 0)
+		{
+			pwin[0] = 100;
+			pwin[1] = 500;
+			pwin[2] = 2000;
+			npwin = 3;
+		}
+
+		float	   *out2 = xmalloc(sizeof(float) * LANES);
+		int			RW = 25;	/* the ratified shape's exact-rerank window */
+
+		printf("# corpus %s, n=%ld dim=%d bits=%d k=%d nq=%d\n", basepath, n, dim, bits, K, nq);
+		printf("# kernel: %s   two-stage prefix scan, exact rerank window %d\n",
+			   kall[0]->name, RW);
+		printf("# stage-1 coordinate work is m/dim of a full scan; stage 2 is W*dim\n");
+		printf("#\n");
+		printf("prefix_m\tm/dim\tW\trecall@10\tcoord_work_vs_full\ts1_ms\ts2_ms\ttotal_ms\n");
+
+		/* Exact top-K per query, by brute force over the original vectors: the
+		 * only honest reference for an end-to-end recall number. */
+		int		   *gt = xmalloc((size_t) nq * K * sizeof(int));
+
+		for (int t = 0; t < nq; t++)
+		{
+			TopK		g;
+
+			topk_init(&g, K);
+			for (long i = 0; i < n; i++)
+			{
+				const float *v = base + (size_t) i * dim;
+				const float *qq = qv + (size_t) t * dim;
+				double		ip = 0;
+
+				for (int j = 0; j < dim; j++)
+					ip += (double) qq[j] * v[j];
+				topk_push(&g, (float) ip, (int) i);
+			}
+			for (int i = 0; i < K; i++)
+				gt[t * K + i] = g.h[i].id;
+			free(g.h);
+			fprintf(stderr, "\r  exact gt %d/%d   ", t + 1, nq);
+		}
+		fprintf(stderr, "\r  exact gt done        \n");
+
+		for (int pi = 0; pi < nprefix; pi++)
+		{
+			int			m = prefix[pi];
+
+			if (m < 1 || m > dim)
+				die("prefix out of range");
+			for (int wi = 0; wi < npwin; wi++)
+			{
+				int			W = pwin[wi];
+				double		hits = 0;
+				double		ts1 = 0,
+							ts2 = 0;
+				Hit		   *cand = xmalloc(sizeof(Hit) * W);
+
+				for (int t = 0; t < nq; t++)
+				{
+					WeaveQueryLut lut;
+
+					if (weave_query_lut_build(&lut, &q, qv + (size_t) t * dim, malloc) != 0)
+						die("lut_build");
+
+					/* Stage 1: the same kernel, told the vector is m long. */
+					WeaveQueryLut plut = lut;
+
+					plut.dim = m;
+
+					TopK		s1;
+
+					topk_init(&s1, W);
+					double		tt = now();
+
+					for (long b = 0; b < nblk; b++)
+					{
+						WeaveScoreBlock blk = {0};
+
+						blk.lut = &plut;
+						blk.layout = WEAVE_PACK_LANE;
+						blk.codes = codes + (size_t) b * blkbytes;
+						blk.scales = scales + b * LANES;
+						blk.scalestride = 1;
+						blk.nlanes = nlanes[b];
+						blk.livemask = nlanes[b] == 32 ? 0xffffffffu : ((1u << nlanes[b]) - 1);
+						if (kall[0]->score_block(&blk, out2) < 0)
+							die("score_block rejected a prefix block");
+						for (int sl = 0; sl < nlanes[b]; sl++)
+							topk_push(&s1, out2[sl], lanevec[b * LANES + sl]);
+					}
+
+					ts1 += now() - tt;
+
+					/* Stage 2: full-dim rescore of the W survivors.  Done per
+					 * LANE rather than per block, because the survivors scatter
+					 * and rescoring their whole blocks would charge stage 2 for
+					 * 32x the work it does. */
+					int			ncand = s1.n;
+
+					memcpy(cand, s1.h, sizeof(Hit) * ncand);
+
+					TopK		s2;
+
+					topk_init(&s2, RW);
+					tt = now();
+					for (int c = 0; c < ncand; c++)
+					{
+						int			vi = cand[c].id;
+						long		b = vipos[vi] / LANES;
+						int			sl = (int) (vipos[vi] % LANES);
+						WeaveScoreBlock blk = {0};
+
+						blk.lut = &lut;
+						blk.layout = WEAVE_PACK_LANE;
+						blk.codes = codes + (size_t) b * blkbytes;
+						blk.scales = scales + b * LANES;
+						blk.scalestride = 1;
+						blk.nlanes = nlanes[b];
+						blk.livemask = 1u << sl;
+						if (kall[0]->score_block(&blk, out2) < 0)
+							die("score_block rejected a rescore block");
+						topk_push(&s2, out2[sl], vi);
+					}
+
+					ts2 += now() - tt;
+
+					/* Stage 3: exact float32 rerank of the top RW, which is what
+					 * the shipping shape does from the heap. */
+					TopK		s3;
+
+					topk_init(&s3, K);
+					for (int c = 0; c < s2.n; c++)
+					{
+						const float *v = base + (size_t) s2.h[c].id * dim;
+						const float *qq = qv + (size_t) t * dim;
+						double		ip = 0;
+
+						for (int j = 0; j < dim; j++)
+							ip += (double) qq[j] * v[j];
+						topk_push(&s3, (float) ip, s2.h[c].id);
+					}
+					for (int i = 0; i < s3.n; i++)
+						for (int j = 0; j < K; j++)
+							if (s3.h[i].id == gt[t * K + j])
+							{
+								hits++;
+								break;
+							}
+					free(s1.h);
+					free(s2.h);
+					free(s3.h);
+					free(lut._alloc);
+				}
+				double		work = (double) m / dim + (double) W * dim / ((double) n * dim);
+
+				printf("%d\t%.4f\t%d\t%.4f\t%.4f\t%.2f\t%.2f\t%.2f\n",
+					   m, (double) m / dim, W, hits / (nq * (double) K), work,
+					   1000 * ts1 / nq, 1000 * ts2 / nq,
+					   1000 * (ts1 + ts2) / nq);
+				fflush(stdout);
+				free(cand);
+			}
+		}
+		return 0;
 	}
 
 	/* ---- scan ---------------------------------------------------------- */
