@@ -528,18 +528,26 @@ run_hnswbase() {
 run_codescan() {
 	# The measurement the restated Phase V gate's latency term now turns on.
 	#
-	# bench/RESULTS_CODE_SCAN.md established the STRUCTURAL half locally: the
-	# block bound prunes 0.00% on GIST-960d and 0.01% on GloVe-200d, so a query
-	# scores every code in the index.  What that costs in milliseconds could not
-	# be measured there -- the workstation was at load average 26 on 8 cores and
-	# identical work swung 2.2x.  A latency number is worthless under contention,
-	# so it is taken here, on an instance doing nothing else.
+	# bench/RESULTS_CODE_SCAN.md settled the STRUCTURAL half locally: the block
+	# bound prunes 0.00% on GIST-960d and 0.01% on GloVe-200d, so a query scores
+	# every code in the index.  What that costs in milliseconds could not be
+	# measured there -- the workstation was at load average 26 on 8 cores and
+	# identical work swung 2.2x.  A latency number taken under contention is not a
+	# latency number, so it is taken here.
 	#
-	# Three kernels are timed, not one.  `lut-avx2` is the best available on x86-64
-	# and `lut-wide` is the portable baseline it must beat; the `scalar` oracle is
-	# the correctness reference and its time bounds what the widths above 4 bits
-	# would cost, since they have no SIMD path at all.  Reporting only the fastest
-	# would hide that the fallback is what widths 5-8 actually run.
+	# TIMING RUNS USE order=natural, DELIBERATELY.  Nothing prunes, so every arm
+	# scores every lane and the warp ordering cannot change the time; and
+	# clustering at these sizes is the most expensive thing in the job by far.
+	# The first version of this job asked for order=clustered with lists = n/32,
+	# which at n = 1M is a k-means over 31,250 centroids: O(n * lists * dim) is
+	# ~3e13 flops PER ITERATION, times six iterations, times three kernels,
+	# because it also re-clustered for every kernel.  It would not have finished.
+	# Preparation is per-corpus and timing is per-kernel, which is what
+	# `kernel=all` now expresses.
+	#
+	# One clustered arm is kept at 200k to confirm the 0% pruning result on an
+	# uncontended host at a size larger than the local run, since that is the
+	# finding the rest of the phase now rests on.
 	fetch_gist
 	say "building code_scan"
 	$SSH 'cd pg_weave && gcc -O2 -march=native -std=gnu99 -I include \
@@ -547,28 +555,32 @@ run_codescan() {
 			src/vector/pack.c src/vector/kernels.c -lm && echo built' \
 		2>&1 | tee "$OUT/build.log" || die "code_scan build failed"
 
-	# n is swept so the per-vector cost can be separated from the fixed cost, and
-	# so the 1M figure is a measurement rather than an extrapolation from 20k.
+	# n is swept so the per-vector cost is measured at three sizes rather than
+	# extrapolated from one, and so the L3-resident case (50k = 23 MB of codes) is
+	# distinguishable from the DRAM-bound case (1M = 458 MB).
 	for N in 50000 200000 1000000; do
-		for KERN in lut-avx2 lut-wide scalar; do
-			say "n=$N kernel=$KERN"
-			$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs $N \
-					${CSNQ:-10} bits=4 k=10 order=clustered lists=\$(( $N / 32 )) \
-					iters=6 kernel=$KERN \
-					queries=corpus/gist/gist_query.fvecs" \
-				2>&1 | tee -a "$OUT/codescan.log"
-		done
+		say "n=$N, all kernels, 4 bits, natural order"
+		$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs $N \
+				${CSNQ:-10} bits=4 k=10 order=natural kernel=all \
+				queries=corpus/gist/gist_query.fvecs" \
+			2>&1 | tee -a "$OUT/codescan.log" || die "code_scan n=$N failed"
 	done
 
-	# 3-bit at the same n, because the ratified shape's first named revision
-	# trigger is exactly this trade: 3 bits scans 25% fewer bytes and needs a
-	# window of 50 instead of 25.  Without the scan cost at both widths there is
-	# nothing to trade.
-	say "n=1000000 bits=3, the revision-trigger comparison"
+	# 3 bits at n=1M, because the ratified shape's first named revision trigger is
+	# exactly this trade: 3 bits scans 25% fewer bytes and needs a rerank window of
+	# 50 instead of 25.  Without the scan cost at both widths there is nothing to
+	# weigh.
+	say "n=1000000, 3 bits -- the revision-trigger comparison"
 	$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs 1000000 \
-			${CSNQ:-10} bits=3 k=10 order=clustered lists=31250 iters=6 \
-			kernel=lut-avx2 queries=corpus/gist/gist_query.fvecs" \
-		2>&1 | tee -a "$OUT/codescan.log"
+			${CSNQ:-10} bits=3 k=10 order=natural kernel=all \
+			queries=corpus/gist/gist_query.fvecs" \
+		2>&1 | tee -a "$OUT/codescan.log" || die "code_scan 3-bit failed"
+
+	say "n=200000 clustered -- does the bound prune at scale on a clean host?"
+	$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs 200000 \
+			${CSNQ:-10} bits=4 k=10 order=clustered lists=6250 iters=6 \
+			kernel=lut-wide queries=corpus/gist/gist_query.fvecs" \
+		2>&1 | tee -a "$OUT/codescan.log" || die "code_scan clustered failed"
 }
 
 run_p0merge() {
