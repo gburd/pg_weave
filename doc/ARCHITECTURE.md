@@ -280,9 +280,27 @@ Four things, and it should claim exactly four things:
    with one WAL stream, one vacuum, and one visibility rule.
 2. **Fused-threshold top-k** rather than over-fetch-plus-RRF: one threshold, no
    over-fetch, scores with meaning.
+
+   **Measured 2026-09-13, and this claim is currently half-supported.** The
+   mechanism needs a per-block upper bound on each channel's score. The *lexical*
+   bound — block-max WAND over the `max_tf`/`min_doclen` already in
+   `WeaveBlockHdr` — works and is separately validated. The *vector* bound does
+   not: `bench/RESULTS_CODE_SCAN.md` measures it pruning **0.00%** of blocks on
+   GIST-960d and **0.01%** on GloVe-200d, against 99.6% on the synthetic corpus
+   it was originally measured on. For L2-normalized vectors the Cauchy–Schwarz
+   term is ≈ 1.0 by construction while θ is always below 1.0, and the
+   centroid+radius term is loose by a factor growing with √dim because it assumes
+   a residual aligned with the query. **Do not make this claim about the vector
+   channel until a candidate-reduction mechanism that measurably works is in
+   place.** The claim as stated is safe for lexical, fuzzy and regex; it is not
+   yet safe for vector, and saying so here is cheaper than being told.
 3. Queries that get **faster** as predicates get more selective, because the
-   predicate is pushed into graph traversal and into the SIMD block mask,
-   instead of collapsing recall.
+   predicate is pushed into the SIMD block mask instead of collapsing recall.
+   (The "graph traversal" half of this sentence is stale — the Vamana plan was
+   withdrawn in V9's history. The mask is the live mechanism, and it is
+   *predicate*-driven, which is why the failure of the *score*-driven block bound
+   in claim 2 does not touch this claim: `weave_score_block()` skips a masked
+   lane without reading a code byte.)
 4. C, PostgreSQL-licensed, MVCC- and WAL-native, `trusted`, no external engine —
    therefore on the contrib track, which an AGPL extension embedding a
    non-PostgreSQL storage engine structurally cannot be.
