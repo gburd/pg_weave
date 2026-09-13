@@ -230,7 +230,7 @@ read but **not** to port line-by-line: `~/src/turbovec` (Rust, MIT).
 | V7 | New page kinds `WEAVE_PK_VCODES`/`WEAVE_PK_VMETA` (ids 18/17, reserved by X1 in the extended kind space -- read them with `WeavePageHasKind()`, never a bitwise AND); codes live in the bolt under GenericXLog. **On-disk determinism:** `weave_block_codebytes()` allocates 0-28 slack bytes per block beyond the tight `4*dim*bits` requirement (see the note above it in `include/weave/quantize.h`), and no pack function ever writes them, so V7 **must zero the block buffer before encoding** or two indexes holding identical vectors get different bytes on disk. | crash-recovery TAP test extended to a vector index |
 | V8 | Code-scan shuttle: `score_block` over 32 lanes, `allow`-mask block short-circuit, and the block bound from `doc/specs/FUSED_TOPK.md` §2. Passes the segment's pack layout and the allowlist's `nwarp` into `score_block()` — both are parameters of that prototype, neither is assumed (`doc/specs/VECTOR_CHANNEL.md` §§8, 9) | (C1)+(C2) property test; a selective mask makes the scan measurably *faster* |
 | V9 | **DEMOTED 2026-09-12 to "conditional on our own flat-vs-IVF measurement", from required.** pg_turbovec v2.8.0–2.8.3 measured at 1M rows that **flat brute-force beats IVF at every recall target at 2-bit and 4-bit**; IVF wins only at **1-bit**, and only up to ~0.95 (47 % faster at R@10 ≥ 0.90, 38 % at ≥ 0.95). The mechanism it gives is that wider, less lossy codes need a narrower exact-rerank window, so the full flat scan is already cheap — not that probe-miss error dominates. pg_weave's own sweep now puts it at **3 bits plus an exact top-100 rerank**, i.e. squarely in the regime where IVF measured *worse* than flat, and pg_weave would additionally be clustering over **already-quantized** codes, a lossier geometry than pg_turbovec's and one nobody has measured. Before building V9, measure flat-vs-IVF on pg_weave's own codebook; if it reproduces, withdraw V9 and let V8's flat 32-lane scan plus the block bound carry the channel. **Knock-on: V13 loses its justification** — it was written as "IVF satisfies this requirement inherently", and without IVF the warp ordering needs a build-time clustering step of its own, which is what the withdrawn graph plan also needed. The block bound prunes 99.6 % of blocks with a coherent warp and 0.0 % with a random one, so the clustering does not become optional just because the probing does. Original entry follows. **IVF coarse quantizer** over the quantized codes: k-means over a sample, per-cluster centroids, `nprobe` probing, cluster-aligned code blocks (which also satisfies V13). **NOT a proximity graph** — withdrawn after pg_turbovec deprecated its graph kind in v2.5.0, having measured that at R@10 ≥ 0.98 on GIST-10M/960-d IVF reached 28.4 ms while the graph could not reach 0.98 at **any** latency (ceiling 0.873 at 181 ms) and built 57–90× slower. **A later release (v2.7.4) additionally measured that IVF's probe count sets a hard recall ceiling a wider rerank window cannot break — 0.846/0.906/0.954/0.978/0.984 at probes 8/16/32/64/128 at `lists=512` — a mechanism, not a BQ-specific artifact, so it applies to this design's IVF too.** `doc/specs/VECTOR_CHANNEL.md` §8a. | recall@10 ≥ 0.99 on 1M × 1024-d, **backed by a probes-vs-recall-vs-p50 sweep on pg_weave's own codebook and corpus geometry, not a single (probes, recall, p50) triple picked to clear the bar**; p50 within 2× of pgvector HNSW measured at the same recall target **on the same corpus** (confirm HNSW can itself reach 0.99 there before using it as the comparator — pg_turbovec's own data shows a corpus where HNSW topped out at 0.983); storage ≤ 0.15× pgvector HNSW; **plus a recall floor in the gate for any partitioned build** — pg_turbovec's shard/thread coupling cost R@10 0.920 → 0.605 while a build-time-only test called it a 60× speedup |
-| V10 | **PROMOTED to a 0.99 prerequisite 2026-09-10, was "optional".** `recall=exact` path: graph off, full code scan, and the full-precision rerank sidecar `WEAVE_PK_VRERANK`. `bench/RESULTS_IVF_RECALL.md` measured compressed-domain-only recall@10 at **full probe** — probe-miss error zero, so this is the ceiling over every `nprobe` — topping out at 0.9205 (GloVe-200d) and 0.8780 (GIST-960d) at 4 bits, against a 0.99 gate. A rerank window of 100 closed the gap on both corpora. So the sidecar is not an extra for an exactness mode; it is how the ordinary gate is met. `doc/specs/VECTOR_CHANNEL.md` §2.1. | recall@10 == 1.000 for `recall=exact`, **and** the rerank window needed for `recall@10 >= 0.99` recorded per bit width and corpus |
+| V10 | **RESHAPED 2026-09-13 by the ratified Phase V shape; the sidecar is WITHDRAWN.** The `recall=exact` path is: graph off, full code scan, and an exact float32 rerank of a top-`w` window read **from the heap**. The full-precision sidecar `WEAVE_PK_VRERANK` this task used to specify is withdrawn — a stored float32 sidecar costs `4 * dim` = 4,096 B/vector at 1024-d, which is half of what a measured pgvector HNSW index spends per vector (8,056 B) and would forfeit the storage gate outright. The heap already holds the vector at full precision and the index pays nothing for it. Committed shape: **4 bits, window 25** — recall@10 0.9920 at n=1M on GIST-960d, index 0.064× HNSW. The window is a query-time GUC (`pg_weave.vec_rerank_window`), not a reloption, since it changes no stored bytes. Why a rerank is required at all, rather than a wider code: compressed-domain recall@10 at **full probe** — probe-miss error zero, so a ceiling over every `nprobe` — tops out at 0.9860 on GIST at **8 bits**, so no supported width reaches 0.99 alone (`bench/RESULTS_BITWIDTH_SWEEP.md`). The rerank is float32, so the ceiling that binds is 1.0. `doc/specs/VECTOR_CHANNEL.md` §2.1.1, `bench/RESULTS_PHASE_V_COLD.md`. | the rerank is measured at n≥1M against **exact search on the same table**, not a shipped ground-truth file; window default 25 and the ~+25%-per-decade growth documented; and `WEAVE_PK_VRERANK` left reserved-and-withdrawn in `pagekind.h` so nobody implements it from a stale comment |
 | V11 | Journal-checksum-style incremental commit for the vector wefts (alternating header slots, delta digest) — adapted to PostgreSQL's WAL rather than replacing it | torn-write injection TAP test detects and recovers |
 | V12 | ColBERT-style multivector late interaction as a distinct channel kind | MaxSim correctness against a reference implementation |
 | V13 | **RE-JUSTIFICATION REQUIRED 2026-09-12** — this row says "IVF satisfies this requirement inherently", and V9 (IVF) is now demoted, so the clustering has to be provided by something. It does not become optional: the block bound prunes 99.6 % of blocks with a coherent warp and **0.0 %** with a random one, so warp coherence is load-bearing regardless of whether anything probes clusters at query time. What changes is that it needs a build-time k-means of its own rather than inheriting one — the same requirement the withdrawn proximity-graph plan had. Original entry follows. **Warp ordering by cluster.** Assign warp positions in the order the IVF build's k-means clustering produces (§8a of doc/specs/VECTOR_CHANNEL.md; IVF satisfies this requirement inherently, where the withdrawn graph plan needed it as a separate constraint), so each 32-lane code block is spatially coherent. Not an optimization: `bench/RESULTS_BOUND_PRUNING.md` measures the block bound pruning 99.6% of blocks with a coherent warp and **0.0%** with a random one. | `bench/bound_pruning.c` reports ≥ 90% blocks pruned at k=10 on the shipped corpora; a heap-order build is rejected by the gate |
@@ -248,10 +248,97 @@ checks),
 no verified vector ISA outside x86-64 AVX2, no approximate kernel family, and
 no per-host A/B. V7–V14 not started.
 
-**Phase V gate — ANSWERED BY MEASUREMENT 2026-09-12. Resolution 1 is refuted; a
-maintainer decision is needed on the shape that replaces it.** The gate was: on
-1M × 1024-d Cohere-wiki, all three of `recall@10 ≥ 0.99`, `p50 ≤ 2× pgvector HNSW`,
-`size ≤ 0.15× pgvector HNSW` simultaneously.
+**Phase V gate — RESTATED AND RATIFIED 2026-09-13.** The gate below replaces the
+original, which was **mis-specified rather than merely unmet**: it conditioned a
+latency comparison on a recall the comparator cannot reach, and it quoted a
+storage ratio whose denominator was never measured. The measurements that forced
+the restatement are in `bench/RESULTS_PHASE_V_COLD.md` and are summarised further
+down; the original gate and its history are kept below the restatement because it
+was quoted for months and a silent rewrite would strand every citation.
+
+### The restated gate
+
+On **two corpora of different dimensionality at n ≥ 1M** (GIST-960d and a 1024-d
+corpus — the original named Cohere-wiki), all of:
+
+1. **Recall.** `recall@10 ≥ 0.99`, measured against **exact search over the same
+   table**, at the shipped defaults. Not against a ground-truth file shipped with a
+   corpus: those describe the preprocessing they were built with, and normalizing
+   rows for cosine invalidates an exact-L2 file (this bit us — `bench/hnsw_base.sh`
+   recomputes ground truth with a sequential scan for exactly this reason).
+
+2. **Storage.** `index bytes ≤ 0.15 ×` a **measured** pgvector HNSW index on the
+   same corpus, with HNSW's build parameters recorded next to the ratio, and with
+   the HNSW configuration taken from the **best-recall point of an `m` ×
+   `ef_construction` sweep** rather than an arbitrary one. Under-tuning the
+   comparator makes both this gate and the next one easier and both worthless; a
+   better-built HNSW is also *larger*, so this rule can only cost us.
+
+3. **Latency, iso-recall, with the cache state declared.** Let
+   `R* = min(0.99, best recall@10 pgvector HNSW achieves on this corpus over the
+   swept m / ef_construction / ef_search)`. At recall ≥ `R*`, pg_weave's p50 must
+   be ≤ 2× pgvector HNSW's p50, **warm and cold, both**, with p99 reported
+   alongside and exact search reported as the latency upper bound.
+   - Comparing at *unmatched* recall is the pg_turbovec retraction in miniature —
+     a fast wrong answer beats a slow right one on every clock.
+   - A p50 with no declared cache state is not reproducible: the same HNSW index
+     measured **3.548 ms warm and 416 ms cold** in this project's own run.
+   - If `R* < 0.99`, the result must say so with the number, and must report
+     pg_weave's recall at its own operating point — i.e. that we clear a bar the
+     comparator does not.
+
+4. **Anti-gaming, carried and extended.** A probes/recall/p50 **sweep**, never a
+   single triple chosen to clear the bar. A recall floor for any partitioned build
+   (pg_turbovec's shard/thread coupling cost R@10 0.920 → 0.605 while a
+   build-time-only test called it a 60× speedup). The comparator's tuning recorded.
+   Every latency figure labelled warm or cold, with the prewarm **verified** rather
+   than attempted — an unverified `pg_prewarm` produced a "warm" arm in this
+   project's own run that read 2,136 pages per query.
+
+**Where the shape stands against it today:** (1) met on GIST-960d at n=1M (0.9920),
+second corpus outstanding; (2) met with margin (0.064× against a measured 8,056
+B/vector); (3) **unmeasured**, because V7/V8 do not exist and the code scan is the
+half that will decide it.
+
+### The committed shape — RATIFIED 2026-09-13
+
+**4-bit codes plus an exact float32 rerank of a top-25 window, read from the heap.**
+
+- recall@10 **0.9920** at n = 1M on GIST-960d, full probe, self-check PASS;
+- index **512 B/vector at 1024-d = 0.064× pgvector HNSW** (measured denominator);
+- the widest width that keeps the SIMD code-scan kernel — 5–8 bits fall back to the
+  scalar oracle (`KERNEL_GROUP_BITS_MAX`), and the code scan touches every vector
+  while the rerank touches twenty-five, so trading vectorized scoring for five
+  fewer candidates is the wrong way round;
+- `WEAVE_VEC_DEFAULT_BITS` is **already 4**, so the width needs no code change;
+- the rerank window is a **query-time GUC** (`pg_weave.vec_rerank_window`, default
+  25), not a reloption, because it does not change stored bytes — the rule stated in
+  `include/weave/vector.h`.
+
+**This is committed, not closed.** It is the best shape *measured so far*, and five
+named experiments could replace it. Each is a measurement, not a preference:
+
+1. **The code scan.** If scanning 4-bit codes dominates, 3 bits scans 25% fewer
+   bytes and needs window 50 — trading code-scan bytes for rerank page reads. Only
+   a measurement orders these, and it is the next V task.
+2. **A SIMD kernel for widths 5–8.** Their fallback to the scalar oracle is the
+   main reason 5 bits (window 20) lost. Build one and 5 bits is back in contention.
+3. **An HNSW `m` / `ef_construction` sweep.** Changes `R*` and therefore whether we
+   clear gate 3; `m = 16` is modest for 960-d and pgvector's own guidance is to
+   raise it.
+4. **Window growth past n = 1M.** It grows ~+25% per decade of n, so n = 10M wants
+   ~31 and n = 100M ~39. A deployment target above 1M re-prices the rerank.
+5. **A prefetch path for detoast.** Detoast is serialized in PG 17; making it
+   concurrent would cheapen wide windows and therefore favour narrower codes.
+
+### The original gate, superseded
+
+The gate was: on 1M × 1024-d Cohere-wiki, all three of `recall@10 ≥ 0.99`,
+`p50 ≤ 2× pgvector HNSW`, `size ≤ 0.15× pgvector HNSW` simultaneously. Two of its
+three terms turned out to be unusable as written — the latency term because the
+comparator has no 0.99 operating point at m=16/ef_construction=64 (measured 0.9760
+ceiling), and the storage term because its denominator was an estimate that was 30%
+low. The recall term survives unchanged and is the one the shape is held to.
 
 `bench/RESULTS_BITWIDTH_SWEEP.md` swept widths 2..8 at full probe on both corpora,
 which is what resolution 1 ("keep both claims, find a rerank representation cheaper

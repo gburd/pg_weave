@@ -50,8 +50,8 @@
 										 * blocks, each preceded by a
 										 * WeaveVecBlockHdr */
 #define WEAVE_VGRAPH		WEAVE_PK_VGRAPH /* Vamana CSR adjacency (weave/graph.h) */
-#define WEAVE_VRERANK		WEAVE_PK_VRERANK	/* optional full-precision sidecar for
-										 * the recall=exact rerank tail */
+#define WEAVE_VRERANK		WEAVE_PK_VRERANK	/* WITHDRAWN -- see pagekind.h.  The
+										 * rerank reads the heap, not a sidecar. */
 
 /* ---------------------------------------------------------------------------
  * The wvec SQL type
@@ -135,7 +135,9 @@ typedef struct WeaveVecMeta
 	uint32		nblocks;		/* ceil(nvec / WEAVE_VEC_BLOCK) */
 	BlockNumber codestart;		/* first WEAVE_VCODES page */
 	BlockNumber graphstart;		/* first WEAVE_VGRAPH page, or Invalid */
-	BlockNumber rerankstart;	/* first WEAVE_VRERANK page, or Invalid */
+	/* No rerankstart: the exact rerank reads full precision from the HEAP, so
+	 * there is no sidecar chain to point at.  Withdrawn 2026-09-13 before it was
+	 * ever written to disk, so this is not a format change. */
 	BlockNumber calibstart;		/* TQ+ calibration blob, or Invalid = identity */
 
 	uint32		calibsample;	/* rows the calibration was fit from; 0 = none */
@@ -200,12 +202,23 @@ typedef struct WeaveVecLane
  *
  * Set on the index, not by GUC, because they change the bytes on disk:
  *
- *		bits			2 | 3 | 4			code width			default 4
+ *		bits			2..8				code width			default 4
  *		graph			bool				build the Vamana weft	default true
  *		graph_degree	int					R, out-degree		default 32
  *		graph_beam		int					L, build beam width	default 64
- *		rerank			bool				full-precision sidecar	default false
  *		calibrate		int					TQ+ sample rows, 0=off	default 0
+ *
+ * `bits` defaults to 4 because that is the ratified Phase V shape (doc/PHASES.md,
+ * "the committed shape"): with an exact top-25 rerank it reaches recall@10 0.9920
+ * at n = 1M on GIST-960d for 512 B/vector, which is 0.064x a measured pgvector
+ * HNSW index, and 4 is the widest width that still has a SIMD scoring kernel --
+ * 5..8 fall back to the scalar oracle (see KERNEL_GROUP_BITS_MAX).  Widths up to
+ * 8 are accepted because the codec supports them and the recall ceiling at each
+ * is measured (bench/RESULTS_BITWIDTH_SWEEP.md); they are not recommended.
+ *
+ * There is no `rerank` reloption.  It used to select a stored full-precision
+ * sidecar, which is withdrawn -- see WEAVE_VRERANK above.  The rerank window is a
+ * query-time GUC instead, because it changes no stored bytes.
  * ------------------------------------------------------------------------- */
 
 #define WEAVE_VEC_DEFAULT_BITS			4
@@ -218,6 +231,24 @@ typedef struct WeaveVecLane
 
 /* Candidate multiplier for the graph traversal: visit oversample * k nodes. */
 extern int	weave_vec_oversample;
+
+/*
+ * Size of the exact float32 rerank window: the top `w` candidates from the
+ * compressed-domain scan are re-scored against the heap's full-precision vectors
+ * and the best k of those are returned.
+ *
+ * Default 25, which is the ratified Phase V shape at 4 bits: recall@10 0.9920 at
+ * n = 1M on GIST-960d, against 0.9810 at window 20 and 0.9980 at 30
+ * (bench/RESULTS_PHASE_V_COLD.md).  A GUC and not a reloption because it changes
+ * no stored bytes -- the same index answers a wider or narrower window.
+ *
+ * IT SHOULD GROW WITH THE CORPUS.  The window has to be wide enough to still
+ * contain the true top-k after quantization perturbs the ordering, and that
+ * requirement grows by about +25% per decade of row count: 25 at n = 1M implies
+ * roughly 31 at 10M and 39 at 100M.  Measured at 100k and 1M and interpolated
+ * beyond, so treat >1M as a starting point to verify rather than a setting.
+ */
+extern int	weave_vec_rerank_window;
 
 /* "exact" disables the graph and scans every code block; "graph" uses the
  * traversal.  Exposed as an enum GUC so a session can opt into 1.000 recall for
