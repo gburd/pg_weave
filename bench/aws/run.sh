@@ -18,6 +18,9 @@
 #					  all	   all of the above
 #					  winsweep   rerank window at n=1M, the Phase V frontier's
 #							     fragile number (CPU only, no server)
+#					  codescan   flat code-scan throughput at n up to 1M, three
+#							     kernels, 4 and 3 bits (CPU only, no server).
+#							     Needs an UNCONTENDED host to mean anything.
 #					  rerankcold winsweep, then cold p50 of a heap rerank with
 #							     the real wvec type (bench/rerank_cold.sh)
 #					  hnswbase   the pgvector HNSW baseline: bytes/vector,
@@ -53,6 +56,7 @@ case "$JOB" in
 	# the same corpus is ~5 GB again.  400 leaves room to hold all of it at once
 	# without the load failing halfway through a two-hour run.
 	winsweep|rerankcold|hnswbase) VOLGB=${VOLGB_OVERRIDE:-400} ;;
+	codescan) VOLGB=${VOLGB_OVERRIDE:-250} ;;
 esac
 REGION=$(aws configure get region --profile "$PROFILE")
 RUN=pgweave-$(date -u +%Y%m%d-%H%M%S)
@@ -521,6 +525,52 @@ run_hnswbase() {
 	[ "$rc" = 0 ] || die "hnsw_base.sh failed (see $OUT/hnswbase.log)"
 }
 
+run_codescan() {
+	# The measurement the restated Phase V gate's latency term now turns on.
+	#
+	# bench/RESULTS_CODE_SCAN.md established the STRUCTURAL half locally: the
+	# block bound prunes 0.00% on GIST-960d and 0.01% on GloVe-200d, so a query
+	# scores every code in the index.  What that costs in milliseconds could not
+	# be measured there -- the workstation was at load average 26 on 8 cores and
+	# identical work swung 2.2x.  A latency number is worthless under contention,
+	# so it is taken here, on an instance doing nothing else.
+	#
+	# Three kernels are timed, not one.  `lut-avx2` is the best available on x86-64
+	# and `lut-wide` is the portable baseline it must beat; the `scalar` oracle is
+	# the correctness reference and its time bounds what the widths above 4 bits
+	# would cost, since they have no SIMD path at all.  Reporting only the fastest
+	# would hide that the fallback is what widths 5-8 actually run.
+	fetch_gist
+	say "building code_scan"
+	$SSH 'cd pg_weave && gcc -O2 -march=native -std=gnu99 -I include \
+			-o /scratch/code_scan bench/code_scan.c src/vector/quantize.c \
+			src/vector/pack.c src/vector/kernels.c -lm && echo built' \
+		2>&1 | tee "$OUT/build.log" || die "code_scan build failed"
+
+	# n is swept so the per-vector cost can be separated from the fixed cost, and
+	# so the 1M figure is a measurement rather than an extrapolation from 20k.
+	for N in 50000 200000 1000000; do
+		for KERN in lut-avx2 lut-wide scalar; do
+			say "n=$N kernel=$KERN"
+			$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs $N \
+					${CSNQ:-10} bits=4 k=10 order=clustered lists=\$(( $N / 32 )) \
+					iters=6 kernel=$KERN \
+					queries=corpus/gist/gist_query.fvecs" \
+				2>&1 | tee -a "$OUT/codescan.log"
+		done
+	done
+
+	# 3-bit at the same n, because the ratified shape's first named revision
+	# trigger is exactly this trade: 3 bits scans 25% fewer bytes and needs a
+	# window of 50 instead of 25.  Without the scan cost at both widths there is
+	# nothing to trade.
+	say "n=1000000 bits=3, the revision-trigger comparison"
+	$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs 1000000 \
+			${CSNQ:-10} bits=3 k=10 order=clustered lists=31250 iters=6 \
+			kernel=lut-avx2 queries=corpus/gist/gist_query.fvecs" \
+		2>&1 | tee -a "$OUT/codescan.log"
+}
+
 run_p0merge() {
 	# A/B for the merge tombstone P0 (bench/RESULTS_P0_MERGE_TOMBSTONE.md).
 	#
@@ -684,6 +734,7 @@ case "$JOB" in
 	p0merge) run_p0merge ;;
 	vall)    run_bitsweep; run_p0merge ;;
 	winsweep)   run_winsweep ;;
+	codescan)   run_codescan ;;
 	rerankcold) run_winsweep; run_rerankcold ;;
 	hnswbase)   run_hnswbase ;;
 	all)     run_smoke; run_bound; run_lexical ;;
