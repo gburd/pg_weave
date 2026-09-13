@@ -268,26 +268,45 @@ places are corrected; §2.1 now derives it.
 
 **What it costs the plan.**
 
-1. **V10's rerank sidecar is promoted from optional to a 0.99 prerequisite**, and
-   `WEAVE_PK_VRERANK` from an extra to required.
-2. **The recall gate and the storage gate may be jointly unsatisfiable.** A
-   full-coverage float32 sidecar costs `4 * dim` bytes per vector — 4,096 at 1024-d —
-   about what pgvector HNSW spends on the vector it stores, while `size <= 0.15×
-   pgvector HNSW` assumed the codes were the whole index. `doc/PHASES.md`'s Phase V
-   gate now states the three possible resolutions and marks the choice as the
-   maintainer's, not an engineering task: prove a cheaper rerank representation, keep
-   the storage claim and lower the recall claim ("0.92 at ~0.12×" is a real product
-   position), or keep the recall claim and drop the storage claim.
+1. **V10 is reshaped and `WEAVE_PK_VRERANK` is WITHDRAWN** (2026-09-13). The rerank
+   is required, but it reads full precision from the **heap**, not from a stored
+   sidecar. The id stays reserved so it is neither reused nor revived from a stale
+   comment.
+2. **The recall gate and the storage gate are NOT jointly unsatisfiable — that
+   reading rested on an unmeasured denominator.** A full-coverage float32 sidecar
+   does cost `4 * dim` = 4,096 B/vector at 1024-d, which is why the sidecar is
+   withdrawn; but with the rerank coming from the heap the index is codes only, and
+   pgvector HNSW measures **8,056 B/vector** (m=16, ef_construction=64, 999,990 ×
+   960-d, `bench/RESULTS_PHASE_V_COLD.md`) rather than the ~5,700 B/vector the
+   `0.15×` budget had been priced from. The ratified shape is **4 bits + a top-25
+   heap rerank: recall@10 0.9920 at n=1M, 0.064× HNSW.** Both gates met on one
+   corpus. The three-resolution framing is resolved and closed.
 3. **TQ+ affine calibration is not the fix.** It moved recall the wrong way at 3 of 4
    measured points.
-4. `doc/ARCHITECTURE.md` §8 no longer implies "0.99 at 10× storage savings", because
-   nothing measured supports it.
+4. `doc/ARCHITECTURE.md` §8 states recall and storage as measured and **latency as
+   unmeasured**: V7/V8 do not exist, so no pg_weave vector query has been timed end
+   to end. The code scan — 512 MB of codes at 1M × 4 bits — is now the deciding half.
+5. **The gate itself was restated** (2026-09-13), because `p50 ≤ 2× pgvector HNSW at
+   recall@10 ≥ 0.99` named an operating point the comparator does not have: pgvector
+   HNSW tops out at **0.9760** on this corpus. Latency is now compared iso-recall at
+   `R* = min(0.99, the comparator's best)`, warm and cold both, with the comparator
+   tuned by an `m` × `ef_construction` sweep and every prewarm verified.
 
-**What it does not show.** 200k × 200-d and 100k × 960-d, not the gate's 1M × 1024-d
-Cohere-wiki; k=10 cosine only. The quantization ceiling is the robust half — taken at
-full probe, so no partition quality can raise it. The probe-miss half of the same run
-is *pessimistically* biased by a deliberately crude harness k-means and must not be
-quoted as a ceiling.
+**What it does not show.** The width sweep is 200k × 200-d and 100k × 960-d; the
+window, the HNSW baseline and the cold latencies are **1M × 960-d**, still not the
+gate's second corpus at 1024-d. k=10 cosine only. The quantization ceiling is the
+robust half — taken at full probe, so no partition quality can raise it. The
+probe-miss half of the same run is *pessimistically* biased by a deliberately crude
+harness k-means and must not be quoted as a ceiling.
+
+Three specific limits on the 2026-09-12 EC2 run, all recorded in
+`bench/RESULTS_PHASE_V_COLD.md`: the HNSW recall ceiling of 0.9760 is for **m=16,
+ef_construction=64** and modest `m` is a known weakness at 960-d, so the sweep that
+would confirm or move it has not been run; every **warm** arm after the first loop
+iteration is invalid because `pg_prewarm` was never installed; and all
+reads-per-candidate figures from that run are invalid because planner catalog reads
+were summed into the execution count. The cold p50s and the recall table are the
+parts that stand.
 
 Compare the cost of learning this now against the counterfactual: V7, V8 and V9 built
 on disk, all correct, and then a recall gate that no configuration reaches. That is
