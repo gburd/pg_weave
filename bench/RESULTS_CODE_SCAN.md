@@ -51,6 +51,11 @@ they agree, because the bound never gets under the bar at all.
 Natural (file-order) warp ordering gives the same 0.00%, so this is not a
 clustering-quality problem.
 
+Confirmed on the uncontended `c7i.4xlarge` at a larger size: **n = 200k, one
+k-means cluster per block (`lists = 6250`, 6 iterations), 0.00% pruned at oracle
+θ.** θ = 0.8881, `⟨q,c⟩` = 0.7255, mean R = 0.7160, so B3 = 1.4415 — the same
+mechanism at ten times the corpus and with a better-converged clustering.
+
 **Soundness passed on every query of every run**: no bound was ever below a lane
 it covers, and the pruned arm's top-10 was identical to the flat arm's. The bound
 is correct. It is simply never small enough to be useful.
@@ -134,17 +139,108 @@ a flat scan.
    faster. Nothing here weakens it. The distinction matters: *masking* is
    predicate-driven and works; *bounding* is score-driven and does not.
 
+## Throughput: 291 ms per query at n = 1M, and the width does not matter
+
+Date: 2026-09-13. Instance: `c7i.4xlarge` (16 vCPU, Xeon Platinum 8488C),
+us-east-2, run `pgweave-20260913-*`, **doing nothing else**. GIST-960d,
+L2-normalized, real held-out queries, 10 queries per point, `order=natural`
+(nothing prunes, so warp order cannot change the time). Reproduce with
+`bench/aws/run.sh c7i.4xlarge codescan`.
+
+Nanoseconds per vector scored, which is the figure that extrapolates:
+
+| kernel | n = 50k | n = 200k | n = 1M, 4 bits | n = 1M, 3 bits |
+|---|---:|---:|---:|---:|
+| `lut-wide` | 292.6 | 291.6 | **291.2** | **292.1** |
+| `lut-avx2` | 426.6 | 425.4 | 425.2 | 419.0 |
+| `scalar` | 10,945.3 | 10,953.4 | 10,943.2 | 7,998.4 |
+
+Per query at n = 1M: **291 ms** (`lut-wide`), 425 ms (`lut-avx2`), **10.9 s**
+(`scalar`).
+
+### It is compute-bound, and the evidence is that n does not matter
+
+Per-vector cost is flat to within 0.5% from n = 50k to n = 1M. At 50k the codes
+are 23 MB and fit in L3; at 1M they are 458 MB and cannot. **If this were
+bandwidth-bound those two points would differ, and they do not.** The cost is one
+LUT gather per coordinate per vector, so it is `O(dim × nvec)` and indifferent to
+where the bytes live.
+
+### Therefore 3 bits buys nothing, and revision trigger 1 is resolved for 4 bits
+
+`doc/PHASES.md`'s committed shape lists five named experiments that could replace
+it. The first was: "if scanning 4-bit codes dominates, 3 bits scans 25% fewer
+bytes and needs window 50 — trading code-scan bytes for rerank page reads."
+
+Measured, **3 bits scans 25% fewer bytes in the same time**: 292.1 ns against
+291.2 ns, a 0.3% difference in the wrong direction and inside the noise. The width
+sets how many bits come out of each lookup, not how many lookups happen. So:
+
+| | 4 bits | 3 bits |
+|---|---|---|
+| scan, n = 1M | 291.2 ns/vec | 292.1 ns/vec |
+| index | 512 B/vec, 0.064× HNSW | 384 B/vec, 0.048× HNSW |
+| rerank window @ 0.99, n = 1M | 25 | 50 |
+| rerank cold p50 | ~100 ms | ~180 ms |
+
+Three bits trades 25% of a storage budget that is already met by 2–3× for a
+doubled rerank window, which is real cold I/O. That is a slack constraint bought
+with a binding one. **4 bits stays, now on measured grounds rather than on the
+SIMD-path argument alone.**
+
+### The shipped kernel default is the slower path
+
+`lut-wide` beats `lut-avx2` by **1.44×** at every size and both widths, and
+`weave_score_kernel_best()` selects `lut-avx2`. So the default resolution picks the
+slower kernel. This independently reproduces what `doc/specs/VECTOR_CHANNEL.md` §9
+records from pg_turbovec — they "measured AVX2 and declined it", because a
+gather-per-coordinate has no reuse to amortize the gather latency against. Ours is
+the same shape and the same outcome.
+
+Not yet established: whether `lut-wide` also wins at small `dim`, where the AVX2
+setup cost is amortized over fewer coordinates. Every point measured here is
+960-d. The fix is a measurement across `dim`, not a one-line change to the
+selection order.
+
+### Widths 5–8 are not merely unattractive, they are unusable
+
+`scalar` is **37× `lut-wide`** — 10.9 s per query at n = 1M. That is what widths
+5–8 run, because the wide and AVX2 paths pack 8 lanes into a 32-bit word and are
+structurally limited to 4 bits (`KERNEL_GROUP_BITS_MAX`). The ratified shape's
+"widest width that keeps the SIMD kernel" argument was made qualitatively; this is
+the quantity.
+
+## What this means for the gate, plainly
+
+The restated Phase V gate's latency term is `p50 ≤ 2× pgvector HNSW` at matched
+recall, warm and cold. Warm, pgvector HNSW measured **3.548 ms** at ef = 10
+(`bench/RESULTS_PHASE_V_COLD.md`), so the bar is ~7.1 ms. A flat scan is **291 ms**
+before the rerank is added.
+
+**The vector channel misses the latency term by roughly 40×, and no choice of code
+width changes that.** This is the same order as the 490× loss pg_turbovec measured
+for their flat scan against pgvector HNSW, reached independently.
+
+Because the cost is `O(dim × nvec)` with no bandwidth component, only two things
+can move it:
+
+1. **Scan fewer vectors.** Candidate reduction: IVF (task V9, demoted 2026-09-12)
+   or a proximity graph (withdrawn earlier). The block bound was the third option
+   and it does not prune. **V9's demotion rested partly on the flat scan being
+   cheap once the bound pruned it; that premise is now measured false, so the
+   demotion should be reconsidered.**
+2. **Score fewer coordinates.** Dimensionality reduction before quantization, or a
+   two-stage scan over a prefix of coordinates. Neither is in the ledger.
+
+What will *not* help: narrower codes, a different SIMD kernel (the best available
+is already 291 ms, and the portable one at that), or better warp ordering.
+
 ## What is still unmeasured
 
-**Throughput.** How long a flat scan of 1M codes actually takes at 4 bits and
-960–1024-d, per kernel (`scalar`, `lut-wide`, `lut-avx2`), on an uncontended
-machine. That number decides how bad the absence of pruning is, and it is the
-next measurement. The preliminary local figures were taken under 3× CPU
-oversubscription and are not reported here for that reason.
-
-A rough expectation to be checked rather than trusted: at 4 bits a 960-d lane is
-480 B, so 1M vectors is 480 MB per query, and the LUT path does one gather per
-coordinate per vector — 960M gathers per query. If that is the shape of the cost,
-the flat scan is compute-bound rather than bandwidth-bound, and pg_turbovec's
-independently measured 490× loss to pgvector HNSW for a flat scan is the reference
-point to compare against.
+- Whether `lut-wide`'s win over `lut-avx2` holds at lower `dim`.
+- Whether the bound prunes on a corpus that is genuinely well-clustered. Both
+  corpora here fail it, for opposite reasons, which is what makes the failure look
+  structural — but "no real corpus we tried" is not "no corpus".
+- Any end-to-end pg_weave vector query, since V7 and V8 still do not exist. The
+  291 ms is the scan in isolation, measured through the shipping kernels on
+  shipping-format packed codes, which is the closest proxy available without them.
