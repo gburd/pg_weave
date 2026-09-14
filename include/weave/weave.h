@@ -242,5 +242,6 @@ extern int64 weave_count_visible_oid(Oid indexoid, WeaveQuery q);
 extern int pg_weave_wand_initial_k;
 extern int pg_weave_build_collapse_max_mb;
 extern int pg_weave_build_mem_ceiling_mb;
+extern double pg_weave_vacuum_tombstone_frac;
 
 #endif							/* WEAVE_H */

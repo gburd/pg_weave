@@ -2144,12 +2144,12 @@ merge_source_load_page(MergeSource *src)
 		 * count and byte total this walk produces directly size the two
 		 * allocations below, so an unguarded walk over a recycled page does not
 		 * merely read out of bounds -- it asks for an allocation derived from
-		 * garbage.  Upstream (pg_fts 1.7.0) hit exactly this at field scale as
-		 * "invalid memory alloc request size 3406063183" (~142M entries where an
-		 * 8 kB page holds a few hundred) raised from this function, which sits
-		 * under the streaming merge -- so it killed every merge, every autovacuum
-		 * cleanup and every explicit vacuum, and the index could never be
-		 * reclaimed again.  See doc/GAPS.md G15. */
+		 * garbage.  This shape has been hit in the field at scale as "invalid
+		 * memory alloc request size 3406063183" (~142M entries where an 8 kB page
+		 * holds a few hundred) raised from this function, which sits under the
+		 * streaming merge -- so it killed every merge, every autovacuum cleanup
+		 * and every explicit vacuum, and the index could never be reclaimed
+		 * again.  Provenance and the full report are in doc/GAPS.md G15. */
 		n = 0;
 		used = 0;
 		while (ptr < end)
