@@ -118,28 +118,10 @@ weave_scan_readbuf(Relation index, BlockNumber blk)
 #define WEAVE_QUERY_MAX_PHRASE_TERMS 32
 #define WEAVE_PHRASE_POSBUF 16384
 
-/*
- * Does a dictionary entry starting at `de` fit within a page ending at `end`?
- *
- * Dictionary pages are read under only BUFFER_LOCK_SHARE.  A concurrent
- * merge/vacuum can free a segment's pages while a concurrent insert recycles
- * and overwrites them (pg_weave recycles freed pages with no deletion-xid gate),
- * so a scan that snapshotted the segment directory before that change can read
- * a recycled page mid-walk.  If de->termlen is then garbage, the entry stride
- * and the term-compare run past the page (out-of-bounds read -> SIGSEGV) and a
- * decoded df can be a multi-gigabyte "invalid memory alloc request size".  Every
- * reader dict walk must confirm the entry header AND its term bytes fit before
- * trusting de->termlen; on a miss it stops the page walk (a bounded wrong /
- * incomplete result), and the scan's generation re-check then detects the stale
- * read and restarts.  Same contract as the block-decode guards.
- */
-static inline bool
-weave_dict_entry_fits(const WeaveDictEntry *de, const char *end)
-{
-	const char *t = (const char *) de + offsetof(WeaveDictEntry, term);
-
-	return t <= end && t + de->termlen <= end;
-}
+/* weave_dict_entry_fits() and weave_dictindex_entry_fits() moved to
+ * include/weave/am.h: the same guard is required by the merge, vacuum and
+ * trigram walks, and while it was static here those four files each walked
+ * dictionary entries with no bounds check at all. */
 
 /* A scored heap tuple (score, or distance in an ordering scan). */
 typedef struct ScoredTid
@@ -464,13 +446,18 @@ weave_dict_seek(Relation index, const WeaveSegMeta *seg,
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 		while (ptr < end)
 		{
 			WeaveDictIndexEntry *ie = (WeaveDictIndexEntry *) ptr;
-			int			cmplen = Min((int) ie->termlen, termlen);
-			int			c = memcmp(ie->term, term, cmplen);
+			int			cmplen;
+			int			c;
+
+			if (!weave_dictindex_entry_fits(ie, end))
+				break;			/* recycled/corrupt page: stop (see the helper) */
+			cmplen = Min((int) ie->termlen, termlen);
+			c = memcmp(ie->term, term, cmplen);
 
 			if (c == 0)
 				c = (int) ie->termlen - termlen;
@@ -525,7 +512,7 @@ weave_lookup_term(Relation index, const WeaveSegMeta *seg,
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 
 		while (ptr < end)
 		{
@@ -796,7 +783,7 @@ weave_lookup_prefix(Relation index, const WeaveSegMeta *seg,
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 
 		while (ptr < end)
@@ -1089,7 +1076,7 @@ weave_fuzzy_terms(Relation index, const WeaveSegMeta *seg,
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 
 		while (ptr < end)
@@ -1360,7 +1347,7 @@ weave_universe_bounded(Relation index, BlockNumber dictstart, double ndocs,
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 
 		while (ptr < end)
@@ -1860,7 +1847,7 @@ weave_lookup_term_pos(Relation index, const WeaveSegMeta *seg,
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		while (ptr < end)
 		{
 			WeaveDictEntry *de = (WeaveDictEntry *) ptr;
@@ -2400,7 +2387,7 @@ collect_retry:
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buffer);
 			ptr = (char *) PageGetContents(page);
-			end = (char *) page + ((PageHeader) page)->pd_lower;
+			end = weave_page_entry_end(page);
 			next = WeavePageGetOpaque(page)->nextblk;
 
 			while (ptr < end)
@@ -2647,7 +2634,7 @@ weave_lookup_dict(Relation index, const WeaveSegMeta *seg,
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 
 		while (ptr < end)
@@ -2710,7 +2697,7 @@ weave_lookup_df(Relation index, const WeaveSegMeta *seg,
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 
 		while (ptr < end)
@@ -3009,7 +2996,7 @@ wand_load_block(WandCursor *c)
 	buf = ReadBuffer(c->index, c->curblk);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-	pend = (char *) page + ((PageHeader) page)->pd_lower;
+	pend = weave_page_entry_end(page);
 	p = (char *) page + c->curoff;
 
 	/* skip any empty tail; advance across pages until a real block or EOF */
@@ -3033,7 +3020,7 @@ wand_load_block(WandCursor *c)
 		buf = ReadBuffer(c->index, c->curblk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		pend = (char *) page + ((PageHeader) page)->pd_lower;
+		pend = weave_page_entry_end(page);
 		p = (char *) page + c->curoff;
 	}
 
@@ -3268,7 +3255,7 @@ wand_skip_blocks(WandCursor *c, uint64 target)
 		buf = ReadBuffer(c->index, c->curblk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		pend = (char *) page + ((PageHeader) page)->pd_lower;
+		pend = weave_page_entry_end(page);
 		nextblk = WeavePageGetOpaque(page)->nextblk;
 		p = (char *) page + c->curoff;
 		while (p + sizeof(WeaveBlockHdr) <= pend && c->nread < (int) c->df)
@@ -5152,20 +5139,22 @@ weave_anomalous_docs(PG_FUNCTION_ARGS)
 				LockBuffer(buffer, BUFFER_LOCK_SHARE);
 				page = BufferGetPage(buffer);
 				ptr = (char *) PageGetContents(page);
-				end = (char *) page + ((PageHeader) page)->pd_lower;
+				end = weave_page_entry_end(page);
 				next = WeavePageGetOpaque(page)->nextblk;
 
 				while (ptr < end)
 				{
 					WeaveDictEntry *de = (WeaveDictEntry *) ptr;
-					Size		esize = MAXALIGN(offsetof(WeaveDictEntry, term) +
-												 de->termlen);
+					Size		esize;
 					char		key[WEAVE_ANOM_TERMKEYLEN];
-					int			klen = Min((int) de->termlen,
-										   WEAVE_ANOM_TERMKEYLEN - 1);
+					int			klen;
 					AnomTermDf *te;
 					bool		found;
 
+					if (!weave_dict_entry_fits(de, end))
+						break;	/* recycled/corrupt page: stop (see the helper) */
+					esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+					klen = Min((int) de->termlen, WEAVE_ANOM_TERMKEYLEN - 1);
 					memcpy(key, de->term, klen);
 					key[klen] = '\0';
 					te = (AnomTermDf *) hash_search(dfht, key, HASH_ENTER,
@@ -5213,17 +5202,15 @@ weave_anomalous_docs(PG_FUNCTION_ARGS)
 				LockBuffer(buffer, BUFFER_LOCK_SHARE);
 				page = BufferGetPage(buffer);
 				ptr = (char *) PageGetContents(page);
-				end = (char *) page + ((PageHeader) page)->pd_lower;
+				end = weave_page_entry_end(page);
 				next = WeavePageGetOpaque(page)->nextblk;
 
 				while (ptr < end)
 				{
 					WeaveDictEntry *de = (WeaveDictEntry *) ptr;
-					Size		esize = MAXALIGN(offsetof(WeaveDictEntry, term) +
-												 de->termlen);
+					Size		esize;
 					char		key[WEAVE_ANOM_TERMKEYLEN];
-					int			klen = Min((int) de->termlen,
-										   WEAVE_ANOM_TERMKEYLEN - 1);
+					int			klen;
 					AnomTermDf *te;
 					uint64		gdf;
 					double		idf;
@@ -5231,6 +5218,10 @@ weave_anomalous_docs(PG_FUNCTION_ARGS)
 					int			np,
 								j;
 
+					if (!weave_dict_entry_fits(de, end))
+						break;	/* recycled/corrupt page: stop (see the helper) */
+					esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+					klen = Min((int) de->termlen, WEAVE_ANOM_TERMKEYLEN - 1);
 					memcpy(key, de->term, klen);
 					key[klen] = '\0';
 					te = (AnomTermDf *) hash_search(dfht, key, HASH_FIND, NULL);

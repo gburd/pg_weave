@@ -268,7 +268,7 @@ weave_decode_term(Relation index, BlockNumber firstblk, uint32 firstoff,
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		pend = (char *) page + ((PageHeader) page)->pd_lower;
+		pend = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 		p = (char *) page + off;
 		while (p + sizeof(WeaveBlockHdr) <= pend && n < (int) df)
@@ -1129,7 +1129,7 @@ weave_doclendir_scan_seg(Relation index, BlockNumber start,
 			break;
 		}
 		ptr = (char *) page + MAXALIGN(SizeOfPageHeaderData);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 		/* the page's first docid = its first block's first_docid */
 		if (ptr + sizeof(WeaveDoclenBlockHdr) <= end)
@@ -1427,7 +1427,7 @@ weave_doclen_resident_load_block(WeaveDoclenResident *r, WeaveDoclenBlockHdr *bh
 static void
 weave_doclen_cursor_relocate(WeaveDoclenResident *r, uint64 docid)
 {
-	char	   *end = (char *) r->page + ((PageHeader) r->page)->pd_lower;
+	char	   *end = weave_page_entry_end((Page) r->page);
 	char	   *start = (char *) r->page + MAXALIGN(SizeOfPageHeaderData);
 	char	   *cand = weave_doclen_resident_find_block(start, end, docid);
 
@@ -1499,7 +1499,7 @@ weave_doclen_cursor_load_page(WeaveDoclenCursor *c, BlockNumber blkno, uint64 do
 	UnlockReleaseBuffer(buf);		/* r->page is a private copy from here on */
 	r->pageblk = blkno;
 
-	end = (char *) r->page + ((PageHeader) r->page)->pd_lower;
+	end = weave_page_entry_end((Page) r->page);
 	ptr = (char *) r->page + MAXALIGN(SizeOfPageHeaderData);
 
 	/* header-only walk to find the page's first and last docid, and the last
@@ -2323,12 +2323,20 @@ weave_free_segment(Relation index, const WeaveSegMeta *seg)
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 		while (ptr < end)
 		{
 			WeaveDictEntry *de = (WeaveDictEntry *) ptr;
-			Size		esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+			Size		esize;
+
+			/* Unguarded, a garbage termlen oversteps the page and a garbage
+			 * de->firstposting is handed to weave_free_chain() below -- which
+			 * would walk an arbitrary block chain marking pages free.  Freeing
+			 * live pages from a corrupt read is the worst outcome in this file. */
+			if (!weave_dict_entry_fits(de, end))
+				break;
+			esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
 
 			/* all terms share ONE posting chain; the first term names its head */
 			if (postchain == InvalidBlockNumber)
@@ -2355,12 +2363,14 @@ weave_free_segment(Relation index, const WeaveSegMeta *seg)
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
-		while (ptr < end)
+		while (ptr + MAXALIGN(sizeof(WeaveTrgmEntry)) <= end)
 		{
 			WeaveTrgmEntry *te = (WeaveTrgmEntry *) ptr;
 
+			/* fixed stride, so only the header-fits test is needed -- but it IS
+			 * needed: te->firstdata goes straight to weave_free_chain(). */
 			weave_free_chain(index, te->firstdata);
 			ptr += MAXALIGN(sizeof(WeaveTrgmEntry));
 		}

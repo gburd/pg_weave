@@ -25,7 +25,7 @@ export ASAN_OPTIONS="abort_on_error=1:detect_leaks=1"
 export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
 
 echo "== building fuzzers ($CC, ASan+UBSan) =="
-for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc; do
+for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_dictwalk; do
     $CC $CFLAGS "$here/$f.c" -o "$out/$f"
 done
 # fuzz_surftrie is the one fuzzer with a companion .c: the Z3 trie's builder and
@@ -51,10 +51,19 @@ $CC $CFLAGS -DWEAVE_SURF_PLANT_NO_SIZE_GUARD=1 "$here/fuzz_surftrie.c" \
     "$root/src/query/surftrie.c" -o "$out/fuzz_surftrie_nosize"
 $CC $CFLAGS -DWEAVE_SURF_PLANT_NO_SELECT_GUARD=1 "$here/fuzz_surftrie.c" \
     "$root/src/query/surftrie.c" -o "$out/fuzz_surftrie_nosel"
+# planted-bug binaries for the dictionary page walk (G15).  TWO teeth, not
+# three.  A third was written -- "the second walk trusts the first walk's count"
+# -- and it did NOT bite, because the rationale for it was wrong: both passes run
+# with BUFFER_LOCK_SHARE held, which excludes writers, so the two passes provably
+# see the same bytes and the second walk's n < cap test is belt-and-braces rather
+# than load-bearing.  Recorded here instead of deleted, because the useful fact is
+# that the fuzz target is what corrected the claim.
+$CC $CFLAGS -DFUZZ_NO_FITS_GUARD=1 "$here/fuzz_dictwalk.c" -o "$out/fuzz_dictwalk_nofits"
+$CC $CFLAGS -DFUZZ_RAW_PDLOWER=1 "$here/fuzz_dictwalk.c" -o "$out/fuzz_dictwalk_rawlower"
 
 echo "== running fuzzers =="
 rc=0
-for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_surftrie; do
+for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_surftrie fuzz_dictwalk; do
     if "$out/$f"; then
         echo "PASS: $f"
     else
@@ -135,6 +144,27 @@ if "$out/fuzz_surftrie_nosel" >/dev/null 2>&1; then
     rc=1
 else
     echo "PASS: fuzz_surftrie_nosel aborted as expected (select-sample teeth)"
+fi
+
+# The dictwalk teeth.  #1: without the entry-fits guard a corrupt termlen
+# oversteps the page -- the exact shape that shipped in eight walks and that
+# upstream hit as a 3.4 GB alloc request from inside the merge/vacuum path.
+if "$out/fuzz_dictwalk_nofits" >/dev/null 2>&1; then
+    echo "FAIL: fuzz_dictwalk_nofits exited 0 -- harness did NOT catch the unguarded dict walk!"
+    rc=1
+else
+    echo "PASS: fuzz_dictwalk_nofits aborted as expected (entry-fits teeth)"
+fi
+
+# #2: forming `page + pd_lower` from an unvalidated pd_lower is UB at pointer
+# formation, with no dereference.  UBSan's pointer-overflow check must fire --
+# this is the hazard a guard written as a pointer comparison cannot avoid, and
+# it is what upstream's first version of this fix tripped over.
+if "$out/fuzz_dictwalk_rawlower" >/dev/null 2>&1; then
+    echo "FAIL: fuzz_dictwalk_rawlower exited 0 -- harness did NOT catch the unvalidated pd_lower!"
+    rc=1
+else
+    echo "PASS: fuzz_dictwalk_rawlower aborted as expected (pd_lower-as-integer teeth)"
 fi
 
 if [ "$rc" -eq 0 ]; then

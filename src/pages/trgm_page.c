@@ -387,9 +387,11 @@ weave_trgm_candidates(Relation index, BlockNumber trgmstart,
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
 			ptr = (char *) PageGetContents(page);
-			end = (char *) page + ((PageHeader) page)->pd_lower;
+			end = weave_page_entry_end(page);
 			next = WeavePageGetOpaque(page)->nextblk;
-			while (ptr < end)
+			/* fixed stride, so the header-fits bound is the whole guard -- but it
+			 * IS needed: te->firstdata and te->smlen are trusted below. */
+			while (ptr + MAXALIGN(sizeof(WeaveTrgmEntry)) <= end)
 			{
 				WeaveTrgmEntry *te = (WeaveTrgmEntry *) ptr;
 
@@ -472,12 +474,16 @@ weave_trgm_candidates(Relation index, BlockNumber trgmstart,
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 		while (ptr < end && oi < nords)
 		{
 			WeaveDictEntry *de = (WeaveDictEntry *) ptr;
-			Size		esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+			Size		esize;
+
+			if (!weave_dict_entry_fits(de, end))
+				break;			/* recycled/corrupt page: stop (see the helper) */
+			esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
 
 			if (ordinal == (uint32) ords[oi])
 			{
