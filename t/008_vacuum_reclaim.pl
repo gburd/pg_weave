@@ -100,30 +100,38 @@ my $nseg = $node->safe_psql('postgres',
 diag("index pages after deleting 90%: weave_vacuum #1 $d1 (returned $r1), "
    . "#2 $d2 (returned $r2), pre-delete $v2, segments $nseg");
 
-# KNOWN GAP, diagnosed by these two assertions on the run that added them
-# (doc/GAPS.md G12, task L18). weave_vacuum() returned FALSE both times and
-# weave_index_nsegments() is 1: compaction is implemented as a MERGE of segments,
-# a merge of one segment is a no-op, and insert-time tiered merge drives every
-# index toward exactly one segment. So the steady state is the state that cannot
-# reclaim, and deleting 90% of the corpus leaves the index at 100% of its size --
-# plus the tombstone pages weave_bulkdelete just added, which is the 7-page GROWTH
-# these numbers show.
+# G14/L18: FIXED 2026-09-14, and these assertions are what diagnosed it.
 #
-# Marked TODO rather than deleted, and rather than left red. A TODO that starts
-# passing is reported by prove as an unexpected success, so this cannot rot
-# silently once the gap is fixed -- which is the whole reason to record an
-# expectation in code instead of only in a document.
-TODO: {
-    local $TODO = 'G12/L18: weave_vacuum() cannot compact a single segment, '
-        . 'so a delete-heavy index never reclaims';
-
-    cmp_ok($d2, '<', $v2,
-        'weave_vacuum() RECLAIMS after a 90% delete (strictly smaller than pre-delete)');
-    # A weak margin would pass on a single freed page. 90% of the rows are gone, so
-    # most of the postings are too; require at least a fifth of the file back.
-    cmp_ok($d2, '<=', int($v2 * 0.8),
-        'weave_vacuum() reclaims a meaningful fraction, not one page');
-}
+# Before the fix: 2289 -> 2296 pages (it GREW by 7, the tombstone bookkeeping
+# weave_bulkdelete adds), weave_vacuum() returned FALSE both times, segments = 1.
+# The steady state was the state that could not reclaim -- insert-time tiered
+# merge drives every index toward exactly one segment -- so the only recovery
+# from a delete-heavy workload was REINDEX.
+#
+# After the fix: 2289 -> 264 pages, TRUE on the first call and FALSE on the
+# second. Both of those matter. 264/2289 = 11.5% of the file for 10% of the rows,
+# i.e. the reclaim is very nearly proportional and essentially complete. And
+# false-on-the-second-call is the convergence property, not a failure: the
+# rewrite emits a segment with ndeleted = 0, so the tombstone term is satisfied
+# and the second call correctly finds nothing to do.
+#
+# The cause was NOT the one doc/GAPS.md originally recorded ("a merge of one
+# segment is a no-op"). The rewrite machinery always handled a single segment and
+# always dropped tombstoned postings; weave_index_is_compacted() simply had no
+# term for tombstones, so nothing ever asked it to run. See src/am/amvacuum.c.
+#
+# These were TODO assertions, and a TODO that starts passing is reported by prove
+# as an unexpected success -- which is exactly how this fix was confirmed rather
+# than assumed. Kept as ordinary assertions now, with the margin tightened from
+# the measurement: it reclaimed to 11.5%, so 80% is far too weak a bar to notice
+# a regression. 50% would still pass if the fix half-broke; require 25%.
+ok($r1 eq 't',
+    'weave_vacuum() REPORTS that it did work after a 90% delete');
+cmp_ok($d2, '<', $v2,
+    'weave_vacuum() RECLAIMS after a 90% delete (strictly smaller than pre-delete)');
+cmp_ok($d2, '<=', int($v2 * 0.25),
+    'weave_vacuum() reclaims most of the file, not one page (measured: 11.5%)');
+is($nseg, 1, 'still exactly one segment after the reclaiming rewrite');
 
 # And the index is still correct after compaction -- run AFTER the delete/reclaim
 # cycle so it covers the tombstoned state too, which is where a merge that
@@ -135,6 +143,41 @@ my $seq = $node->safe_psql('postgres',
     q{SET enable_indexscan=off; SET enable_bitmapscan=off;
       SELECT count(*) FROM docs WHERE to_wdoc('simple', body) @@@ 'w7'::wquery});
 is($c, $seq, 'index results still correct after weave_vacuum compaction');
+
+# ---------------------------------------------------------------------------
+# WHAT PLAIN VACUUM DOES ABOUT TOMBSTONES, pinned so the answer is a test result
+# rather than an assumption.
+#
+# L18 fixed weave_index_is_compacted(), which is the floor guard weave_vacuum()
+# consults. weave_vacuumcleanup() -- the autovacuum/plain-VACUUM path -- has a
+# SECOND and independent trigger for the same rewrite, and it has the same blind
+# spot: it fires only when free pages exceed 25% of the file, and a tombstone is
+# not a free page. So plain VACUUM is expected NOT to reclaim tombstoned space.
+#
+# That asymmetry is deliberate, not an oversight, and the reason is the recycle
+# gate. weave_vacuum() takes AccessExclusiveLock, which is what licenses
+# weave_page_recyclable() (src/am/am.c) to bypass GlobalVisCheckRemovableXid and
+# reuse pages inside the same call -- that is why the two-phase vacate+pack
+# converges in ONE pass there. Under autovacuum's ShareUpdateExclusiveLock a
+# concurrent scan can exist, so the gate must stand, phase 2 cannot pack into the
+# pages phase 1 just freed, and the rewrite would EXTEND instead. Adding the
+# tombstone term to this trigger without solving that first is how pg_fts got
+# 35 -> 52 -> 69 MB across three no-op cleanups.
+#
+# So this arm asserts the CURRENT, LIMITED behaviour: plain VACUUM must not grow
+# the index, and is not required to shrink it. If someone later teaches the
+# autovacuum path to reclaim tombstones, this assertion starts failing on the
+# shrink and that is the prompt to re-read the paragraph above.
+my $pre_pv = idxpages();
+$node->safe_psql('postgres', 'DELETE FROM docs WHERE id % 100 = 0');
+$node->safe_psql('postgres', 'VACUUM docs');
+my $pv1 = idxpages();
+$node->safe_psql('postgres', 'VACUUM docs');
+my $pv2 = idxpages();
+diag("plain VACUUM after a further delete: pre $pre_pv, #1 $pv1, #2 $pv2 "
+   . '(tombstone reclaim is weave_vacuum() only -- see the comment above)');
+cmp_ok($pv2, '<=', $pre_pv + 8,
+    'repeated plain VACUUM does not grow the index (the pg_fts 35->52->69 MB bug)');
 
 $node->stop;
 done_testing();

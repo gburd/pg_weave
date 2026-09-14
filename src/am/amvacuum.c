@@ -210,14 +210,42 @@ weave_truncate_free_tail(Relation index)
 
 /*
  * Is the index already at its compaction floor -- i.e. would a vacate+pack
- * rewrite be pure waste?  True only when BOTH:
+ * rewrite be pure waste?  True only when ALL THREE:
  *   (1) the live data is already front-packed (negligible free space below the
  *       highest live block), so a rewrite would only re-grow then re-truncate
  *       to the same size, and
  *   (2) there is at most ONE live segment, so there is nothing to coalesce
- *       (weave_vacuum's other job is to merge segments to one for scan speed).
- * If either fails, the vacate+pack pass still has work to do.  Scan-only for
- * the FSM part; a brief shared lock on the metapage for the segment count.
+ *       (weave_vacuum's other job is to merge segments to one for scan speed),
+ *       and
+ *   (3) that segment is not mostly TOMBSTONES.
+ *
+ * TERM (3) IS TASK L18, AND ITS ABSENCE MADE THE STEADY STATE UNRECLAIMABLE.
+ * Terms (1) and (2) are both statements about FREE SPACE and segment count, and
+ * a tombstone is neither: it is a live, allocated, fully-packed page holding a
+ * posting that no scan can see.  So a single segment that is 90% deleted is
+ * perfectly front-packed, has nothing to coalesce, and this function called it
+ * compacted -- weave_vacuum() then truncated an empty free tail, returned false,
+ * and reclaimed nothing.  Measured before the fix: delete 90% of 120k rows,
+ * VACUUM, weave_vacuum() twice -> 2289 to 2296 pages (it GREW by 7), false both
+ * times, nsegments = 1.  Since insert-time tiered merge drives every index
+ * toward exactly one segment, THE STEADY STATE WAS THE STATE THAT COULD NOT
+ * RECLAIM, and the only recovery was REINDEX.  See doc/GAPS.md G14.
+ *
+ * Note what the fix did NOT need.  doc/GAPS.md originally diagnosed this as
+ * "compaction is implemented as a merge, and a merge of one segment is a no-op
+ * guarded by an nsegments > 1 precondition".  That was wrong on both counts:
+ * weave_merge_selected() has no such precondition, weave_compact_to_one()
+ * already calls it with nsel >= 1, and weave_merge_segments_streaming() already
+ * physically drops tombstoned postings per source (ambuild.c, "tombstoned:
+ * physically drop") -- so a single-segment rewrite always reclaimed correctly.
+ * The rewrite machinery was complete; nothing ever asked it to run.  The whole
+ * fix is this predicate learning what a tombstone is.
+ *
+ * Convergence is unchanged and still one pass: the rewrite writes a segment with
+ * ndeleted = 0, so on the next iteration term (3) holds and the loop stops.
+ *
+ * Scan-only for the FSM part; a brief shared lock on the metapage for the
+ * segment count and the tombstone counts.
  */
 static bool
 weave_index_is_compacted(Relation index)
@@ -228,8 +256,11 @@ weave_index_is_compacted(Relation index)
 	BlockNumber threshold;
 	BlockNumber blk;
 	uint32		nlive = 0;
+	double		ndocs = 0;
+	double		ndeleted = 0;
 
-	/* (2) segment count: only a single live segment counts as coalesced */
+	/* (2) segment count: only a single live segment counts as coalesced, and
+	 * (3) tombstone load, from the same metapage read */
 	{
 		WeaveMetaPageData meta;
 		Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
@@ -240,10 +271,24 @@ weave_index_is_compacted(Relation index)
 		UnlockReleaseBuffer(mb);
 		for (i = 0; i < meta.nsegments; i++)
 			if (meta.segs[i].dictstart != InvalidBlockNumber)
+			{
 				nlive++;
+				ndocs += meta.segs[i].ndocs;
+				ndeleted += meta.segs[i].ndeleted;
+			}
 	}
 	if (nlive > 1)
 		return false;				/* multiple segments: pack must coalesce */
+
+	/*
+	 * (3) tombstone load.  Above the threshold a rewrite has real work to do
+	 * however well packed the file is, because the space is held by invisible
+	 * postings rather than by free pages.  pg_weave.vacuum_tombstone_frac
+	 * defaults to 0.2, which is a convention and not a measured optimum -- see
+	 * the GUC's definition in src/am/am.c.
+	 */
+	if (ndocs > 0 && ndeleted / ndocs > pg_weave_vacuum_tombstone_frac)
+		return false;
 
 	/* (1) front-packed: highest live block, then free-below count */
 	for (blk = nblocks; blk > 1; blk--)

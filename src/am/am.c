@@ -559,6 +559,19 @@ static bool weave_page_recyclable(Relation index, Page page);
 int			pg_weave_wand_initial_k = 32;
 int			pg_weave_build_collapse_max_mb = 4096;
 
+/* GUC: tombstone fraction above which a SINGLE segment is no longer considered
+ * to be at its compaction floor.  See weave_index_is_compacted() in
+ * src/am/amvacuum.c for why this term has to exist at all (task L18): every
+ * other term in that predicate is about free space, and a tombstone is not free
+ * space -- it is a live page holding a posting nobody can see.
+ *
+ * THE DEFAULT IS NOT MEASURED.  0.2 is the conventional choice and it is a
+ * guess; the frontier has not been swept.  It trades rewrite cost (a rewrite
+ * streams the whole segment through the buffer pool twice) against space held by
+ * invisible postings, and the right value certainly depends on segment size.
+ * Recorded as a guess rather than presented as a tuned default. */
+double		pg_weave_vacuum_tombstone_frac = 0.2;
+
 /* GUC: per-participant flush-budget growth ceiling, in MB.  0 = keep the safe
  * default ceiling of 2 * maintenance_work_mem (unchanged behavior).  When set
  * larger, a build lets each participant's flush budget grow up to this, so a

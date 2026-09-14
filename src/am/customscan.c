@@ -463,6 +463,13 @@ _PG_init(void)
 							0, 0, INT_MAX,
 							PGC_USERSET, GUC_UNIT_MB, NULL, NULL, NULL);
 
+	DefineCustomRealVariable("pg_weave.vacuum_tombstone_frac",
+							 "Tombstone fraction above which weave_vacuum() rewrites a single segment to reclaim its space.",
+							 "Deleted rows leave tombstoned postings that still occupy pages; only a rewrite drops them. Below this fraction a single-segment index is treated as already at its size floor and no rewrite is done. Set to 0 to rewrite whenever any row has been deleted, or to 1 to disable tombstone-driven rewrites entirely. The default is a convention, not a measured optimum.",
+							 &pg_weave_vacuum_tombstone_frac,
+							 0.2, 0.0, 1.0,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
 #ifdef WEAVE_TEST_HOOKS
 	/*
 	 * TEST-ONLY build.  This GUC only exists when compiled with
