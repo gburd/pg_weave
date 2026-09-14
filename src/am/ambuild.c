@@ -1125,7 +1125,7 @@ weave_write_postings(WeavePostWriter *pw, BuildTerm *bt,
 		if (pw->buffer != InvalidBuffer)
 		{
 			pageend = (char *) pw->page + BLCKSZ - MAXALIGN(sizeof(WeavePageOpaqueData));
-			if ((char *) pw->page + ((PageHeader) pw->page)->pd_lower + need > pageend)
+			if (weave_page_entry_end(pw->page) + need > pageend)
 			{
 				Buffer		next = weave_new_buffer(index);
 				BlockNumber nextblk = BufferGetBlockNumber(next);
@@ -1155,7 +1155,7 @@ weave_write_postings(WeavePostWriter *pw, BuildTerm *bt,
 			start_recorded = true;
 		}
 
-		dst = (char *) pw->page + ((PageHeader) pw->page)->pd_lower;
+		dst = weave_page_entry_end(pw->page);
 		bh = (WeaveBlockHdr *) dst;
 		bh->count = (uint32) bcount;
 		bh->max_tf = blk_max_tf;
@@ -1345,7 +1345,7 @@ weave_doclens_load(Relation index, BlockNumber doclenstart, WeaveDoclens *d)
 			break;
 		}
 		ptr = (char *) page + MAXALIGN(SizeOfPageHeaderData);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 
 		while (ptr + sizeof(WeaveDoclenBlockHdr) <= end)
@@ -1766,7 +1766,7 @@ weave_write_dictionary_iter(Relation index, DictNextFn next, void *nstate,
 			npages++;
 		}
 
-		dst = (char *) page + ((PageHeader) page)->pd_lower;
+		dst = weave_page_entry_end(page);
 		{
 			WeaveDictEntry *de = (WeaveDictEntry *) dst;
 
@@ -1826,7 +1826,7 @@ weave_write_dictionary_iter(Relation index, DictNextFn next, void *nstate,
 				ip = GenericXLogRegisterBuffer(istate, ib, GENERIC_XLOG_FULL_IMAGE);
 				weave_init_page(ip, WEAVE_PK_DICTINDEX);
 			}
-			dst = (char *) ip + ((PageHeader) ip)->pd_lower;
+			dst = weave_page_entry_end(ip);
 			ie = (WeaveDictIndexEntry *) dst;
 			ie->blk = pgblk[j];
 			ie->termlen = flen;
@@ -2112,16 +2112,27 @@ merge_source_load_page(MergeSource *src)
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 
-		/* count entries + term bytes on this page (bounded by BLCKSZ) */
+		/* Count entries + term bytes on this page.  BOUNDS-GUARD EVERY ENTRY: the
+		 * count and byte total this walk produces directly size the two
+		 * allocations below, so an unguarded walk over a recycled page does not
+		 * merely read out of bounds -- it asks for an allocation derived from
+		 * garbage.  Upstream (pg_fts 1.7.0) hit exactly this at field scale as
+		 * "invalid memory alloc request size 3406063183" (~142M entries where an
+		 * 8 kB page holds a few hundred) raised from this function, which sits
+		 * under the streaming merge -- so it killed every merge, every autovacuum
+		 * cleanup and every explicit vacuum, and the index could never be
+		 * reclaimed again.  See doc/GAPS.md G15. */
 		n = 0;
 		used = 0;
 		while (ptr < end)
 		{
 			WeaveDictEntry *de = (WeaveDictEntry *) ptr;
 
+			if (!weave_dict_entry_fits(de, end))
+				break;			/* recycled/corrupt page: stop the walk */
 			n++;
 			used += de->termlen;
 			ptr += MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
@@ -2144,14 +2155,27 @@ merge_source_load_page(MergeSource *src)
 				: palloc(src->bytescap);
 		}
 
+		/* Second walk applies the IDENTICAL entry-fits bound to the first.  The
+		 * n < src->pagecap and byte-capacity tests are belt-and-braces, NOT
+		 * load-bearing: BUFFER_LOCK_SHARE is held across both passes, so they
+		 * provably see the same bytes and neither test can fire.  A fuzz build
+		 * with them removed exits clean, which is how that was established --
+		 * see test/fuzz/fuzz_dictwalk.c.  Kept because they make this loop safe
+		 * to read without reasoning about the pass above it. */
 		ptr = (char *) PageGetContents(page);
 		used = 0;
 		n = 0;
-		while (ptr < end)
+		while (ptr < end && n < src->pagecap)
 		{
 			WeaveDictEntry *de = (WeaveDictEntry *) ptr;
-			MergeDictTerm *mt = &src->page[n++];
+			MergeDictTerm *mt;
 
+			if (!weave_dict_entry_fits(de, end))
+				break;
+			if (used + de->termlen > src->bytescap)
+				break;
+
+			mt = &src->page[n++];
 			mt->termlen = de->termlen;
 			mt->df = de->df;
 			mt->firstposting = de->firstposting;
@@ -4153,7 +4177,7 @@ weave_flush_pending(Relation index)
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 		while (ptr < end)
 		{

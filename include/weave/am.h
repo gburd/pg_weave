@@ -470,6 +470,70 @@ extern void weave_endscan(IndexScanDesc scan);
 	(((Size) (sz)) > MaxAllocSize \
 	 ? repalloc_huge((p), (sz)) \
 	 : repalloc((p), (sz)))
+/* --- page-entry walk bounds guards (every AM translation unit) ----------- */
+/*
+ * Where do the variable-length entries a writer appended to `page` end?
+ *
+ * VALIDATE pd_lower AS AN INTEGER BEFORE FORMING A POINTER FROM IT.  Every
+ * dict/trigram/doclen walk in this AM reads its end bound from the page header
+ * of a page held under only BUFFER_LOCK_SHARE, and that value comes off disk:
+ * a recycled, torn or corrupt page can report anything.  `page + pd_lower` for
+ * an out-of-range pd_lower is undefined behaviour *at the point the pointer is
+ * formed*, before anything is dereferenced -- so a walk written as the
+ * pointer comparison `ptr < (char *) page + pd_lower` is already UB and a
+ * sanitizer build will say so.  An implausible pd_lower is treated as an EMPTY
+ * page (walk terminates immediately) rather than an error: these walks run in
+ * VACUUM, cleanup and merge, and an ereport there is how an index becomes
+ * permanently unvacuumable.
+ */
+static inline char *
+weave_page_entry_end(Page page)
+{
+	uint32		lower = ((PageHeader) page)->pd_lower;
+	Size		contents = (Size) ((char *) PageGetContents(page) - (char *) page);
+
+	if ((Size) lower > (Size) BLCKSZ || (Size) lower < contents)
+		return (char *) page + contents;	/* implausible: treat page as empty */
+	return (char *) page + lower;
+}
+
+/*
+ * Does a dictionary entry starting at `de` fit within a page ending at `end`?
+ *
+ * Dictionary pages are read under only BUFFER_LOCK_SHARE.  A concurrent
+ * merge/vacuum can free a segment's pages while a concurrent insert recycles
+ * and overwrites them, so a scan that snapshotted the segment directory before
+ * that change can read a recycled page mid-walk.  If de->termlen is then
+ * garbage, the entry stride and the term-compare run past the page
+ * (out-of-bounds read -> SIGSEGV), a decoded df can be a multi-gigabyte
+ * "invalid memory alloc request size", and a *count* accumulated by the walk
+ * can size an allocation from pure garbage.  Every walk must confirm the entry
+ * header AND its term bytes fit before trusting de->termlen; on a miss it stops
+ * the page walk (a bounded incomplete result), and the scan's generation
+ * re-check then detects the stale read and restarts.
+ *
+ * The stride these guards license, MAXALIGN(offsetof(..., term) + termlen), is
+ * always >= MAXALIGN(offsetof(..., term)) > 0, so a guarded walk cannot spin.
+ */
+static inline bool
+weave_dict_entry_fits(const WeaveDictEntry *de, const char *end)
+{
+	const char *t = (const char *) de + offsetof(WeaveDictEntry, term);
+
+	return t <= end && t + de->termlen <= end;
+}
+
+/* Same contract for the sparse dict *index* entries walked by a term seek.
+ * Unguarded, a garbage termlen here both oversteps the page and yields a
+ * garbage `blk` that the seek then reads as if it were a dictionary page. */
+static inline bool
+weave_dictindex_entry_fits(const WeaveDictIndexEntry *ie, const char *end)
+{
+	const char *t = (const char *) ie + offsetof(WeaveDictIndexEntry, term);
+
+	return t <= end && t + ie->termlen <= end;
+}
+
 /* --- docid <-> heap TID (used by every AM translation unit) -------------- */
 /*
  * Pack/unpack a heap TID into a monotonic 48-bit docid so that ascending TIDs

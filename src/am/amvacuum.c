@@ -522,15 +522,27 @@ weave_segment_docids(Relation index, const WeaveSegMeta *seg)
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
 		ptr = (char *) PageGetContents(page);
-		end = (char *) page + ((PageHeader) page)->pd_lower;
+		end = weave_page_entry_end(page);
 		next = WeavePageGetOpaque(page)->nextblk;
 		while (ptr < end)
 		{
 			WeaveDictEntry *de = (WeaveDictEntry *) ptr;
-			Size		esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+			Size		esize;
 			WeavePosting *post;
 			int			np,
 						k;
+
+			/*
+			 * This walk runs on EVERY vacuum and every CIC validate.  Unguarded,
+			 * a garbage termlen oversteps the page AND a garbage de->df is handed
+			 * to weave_decode_term below.  Because the failure is inside the
+			 * vacuum path it does not merely produce a wrong answer: it makes the
+			 * index permanently unvacuumable, which is how the same defect
+			 * presented upstream.  See doc/GAPS.md G15.
+			 */
+			if (!weave_dict_entry_fits(de, end))
+				break;
+			esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
 
 			np = weave_decode_term(index, de->firstposting, de->firstoffset,
 								  de->df, &post, NULL, false, NULL, true,
