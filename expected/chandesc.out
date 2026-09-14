@@ -16,7 +16,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.7.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.8.0" of extension "pg_weave" is already installed
 CREATE TABLE cd (id serial, d wdoc);
 -- Three frequency bands so the index has a real dictionary and several posting
 -- blocks, not a degenerate one-page structure that no invariant can be wrong on.

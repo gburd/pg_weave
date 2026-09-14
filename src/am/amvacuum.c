@@ -209,6 +209,35 @@ weave_truncate_free_tail(Relation index)
 }
 
 /*
+ * What fraction of this index's indexed documents are tombstoned?
+ *
+ * Factored out because two independent decisions need it -- the compaction floor
+ * guard (weave_index_is_compacted) and the autovacuum cleanup trigger -- and when
+ * only one of them knew about tombstones, the other silently disagreed about
+ * whether there was work to do.  Brief shared lock on the metapage.
+ */
+static double
+weave_tombstone_frac(Relation index)
+{
+	WeaveMetaPageData meta;
+	Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
+	double		ndocs = 0;
+	double		ndeleted = 0;
+	uint32		i;
+
+	LockBuffer(mb, BUFFER_LOCK_SHARE);
+	weave_meta_from_page(BufferGetPage(mb), &meta);
+	UnlockReleaseBuffer(mb);
+	for (i = 0; i < meta.nsegments; i++)
+		if (meta.segs[i].dictstart != InvalidBlockNumber)
+		{
+			ndocs += meta.segs[i].ndocs;
+			ndeleted += meta.segs[i].ndeleted;
+		}
+	return ndocs > 0 ? ndeleted / ndocs : 0.0;
+}
+
+/*
  * Is the index already at its compaction floor -- i.e. would a vacate+pack
  * rewrite be pure waste?  True only when ALL THREE:
  *   (1) the live data is already front-packed (negligible free space below the
@@ -256,11 +285,8 @@ weave_index_is_compacted(Relation index)
 	BlockNumber threshold;
 	BlockNumber blk;
 	uint32		nlive = 0;
-	double		ndocs = 0;
-	double		ndeleted = 0;
 
-	/* (2) segment count: only a single live segment counts as coalesced, and
-	 * (3) tombstone load, from the same metapage read */
+	/* (2) segment count: only a single live segment counts as coalesced */
 	{
 		WeaveMetaPageData meta;
 		Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
@@ -271,11 +297,7 @@ weave_index_is_compacted(Relation index)
 		UnlockReleaseBuffer(mb);
 		for (i = 0; i < meta.nsegments; i++)
 			if (meta.segs[i].dictstart != InvalidBlockNumber)
-			{
 				nlive++;
-				ndocs += meta.segs[i].ndocs;
-				ndeleted += meta.segs[i].ndeleted;
-			}
 	}
 	if (nlive > 1)
 		return false;				/* multiple segments: pack must coalesce */
@@ -287,7 +309,7 @@ weave_index_is_compacted(Relation index)
 	 * defaults to 0.2, which is a convention and not a measured optimum -- see
 	 * the GUC's definition in src/am/am.c.
 	 */
-	if (ndocs > 0 && ndeleted / ndocs > pg_weave_vacuum_tombstone_frac)
+	if (weave_tombstone_frac(index) > pg_weave_vacuum_tombstone_frac)
 		return false;
 
 	/* (1) front-packed: highest live block, then free-below count */
@@ -444,6 +466,49 @@ weave_vacuum_compact(Relation index)
 		 * already-compact index a near-no-op (no rewrite at all).
 		 */
 		if (weave_index_is_compacted(index))
+		{
+			nblocks = weave_truncate_free_tail(index);
+			if (nblocks < prevblocks)
+				didwork = true;
+			prevblocks = nblocks;
+			break;
+		}
+
+		/*
+		 * SKIP A PASS WHOSE FREE SPACE IS NOT YET REUSABLE (task L19).
+		 *
+		 * The vacate+pack relocation only shrinks the file if the pack phase can
+		 * allocate from the pages the vacate phase freed.  Under
+		 * AccessExclusiveLock weave_page_recyclable() bypasses the visibility
+		 * gate, so it always can.  Under ShareUpdateExclusiveLock (autovacuum,
+		 * plain VACUUM) the gate stands, and whether it lets anything through
+		 * depends on whether the transaction id horizon has advanced past the xid
+		 * stamped on those pages when they were freed.
+		 *
+		 * MEASURED, both ways, in t/015_alloc_outcomes.pl.  With the horizon
+		 * advancing normally the pass works and is stable -- 1823 -> 220 pages on
+		 * the first cycle and 220 on the next four, with 73 low-bias reuses per
+		 * cycle.  With the horizon STALLED (an idle database: nothing consumes
+		 * xids between vacuums) every candidate is rejected, every allocation
+		 * extends, and the file ratchets up by a constant 73 pages per cycle
+		 * forever -- 1022 -> 1166 -> 1239 -> 1312 -> 1385 -> 1458 -- while the
+		 * rejected-candidate list grows with it, so the scan gets slower too.
+		 *
+		 * So probe first: if nothing is currently recyclable, this pass can only
+		 * extend the relation, and doing nothing is strictly better.  A later
+		 * cycle, once the horizon has moved, does the work.
+		 *
+		 * THE OBVIOUS WAY TO GET THIS WRONG is to skip forever.  A sibling project
+		 * shipped this same skip for the growth half of this bug and its own test
+		 * then caught the fix degrading into never reclaiming at all, because a
+		 * stale free-space map made the pass look unnecessary on every cycle.  Two
+		 * defences: the probe asks about RECYCLABILITY (a property of the page's
+		 * freeing xid, which advances on its own) rather than about free space, and
+		 * t/015 requires a shrink on the horizon-advancing arm, so a regression
+		 * into permanent skipping fails a test rather than silently stopping work.
+		 */
+		if (!CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&
+			!weave_any_free_page_recyclable(index))
 		{
 			nblocks = weave_truncate_free_tail(index);
 			if (nblocks < prevblocks)
@@ -918,6 +983,40 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			 * low blocks, then truncate the free tail.  Gated so routine
 			 * autovacuum does not pay a full rewrite every pass -- only when the
 			 * free tail is a meaningful fraction of the file.
+			 *
+			 * THIS TRIGGER IS BLIND TO TOMBSTONES, AND THAT IS NOW A MEASURED
+			 * DECISION RATHER THAN AN OVERSIGHT (task L19).
+			 *
+			 * A tombstone is not free space -- it is a live, fully-packed page
+			 * holding a posting no scan can see -- so on a delete-heavy index
+			 * `freeblks` stays small, this trigger never fires, and tombstoned
+			 * space is reclaimed only by an explicit weave_vacuum().  Adding
+			 * `|| weave_tombstone_frac(index) > pg_weave_vacuum_tombstone_frac`
+			 * here is the obvious fix.  IT WAS TRIED, MEASURED, AND REVERTED,
+			 * because it produces an unbounded ratchet:
+			 *
+			 *   pages:  1022 -> 1166 -> 1239 -> 1312 -> 1385 -> 1458  (+73/cycle)
+			 *   lowfree_reuse:     0     0      0      0      0
+			 *   lowfree_defer:  1001  1092   1165   1238   1311
+			 *   extend:          144    73     73     73     73
+			 *
+			 * The rewrite runs, frees pages, and then CANNOT REUSE ANY OF THEM:
+			 * weave_page_recyclable() bypasses GlobalVisCheckRemovableXid() only
+			 * under AccessExclusiveLock, and autovacuum holds
+			 * ShareUpdateExclusiveLock, where a concurrent scan may still hold a
+			 * directory snapshot referencing those pages.  So every allocation
+			 * extends, the file grows every cycle forever, and the deferred-page
+			 * list grows with it so the scan gets slower too.  This is the same
+			 * failure the sibling project shipped and had to fix (35 -> 52 -> 69 MB
+			 * across three no-op cleanups).
+			 *
+			 * The pages freed by cycle N only become recyclable in a LATER
+			 * transaction, and a rewrite needs pages before it can free any, so
+			 * in-cycle reclaim under a share lock is not merely unimplemented --
+			 * it is circular.  Closing L19 needs a design that does not
+			 * rewrite-in-place under a share lock, not this one line.
+			 * t/015_alloc_outcomes.pl asserts the no-ratchet property, so adding
+			 * the term fails loudly instead of shipping.
 			 */
 			{
 				BlockNumber nblocks = RelationGetNumberOfBlocks(info->index);
