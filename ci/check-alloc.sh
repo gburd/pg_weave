@@ -39,6 +39,29 @@ FILES="src/am/am.c src/am/ambuild.c src/am/amvacuum.c src/am/amscan.c src/pages/
 # words in the allocation's argument text.
 SCALE='df|gdf|sumtf|nterms|nout|ndocs|nposts|maxdocids|maxaccs|naccs|npos|maxpos|maxposts|parena_cap|ocap|sumdoclen|maxraw|doclen|ndistinct'
 
+# THE DOUBLING-CAPACITY IDIOM, and why it is matched separately.
+#
+# SCALE above is an allowlist of size-variable NAMES, and it grew one name at a
+# time as each was encountered -- `parena_cap` and `ocap` are in it because
+# someone hit those two. That is the same "find one function at a time" mode the
+# lint was written to replace, and it left the codebase's DOMINANT allocation
+# pattern completely invisible:
+#
+#     cap = cap ? cap * 2 : 1024;
+#     p = p ? repalloc(p, cap * sizeof(T)) : palloc(cap * sizeof(T));
+#
+# A 2026-09-14 sweep found 43 such sites, of which eight were genuinely
+# corpus-scale and four were reachable from VACUUM/merge -- i.e. a throw there
+# does not lose one query, it makes the index permanently unvacuumable. The lint
+# reported "no unguarded corpus-scale allocations" the whole time, which is worse
+# than having no lint: it was evidence of safety that had not been checked.
+#
+# So: match the IDIOM, not a list of names. Any identifier containing "cap" in
+# an allocation's size expression is a candidate. This deliberately over-matches
+# (a genuinely bounded `cap` must be annotated), because the cost of an
+# annotation is one line and the cost of a miss is an unvacuumable index.
+CAPIDIOM='[A-Za-z_][A-Za-z_0-9]*[Cc][Aa][Pp][A-Za-z_0-9]*'
+
 fail=0
 for f in $FILES; do
 	[ -f "$f" ] || continue
@@ -53,9 +76,11 @@ for f in $FILES; do
 		esac
 		# skip lines explicitly allowlisted with a reason
 		case "$text" in *alloc-ok:*) continue ;; esac
-		# a plain palloc/repalloc call with a scale-driver word in it?
+		# a plain palloc/repalloc call with a scale-driver word in it, or with a
+		# capacity-variable name (the doubling idiom -- see CAPIDIOM above)?
 		if printf '%s' "$text" | grep -qE '\b(palloc0?|repalloc)\(' \
-		   && printf '%s' "$text" | grep -qwE "$SCALE"; then
+		   && { printf '%s' "$text" | grep -qwE "$SCALE" \
+				|| printf '%s' "$text" | grep -qE "$CAPIDIOM"; }; then
 			echo "UNGUARDED corpus-scale alloc: $f:$n:$text"
 			fail=1
 		fi

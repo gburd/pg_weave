@@ -457,7 +457,10 @@ weave_trgm_candidates(Relation index, BlockNumber trgmstart,
 	/* stage 2: walk THIS SEGMENT's dictionary once; for each candidate ordinal,
 	 * union its term's docid postings.  The trigram directory's ordinals index
 	 * into the segment's own dictionary, written in ordinal order. */
-	tids = (ItemPointerData *) palloc(cap * sizeof(ItemPointerData));
+	/* sized by the number of matching tuples, which is corpus-scale (a
+	 * trigram set can match every row); query path, so a throw here loses
+	 * one query, not a vacuum */
+	tids = (ItemPointerData *) WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(ItemPointerData));
 	ordinal = 0;
 	oi = 0;
 	dblk = dictstart;
@@ -499,7 +502,8 @@ weave_trgm_candidates(Relation index, BlockNumber trgmstart,
 					if (n >= cap)
 					{
 						cap *= 2;
-						tids = repalloc(tids, cap * sizeof(ItemPointerData));
+						/* corpus-scale, query path: see the palloc above */
+						tids = WEAVE_REALLOC_MAYBE_HUGE(tids, (Size) cap * sizeof(ItemPointerData));
 					}
 					tids[n++] = post[k].tid;
 				}

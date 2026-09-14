@@ -678,9 +678,14 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			{
 				if (ncarry >= carrycap)
 				{
+					/* sized by the segment's tombstone count -- corpus-scale, and
+					 * this runs INSIDE bulkdelete, so a throw here does not lose one
+					 * vacuum, it blocks all reclaim for as long as the index stays
+					 * that size.  Same class as the doclen resident array. */
 					carrycap = carrycap ? carrycap * 2 : 1024;
-					carry = carry ? repalloc(carry, carrycap * sizeof(uint64))
-						: palloc(carrycap * sizeof(uint64));
+					carry = carry
+						? WEAVE_REALLOC_MAYBE_HUGE(carry, (Size) carrycap * sizeof(uint64))
+						: WEAVE_ALLOC_MAYBE_HUGE((Size) carrycap * sizeof(uint64));
 				}
 				carry[ncarry++] = dv;
 			}
@@ -735,9 +740,10 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				{
 					if (nnew >= newcap)
 					{
-						newcap = newcap ? newcap * 2 : 1024;
-						newdead = newdead ? repalloc(newdead, newcap * sizeof(uint64))
-							: palloc(newcap * sizeof(uint64));
+						newcap = newcap ? newcap * 2 : 1024;	/* huge-safe: see carry above */
+						newdead = newdead
+							? WEAVE_REALLOC_MAYBE_HUGE(newdead, (Size) newcap * sizeof(uint64))
+							: WEAVE_ALLOC_MAYBE_HUGE((Size) newcap * sizeof(uint64));
 					}
 					newdead[nnew++] = v;
 					tuples_removed++;
