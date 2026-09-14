@@ -28,7 +28,7 @@ n-gram).
 | Build time | **at GIN parity** | 192.5 s vs GIN 202.7 s, pg_textsearch 49.2 s (3.91× behind). `bench/RESULTS_L15.md` |
 | Index size | **best of the three** | 626 MB vs pg_textsearch 873 MB, tsvector+GIN 1120 MB |
 | Crash recovery, replication, MVCC, CIC/REINDEX | **works** | inherited; `t/001`–`t/009` |
-| Vacuum, tombstones, tiered merge | **works** | inherited; `t/008` reclaims 4688 → 2199 pages |
+| Vacuum, tombstones, tiered merge | **partial** | Explicit `weave_vacuum()` reclaims: after deleting 90% of 120k rows, **2289 → 264 pages** in one pass (11.5% of the file for 10% of the rows), `t/008`. **Autovacuum and plain `VACUUM` do NOT reclaim tombstoned space** — 264 → 267 → 267, flat — because the rewrite needs `AccessExclusiveLock` to bypass the page-recycle gate, and under a share lock it would extend the relation instead. So a delete-heavy deployment **requires a scheduled `weave_vacuum()`**; that is an operational requirement, not a footnote. Task L19. Until 2026-09-14 nothing reclaimed at all and the only recovery was `REINDEX` (G14) |
 | Multi-channel on-disk substrate: per-bolt channel descriptors, extended page-kind space, versioned metapage reader | **works** | phase X (format v6); `t/010` upgrades a 20,000-row v5 index and proves byte-identical answers; `t/011` proves a corrupted descriptor `ERROR`s cleanly; 852,070 exhaustive kind-space checks |
 | `weave_check()` invariant verification | **partial** | 11 invariants, incl. chandesc reachability and page-kind classification. Before phase X only `weave_check_meta()` existed. ~14 of `SEGMENT_FORMAT.md` §9 still owed |
 | Vector quantizer: rotation, codebook, encode/decode, packing | **works** | 17,741 + 1,909,440 property checks, 0 failures (tasks V2–V5) |
@@ -153,7 +153,11 @@ mechanically checkable. `doc/PHASES.md` has the task-level detail.
 ### Non-blocking but expected before anyone should trust it
 
 17. Parallel scan; parallel vacuum.
-18. A page recycler, so merge does not leave space only REINDEX reclaims.
+18. A page recycler, so merge does not leave space only REINDEX reclaims. **Partly
+    delivered 2026-09-14 (L18):** an explicit `weave_vacuum()` now reclaims
+    tombstoned space (2289 → 264 pages after a 90% delete). What remains is doing
+    it under a share lock so autovacuum can, which is task L19 — and the WAL cost
+    of the free path itself, task L21/G17.
 19. Predicate locks, hence SSI support.
 20. `EXPLAIN` output that shows per-channel work, so a slow query is diagnosable.
 
