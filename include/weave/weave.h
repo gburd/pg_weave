@@ -244,4 +244,15 @@ extern int pg_weave_build_collapse_max_mb;
 extern int pg_weave_build_mem_ceiling_mb;
 extern double pg_weave_vacuum_tombstone_frac;
 
+/* Allocator outcome counters (src/am/am.c).  Backend-local; read from SQL via
+ * weave_alloc_stats().  See the block comment above weave_new_buffer() for why
+ * they are always compiled in and why they are read from SQL rather than logged. */
+extern uint64 weave_alloc_lowfree_reuse;
+extern uint64 weave_alloc_lowfree_defer;
+extern uint64 weave_alloc_lowfree_contended;
+extern uint64 weave_alloc_fsm_reuse;
+extern uint64 weave_alloc_fsm_defer;
+extern uint64 weave_alloc_fsm_contended;
+extern uint64 weave_alloc_extend;
+
 #endif							/* WEAVE_H */

@@ -905,6 +905,12 @@ extern void weave_merge_segments(Relation index);
 extern bool weave_merge_all(Relation index, bool try_parallel);
 extern bool weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel);
 
+/* Non-static so amvacuum.c can ask it before starting a relocation pass: the
+ * page-recycle predicate it wraps is static in am.c (allocator-private), and the
+ * answer decides whether that pass can pack into the space it frees or can only
+ * extend the relation.  See weave_vacuum_compact(). */
+extern bool weave_any_free_page_recyclable(Relation index);
+
 /*
  * src/am/amvacuum.c -- ambulkdelete/amvacuumcleanup and the size-floor
  * compaction.  weave_bulkdelete/_vacuumcleanup are consumed by am.c (amhandler);

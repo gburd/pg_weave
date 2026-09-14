@@ -625,6 +625,46 @@ weave_alloc_end(void)
 	weave_lowfree_i = 0;
 }
 
+/*
+ * ALLOCATOR OUTCOME COUNTERS.
+ *
+ * Backend-local, always compiled in, read via weave_alloc_stats().  They exist
+ * because two separate bloat investigations in this lineage were blocked on not
+ * knowing which of three things the allocator was doing, and both wasted a cycle
+ * guessing.  Every page pg_weave allocates comes from exactly one of:
+ *
+ *   lowfree_reuse  -- the compaction low-bias list (weave_alloc_begin gathered it)
+ *   fsm_reuse      -- the free space map, via GetFreeIndexPage
+ *   extend         -- P_NEW, the relation grew
+ *
+ * plus two ways a reuse candidate is passed over:
+ *
+ *   *_defer        -- weave_page_recyclable() said a concurrent scan might still
+ *                     hold it, so it went back to the FSM unused
+ *   *_contended    -- ConditionalLockBuffer failed; someone else had the buffer
+ *
+ * WHY ALWAYS-ON RATHER THAN BEHIND A BUILD FLAG.  The counters are one increment
+ * per ReadBuffer, i.e. unmeasurable next to the buffer read itself.  A build flag
+ * would mean the numbers are only available from a binary nobody is running, and
+ * the sibling project recorded "verify counters are present in the shipped .so
+ * before trusting results" as a lesson learned the hard way.  Reading them from
+ * SQL rather than elog(LOG) is deliberate for the same reason: log_min_messages
+ * = warning silences elog(LOG), which cost that project a whole run.
+ *
+ * These answer a question, they are not a diagnosis.  A high extend count with a
+ * high defer count means the recycle gate is the constraint; a high extend count
+ * with defer = 0 means the free list was never even consulted, which is a
+ * different bug entirely.  Distinguishing those two by reasoning is exactly what
+ * has failed here before.
+ */
+uint64		weave_alloc_lowfree_reuse = 0;
+uint64		weave_alloc_lowfree_defer = 0;
+uint64		weave_alloc_lowfree_contended = 0;
+uint64		weave_alloc_fsm_reuse = 0;
+uint64		weave_alloc_fsm_defer = 0;
+uint64		weave_alloc_fsm_contended = 0;
+uint64		weave_alloc_extend = 0;
+
 Buffer
 weave_new_buffer(Relation index)
 {
@@ -645,14 +685,17 @@ weave_new_buffer(Relation index)
 			{
 				/* a scan may still reference this just-freed page; leave it in
 				 * the FSM for a later allocation once its horizon passes */
+				weave_alloc_lowfree_defer++;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				ReleaseBuffer(buffer);
 				RecordFreeIndexPage(index, blk);
 				continue;
 			}
 			RecordUsedIndexPage(index, blk);
+			weave_alloc_lowfree_reuse++;
 			return buffer;
 		}
+		weave_alloc_lowfree_contended++;
 		ReleaseBuffer(buffer);
 	}
 
@@ -668,18 +711,33 @@ weave_new_buffer(Relation index)
 		{
 			if (!weave_page_recyclable(index, BufferGetPage(buffer)))
 			{
-				/* not yet safe to reuse (a concurrent scan could still be
-				 * reading it); re-record so it is handed out later, and try the
-				 * next free page.  Terminates: extension is the backstop when no
-				 * currently-recyclable free page exists. */
+				/*
+				 * Not yet safe to reuse (a concurrent scan could still be reading
+				 * it): re-record it so a later allocation gets it, and STOP.
+				 *
+				 * THE `break` IS DELIBERATE AND ITS COST IS REAL.  This used to say
+				 * "and try the next free page", which is not what the code does and
+				 * could not be: GetFreeIndexPage() *removes* the page from the FSM
+				 * and RecordFreeIndexPage() puts it back, so a `continue` would
+				 * hand out the same block forever.  The consequence of stopping is
+				 * that ONE not-yet-recyclable page abandons FSM reuse for the whole
+				 * rest of this allocation sequence and everything after it extends
+				 * -- which is a plausible mechanism for freed-but-never-reused
+				 * growth, and is why weave_alloc_fsm_defer is counted separately
+				 * from weave_alloc_extend.  Do not "fix" this into a loop without
+				 * a way to skip a block rather than re-queue it.
+				 */
+				weave_alloc_fsm_defer++;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				ReleaseBuffer(buffer);
 				RecordFreeIndexPage(index, blk);
 				break;
 			}
+			weave_alloc_fsm_reuse++;
 			return buffer;		/* got it */
 		}
 		/* someone else is using it; try the next free page */
+		weave_alloc_fsm_contended++;
 		ReleaseBuffer(buffer);
 	}
 
@@ -704,7 +762,113 @@ weave_new_buffer(Relation index)
 	buffer = ReadBuffer(index, P_NEW);
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 	UnlockRelationForExtension(index, ExclusiveLock);
+	weave_alloc_extend++;
 	return buffer;
+}
+
+PG_FUNCTION_INFO_V1(weave_alloc_stats);
+PG_FUNCTION_INFO_V1(weave_alloc_stats_reset);
+
+/*
+ * weave_alloc_stats() -> record : this backend's page-allocation outcomes.
+ *
+ * Backend-local and cumulative since backend start or the last
+ * weave_alloc_stats_reset().  NOT per-index: the counters sit on the allocator,
+ * which is backend-scoped state (weave_lowfree, weave_alloc_extend_only), so a
+ * measurement run should touch one index in one session.  That is a real
+ * limitation and it is the honest shape -- attributing a count to an index would
+ * mean shared memory and a stats collector for something whose only job is to
+ * answer "which of three branches ran".
+ *
+ * PARALLEL RESTRICTED, not safe: a parallel build's workers each allocate pages
+ * into their own counters and the leader would report only its own, which is a
+ * wrong answer rather than a slow one.
+ */
+Datum
+weave_alloc_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[7];
+	bool		nulls[7] = {false, false, false, false, false, false, false};
+	HeapTuple	tuple;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	values[0] = Int64GetDatum((int64) weave_alloc_lowfree_reuse);
+	values[1] = Int64GetDatum((int64) weave_alloc_lowfree_defer);
+	values[2] = Int64GetDatum((int64) weave_alloc_lowfree_contended);
+	values[3] = Int64GetDatum((int64) weave_alloc_fsm_reuse);
+	values[4] = Int64GetDatum((int64) weave_alloc_fsm_defer);
+	values[5] = Int64GetDatum((int64) weave_alloc_fsm_contended);
+	values[6] = Int64GetDatum((int64) weave_alloc_extend);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/* Zero this backend's allocator counters, so a measurement can bracket one
+ * operation instead of reporting everything since connect. */
+Datum
+weave_alloc_stats_reset(PG_FUNCTION_ARGS)
+{
+	weave_alloc_lowfree_reuse = 0;
+	weave_alloc_lowfree_defer = 0;
+	weave_alloc_lowfree_contended = 0;
+	weave_alloc_fsm_reuse = 0;
+	weave_alloc_fsm_defer = 0;
+	weave_alloc_fsm_contended = 0;
+	weave_alloc_extend = 0;
+	PG_RETURN_VOID();
+}
+
+/*
+ * Is ANY currently-free page recyclable right now?
+ *
+ * Lives here, next to weave_page_recyclable() which is static, because the
+ * question is allocator knowledge: the answer is what decides whether a
+ * relocation pass can pack into the space it frees or can only extend the
+ * relation.  amvacuum.c asks it before starting a vacate+pack under a lock weaker
+ * than AccessExclusiveLock (see the long comment at that call site for the two
+ * measured behaviours this protects against).
+ *
+ * Returns false when there are no free pages at all, which is the right answer for
+ * the caller: with nothing to pack into, a relocation can only extend.
+ *
+ * BOUNDED PROBE.  It stops after WEAVE_RECYCLE_PROBE_MAX candidates because each
+ * one costs a buffer read, and the caller may run on every autovacuum cycle.  The
+ * bound can only produce a FALSE NEGATIVE -- "nothing recyclable" when a page
+ * beyond the probe window was -- which makes the caller skip a pass it could have
+ * done.  That is self-correcting on the next cycle and is the safe direction: a
+ * false positive would start a relocation that can only grow the file.
+ */
+#define WEAVE_RECYCLE_PROBE_MAX 256
+
+bool
+weave_any_free_page_recyclable(Relation index)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	BlockNumber blk;
+	int			probed = 0;
+
+	for (blk = 1; blk < nblocks && probed < WEAVE_RECYCLE_PROBE_MAX; blk++)
+	{
+		Buffer		buf;
+		bool		ok;
+
+		CHECK_FOR_INTERRUPTS();	/* no buffer lock held across the FSM check */
+		if (GetRecordedFreeSpace(index, blk) < BLCKSZ / 2)
+			continue;
+		probed++;
+		buf = ReadBuffer(index, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		ok = weave_page_recyclable(index, BufferGetPage(buf));
+		UnlockReleaseBuffer(buf);
+		if (ok)
+			return true;
+	}
+	return false;
 }
 
 /*
