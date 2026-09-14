@@ -1301,10 +1301,10 @@ weave_doclen_cursor_init(WeaveDoclenCursor *c, Relation index, BlockNumber start
 		if (res->page == NULL)
 		{
 			res->cap = WEAVE_BLOCK_SIZE;
-			res->docid = (uint64 *) palloc(res->cap * sizeof(uint64));
-			res->byte = (uint8 *) palloc(res->cap * sizeof(uint8));
+			res->docid = (uint64 *) palloc(res->cap * sizeof(uint64));	/* alloc-ok: fixed size -- WEAVE_BLOCK_SIZE entries and one BLCKSZ page, not corpus-scale */
+			res->byte = (uint8 *) palloc(res->cap * sizeof(uint8));	/* alloc-ok: fixed size -- WEAVE_BLOCK_SIZE entries and one BLCKSZ page, not corpus-scale */
 			res->pagecap = BLCKSZ;
-			res->page = (unsigned char *) palloc(res->pagecap);
+			res->page = (unsigned char *) palloc(res->pagecap);	/* alloc-ok: fixed size -- WEAVE_BLOCK_SIZE entries and one BLCKSZ page, not corpus-scale */
 			res->pageblk = InvalidBlockNumber;
 			res->pagefirst = 0;
 			res->pagelast = 0;

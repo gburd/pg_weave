@@ -41,6 +41,7 @@
 #include "postgres.h"
 
 #include "weave/weave.h"
+#include "weave/am.h"			/* WEAVE_ALLOC_MAYBE_HUGE / WEAVE_REALLOC_MAYBE_HUGE */
 #include "weave/docvalid.h"
 #include "catalog/pg_collation.h"
 #include "lib/stringinfo.h"
@@ -242,13 +243,20 @@ weave_doc_parse_canonical(const char *in)
 	const char *p = in;
 	uint32		cap = 4;
 	uint32		nterms = 0;
-	char	  **terms = (char **) palloc(cap * sizeof(char *));
-	int		   *lens = (int *) palloc(cap * sizeof(int));
-	uint32	   *tfs = (uint32 *) palloc(cap * sizeof(uint32));
+	/*
+	 * Nominally "bounded by one document", but that bound does not hold: the
+	 * 8-byte pointer array overflows MaxAllocSize at ~134M terms while the
+	 * minimal ~6-byte-per-token encoding lets a single 1GB text literal carry
+	 * ~179M tokens.  So a maximal literal overflows the array before it hits
+	 * the document ceiling doc.c enforces above.
+	 */
+	char	  **terms = (char **) WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(char *));
+	int		   *lens = (int *) WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(int));
+	uint32	   *tfs = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(uint32));
 	StringInfoData term;
 	uint32		poscap = 8;
 	uint32		npos = 0;
-	uint32	   *positions = (uint32 *) palloc(poscap * sizeof(uint32));
+	uint32	   *positions = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE((Size) poscap * sizeof(uint32));
 	bool		has_pos = false;
 	bool		seen_any = false;
 	WeaveDoc		result;
@@ -361,9 +369,9 @@ weave_doc_parse_canonical(const char *in)
 		if (nterms == cap)
 		{
 			cap *= 2;
-			terms = (char **) repalloc(terms, cap * sizeof(char *));
-			lens = (int *) repalloc(lens, cap * sizeof(int));
-			tfs = (uint32 *) repalloc(tfs, cap * sizeof(uint32));
+			terms = (char **) WEAVE_REALLOC_MAYBE_HUGE(terms, (Size) cap * sizeof(char *));
+			lens = (int *) WEAVE_REALLOC_MAYBE_HUGE(lens, (Size) cap * sizeof(int));
+			tfs = (uint32 *) WEAVE_REALLOC_MAYBE_HUGE(tfs, (Size) cap * sizeof(uint32));
 		}
 		terms[nterms] = (char *) palloc(Max(term.len, 1));	/* alloc-ok: one term's bytes */
 		memcpy(terms[nterms], term.data, term.len);
@@ -417,7 +425,7 @@ weave_doc_parse_canonical(const char *in)
 				if (npos == poscap)
 				{
 					poscap *= 2;
-					positions = (uint32 *) repalloc(positions, poscap * sizeof(uint32));
+					positions = (uint32 *) WEAVE_REALLOC_MAYBE_HUGE(positions, (Size) poscap * sizeof(uint32));
 				}
 				positions[npos++] = v;
 			}

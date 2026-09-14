@@ -1376,13 +1376,32 @@ weave_doclens_load(Relation index, BlockNumber doclenstart, WeaveDoclens *d)
 
 			if (d->n + (int) bcount > cap)
 			{
+				/*
+				 * This array holds EVERY docid in the segment, so past ~134M docids
+				 * (MaxAllocSize/8) a plain palloc throws "invalid memory alloc
+				 * request size".  That is not a soft failure: this runs from
+				 * merge_source_open(), so once a segment is big enough EVERY merge,
+				 * autovacuum cleanup and weave_vacuum() fails and the index can
+				 * never be reclaimed again.  Upstream hit exactly this.
+				 *
+				 * HUGE-SAFETY IS THE RIGHT FIX *HERE* AND THE WRONG FIX ONE PAGE
+				 * OVER, which is the distinction upstream lost.  `bcount` is
+				 * bounds-checked above (WEAVE_BLOCK_SIZE, blkend <= end), so this
+				 * size is an honest count of real docids and lifting the ceiling is
+				 * correct.  Where a size is derived from an UNVALIDATED on-page
+				 * field, routing it to MemoryContextAllocHuge is worse than throwing
+				 * -- it turns a clean error into a multi-GB allocation and a garbage
+				 * walk.  Validate first, then lift the ceiling; never the reverse.
+				 */
 				cap = Max(cap * 2, d->n + (int) bcount + 128);
 				d->docids = d->docids
-					? (uint64 *) repalloc(d->docids, (Size) cap * sizeof(uint64))
-					: (uint64 *) palloc((Size) cap * sizeof(uint64));
+					? (uint64 *) WEAVE_REALLOC_MAYBE_HUGE(d->docids,
+													  (Size) cap * sizeof(uint64))
+					: (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(uint64));
 				d->bytes = d->bytes
-					? (uint8 *) repalloc(d->bytes, (Size) cap * sizeof(uint8))
-					: (uint8 *) palloc((Size) cap * sizeof(uint8));
+					? (uint8 *) WEAVE_REALLOC_MAYBE_HUGE(d->bytes,
+													 (Size) cap * sizeof(uint8))
+					: (uint8 *) WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(uint8));
 			}
 			/* v5 stores offsets from first_docid; v4 stores gaps.  This path
 			 * materializes the whole sidecar either way (it feeds the merge, which
@@ -1751,13 +1770,19 @@ weave_write_dictionary_iter(Relation index, DictNextFn next, void *nstate,
 		{
 			if (npages >= pgcap)
 			{
+				/* one entry per dict page written, i.e. vocabulary-scale with no
+				 * formal bound; reached from weave_vacuumcleanup via the streaming
+				 * merge, so a throw here blocks reclaim rather than one query. */
 				pgcap = Max(pgcap * 2, 64);
-				pgblk = pgblk ? repalloc(pgblk, pgcap * sizeof(BlockNumber))
-					: palloc(pgcap * sizeof(BlockNumber));
-				pgfirst = pgfirst ? repalloc(pgfirst, pgcap * sizeof(char *))
-					: palloc(pgcap * sizeof(char *));
-				pgfirstlen = pgfirstlen ? repalloc(pgfirstlen, pgcap * sizeof(int))
-					: palloc(pgcap * sizeof(int));
+				pgblk = pgblk
+					? WEAVE_REALLOC_MAYBE_HUGE(pgblk, (Size) pgcap * sizeof(BlockNumber))
+					: WEAVE_ALLOC_MAYBE_HUGE((Size) pgcap * sizeof(BlockNumber));
+				pgfirst = pgfirst
+					? WEAVE_REALLOC_MAYBE_HUGE(pgfirst, (Size) pgcap * sizeof(char *))
+					: WEAVE_ALLOC_MAYBE_HUGE((Size) pgcap * sizeof(char *));
+				pgfirstlen = pgfirstlen
+					? WEAVE_REALLOC_MAYBE_HUGE(pgfirstlen, (Size) pgcap * sizeof(int))
+					: WEAVE_ALLOC_MAYBE_HUGE((Size) pgcap * sizeof(int));
 			}
 			pgblk[npages] = BufferGetBlockNumber(buffer);
 			pgfirstlen[npages] = r.len;
@@ -2142,8 +2167,8 @@ merge_source_load_page(MergeSource *src)
 		{
 			src->pagecap = Max(n, src->pagecap ? src->pagecap * 2 : 256);
 			src->page = src->page
-				? repalloc(src->page, src->pagecap * sizeof(MergeDictTerm))
-				: palloc(src->pagecap * sizeof(MergeDictTerm));
+				? repalloc(src->page, src->pagecap * sizeof(MergeDictTerm))	/* alloc-ok: bounded by one 8kB page -- the entry walk above is bounds-guarded, so n and used cannot exceed what a page holds */
+				: palloc(src->pagecap * sizeof(MergeDictTerm));	/* alloc-ok: bounded by one 8kB page -- the entry walk above is bounds-guarded, so n and used cannot exceed what a page holds */
 		}
 		if (used > src->bytescap || (n > 0 && src->pagebytes == NULL))
 		{
@@ -2151,8 +2176,8 @@ merge_source_load_page(MergeSource *src)
 			 * degenerate all-zero-length-term case (avoids memcpy(NULL,...,0)) */
 			src->bytescap = Max(Max(used, (Size) 1), src->bytescap ? src->bytescap * 2 : (Size) BLCKSZ);
 			src->pagebytes = src->pagebytes
-				? repalloc(src->pagebytes, src->bytescap)
-				: palloc(src->bytescap);
+				? repalloc(src->pagebytes, src->bytescap)	/* alloc-ok: bounded by one 8kB page -- the entry walk above is bounds-guarded, so n and used cannot exceed what a page holds */
+				: palloc(src->bytescap);	/* alloc-ok: bounded by one 8kB page -- the entry walk above is bounds-guarded, so n and used cannot exceed what a page holds */
 		}
 
 		/* Second walk applies the IDENTICAL entry-fits bound to the first.  The
@@ -2357,7 +2382,7 @@ typedef struct DictSpill
 {
 	BufFile    *bf;
 	char	   *tbuf;			/* reusable read buffer for term bytes */
-	int			tcap;
+	Size		tcap;
 	DictRec		cur;			/* last record read back (term points into tbuf) */
 	int			ordinal;		/* ordinal of cur among all spilled records */
 } DictSpill;
@@ -2408,10 +2433,17 @@ dict_spill_next(void *st, DictRec *out)
 	BufFileReadExact(sp->bf, &sp->cur.max_tf, sizeof(uint32));
 	BufFileReadExact(sp->bf, &sp->cur.firstposting, sizeof(BlockNumber));
 	BufFileReadExact(sp->bf, &sp->cur.firstoffset, sizeof(uint32));
-	if (sp->cur.len > sp->tcap)
+	if ((Size) sp->cur.len > sp->tcap)
 	{
-		sp->tcap = Max(sp->cur.len, sp->tcap ? sp->tcap * 2 : 256);
-		sp->tbuf = sp->tbuf ? repalloc(sp->tbuf, sp->tcap) : palloc(sp->tcap);
+		/* tcap was an int and the doubling below is what overflowed it: a term
+		 * length is bounded by the document (doc.c:188 caps a document at
+		 * MaxAllocSize), so cur.len can approach 1GB, and tcap*2 then exceeds
+		 * INT_MAX -- signed overflow, and a negative int reaching palloc()
+		 * becomes an enormous Size.  Widened to Size and made huge-safe; this is
+		 * on the merge path, so a throw here blocks reclaim. */
+		sp->tcap = Max((Size) sp->cur.len, sp->tcap ? sp->tcap * 2 : (Size) 256);
+		sp->tbuf = sp->tbuf ? WEAVE_REALLOC_MAYBE_HUGE(sp->tbuf, sp->tcap)
+			: WEAVE_ALLOC_MAYBE_HUGE(sp->tcap);
 	}
 	if (sp->cur.len > 0)
 		BufFileReadExact(sp->bf, sp->tbuf, sp->cur.len);

@@ -765,7 +765,10 @@ weave_lookup_prefix(Relation index, const WeaveSegMeta *seg,
 	BlockNumber blk = weave_dict_seek(index, seg, prefix, prefixlen);
 	int			cap = 32;
 	int			n = 0;
-	ItemPointerData *tids = palloc(cap * sizeof(ItemPointerData));
+	/* sized by the number of matching tuples, which is corpus-scale (a
+	 * prefix can match every row); query path, so a throw here loses one
+	 * query rather than a vacuum */
+	ItemPointerData *tids = WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(ItemPointerData));
 	bool		done = false;
 
 	while (blk != InvalidBlockNumber && !done)
@@ -826,7 +829,8 @@ weave_lookup_prefix(Relation index, const WeaveSegMeta *seg,
 					if (n >= cap)
 					{
 						cap *= 2;
-						tids = repalloc(tids, cap * sizeof(ItemPointerData));
+						/* corpus-scale, query path: see the palloc above */
+						tids = WEAVE_REALLOC_MAYBE_HUGE(tids, (Size) cap * sizeof(ItemPointerData));
 					}
 					tids[n++] = post[k].tid;
 				}
@@ -1122,10 +1126,13 @@ weave_fuzzy_terms(Relation index, const WeaveSegMeta *seg,
 					if (nruns >= runcap)
 					{
 						runcap = Max(runcap * 2, 16);
-						runs = runs ? repalloc(runs, runcap * sizeof(ItemPointerData *))
-							: palloc(runcap * sizeof(ItemPointerData *));
-						runlen = runlen ? repalloc(runlen, runcap * sizeof(int))
-							: palloc(runcap * sizeof(int));
+						/* runcap tracks the number of matching terms, each
+						 * contributing a run of matching tuples -- corpus-scale;
+						 * query path, so a throw here loses one query */
+						runs = runs ? WEAVE_REALLOC_MAYBE_HUGE(runs, (Size) runcap * sizeof(ItemPointerData *))
+							: WEAVE_ALLOC_MAYBE_HUGE((Size) runcap * sizeof(ItemPointerData *));
+						runlen = runlen ? WEAVE_REALLOC_MAYBE_HUGE(runlen, (Size) runcap * sizeof(int))
+							: WEAVE_ALLOC_MAYBE_HUGE((Size) runcap * sizeof(int));
 					}
 					runs[nruns] = run;
 					runlen[nruns] = np;
@@ -1316,7 +1323,7 @@ weave_universe_bounded(Relation index, BlockNumber dictstart, double ndocs,
 	BlockNumber blk = dictstart;
 	int			cap = 64;
 	int			n = 0;
-	ItemPointerData *tids = palloc(cap * sizeof(ItemPointerData));
+	ItemPointerData *tids = palloc(cap * sizeof(ItemPointerData));	/* alloc-ok: guarded by the explicit cap*2*sizeof > MaxAllocSize ereport just above */
 
 	/* Fold threshold: once the buffer holds more than fold_at raw TIDs,
 	 * sort_uniq collapses it back to the <= ndocs distinct ones.  A distinct
@@ -1391,7 +1398,7 @@ weave_universe_bounded(Relation index, BlockNumber dictstart, double ndocs,
 									 errmsg("pg_weave: candidate set for this query is too large"),
 									 errhint("Build the index WITH (trigrams = on) so fuzzy/regex/NOT queries can be accelerated.")));
 						cap *= 2;
-						tids = repalloc(tids, cap * sizeof(ItemPointerData));
+						tids = repalloc(tids, cap * sizeof(ItemPointerData));	/* alloc-ok: guarded by the explicit cap*2*sizeof > MaxAllocSize ereport just above */
 					}
 				}
 				tids[n++] = post[k].tid;
@@ -2036,7 +2043,8 @@ weave_phrase_eval_seg(Relation index, const WeaveSegMeta *seg, WeaveQuery q,
 			if (*ntids >= *captids)
 			{
 				*captids = Max(*captids * 2, 16);
-				*tids = repalloc(*tids, (Size) *captids * sizeof(ItemPointerData));
+				/* corpus-scale (one matching tid per doc); query path */
+				*tids = WEAVE_REALLOC_MAYBE_HUGE(*tids, (Size) *captids * sizeof(ItemPointerData));
 			}
 			(*tids)[(*ntids)++] = tid;
 		}
@@ -2287,7 +2295,9 @@ collect_retry:
 			if (ptids == NULL)
 			{
 				captids = 64;
-				ptids = (ItemPointerData *) palloc(captids * sizeof(ItemPointerData));
+				/* corpus-scale (one tid per matching doc); query path, so a
+				 * throw here loses one query, not a vacuum */
+				ptids = (ItemPointerData *) WEAVE_ALLOC_MAYBE_HUGE((Size) captids * sizeof(ItemPointerData));
 			}
 			if (!weave_phrase_eval_seg(index, sg, query, pterm, pstep, npterm,
 									  &ptids, &nptids, &captids))
