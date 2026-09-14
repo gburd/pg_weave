@@ -145,19 +145,46 @@ dynahash left; `simplehash.h` might recover a third of it and is not the next
 thing). Parallel merge (L4) and parallel scan (L11) are withdrawn on upstream
 evidence. `bench/RESULTS_L15.md`.
 
-### G12 — a single-segment index never reclaims deleted space — **OPEN, found 2026-09-13**
+### G14 — a single-segment index never reclaimed deleted space — **CLOSED by L18 2026-09-14**
+
+**Renumbered from G12, which was already taken** by the boolean-NOT gap in the
+table above. The collision shipped for a day; two different gaps under one id in
+one file is how a closed gap gets cited as evidence for an open one.
 
 Delete 90% of a 120,000-row corpus, `VACUUM`, then `weave_vacuum()` twice, and the
-index goes **2289 → 2296 pages**: it grows by 7 and reclaims nothing.
-`weave_vacuum()` returns **false** both times and `weave_index_nsegments()` is
-**1**.
+index went **2289 → 2296 pages**: it grew by 7 and reclaimed nothing.
+`weave_vacuum()` returned **false** both times and `weave_index_nsegments()` was
+**1**. Since insert-time tiered merge drives every index toward exactly one
+segment, **the steady state of a weave index was the state that could not
+reclaim**, and the only recovery was `REINDEX`.
 
-**Mechanism.** Compaction is implemented as a *merge* of segments
-(`weave_merge_segments_streaming()`, reached only via `weave_merge_selected()`),
-and a merge of one segment is a no-op guarded by an `nsegments > 1` precondition.
-Insert-time tiered merge drives every index toward exactly one segment. **So the
-steady state of a weave index is the state that cannot reclaim.** The 7-page growth
-is `weave_bulkdelete` adding tombstone bookkeeping that nothing later removes.
+**Fixed:** 2289 → **264 pages**, true on the first call and false on the second.
+264/2289 is 11.5% of the file for 10% of the rows — nearly proportional, so the
+reclaim is essentially complete. Converges in one pass, because the rewrite emits
+a segment with `ndeleted = 0`.
+
+**THE MECHANISM RECORDED HERE WAS WRONG, and that is the useful part.** This entry
+used to say compaction was "implemented as a *merge* of segments, and a merge of
+one segment is a no-op guarded by an `nsegments > 1` precondition". All three
+clauses were false. `weave_merge_selected()` has no such precondition,
+`weave_compact_to_one()` already calls it with `nsel >= 1`, and
+`weave_merge_segments_streaming()` already drops tombstoned postings per source.
+**The rewrite machinery was complete and correct the whole time; nothing ever
+asked it to run.**
+
+The real cause: every term in `weave_index_is_compacted()` — the floor guard
+`weave_vacuum()` consults before deciding a rewrite would be waste — is a
+statement about **free space** or segment count, and **a tombstone is neither**. It
+is a live, allocated, fully-packed page holding a posting no scan can see. A
+segment that is 90% deleted is perfectly front-packed with nothing to coalesce, so
+the guard called it compacted. The whole fix is a third term teaching that
+predicate what a tombstone is, gated by `pg_weave.vacuum_tombstone_frac`
+(default 0.2, **not measured** — the frontier has not been swept and the right
+value depends on segment size).
+
+Had the diagnosis in this file been trusted, the work would have been a redesign
+of the merge instead of eight lines. **A wrong mechanism in a gap entry is more
+expensive than no mechanism**, because it is specific enough to act on.
 
 **Why no test caught it.** `t/008_vacuum_reclaim.pl` existed for exactly this
 requirement — its header says "must SHRINK a bloated index, not grow it" — but it
@@ -175,17 +202,152 @@ reclaiming (18 → 22 MB) because a stale free-space map overstates the live siz
 The lesson transferred even though the root cause did not: **a no-growth assertion
 cannot see a no-reclaim regression, and a fix for one produces the other.**
 
-**Consequence.** An append-then-delete workload has no way to reclaim index space
-short of `REINDEX`. That is a production-readiness problem, not a benchmark
-problem: a table whose rows are replaced over time grows an index monotonically.
+**STILL OPEN, deliberately: the autovacuum path does not reclaim tombstones.**
+`weave_vacuumcleanup()` has an independent trigger for the same rewrite with the
+identical blind spot (it fires only when free pages exceed 25% of the file). It is
+left alone because `weave_vacuum()` takes `AccessExclusiveLock`, which is what
+licenses `weave_page_recyclable()` to bypass `GlobalVisCheckRemovableXid` and reuse
+pages inside the same call — that is why vacate+pack converges in one pass there.
+Under autovacuum's `ShareUpdateExclusiveLock` a concurrent scan can exist, the gate
+must stand, phase 2 cannot pack into the pages phase 1 just freed, and the rewrite
+would **extend**. That is exactly how pg_fts produced its 35 → 52 → 69 MB. So
+tombstone reclaim currently **requires an explicit `weave_vacuum()`**, and `t/008`
+has an arm that pins the limitation by measurement (264 → 267 → 267 across two
+plain `VACUUM`s: no growth, no reclaim) rather than leaving it an assumption.
+Closing it needs a rewrite that is correct under a share lock, which is its own
+task and its own measurement.
 
-**Fix direction** (task L18): `weave_vacuum()` must rewrite a *single* segment when
-its tombstone fraction exceeds a threshold — a compaction that is not a merge.
-`weave_page_recyclable()` gates free-page reuse on `GlobalVisCheckRemovableXid()`
-(`src/am/am.c:2252`), so pages freed by that rewrite are not reusable in the same
-transaction; pg_fts's experience says the honest handling is to let the *next*
-cycle reclaim them rather than to extend the relation, and to refresh the FSM
-before deciding, or the pass gets skipped forever.
+### G15 — eight dictionary page walks had no bounds check — **CLOSED 2026-09-14**
+
+Eight loops stepped over variable-length `WeaveDictEntry` records taking their end
+bound from a raw `pd_lower` and their stride from an untrusted on-page
+`de->termlen`. On a recycled or corrupt page — possible because these pages are
+read under only `BUFFER_LOCK_SHARE` — the walk leaves the page. Ranked by
+consequence:
+
+1. `merge_source_load_page()` (`src/am/ambuild.c`) — **the counting pass SIZES two
+   allocations and bounds a second pass that WRITES.** This shape has been hit in
+   the field at scale as `invalid memory alloc request size 3406063183` (~142M
+   entries where an 8 kB page holds a few hundred), and because the function sits
+   under the streaming merge it killed every merge, every autovacuum cleanup and
+   every explicit vacuum: **the index could never be vacuumed or reclaimed again.**
+   Provenance: pg_fts 1.7.0, investigating a 2.87M-doc email-body index.
+2. `weave_segment_docids()` (`src/am/amvacuum.c`) — runs on **every** VACUUM and CIC
+   validate, and feeds a garbage `de->df` to `weave_decode_term()`.
+3. `weave_dict_seek()` (`src/am/amscan.c`) — the hottest term lookup in the AM; a
+   garbage `ie->blk` is then read as if it were a dictionary page.
+4. `weave_free_segment()`'s two walks (`src/am/am.c`) — a garbage `de->firstposting`
+   goes to `weave_free_chain()`, which would mark an arbitrary block chain free.
+   **Freeing live pages from a corrupt read is the worst outcome in that file.**
+5. `weave_anomalous_docs()`'s two passes (`src/am/amscan.c`) — SQL-reachable by any
+   user.
+6. `trgm_page.c`'s dictionary and trigram walks.
+
+**Do not port a fix for this as "make the allocation huge-safe".** Upstream treated
+it as two findings and did both, but its 2.5 GB request came *from* the unvalidated
+walk — routing a garbage-derived size to `MemoryContextAllocHuge` turns a clean
+error into a 2.5 GB allocation and a garbage walk, which is worse. Validation and
+huge-safety fix different bugs. Our doclen loader was already guarded, so its size
+is honest and corpus-scale, and *that* one wanted huge-safety (see G16).
+
+**Fixed** by `weave_page_entry_end()` (validates `pd_lower` as an integer before a
+pointer is formed from it — `page + pd_lower` for an out-of-range value is UB *at
+formation*, so a guard written as the pointer comparison `ptr < (char *) page +
+pd_lower` is itself the bug it means to prevent) and by promoting
+`weave_dict_entry_fits()` from `static` in `amscan.c` to `include/weave/am.h`. That
+helper was already correct and already used at seven `amscan.c` sites; **it was
+`static`, so the four other files that needed it each walked unguarded instead.**
+A guard only one translation unit can reach is how eight walks went without one.
+
+`test/fuzz/fuzz_dictwalk.c` pins both hazards with planted-bug builds that must
+abort. A third planted bug was written and **exited 0**: it removed the second
+walk's `n < cap` bound on the rationale that the two passes might see different
+bytes, and that rationale is false — the share lock is held across both passes. The
+bound stays as belt-and-braces and is documented as not load-bearing.
+
+**`src/am/amcheck.c` is deliberately excluded** from the `pd_lower` clamp: it
+reports corruption for a living, and clamping there would hide what it exists to
+find. Recorded here so the inconsistency is a decision rather than an oversight.
+
+### G16 — the allocation lint reported safety it had not checked — **CLOSED 2026-09-14**
+
+`ci/check-alloc.sh` had said "no unguarded corpus/vocabulary-scale allocations" on
+every commit for months. It matched an enumerated allowlist of size-variable
+**names** — `df`, `sumtf`, `ndocs`, `nposts` and eighteen more — and that list grew
+one name at a time as each was hit (`parena_cap` and `ocap` are in it because
+someone hit exactly those two). That is the same find-one-function-at-a-time mode
+the lint was written to replace, and it left the codebase's **dominant** allocation
+pattern invisible: the doubling capacity variable.
+
+A sweep for that idiom found **43 sites the lint could not see.** Eight are
+genuinely corpus-scale. **Four are reachable from VACUUM or merge**, which is the
+part that matters — a throw on a query path loses one query, a throw inside
+`weave_bulkdelete` or the streaming merge means every vacuum fails and the index can
+never be reclaimed again:
+
+- the doclen resident array (every docid in a segment, ~134M to overflow), reached
+  from `merge_source_open()`;
+- `weave_bulkdelete()`'s `carry` and `newdead` tombstone arrays;
+- the dict-page bookkeeping trio in the dictionary writer, reached from
+  `weave_vacuumcleanup()` via the streaming merge;
+- `dict_spill_next()`'s term buffer, where **`tcap` was an `int` and the doubling
+  itself was the bug**: a term length is bounded by the document (1 GB), so
+  `tcap * 2` exceeds `INT_MAX`, signed-overflows, and a negative int reaching
+  `palloc` becomes an enormous `Size`.
+
+Also `doc.c`'s per-document parse arrays, where the "bounded by one document"
+defence does **not** hold: the 8-byte pointer array overflows at ~134M terms while
+the minimal ~6-byte-per-token encoding lets a single 1 GB literal carry ~179M
+tokens, so a maximal literal overflows the array before reaching the document
+ceiling `doc.c` already enforces.
+
+The lint now matches the **idiom** rather than a list of names, and deliberately
+over-matches: a bounded `cap` costs one `alloc-ok:` annotation, a missed one costs
+an unvacuumable index. Nine genuinely bounded sites carry that annotation with the
+bound stated, so the next reader need not re-derive it. Teeth verified by planting a
+plain `palloc(mycap * ...)` and confirming it fails — **because a lint that goes
+green on its first run is precisely what the old one did.**
+
+### G17 — `weave_free_page()` emits one WAL record per page — **OPEN, identified 2026-09-14**
+
+`weave_free_page()` (`src/am/am.c`) wraps each page in its own
+`GenericXLogStart`/`Finish`, and it is called in a loop from `weave_free_chain()`
+and `weave_free_segment()`. Freeing a segment therefore emits one full-page delta
+per page. Upstream measured the same shape at 3.8 GB / ~489k pages: its vacuum ran
+**113+ minutes without finishing** (gdb showed progress, not a hang).
+
+This is now **more** likely to be reached, not less: **L18 makes `weave_vacuum()`
+actually rewrite tombstone-heavy segments**, so the free path runs on real
+workloads where it previously did nothing. Our reclaim test frees ~2000 pages and
+is fast; a multi-GB index has not been measured here.
+
+A fix means batching pages into one `GenericXLog` record, which is bounded by
+`MAX_GENERIC_XLOG_PAGES` (4) — so the best available win is **~4×, not the order of
+magnitude the page count suggests**. Upstream deliberately did not rush it into a
+correctness release, and neither should we: it needs its own measurement on a large
+index, and that measurement should establish whether 4× is enough to matter before
+any code is written.
+
+### Checked and NOT a gap: HOT-successor TIDs in `amgettuple`
+
+pg_tre 4.0.2 fixed a silent under-return: its always-true scan path collected TIDs
+from `heap_getnext()`, which returns the **current** tuple version, and after any
+HOT update that version is a `HEAP_ONLY` successor rather than the chain root.
+`index_fetch_heap` bails immediately on a heap-only TID, so every HOT-updated row
+was handed over as unreachable and silently discarded — 169 of 185 rows on the
+reporter's production heap.
+
+**pg_weave is immune, and the reason is structural rather than lucky.** Our only
+heap scan is `table_index_build_scan()` in `ambuild.c`, which routes through
+`heapam_index_build_range_scan()` — core code that already translates a heap-only
+tuple to its chain root via `heap_get_root_tuples()`. Every other TID we return
+comes out of the index's own posting lists, and those store roots. The NOT-universe
+path (`weave_universe_bounded()`) is built from posting lists, not from the heap, so
+it inherits the same property.
+
+Recorded rather than left unstated: "we don't have that bug" is only worth
+anything with the mechanism attached, and the next person to add a heap-reading
+path needs to know this is the constraint they are working under.
 
 ## 4. Gaps against the rest of the stack
 
@@ -274,9 +436,8 @@ term hash; the build reached 192.5 s because the larger cost was a second,
 unnamed per-posting hash (the doclen collector). The profile's estimate was
 wrong in the useful direction, but it was wrong, and for a reason worth keeping:
 it attributed by symbol, not by caller, and so counted one hash where there were
-two. G1, G2, G6 and G12 are closed,
-and G2 and G12 both turned out to be wins. G1, G2, and G6 are closed, and G2 turned out to
-be a win — pg_weave's index is 1.76× *smaller* than GIN's, not 1.9× larger.
+two. G1, G2, G6 and G12 are closed, and G2 and G12 both turned out to be wins —
+pg_weave's index is 1.76× *smaller* than GIN's, not 1.9× larger.
 
 Compaction was also shown not to affect ranked latency, which **falsifies the
 stated G3/G4 diagnosis**: the build already produces one segment, so per-segment
