@@ -145,29 +145,26 @@ my $seq = $node->safe_psql('postgres',
 is($c, $seq, 'index results still correct after weave_vacuum compaction');
 
 # ---------------------------------------------------------------------------
-# WHAT PLAIN VACUUM DOES ABOUT TOMBSTONES, pinned so the answer is a test result
-# rather than an assumption.
+# PLAIN VACUUM MUST NOT GROW THE INDEX.
 #
-# L18 fixed weave_index_is_compacted(), which is the floor guard weave_vacuum()
-# consults. weave_vacuumcleanup() -- the autovacuum/plain-VACUUM path -- has a
-# SECOND and independent trigger for the same rewrite, and it has the same blind
-# spot: it fires only when free pages exceed 25% of the file, and a tombstone is
-# not a free page. So plain VACUUM is expected NOT to reclaim tombstoned space.
+# THIS BLOCK USED TO CLAIM SOMETHING FALSE, and the correction is worth more than
+# the assertion. It said plain VACUUM cannot reclaim tombstoned space and pinned
+# "264 -> 267 -> 267, no reclaim" as the limitation. That was an artifact of THIS
+# harness: the node runs with no concurrent activity, so nothing consumes
+# transaction ids, and weave_page_recyclable() gates every freed page on
+# GlobalVisCheckRemovableXid(). With a stalled xid horizon no page ever becomes
+# recyclable and no reclaim is possible anywhere. Advance the horizon and plain
+# VACUUM reclaims fine -- t/015_alloc_outcomes.pl measures 1093 -> 94 pages, then
+# stable, with 73 low-bias page reuses.
 #
-# That asymmetry is deliberate, not an oversight, and the reason is the recycle
-# gate. weave_vacuum() takes AccessExclusiveLock, which is what licenses
-# weave_page_recyclable() (src/am/am.c) to bypass GlobalVisCheckRemovableXid and
-# reuse pages inside the same call -- that is why the two-phase vacate+pack
-# converges in ONE pass there. Under autovacuum's ShareUpdateExclusiveLock a
-# concurrent scan can exist, so the gate must stand, phase 2 cannot pack into the
-# pages phase 1 just freed, and the rewrite would EXTEND instead. Adding the
-# tombstone term to this trigger without solving that first is how pg_fts got
-# 35 -> 52 -> 69 MB across three no-op cleanups.
+# So the numbers below are not evidence about reclaim, and this arm no longer
+# pretends they are. What it still tests is real and is the bug this file was
+# written for: repeated plain VACUUM must not GROW the index. pg_fts shipped
+# 35 -> 52 -> 69 MB across three no-op cleanups, and we shipped an unbounded
+# +73-pages-per-cycle ratchet in the same path until L19 (doc/GAPS.md G18).
 #
-# So this arm asserts the CURRENT, LIMITED behaviour: plain VACUUM must not grow
-# the index, and is not required to shrink it. If someone later teaches the
-# autovacuum path to reclaim tombstones, this assertion starts failing on the
-# shrink and that is the prompt to re-read the paragraph above.
+# Reclaim behaviour is measured in t/015, which controls the xid horizon on
+# purpose. Do not re-add a reclaim assertion here without controlling it.
 my $pre_pv = idxpages();
 $node->safe_psql('postgres', 'DELETE FROM docs WHERE id % 100 = 0');
 $node->safe_psql('postgres', 'VACUUM docs');
@@ -175,9 +172,12 @@ my $pv1 = idxpages();
 $node->safe_psql('postgres', 'VACUUM docs');
 my $pv2 = idxpages();
 diag("plain VACUUM after a further delete: pre $pre_pv, #1 $pv1, #2 $pv2 "
-   . '(tombstone reclaim is weave_vacuum() only -- see the comment above)');
+   . '(this node cannot advance its xid horizon, so these say nothing about '
+   . 'reclaim -- see t/015 for that)');
 cmp_ok($pv2, '<=', $pre_pv + 8,
-    'repeated plain VACUUM does not grow the index (the pg_fts 35->52->69 MB bug)');
+    'repeated plain VACUUM does not grow the index (the 35->52->69 MB bug class)');
+is($pv2, $pv1,
+    'and the second VACUUM changes nothing (no ratchet: G18)');
 
 $node->stop;
 done_testing();

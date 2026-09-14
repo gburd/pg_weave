@@ -202,20 +202,23 @@ reclaiming (18 → 22 MB) because a stale free-space map overstates the live siz
 The lesson transferred even though the root cause did not: **a no-growth assertion
 cannot see a no-reclaim regression, and a fix for one produces the other.**
 
-**STILL OPEN, deliberately: the autovacuum path does not reclaim tombstones.**
-`weave_vacuumcleanup()` has an independent trigger for the same rewrite with the
-identical blind spot (it fires only when free pages exceed 25% of the file). It is
-left alone because `weave_vacuum()` takes `AccessExclusiveLock`, which is what
-licenses `weave_page_recyclable()` to bypass `GlobalVisCheckRemovableXid` and reuse
-pages inside the same call — that is why vacate+pack converges in one pass there.
-Under autovacuum's `ShareUpdateExclusiveLock` a concurrent scan can exist, the gate
-must stand, phase 2 cannot pack into the pages phase 1 just freed, and the rewrite
-would **extend**. That is exactly how pg_fts produced its 35 → 52 → 69 MB. So
-tombstone reclaim currently **requires an explicit `weave_vacuum()`**, and `t/008`
-has an arm that pins the limitation by measurement (264 → 267 → 267 across two
-plain `VACUUM`s: no growth, no reclaim) rather than leaving it an assumption.
-Closing it needs a rewrite that is correct under a share lock, which is its own
-task and its own measurement.
+**RETRACTED 2026-09-14, the day after it was written: "the autovacuum path does
+not reclaim tombstones."** That claim was measured on a test cluster with
+`autovacuum = off` and no other activity, so **nothing consumed transaction ids**.
+`weave_free_page()` stamps `ReadNextTransactionId()` on a freed page and
+`weave_page_recyclable()` asks `GlobalVisCheckRemovableXid()`, so with a stalled
+horizon no page ever becomes recyclable and no reclaim is possible — an artifact of
+the harness, not a property of the code. Advance the horizon and plain `VACUUM`
+reclaims: **1093 → 94 pages** on the first cycle, then 94 for the next four, with
+73 low-bias page reuses. `t/008`'s "264 → 267 → 267, no reclaim" arm was reading
+the same artifact.
+
+The general error is one this file keeps recording: **a measurement taken in
+conditions the production system does not have is not a measurement of the
+production system.** An idle cluster does not advance its xid horizon, and every
+visibility-gated mechanism in PostgreSQL depends on that horizon moving.
+
+**What was actually wrong was narrower and pre-existing — see G18.**
 
 ### G15 — eight dictionary page walks had no bounds check — **CLOSED 2026-09-14**
 
@@ -308,25 +311,108 @@ bound stated, so the next reader need not re-derive it. Teeth verified by planti
 plain `palloc(mycap * ...)` and confirming it fails — **because a lint that goes
 green on its first run is precisely what the old one did.**
 
-### G17 — `weave_free_page()` emits one WAL record per page — **OPEN, identified 2026-09-14**
+### ~~G17~~ — one WAL record per freed page — **WITHDRAWN 2026-09-14, the evidence was retracted upstream**
 
-`weave_free_page()` (`src/am/am.c`) wraps each page in its own
-`GenericXLogStart`/`Finish`, and it is called in a loop from `weave_free_chain()`
-and `weave_free_segment()`. Freeing a segment therefore emits one full-page delta
-per page. Upstream measured the same shape at 3.8 GB / ~489k pages: its vacuum ran
-**113+ minutes without finishing** (gdb showed progress, not a hang).
+Recorded earlier on 2026-09-14 citing an upstream measurement of ~14 ms/page (a
+3.8 GB index, ~489k pages, a vacuum running 113+ minutes without finishing).
+**Upstream retracted that number the same day.** Re-measured there: 8,686,917 pages
+freed in 46 seconds = **0.005 ms/page, ~2,800× cheaper** than published, confirmed
+by a second run (7,912,288 pages in 33 s). There is no per-page WAL problem and no
+batching is needed.
 
-This is now **more** likely to be reached, not less: **L18 makes `weave_vacuum()`
-actually rewrite tombstone-heavy segments**, so the free path runs on real
-workloads where it previously did nothing. Our reclaim test frees ~2000 pages and
-is fast; a multi-GB index has not been measured here.
+The original number came from a stack sample taken on an index that had **already
+hit the allocation bug repeatedly**, so the backend was working on a damaged state.
+`gdb` showed the process inside the page-free function, and that was turned into
+"this function is the bottleneck".
 
-A fix means batching pages into one `GenericXLog` record, which is bounded by
-`MAX_GENERIC_XLOG_PAGES` (4) — so the best available win is **~4×, not the order of
-magnitude the page count suggests**. Upstream deliberately did not rush it into a
-correctness release, and neither should we: it needs its own measurement on a large
-index, and that measurement should establish whether 4× is enough to matter before
-any code is written.
+**The lesson is why this entry is kept rather than deleted: a stack sample gives a
+LOCATION, not a RATE.** To claim a cost you need pages per second, not a frame. The
+second-order error is ours: G17 was written here, and task L21 into
+`doc/PHASES.md`, on inherited evidence never measured against our own code. Both
+are withdrawn. If the free path ever looks slow here, the first step is a rate.
+
+### G18 — a relocation pass under a share lock ratcheted the index upward — **CLOSED by L19 2026-09-14**
+
+Pre-existing, and found only because the allocator counters (G19) made the branch
+visible. Once `weave_vacuumcleanup()`'s free-page trigger fires — which a bulk
+ingest guarantees, since every tiered merge frees its inputs — the vacate+pack
+relocation runs under `ShareUpdateExclusiveLock`, can reuse **nothing**, and
+extends. The pages it just freed keep the trigger satisfied, so it repeats:
+
+| cycle | pages | `lowfree_reuse` | `lowfree_defer` | `extend` |
+|---|---|---|---|---|
+| start | 1022 | | | |
+| 1 | 1166 | 0 | 1001 | 144 |
+| 2 | 1239 | 0 | 1092 | 73 |
+| 3 | 1312 | 0 | 1165 | 73 |
+| 4 | 1385 | 0 | 1238 | 73 |
+| 5 | 1458 | 0 | 1311 | 73 |
+
+`lowfree_reuse = 0` with `lowfree_defer` = every candidate is the whole diagnosis.
+`weave_page_recyclable()` bypasses `GlobalVisCheckRemovableXid()` only under
+`AccessExclusiveLock`; under a share lock a concurrent scan may still hold a
+directory snapshot referencing those pages, so the gate must stand. Worse, the
+rejected-candidate list grows every cycle, so the scan gets slower as the file
+gets bigger.
+
+**Attributed, not assumed:** the identical ratchet appears with L18's tombstone
+term disabled (`vacuum_tombstone_frac = 1.0`), so L18 did not cause it. It also
+requires a **stalled** xid horizon; with the horizon advancing the same sequence
+reclaims (1093 → 94) and is stable. So the trigger condition is "free pages > 25%
+of the file **and** an idle database" — narrow, but real: a read-mostly system with
+periodic deletes and a scheduled `VACUUM`.
+
+This is the shape the sibling project has open as a ~210× transient bloat with the
+cause listed as unknown. The cause here is the recycle gate plus a self-sustaining
+trigger.
+
+**Fixed** the way that project fixed the growth half: `weave_vacuum_compact()`
+probes, when it does not hold `AccessExclusiveLock`, whether any currently-free
+page is recyclable, and if none is, truncates any free tail and stops. A pass that
+cannot pack can only extend, so doing nothing is strictly better.
+
+| | before | after |
+|---|---|---|
+| stalled horizon | 1022 → 1166 → 1239 → 1312 → 1385 → **1458** | 1022 → 1093 → 1093 → 1093 → 1093 → **1093** |
+| advancing horizon | — | 1093 → **94**, then flat (11.6×) |
+
+**The obvious way to get this wrong is to skip forever**, which is exactly how that
+project's own fix degraded (18 → 22 MB, never reclaiming, because a stale
+free-space map made the pass look unnecessary every time). Two defences: the probe
+asks about **recyclability**, a property of the freeing xid which advances on its
+own, rather than about free space; and `t/015` **requires a shrink** on the
+horizon-advancing arm, so degrading into permanent skipping fails a test rather
+than silently stopping work. The probe is bounded to 256 candidates; the bound can
+only cause a false negative (skip a pass that would have worked), which
+self-corrects next cycle — the safe direction, since a false positive starts a
+relocation that can only grow the file.
+
+### G19 — nothing could say which allocation path ran — **CLOSED 2026-09-14**
+
+Not a bug in the index; a bug in what could be known about it. Every page pg_weave
+allocates comes from the compaction low-bias list, the free space map, or a
+relation extension, and until now nothing reported which. **Three separate
+investigations in this lineage stalled on exactly that, and all three acted on a
+guess:**
+
+1. L18 asserted the recycle gate was blocking reuse under a share lock. Measured:
+   `defer = 0`. The gate was never consulted, because the trigger never fired.
+2. L18 asserted autovacuum could not reclaim tombstoned space. Measured on a
+   cluster that could not advance its xid horizon; false in production conditions.
+3. The sibling project published a per-page WAL cost as the reason freeing a
+   segment was slow, then retracted it — G17 above.
+
+`weave_alloc_stats()` reports seven counters: `lowfree_reuse`, `lowfree_defer`,
+`lowfree_contended`, `fsm_reuse`, `fsm_defer`, `fsm_contended`, `extend`. The
+discrimination this buys is the one reasoning kept failing at: **`extend` high with
+`defer` high means the recycle gate is the constraint; `extend` high with `defer`
+zero means the free list was never consulted at all** — a different bug with a
+different fix.
+
+Always compiled in (one increment per `ReadBuffer`) and read from SQL rather than
+logged, both deliberate: a build flag means the numbers only exist in a binary
+nobody is running, and `log_min_messages = warning` silences `elog(LOG)`, which
+cost the sibling project a whole measurement run.
 
 ### Checked and NOT a gap: HOT-successor TIDs in `amgettuple`
 
