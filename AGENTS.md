@@ -80,6 +80,30 @@ find <that path> -name regression.diffs
 Without `--keep-failed` you get a failure with no diff and no way to see what
 changed. This cost real time to discover; do not rediscover it.
 
+**Two traps that manufacture false evidence about a check, both hit for real:**
+
+- **`nix build` caches successful checks.** A plain `nix build .#checks...` on an
+  unchanged tree returns the cached success without running anything. To actually
+  re-run a test -- to probe a flaky one, say -- you need `--rebuild`.
+- **`--rebuild` refuses when there is no valid prior output**, exiting 1 with "some
+  outputs are not valid, so checking is not possible" *without running the test*, and
+  **`nix log <drv>` then hands you the most recent HISTORICAL log for that
+  derivation** -- not the run you just attempted. Combining the two reports an old
+  failure as a new one, repeatedly. This produced a six-times-counted "reproduction"
+  of a bug from a single old run (see G21 in `doc/GAPS.md`).
+
+So: **a test result needs evidence the test RAN**, not just an exit status -- grep the
+output for the test's own markers. And capture the status of the build itself, never
+through a pipe:
+
+```sh
+nix build ... 2>&1 | tail -5; echo "$?"   # WRONG: that is tail's status, always 0
+nix build ... >/dev/null 2>&1; echo "$?"  # right
+```
+
+Three verification errors in two days came from this family. A gate that reports a
+state it never checked is the failure mode `make check-alloc` was widened for.
+
 Standalone codec tests, no backend needed:
 
 ```sh
