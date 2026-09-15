@@ -791,9 +791,15 @@ run_csdim() {
 			2>&1 | tee -a "$OUT/csdim_fixedn.log" || die "csdim fixed-n dim=$dim failed"
 	done
 	for dim in $CSDIMS; do
-		# 4 bits => dim/2 bytes per vector; ~480 MB is the 960-d/1M point every
-		# recorded kernel number was taken at.
-		n=$(( ${CSDIMMB:-480} * 1048576 / (dim / 2) ))
+		# 4 bits => dim/2 bytes per vector.  THE DEFAULT IS 30 MB, NOT THE 480 MB
+		# of the 960-d/1M point, and the reason is the corpus: 480 MB needs
+		# 1,048,576 vectors at 960-d and more at every smaller dim, while GIST has
+		# exactly 1,000,000 -- so a 480 MB arm skips EVERY point, which is what the
+		# first run of this job did.  30 MB is 1M x 32 B, the largest array
+		# reachable at 64-d, hence the only size a sweep spanning 64-960 can hold
+		# constant here.  A bandwidth-bound low-dim point is not obtainable from
+		# this corpus on any instance.
+		n=$(( ${CSDIMMB:-30} * 1048576 / (dim / 2) ))
 		if [ "$n" -gt 1000000 ]; then
 			say "skipping fixed-bytes dim=$dim: it needs n=$n and the corpus has 1M"
 			continue
