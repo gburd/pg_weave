@@ -142,33 +142,51 @@ fvecs_dim(const char *path)
  * bench/ivf_recall.c does -- weave_encode() refuses them, and GIST contains a
  * handful. Returns the number actually kept, so every downstream count is the
  * kept count and not the requested one.
+ *
+ * `filedim` is the file's dimensionality; `usedim <= filedim` is how many leading
+ * coordinates to keep, and the norm is taken over THOSE, so a truncated corpus is
+ * a proper unit-norm corpus of the lower dimensionality rather than a set of
+ * partial vectors. Truncation is legitimate here and not a shortcut: the
+ * quantizer's rotation makes coordinates exchangeable, which is the same property
+ * V15's prefix stage rests on.
+ *
+ * One consequence to keep in view when comparing across `usedim`: the zero-norm
+ * test now applies to the truncated vector, so a row whose leading coordinates are
+ * all zero is dropped at small `usedim` and kept at large. The kept count is
+ * therefore a function of usedim, which is why the caller reports it per point.
  */
 static long
-fvecs_read(const char *path, int dim, long n, long skip, float *out)
+fvecs_read(const char *path, int filedim, long n, long skip, float *out,
+		   int usedim)
 {
 	FILE	   *f = fopen(path, "rb");
-	size_t		reclen = 4 + (size_t) dim * 4;
+	size_t		reclen = 4 + (size_t) filedim * 4;
 	long		kept = 0,
 				dropped = 0;
+	float	   *rec;
 
 	if (!f)
 		die("cannot open fvecs");
+	rec = xmalloc((size_t) filedim * sizeof(float));
 	if (skip && fseek(f, (long) (skip * reclen), SEEK_SET) != 0)
 		die("fseek");
 	for (long i = 0; i < n; i++)
 	{
 		int32_t		d;
-		float	   *v = out + (size_t) kept * dim;
+		float	   *v = out + (size_t) kept * usedim;
 		double		ss = 0;
 
 		if (fread(&d, 4, 1, f) != 1)
 			break;
-		if (d != dim)
+		if (d != filedim)
 			die("ragged fvecs");
-		if (fread(v, 4, (size_t) dim, f) != (size_t) dim)
+		if (fread(rec, 4, (size_t) filedim, f) != (size_t) filedim)
 			break;
-		for (int j = 0; j < dim; j++)
+		for (int j = 0; j < usedim; j++)
+		{
+			v[j] = rec[j];
 			ss += (double) v[j] * v[j];
+		}
 		if (ss <= 0)
 		{
 			dropped++;
@@ -176,10 +194,11 @@ fvecs_read(const char *path, int dim, long n, long skip, float *out)
 		}
 		double		inv = 1.0 / sqrt(ss);
 
-		for (int j = 0; j < dim; j++)
+		for (int j = 0; j < usedim; j++)
 			v[j] = (float) (v[j] * inv);
 		kept++;
 	}
+	free(rec);
 	fclose(f);
 	if (dropped)
 		fprintf(stderr, "  dropped %ld zero-norm rows\n", dropped);
@@ -1049,7 +1068,8 @@ main(int argc, char **argv)
 
 	if (argc < 4)
 		die("usage: code_scan <base.fvecs> <nbase> <nq> [bits=4 k=10 "
-			"order=clustered|natural lists=1024 kernel=<name> queries=<path>]\n"
+			"order=clustered|natural lists=1024 kernel=<name> queries=<path> "
+			"dim=<d>]\n"
 			"       code_scan selfcheck=<nblocks>");
 
 	const char *basepath = argv[1];
@@ -1066,6 +1086,7 @@ main(int argc, char **argv)
 				nprefix = 0;
 	int			pwin[8],
 				npwin = 0;
+	int			usedim = 0;			/* 0 = whatever the file has */
 
 	for (int i = 4; i < argc; i++)
 	{
@@ -1079,6 +1100,8 @@ main(int argc, char **argv)
 			lists = atoi(a + 6);
 		else if (!strncmp(a, "iters=", 6))
 			iters = atoi(a + 6);
+		else if (!strncmp(a, "dim=", 4))
+			usedim = atoi(a + 4);
 		else if (!strncmp(a, "kernel=", 7))
 			kernelname = a + 7;
 		else if (!strncmp(a, "queries=", 8))
@@ -1117,11 +1140,19 @@ main(int argc, char **argv)
 	if (bits < WEAVE_BITS_MIN || bits > WEAVE_BITS_MAX)
 		die("bits out of range");
 
-	int			dim = fvecs_dim(basepath);
+	int			filedim = fvecs_dim(basepath);
+	int			dim = usedim > 0 ? usedim : filedim;
 
+	if (dim > filedim)
+		die("dim= exceeds the corpus dimensionality");
+	if (dim < 1)
+		die("dim= must be positive");
+
+	if (dim != filedim)
+		fprintf(stderr, "  dim=%d (truncated from the file's %d)\n", dim, filedim);
 	fprintf(stderr, "  dim=%d, reading up to %ld rows\n", dim, nreq);
 	float	   *base = xmalloc((size_t) nreq * dim * sizeof(float));
-	long		n = fvecs_read(basepath, dim, nreq, 0, base);
+	long		n = fvecs_read(basepath, filedim, nreq, 0, base, dim);
 
 	if (n < LANES)
 		die("corpus too small");
@@ -1278,17 +1309,17 @@ main(int argc, char **argv)
 	{
 		int			qd = fvecs_dim(qpath);
 
-		if (qd != dim)
+		if (qd != filedim)
 			die("query dim != base dim");
 		qv = xmalloc((size_t) nq * dim * sizeof(float));
-		nqv = fvecs_read(qpath, dim, nq, 0, qv);
+		nqv = fvecs_read(qpath, filedim, nq, 0, qv, dim);
 	}
 	else
 	{
 		/* Held out from the tail of the base file, which is why nbase must be
 		 * below the file's row count for this path to be a true hold-out. */
 		qv = xmalloc((size_t) nq * dim * sizeof(float));
-		nqv = fvecs_read(basepath, dim, nq, nreq, qv);
+		nqv = fvecs_read(basepath, filedim, nq, nreq, qv, dim);
 	}
 	if (nqv < nq)
 		die("too few query vectors");
