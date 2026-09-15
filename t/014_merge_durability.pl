@@ -37,6 +37,45 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+# When the leak invariant fires, the invariant row carries a count and a first
+# block and nothing else -- and what the page IS is the whole diagnosis, because a
+# leaked page's kind names the write path that left it.  weave_page_info() is that
+# reading.  Printed as a diag rather than asserted: the assertion is the
+# weave_check() row, this is the evidence for whoever reads the failure.
+#
+# This exists because doc/GAPS.md G21 -- an intermittent leak of exactly one page
+# in this file, roughly 1 run in 8-10 -- was undiagnosable without it.  An
+# intermittent failure has to print its evidence at the moment it happens; there is
+# no going back for it afterwards.
+#
+# coalesce(freed, false) rather than NOT freed on purpose: freed is NULL for a page
+# with no weave-sized special area, and a torn page that is also unreachable is a
+# row this must show, not one it may filter out.
+sub dump_orphans
+{
+	my ($node, $label) = @_;
+	my $rows = $node->safe_psql('postgres', q{
+		SELECT string_agg(blkno || ' kind=' || coalesce(kind, '(none)')
+		                  || ' flags=0x' || coalesce(to_hex(flags), '?')
+		                  || ' kind_id=' || coalesce(kind_id::text, '?')
+		                  || ' nextblk=' || coalesce(nextblk::text, 'none')
+		                  || ' lsn=' || lsn
+		                  || ' free=' || coalesce(free_bytes::text, '?'),
+		                  E'\n' ORDER BY blkno)
+		  FROM weave_page_info('md_weave')
+		 WHERE NOT reachable AND coalesce(freed, false) = false
+		   AND NOT uninitialized});
+	return if $rows eq '';
+
+	my $ctl = $node->safe_psql('postgres',
+		q{SELECT 'redo=' || redo_lsn || ' checkpoint=' || checkpoint_lsn
+		    FROM pg_control_checkpoint()});
+	my $npages = $node->safe_psql('postgres',
+		q{SELECT pg_relation_size('md_weave') / current_setting('block_size')::int});
+	diag("$label: orphaned page(s) in md_weave ($npages pages, $ctl)\n$rows");
+	return;
+}
+
 my $node = PostgreSQL::Test::Cluster->new('primary');
 $node->init;
 # fsync off because durability against a MACHINE crash is not what is under test:
@@ -108,6 +147,7 @@ my ($ok, $detail) = split /\|/,
 ok(!defined $ok || $ok eq '',
 	'weave_check() finds no failed invariant after recovery'
 	. (defined $detail ? " ($detail)" : ''));
+dump_orphans($node, 'after the merge crash');
 
 is($node->safe_psql('postgres', q{SELECT count(*) FROM md}), $rows_merged,
 	'the index still answers over every row after recovery');
@@ -144,5 +184,6 @@ my ($vok, $vdetail) = split /\|/,
 ok(!defined $vok || $vok eq '',
 	'weave_check() finds no failed invariant after the second recovery'
 	. (defined $vdetail ? " ($vdetail)" : ''));
+dump_orphans($node, 'after the vacuum crash');
 
 done_testing();
