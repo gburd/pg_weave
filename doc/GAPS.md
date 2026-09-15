@@ -485,43 +485,72 @@ is acceptable", 50 lines above another comment in the same function saying "EVER
 insert lands here and mints a segment" for the common case of a body index. Both
 cannot be true, and the measurement says the second one is.
 
-### G21 - `t/014` reports a leaked page after double crash recovery - **OPEN, characterised not diagnosed 2026-09-15**
+### G21 - `t/014` intermittently reports a leaked page after double crash recovery - **OPEN, reproducible, mechanism unknown 2026-09-15**
 
 `t/014_merge_durability.pl` test 9 fails with `weave_check()` reporting **"1 unreachable
-page(s) not flagged freed; first is block 2883"** after the *second* crash-recovery cycle.
+page(s) not flagged freed; first is block 2883"** after the second crash-recovery cycle.
+Test 7, which asserts the relation size survived that crash, passes in the same run - so
+the file is the right length and one page inside it is orphaned.
+
+**Reproducer**, roughly **1 run in 8-10** on this workstation:
+
+    nix build .#checks.x86_64-linux.tap-pg17 --rebuild -L
+
+`--rebuild` is required: a plain `nix build` returns a cached success without re-running.
+See the warning below before trusting any result from it.
 
 **What is established:**
 
-- It reproduces **8 of 8 runs** on this workstation via `nix build
-  .#checks.x86_64-linux.tap-pg17 --rebuild`, at two different commits, and reports the
-  **same block number every time** - 2883.
-- It is **not caused by the V16 kernel work**: 3 of 3 runs fail on a clean worktree at
-  `5911d70`, which contains none of it.
-- It is **not caught by CI**, which is green. CI does run this file - the TAP leg is
-  `make installcheck REGRESS= ISOLATION=` with `TAP_TESTS = 1`, which covers all of `t/`
-  - so the failure does not reproduce on a PGDG PostgreSQL on a hosted runner.
-- It passed twice earlier the same day on this machine, at *higher* system load, so it is
-  **nondeterministic in occurrence while deterministic in outcome**. That combination is
-  what a crash landing at different points would produce: the merge is deterministic, so
-  when a page does leak it is always the same page.
+- It reproduces on the current committed tree, with `t/014` definitely executed, and
+  reports the same block number every time it appears: 2883.
+- **Block 2883 is the single page `weave_vacuum()` appends.** Reproduced by hand: after
+  the first crash the relation is exactly 2883 pages (blocks 0..2882), and
+  `weave_vacuum()` extends it to 2884. So the orphan is whatever that one appended page
+  is, and in the passing case the same page ends up reachable.
+- It is **not caught by CI**, which is green and does run this file (the TAP leg is
+  `make installcheck REGRESS= ISOLATION=` with `TAP_TESTS = 1`).
+- It is **not** reproducible by any deliberate sequence I could construct by hand: a deep
+  check after `weave_merge()`, after `weave_vacuum()`, after either followed by an
+  immediate crash, and after crashing *during* `weave_vacuum()` at eight different offsets
+  from 0.05 s to 0.8 s, are all CLEAN. `weave_vacuum()` completes in under 50 ms on this
+  corpus, so a sleep-based crash cannot land inside it.
+- Synthetic load (12 spinners, load average 14.6) does **not** make it appear.
 
-**What is not established:** whether a page unreachable and unflagged after a crash is a
-real leak or an artifact of what `weave_check()` counts as reachable. A merge that crashed
-after allocating a page but before linking it would leave exactly this state, and whether
-that space is later recovered by `weave_vacuum_compact()` has not been checked. Either
-answer is worth having: a real leak belongs with G18 and G20 in the page-accounting family,
-and an over-strict check produces a test that fails for correct behaviour.
+**What is NOT established, and is the whole diagnosis:** what kind of page block 2883 is,
+and why it is sometimes linked and sometimes not. There is no page-level introspection
+function in the extension, so the next step is either a debug function reporting a block's
+kind and flags, or decoding the page header from a raw file dump of a preserved failing
+data directory (`--keep-failed` keeps it).
 
-**How this was nearly missed, which is the reusable part.** Two of my own verification runs
-reported this leg green because the exit status was read through a pipe:
+One mechanism is worth writing down because it is the only one consistent with a *physical*
+log: **GenericXLog replay has no undo.** A transaction killed part-way has the records it
+already emitted replayed and the rest not, so a page can be initialised, WAL-logged, and
+linked nowhere. `weave_vacuum()` had committed before the crash in this test, and
+`ForceSyncCommit()` flushes its records, so its own work should be all-or-nothing - but
+`t/014` leaves **autovacuum ON**, and an autovacuum worker killed inside
+`weave_vacuumcleanup()` would produce exactly this. That is a hypothesis with the right
+shape and no evidence yet; it predicts the failure should vanish with `autovacuum = off`,
+which is a cheap test and has not been run.
 
-    nix build ... 2>&1 | tail -5; echo "tap=$?"    # $? is tail's, always 0
+**A CORRECTION, because the first version of this entry was wrong in a way that matters
+more than the bug.** It claimed 8 of 8 reproductions including 3 on a clean worktree, and
+concluded the failure was deterministic and pre-existing. **Six of those eight runs never
+executed the test.** `nix build --rebuild` **refuses** when the derivation has no valid
+prior output - it exits 1 with "some outputs are not valid, so checking is not possible" -
+and I read that exit 1 as a test failure. I then ran `nix log <drv>` to get the detail,
+which returns the **most recent historical log for that derivation**, not the log of the
+run I had just attempted. So the same old failure was reported back to me six times and I
+counted it six times.
 
-`$?` after a pipeline is the *last* command's status. The same mistake appeared twice in
-one session, the second time as `nix build ... | tail -1 | grep -q .` used as a
-pass/fail test. **Capture the status of the build itself** - `cmd >/dev/null 2>&1; echo $?`
-- or the gate reports success it never checked, which is the same failure mode
-`make check-alloc` was widened for.
+Two rules follow, and they are the reusable part of this entry:
+
+1. **`nix log` is historical.** It is not evidence about the run you just made.
+2. **A test result needs proof the test RAN**, not just an exit status. Grep the output for
+   the test's own markers. Every run counted here now carries that evidence.
+
+This is the third verification error in two days from the same family - the other two being
+`$?` after a pipeline reading `tail`'s status, and a `grep -q` used as a pass/fail test.
+All three reported a state that had not been checked.
 
 ### Checked and NOT a gap: HOT-successor TIDs in `amgettuple`
 
