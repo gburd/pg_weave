@@ -197,10 +197,12 @@ records from pg_turbovec — they "measured AVX2 and declined it", because a
 gather-per-coordinate has no reuse to amortize the gather latency against. Ours is
 the same shape and the same outcome.
 
-Not yet established: whether `lut-wide` also wins at small `dim`, where the AVX2
-setup cost is amortized over fewer coordinates. Every point measured here is
-960-d. The fix is a measurement across `dim`, not a one-line change to the
-selection order.
+~~Not yet established: whether `lut-wide` also wins at small `dim`.~~ **Settled by
+V17 (below): it wins at 64, 128, 240, 480, 768 and 960 on two microarchitectures,
+and the ratio is flat in `dim`, so the "AVX2 setup amortized over fewer
+coordinates" hypothesis that made this an open question is wrong in the direction
+it was posed.** The registry order was corrected by V16 and the correction is now
+measured rather than inferred.
 
 ### Widths 5–8 are not merely unattractive, they are unusable
 
@@ -532,15 +534,98 @@ hardware, so that figure is either parallel across workers or is not scanning
 everything. **It should not be treated as a target**, and the gap it appeared to show
 was ~5x of real kernel deficit plus a comparison that does not hold.
 
+## V17: the kernel ordering across `dim`, on two microarchitectures
+
+Every kernel latency above is 960-d, and `weave_score_kernel_best()` picks by
+registry order for **every** `dim`. V16 reordered that list (`lut-wide` ahead of
+`lut-avx2`) on the 960-d point alone -- the same unmeasured-default mistake it was
+fixing, one position along. This section is the measurement that was owed.
+
+`bench/code_scan.c` gained `dim=<d>`, which truncates each vector to its leading `d`
+coordinates and renormalizes. That is legitimate rather than convenient: the
+quantizer's rotation makes coordinates exchangeable, which is the same property
+V15's prefix stage rests on. The zero-norm drop then applies to the truncated
+vector, so the kept count varies slightly with `dim` and every row reports its own.
+
+### Measured, r7i.2xlarge (Xeon 8488C), n = 1M, nq = 10 from the held-out query file, 4 bits, run `pgweave-20260915-201059`
+
+ns per vector, with ns per coordinate in brackets:
+
+| `dim` | code bytes | `lut-byte` | `lut-wide` | `lut-avx2` | wide/avx2 | byte/wide |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 30.5 MB | **5.4** (0.084) | 20.8 (0.325) | 30.2 (0.472) | 1.45x | 3.85x |
+| 128 | 61.0 MB | **10.4** (0.081) | 39.3 (0.307) | 58.8 (0.459) | 1.50x | 3.78x |
+| 240 | 114.4 MB | **17.3** (0.072) | 74.2 (0.309) | 108.8 (0.453) | 1.47x | 4.29x |
+| 480 | 228.9 MB | **32.2** (0.067) | 150.0 (0.312) | 216.4 (0.451) | 1.44x | 4.66x |
+| 768 | 366.2 MB | **50.9** (0.066) | 232.4 (0.303) | 344.2 (0.448) | 1.48x | 4.57x |
+| 960 | 457.8 MB | **63.3** (0.066) | 293.3 (0.306) | 431.5 (0.449) | 1.47x | 4.63x |
+
+The two scalar arms are omitted from the table and were measured: `lut-byte-ref` runs
+588-8,592 ns and `scalar` 755-11,121 ns, both flat at ~9.0 and ~11.6 ns/coordinate.
+They are the references, not candidates.
+
+### Measured, workstation (AVX2-only, no AVX-512), n = 200k, nq = 5
+
+Recorded because it is a **different microarchitecture running the same AVX2 code**,
+which is the only way to ask whether the ordering is a property of the kernels or of
+one host. Absolute numbers here are not comparable with the table above and must not
+be read into it.
+
+| `dim` | `lut-byte` | `lut-wide` | `lut-avx2` | wide/avx2 |
+|---:|---:|---:|---:|---:|
+| 64 | 6.4 | 28.8 | 51.0 | 1.77x |
+| 128 | 9.1 | 51.4 | 93.3 | 1.82x |
+| 240 | 14.7 | 93.1 | 175.6 | 1.89x |
+| 480 | 25.0 | 184.2 | 345.7 | 1.88x |
+| 768 | 37.2 | 297.1 | 561.5 | 1.89x |
+| 960 | 51.6 | 383.8 | 726.6 | 1.89x |
+
+### What it decides
+
+- **`lut-wide` beats `lut-avx2` at every `dim` measured, on both hosts. There is no
+  crossover to find.** The hypothesis that motivated the sweep -- that AVX2's
+  per-coordinate gather setup would pay for itself once amortized over fewer
+  coordinates -- is wrong in the direction it was posed: the ratio is *flat* in `dim`
+  (1.44-1.50 on the Xeon, 1.77-1.89 on the workstation), so there is no setup cost
+  being amortized at all. V16's registry order stands, now for a measured reason.
+  **No code change.**
+- The margin is host-dependent (1.47x vs 1.89x at 960-d) while the sign is not, which
+  is the strongest form this claim can take without a third host.
+- **`lut-byte` scales down and stays 3.8-4.7x ahead**, so an eventual rerank-backed
+  path wants it at every dimensionality, not only at 960-d. Its ns/coordinate
+  *improves* with `dim` (0.084 -> 0.066) -- the per-query table load amortizes over
+  more coordinates -- which is the opposite of the effect predicted for `lut-avx2`.
+- `lut-wide` is compute-bound at **every** size measured: 293.3 ns at 480 B/vector is
+  1.6 GB/s against the measured 11.8 GB/s single-core wall. Only `lut-byte` gets near
+  the wall (7.6 GB/s at 960-d/1M, matching the 7.91 GB/s recorded from an independent
+  run). So "the scan is bandwidth-bound" is a statement about the *byte* kernel
+  specifically, and the fallbacks have headroom they cannot use.
+- Reproducibility against the earlier run at 960-d/1M: `lut-wide` 293.3 vs 297.7 ns
+  (1.5%), `lut-avx2` 431.5 vs 418.8 (3.0%), `lut-byte` 63.3 vs 58.7-60.7 (4-8%).
+
+### The fixed-code-bytes arm did not run on the instance, and the reason is the corpus
+
+The job has a second arm that holds the code array at a constant size while `dim`
+varies, so the comparison is per-coordinate compute rather than cache residency.
+**Every point of it was skipped:** at 480 MB it needs 1,048,576 vectors at 960-d and
+more at every smaller `dim`, and GIST has exactly 1,000,000. The default is now
+30 MB, the largest size reachable at 64-d (1M x 32 B) and therefore the only size a
+sweep spanning 64-960 can hold constant with this corpus.
+
+That costs less than it looks. Within any row above, every kernel sees byte-identical
+input, so the per-`dim` winner -- the thing `best()` needs -- is established without
+the second arm. What the arm would add is a cleaner statement about ns/coordinate
+across `dim`, and the workstation's 96 MB arm supplies a weak version already: at
+equal `dim` and 4x the bytes, `lut-wide` moved -1.0% (480-d) and +3.4% (240-d).
+
 ## What is still unmeasured
 
 - **Recall at n = 1M with more than 10 queries.** Every n = 1M recall figure here is
   nq = 10 (100 ground-truth slots), which cannot separate 0.99 from 1.00. The phase gate
   asks for >= 0.99 at n >= 1M, so it is not yet properly evidenced at that size. Run
   `CSNQ=100`; it costs one more instance-hour and it is the cheapest open item.
-- Whether `lut-byte`'s 5.26x holds at lower `dim`. Every figure here is 960-d, and the
-  byte kernel's advantage comes from amortizing a table load across 32 lanes per
-  coordinate, which is dim-independent in principle and unmeasured in fact.
+- ~~Whether `lut-byte`'s 5.26x holds at lower `dim`.~~ **Measured (V17): 3.8-4.7x
+  over `lut-wide` from 64-d to 960-d, and its ns/coordinate improves as `dim` grows.**
 - `lut-byte` is AVX2 only. There is no NEON path, so on aarch64 the fastest kernel is
   `lut-wide` and every latency conclusion in this section is x86-64 only.
 - Whether the ~1.49x remaining to the bandwidth wall is reachable at all. Prefetching
@@ -558,5 +643,7 @@ was ~5x of real kernel deficit plus a comparison that does not hold.
   verdict, in either direction, and it has not been run.
 - The prefix scan's recall on a second corpus at a different dimensionality. Every
   prefix figure here is GIST-960d.
-- `lut-avx2` vs `lut-wide` at lower `dim`. Still owed, and now less urgent: both are
-  beaten by `lut-byte` at 960-d, so the question is which is the right *fallback*.
+- ~~`lut-avx2` vs `lut-wide` at lower `dim`.~~ **Measured (V17): `lut-wide` wins at
+  every `dim` on both hosts, so the fallback question is closed.** What remains is a
+  third microarchitecture -- the margin varies 1.47x-1.89x between the two measured,
+  and there is no aarch64 point at all.
