@@ -515,12 +515,25 @@ See the warning below before trusting any result from it.
   from 0.05 s to 0.8 s, are all CLEAN. `weave_vacuum()` completes in under 50 ms on this
   corpus, so a sleep-based crash cannot land inside it.
 - Synthetic load (12 spinners, load average 14.6) does **not** make it appear.
+- Killing the postmaster **during a plain `VACUUM`** - which is what invokes
+  `weave_vacuumcleanup()`, the autovacuum path the hypothesis below implicates - is
+  CLEAN at eight offsets from 0.02 s to 0.5 s. So either the window is narrower than a
+  sleep can hit, or the cleanup path is not where the page is lost. Recorded so the
+  next attempt does not repeat it.
 
 **What is NOT established, and is the whole diagnosis:** what kind of page block 2883 is,
 and why it is sometimes linked and sometimes not. There is no page-level introspection
-function in the extension, so the next step is either a debug function reporting a block's
-kind and flags, or decoding the page header from a raw file dump of a preserved failing
-data directory (`--keep-failed` keeps it).
+function in the extension, and **black-box crashing has now been tried and does not
+reproduce it** (see above), so guessing at sequences is exhausted. The next step is one of:
+
+1. a debug SQL function reporting a given block's page kind, flags and freed state - the
+   smallest thing that turns this from a guess into a reading, and useful well beyond
+   this gap;
+2. run the reproducer under `--keep-failed` until it trips, then decode the page header
+   out of the preserved data directory;
+3. run `t/014` with `autovacuum = off` about 30 times to test the hypothesis below by
+   elimination. Cheapest to write, slowest to run, and it only narrows rather than
+   diagnoses.
 
 One mechanism is worth writing down because it is the only one consistent with a *physical*
 log: **GenericXLog replay has no undo.** A transaction killed part-way has the records it
