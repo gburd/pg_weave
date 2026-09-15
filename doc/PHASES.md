@@ -238,7 +238,8 @@ read but **not** to port line-by-line: `~/src/turbovec` (Rust, MIT).
 | V12 | ColBERT-style multivector late interaction as a distinct channel kind | MaxSim correctness against a reference implementation |
 | V13 | **JUSTIFICATION GONE 2026-09-13; withdraw or re-justify.** Warp ordering by cluster existed to make the block bound prune. The bound prunes 0.00% on real corpora WITH one k-means cluster per block, and natural file order measures the same 0.00% (`bench/RESULTS_CODE_SCAN.md`), so ordering the warp buys nothing measurable. It was already reduced to this single justification when V9 was demoted. Original entry: **RE-JUSTIFICATION REQUIRED 2026-09-12** — this row says "IVF satisfies this requirement inherently", and V9 (IVF) is now demoted, so the clustering has to be provided by something. It does not become optional: the block bound prunes 99.6 % of blocks with a coherent warp and **0.0 %** with a random one, so warp coherence is load-bearing regardless of whether anything probes clusters at query time. What changes is that it needs a build-time k-means of its own rather than inheriting one — the same requirement the withdrawn proximity-graph plan had. Original entry follows. **Warp ordering by cluster.** Assign warp positions in the order the IVF build's k-means clustering produces (§8a of doc/specs/VECTOR_CHANNEL.md; IVF satisfies this requirement inherently, where the withdrawn graph plan needed it as a separate constraint), so each 32-lane code block is spatially coherent. Not an optimization: `bench/RESULTS_BOUND_PRUNING.md` measures the block bound pruning 99.6% of blocks with a coherent warp and **0.0%** with a random one. | `bench/bound_pruning.c` reports ≥ 90% blocks pruned at k=10 on the shipped corpora; a heap-order build is rejected by the gate |
 | V14 | Per-block centroid (stored as a quantized code) + radius in `WeaveVecBlockHdr`, maintained across insert, vacuum lane-zero, and merge | `weave_check()` recomputes both and compares; a randomized soundness run of `bench/bound_pruning.c` finds no (C2) violation |
-| **V15** | **NEW 2026-09-13, and it is what makes the latency gate pass.** **Two-stage prefix scan.** Stage 1 scores every vector against the first `m` of `dim` coordinates and keeps the best `W`; stage 2 rescores those `W` over all coordinates; stage 3 is V10's exact heap rerank of the top 25. Measured at n=1M on GIST-960d: m/dim = 0.25, W = 8000 gives recall@10 **0.9800 for 111.2 ms** against 293 ms flat, which is **1.51× pgvector HNSW at matched recall** inside a 2× bar (`bench/RESULTS_CODE_SCAN.md`). **Requires no new on-disk structure and no build-time step**, which is why it was chosen over V9's IVF: the rotation (§3) makes coordinates exchangeable so a prefix is an unbiased subsample, and `WEAVE_PACK_LANE`'s code index is `j * 32 + slot`, independent of `dim`, so coordinates `0..m-1` of all 32 lanes are a contiguous prefix of the block and the LUT's first `m` rows are a prefix of the LUT. Stage 1 is the existing kernel with a shallow-copied LUT whose `dim` is `m`. **LAYOUT PRECONDITION, and it fails silently:** under `WEAVE_PACK_VECMAJOR` the index is `slot * dim + j`, so a truncated LUT reads *wrong* bits rather than fewer of them — it returns wrong distances, not an error, which is the same trap `src/vector/pack.c` warns about for layouts generally. The implementation must assert `WEAVE_PACK_LANE`. `m` and `W` are query-time GUCs (they change no stored bytes): `pg_weave.vec_prefix_frac` and `pg_weave.vec_prefix_window`. `W` scales **sublinearly** in n — 8000 at n=100k matches 20000 at n=1M — so the default must be documented as a floor that grows, the way V10's rerank window is. | end-to-end recall@10 ≥ 0.98 at n ≥ 1M on two corpora of different dimensionality, measured against **exact search over the same table**; p50 ≤ 2× pgvector HNSW at matched recall, warm and cold, on the same instance type; a property test that stage 1 + stage 2 returns exactly the flat scan's top-k whenever W ≥ n; and a hard assertion that the pack layout is `WEAVE_PACK_LANE` |
+| **V15** | **DEMOTED 2026-09-15 from "what makes the latency gate pass" to an optional recall/latency knob.** **Two-stage prefix scan.** Stage 1 scores every vector against the first `m` of `dim` coordinates and keeps the best `W`; stage 2 rescores those `W` over all coordinates; stage 3 is V10's exact heap rerank of the top 25. **Why it was demoted:** V16's byte-LUT kernel makes the *flat* scan 60.7 ms at n=1M, which is 0.82x pgvector HNSW at matched recall, so the gate passes without any prefix approximation and at higher recall. Measured on one host in one run, the prefix arm through the fast kernel is **slower than flat at equal recall** — prefix 0.5 / W 8000 is 64.6 ms at recall 1.0000 against the flat scan's 60.7 ms — because stage 1 saves ~16 ms and stage 2 costs ~20 ms. It remains worth having at m/dim = 0.25, where it is 46.9 ms at recall 0.9800: a 1.3x latency win for 2 points of recall. **The one reason it may yet beat flat outright:** `bench/code_scan.c` rescores each stage-2 survivor with a single-lane mask while the fast kernels skip at 8-lane granularity, so stage 2 is charged roughly **4x** what a batched implementation would cost; at a quarter of 20 ms, prefix 0.5 lands near 49 ms at recall 1.0000. That is an estimate and the reason this task is open rather than withdrawn — **the first thing it must do is batch stage 2 and re-measure, because if that estimate is wrong the task is a knob and nothing more.** It still needs no new on-disk structure: the rotation makes coordinates exchangeable so a prefix is an unbiased subsample, and `WEAVE_PACK_LANE`'s code index is `j * 32 + slot`, independent of dim, so a coordinate prefix is a contiguous prefix of the block; it is layout-specific and must assert `WEAVE_PACK_LANE`. `m` and `W` are query-time GUCs (they change no stored bytes): `pg_weave.vec_prefix_frac` and `pg_weave.vec_prefix_window`. `W` scales **sublinearly** in n — 8000 at n=100k matches 20000 at n=1M — so the default must be documented as a floor that grows, the way V10's rerank window is. | a batched stage 2, re-measured against the flat `lut-byte` scan on the same host and run — **if it does not beat flat at equal recall, it ships defaulted OFF and is documented as a latency-for-recall knob**; end-to-end recall@10 >= 0.98 at n >= 1M on two corpora of different dimensionality, measured against **exact search over the same table**; a property test that stage 1 + stage 2 returns exactly the flat scan's top-k whenever W >= n; and a hard assertion that the pack layout is `WEAVE_PACK_LANE` |
+| **V16** | **NEW 2026-09-15, and it is what makes the latency gate pass.** **Nibble-LUT (byte-LUT) scoring kernel**, promoted from V6's list of deliberately-unimplemented kernel families. Quantize the query table to unsigned 8 bits per entry (subtract a per-coordinate minimum, scale by a positive step, so the transform is **rank-preserving up to rounding**), then score with `_mm256_shuffle_epi8`: at 4 bits a coordinate's 32 lane codes are exactly 16 contiguous bytes in `WEAVE_PACK_LANE`, so one shuffle looks up 32 table values. Accumulate in 16-bit lanes and widen to 32-bit **every 256 coordinates at most** — `255 * 960` overflows 16 bits, and saturating adds must not be used to hide it because saturation silently changes scores. Measured in the harness at n=1M GIST-960d: **60.7 ns/vector, 5.26x `lut-wide` and 7.58x `lut-avx2`**, for **0.0020 recall** (0.9950 -> 0.9930) — the budget V6 recorded as owed. The scan is then at 7.91 GB/s against a measured 11.77 GB/s single-core wall, so it is 67% bandwidth-bound and only ~1.49x remains to any kernel. **Requires exactly 4 bits** — a nibble LUT is a 16-entry table — which makes the ratified shape's width load-bearing rather than a compromise, and closes the 3-bit revision trigger a second time on a second mechanism. Prototype and differential gate already exist in `bench/code_scan.c` (`lut-byte`, `lut-byte-ref`); this task moves them into `src/vector/kernels.c` behind the dispatch table. **`weave_score_kernel_best()` currently returns `lut-avx2`, the slowest of the three LUT paths; fixing that is part of this task and is a separate measurement at low `dim`.** | bit-identical to a scalar reference implementing the same integer arithmetic, over randomized `dim`/`livemask`/`allow`/`nlanes`, with the check exiting non-zero on one bit of disagreement (an approximate kernel **cannot** be gated against the exact oracle for equality, which is why the reference exists); mutation-tested — removing the 16-bit widening, perturbing the un-permutation, and mis-broadcasting a coordinate's table must each be caught; **not registered at all** where AVX2 is absent, never aliased to the scalar path; refuses `bits != 4` and `WEAVE_PACK_VECMAJOR` rather than delegating to the oracle under its own name; and a recall budget recorded as a number on a real corpus |
 
 **Status:** V1–V5 done. V2–V5 have working scalar implementations in
 `src/vector/quantize.c` and `src/vector/pack.c` with 17,741 + 1,909,440
@@ -250,7 +251,18 @@ above `WeavePackLayout`). V6 is partial: three verified scoring paths and a
 resolved dispatch table (`src/vector/kernels.c`, `src/vector/kernel_ops.c`, 308,278 differential
 checks),
 no verified vector ISA outside x86-64 AVX2, no approximate kernel family, and
-no per-host A/B. V7–V14 not started.
+no per-host A/B. V7-V14 not started; **V15 demoted and V16 opened 2026-09-15**.
+
+**V6's "no approximate kernel family" is now the highest-value open item in the
+phase, and it has a prototype.** That clause was written as a scoping decision — the
+byte-LUT and int8-dot families quantize the query table, so they cannot be
+bit-identical to the exact oracle, and they owed a recall budget nobody had measured.
+Both halves are now answered: the budget is **0.0020** recall and the family is
+**5.26x** faster than the best exact kernel. See V16 and
+`bench/RESULTS_CODE_SCAN.md`. The lesson is not that the scoping decision was wrong —
+it was correctly stated as a debt — it is that **a deferred measurement stayed
+deferred for as long as nothing forced it, and what forced it was reading a sibling
+project's number that could not be reconciled with ours.**
 
 **Phase V gate — RESTATED AND RATIFIED 2026-09-13.** The gate below replaces the
 original, which was **mis-specified rather than merely unmet**: it conditioned a
@@ -324,23 +336,35 @@ flat scan against HNSW's 4.541 ms at ef=10, whose recall is **0.4280** — the
 unmatched-recall error term 3 was written to forbid, made two commits after writing
 it. Honestly compared, even the unaccelerated flat scan is 3.97×, not 40×.
 
-**What closed it: the two-stage prefix scan** (`bench/RESULTS_CODE_SCAN.md`). Stage
-1 scores every vector against the first `m` of `dim` coordinates and keeps the best
-`W`; stage 2 rescores those over all coordinates; stage 3 is the exact rerank the
-shape already pays for. At m/dim = 0.25 and W = 8000 that is recall 0.9800 for
-111.2 ms against 293 ms flat. `W` scales **sublinearly** in n, so the ratio improves
-as the corpus grows.
+**What closed it, SUPERSEDED 2026-09-15 — it was the kernel, not the algorithm.**
+This section previously credited the two-stage prefix scan with closing the term, at
+recall 0.9800 for 111.2 ms against 293 ms flat. That reading stood for two days and
+was overtaken by a measurement it had not occurred to anyone to take: the flat scan's
+291-319 ns/vector is about one cycle per coordinate, which is precisely what one LUT
+gather per coordinate costs, and 480 B in 319 ns is only 1.5 GB/s against a measured
+single-core wall of 11.77 GB/s. The scan was not expensive because it scored too many
+vectors. It was expensive because the kernel scored each coordinate with a gather.
 
-It needs **no new on-disk structure**: the rotation makes coordinates exchangeable
-so a prefix is an unbiased subsample, and `WEAVE_PACK_LANE`'s code index is
-`j * 32 + slot`, independent of dim, so a prefix of coordinates is a contiguous
-prefix of the block. Stage 1 is the existing kernel with a shallow-copied LUT whose
-dim is `m`.
+`lut-byte`, the nibble-LUT AVX2 kernel `src/vector/pack.c`'s header had described as
+the reason `WEAVE_PACK_LANE` exists, measures **60.7 ns/vector at n = 1M — 5.26x
+`lut-wide` and 7.58x the kernel `weave_score_kernel_best()` actually picks**. A full
+flat scan is then **60.7 ms against pgvector HNSW's 73.8 ms at matched recall: 0.82x,
+faster outright**, where the prefix scan was 1.58x behind on the same host and run.
+The 8-bit query table that buys this costs **0.0020 recall** (0.9950 -> 0.9930),
+measured, which is the budget V6's gate recorded as owed and undetermined.
 
-**Two things this does NOT do.** It does not restore claim 2: a two-stage
-approximation with an exact rescore is not a *threshold* mechanism, and the block
-bound still prunes 0.00%. And it does not make the channel exist — V7 and V8 are
-still unimplemented, so every figure here is the scan in isolation.
+The term is therefore met **more comfortably and at higher recall than the prefix scan
+met it**, and it is met by the flat scan the phase started with. See
+`bench/RESULTS_CODE_SCAN.md`.
+
+**Two things this does NOT do.** It does not restore claim 2: a cheaper kernel is not
+a *threshold* mechanism, and the block bound still prunes 0.00%. And it does not make
+the channel exist — V7 and V8 are still unimplemented, so every figure here is the
+scan in isolation.
+
+**What remains of the prefix scan** is described in V15 below: it survives as a knob
+that trades recall for latency rather than as the mechanism the gate depends on, and
+one reason to keep it is that this harness overcharges its stage 2 by roughly 4x.
 
 ### The committed shape — RATIFIED 2026-09-13
 

@@ -299,9 +299,161 @@ block bound still prunes 0.00%. A latency pass and a fused-threshold claim are
 different things, and conflating them is how the fifth claim gets made by
 accident.
 
+## The kernel was the problem, and it cost 5.3x: 319 ns -> 61 ns per vector
+
+Date: 2026-09-15. Instance: **`r7i.2xlarge`**, us-east-2, run
+`pgweave-20260915-045706`, doing nothing else. Same corpus and protocol as above.
+Reproduce with `bench/aws/run.sh r7i.2xlarge codescan`.
+
+**Everything in this section comes from one run on one host**, so the ratios inside
+it are internally valid. Do not ratio these against the 291.2 ns above: that was
+`c7i.4xlarge`. On this host `lut-wide` measures 319.2 ns, and the 9.6% difference is
+the hardware, not drift.
+
+Why this was measured at all: a sibling project reports a 4-bit flat scan at 6.08 ms
+for 1M x 1024-d, against our 293 ms for 1M x 960-d, in the same algorithm family and
+with neither side threaded. Our 291-319 ns/vector is about one cycle per coordinate,
+which is exactly what one LUT gather per coordinate costs, so the arithmetic said the
+kernel was the gap rather than the algorithm. `src/vector/pack.c`'s header had said so
+all along: `WEAVE_PACK_LANE` exists so "a byte-LUT kernel loads 32 lanes' codes for
+one coordinate in one vector register", and that kernel had never been written. V6's
+gate listed the byte-LUT family as deliberately unimplemented, for owing a recall
+budget that did not exist.
+
+Nanoseconds per vector scored, 4 bits unless stated:
+
+| kernel | n = 50k | n = 200k | n = 1M | n = 1M, 3 bits |
+|---|---:|---:|---:|---:|
+| **`lut-byte`** (AVX2 byte LUT) | **36.7** | **58.6** | **60.7** | n/a |
+| `lut-wide` | 311.8 | 320.8 | 319.2 | 315.4 |
+| `lut-avx2` | 462.8 | 464.3 | 459.9 | — |
+| `lut-byte-ref` (scalar ref) | 9,347.9 | 9,352.0 | 9,350.8 | n/a |
+| `scalar` (oracle) | 12,263.9 | 12,258.0 | 12,279.2 | 9,018.7 |
+
+At n = 1M a full flat scan is **60.7 ms** with `lut-byte` against 319.2 ms with
+`lut-wide` — **5.26x**. Against the kernel `weave_score_kernel_best()` actually picks,
+`lut-avx2`, it is **7.58x**.
+
+### The per-vector cost stopped being flat in n, and that is the finding
+
+Every earlier kernel measured the same ns/vector from 50k to 1M, which is what proved
+the scan compute-bound. `lut-byte` does not: **36.7 -> 58.6 -> 60.7**. At 50k the
+24 MB of codes are L3-resident; at 200k (96 MB) and 1M (480 MB) they are not. The
+kernel is fast enough that the scan has left compute and reached memory.
+
+So the headroom question is now closed with a measured wall rather than an estimate.
+A single-threaded sequential read on this host, buffer far past L3, measured three
+times:
+
+| probe | GB/s |
+|---|---:|
+| touch every cacheline (memory-bound) | 11.77, 11.79, 11.75 |
+| read every byte in a scalar loop (IPC-bound) | 4.79, 4.81, 4.83 |
+
+The cacheline figure is the bandwidth; the byte-loop figure is a property of the loop,
+not the memory system, and is not the wall.
+
+At 480 B per vector, 60.7 ns is **7.91 GB/s — 67% of the 11.77 GB/s wall.** The floor
+for any kernel that reads each code once is 40.8 ns/vector, i.e. **40.8 ms** for a 1M
+scan. The 7.5x of apparent headroom the arithmetic suggested resolves as **5.26x that
+the kernel took, and 1.49x that remains**, and the remaining part is bounded by
+physics rather than by effort.
+
+### The recall budget V6 said was owed: two tenths of a point
+
+Measured locally, because recall is deterministic and needs no clean host. The two
+kernels differ *only* in the query table, run at full dim on real GIST-960d, n = 200k,
+identical configuration otherwise:
+
+| kernel | recall@10 |
+|---|---:|
+| `lut-wide`, exact float table | 0.9950 |
+| `lut-byte-ref`, 8-bit table | **0.9930** |
+
+**0.0020.** The reason it is this small is structural rather than lucky: the transform
+subtracts a per-coordinate minimum and multiplies by a positive step, so it is
+rank-preserving up to rounding, and the only error is quantizing each table entry to
+1/255 of the table's range. Max absolute deviation from the exact score, over real
+codec output, is 0.012 on a score whose scale is 1.
+
+### 4 bits is now load-bearing, not a compromise
+
+A byte LUT is a nibble LUT: `_mm256_shuffle_epi8` looks up a 16-entry table, which is
+exactly `2^4`. `lut-byte` refuses `bits != 4` outright rather than delegating to the
+oracle, because a kernel that silently reports scalar numbers under its own name is
+how a fast-but-wrong headline gets published.
+
+The ratified shape chose 4 bits on storage and recall, and the earlier finding here
+was that 3 bits buys nothing because width sets bits per lookup rather than the number
+of lookups. That is now stronger: **at 3 bits the fastest kernel does not exist**, and
+`lut-wide` at 3 bits (315.4 ns) is 5.2x slower than `lut-byte` at 4 bits. The first
+named revision trigger for the shape is resolved for 4 bits a second time, on a second
+mechanism.
+
+## What this does to V15, which was next on the path
+
+V15 (the two-stage prefix scan) was specified as *the thing that makes the latency
+gate pass*. It is not, any more. Both grids below are from the same run, same host,
+identical prefix/window points:
+
+| m/dim | W | recall@10 | `lut-wide` total | `lut-byte` total |
+|---|---:|---:|---:|---:|
+| 0.500 | 8000 | 1.0000 | 194.06 ms | **64.58 ms** |
+| 0.500 | 20000 | 1.0000 | 237.64 | 99.31 |
+| 0.250 | 8000 | 0.9800 | 116.25 | **46.90** |
+| 0.250 | 20000 | 0.9900 | 158.81 | 80.23 |
+| 0.125 | 8000 | 0.83 / 0.84 | 75.16 | 37.42 |
+| 0.125 | 20000 | 0.9300 | 119.34 | 71.67 |
+
+Against the gate's bar — pgvector HNSW warm p50 **73.764 ms** at `R*` = 0.9760, bar
+2x = 147.5 ms:
+
+| configuration | recall@10 | warm p50 | vs HNSW |
+|---|---:|---:|---:|
+| pgvector HNSW, ef = 800 | 0.9760 | 73.8 ms | 1.00x |
+| **`lut-byte` flat scan** | ~0.993 | **60.7 ms** | **0.82x** |
+| **`lut-byte`, prefix 0.5 / W 8000** | **1.0000** | 64.6 ms | **0.88x** |
+| `lut-byte`, prefix 0.25 / W 8000 | 0.9800 | 46.9 ms | 0.64x |
+| `lut-wide`, prefix 0.25 / W 8000 (V15 as specced) | 0.9800 | 116.3 ms | 1.58x |
+| `lut-wide` flat scan | 1.0000 | 319.2 ms | 4.33x |
+
+**The scan now beats pgvector HNSW outright at recall 1.0000**, where V15 as specced
+was 1.58x behind it at recall 0.98. Two consequences:
+
+1. **V15 is no longer necessary and is no longer free.** With the byte kernel, prefix
+   0.5 at W 8000 costs 64.6 ms against the flat scan's 60.7 ms at the same recall —
+   the prefix arm is *slower*, because stage 2 costs ~20 ms and stage 1 only saved
+   ~16 ms. V15 becomes a knob that trades 2 points of recall for 1.3x (46.9 ms at
+   0.98), not the mechanism that makes the gate pass.
+2. **Stage 2 is charged too much here, so 1 is not the last word.** The harness
+   rescores each survivor with a single-lane mask while the fast kernels skip at
+   8-lane granularity, so stage 2 is charged roughly 4x a batched implementation. At a
+   quarter of 20 ms, prefix 0.5 would land near 49 ms at recall 1.0000 and would beat
+   the flat scan. That is a reason to keep V15 open, and it is an estimate, not a
+   measurement.
+
+### The 6.08 ms that started this is not a full flat scan
+
+Worth stating because it was the trigger. 1M x 1024-d at 4 bits is 512 MB of codes;
+at the 11.77 GB/s measured here that is **43.5 ms minimum**, single-threaded. A 6.08 ms
+full flat scan of that corpus is therefore not physically possible on comparable
+hardware, so that figure is either parallel across workers or is not scanning
+everything. **It should not be treated as a target**, and the gap it appeared to show
+was ~5x of real kernel deficit plus a comparison that does not hold.
+
 ## What is still unmeasured
 
-- Whether `lut-wide`'s win over `lut-avx2` holds at lower `dim`.
+- **The flat `lut-byte` scan's own recall at n = 1M.** The 0.9930 figure is n = 200k,
+  and the 1.0000 entries in the prefix grid are at m/dim = 0.5, not full dim. The
+  0.82x row above therefore carries an approximate recall, which is the weakest number
+  in this file. Measure it before quoting that row anywhere.
+- Whether `lut-byte`'s 5.26x holds at lower `dim`. Every figure here is 960-d, and the
+  byte kernel's advantage comes from amortizing a table load across 32 lanes per
+  coordinate, which is dim-independent in principle and unmeasured in fact.
+- `lut-byte` is AVX2 only. There is no NEON path, so on aarch64 the fastest kernel is
+  `lut-wide` and every latency conclusion in this section is x86-64 only.
+- Whether the ~1.49x remaining to the bandwidth wall is reachable at all. Prefetching
+  and non-temporal loads are the usual levers; neither has been tried.
 - Whether the bound prunes on a corpus that is genuinely well-clustered. Both
   corpora here fail it, for opposite reasons, which is what makes the failure look
   structural — but "no real corpus we tried" is not "no corpus".
@@ -315,3 +467,5 @@ accident.
   verdict, in either direction, and it has not been run.
 - The prefix scan's recall on a second corpus at a different dimensionality. Every
   prefix figure here is GIST-960d.
+- `lut-avx2` vs `lut-wide` at lower `dim`. Still owed, and now less urgent: both are
+  beaten by `lut-byte` at 960-d, so the question is which is the right *fallback*.
