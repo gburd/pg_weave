@@ -778,12 +778,16 @@ run_csdim() {
 	# nq is small on purpose: this job measures ns/vector and the scan is timed
 	# per query.  Recall at nq=100 is the csrecall job's business, and mixing the
 	# two would make this job an hour longer for numbers already recorded.
+	# queries= is NOT optional at n=1M.  Without it the harness holds the query
+	# set out of the TAIL of the base file, and GIST has exactly 1,000,000 base
+	# vectors, so there is nothing left to hold out and the run dies with "too few
+	# query vectors" AFTER paying for the encode.  Learned by doing it.
 	CSDIMS=${CSDIMS:-"64 128 240 480 768 960"}
 	for dim in $CSDIMS; do
 		say "fixed n=${CSDIMN:-1000000}, dim=$dim"
 		$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs \
 				${CSDIMN:-1000000} ${CSDIMNQ:-10} bits=4 k=10 order=natural \
-				kernel=all dim=$dim" \
+				kernel=all dim=$dim queries=corpus/gist/gist_query.fvecs" \
 			2>&1 | tee -a "$OUT/csdim_fixedn.log" || die "csdim fixed-n dim=$dim failed"
 	done
 	for dim in $CSDIMS; do
@@ -796,7 +800,8 @@ run_csdim() {
 		fi
 		say "fixed ~${CSDIMMB:-480} MB, dim=$dim, n=$n"
 		$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs $n \
-				${CSDIMNQ:-10} bits=4 k=10 order=natural kernel=all dim=$dim" \
+				${CSDIMNQ:-10} bits=4 k=10 order=natural kernel=all dim=$dim \
+				queries=corpus/gist/gist_query.fvecs" \
 			2>&1 | tee -a "$OUT/csdim_fixedbytes.log" || die "csdim fixed-bytes dim=$dim failed"
 	done
 }
