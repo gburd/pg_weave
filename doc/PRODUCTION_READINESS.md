@@ -203,7 +203,11 @@ when the scope was read as "BM25 + vector", then back when it was restated as al
 six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
 hard rule was weakened on an inference about scope rather than a question about it.*
 
-29 of 66 tasks are done (`doc/PHASES.md`), phase X included. The ordering below is
+**30 of 69 tasks are done** (`doc/PHASES.md`), phase X included, with 1 partial (V6) and
+5 withdrawn (L2, L21, V9, V10, V13). By phase: X 4/4, L 16/20, Z 4/9, V 5/16, P 2/4,
+F 0/5, M 0/6, R 0/5. **One of the six retrieval kinds answers a query** -- BM25 lexical;
+the vector channel has a codec and kernels but no on-disk format or scan path, and
+fuzzy/regex/prefix/n-gram are imported but unwired. The ordering below is
 forced by three things: hard rule 7 (F waits for L, Z **and** V), every new on-disk
 structure owing the adversity gates (7–11) before it counts, and hard rule 9 — which
 is why one *measurement* from phase V jumps ahead of both channels. The page-kind

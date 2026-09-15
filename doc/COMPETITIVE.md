@@ -1,9 +1,19 @@
 # Competitive landscape
 
-Written 2026-09-06. Numbers are cited to their source; where a figure is a target
-rather than a measurement it says so. `doc/PRODUCTION_READINESS.md` is the
-companion document and should be read first — pg_weave is not shippable today and
-nothing below implies otherwise.
+Written 2026-09-06, **pgvector section revised 2026-09-15**. Numbers are cited to their
+source; where a figure is a target rather than a measurement it says so.
+`doc/PRODUCTION_READINESS.md` is the companion document and should be read first —
+pg_weave is not shippable today and nothing below implies otherwise.
+
+**How much of the product exists, stated here because this file is what an evaluator
+reads first and it is easy to come away with the wrong impression.** The product is six
+retrieval kinds over one docid space. **One of the six answers a query today** — BM25
+lexical, which is measured against GIN and `pg_textsearch` below. The vector channel has
+a codec and scoring kernels but no on-disk format and no scan path; fuzzy, regex, prefix
+and n-gram have imported code and no wiring. **Fused-threshold top-k, the thing that
+makes the project novel rather than another BM25 extension, is 0 of 5 tasks and cannot
+start until the channels land** (`AGENTS.md` hard rule 7). So every comparison in this
+file is either one conventional channel, or a scan measured inside a benchmark harness.
 
 ## The field
 
@@ -158,13 +168,45 @@ never gets finished.
 
 ## pgvector
 
-The incumbent and the real adoption obstacle. 1M × 1024-d Cohere-wiki, HNSW:
-**p50 5.2 ms at recall@10 0.96, 1953 MiB** (`pg_turbovec/docs/PARITY_GAPS.md`).
+The incumbent and the real adoption obstacle.
 
-pg_weave's Phase V gate is recall ≥ 0.99, p50 ≤ 2× pgvector, storage ≤ 0.15×
-pgvector, simultaneously. That is the bar, it is not met, and the flat-scan
-predecessor missed it by **490×** on latency. Task V9 (graph over quantized codes)
-is what closes it, and V9 is not started.
+**Revised 2026-09-15.** This section previously read: "the flat-scan predecessor missed
+it by **490×** on latency. Task V9 (graph over quantized codes) is what closes it, and
+V9 is not started." Every clause of that is now wrong, and the corrections are worth
+stating rather than quietly deleting:
+
+- The **490×** was borrowed from a sibling project's flat-scan loss and never measured
+  here. Our own honest figure against a *recall-matched* baseline was 3.97×, and the
+  intermediate "misses by ~40×" was retracted for comparing against HNSW at recall
+  0.4280.
+- **V9 is withdrawn.** IVF over quantized codes was measured and does not reach the
+  recall target at any probe count; a sibling project independently found it
+  *unreachable* above R@10 0.98 at 1M × 1024-d.
+- What actually closes the latency term is a **kernel** plus a two-stage scan — tasks
+  V16 and V15 — not a graph.
+
+The gate is recall@10 ≥ 0.99, p50 ≤ 2× pgvector at matched recall, and storage ≤ 0.15×
+pgvector, simultaneously. Measured against a pgvector HNSW baseline we built ourselves
+(`bench/hnsw_base.sh`, GIST-960d, n = 1M, r7i.2xlarge), whose recall ceiling is 0.9760
+at ef = 800 and warm p50 there is 73.764 ms:
+
+| gate term | bar | measured | verdict |
+|---|---|---|---|
+| storage | ≤ 0.15× | **0.064×** (512 B vs 8,056 B/vector) | passes |
+| latency | ≤ 2× at matched recall | **0.72×** (52.8 ms) | passes with margin |
+| recall@10 | ≥ 0.99 | 1.0000, but **nq = 10** | not properly evidenced |
+
+**Read that table with the caveat attached.** Those are figures for the *scan in
+isolation*, produced by `bench/code_scan.c`. Tasks V7 (on-disk code pages), V8 (scan
+shuttle), V15 and V16 are all unimplemented, so **no pg_weave vector query exists to
+time end to end** — nothing measured includes page reads, visibility checks or tuple
+machinery. And every n = 1M recall figure is 10 queries, i.e. 100 ground-truth slots,
+which cannot distinguish 0.99 from 1.00.
+
+The earlier "1M × 1024-d Cohere-wiki, HNSW p50 5.2 ms at recall@10 0.96, 1953 MiB"
+figure cited from a sibling project is kept out of the table deliberately: it is a
+different corpus at a different dimensionality, and comparing our GIST-960d numbers
+against it is the cross-corpus error this file exists to avoid.
 
 pgvector is also small, boring, and everywhere. `doc/ARCHITECTURE.md` §8.4 concedes
 operational simplicity as a permanent loss.
