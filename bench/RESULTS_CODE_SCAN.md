@@ -390,47 +390,98 @@ of lookups. That is now stronger: **at 3 bits the fastest kernel does not exist*
 named revision trigger for the shape is resolved for 4 bits a second time, on a second
 mechanism.
 
-## What this does to V15, which was next on the path
+## What this does to V15 — and the answer changed twice, because stage 2 was a harness artifact
 
-V15 (the two-stage prefix scan) was specified as *the thing that makes the latency
-gate pass*. It is not, any more. Both grids below are from the same run, same host,
-identical prefix/window points:
+**Read the sequence, not just the conclusion**, because the conclusion moved three times
+in two days and every move was downstream of one measurement error.
 
-| m/dim | W | recall@10 | `lut-wide` total | `lut-byte` total |
-|---|---:|---:|---:|---:|
-| 0.500 | 8000 | 1.0000 | 194.06 ms | **64.58 ms** |
-| 0.500 | 20000 | 1.0000 | 237.64 | 99.31 |
-| 0.250 | 8000 | 0.9800 | 116.25 | **46.90** |
-| 0.250 | 20000 | 0.9900 | 158.81 | 80.23 |
-| 0.125 | 8000 | 0.83 / 0.84 | 75.16 | 37.42 |
-| 0.125 | 20000 | 0.9300 | 119.34 | 71.67 |
+1. Before the byte kernel existed, V15 was recorded as *the thing that makes the latency
+   gate pass*, at 1.51x HNSW. True at the time, and the wrong lever.
+2. With the byte kernel and the harness's original stage 2, prefix 0.5 measured 64.6 ms
+   against a 60.7 ms flat scan at the same recall, so V15 was **demoted** to a
+   recall/latency knob. Also correct for that harness.
+3. The harness's stage 2 was scoring **one whole 32-lane block per survivor**
+   (`livemask = 1 << sl`), which for `lut-byte` wastes 31/32 of every call because that
+   kernel scores all 32 lanes regardless of mask. With stage 2 grouped by block, V15 is
+   **the best configuration measured** and the demotion is withdrawn.
 
-Against the gate's bar — pgvector HNSW warm p50 **73.764 ms** at `R*` = 0.9760, bar
-2x = 147.5 ms:
+So both earlier V15 verdicts were computed against a stage 2 that was an artifact, and
+the flip-flop is not new information arriving — it is the same information being measured
+correctly on the third attempt.
+
+### Measured, n = 1M, grouped stage 2, run `pgweave-20260915-110445`
+
+| m/dim | W | recall@10 | `lut-wide` s1 / s2 / total | `lut-byte` s1 / s2 / total | s2 blocks |
+|---|---:|---:|---:|---:|---:|
+| 1.000 | 8000 | 1.0000 | 294.8 / 21.3 / **316.1** | 62.3 / 13.6 / **75.9** | 6,614 |
+| 1.000 | 20000 | 1.0000 | 297.2 / 48.0 / 345.1 | 67.6 / 27.6 / 95.1 | 13,659 |
+| 0.500 | 8000 | **1.0000** | 152.7 / 21.5 / 174.2 | 39.3 / 13.5 / **52.8** | 6,618 |
+| 0.500 | 20000 | 1.0000 | 157.1 / 47.9 / 204.9 | 44.3 / 27.7 / 71.9 | 13,692 |
+| 0.250 | 8000 | 0.9800 | 82.3 / 21.5 / 103.8 | 24.4 / 13.6 / **38.0** | 6,659 |
+| 0.250 | 20000 | 0.9900 | 87.0 / 48.5 / 135.5 | 28.8 / 27.6 / 56.3 | 13,784 |
+| 0.125 | 8000 | 0.83 / 0.84 | 45.7 / 21.3 / 67.1 | 17.3 / 13.4 / 30.7 | 6,602 |
+| 0.125 | 20000 | 0.9300 | 49.4 / 47.3 / 96.8 | 21.6 / 27.4 / 49.0 | 13,660 |
+
+**Prefix 0.5 at W 8000 is 52.8 ms at recall 1.0000, against 75.9 ms for the full-dim
+arm at the same recall — 1.44x, for free.** That is the configuration to build.
+
+### The weakest number in this file is now measured
+
+The previous revision quoted the flat scan's recall as "~0.993", taken from n = 200k, and
+flagged it as the file's weakest claim. At n = 1M, full dim, W = 8000, **both kernels
+measure recall@10 = 1.0000** — the byte table's cost at this size is 0.0000, not 0.0020.
+
+**But note the query count.** Every n = 1M figure in this file is **nq = 10**, i.e. 100
+ground-truth slots, so "1.0000" means 100/100 and cannot distinguish 0.99 from 1.00 with
+any confidence. The 0.0020 delta is the better-resolved number: n = 200k, nq = 100. The
+gate asks for recall@10 >= 0.99 at n >= 1M, and **satisfying it properly needs `CSNQ=100`
+at n = 1M**, which has not been run.
+
+### Against the gate's bar
+
+pgvector HNSW warm p50 **73.764 ms** at `R*` = 0.9760; bar is 2x = 147.5 ms.
 
 | configuration | recall@10 | warm p50 | vs HNSW |
 |---|---:|---:|---:|
 | pgvector HNSW, ef = 800 | 0.9760 | 73.8 ms | 1.00x |
-| **`lut-byte` flat scan** | ~0.993 | **60.7 ms** | **0.82x** |
-| **`lut-byte`, prefix 0.5 / W 8000** | **1.0000** | 64.6 ms | **0.88x** |
-| `lut-byte`, prefix 0.25 / W 8000 | 0.9800 | 46.9 ms | 0.64x |
-| `lut-wide`, prefix 0.25 / W 8000 (V15 as specced) | 0.9800 | 116.3 ms | 1.58x |
-| `lut-wide` flat scan | 1.0000 | 319.2 ms | 4.33x |
+| **`lut-byte`, prefix 0.5 / W 8000** | **1.0000** (nq=10) | **52.8 ms** | **0.72x** |
+| `lut-byte`, prefix 0.25 / W 8000 | 0.9800 | 38.0 ms | 0.51x |
+| `lut-byte`, full dim / W 8000 | 1.0000 (nq=10) | 75.9 ms | 1.03x |
+| `lut-byte` bare flat scan, no rerank pipeline | — | 58.7 ms | 0.80x |
+| `lut-wide`, prefix 0.25 / W 8000 (V15 as specced) | 0.9800 | 103.8 ms | 1.41x |
+| `lut-wide`, full dim / W 8000 | 1.0000 | 316.1 ms | 4.28x |
 
-**The scan now beats pgvector HNSW outright at recall 1.0000**, where V15 as specced
-was 1.58x behind it at recall 0.98. Two consequences:
+**The term is met with margin and at higher recall than the comparator reaches**, by a
+combination of the two levers rather than either alone.
 
-1. **V15 is no longer necessary and is no longer free.** With the byte kernel, prefix
-   0.5 at W 8000 costs 64.6 ms against the flat scan's 60.7 ms at the same recall —
-   the prefix arm is *slower*, because stage 2 costs ~20 ms and stage 1 only saved
-   ~16 ms. V15 becomes a knob that trades 2 points of recall for 1.3x (46.9 ms at
-   0.98), not the mechanism that makes the gate pass.
-2. **Stage 2 is charged too much here, so 1 is not the last word.** The harness
-   rescores each survivor with a single-lane mask while the fast kernels skip at
-   8-lane granularity, so stage 2 is charged roughly 4x a batched implementation. At a
-   quarter of 20 ms, prefix 0.5 would land near 49 ms at recall 1.0000 and would beat
-   the flat scan. That is a reason to keep V15 open, and it is an estimate, not a
-   measurement.
+### What grouping stage 2 was actually worth, and why my estimate was wrong twice
+
+Stage 2 fell from ~20.1 ms to 13.5 ms at W = 8000, **33%**. Both of my predictions
+missed, in opposite directions: the first guessed "roughly 4x" from the single-lane mask,
+and the correction guessed 12% from the distinct-block count
+`nblocks * (1 - exp(-W/nblocks))` = 7,058 of 8,000.
+
+The measured block count is **6,614**, below even that prediction, and the time fell
+further than the block count did. The likely reason the time beat the count: grouping
+sorts survivors by block, so stage 2 walks the code array in **ascending block order**
+instead of heap order. On a bandwidth-bound scan, converting scattered block reads into
+sequential ones is worth more than eliminating a few of them. That is an inference from
+two measured quantities, not a separate measurement, and it is the kind of claim this
+file has been wrong about before — it is offered as the likely mechanism, not a result.
+
+### Cross-run variance, stated so the ratios are not over-read
+
+Two runs, same instance type and same CPU model (Xeon Platinum 8488C):
+
+| quantity | run 045706 | run 110445 | spread |
+|---|---:|---:|---:|
+| `lut-byte`, n = 1M | 60.7 ns | 58.7 ns | 3.3% |
+| `lut-wide`, n = 1M | 319.2 ns | 297.7 ns | 6.8% |
+| `lut-byte` speedup | 5.26x | 5.07x | — |
+| single-core bandwidth | 11.77 GB/s | 11.87 GB/s | 0.8% |
+
+So the kernel win is **~5x**, not precisely 5.26x, and the bandwidth wall reproduces
+across instances to under 1%. At 58.7 ns the scan runs at 8.18 GB/s, **69% of the wall**.
 
 ### The 6.08 ms that started this is not a full flat scan
 
@@ -443,10 +494,10 @@ was ~5x of real kernel deficit plus a comparison that does not hold.
 
 ## What is still unmeasured
 
-- **The flat `lut-byte` scan's own recall at n = 1M.** The 0.9930 figure is n = 200k,
-  and the 1.0000 entries in the prefix grid are at m/dim = 0.5, not full dim. The
-  0.82x row above therefore carries an approximate recall, which is the weakest number
-  in this file. Measure it before quoting that row anywhere.
+- **Recall at n = 1M with more than 10 queries.** Every n = 1M recall figure here is
+  nq = 10 (100 ground-truth slots), which cannot separate 0.99 from 1.00. The phase gate
+  asks for >= 0.99 at n >= 1M, so it is not yet properly evidenced at that size. Run
+  `CSNQ=100`; it costs one more instance-hour and it is the cheapest open item.
 - Whether `lut-byte`'s 5.26x holds at lower `dim`. Every figure here is 960-d, and the
   byte kernel's advantage comes from amortizing a table load across 32 lanes per
   coordinate, which is dim-independent in principle and unmeasured in fact.
