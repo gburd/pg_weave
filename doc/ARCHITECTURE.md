@@ -229,20 +229,35 @@ fundamental and no amount of engineering removes them; they are knobs, not bugs.
    ef = 400 and 3.548 ms warm at ef = 10. HNSW's traversal is dependent random I/O;
    a rerank window's TIDs are all known before the first fetch.
 
-   **The code scan is now measured too** (`bench/RESULTS_CODE_SCAN.md`). A flat scan
-   of 1M 960-d 4-bit codes is 293 ms, and the per-block bound that was supposed to
-   prune it prunes **0.00%** on real corpora. What makes it affordable is a
-   **two-stage prefix scan** (task V15): score every vector on the first quarter of
-   the coordinates, rescore the best 8,000 fully, then exact-rerank the top 25 —
-   recall@10 0.9800 for 111.2 ms, which is **1.51× pgvector HNSW at matched
-   recall**, inside the 2× bar. So the honest position is:
+   **The code scan is now measured too** (`bench/RESULTS_CODE_SCAN.md`). The per-block
+   bound that was supposed to prune it prunes **0.00%** on real corpora, so a query
+   scores every code. What makes that affordable is not an algorithm but a **kernel**:
+   the scan had been costing about one cycle per coordinate because it did one LUT
+   gather per coordinate, and a nibble-LUT AVX2 kernel (task V16) scores a coordinate's
+   32 lanes with one byte shuffle. At n = 1M that is **60.7 ms against 319.2 ms**, for
+   a measured recall cost of 0.0020, which makes the flat scan **0.82× pgvector HNSW
+   at matched recall — faster outright**, inside a 2× bar.
+
+   Two corrections this forced, both worth keeping visible:
+
+   - The two-stage prefix scan (task V15) was recorded here for two days as the thing
+     that made this term pass, at 1.51×. It did pass, and it was **the wrong lever**:
+     the same host and run puts it at 1.58× while the flat scan with the right kernel
+     is 0.82×, at higher recall. V15 is now a recall/latency knob.
+   - The scan is no longer compute-bound. `lut-byte`'s cost per vector rises with n
+     (36.7 → 58.6 → 60.7 ns) instead of staying flat, and 480 B in 60.7 ns is 7.91 GB/s
+     against a **measured** 11.77 GB/s single-core wall. Roughly 1.49× remains to any
+     kernel on this hardware, and it is bounded by memory rather than by effort.
+
+   So the honest position is:
 
    - **recall and storage:** 0.9920 at 0.064× measured, one corpus, n = 1M. The
      earlier fallback framing — "~0.92 recall at ~0.12× storage, or ~1.00 recall at
      0.067× plus an untimed heap-fetch cost" — is superseded.
-   - **latency:** the *scan* is measured and passes at iso-recall. A whole query is
-     still not, because V7, V8 and V15 are unimplemented, so no pg_weave vector
-     query exists to time end to end.
+   - **latency:** the *scan* is measured and passes at iso-recall, now with margin
+     rather than inside the bar. A whole query is still not, because V7, V8 and V16
+     are unimplemented, so no pg_weave vector query exists to time end to end. V16's
+     kernel exists only in `bench/code_scan.c`.
 
    So the storage and recall halves of "0.99 at 0.15×" are supported by measurement
    on one corpus, and the latency half is supported **for the scan in isolation**,
