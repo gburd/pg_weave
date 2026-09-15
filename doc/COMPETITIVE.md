@@ -193,15 +193,19 @@ at ef = 800 and warm p50 there is 73.764 ms:
 | gate term | bar | measured | verdict |
 |---|---|---|---|
 | storage | ≤ 0.15× | **0.064×** (512 B vs 8,056 B/vector) | passes |
-| latency | ≤ 2× at matched recall | **0.72×** (52.8 ms) | passes with margin |
-| recall@10 | ≥ 0.99 | 1.0000, but **nq = 10** | not properly evidenced |
+| latency | ≤ 2× at matched recall | **0.76×** (56.2 ms at recall 0.9880) | passes |
+| recall@10 | ≥ 0.99 | **0.9930** at n = 1M, 100 queries | passes |
 
 **Read that table with the caveat attached.** Those are figures for the *scan in
 isolation*, produced by `bench/code_scan.c`. Tasks V7 (on-disk code pages), V8 (scan
 shuttle), V15 and V16 are all unimplemented, so **no pg_weave vector query exists to
 time end to end** — nothing measured includes page reads, visibility checks or tuple
-machinery. And every n = 1M recall figure is 10 queries, i.e. 100 ground-truth slots,
-which cannot distinguish 0.99 from 1.00.
+machinery.
+
+The recall row read 1.0000 until 2026-09-15, from 10 queries. At 100 queries it is
+0.9930, and the configuration this project had been recommending — prefix 0.5 with a
+window of 8,000 — turned out to be 0.9880, **below the gate**. The 10-query sample was
+optimistic by up to 7 points, not merely coarse.
 
 The earlier "1M × 1024-d Cohere-wiki, HNSW p50 5.2 ms at recall@10 0.96, 1953 MiB"
 figure cited from a sibling project is kept out of the table deliberately: it is a

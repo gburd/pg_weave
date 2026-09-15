@@ -485,6 +485,44 @@ is acceptable", 50 lines above another comment in the same function saying "EVER
 insert lands here and mints a segment" for the common case of a body index. Both
 cannot be true, and the measurement says the second one is.
 
+### G21 - `t/014` reports a leaked page after double crash recovery - **OPEN, characterised not diagnosed 2026-09-15**
+
+`t/014_merge_durability.pl` test 9 fails with `weave_check()` reporting **"1 unreachable
+page(s) not flagged freed; first is block 2883"** after the *second* crash-recovery cycle.
+
+**What is established:**
+
+- It reproduces **8 of 8 runs** on this workstation via `nix build
+  .#checks.x86_64-linux.tap-pg17 --rebuild`, at two different commits, and reports the
+  **same block number every time** - 2883.
+- It is **not caused by the V16 kernel work**: 3 of 3 runs fail on a clean worktree at
+  `5911d70`, which contains none of it.
+- It is **not caught by CI**, which is green. CI does run this file - the TAP leg is
+  `make installcheck REGRESS= ISOLATION=` with `TAP_TESTS = 1`, which covers all of `t/`
+  - so the failure does not reproduce on a PGDG PostgreSQL on a hosted runner.
+- It passed twice earlier the same day on this machine, at *higher* system load, so it is
+  **nondeterministic in occurrence while deterministic in outcome**. That combination is
+  what a crash landing at different points would produce: the merge is deterministic, so
+  when a page does leak it is always the same page.
+
+**What is not established:** whether a page unreachable and unflagged after a crash is a
+real leak or an artifact of what `weave_check()` counts as reachable. A merge that crashed
+after allocating a page but before linking it would leave exactly this state, and whether
+that space is later recovered by `weave_vacuum_compact()` has not been checked. Either
+answer is worth having: a real leak belongs with G18 and G20 in the page-accounting family,
+and an over-strict check produces a test that fails for correct behaviour.
+
+**How this was nearly missed, which is the reusable part.** Two of my own verification runs
+reported this leg green because the exit status was read through a pipe:
+
+    nix build ... 2>&1 | tail -5; echo "tap=$?"    # $? is tail's, always 0
+
+`$?` after a pipeline is the *last* command's status. The same mistake appeared twice in
+one session, the second time as `nix build ... | tail -1 | grep -q .` used as a
+pass/fail test. **Capture the status of the build itself** - `cmd >/dev/null 2>&1; echo $?`
+- or the gate reports success it never checked, which is the same failure mode
+`make check-alloc` was widened for.
+
 ### Checked and NOT a gap: HOT-successor TIDs in `amgettuple`
 
 pg_tre 4.0.2 fixed a silent under-return: its always-true scan path collected TIDs

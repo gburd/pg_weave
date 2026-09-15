@@ -238,10 +238,14 @@ fundamental and no amount of engineering removes them; they are knobs, not bugs.
    — about **5×**, reproduced across two runs — for a recall cost measured at 0.0020 at
    n = 200k and 0.0000 at n = 1M.
 
-   The prefix scan (task V15) then adds a further 1.44× on top of that, at **no recall
-   cost**: prefix 0.5 with a window of 8,000 is **52.8 ms at recall 1.0000**, against
-   75.9 ms for the full-dim pipeline at the same recall, which is **0.72× pgvector HNSW
-   at matched recall**.
+   The prefix scan (task V15) adds to that by an amount that depends on the recall
+   required — measured at 100 queries, not 10. At **recall ≥ 0.9760**, the comparator's
+   ceiling and what the gate's matched-recall term uses, prefix 0.5 with a window of
+   8,000 is **56.2 ms at recall 0.9880 — 0.76× pgvector HNSW**. At **recall ≥ 0.99** the
+   cheapest prefix configuration is 75.6 ms against the full-dim pipeline's 80.2 ms,
+   which is only **1.06×**. An earlier revision claimed "1.44× at no recall cost" from a
+   10-query sample; that sample was optimistic by up to 7 points and the claim is
+   withdrawn.
 
    Two corrections this forced, both worth keeping visible:
 
@@ -262,13 +266,14 @@ fundamental and no amount of engineering removes them; they are knobs, not bugs.
    - **recall and storage:** 0.9920 at 0.064× measured, one corpus, n = 1M. The
      earlier fallback framing — "~0.92 recall at ~0.12× storage, or ~1.00 recall at
      0.067× plus an untimed heap-fetch cost" — is superseded.
-   - **latency:** the *scan* is measured and passes at iso-recall, now with margin
-     rather than inside the bar. A whole query is still not, because V7, V8, V15 and V16
-     are unimplemented, so no pg_weave vector query exists to time end to end — the
-     kernel and the prefix scan both exist only in `bench/code_scan.c`. And **every
-     n = 1M recall figure is nq = 10**, i.e. 100 ground-truth slots, which cannot
-     separate 0.99 from 1.00; the gate's recall term is not yet properly evidenced at
-     that size.
+   - **latency:** the *scan* is measured and passes at iso-recall — 0.76× at the
+     comparator's recall ceiling. A whole query is still not measured, because V7 and
+     V8 do not exist, so no pg_weave vector query can be timed end to end. V16's
+     kernel is now in `src/vector/kernels.c`; the prefix scan lives only in
+     `bench/code_scan.c`.
+   - **recall:** now evidenced at n = 1M with 100 queries (1,000 slots) rather than
+     10 — 0.9930 at full dim and at prefix 0.5 with a 20,000 window. The earlier
+     1.0000 figures were a 10-query artifact, optimistic by up to 7 points.
 
    So the storage and recall halves of "0.99 at 0.15×" are supported by measurement
    on one corpus, and the latency half is supported **for the scan in isolation**,
