@@ -209,7 +209,21 @@ weave_rotation_init(WeaveRotation *rot, int dim,
 	rot->tail = dim - rot->nblocks * rot->block;
 	rot->invsqrtb = (float) (1.0 / sqrt((double) rot->block));
 
-	permbytes = sizeof(weave_uint16) * (size_t) dim;
+	/*
+	 * perm[] is uint16 and sign[] is uint64, both carved out of ONE byte block,
+	 * so the perm run has to be padded to 8 or sign[] lands misaligned whenever
+	 * dim is not a multiple of 4.  x86 tolerates that and returns the right
+	 * answer, which is exactly why it went unnoticed: it is undefined behaviour
+	 * that -fsanitize=undefined reports (as a misaligned load and store in the
+	 * sign loop below) and that a stricter target may fault on.  It surfaced when
+	 * test/hegel/test_kernels.c started building quantizers at dims like 15 and
+	 * 513; every dim the tests used before was a multiple of 4.
+	 *
+	 * The padding costs at most 6 bytes per round and changes NO output byte --
+	 * the permutation and the signs are functions of the ChaCha stream and dim
+	 * alone -- so V2's cross-architecture fixture hash still reproduces.
+	 */
+	permbytes = (sizeof(weave_uint16) * (size_t) dim + 7) & ~(size_t) 7;
 	signbytes = sizeof(weave_uint64) * (size_t) ((dim + 63) / 64);
 	total = (permbytes + signbytes) * WEAVE_ROT_ROUNDS;
 
@@ -1035,6 +1049,72 @@ weave_decode(const WeaveQuantizer *q, const weave_uint8 *code,
  * Query lookup table and the block bound
  * ------------------------------------------------------------------------- */
 
+/*
+ * Quantize the float table to bytes for the byte-LUT kernels.
+ *
+ * The formula, the reason a GLOBAL step with a per-row offset is the right shape,
+ * and the rank-preservation argument are all at WeaveQueryLut.lut8 in
+ * weave/quantize.h; this function is the transcription and does not restate them.
+ * Two implementation notes that are not in the header because they are about this
+ * loop and not about the design:
+ *
+ *	 - `offset` accumulates in DOUBLE, ascending j, which is the order and the type
+ *	   weave_lut_score_code() sums in.  A degenerate table (range == 0, so every
+ *	   code reconstructs to mn_j) therefore comes back as close to the oracle as a
+ *	   float can carry, instead of merely close.
+ *	 - mn_j is recomputed here rather than carried in a dim-length array from the
+ *	   caller's first pass.  16 comparisons per coordinate against the dim * 16
+ *	   multiplies already spent is not worth 64 kB more stack in a backend, and
+ *	   this file's stack frames are deliberately bounded (weave/quantize.h).
+ */
+static void
+query_lut8_build(WeaveQueryLut *out, float range)
+{
+	int			dim = out->dim;
+	int			n = out->nlevels;
+	double		offset = 0.0;
+	int			j,
+				c;
+
+	out->lut8_step = (range > 0.0f) ? range / 255.0f : 0.0f;
+
+	for (j = 0; j < dim; j++)
+	{
+		const float *row = out->lut + (size_t) j * n;
+		weave_uint8 *dst = out->lut8 + (size_t) j * n;
+		float		mn = row[0];
+
+		for (c = 1; c < n; c++)
+		{
+			if (row[c] < mn)
+				mn = row[c];
+		}
+		offset += (double) mn;
+
+		for (c = 0; c < n; c++)
+		{
+			long		v;
+
+			if (out->lut8_step <= 0.0f)
+			{
+				/* range == 0: every row is constant, so every code reconstructs
+				 * to mn_j and the integer part carries nothing.  Guarding here
+				 * rather than dividing by zero. */
+				dst[c] = 0;
+				continue;
+			}
+			v = lrintf((row[c] - mn) / out->lut8_step);
+			if (v < 0)
+				v = 0;
+			if (v > 255)
+				v = 255;
+			dst[c] = (weave_uint8) v;
+		}
+	}
+
+	out->lut8_offset = (float) offset;
+}
+
 int
 weave_query_lut_build(WeaveQueryLut *out, const WeaveQuantizer *q,
 					  const float *query, void *(*alloc) (size_t))
@@ -1042,16 +1122,36 @@ weave_query_lut_build(WeaveQueryLut *out, const WeaveQuantizer *q,
 	float		x[WEAVE_MAX_DIM];
 	int			dim = q->dim;
 	int			n = q->cb.nlevels;
+	size_t		nentry = (size_t) dim * (size_t) n;
+	size_t		bytetail;
+	weave_uint8 *block;
 	double		bound = 0.0;
 	double		qn2 = 0.0;
+	float		range = 0.0f;
 	int			j,
 				c;
 
 	memset(out, 0, sizeof(*out));
-	out->lut = (float *) alloc(sizeof(float) * (size_t) dim * (size_t) n);
-	if (out->lut == NULL)
+
+	/*
+	 * ONE allocation for both tables, with `lut` at the front and `lut8`
+	 * immediately past the floats, because the caller's contract is a single
+	 * free() of `_alloc`.  A second allocation here would be a second thing every
+	 * call site has to release, and there are call sites in the backend, in the
+	 * benchmarks and in the property tests.
+	 *
+	 * The byte tail is sized to zero at any width but 4 bits: nothing can read it
+	 * there (weave/quantize.h -- one vpshufb table is 16 entries), and at 8 bits
+	 * it would be a 25 % larger per-query allocation for a table no kernel can
+	 * use.
+	 */
+	bytetail = (n == 16) ? nentry : 0;
+	block = (weave_uint8 *) alloc(sizeof(float) * nentry + bytetail);
+	if (block == NULL)
 		return -1;
-	out->_alloc = out->lut;
+	out->_alloc = block;
+	out->lut = (float *) block;
+	out->lut8 = (bytetail > 0) ? block + sizeof(float) * nentry : NULL;
 	out->dim = dim;
 	out->nlevels = n;
 
@@ -1077,6 +1177,8 @@ weave_query_lut_build(WeaveQueryLut *out, const WeaveQuantizer *q,
 	for (j = 0; j < dim; j++)
 	{
 		double		best = -1e300;
+		float		mn,
+					mx;
 
 		for (c = 0; c < n; c++)
 		{
@@ -1089,11 +1191,30 @@ weave_query_lut_build(WeaveQueryLut *out, const WeaveQuantizer *q,
 		/* The codebook is symmetric about zero, so best >= 0 always; the
 		 * assertion that L(q) >= 0 in weave/quantize.h rests on that. */
 		bound += best;
+
+		/* The byte table's shared step is a max over the WHOLE table, so its
+		 * per-row span is measured here, on the STORED floats -- the values the
+		 * kernels will actually quantize -- rather than on the doubles. */
+		mn = mx = out->lut[(size_t) j * n];
+		for (c = 1; c < n; c++)
+		{
+			float		v = out->lut[(size_t) j * n + c];
+
+			if (v < mn)
+				mn = v;
+			if (v > mx)
+				mx = v;
+		}
+		if (mx - mn > range)
+			range = mx - mn;
 	}
 
 	out->lutbound = (float) bound;
 	out->qnorm2 = (float) qn2;
 	out->qnorm = (float) sqrt(qn2);
+
+	if (out->lut8 != NULL)
+		query_lut8_build(out, range);
 	return 0;
 }
 

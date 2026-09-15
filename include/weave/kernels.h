@@ -11,11 +11,12 @@
  * test must link the SHIPPED kernels, not a copy of them.  A copy would agree
  * with itself forever.
  *
- * EXACTNESS.  Every kernel registered here produces results BIT-IDENTICAL to
- * weave_score_block_scalar(), and test/hegel/test_kernels.c asserts it with
- * memcmp over a randomized grid.  That is stronger than the "a scoring kernel
- * may differ in the last bit" latitude src/vector/kernels.c describes, and it is
- * affordable for one specific structural reason:
+ * EXACTNESS, AND WHICH KERNELS IT BINDS.  Every kernel whose `approximate` flag
+ * is clear produces results BIT-IDENTICAL to weave_score_block_scalar(), and
+ * test/hegel/test_kernels.c asserts it with memcmp over a randomized grid.  That
+ * is stronger than the "a scoring kernel may differ in the last bit" latitude
+ * src/vector/kernels.c describes, and it is affordable for one specific
+ * structural reason:
  *
  *		the parallelism is across LANES, not across coordinates.
  *
@@ -27,14 +28,25 @@
  * "close enough" instead, and then every future disagreement becomes a judgement
  * call.  Do not do that.
  *
- * WHAT IS DELIBERATELY NOT HERE.  doc/specs/VECTOR_CHANNEL.md sect. 8 lists
- * nibble-split byte-LUT and int8-dot strategies (SSE2/SSSE3, NEON TBL, NEON
- * SDOT, AVX-512 VNNI).  Those quantize the query lookup table to 8 bits before
- * gathering, so they are not one ULP from this reference, they are one
- * QUANTIZATION STEP from it -- and V6's gate as written ("identical to the
- * scalar path") cannot be met by any of them.  They need their own error budget,
- * their own recall measurement, and their own gate.  None of that exists yet, so
- * none of them is implemented.  See doc/PHASES.md V6.
+ * THE ONE FAMILY THAT IS NOT EXACT, and how it is fenced off.  Task V16 added
+ * the nibble-split byte-LUT kernels doc/specs/VECTOR_CHANNEL.md sect. 8
+ * tabulates: "lut-byte-ref" (scalar) and "lut-byte" (AVX2 vpshufb).  They
+ * quantize the query table to 8 bits before gathering, so they are not one ULP
+ * from the oracle, they are one QUANTIZATION STEP from it -- an error budget, not
+ * a rounding difference.  Both therefore carry `approximate` set, and the fence
+ * is:
+ *
+ *	 - weave_score_kernel_best() never returns one, so `auto` cannot select one;
+ *	 - the differential test gates them against EACH OTHER bit for bit (they are
+ *	   the same integer arithmetic twice) and merely REPORTS their deviation from
+ *	   the oracle, because an approximate kernel cannot be gated on equality with
+ *	   an exact one and pretending otherwise would delete the gate;
+ *	 - they refuse any block they cannot score exactly as specified -- 4 bits and
+ *	   WEAVE_PACK_LANE only -- rather than delegating to the oracle, so a
+ *	   measurement can never be another path's number wearing this one's name.
+ *
+ * The int8-dot family (NEON SDOT/SMMLA, AVX-512 VNNI) is still absent, as is any
+ * NEON byte-LUT path.  See doc/PHASES.md V6 and V16.
  *
  * Copyright (c) 2025-2026, Gregory Burd
  *
@@ -128,10 +140,11 @@ typedef struct WeaveScoreBlock
  * live-and-allowed lane at all returns without touching a code byte.  That is
  * the mechanism by which a selective predicate makes this channel faster rather
  * than slower (doc/specs/VECTOR_CHANNEL.md sect. 9), so it is not an
- * optimization to be traded away for simpler code.  The GRANULARITY at which
  * each path skips differs and is stated where each path implements it: the
- * oracle skips per lane, and the wide and AVX2 paths skip per group of 8 lanes,
- * because a group is the unit their addressing is built on.
+ * oracle skips per lane, the wide and AVX2 float paths skip per group of 8 lanes
+ * because a group is the unit their addressing is built on, and the byte-LUT AVX2
+ * path skips per whole block because one coordinate's 16 code bytes cover all 32
+ * lanes and there is no 8-lane subset it could decline to load.
  */
 typedef int (*weave_score_block_fn) (const WeaveScoreBlock *blk, float *out);
 
@@ -141,21 +154,64 @@ typedef struct WeaveScoreKernel
 	 * it names the ISA and the strategy, e.g. "lut-avx2". */
 	const char *name;
 	weave_score_block_fn score_block;
+
+	/*
+	 * Nonzero if this kernel's scores are an APPROXIMATION of the oracle's
+	 * rather than a bit-identical reproduction of them (today: the byte-LUT
+	 * family, whose 8-bit query table costs one quantization step per
+	 * coordinate).
+	 *
+	 * WHY THIS IS A PROPERTY OF THE KERNEL AND NOT REGISTRY BOOKKEEPING.  An
+	 * approximate kernel is only SOUND when something downstream repairs the
+	 * ranking it perturbed -- an exact rerank over a window.  The ratified shape
+	 * does exactly that (4 bits, exact rerank of a top-25 window, recall@10
+	 * 0.9920 at n = 1M on GIST-960d; weave/quantize.h and
+	 * bench/RESULTS_BITWIDTH_SWEEP.md), but tasks V7/V8/V15 do not exist yet, so
+	 * there is no query path in this tree that can GUARANTEE the rerank is
+	 * present.  A caller that needs to know whether a rerank is mandatory reads
+	 * this flag; that is a question about the kernel it was handed, so the answer
+	 * belongs on the kernel.
+	 *
+	 * Consequences, enforced in src/vector/kernels.c:
+	 *
+	 *	 - weave_score_kernel_best() SKIPS approximate kernels, so `auto` cannot
+	 *	   select one.  Promoting lut-byte to `auto` is a decision that belongs
+	 *	   with V8/V15, where the rerank exists to justify it -- not here.
+	 *	 - weave_score_kernel_lookup() still finds them by name, so a path can be
+	 *	   forced deliberately and A/B'd.
+	 *	 - weave_score_kernel_list() still lists them, so the differential test
+	 *	   and any diagnostic see every path dispatch can reach.
+	 */
+	int			approximate;
 } WeaveScoreKernel;
 
 /* The oracle.  Always available, layout-agnostic, and the fallback forever. */
 extern const WeaveScoreKernel weave_score_kernel_scalar;
 
 /*
- * Every kernel usable on THIS host, best first, scalar last.  Fills at most
- * `max` entries and returns how many.  The differential test walks this list,
- * which is why it is public: a path that dispatch can select but the test cannot
- * see is exactly the hole AGENTS.md rule 8 exists to close.
+ * Every kernel usable on THIS host: the exact paths best first, then the
+ * approximate ones, and scalar always last.  Fills at most `max` entries and
+ * returns how many.  The differential test walks this list, which is why it is
+ * public: a path that dispatch can select but the test cannot see is exactly the
+ * hole AGENTS.md rule 8 exists to close.
+ *
+ * A caller that compares kernels against each other MUST split the list on
+ * `approximate` first.  Asserting that an approximate kernel equals the oracle
+ * does not fail honestly -- it fails always, and the usual repair (loosen it to a
+ * tolerance) would silently weaken the exact kernels' gate too.
  */
 extern int	weave_score_kernel_list(const WeaveScoreKernel **out, int max);
 
-/* Best available, and lookup by the name above (NULL if this host cannot run
- * it).  Both are pure; the backend resolves once and caches. */
+/*
+ * Best available, and lookup by the name above (NULL if this host cannot run
+ * it).  Both are pure; the backend resolves once and caches.
+ *
+ * best() considers EXACT kernels only, for the reason given at
+ * WeaveScoreKernel.approximate.  lookup() does not filter: naming a kernel is
+ * how a host gets A/B'd and how a bug report from another machine is reproduced,
+ * and refusing to resolve a name that the list reports would make both
+ * impossible.
+ */
 extern const WeaveScoreKernel *weave_score_kernel_best(void);
 extern const WeaveScoreKernel *weave_score_kernel_lookup(const char *name);
 

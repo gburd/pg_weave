@@ -32,21 +32,30 @@
  *	   +/- and one multiply in a fixed order, and V2's gate is a cross-architecture
  *	   fixture hash that a vector path would have to reproduce exactly.
  *
- * WHY THE ISA MATRIX IS SHORTER THAN THE SPEC'S.  doc/specs/VECTOR_CHANNEL.md
+ * WHY THE ISA MATRIX IS STILL SHORTER THAN THE SPEC'S.  doc/specs/VECTOR_CHANNEL.md
  * sect. 8 tabulates SSE2 / AVX2 / AVX-512BW / VNNI / NEON / SDOT, all of them
- * byte-LUT or int8-dot strategies.  Both of those families quantize the float
- * query table to 8 bits before gathering, which is an approximation, not a
- * rounding difference -- so none of them can pass V6's stated gate ("results
- * identical to the scalar path") and each one needs a recall budget that does not
- * exist yet.  Held to exactness, scoring is GATHER-bound: 32 independent
+ * byte-LUT or int8-dot strategies.  Both families quantize the float query table
+ * to 8 bits before gathering, which is an approximation, not a rounding
+ * difference -- so none of them can pass V6's stated gate ("results identical to
+ * the scalar path").  Held to exactness, scoring is GATHER-bound: 32 independent
  * table lookups per coordinate.  SSE2 has no gather and no variable shift, so an
  * exact SSE2 kernel is the portable wide-word kernel below plus register
  * shuffling; the same is true of baseline NEON.  AVX2 is the first x86 ISA with
- * both (vpgatherdd, vpsrlvd), which is why it is the one vector path here.  That
- * is the same shape of conclusion pg_turbovec reached for its Hamming kernel
+ * both (vpgatherdd, vpsrlvd), which is why it is the one EXACT vector path here.
+ * That is the same shape of conclusion pg_turbovec reached for its Hamming kernel
  * (sect. 8: they measured AVX2 and declined it because the wide-word scalar form
  * already extracted the available ILP), and it is why "lut-wide" exists as a
- * first-class kernel rather than as an afterthought.
+ * first-class kernel rather than as an afterthought -- and, measured at 960-d, why
+ * it is now the head of the registry.
+ *
+ * TASK V16 ADDED THE BYTE-LUT FAMILY ANYWAY, under a different gate.  lut-byte-ref
+ * and lut-byte below are approximate by construction and say so
+ * (WeaveScoreKernel.approximate), so they are gated against EACH OTHER for
+ * bit-identity and against the oracle only for a REPORTED deviation, and
+ * weave_score_kernel_best() refuses to hand one out.  V6's exactness gate is
+ * therefore intact and unweakened; what changed is that an approximate kernel is
+ * now allowed to exist next to it, fenced.  The int8-dot family and any NEON
+ * byte-LUT path are still absent.  See doc/PHASES.md V6 and V16.
  *
  * Copyright (c) 2025-2026, Gregory Burd
  *
@@ -275,6 +284,7 @@ weave_score_block_scalar(const WeaveScoreBlock *blk, float *out)
 const WeaveScoreKernel weave_score_kernel_scalar = {
 	.name = "scalar",
 	.score_block = weave_score_block_scalar,
+	.approximate = 0,			/* it IS the definition of exact here */
 };
 
 /* ---------------------------------------------------------------------------
@@ -476,6 +486,7 @@ weave_score_block_wide(const WeaveScoreBlock *blk, float *out)
 static const WeaveScoreKernel weave_score_kernel_wide = {
 	.name = "lut-wide",
 	.score_block = weave_score_block_wide,
+	.approximate = 0,
 };
 
 /* ---------------------------------------------------------------------------
@@ -598,6 +609,330 @@ weave_score_block_avx2(const WeaveScoreBlock *blk, float *out)
 static const WeaveScoreKernel weave_score_kernel_avx2 = {
 	.name = "lut-avx2",
 	.score_block = weave_score_block_avx2,
+	.approximate = 0,
+};
+
+#endif							/* WEAVE_KERNEL_X86_GNUC */
+
+/* ---------------------------------------------------------------------------
+ * The byte-LUT family: lut-byte-ref (scalar) and lut-byte (AVX2 vpshufb)
+ *
+ * Task V16.  These are the first APPROXIMATE kernels in this file: they gather
+ * from WeaveQueryLut.lut8, an 8-bit quantization of the float table, so a lane's
+ * score carries one rounding residual per coordinate instead of none.  The
+ * quantization, and the argument that it is rank-preserving up to that residual,
+ * are at WeaveQueryLut.lut8 in weave/quantize.h.  What is enforced HERE is the
+ * fencing: `approximate` is set, so weave_score_kernel_best() will not return
+ * either of them and `auto` cannot select one (see
+ * WeaveScoreKernel.approximate).
+ *
+ * THEY REFUSE RATHER THAN DELEGATE.  Both return -1 for anything but 4 bits in
+ * WEAVE_PACK_LANE, where lut-wide and lut-avx2 would fall back to the oracle.
+ * The difference is deliberate.  A fallback inside an approximate kernel would
+ * make it report the ORACLE's numbers -- both its scores and its speed -- under
+ * this kernel's name, and a fast-but-wrong result published under the wrong name
+ * is the exact failure AGENTS.md rule 8 was written about.  -1 is already the
+ * contract for a block description this path cannot honour (see
+ * weave_score_block_fn in weave/kernels.h) and the backend adapter turns it into
+ * a clean ERROR.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Accept only what the byte table can score exactly as specified.
+ *
+ * Everything block_bits() rejects is rejected here too, plus: 4 bits exactly
+ * (equivalently nlevels == 16, which is the only width weave_query_lut_build()
+ * builds a byte table for, and the only one a 16-entry vpshufb table can hold);
+ * WEAVE_PACK_LANE only; and a lut8 that is actually present, which is the same
+ * condition seen from the table's side rather than the width's.  Checking both
+ * is not redundant: `nlevels` comes off a page and `lut8` comes from the query
+ * side, and a mismatch between them means one of the two is not what this kernel
+ * was handed.
+ */
+static inline int
+byte_block_ok(const WeaveScoreBlock *blk)
+{
+	if (block_bits(blk) != 4)
+		return 0;
+	if (blk->layout != WEAVE_PACK_LANE)
+		return 0;
+	if (blk->lut->lut8 == NULL)
+		return 0;
+	return 1;
+}
+
+/*
+ * The one place a lane's integer accumulator becomes a float.
+ *
+ * BOTH byte kernels call this, so their outputs are bit-identical by construction
+ * rather than by two expressions happening to agree -- which is what makes the
+ * differential assertion between them (test/hegel/test_kernels.c K6) a statement
+ * about the SIMD addressing and nothing else.  The trailing multiply by the
+ * lane's renormalization scale in double, then one cast to float, is what
+ * weave_lut_score_code() and group_store() above do.
+ */
+static inline float
+byte_lane_score(const WeaveQueryLut *lut, weave_uint32 acc, float scale)
+{
+	return (float) (((double) lut->lut8_step * (double) acc +
+					 (double) lut->lut8_offset) * (double) scale);
+}
+
+/*
+ * Scalar reference for the byte table.
+ *
+ * It exists to separate the two things a byte-LUT kernel can get wrong.  Any
+ * disagreement between this and the exact oracle is the 8-bit table's rounding;
+ * any disagreement between this and lut-byte is a SIMD bug.  One number each,
+ * instead of one number confounding both.
+ *
+ * Like the oracle, it reaches codes only through weave_unpack_lane(), so it does
+ * NOT share the nibble/128-bit-half addressing assumptions of the AVX2 kernel
+ * below.  That independence is the whole value of the comparison.
+ *
+ * SKIP GRANULARITY: one lane, as the oracle.
+ */
+static int
+weave_score_block_byte_ref(const WeaveScoreBlock *blk, float *out)
+{
+	weave_uint8 code[WEAVE_CODE_MAX_BYTES];
+	const weave_uint8 *tbl;
+	weave_uint32 avail;
+	int			dim;
+	int			s,
+				j;
+
+	if (!byte_block_ok(blk))
+		return -1;
+
+	dim = blk->lut->dim;
+	tbl = blk->lut->lut8;
+	avail = lane_avail_mask(blk);
+	if (avail == 0)
+	{
+		fill_never(out, 0, blk->nlanes);
+		return blk->nlanes;
+	}
+
+	for (s = 0; s < blk->nlanes; s++)
+	{
+		weave_uint32 acc = 0;
+
+		if ((avail & (1u << s)) == 0)
+		{
+			out[s] = WEAVE_KERNEL_NEVER;
+			continue;
+		}
+		weave_unpack_lane(blk->layout, dim, 4, blk->codes, s, code);
+		for (j = 0; j < dim; j++)
+		{
+			/* bits == 4: coordinate j of one vector's code is nibble j, low
+			 * nibble first (src/vector/pack.c put_bits writes LSB first). */
+			weave_uint32 cix = (j & 1) ? (weave_uint32) (code[j >> 1] >> 4)
+				: (weave_uint32) (code[j >> 1] & 0x0F);
+
+			acc += tbl[(size_t) j * 16 + cix];
+		}
+
+		/*
+		 * 32 bits is not a budget, it is headroom: 255 * WEAVE_MAX_DIM = 4.2e6.
+		 * The AVX2 path below is the one that has to work at it, because its
+		 * accumulators start out 16 bits wide.
+		 */
+		out[s] = byte_lane_score(blk->lut, acc,
+								 blk->scales[(size_t) s * blk->scalestride]);
+	}
+	return blk->nlanes;
+}
+
+static const WeaveScoreKernel weave_score_kernel_byte_ref = {
+	.name = "lut-byte-ref",
+	.score_block = weave_score_block_byte_ref,
+	.approximate = 1,
+};
+
+/* ---------------------------------------------------------------------------
+ * lut-byte: AVX2 vpshufb byte-LUT gather
+ *
+ * THE ADDRESSING, spelled out because a wrong permutation here produces
+ * plausible-but-wrong scores and nothing else would catch it.
+ *
+ * At bits == 4 in WEAVE_PACK_LANE, code (coordinate j, lane s) is at bit
+ * (j * 32 + s) * 4, so coordinate j's 32 codes are the 16 CONTIGUOUS bytes at
+ * offset j * 16, and byte b of those holds lane 2b in its LOW nibble and lane
+ * 2b + 1 in its HIGH nibble.
+ *
+ * _mm256_shuffle_epi8 indexes within each 128-bit half INDEPENDENTLY, and a
+ * 16-entry byte table is exactly one half.  So rather than broadcasting one
+ * coordinate's table into both halves and wasting half the register on duplicate
+ * work, this processes coordinates IN PAIRS: one 32-byte load covers coordinates
+ * j and j+1, one 32-byte table load covers rows j and j+1, and each half of the
+ * shuffle uses its OWN coordinate's table.  Byte B of the result therefore
+ * belongs to coordinate j + B/16 and lane 2 * (B mod 16), + 1 for the high-nibble
+ * shuffle.
+ *
+ * OVERFLOW IS THE TRAP.  Gathered values are bytes 0..255 and dim reaches 960 in
+ * the corpora this is measured on, so 255 * 960 = 244800 does not fit the 16-bit
+ * lanes the byte widening naturally lands in.  Each 16-bit slot receives ONE byte
+ * per pair-iteration, so 255 * 257 is the true ceiling; this widens into 32-bit
+ * accumulators every LUT8_FLUSH_PAIRS = 128 pair-iterations, i.e. every 256
+ * coordinates (255 * 256 = 65280 < 65536).  Saturating adds are NOT used to paper
+ * over this: saturation silently changes a score, and a silently changed score is
+ * indistinguishable from a working kernel.
+ *
+ * SKIP GRANULARITY: the whole block.  Coarser than lut-wide's 8 lanes and
+ * necessarily so -- one coordinate's 16 code bytes cover all 32 lanes, so there
+ * is no 8-lane subset this path could decline to load.  A block with no
+ * live-and-allowed lane is skipped entirely and touches no code byte; anything
+ * else scores all 32 lanes and writes the sentinel over the masked ones.
+ *
+ * NO perm0 lane interleave, as in weave_score_block_avx2(): the 128-bit-half
+ * bookkeeping vpshufb forces is dealt with by an explicit index map at flush time
+ * (lut8_flush) instead, which is readable on the page.
+ * ------------------------------------------------------------------------- */
+
+#ifdef WEAVE_KERNEL_X86_GNUC
+
+/* 255 * 256 = 65280 < 65536; see the overflow note above. */
+#define LUT8_FLUSH_PAIRS	128
+
+/*
+ * Fold four vectors of 16-bit lane accumulators into 32 lane-indexed 32-bit
+ * accumulators.  THIS is the un-permutation, written out once per flush rather
+ * than as a chain of shuffles, because being able to read the index map off the
+ * page is worth more than the instructions it costs (one flush per 256
+ * coordinates, against 8192 table lookups).
+ *
+ * Element k of a 16 x u16 vector is element k & 7 of 128-bit half k >> 3.  Half 0
+ * carries coordinate j and half 1 carries coordinate j+1 -- two different
+ * coordinates' contributions to the SAME lane -- so both halves add into the same
+ * acc32 slot, which is why the map ignores k >> 3:
+ *
+ *	 e0[k] -> lane 2*(k&7)			(low nibble, bytes 0-7	 of the half)
+ *	 e1[k] -> lane 2*(k&7) + 16		(low nibble, bytes 8-15  of the half)
+ *	 o0[k] -> lane 2*(k&7) + 1		(high nibble, bytes 0-7)
+ *	 o1[k] -> lane 2*(k&7) + 17		(high nibble, bytes 8-15)
+ */
+__attribute__((target("avx2")))
+static inline void
+lut8_flush(__m256i e0, __m256i e1, __m256i o0, __m256i o1, weave_uint32 *acc32)
+{
+	weave_uint16 t[4][16];
+	int			k;
+
+	_mm256_storeu_si256((__m256i *) t[0], e0);
+	_mm256_storeu_si256((__m256i *) t[1], e1);
+	_mm256_storeu_si256((__m256i *) t[2], o0);
+	_mm256_storeu_si256((__m256i *) t[3], o1);
+
+	for (k = 0; k < 16; k++)
+	{
+		int			i = k & 7;
+
+		acc32[2 * i] += t[0][k];
+		acc32[2 * i + 16] += t[1][k];
+		acc32[2 * i + 1] += t[2][k];
+		acc32[2 * i + 17] += t[3][k];
+	}
+}
+
+__attribute__((target("avx2")))
+static int
+weave_score_block_byte_avx2(const WeaveScoreBlock *blk, float *out)
+{
+	const __m256i nib = _mm256_set1_epi8(0x0F);
+	const __m256i zero = _mm256_setzero_si256();
+	weave_uint32 acc32[WEAVE_VEC_BLOCK];
+	weave_uint32 avail;
+	__m256i		e0,
+				e1,
+				o0,
+				o1;
+	const weave_uint8 *codes;
+	const weave_uint8 *tbl;
+	int			dim;
+	int			j,
+				s,
+				pairs;
+
+	if (!byte_block_ok(blk))
+		return -1;
+
+	avail = lane_avail_mask(blk);
+	if (avail == 0)
+	{
+		fill_never(out, 0, blk->nlanes);
+		return blk->nlanes;
+	}
+
+	dim = blk->lut->dim;
+	codes = blk->codes;
+	tbl = blk->lut->lut8;
+	memset(acc32, 0, sizeof(acc32));
+	e0 = e1 = o0 = o1 = zero;
+	pairs = 0;
+
+	for (j = 0; j + 1 < dim; j += 2)
+	{
+		__m256i		cv = _mm256_loadu_si256((const __m256i *) (codes + (size_t) j * 16));
+		__m256i		tv = _mm256_loadu_si256((const __m256i *) (tbl + (size_t) j * 16));
+		__m256i		lo = _mm256_and_si256(cv, nib);
+		__m256i		hi = _mm256_and_si256(_mm256_srli_epi16(cv, 4), nib);
+		__m256i		vlo = _mm256_shuffle_epi8(tv, lo);
+		__m256i		vhi = _mm256_shuffle_epi8(tv, hi);
+
+		e0 = _mm256_add_epi16(e0, _mm256_unpacklo_epi8(vlo, zero));
+		e1 = _mm256_add_epi16(e1, _mm256_unpackhi_epi8(vlo, zero));
+		o0 = _mm256_add_epi16(o0, _mm256_unpacklo_epi8(vhi, zero));
+		o1 = _mm256_add_epi16(o1, _mm256_unpackhi_epi8(vhi, zero));
+
+		if (++pairs == LUT8_FLUSH_PAIRS)
+		{
+			lut8_flush(e0, e1, o0, o1, acc32);
+			e0 = e1 = o0 = o1 = zero;
+			pairs = 0;
+		}
+	}
+	if (pairs > 0)
+		lut8_flush(e0, e1, o0, o1, acc32);
+
+	/*
+	 * Odd dim: the last coordinate has no partner.  Done scalar rather than with
+	 * a 128-bit load because weave_block_codebytes() rounds a 4-bit block up to
+	 * more than 16 * dim bytes when dim is odd, so a vector load here would reach
+	 * into the slack tail -- in bounds, but never written by any pack function
+	 * (weave/quantize.h), which is a valgrind report and a reader's doubt for no
+	 * gain on one coordinate out of dim.  The byte table has no such tail either:
+	 * it is exactly dim * 16 bytes.
+	 */
+	if (j < dim)
+	{
+		const weave_uint8 *p = codes + (size_t) j * 16;
+		const weave_uint8 *row = tbl + (size_t) j * 16;
+		int			b;
+
+		for (b = 0; b < 16; b++)
+		{
+			acc32[2 * b] += row[p[b] & 0x0F];
+			acc32[2 * b + 1] += row[p[b] >> 4];
+		}
+	}
+
+	for (s = 0; s < blk->nlanes; s++)
+	{
+		if ((avail & (1u << s)) == 0)
+			out[s] = WEAVE_KERNEL_NEVER;
+		else
+			out[s] = byte_lane_score(blk->lut, acc32[s],
+									 blk->scales[(size_t) s * blk->scalestride]);
+	}
+	return blk->nlanes;
+}
+
+static const WeaveScoreKernel weave_score_kernel_byte = {
+	.name = "lut-byte",
+	.score_block = weave_score_block_byte_avx2,
+	.approximate = 1,
 };
 
 #endif							/* WEAVE_KERNEL_X86_GNUC */
@@ -605,17 +940,35 @@ static const WeaveScoreKernel weave_score_kernel_avx2 = {
 /* ---------------------------------------------------------------------------
  * The registry
  *
- * Best first, scalar last.  Only paths that have passed
- * test/hegel/test_kernels.c on a host that can run them appear here at all: a
- * path dispatch can pick but the differential test never exercised is the
- * fast-but-wrong shape AGENTS.md rule 8 is about, and leaving it out of the
- * table is a stronger guarantee than leaving it in and hoping.
+ * Exact paths best first, then the approximate ones, and scalar always last.
+ * Only paths that have passed test/hegel/test_kernels.c on a host that can run
+ * them appear here at all: a path dispatch can pick but the differential test
+ * never exercised is the fast-but-wrong shape AGENTS.md rule 8 is about, and
+ * leaving it out of the table is a stronger guarantee than leaving it in and
+ * hoping.
  *
- * "Best" here means widest ISA, which is a convention borrowed from core, NOT a
- * measurement -- and for an exact float-LUT gather it is a weaker assumption
- * than usual, because the work is gathers rather than arithmetic.  bench/kernels.c
- * is owed (doc/PHASES.md V6) and pg_weave.vec_kernel exists so a host can be
- * A/B'd and a bug report reproduced without a rebuild.
+ * "BEST" IS NOW A MEASUREMENT, AT ONE DIMENSION.  This comment used to say best
+ * meant widest ISA -- "a convention borrowed from core, NOT a measurement" -- and
+ * put lut-avx2 ahead of lut-wide on that basis.  Task V16 measured it on
+ * GIST-960d at n = 50k / 200k / 1M, two independent runs on r7i.2xlarge, and
+ * lut-wide wins at every point (297.7 vs 418.8 ns/vector at n = 1M).  So the
+ * order is reversed and it is no longer a convention.
+ *
+ * THE CAVEAT, recorded rather than left implicit: that is one dimension.  Whether
+ * lut-wide still wins at LOW dim is UNMEASURED -- the gather's setup cost is
+ * per-coordinate while its win is per-lane, so the crossover, if there is one,
+ * would be at small dim.  Read this as "measured at 960-d", not "measured
+ * everywhere".  pg_weave.vec_kernel exists so a host can be A/B'd and a bug
+ * report reproduced without a rebuild.
+ *
+ * The approximate entries sit between the exact SIMD paths and scalar.  Their
+ * position is inert for dispatch, because weave_score_kernel_best() skips them
+ * outright (WeaveScoreKernel.approximate); they are in the table so that
+ * weave_score_kernel_list() reports them and the differential test cannot miss a
+ * path a caller could force.  lut-byte is registered ONLY where AVX2 is present
+ * and is never aliased to lut-byte-ref: a scalar fallback answering to a SIMD
+ * kernel's name is how the sibling project published a headline number it had to
+ * retract.
  * ------------------------------------------------------------------------- */
 
 typedef struct WeaveScoreKernelReg
@@ -625,10 +978,14 @@ typedef struct WeaveScoreKernelReg
 } WeaveScoreKernelReg;
 
 static const WeaveScoreKernelReg kernel_registry[] = {
+	{&weave_score_kernel_wide, NULL},
 #ifdef WEAVE_KERNEL_X86_GNUC
 	{&weave_score_kernel_avx2, host_has_avx2},
 #endif
-	{&weave_score_kernel_wide, NULL},
+	{&weave_score_kernel_byte_ref, NULL},
+#ifdef WEAVE_KERNEL_X86_GNUC
+	{&weave_score_kernel_byte, host_has_avx2},
+#endif
 	{&weave_score_kernel_scalar, NULL},
 };
 
@@ -660,6 +1017,17 @@ weave_score_kernel_best(void)
 	{
 		if (kernel_registry[i].available != NULL &&
 			!kernel_registry[i].available())
+			continue;
+
+		/*
+		 * APPROXIMATE KERNELS ARE NOT AUTO-SELECTABLE.  Their soundness depends
+		 * on an exact rerank downstream and no query path here can guarantee one
+		 * yet (V7/V8/V15); see WeaveScoreKernel.approximate for the full
+		 * argument.  Skipping them here rather than omitting them from the table
+		 * keeps them reachable by name, which is what the A/B and the
+		 * differential test need.
+		 */
+		if (kernel_registry[i].k->approximate)
 			continue;
 		return kernel_registry[i].k;
 	}

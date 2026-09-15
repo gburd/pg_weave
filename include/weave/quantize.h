@@ -465,6 +465,48 @@ typedef struct WeaveQueryLut
 								 * because it is free. */
 	float		qnorm;			/* ||q||_2, for bounds (B2) and (B3) */
 	float		qnorm2;			/* ||q||^2, for the L2 bound */
+
+	/* ----------------------------------------------------------------------
+	 * The 8-bit companion table, for the byte-LUT scoring kernels (task V16,
+	 * src/vector/kernels.c "lut-byte-ref" and "lut-byte").
+	 *
+	 * dim * nlevels bytes in the SAME row-major-by-coordinate layout as `lut`,
+	 * carved out of the SAME single allocation `_alloc` points at, so a caller
+	 * still frees exactly one block.  NULL unless nlevels == 16.
+	 *
+	 * FOUR BITS IS A HARD REQUIREMENT, not a preference.  The AVX2 kernel gathers
+	 * with _mm256_shuffle_epi8, whose table is 16 bytes per 128-bit half, so one
+	 * coordinate's whole table has to BE those 16 entries.  At any other width
+	 * there is no byte table to build and the kernels refuse the block rather
+	 * than approximate it differently.
+	 *
+	 * THE QUANTIZATION, and why it costs ranking so little.  Per coordinate j,
+	 *
+	 *	 mn_j   = min over c of lut[j][c]
+	 *	 range  = max over j,c of (lut[j][c] - mn_j)		-- ONE value, whole table
+	 *	 step   = range / 255							-- 0 iff range == 0
+	 *	 lut8[j][c] = clamp(lrintf((lut[j][c] - mn_j) / step), 0, 255)
+	 *	 offset = sum_j mn_j
+	 *
+	 * and a lane's score is reconstructed as step * acc + offset, where acc is
+	 * the integer sum of the gathered bytes.  A per-row offset with a GLOBAL step
+	 * is what keeps that reconstruction AFFINE in one integer accumulator: step >
+	 * 0 and offset is a constant of the query, identical for every lane of every
+	 * block, so the map cannot reorder lanes.  The transform is therefore
+	 * RANK-PRESERVING UP TO ROUNDING -- the only thing that can permute a result
+	 * list is the per-coordinate rounding residual, bounded by step/2 each.  That
+	 * is why the measured recall cost is 0.0020 on GIST-960d rather than
+	 * arbitrary, and it is why a per-COORDINATE step was rejected: it would make
+	 * the reconstruction a weighted sum and cost a multiply per coordinate,
+	 * which is the entire saving.
+	 *
+	 * It is still an APPROXIMATION, so the kernels that read it are marked
+	 * `approximate` in weave/kernels.h and `auto` will not select them.
+	 * ---------------------------------------------------------------------- */
+	weave_uint8 *lut8;			/* dim * nlevels bytes, or NULL if nlevels != 16 */
+	float		lut8_step;		/* one quantum in score units; 0 iff range == 0 */
+	float		lut8_offset;	/* sum_j mn_j; the same for every lane */
+
 	void	   *_alloc;
 } WeaveQueryLut;
 

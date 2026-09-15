@@ -390,7 +390,7 @@ of lookups. That is now stronger: **at 3 bits the fastest kernel does not exist*
 named revision trigger for the shape is resolved for 4 bits a second time, on a second
 mechanism.
 
-## What this does to V15 — and the answer changed twice, because stage 2 was a harness artifact
+## What this does to V15 — the answer changed THREE times, twice through a harness artifact and once through a biased query sample
 
 **Read the sequence, not just the conclusion**, because the conclusion moved three times
 in two days and every move was downstream of one measurement error.
@@ -411,6 +411,9 @@ correctly on the third attempt.
 
 ### Measured, n = 1M, grouped stage 2, run `pgweave-20260915-110445`
 
+**The recall column here is nq = 10 and is WRONG** — see the retraction two sections down.
+The latencies and block counts are sound; read the recall from the nq = 100 table.
+
 | m/dim | W | recall@10 | `lut-wide` s1 / s2 / total | `lut-byte` s1 / s2 / total | s2 blocks |
 |---|---:|---:|---:|---:|---:|
 | 1.000 | 8000 | 1.0000 | 294.8 / 21.3 / **316.1** | 62.3 / 13.6 / **75.9** | 6,614 |
@@ -425,34 +428,71 @@ correctly on the third attempt.
 **Prefix 0.5 at W 8000 is 52.8 ms at recall 1.0000, against 75.9 ms for the full-dim
 arm at the same recall — 1.44x, for free.** That is the configuration to build.
 
-### The weakest number in this file is now measured
+### RETRACTED: the recall figures above are nq=10 and the 10-query sample is OPTIMISTIC
 
-The previous revision quoted the flat scan's recall as "~0.993", taken from n = 200k, and
-flagged it as the file's weakest claim. At n = 1M, full dim, W = 8000, **both kernels
-measure recall@10 = 1.0000** — the byte table's cost at this size is 0.0000, not 0.0020.
+Run `pgweave-20260915-124832`, `bench/aws/run.sh r7i.2xlarge csrecall`, n = 1M, **nq =
+100** (1,000 ground-truth slots). The previous revision of this file reported
+recall 1.0000 at full dim and at prefix 0.5, from 10 queries, and flagged the query count
+as the file's weakest number. The flag was right and every figure it guarded was wrong:
 
-**But note the query count.** Every n = 1M figure in this file is **nq = 10**, i.e. 100
-ground-truth slots, so "1.0000" means 100/100 and cannot distinguish 0.99 from 1.00 with
-any confidence. The 0.0020 delta is the better-resolved number: n = 200k, nq = 100. The
-gate asks for recall@10 >= 0.99 at n >= 1M, and **satisfying it properly needs `CSNQ=100`
-at n = 1M**, which has not been run.
+| m/dim | W | nq = 10 | **nq = 100** | error |
+|---|---:|---:|---:|---:|
+| 1.000 | 8000 | 1.0000 | **0.9930** | -0.007 |
+| 1.000 | 20000 | 1.0000 | 0.9920 | -0.008 |
+| 0.500 | 8000 | 1.0000 | **0.9880** | -0.012 |
+| 0.500 | 20000 | 1.0000 | 0.9930 | -0.007 |
+| 0.250 | 8000 | 0.9800 | **0.9090** | **-0.071** |
+| 0.250 | 20000 | 0.9900 | 0.9630 | -0.027 |
+| 0.125 | 8000 | 0.8400 | 0.6540 | -0.186 |
+| 0.125 | 20000 | 0.9300 | 0.7980 | -0.132 |
 
-### Against the gate's bar
+**nq = 10 was not merely imprecise, it was biased optimistic — by 7 points at the
+configuration this file had been recommending.** The first ten GIST query vectors are
+easier than the next ninety. A coarse sample and a *biased* sample are different
+failures, and only the second one invalidates a conclusion; this was the second.
 
-pgvector HNSW warm p50 **73.764 ms** at `R*` = 0.9760; bar is 2x = 147.5 ms.
+**The byte kernel's own recall cost survives**, which is the one claim here that does not
+move. Same run, same points, `lut-wide` against `lut-byte`: 0.9940/0.9930 at full dim,
+0.9880/0.9880 at prefix 0.5, 0.9090/0.9090 at prefix 0.25, 0.6550/0.6540 at 0.125. So
+**<= 0.0010 at n = 1M**, consistent with the 0.0020 measured at n = 200k. The 8-bit query
+table is as cheap as claimed; it was the *prefix* recall that was overstated.
 
-| configuration | recall@10 | warm p50 | vs HNSW |
-|---|---:|---:|---:|
-| pgvector HNSW, ef = 800 | 0.9760 | 73.8 ms | 1.00x |
-| **`lut-byte`, prefix 0.5 / W 8000** | **1.0000** (nq=10) | **52.8 ms** | **0.72x** |
-| `lut-byte`, prefix 0.25 / W 8000 | 0.9800 | 38.0 ms | 0.51x |
-| `lut-byte`, full dim / W 8000 | 1.0000 (nq=10) | 75.9 ms | 1.03x |
-| `lut-byte` bare flat scan, no rerank pipeline | — | 58.7 ms | 0.80x |
-| `lut-wide`, prefix 0.25 / W 8000 (V15 as specced) | 0.9800 | 103.8 ms | 1.41x |
-| `lut-wide`, full dim / W 8000 | 1.0000 | 316.1 ms | 4.28x |
+### The honest configuration table, nq = 100
 
-**The term is met with margin and at higher recall than the comparator reaches**, by a
-combination of the two levers rather than either alone.
+`lut-byte`, n = 1M, grouped stage 2. Bar: pgvector HNSW warm p50 **73.764 ms** at its
+recall ceiling `R*` = 0.9760.
+
+| m/dim | W | recall@10 | total | vs HNSW | meets >= 0.99? |
+|---|---:|---:|---:|---:|:--:|
+| 1.000 | 8000 | 0.9930 | 80.19 ms | 1.09x | yes |
+| 1.000 | 20000 | 0.9920 | 100.14 | 1.36x | yes |
+| 0.500 | 8000 | 0.9880 | **56.22** | **0.76x** | no |
+| 0.500 | 20000 | 0.9930 | **75.56** | 1.02x | yes |
+| 0.250 | 8000 | 0.9090 | 40.42 | 0.55x | no |
+| 0.250 | 20000 | 0.9630 | 59.88 | 0.81x | no |
+
+All three gate terms still pass, and the margins are smaller than the previous revision
+claimed:
+
+- **storage** 0.064x against a 0.15x bar — unchanged.
+- **latency at matched recall** `R*` = 0.9760: the cheapest configuration reaching that
+  recall is prefix 0.5 / W 8000 at **56.22 ms = 0.76x**. Passes.
+- **recall >= 0.99** at n >= 1M: reached by prefix 0.5 / W 20000 (0.9930) and by the
+  full-dim arm (0.9930). Now genuinely evidenced at 1,000 slots rather than 100.
+
+### What V15 is actually worth, which depends on the recall you need
+
+This is the number the previous two revisions both got wrong, in both directions:
+
+- **at recall >= 0.99**, the best prefix configuration is 75.56 ms against the full-dim
+  arm's 80.19 ms — **1.06x. Marginal.**
+- **at recall >= 0.9760** (the matched-recall bar), prefix 0.5 / W 8000 is 56.22 ms
+  against 80.19 ms — **1.43x.**
+
+So the prefix scan buys a real 1.4x if 0.976 is acceptable and almost nothing if 0.99 is
+required, because reaching 0.99 with a prefix costs the larger window that stage 2 then
+has to pay for. "Prefix 0.5 at recall 1.0000 for 1.44x free" was an artifact of the
+10-query sample and is withdrawn.
 
 ### What grouping stage 2 was actually worth, and why my estimate was wrong twice
 
