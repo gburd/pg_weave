@@ -198,6 +198,25 @@ typedef struct
 	int			id;
 } Hit;
 
+/*
+ * Stage 2 groups its survivors by block, which needs them ordered by block.
+ * qsort's comparator cannot take the candidate array or the position table as
+ * arguments, so they are handed over here.  File statics are acceptable in a
+ * single-threaded harness and are set immediately before each qsort call.
+ */
+static const long *g_s2_vipos;
+static const Hit *g_s2_cand;
+
+/* orders candidate INDICES by the block their vector lives in */
+static int
+cand_by_block(const void *a, const void *b)
+{
+	long		pa = g_s2_vipos[g_s2_cand[*(const int *) a].id];
+	long		pb = g_s2_vipos[g_s2_cand[*(const int *) b].id];
+
+	return (pa > pb) - (pa < pb);
+}
+
 static int
 hitcmp(const void *a, const void *b)
 {
@@ -1846,7 +1865,9 @@ main(int argc, char **argv)
 			   kall[0]->name, RW);
 		printf("# stage-1 coordinate work is m/dim of a full scan; stage 2 is W*dim\n");
 		printf("#\n");
-		printf("prefix_m\tm/dim\tW\trecall@10\tcoord_work_vs_full\ts1_ms\ts2_ms\ttotal_ms\n");
+		printf("# s2_blocks is what stage 2 scored after grouping survivors by block;\n");
+		printf("# s2_pred is nblocks * (1 - exp(-W/nblocks)), the count grouping should reach\n");
+		printf("prefix_m\tm/dim\tW\trecall@10\tcoord_work_vs_full\ts1_ms\ts2_ms\ttotal_ms\ts2_blocks\ts2_pred\n");
 
 		/* Exact top-K per query, by brute force over the original vectors: the
 		 * only honest reference for an end-to-end recall number. */
@@ -1886,7 +1907,14 @@ main(int argc, char **argv)
 				double		hits = 0;
 				double		ts1 = 0,
 							ts2 = 0;
+				/* blocks stage 2 actually scored, summed over queries.  Reported
+				 * so the grouping's predicted saving is checked rather than
+				 * asserted: the prediction is
+				 * nblocks * (1 - exp(-W / nblocks)) per query. */
+				double		s2groups = 0;
 				Hit		   *cand = xmalloc(sizeof(Hit) * W);
+				int		   *ord = xmalloc(sizeof(int) * W);
+				float	   *s2score = xmalloc(sizeof(float) * W);
 
 				for (int t = 0; t < nq; t++)
 				{
@@ -1928,24 +1956,80 @@ main(int argc, char **argv)
 
 					ts1 += now() - tt;
 
-					/* Stage 2: full-dim rescore of the W survivors.  Done per
-					 * LANE rather than per block, because the survivors scatter
-					 * and rescoring their whole blocks would charge stage 2 for
-					 * 32x the work it does. */
+					/* Stage 2: full-dim rescore of the W survivors.
+					 *
+					 * GROUPED BY BLOCK, and the reason is worth stating because
+					 * it bounds what this stage can ever cost.  A kernel scores a
+					 * BLOCK; the smallest thing it can score is 32 lanes.  Worse,
+					 * in WEAVE_PACK_LANE one vector's code is maximally
+					 * scattered -- coordinate j of lane s is a single nibble at
+					 * byte j * 16 + s / 2 -- so reading ONE lane's dim nibbles
+					 * touches dim distinct 16-byte spans, which is every byte of
+					 * the block.  Scoring one lane therefore costs the same
+					 * memory traffic as scoring all 32, and since the scan is
+					 * bandwidth-bound (bench/RESULTS_CODE_SCAN.md) there is no
+					 * per-vector shortcut to be had in this layout.
+					 *
+					 * So the only lever is to touch each block ONCE however many
+					 * survivors it holds, which is what the grouping below does.
+					 * The earlier version scored one block per survivor with
+					 * livemask = 1 << sl, paying for a whole block per candidate.
+					 *
+					 * What that is worth is small and predictable: at W survivors
+					 * over nblocks blocks the distinct-block count is
+					 * nblocks * (1 - exp(-W/nblocks)), so at W = 8000 over 31,250
+					 * blocks it is ~7,057 -- about 12%, not the ~4x an earlier
+					 * revision of doc/PHASES.md guessed.  s2_groups below reports
+					 * the count that was actually scored so the prediction is
+					 * checked rather than asserted.
+					 *
+					 * The stage that WOULD be cheap here is one over
+					 * WEAVE_PACK_VECMAJOR, where a vector's coordinates are
+					 * contiguous -- which is exactly what that layout exists for.
+					 * Stage 1 wants LANE and stage 2 wants VECMAJOR, and no index
+					 * can have both without storing the codes twice.  That
+					 * tension is the real reason a two-stage scan is not free.
+					 */
 					int			ncand = s1.n;
 
 					memcpy(cand, s1.h, sizeof(Hit) * ncand);
 
-					TopK		s2;
-
-					topk_init(&s2, RW);
-					tt = now();
+					/* Score in block order, but PUSH in the original order.
+					 *
+					 * Grouping is a statement about which blocks get touched, not
+					 * about the order results are consumed in, and keeping those
+					 * two things separate is what makes this provably identical to
+					 * the ungrouped version rather than probably identical.  An
+					 * earlier revision sorted `cand` itself and pushed in the
+					 * sorted order; recall moved (0.9350 -> 0.9200 at n=200k with
+					 * lut-wide), which is how a reordering that was assumed to be
+					 * harmless announced that it was not.
+					 *
+					 * `ord` holds candidate indices sorted by block; scores land in
+					 * `s2score` indexed by the ORIGINAL candidate position.
+					 */
 					for (int c = 0; c < ncand; c++)
+						ord[c] = c;
+					g_s2_vipos = vipos;
+					g_s2_cand = cand;
+					qsort(ord, (size_t) ncand, sizeof(int), cand_by_block);
+
+					tt = now();
+					for (int oi = 0; oi < ncand;)
 					{
-						int			vi = cand[c].id;
-						long		b = vipos[vi] / LANES;
-						int			sl = (int) (vipos[vi] % LANES);
+						long		b = vipos[cand[ord[oi]].id] / LANES;
+						int		   *e = ord + oi;
+						int			cnt = 0;
+						weave_uint32 mask = 0;
 						WeaveScoreBlock blk = {0};
+
+						/* every survivor in this block, in one mask */
+						while (oi + cnt < ncand &&
+							   vipos[cand[ord[oi + cnt]].id] / LANES == b)
+						{
+							mask |= 1u << (int) (vipos[cand[ord[oi + cnt]].id] % LANES);
+							cnt++;
+						}
 
 						blk.lut = &lut;
 						blk.layout = WEAVE_PACK_LANE;
@@ -1953,13 +2037,30 @@ main(int argc, char **argv)
 						blk.scales = scales + b * LANES;
 						blk.scalestride = 1;
 						blk.nlanes = nlanes[b];
-						blk.livemask = 1u << sl;
+						blk.livemask = mask;
 						if (kall[0]->score_block(&blk, out2) < 0)
 							die("score_block rejected a rescore block");
-						topk_push(&s2, out2[sl], vi);
-					}
+						for (int q = 0; q < cnt; q++)
+						{
+							int			ci = e[q];
+							int			sl = (int) (vipos[cand[ci].id] % LANES);
 
+							s2score[ci] = out2[sl];
+						}
+						s2groups++;
+						oi += cnt;
+					}
 					ts2 += now() - tt;
+
+					TopK		s2;
+
+					topk_init(&s2, RW);
+					for (int c = 0; c < ncand; c++)
+						topk_push(&s2, s2score[c], cand[c].id);
+
+					/* The top-RW selection is not stage-2 scan work and is not
+					 * timed as such; ts2 was closed above, at the end of the
+					 * scoring loop. */
 
 					/* Stage 3: exact float32 rerank of the top RW, which is what
 					 * the shipping shape does from the heap. */
@@ -1989,13 +2090,19 @@ main(int argc, char **argv)
 					free(lut._alloc);
 				}
 				double		work = (double) m / dim + (double) W * dim / ((double) n * dim);
+				long		nblk = (n + LANES - 1) / LANES;
+				double		predicted = (double) nblk *
+					(1.0 - exp(-(double) W / (double) nblk));
 
-				printf("%d\t%.4f\t%d\t%.4f\t%.4f\t%.2f\t%.2f\t%.2f\n",
+				printf("%d\t%.4f\t%d\t%.4f\t%.4f\t%.2f\t%.2f\t%.2f\t%.0f\t%.0f\n",
 					   m, (double) m / dim, W, hits / (nq * (double) K), work,
 					   1000 * ts1 / nq, 1000 * ts2 / nq,
-					   1000 * (ts1 + ts2) / nq);
+					   1000 * (ts1 + ts2) / nq,
+					   s2groups / nq, predicted);
 				fflush(stdout);
 				free(cand);
+				free(ord);
+				free(s2score);
 			}
 		}
 		return 0;
