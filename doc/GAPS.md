@@ -485,19 +485,20 @@ is acceptable", 50 lines above another comment in the same function saying "EVER
 insert lands here and mints a segment" for the common case of a body index. Both
 cannot be true, and the measurement says the second one is.
 
-### G21 - `t/014` intermittently reports a leaked page after double crash recovery - **OPEN, reproducible, mechanism unknown 2026-09-15**
+### G21 - `t/014` reported a leaked page after double crash recovery, once - **OPEN, NOT currently reproducible, mechanism unknown 2026-09-15**
 
-`t/014_merge_durability.pl` test 9 fails with `weave_check()` reporting **"1 unreachable
-page(s) not flagged freed; first is block 2883"** after the second crash-recovery cycle.
-Test 7, which asserts the relation size survived that crash, passes in the same run - so
-the file is the right length and one page inside it is orphaned.
+`t/014_merge_durability.pl` test 9 failed once with `weave_check()` reporting **"1
+unreachable page(s) not flagged freed; first is block 2883"** after the second
+crash-recovery cycle. Test 7, which asserts the relation size survived that crash, passed
+in the same run - so the file was the right length and one page inside it was orphaned.
 
-**Reproducer**: the full nix TAP leg, and -- as of 2026-09-15 -- *only* the full leg.
+**Reproducer**: none. It was seen in the full nix TAP leg,
 
     nix build .#checks.x86_64-linux.tap-pg17 --rebuild -L
 
-`--rebuild` is required: a plain `nix build` returns a cached success without re-running.
-See the warning below before trusting any result from it.
+and has not been seen since -- see the table below before spending time on it.
+`--rebuild` is required for any attempt: a plain `nix build` returns a cached success
+without re-running. See the warning further down before trusting any result from it.
 
 **The rate is not known, and the "1 run in 8-10" this entry used to claim is withdrawn.**
 That figure came out of the same contaminated series the correction below describes -- the
@@ -507,21 +508,28 @@ that `t/014` actually ran:
 
 | series | runs | failures |
 |---|---:|---:|
-| full `tap-pg17` leg, `--rebuild --keep-failed` | 15 | 0 |
+| full `tap-pg17` leg, `--rebuild --keep-failed` | 16 | 0 |
+| the full `t/0*.pl` list, same order, outside nix | 20 | 0 |
 | `t/014` alone, driven by `prove` against the same binaries the leg builds | 100 | 0 |
 
-The two lines say different things and the difference is the finding. **The 100 clean
-isolated runs rule the file out as a self-contained reproducer:** at one failure in nine, a
-clean run of 100 has probability 8e-6. The 15 clean legs do *not* rule out a per-leg rate
-that size -- 0 in 15 puts the 95 % upper bound at 18 % -- so this is not "the bug went
-away", it is "the trigger is not inside `t/014` in isolation". What the leg has and the
-isolated run does not: twelve other test files run before it in the same `prove`
-invocation, the nix sandbox, and that sandbox's filesystem. A cheap next probe is
-therefore the *whole* file list outside nix, which separates "other tests first" from "nix
-sandbox".
+The three lines say different things and the differences are the finding.
 
-An isolated run costs 5.7 s and a full leg costs 3 min, which is the reason to keep
-looking for a reproducer smaller than the leg.
+- **The file alone is not a reproducer.** At one failure in nine, 100 clean isolated runs
+  have probability 8e-6.
+- **Neither is the file list, sandbox or no sandbox.** Combining the two full-sequence
+  series -- 36 runs, 0 failures -- puts P(all clean | one in nine) at 1.4 %, and the
+  95 % upper bound on the per-run rate at **8 %**. So the rate is not 1 in 9; it may
+  well be 1 in 50 or 1 in 100, which no affordable loop distinguishes.
+- The nix sandbox is not the trigger either: a sequence outside it costs 2 m 55 s
+  against the leg's 2 m 58 s, so the two series are the same experiment minus the
+  sandbox, and both are clean.
+
+**Disposition: not hunted further until it recurs.** There is no reproducer, and
+continuing to buy 3-minute lottery tickets at a rate bounded above by 8 % is worse value
+than the open work in `doc/PHASES.md`. What replaces the hunt is the instrument below:
+the next occurrence -- in CI, on a workstation, anywhere -- prints what the page is
+instead of just that it exists. That is the whole reason to build the reading before
+chasing the bug.
 
 **What is established:**
 
@@ -568,18 +576,15 @@ what they would disagree about.
 
 What is left, in order:
 
-1. **Find a reproducer smaller than the 3-minute leg**, now that the file alone is ruled
-   out: run the full `t/*.pl` list outside nix (separates "twelve tests run first" from
-   "the nix sandbox"), then bisect the list.
-2. Keep legs running with the diag in place; the reading arrives with the failure.
-3. Run `t/014` with `autovacuum = off` to test the hypothesis below by elimination.
-   Cheapest to write, and it only narrows rather than diagnoses -- and note it is a test
-   of a hypothesis, not a reproducer, so it needs a reproducer first to be worth
-   anything.
+1. **Wait for it.** The instrument reports the page's kind the next time it happens; CI
+   runs this file on every push.
+2. If it recurs and a reproducer appears with it, run `t/014` with `autovacuum = off` to
+   test the hypothesis below by elimination. Note that this is a test of a hypothesis,
+   not a reproducer, so it is worth nothing until step 1 supplies one.
 
 Decoding a page header by hand out of a `--keep-failed` data directory (the old step 2) is
-no longer the plan: the instrument prints the same reading in SQL, and the 15 legs run
-under `--keep-failed` since it landed have not tripped.
+no longer the plan: the instrument prints the same reading in SQL, and 16 legs run under
+`--keep-failed` since it landed have not tripped.
 
 One mechanism is worth writing down because it is the only one consistent with a *physical*
 log: **GenericXLog replay has no undo.** A transaction killed part-way has the records it
