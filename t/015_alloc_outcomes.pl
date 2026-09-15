@@ -42,6 +42,14 @@ $node->safe_psql('postgres', 'CREATE EXTENSION pg_weave');
 
 # Returns the seven counters as a hashref, after resetting them, running $sql, and
 # reading them back -- so every number brackets exactly one operation.
+#
+# THE SINGLE safe_psql IS LOAD-BEARING, not tidiness. The counters are
+# backend-local, so a reset, an operation and a read split across three psql
+# invocations are three different backends and the read returns a fresh backend's
+# zeros -- which reads exactly like "the allocator was never called" while the index
+# grows. The sibling project lost a cycle to that reading. Do not split this into
+# separate safe_psql calls, and do not add a test that reads the counters after an
+# operation performed elsewhere.
 sub bracket
 {
     my ($sql) = @_;
