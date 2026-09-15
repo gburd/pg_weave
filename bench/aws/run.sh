@@ -638,7 +638,7 @@ EOF
 	say "two-stage prefix scan, n=1M, timed"
 	$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs 1000000 \
 			${CSNQ:-10} bits=4 k=10 order=natural kernel=lut-wide \
-			prefix=480,240,120 pwin=8000,20000 \
+			prefix=960,480,240,120 pwin=8000,20000 \
 			queries=corpus/gist/gist_query.fvecs" \
 		2>&1 | tee -a "$OUT/prefix.log" || die "prefix scan failed"
 
@@ -652,9 +652,19 @@ EOF
 	say "two-stage prefix scan through the byte-LUT kernel, n=1M"
 	$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs 1000000 \
 			${CSNQ:-10} bits=4 k=10 order=natural kernel=lut-byte \
-			prefix=480,240,120 pwin=8000,20000 \
+			prefix=960,480,240,120 pwin=8000,20000 \
 			queries=corpus/gist/gist_query.fvecs" \
 		2>&1 | tee -a "$OUT/prefix_byte.log" || die "byte-LUT prefix scan failed"
+
+	# The clustered arm is OPT-IN (CSCLUSTER=1) because it re-derives an answer we
+	# already have from two clean-host runs -- 0.00% pruning at n=200k, lists=6250 --
+	# and a k-means over 6,250 centroids at 960-d costs ~11 minutes PER ITERATION,
+	# six of them, which is most of an instance-hour to confirm a number twice
+	# confirmed.  Set CSCLUSTER=1 when the bound itself is what changed.
+	if [ "${CSCLUSTER:-0}" != "1" ]; then
+		say "skipping the clustered arm (CSCLUSTER=1 to run it); 0.00% pruning already confirmed twice on clean hosts"
+		return
+	fi
 
 	say "n=200000 clustered -- does the bound prune at scale on a clean host?"
 	$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs 200000 \
