@@ -30,6 +30,12 @@
 #							     deterministic, so this arm does not need an
 #							     uncontended host -- but it is run here anyway
 #							     because the corpus is here.
+#					  csdim	   ns/vector for every kernel across dim (V17),
+#							     two arms: fixed n and fixed code bytes.  Sets
+#							     weave_score_kernel_best()'s registry order, which
+#							     until V17 rested on the 960-d point alone.  CPU
+#							     only, and it needs an UNCONTENDED host for the
+#							     same reason codescan does.
 #					  rerankcold winsweep, then cold p50 of a heap rerank with
 #							     the real wvec type (bench/rerank_cold.sh)
 #					  hnswbase   the pgvector HNSW baseline: bytes/vector,
@@ -65,7 +71,7 @@ case "$JOB" in
 	# the same corpus is ~5 GB again.  400 leaves room to hold all of it at once
 	# without the load failing halfway through a two-hour run.
 	winsweep|rerankcold|hnswbase) VOLGB=${VOLGB_OVERRIDE:-400} ;;
-	codescan|csrecall) VOLGB=${VOLGB_OVERRIDE:-250} ;;
+	codescan|csrecall|csdim) VOLGB=${VOLGB_OVERRIDE:-250} ;;
 esac
 REGION=$(aws configure get region --profile "$PROFILE")
 RUN=pgweave-$(date -u +%Y%m%d-%H%M%S)
@@ -725,6 +731,76 @@ run_csrecall() {
 	done
 }
 
+run_csdim() {
+	# V17: WHICH KERNEL WINS AT WHICH DIMENSIONALITY.
+	#
+	# Every kernel latency on record is at 960 dimensions, and
+	# weave_score_kernel_best() picks by registry order for every dim.  V16
+	# reordered that list on the strength of the 960-d point alone, which is the
+	# same unmeasured-default mistake it was fixing, one position along.
+	#
+	# TWO ARMS, because "faster at dim d" has two answers depending on what is
+	# held constant:
+	#   fixed n      -- bytes scanned scale with dim; the realistic shape of an
+	#                   index that happens to carry short vectors.
+	#   fixed bytes  -- n chosen so the code array is about the same size at every
+	#                   dim, holding the memory regime constant so the comparison
+	#                   is per-coordinate compute rather than cache residency.
+	# At 960-d/1M the scan is ~69 % bandwidth-bound, so one arm alone would
+	# confound the two.
+	#
+	# dim= truncates each loaded vector to its leading d coordinates and
+	# renormalizes.  Legitimate rather than a shortcut: the quantizer's rotation
+	# makes coordinates exchangeable, the same property V15's prefix stage rests
+	# on.  It also means the zero-norm drop applies to the truncated vector, so
+	# the kept count is a function of dim -- which is why every row reports its
+	# own n.
+	#
+	# A LIMITATION OF THE CORPUS, NOT THE HOST: GIST has 1M base vectors, so at
+	# 64-d the largest possible code array is ~32 MB.  No low-dim point can be
+	# made bandwidth-bound with this corpus on any instance, and the fixed-bytes
+	# arm cannot reach the low dims at all.  Recorded rather than papered over.
+	fetch_gist
+	say "building code_scan"
+	$SSH 'cd pg_weave && gcc -O2 -march=native -std=gnu99 -I include \
+			-o /scratch/code_scan bench/code_scan.c src/vector/quantize.c \
+			src/vector/pack.c src/vector/kernels.c -lm && echo built' \
+		2>&1 | tee "$OUT/build.log" || die "code_scan build failed"
+
+	# Same gate as the other code_scan jobs, same reason: -march=native here is
+	# not -mavx2 on the workstation, so the binary about to produce latencies is
+	# not the binary that was checked there.
+	say "byte-LUT differential self-check on this host (gate)"
+	$SSH 'cd /scratch && ./code_scan selfcheck=2000' \
+		2>&1 | tee "$OUT/selfcheck.log" \
+		|| die "byte-LUT self-check FAILED on the bench host -- no latency below would mean anything"
+
+	# nq is small on purpose: this job measures ns/vector and the scan is timed
+	# per query.  Recall at nq=100 is the csrecall job's business, and mixing the
+	# two would make this job an hour longer for numbers already recorded.
+	CSDIMS=${CSDIMS:-"64 128 240 480 768 960"}
+	for dim in $CSDIMS; do
+		say "fixed n=${CSDIMN:-1000000}, dim=$dim"
+		$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs \
+				${CSDIMN:-1000000} ${CSDIMNQ:-10} bits=4 k=10 order=natural \
+				kernel=all dim=$dim" \
+			2>&1 | tee -a "$OUT/csdim_fixedn.log" || die "csdim fixed-n dim=$dim failed"
+	done
+	for dim in $CSDIMS; do
+		# 4 bits => dim/2 bytes per vector; ~480 MB is the 960-d/1M point every
+		# recorded kernel number was taken at.
+		n=$(( ${CSDIMMB:-480} * 1048576 / (dim / 2) ))
+		if [ "$n" -gt 1000000 ]; then
+			say "skipping fixed-bytes dim=$dim: it needs n=$n and the corpus has 1M"
+			continue
+		fi
+		say "fixed ~${CSDIMMB:-480} MB, dim=$dim, n=$n"
+		$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs $n \
+				${CSDIMNQ:-10} bits=4 k=10 order=natural kernel=all dim=$dim" \
+			2>&1 | tee -a "$OUT/csdim_fixedbytes.log" || die "csdim fixed-bytes dim=$dim failed"
+	done
+}
+
 run_p0merge() {
 	# A/B for the merge tombstone P0 (bench/RESULTS_P0_MERGE_TOMBSTONE.md).
 	#
@@ -890,6 +966,7 @@ case "$JOB" in
 	winsweep)   run_winsweep ;;
 	codescan)   run_codescan ;;
 	csrecall)   run_csrecall ;;
+	csdim)      run_csdim ;;
 	rerankcold) run_winsweep; run_rerankcold ;;
 	hnswbase)   run_hnswbase ;;
 	all)     run_smoke; run_bound; run_lexical ;;
