@@ -82,6 +82,42 @@ REINDEX INDEX cd_weave;
 SELECT count(*) AS violations_after_reindex
   FROM weave_check('cd_weave', true) WHERE NOT ok;
 
+-- ---- weave_page_info(): the per-page reading -----------------------------
+-- weave_check() reports THAT a page is leaked; this reports WHAT each page is.
+-- Both derive from one traversal (wvck_mark_reachable), which is deliberate: two
+-- walks would be two answers to the same question, and the leak report is exactly
+-- what they would disagree about.  So the interesting assertion is that the two
+-- agree -- if the split ever broke, this is where it shows.
+SELECT kind, freed, uninitialized, reachable
+  FROM weave_page_info('cd_weave', 0);
+SELECT count(*) AS one_row_for_one_block
+  FROM weave_page_info('cd_weave', 0);
+SELECT count(*) = pg_relation_size('cd_weave') / current_setting('block_size')::int
+         AS one_row_per_page
+  FROM weave_page_info('cd_weave');
+
+-- The leak definition, spelled out once here so the shape is on the record for
+-- whoever reads a failure: unreachable, not flagged freed, not uninitialized.
+-- coalesce() because freed is NULL for a page with no weave-sized special area,
+-- and a torn unreachable page must be counted, not filtered out.
+SELECT count(*) AS orphaned_pages
+  FROM weave_page_info('cd_weave')
+ WHERE NOT reachable AND coalesce(freed, false) = false AND NOT uninitialized;
+SELECT ok AS leak_invariant_agrees
+  FROM weave_check('cd_weave', true)
+ WHERE invariant = 'pages_reachable_or_freed';
+
+-- Two independent readers of the descriptor pages must count the same pages.
+SELECT (SELECT count(*) FROM weave_page_info('cd_weave')
+         WHERE kind = 'chandesc' AND NOT freed)
+     = weave_index_nsegments('cd_weave') AS chandesc_pages_agree;
+
+-- Every page decodes to a known kind, which page_kinds_decodable also asserts;
+-- here it is visible per page rather than as a count.
+SELECT count(*) AS undecodable_pages
+  FROM weave_page_info('cd_weave')
+ WHERE NOT uninitialized AND (kind IS NULL OR kind = 'unknown');
+
 -- ---- answers are unaffected by the format change ------------------------
 -- The descriptor page is metadata; it must not perturb a single result.  Index
 -- path versus sequential path, which is the only ground truth available.
@@ -101,6 +137,12 @@ RESET enable_seqscan;
 CREATE TABLE cdnb (id int);
 CREATE INDEX cdnb_btree ON cdnb(id);
 SELECT * FROM weave_check('cdnb_btree');
+SELECT * FROM weave_page_info('cdnb_btree', 0);
+
+-- A block number outside the relation is a caller error, not an empty result: an
+-- empty result reads as "that page is fine".
+SELECT * FROM weave_page_info('cd_weave', 1000000000);
+SELECT * FROM weave_page_info('cd_weave', -1);
 
 -- An index built over an empty table still has a metapage and an empty bolt
 -- directory, so every invariant holds vacuously and nothing is violated.  (The

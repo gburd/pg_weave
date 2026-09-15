@@ -613,6 +613,12 @@ cannot justify.
   or flagged `WEAVE_FREED`. An unreachable unflagged page is a leak. `deep` because
   it walks every chain and every page. Note that nothing short of a REINDEX
   reclaims a page in that state, since it is neither on a chain nor in the FSM.
+  **When it fires, `weave_page_info(idx)` is the follow-up**: the invariant row can
+  only carry a count and a first offender, and a leaked page's *kind* is what names
+  the write path that left it. Both read the same traversal
+  (`wvck_mark_reachable()`), deliberately — two walks would be two answers to one
+  question, and this invariant is exactly what they would disagree about. A leak is
+  the row with `reachable = false`, `freed` not true, `uninitialized = false`.
 - `chains_do_not_overlap` (`deep`) — no block is reached from two different chains.
   §8 item 5.
 

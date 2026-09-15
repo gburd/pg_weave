@@ -54,6 +54,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
 #include "weave/am.h"
@@ -110,6 +111,26 @@ wvck_mark(WeaveCheckCtx *cx, BlockNumber blk)
 		return;
 	}
 	cx->mark[blk] |= WVCK_SEEN;
+}
+
+/*
+ * Allocate and zero one mark byte per block.
+ *
+ * MemoryContextAllocHuge above MaxAllocSize because the size is relation-scale:
+ * at 8 kB pages a 1 TB index is 134 M blocks, so palloc() would throw on an index
+ * that is merely large rather than broken.  (alloc-ok: bounded by the relation
+ * length, and the caller has already opened the relation.)
+ */
+static uint8 *
+wvck_mark_alloc(BlockNumber nblocks)
+{
+	Size		sz = (Size) nblocks * sizeof(uint8);
+	uint8	   *mark = (uint8 *) (sz > MaxAllocSize
+								  ? MemoryContextAllocHuge(CurrentMemoryContext, sz)
+								  : palloc(sz));
+
+	MemSet(mark, 0, sz);
+	return mark;
 }
 
 /*
@@ -883,27 +904,23 @@ wvck_segments(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 }
 
 /*
- * Invariant: every page is reachable from the metapage, or flagged WEAVE_FREED.
- * An unreachable unflagged page is a leak.
+ * Mark every page reachable from the metapage in cx->mark.
  *
- * Expensive (it walks every chain plus every page), so it is behind `deep`, the
- * same treatment doc/specs/SEGMENT_FORMAT.md sect. 9 prescribes for the graph
- * connectivity check.  It is also the check that actually proves the v6
- * descriptor page is both reachable while live and freed on merge -- a page kind
- * that leaked would show up here and nowhere else.
+ * Split out of wvck_reachable() -- which is now only the report -- because
+ * weave_page_info() needs the same traversal to answer "is THIS block reachable"
+ * per page rather than "the first leak is block N".  Two independent walks would
+ * be two answers to one question, and the leak report is precisely the thing they
+ * would disagree about.
  *
  * The posting chain is walked from the FIRST dictionary entry's firstposting,
  * because all terms in a bolt share one chain; this mirrors weave_free_segment(),
- * and if the two ever disagree the leak shows up here.
+ * and if the two ever disagree the leak shows up in the caller.
  */
 static void
-wvck_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
+wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 {
 	uint32		s;
 	BlockNumber blk;
-	int64		nleak = 0;
-	BlockNumber firstleak = InvalidBlockNumber;
-	StringInfoData d;
 
 	wvck_mark(cx, WEAVE_METAPAGE_BLKNO);
 
@@ -1019,6 +1036,31 @@ wvck_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 		}
 		pfree(e.data);
 	}
+}
+
+/*
+ * Invariant: every page is reachable from the metapage, or flagged WEAVE_FREED.
+ * An unreachable unflagged page is a leak.
+ *
+ * Expensive (it walks every chain plus every page), so it is behind `deep`, the
+ * same treatment doc/specs/SEGMENT_FORMAT.md sect. 9 prescribes for the graph
+ * connectivity check.  It is also the check that actually proves the v6
+ * descriptor page is both reachable while live and freed on merge -- a page kind
+ * that leaked would show up here and nowhere else.
+ *
+ * It reports a COUNT and the FIRST offending block, which is all an invariant row
+ * can carry.  When it fires, weave_page_info() is the follow-up: it names every
+ * unreachable page and says what kind each one is.
+ */
+static void
+wvck_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
+{
+	BlockNumber blk;
+	int64		nleak = 0;
+	BlockNumber firstleak = InvalidBlockNumber;
+	StringInfoData d;
+
+	wvck_mark_reachable(cx, meta);
 
 	for (blk = 1; blk < cx->nblocks; blk++)
 	{
@@ -1138,12 +1180,7 @@ weave_check(PG_FUNCTION_ARGS)
 
 	if (deep)
 	{
-		Size		sz = (Size) cx.nblocks * sizeof(uint8);
-
-		cx.mark = (uint8 *) (sz > MaxAllocSize
-							 ? MemoryContextAllocHuge(CurrentMemoryContext, sz)
-							 : palloc(sz));
-		MemSet(cx.mark, 0, sz);
+		cx.mark = wvck_mark_alloc(cx.nblocks);
 		/* re-walk with marking on, so the chain walks populate the bitmap */
 		cx.noverlap = 0;
 		wvck_reachable(&cx, &meta);
@@ -1151,6 +1188,197 @@ weave_check(PG_FUNCTION_ARGS)
 		cx.mark = NULL;
 	}
 
+	index_close(cx.index, AccessShareLock);
+	return (Datum) 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * weave_page_info(regclass, blkno) -- what a page IS, one row per page
+ *
+ * WHY THIS EXISTS.  weave_check(deep) can tell you that a page is leaked; it
+ * cannot tell you WHAT the page is, and that is the whole diagnosis.  An
+ * invariant row carries a count and a first offender ("1 unreachable page(s) not
+ * flagged freed; first is block 2883"), which is enough to know something is
+ * wrong and not enough to know which writer left it.  doc/GAPS.md G21 stalled on
+ * exactly that: the extension had no page-level introspection at all, so the only
+ * remaining moves were guessing at crash sequences (exhausted, all clean) or
+ * decoding a page header by hand out of a preserved data directory.
+ *
+ * WHAT THE COLUMNS ARE FOR, since a diagnostic with unexplained columns gets
+ * misread:
+ *
+ *   kind        -- the decoded WeavePageKind name.  This is the who-wrote-it
+ *                  column; a leaked page's kind names the write path.
+ *   flags/kind_id -- the RAW header bytes.  Present because the decode is lossy
+ *                  on purpose: weave_page_kind_decode() answers "unknown" for
+ *                  several distinct byte patterns (no kind bit, two kind bits, a
+ *                  reserved bit, an out-of-range extended id) and a corruption
+ *                  report needs to distinguish them.
+ *   freed       -- WEAVE_FREED.  Freed pages are not leaks.
+ *   uninitialized -- PageIsNew().  Also not a leak: a crash between the extend
+ *                  and the GenericXLog commit leaves exactly one, which is a
+ *                  normal recoverable state (see wvck_page_kinds()).
+ *   reachable   -- from the metapage, by the SAME walk the leak invariant uses.
+ *                  A leak is reachable=false, freed=false, uninitialized=false.
+ *   nextblk     -- NULL for InvalidBlockNumber, so "chains nowhere" reads as NULL
+ *                  rather than as 4294967295.
+ *   lsn         -- which WAL record last touched the page.  Against the recovery
+ *                  end LSN this says whether a page was written by the operation
+ *                  under suspicion or after it, which no other column can.
+ *   free_bytes  -- distinguishes an initialized-but-empty page from one carrying
+ *                  content, without dumping any content.
+ *
+ * COST.  The reachability walk is O(relation) and runs even for a single block,
+ * because a `reachable` column that is sometimes NULL is a column that gets
+ * misread.  This is a diagnostic; pay the walk.
+ *
+ * It ERRORs on a metapage that does not validate, like weave_check() and for the
+ * same reason: with the format version unknown there is nothing to be reachable
+ * FROM.  If a metapage-corrupt index ever needs this, the fix is a non-throwing
+ * meta reader (weave_read_chandesc() has the precedent), not a `reachable` that
+ * silently means "not computed".
+ *
+ * REVOKEd from PUBLIC in the install SQL: it takes a regclass and index_open()
+ * performs no ACL check, so without that any user could enumerate the page
+ * structure of any index in the database.  It exposes no indexed content, but
+ * pageinspect's precedent is the right one to follow.
+ * ------------------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(weave_page_info);
+
+#define WEAVE_PAGE_INFO_NCOLS 10
+
+static void
+wvpi_row(WeaveCheckCtx *cx, BlockNumber blk)
+{
+	Datum		values[WEAVE_PAGE_INFO_NCOLS];
+	bool		nulls[WEAVE_PAGE_INFO_NCOLS];
+	Buffer		buf;
+	Page		page;
+	bool		isnew;
+
+	memset(nulls, true, sizeof(nulls));
+
+	buf = ReadBuffer(cx->index, blk);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	isnew = PageIsNew(page);
+
+	values[0] = Int64GetDatum((int64) blk);
+	nulls[0] = false;
+	values[5] = BoolGetDatum(isnew);
+	nulls[5] = false;
+	values[6] = BoolGetDatum((cx->mark[blk] & WVCK_SEEN) != 0);
+	nulls[6] = false;
+	values[8] = LSNGetDatum(PageGetLSN(page));
+	nulls[8] = false;
+
+	/*
+	 * Only read the special area when there is one of the right size.  A
+	 * never-written page is all zeroes, so pd_special is 0 and
+	 * PageGetSpecialPointer() would hand back the start of the page -- reporting
+	 * the first four bytes of nothing as flags and a kind.  The size check also
+	 * covers a torn or foreign page, which is a state a corruption diagnostic
+	 * must be able to survive rather than one it may assume away.
+	 */
+	if (!isnew &&
+		PageGetSpecialSize(page) == MAXALIGN(sizeof(WeavePageOpaqueData)))
+	{
+		WeavePageOpaque op = WeavePageGetOpaque(page);
+
+		values[1] = CStringGetTextDatum(weave_page_kind_name(WeavePageGetKind(page)));
+		values[2] = Int32GetDatum((int32) op->flags);
+		values[3] = Int32GetDatum((int32) op->kind);
+		values[4] = BoolGetDatum(WeavePageIsFreed(page));
+		nulls[1] = nulls[2] = nulls[3] = nulls[4] = false;
+		if (op->nextblk != InvalidBlockNumber)
+		{
+			values[7] = Int64GetDatum((int64) op->nextblk);
+			nulls[7] = false;
+		}
+		values[9] = Int32GetDatum((int32) PageGetFreeSpace(page));
+		nulls[9] = false;
+	}
+	UnlockReleaseBuffer(buf);
+
+	tuplestore_putvalues(cx->tupstore, cx->tupdesc, values, nulls);
+}
+
+Datum
+weave_page_info(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	MemoryContext oldcontext;
+	WeaveCheckCtx cx;
+	WeaveMetaPageData meta;
+	Buffer		mb;
+	bool		oneblock = !PG_ARGISNULL(1);
+	int64		want = oneblock ? PG_GETARG_INT64(1) : 0;
+
+	if (rsinfo == NULL || !(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	MemSet(&cx, 0, sizeof(cx));
+	if (get_call_result_type(fcinfo, NULL, &cx.tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	Assert(cx.tupdesc->natts == WEAVE_PAGE_INFO_NCOLS);
+
+	oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	cx.tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = cx.tupstore;
+	rsinfo->setDesc = cx.tupdesc;
+	MemoryContextSwitchTo(oldcontext);
+
+	cx.index = index_open(indexoid, AccessShareLock);
+	if (cx.index->rd_rel->relam != get_index_am_oid("weave", true))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a weave index",
+						RelationGetRelationName(cx.index))));
+
+	cx.nblocks = RelationGetNumberOfBlocks(cx.index);
+	if (cx.nblocks == 0)
+	{
+		/* buildempty()/an unbuilt index: no pages, hence no rows.  Not an error:
+		 * "this index has no pages" is a true and useful answer. */
+		index_close(cx.index, AccessShareLock);
+		return (Datum) 0;
+	}
+
+	if (oneblock && (want < 0 || want >= (int64) cx.nblocks))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("block number %lld is out of range for index \"%s\"",
+						(long long) want, RelationGetRelationName(cx.index)),
+				 errdetail("The relation has %u block(s).", cx.nblocks)));
+
+	mb = ReadBuffer(cx.index, WEAVE_METAPAGE_BLKNO);
+	LockBuffer(mb, BUFFER_LOCK_SHARE);
+	weave_check_meta(BufferGetPage(mb), cx.index);
+	weave_meta_from_page(BufferGetPage(mb), &meta);
+	UnlockReleaseBuffer(mb);
+
+	cx.mark = wvck_mark_alloc(cx.nblocks);
+	wvck_mark_reachable(&cx, &meta);
+
+	if (oneblock)
+		wvpi_row(&cx, (BlockNumber) want);
+	else
+	{
+		BlockNumber blk;
+
+		for (blk = 0; blk < cx.nblocks; blk++)
+		{
+			CHECK_FOR_INTERRUPTS();
+			wvpi_row(&cx, blk);
+		}
+	}
+
+	pfree(cx.mark);
+	cx.mark = NULL;
 	index_close(cx.index, AccessShareLock);
 	return (Datum) 0;
 }
