@@ -458,15 +458,71 @@ partition is computed anyway for the out-of-core pass; it just has to be used.
 
 ## 7. Storage
 
-Page kinds, from the allocation table in `doc/specs/SEGMENT_FORMAT.md` (bits
-0–9 belong to the lexical channel; 14–17 to fuzzy; 18–19 to docvalues/cgram):
+Page kinds. **These are no longer bits.** Task X1 (2026-09-10) replaced the flat
+`uint16` bitmap with an escape bit plus an integer kind space, precisely because the
+vector and fuzzy channels each wanted four more bits and they did not both fit; the
+ids below live in `WeavePageOpaqueData.kind` and are read with `WeavePageHasKind()`,
+never with a bitwise AND. The authority is `include/weave/pagekind.h`.
 
-| bit | kind | contents |
+| id | kind | contents |
 |---|---|---|
-| 10 | `WEAVE_VMETA` | `WeaveVecMeta`: dim, bits, metric, pack layout, block directory root, calibration pointer, calibration sample size and date |
-| 11 | `WEAVE_VCODES` | 32-lane code blocks, each preceded by `WeaveVecBlockHdr` |
-| 12 | `WEAVE_VGRAPH` | IVF centroids + cluster directory; optionally a centroid graph (`include/weave/graph.h`, §8a) |
-| 13 | `WEAVE_VRERANK` | full-precision sidecar. **Required for `recall@10 >= 0.99`, not just for `recall=exact`** — §2.1 measured the compressed-domain ceiling at 0.9205/0.8780 |
+| 17 | `WEAVE_PK_VMETA` | `WeaveVecMeta`: dim, bits, metric, pack layout, code chain root, calibration pointer, calibration sample size and date |
+| 18 | `WEAVE_PK_VCODES` | 32-lane code blocks, each preceded by `WeaveVecBlockHdr` |
+| 19 | `WEAVE_PK_VGRAPH` | IVF centroids + cluster directory; optionally a centroid graph (`include/weave/graph.h`, §8a) |
+| 20 | ~~`WEAVE_PK_VRERANK`~~ | **WITHDRAWN 2026-09-13, id left reserved.** It read "full-precision sidecar, required for recall@10 >= 0.99". The ratified shape reranks from the **heap**: a stored float32 sidecar is `4*dim` = 4,096 B/vector at 1024-d, half of what a measured pgvector HNSW index spends per vector, which forfeits the storage gate. 4 bits plus a top-25 heap rerank measured recall@10 **0.9920** at n=1M on GIST-960d. See `doc/PHASES.md` V10 |
+
+### The paging question V7 has to answer first, with the arithmetic
+
+"32-lane code blocks, each preceded by a `WeaveVecBlockHdr`" does not say how a
+block relates to an 8 kB page, and **at the ratified width it cannot fit in one.**
+A block is `WEAVE_VEC_BLOCK` (32) lanes of `ceil(dim*bits/8)` bytes, plus a header
+carrying a `dim`-wide centroid code, plus 32 `WeaveVecLane` sidecars of 8 bytes. At
+4 bits, with 8,160 usable bytes per page (8,192 less the page header and our 8-byte
+opaque area):
+
+| `dim` | codes | header | lanes | total | pages | blocks/page | waste |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 2,048 | 92 | 256 | 2,396 | 1 | 3 | 12 % |
+| 256 | 4,096 | 156 | 256 | 4,508 | 1 | 1 | 45 % |
+| 384 | 6,144 | 220 | 256 | 6,620 | 1 | 1 | 19 % |
+| 768 | 12,288 | 412 | 256 | 12,956 | **2** | -- | 21 % |
+| 960 | 15,360 | 508 | 256 | 16,124 | **2** | -- | 1 % |
+| 1536 | 24,576 | 796 | 256 | 25,628 | **4** | -- | 21 % |
+
+So the format needs a rule in **both** directions: several blocks must share a page
+at small `dim` or nearly half the file is padding, and a block spans pages above
+`dim` ~ 500 at 4 bits -- which includes GIST-960d, every figure in
+`bench/RESULTS_CODE_SCAN.md`, and the 1536-d embeddings most users arrive with. Two
+shapes are viable, and the choice is **not** an implementation detail, because
+getting it wrong costs a REINDEX:
+
+**(A) A byte stream over a page chain.** Treat the code array as a blob, the way the
+livedocs and SuRF images already are, with blocks at fixed offsets in the stream.
+Simplest writer, no waste, works at any `dim`. The cost lands on the scan path: a
+block that spans pages is not contiguous, so scoring it needs either a memcpy into a
+scratch buffer -- an extra pass over the bytes, and V17 measured the byte kernel at
+7.6 GB/s against an 11.8 GB/s wall, so a second pass is not free -- or fragment-wise
+scoring, which is shape (B) without saying so.
+
+**(B) Coordinate-sliced pages.** Define a `WEAVE_PK_VCODES` page as holding a
+*coordinate range* `[j0, j1)` of one block's 32 lanes. This is natural for
+`WEAVE_PACK_LANE`, where coordinate `j` of lane `s` is one nibble at byte
+`j*16 + s/2`: a page break is a coordinate break by construction, and the byte-LUT
+kernel already walks coordinates in order and widens its accumulators every <= 256
+of them, so it can cross a page boundary with no copy and no scratch buffer. It does
+not work for `WEAVE_PACK_VECMAJOR`, where a page break splits a vector -- acceptable
+only because no scanning kernel uses that layout.
+
+**(B) has a second-order argument that may dominate the first.** V15's prefix stage
+scores the leading `m` of `dim` coordinates; under (A) that saves compute while still
+reading every byte, which is why it measured 1.43x on a bandwidth-bound scan. Under
+(B) the leading coordinates are the leading *pages*, so a prefix scan reads `m/dim`
+of the bytes. On a scan that is ~69 % bandwidth-bound, turning a compute saving into
+an I/O saving is worth more than the 1.43x already recorded -- and it is measurable
+before either is built.
+
+Unresolved, and **blocking V7**: an on-disk decision whose cost of being wrong is a
+REINDEX is escalated, not inferred.
 
 Two pack layouts, recorded in `WeaveVecMeta` because a reader that guesses wrong
 returns wrong distances rather than an error: `WEAVE_PACK_LANE`
