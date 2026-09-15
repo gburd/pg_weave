@@ -21,6 +21,15 @@
 #					  codescan   flat code-scan throughput at n up to 1M, three
 #							     kernels, 4 and 3 bits (CPU only, no server).
 #							     Needs an UNCONTENDED host to mean anything.
+#					  csrecall   ONLY the recall half, at n=1M with CSNQ=100
+#							     queries.  Exists because `codescan` spends ~40
+#							     min running the two SCALAR reference kernels
+#							     100x at n=1M to produce latencies that are not
+#							     wanted, while the recall gate needs the query
+#							     COUNT raised and nothing else.  Recall is
+#							     deterministic, so this arm does not need an
+#							     uncontended host -- but it is run here anyway
+#							     because the corpus is here.
 #					  rerankcold winsweep, then cold p50 of a heap rerank with
 #							     the real wvec type (bench/rerank_cold.sh)
 #					  hnswbase   the pgvector HNSW baseline: bytes/vector,
@@ -56,7 +65,7 @@ case "$JOB" in
 	# the same corpus is ~5 GB again.  400 leaves room to hold all of it at once
 	# without the load failing halfway through a two-hour run.
 	winsweep|rerankcold|hnswbase) VOLGB=${VOLGB_OVERRIDE:-400} ;;
-	codescan) VOLGB=${VOLGB_OVERRIDE:-250} ;;
+	codescan|csrecall) VOLGB=${VOLGB_OVERRIDE:-250} ;;
 esac
 REGION=$(aws configure get region --profile "$PROFILE")
 RUN=pgweave-$(date -u +%Y%m%d-%H%M%S)
@@ -673,6 +682,49 @@ EOF
 		2>&1 | tee -a "$OUT/codescan.log" || die "code_scan clustered failed"
 }
 
+run_csrecall() {
+	# THE RECALL HALF OF PHASE V's GATE, at the query count the gate actually needs.
+	#
+	# Every n=1M recall figure on record was taken with nq=10 -- 100 ground-truth
+	# slots -- which cannot separate 0.99 from 1.00.  The gate asks for recall@10
+	# >= 0.99 at n >= 1M, so it was not evidenced at that size no matter which way
+	# the number came out.  CSNQ defaults to 100 here (1,000 slots, 0.1%
+	# resolution) rather than to 10.
+	#
+	# Only the prefix grids run.  `codescan` would additionally spend ~40 minutes
+	# putting the two scalar reference kernels through 100 queries at n=1M, whose
+	# latencies are already known and whose recall is identical to the fast paths
+	# by construction -- lut-byte is gated as bit-identical to lut-byte-ref, and
+	# lut-wide is bit-identical to the scalar oracle.
+	#
+	# prefix=960 is the full-dim point: stage 1 becomes the whole flat scan, so
+	# that row IS the flat scan's end-to-end recall, which is the specific number
+	# doc/COMPETITIVE.md's gate table currently carries a caveat about.
+	fetch_gist
+	say "building code_scan"
+	$SSH 'cd pg_weave && gcc -O2 -march=native -std=gnu99 -I include \
+			-o /scratch/code_scan bench/code_scan.c src/vector/quantize.c \
+			src/vector/pack.c src/vector/kernels.c -lm && echo built' \
+		2>&1 | tee "$OUT/build.log" || die "code_scan build failed"
+
+	# Same gate as the codescan job, same reason: -march=native here is not
+	# -mavx2 on the workstation, so the binary about to produce recall numbers is
+	# not the binary that was checked there.
+	say "byte-LUT differential self-check on this host (gate)"
+	$SSH 'cd /scratch && ./code_scan selfcheck=2000' \
+		2>&1 | tee "$OUT/selfcheck.log" \
+		|| die "byte-LUT self-check FAILED on the bench host -- no recall below would mean anything"
+
+	for K in lut-wide lut-byte; do
+		say "recall grid, n=1M, nq=${CSNQ:-100}, kernel=$K"
+		$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs 1000000 \
+				${CSNQ:-100} bits=4 k=10 order=natural kernel=$K \
+				prefix=960,480,240,120 pwin=8000,20000 \
+				queries=corpus/gist/gist_query.fvecs" \
+			2>&1 | tee -a "$OUT/recall_$K.log" || die "recall grid failed for $K"
+	done
+}
+
 run_p0merge() {
 	# A/B for the merge tombstone P0 (bench/RESULTS_P0_MERGE_TOMBSTONE.md).
 	#
@@ -837,6 +889,7 @@ case "$JOB" in
 	vall)    run_bitsweep; run_p0merge ;;
 	winsweep)   run_winsweep ;;
 	codescan)   run_codescan ;;
+	csrecall)   run_csrecall ;;
 	rerankcold) run_winsweep; run_rerankcold ;;
 	hnswbase)   run_hnswbase ;;
 	all)     run_smoke; run_bound; run_lexical ;;
