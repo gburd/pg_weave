@@ -91,6 +91,14 @@ changed. This cost real time to discover; do not rediscover it.
   derivation** -- not the run you just attempted. Combining the two reports an old
   failure as a new one, repeatedly. This produced a six-times-counted "reproduction"
   of a bug from a single old run (see G21 in `doc/GAPS.md`).
+- **Editing the tree while a `--rebuild` loop is running silences the loop.** Any
+  edit -- a comma in a doc -- changes the flake source, so the derivation changes, so
+  there is no valid prior output, so every later iteration hits the refusal above and
+  *runs nothing* while finishing in seconds. Hit for real on 2026-09-15: 19 of 20
+  legs in a G21 hunt tested nothing, and the only reason it was noticed is that the
+  loop asserted the test's own marker rather than its exit status. Either leave the
+  tree alone for the duration, or have the loop re-seed with a plain `nix build` when
+  it sees the refusal.
 
 So: **a test result needs evidence the test RAN**, not just an exit status -- grep the
 output for the test's own markers. And capture the status of the build itself, never

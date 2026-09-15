@@ -492,12 +492,36 @@ page(s) not flagged freed; first is block 2883"** after the second crash-recover
 Test 7, which asserts the relation size survived that crash, passes in the same run - so
 the file is the right length and one page inside it is orphaned.
 
-**Reproducer**, roughly **1 run in 8-10** on this workstation:
+**Reproducer**: the full nix TAP leg, and -- as of 2026-09-15 -- *only* the full leg.
 
     nix build .#checks.x86_64-linux.tap-pg17 --rebuild -L
 
 `--rebuild` is required: a plain `nix build` returns a cached success without re-running.
 See the warning below before trusting any result from it.
+
+**The rate is not known, and the "1 run in 8-10" this entry used to claim is withdrawn.**
+That figure came out of the same contaminated series the correction below describes -- the
+one in which six of eight runs never executed the test. What survives the correction is
+that the failure was *observed*, not how often. Runs since, every one carrying evidence
+that `t/014` actually ran:
+
+| series | runs | failures |
+|---|---:|---:|
+| full `tap-pg17` leg, `--rebuild --keep-failed` | 15 | 0 |
+| `t/014` alone, driven by `prove` against the same binaries the leg builds | 100 | 0 |
+
+The two lines say different things and the difference is the finding. **The 100 clean
+isolated runs rule the file out as a self-contained reproducer:** at one failure in nine, a
+clean run of 100 has probability 8e-6. The 15 clean legs do *not* rule out a per-leg rate
+that size -- 0 in 15 puts the 95 % upper bound at 18 % -- so this is not "the bug went
+away", it is "the trigger is not inside `t/014` in isolation". What the leg has and the
+isolated run does not: twelve other test files run before it in the same `prove`
+invocation, the nix sandbox, and that sandbox's filesystem. A cheap next probe is
+therefore the *whole* file list outside nix, which separates "other tests first" from "nix
+sandbox".
+
+An isolated run costs 5.7 s and a full leg costs 3 min, which is the reason to keep
+looking for a reproducer smaller than the leg.
 
 **What is established:**
 
@@ -522,18 +546,40 @@ See the warning below before trusting any result from it.
   next attempt does not repeat it.
 
 **What is NOT established, and is the whole diagnosis:** what kind of page block 2883 is,
-and why it is sometimes linked and sometimes not. There is no page-level introspection
-function in the extension, and **black-box crashing has now been tried and does not
-reproduce it** (see above), so guessing at sequences is exhausted. The next step is one of:
+and why it is sometimes linked and sometimes not.
 
-1. a debug SQL function reporting a given block's page kind, flags and freed state - the
-   smallest thing that turns this from a guess into a reading, and useful well beyond
-   this gap;
-2. run the reproducer under `--keep-failed` until it trips, then decode the page header
-   out of the preserved data directory;
-3. run `t/014` with `autovacuum = off` about 30 times to test the hypothesis below by
-   elimination. Cheapest to write, slowest to run, and it only narrows rather than
-   diagnoses.
+**The instrument for reading it now exists** (was "next step 1"): `weave_page_info(idx,
+blkno)` in `src/am/amcheck.c` reports per page its kind, raw header flags and kind id,
+freed/uninitialized/reachable state, `nextblk`, LSN and free bytes. The leak query is
+
+    SELECT * FROM weave_page_info('md_weave')
+     WHERE NOT reachable AND coalesce(freed, false) = false AND NOT uninitialized;
+
+and `t/014` now runs exactly that after each recovery and `diag`s the rows, with the
+control file's redo and checkpoint LSNs beside them. An intermittent failure has to print
+its evidence at the moment it happens; there is no going back for it afterwards. So the
+next occurrence -- in CI or on a workstation -- reports what the page is without anyone
+having to catch it.
+
+`reachable` comes from the same traversal the leak invariant uses
+(`wvck_mark_reachable()`), split out of `wvck_reachable()` for that purpose: two
+independent walks would be two answers to one question, and this invariant is precisely
+what they would disagree about.
+
+What is left, in order:
+
+1. **Find a reproducer smaller than the 3-minute leg**, now that the file alone is ruled
+   out: run the full `t/*.pl` list outside nix (separates "twelve tests run first" from
+   "the nix sandbox"), then bisect the list.
+2. Keep legs running with the diag in place; the reading arrives with the failure.
+3. Run `t/014` with `autovacuum = off` to test the hypothesis below by elimination.
+   Cheapest to write, and it only narrows rather than diagnoses -- and note it is a test
+   of a hypothesis, not a reproducer, so it needs a reproducer first to be worth
+   anything.
+
+Decoding a page header by hand out of a `--keep-failed` data directory (the old step 2) is
+no longer the plan: the instrument prints the same reading in SQL, and the 15 legs run
+under `--keep-failed` since it landed have not tripped.
 
 One mechanism is worth writing down because it is the only one consistent with a *physical*
 log: **GenericXLog replay has no undo.** A transaction killed part-way has the records it
