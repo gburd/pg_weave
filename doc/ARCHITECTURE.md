@@ -234,20 +234,28 @@ fundamental and no amount of engineering removes them; they are knobs, not bugs.
    scores every code. What makes that affordable is not an algorithm but a **kernel**:
    the scan had been costing about one cycle per coordinate because it did one LUT
    gather per coordinate, and a nibble-LUT AVX2 kernel (task V16) scores a coordinate's
-   32 lanes with one byte shuffle. At n = 1M that is **60.7 ms against 319.2 ms**, for
-   a measured recall cost of 0.0020, which makes the flat scan **0.82× pgvector HNSW
-   at matched recall — faster outright**, inside a 2× bar.
+   32 lanes with one byte shuffle. At n = 1M the bare scan is **58.7 ms against 297.7 ms**
+   — about **5×**, reproduced across two runs — for a recall cost measured at 0.0020 at
+   n = 200k and 0.0000 at n = 1M.
+
+   The prefix scan (task V15) then adds a further 1.44× on top of that, at **no recall
+   cost**: prefix 0.5 with a window of 8,000 is **52.8 ms at recall 1.0000**, against
+   75.9 ms for the full-dim pipeline at the same recall, which is **0.72× pgvector HNSW
+   at matched recall**.
 
    Two corrections this forced, both worth keeping visible:
 
-   - The two-stage prefix scan (task V15) was recorded here for two days as the thing
-     that made this term pass, at 1.51×. It did pass, and it was **the wrong lever**:
-     the same host and run puts it at 1.58× while the flat scan with the right kernel
-     is 0.82×, at higher recall. V15 is now a recall/latency knob.
+   - V15's verdict moved **three times in two days** — gate-passing lever, then demoted
+     as useless, then re-promoted as the best configuration — and every move was
+     downstream of one harness error: stage 2 was scoring a whole 32-lane block per
+     survivor. The lesson is not about the prefix scan. It is that two of those three
+     verdicts were published, and the thing that finally settled it was reading the code
+     that produced the number rather than reasoning about the number.
    - The scan is no longer compute-bound. `lut-byte`'s cost per vector rises with n
      (36.7 → 58.6 → 60.7 ns) instead of staying flat, and 480 B in 60.7 ns is 7.91 GB/s
-     against a **measured** 11.77 GB/s single-core wall. Roughly 1.49× remains to any
-     kernel on this hardware, and it is bounded by memory rather than by effort.
+     against a **measured** 11.8 GB/s single-core wall, which reproduces across instances
+     to under 1%. Roughly 1.4× remains to any kernel on this hardware, and it is bounded
+     by memory rather than by effort.
 
    So the honest position is:
 
@@ -255,9 +263,12 @@ fundamental and no amount of engineering removes them; they are knobs, not bugs.
      earlier fallback framing — "~0.92 recall at ~0.12× storage, or ~1.00 recall at
      0.067× plus an untimed heap-fetch cost" — is superseded.
    - **latency:** the *scan* is measured and passes at iso-recall, now with margin
-     rather than inside the bar. A whole query is still not, because V7, V8 and V16
-     are unimplemented, so no pg_weave vector query exists to time end to end. V16's
-     kernel exists only in `bench/code_scan.c`.
+     rather than inside the bar. A whole query is still not, because V7, V8, V15 and V16
+     are unimplemented, so no pg_weave vector query exists to time end to end — the
+     kernel and the prefix scan both exist only in `bench/code_scan.c`. And **every
+     n = 1M recall figure is nq = 10**, i.e. 100 ground-truth slots, which cannot
+     separate 0.99 from 1.00; the gate's recall term is not yet properly evidenced at
+     that size.
 
    So the storage and recall halves of "0.99 at 0.15×" are supported by measurement
    on one corpus, and the latency half is supported **for the scan in isolation**,
