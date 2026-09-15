@@ -53,6 +53,12 @@
  * usage: code_scan <base.fvecs> <nbase> <nq> [k=v ...]
  *          bits=4 k=10 order=clustered|natural lists=1024 kernel=<name>
  *          queries=<path.fvecs>
+ *        code_scan selfcheck=<nblocks>
+ *
+ * The second form needs no corpus: it is the differential gate on the two
+ * byte-LUT kernels this harness adds (lut-byte-ref and lut-byte, see the
+ * "byte-LUT kernels" section), and it exits non-zero if the AVX2 kernel is not
+ * bit-identical to its scalar reference.
  *
  * Memory: the float base is held to build the clustering and the centroids, so
  * roughly 4*dim*nbase bytes plus the codes. 1M x 960-d is ~4.4 GB.
@@ -65,6 +71,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 #include "weave/kernels.h"
 #include "weave/quantize.h"
@@ -381,15 +391,1125 @@ bycluster(const void *a, const void *b)
 		return g_assign[x] - g_assign[y];
 	return x - y;
 }
+/* ------------------------------------------------------------ byte-LUT kernels
+ *
+ * WHY THESE LIVE IN THE HARNESS AND NOT IN src/vector/kernels.c
+ *
+ * src/vector/pack.c's header says WEAVE_PACK_LANE exists so that "a byte-LUT
+ * kernel loads 32 lanes' codes for one coordinate in one vector register and
+ * gathers from the query table".  No such kernel exists; the shipping AVX2 path
+ * (lut-avx2) gathers 8 floats with vpgatherdps.  The open question is whether
+ * replacing the float gather with an 8-bit table and one vpshufb is worth the
+ * recall it costs.  That is a MEASUREMENT, so it is made here, against the
+ * exported oracle, and nothing under src/ changes until the measurement says
+ * something.
+ *
+ * THE TRANSFORM, AND WHY IT IS NEARLY FREE IN RANK TERMS
+ *
+ * WeaveQueryLut holds dim * nlevels floats, row-major by coordinate.  At bits=4,
+ * nlevels == 16, so a coordinate's row is 16 floats and the exact score of a lane
+ * is sum_j lut[j][code_j], scaled.  Quantize each row to unsigned bytes with ONE
+ * step shared by the whole table and a per-row offset:
+ *
+ *	 mn_j   = min over c of lut[j][c]
+ *	 range  = max over j,c of (lut[j][c] - mn_j)			  -- whole table
+ *	 step   = range / 255							  -- 0 iff range == 0
+ *	 lut8[j][c] = clamp(lrintf((lut[j][c] - mn_j) / step), 0, 255)
+ *	 score  = step * (float) sum_j lut8[j][code_j] + sum_j mn_j
+ *
+ * A per-row offset and a global step is the choice that keeps the reconstruction
+ * an AFFINE function of one integer accumulator: `offset = sum_j mn_j` is a
+ * constant of the QUERY, identical for every lane of every block, and `step > 0`.
+ * An affine map with positive slope and a constant intercept cannot reorder
+ * lanes, so the only thing that can change a ranking is the per-coordinate
+ * rounding residual, bounded by step/2 each.  That is the whole reason the recall
+ * cost is expected to be small, and it is exactly the claim the differential
+ * self-check below measures rather than assumes (a per-COORDINATE step would
+ * have made the reconstruction a weighted sum and cost an extra multiply per
+ * coordinate, which defeats the point).
+ *
+ * The accumulator is a 32-bit integer: 255 * WEAVE_MAX_DIM = 4.2e6, so it cannot
+ * overflow at any dim this codec allows.  Integer addition is associative, which
+ * is why the scalar reference and the AVX2 kernel are required to agree BIT FOR
+ * BIT and not merely closely -- see bench_selfcheck().
+ *
+ * WHAT IS DELIBERATELY NOT DONE: no perm0 lane interleave.  include/weave/
+ * quantize.h mentions one for the LANE layout on x86 and src/vector/kernels.c
+ * (the note above weave_score_block_avx2) records that no kernel applies it.
+ * Codes here are read in plain WEAVE_PACK_LANE order, and the 128-bit-lane
+ * bookkeeping vpshufb forces is dealt with by an explicit index map at flush
+ * time instead.
+ * -------------------------------------------------------------------------- */
+
+/*
+ * The quantized query table, plus the two reconstruction constants.
+ *
+ * It is a file static rather than a parameter because weave_score_block_fn takes
+ * only a WeaveScoreBlock, and building it per BLOCK would cost dim * 16 work
+ * against a block's dim * 32 lookups -- it would dominate the very thing being
+ * measured.  It is built once per query, which is where a real scan would build
+ * it too (the float LUT is already per-query work).
+ *
+ * STALENESS IS THE HAZARD, so it is closed twice.  The harness reuses one
+ * WeaveQueryLut stack slot across queries, so pointer identity alone does NOT
+ * imply the contents are still the ones this table was built from: every
+ * weave_query_lut_build() call site is followed by bench_lut8_bind(), which
+ * rebinds unconditionally.  bench_lut8_ensure() then rebuilds when a kernel is
+ * handed a DIFFERENT table (the prefix scan alternates a truncated `plut` with
+ * the full `lut`), which is cheap because it happens twice per query and not per
+ * block.  A stale table would be the fast-but-wrong failure AGENTS.md rule 8 is
+ * about, so neither half of this is optional.
+ */
+typedef struct Lut8
+{
+	const WeaveQueryLut *src;	/* table this was built from, for ensure() */
+	int			dim;
+	int			valid;			/* 0 = unsupported table; kernels return -1 */
+	weave_uint8 *tbl;			/* dim * 16 bytes, coordinate-major */
+	float	   *mn;				/* dim per-coordinate minima */
+	size_t		cap;			/* bytes in tbl */
+	float		step;			/* one quantum in score units; 0 iff range == 0 */
+	double		offset;			/* sum_j mn_j; the same for every lane */
+} Lut8;
+
+static Lut8 g_lut8;
+
+static void
+bench_lut8_build(const WeaveQueryLut *lut)
+{
+	int			dim = lut->dim;
+	int			nlev = lut->nlevels;
+	double		offset = 0.0;
+	float		range = 0.0f;
+	int			j,
+				c;
+
+	g_lut8.src = lut;
+	g_lut8.dim = dim;
+	g_lut8.valid = 0;
+
+	/* Declined, not approximated: these kernels are 4-bit-only by construction
+	 * (one vpshufb table is 16 bytes) and say so by refusing the block. */
+	if (nlev != 16 || dim < 1 || dim > WEAVE_MAX_DIM || lut->lut == NULL)
+		return;
+
+	if (g_lut8.cap < (size_t) dim * 16 + 32)
+	{
+		free(g_lut8.tbl);
+		free(g_lut8.mn);
+		/* +32 so the paired 32-byte table load at the last even coordinate is
+		 * inside the allocation whatever dim's parity is. */
+		g_lut8.cap = (size_t) dim * 16 + 32;
+		g_lut8.tbl = xmalloc(g_lut8.cap);
+		g_lut8.mn = xmalloc((size_t) dim * sizeof(float));
+	}
+
+	for (j = 0; j < dim; j++)
+	{
+		const float *row = lut->lut + (size_t) j * nlev;
+		float		mn = row[0],
+					mx = row[0];
+
+		for (c = 1; c < 16; c++)
+		{
+			if (row[c] < mn)
+				mn = row[c];
+			if (row[c] > mx)
+				mx = row[c];
+		}
+		if (mx - mn > range)
+			range = mx - mn;
+		g_lut8.mn[j] = mn;
+		/* Ascending j, in double: the same order and the same type the oracle
+		 * (weave_lut_score_code) accumulates in, so a constant table -- range
+		 * == 0, every code reconstructing to mn_j -- comes back bit-exact
+		 * instead of merely close. */
+		offset += (double) mn;
+	}
+
+	g_lut8.step = (range > 0.0f) ? range / 255.0f : 0.0f;
+	g_lut8.offset = offset;
+
+	for (j = 0; j < dim; j++)
+	{
+		const float *row = lut->lut + (size_t) j * nlev;
+		weave_uint8 *dst = g_lut8.tbl + (size_t) j * 16;
+
+		for (c = 0; c < 16; c++)
+		{
+			long		v;
+
+			if (g_lut8.step <= 0.0f)
+			{
+				/* range == 0: the table is constant within every row, so every
+				 * code reconstructs to mn_j and the integer part carries
+				 * nothing.  Guarding here rather than dividing by zero. */
+				dst[c] = 0;
+				continue;
+			}
+			v = lrintf((row[c] - g_lut8.mn[j]) / g_lut8.step);
+			if (v < 0)
+				v = 0;
+			if (v > 255)
+				v = 255;
+			dst[c] = (weave_uint8) v;
+		}
+	}
+	g_lut8.valid = 1;
+}
+
+/* Call after every weave_query_lut_build(): rebinds unconditionally. */
+static void
+bench_lut8_bind(const WeaveQueryLut *lut)
+{
+	bench_lut8_build(lut);
+}
+
+static inline void
+bench_lut8_ensure(const WeaveQueryLut *lut)
+{
+	if (g_lut8.src != lut || g_lut8.dim != lut->dim)
+		bench_lut8_build(lut);
+}
+
+/*
+ * The one place a lane's integer accumulator becomes a float.
+ *
+ * Both kernels call THIS, so their outputs are bit-identical by construction
+ * rather than by two expressions happening to agree.  The trailing multiply by
+ * the lane's renormalization scale, in double, then one cast to float, is what
+ * weave_lut_score_code() and group_store() in src/vector/kernels.c do.
+ */
+static inline float
+bench_lut8_lane(weave_uint32 acc, float scale)
+{
+	return (float) (((double) g_lut8.step * (double) acc + g_lut8.offset) *
+					(double) scale);
+}
+
+/*
+ * Mirrors of block_bits() and lane_avail_mask() from src/vector/kernels.c, which
+ * are static there and cannot be reached from a benchmark.  Copied rather than
+ * exported because exporting them would be a change under src/ for a
+ * measurement's convenience; the self-check compares against the real kernels,
+ * so a copy that drifted would show up as a differential failure.
+ */
+static int
+bench_block_ok(const WeaveScoreBlock *blk)
+{
+	if (blk->lut == NULL || blk->codes == NULL || blk->scales == NULL)
+		return 0;
+	if (blk->lut->dim < 1 || blk->lut->dim > WEAVE_MAX_DIM || blk->lut->lut == NULL)
+		return 0;
+	if (blk->nlanes < 1 || blk->nlanes > WEAVE_VEC_BLOCK)
+		return 0;
+	if (blk->scalestride < 1)
+		return 0;
+	if (blk->layout != WEAVE_PACK_LANE && blk->layout != WEAVE_PACK_VECMAJOR)
+		return 0;
+	if (blk->allow != NULL &&
+		(weave_uint64) blk->firstwarp + (weave_uint64) blk->nlanes >
+		(weave_uint64) blk->nwarp)
+		return 0;
+	/* 4 bits only, and the LANE layout only.  NOT delegated to the oracle the
+	 * way lut-wide and lut-avx2 delegate: a byte-LUT kernel that quietly ran the
+	 * scalar path for a 2-bit corpus would report the scalar path's numbers
+	 * under this kernel's name, which is the shape of the retracted pg_turbovec
+	 * claim.  Refuse instead, loudly. */
+	if (blk->lut->nlevels != 16 || blk->layout != WEAVE_PACK_LANE)
+		return 0;
+	return 1;
+}
+
+static inline weave_uint32
+bench_lane_avail(const WeaveScoreBlock *blk)
+{
+	weave_uint32 m = blk->livemask;
+
+	if (blk->nlanes < WEAVE_VEC_BLOCK)
+		m &= (weave_uint32) ((1u << blk->nlanes) - 1);
+
+	if (blk->allow != NULL)
+	{
+		size_t		w0 = (size_t) (blk->firstwarp >> 6);
+		size_t		w1 = (size_t) ((blk->firstwarp + (weave_uint32) blk->nlanes - 1) >> 6);
+		int			off = (int) (blk->firstwarp & 63);
+		weave_uint64 a = blk->allow[w0] >> off;
+
+		if (w1 != w0 && off != 0)
+			a |= blk->allow[w1] << (64 - off);
+		m &= (weave_uint32) a;
+	}
+	return m;
+}
+
+/* Contract (weave/kernels.h): exactly blk->nlanes floats are written even when
+ * not one code byte is read, so the caller's indexing stays positional. */
+static inline void
+bench_fill_never(float *out, int from, int to)
+{
+	int			s;
+
+	for (s = from; s < to; s++)
+		out[s] = WEAVE_KERNEL_NEVER;
+}
+
+/* ---------------------------------------------------------------------------
+ * lut-byte-ref: scalar reference for the byte table
+ *
+ * Exists to separate the two things a byte-LUT kernel can get wrong.  Any
+ * disagreement between this and the exact `scalar` oracle is the 8-bit table's
+ * rounding, and any disagreement between this and `lut-byte` is a SIMD bug --
+ * one number each, instead of one number confounding both.
+ *
+ * It reaches codes only through weave_unpack_lane(), like the oracle, so it does
+ * NOT share the nibble/128-bit-lane addressing assumptions of the AVX2 kernel
+ * below.  That independence is what makes the bit-identity assertion in
+ * bench_selfcheck() worth anything.
+ *
+ * SKIP GRANULARITY: one lane, as the oracle.  lut-byte below skips at whole-block
+ * granularity; the OUTPUT is identical either way (both write the sentinel), so
+ * the difference is in work done, not in answers.
+ * ------------------------------------------------------------------------- */
+
+static int
+bench_score_block_lut8_ref(const WeaveScoreBlock *blk, float *out)
+{
+	weave_uint8 code[WEAVE_CODE_MAX_BYTES];
+	weave_uint32 avail;
+	int			dim;
+	int			s,
+				j;
+
+	if (!bench_block_ok(blk))
+		return -1;
+	bench_lut8_ensure(blk->lut);
+	if (!g_lut8.valid)
+		return -1;
+
+	dim = blk->lut->dim;
+	avail = bench_lane_avail(blk);
+	if (avail == 0)
+	{
+		bench_fill_never(out, 0, blk->nlanes);
+		return blk->nlanes;
+	}
+
+	for (s = 0; s < blk->nlanes; s++)
+	{
+		weave_uint32 acc = 0;
+
+		if ((avail & (1u << s)) == 0)
+		{
+			out[s] = WEAVE_KERNEL_NEVER;
+			continue;
+		}
+		weave_unpack_lane(blk->layout, dim, 4, blk->codes, s, code);
+		for (j = 0; j < dim; j++)
+		{
+			/* bits=4: coordinate j of a single vector's code is nibble j, low
+			 * nibble first (src/vector/pack.c put_bits, LSB first). */
+			weave_uint32 cix = (j & 1) ? (weave_uint32) (code[j >> 1] >> 4)
+				: (weave_uint32) (code[j >> 1] & 0x0F);
+
+			acc += g_lut8.tbl[(size_t) j * 16 + cix];
+		}
+		out[s] = bench_lut8_lane(acc, blk->scales[(size_t) s * blk->scalestride]);
+	}
+	return blk->nlanes;
+}
+
+static const WeaveScoreKernel bench_kernel_lut8_ref = {
+	.name = "lut-byte-ref",
+	.score_block = bench_score_block_lut8_ref,
+};
+
+/* ---------------------------------------------------------------------------
+ * lut-byte: AVX2 vpshufb byte-LUT gather
+ *
+ * THE ADDRESSING, spelled out because a wrong permutation here produces
+ * plausible-but-wrong scores and nothing else would catch it.
+ *
+ * At bits=4 in WEAVE_PACK_LANE, code (coordinate j, lane s) is at bit
+ * (j * 32 + s) * 4, so coordinate j's 32 codes are the 16 CONTIGUOUS bytes at
+ * offset j * 16, and byte b of those holds lane 2b in its LOW nibble and lane
+ * 2b+1 in its HIGH nibble.
+ *
+ * _mm256_shuffle_epi8 indexes within each 128-bit half independently, and a
+ * 16-entry byte table is exactly one half.  So instead of broadcasting one
+ * coordinate's table into both halves and wasting half the register on duplicate
+ * work, this processes coordinates IN PAIRS: one 32-byte load covers coordinates
+ * j and j+1, one 32-byte table load covers rows j and j+1, and each half of the
+ * shuffle uses its own coordinate's table.  Byte B of the result therefore
+ * belongs to coordinate j + B/16 and lane 2*(B mod 16) (+1 for the high-nibble
+ * shuffle).
+ *
+ * OVERFLOW IS THE TRAP.  Products are byte values 0..255 and dim reaches 960 in
+ * the corpora this harness runs, so 255 * 960 = 244800 does not fit in the 16-bit
+ * lanes the byte widening naturally lands in.  Each 16-bit slot receives ONE byte
+ * per pair-iteration, so 255 * 257 is the true ceiling; this flushes into 32-bit
+ * accumulators every 128 pair-iterations = 256 coordinates (255 * 256 = 65280),
+ * which is the budget stated in the task and comfortably inside it.  Saturating
+ * adds are NOT used: saturation would silently change scores, and a silently
+ * changed score is indistinguishable from a working kernel.
+ *
+ * SKIP GRANULARITY: the whole block.  Coarser than lut-wide's 8 lanes, and
+ * necessarily so -- one coordinate's 16 code bytes cover all 32 lanes, so there
+ * is no 8-lane subset to not load.  A block with no live-and-allowed lane is
+ * skipped entirely and touches no code byte; anything else scores all 32 lanes
+ * and writes the sentinel over the masked ones.
+ * ------------------------------------------------------------------------- */
+
+#ifdef __AVX2__
+
+/* 255 * 256 = 65280 < 65536; see the overflow note above. */
+#define LUT8_FLUSH_PAIRS	128
+
+/*
+ * Fold four vectors of 16-bit lane accumulators into 32 lane-indexed 32-bit
+ * accumulators.  THIS is the un-permutation, done explicitly and once per flush
+ * rather than with a chain of shuffles, because being able to read the index map
+ * off the page is worth more here than the instructions it costs (a flush happens
+ * once per 256 coordinates, against 8192 table lookups).
+ *
+ * Element k of a 16 x u16 vector is element k & 7 of 128-bit half k >> 3.  Half 0
+ * carries coordinate j and half 1 carries coordinate j+1 -- two different
+ * coordinates' contributions to the SAME lane -- so both halves add into the same
+ * acc32 slot, which is why the map below ignores k >> 3:
+ *
+ *	 e0[k] -> lane 2*(k&7)			(low nibble, bytes 0-7   of the half)
+ *	 e1[k] -> lane 2*(k&7) + 16		(low nibble, bytes 8-15  of the half)
+ *	 o0[k] -> lane 2*(k&7) + 1		(high nibble, bytes 0-7)
+ *	 o1[k] -> lane 2*(k&7) + 17		(high nibble, bytes 8-15)
+ */
+static inline void
+lut8_flush(__m256i e0, __m256i e1, __m256i o0, __m256i o1, weave_uint32 *acc32)
+{
+	weave_uint16 t[4][16];
+	int			k;
+
+	_mm256_storeu_si256((__m256i *) t[0], e0);
+	_mm256_storeu_si256((__m256i *) t[1], e1);
+	_mm256_storeu_si256((__m256i *) t[2], o0);
+	_mm256_storeu_si256((__m256i *) t[3], o1);
+
+	for (k = 0; k < 16; k++)
+	{
+		int			i = k & 7;
+
+		acc32[2 * i] += t[0][k];
+		acc32[2 * i + 16] += t[1][k];
+		acc32[2 * i + 1] += t[2][k];
+		acc32[2 * i + 17] += t[3][k];
+	}
+}
+
+static int
+bench_score_block_lut8_avx2(const WeaveScoreBlock *blk, float *out)
+{
+	const __m256i nib = _mm256_set1_epi8(0x0F);
+	const __m256i zero = _mm256_setzero_si256();
+	weave_uint32 acc32[WEAVE_VEC_BLOCK];
+	weave_uint32 avail;
+	__m256i		e0,
+				e1,
+				o0,
+				o1;
+	const weave_uint8 *codes;
+	const weave_uint8 *tbl;
+	int			dim;
+	int			j,
+				s,
+				pairs;
+
+	if (!bench_block_ok(blk))
+		return -1;
+	bench_lut8_ensure(blk->lut);
+	if (!g_lut8.valid)
+		return -1;
+
+	avail = bench_lane_avail(blk);
+	if (avail == 0)
+	{
+		bench_fill_never(out, 0, blk->nlanes);
+		return blk->nlanes;
+	}
+
+	dim = blk->lut->dim;
+	codes = blk->codes;
+	tbl = g_lut8.tbl;
+	memset(acc32, 0, sizeof(acc32));
+	e0 = e1 = o0 = o1 = zero;
+	pairs = 0;
+
+	for (j = 0; j + 1 < dim; j += 2)
+	{
+		__m256i		cv = _mm256_loadu_si256((const __m256i *) (codes + (size_t) j * 16));
+		__m256i		tv = _mm256_loadu_si256((const __m256i *) (tbl + (size_t) j * 16));
+		__m256i		lo = _mm256_and_si256(cv, nib);
+		__m256i		hi = _mm256_and_si256(_mm256_srli_epi16(cv, 4), nib);
+		__m256i		vlo = _mm256_shuffle_epi8(tv, lo);
+		__m256i		vhi = _mm256_shuffle_epi8(tv, hi);
+
+		e0 = _mm256_add_epi16(e0, _mm256_unpacklo_epi8(vlo, zero));
+		e1 = _mm256_add_epi16(e1, _mm256_unpackhi_epi8(vlo, zero));
+		o0 = _mm256_add_epi16(o0, _mm256_unpacklo_epi8(vhi, zero));
+		o1 = _mm256_add_epi16(o1, _mm256_unpackhi_epi8(vhi, zero));
+
+		if (++pairs == LUT8_FLUSH_PAIRS)
+		{
+			lut8_flush(e0, e1, o0, o1, acc32);
+			e0 = e1 = o0 = o1 = zero;
+			pairs = 0;
+		}
+	}
+	if (pairs > 0)
+		lut8_flush(e0, e1, o0, o1, acc32);
+
+	/*
+	 * Odd dim: the last coordinate has no partner.  Done scalar rather than with
+	 * a 128-bit load because weave_block_codebytes() rounds a 4-bit block up to
+	 * 16 * (dim + 1) bytes when dim is odd, so a vector load here would read the
+	 * slack tail -- in bounds, but uninitialized, which is a valgrind report and
+	 * a reader's doubt for no gain on one coordinate out of dim.
+	 */
+	if (j < dim)
+	{
+		const weave_uint8 *p = codes + (size_t) j * 16;
+		const weave_uint8 *row = tbl + (size_t) j * 16;
+		int			b;
+
+		for (b = 0; b < 16; b++)
+		{
+			acc32[2 * b] += row[p[b] & 0x0F];
+			acc32[2 * b + 1] += row[p[b] >> 4];
+		}
+	}
+
+	for (s = 0; s < blk->nlanes; s++)
+	{
+		if ((avail & (1u << s)) == 0)
+			out[s] = WEAVE_KERNEL_NEVER;
+		else
+			out[s] = bench_lut8_lane(acc32[s],
+									 blk->scales[(size_t) s * blk->scalestride]);
+	}
+	return blk->nlanes;
+}
+
+static const WeaveScoreKernel bench_kernel_lut8_avx2 = {
+	.name = "lut-byte",
+	.score_block = bench_score_block_lut8_avx2,
+};
+
+#endif							/* __AVX2__ */
+
+/*
+ * Kernel lookup for this harness: the shipping registry plus the byte-LUT
+ * kernels above.
+ *
+ * lut-byte appears ONLY when this translation unit was compiled with AVX2.  It
+ * is not aliased to lut-byte-ref on other hosts: a scalar fallback answering to
+ * a SIMD kernel's name is how the sibling project published a headline number it
+ * had to retract (AGENTS.md rule 8), so on a host without AVX2 the name simply
+ * does not resolve and the harness says so.
+ */
+static const WeaveScoreKernel *
+bench_kernel_lookup(const char *name)
+{
+	const WeaveScoreKernel *k = weave_score_kernel_lookup(name);
+
+	if (k != NULL)
+		return k;
+	if (!strcmp(name, "lut-byte-ref"))
+		return &bench_kernel_lut8_ref;
+#ifdef __AVX2__
+	if (!strcmp(name, "lut-byte"))
+		return &bench_kernel_lut8_avx2;
+#endif
+	return NULL;
+}
+
+/* True for the byte-LUT kernels, which are APPROXIMATE: their scores differ from
+ * the oracle's by the 8-bit table's rounding.  Two of this harness's assertions
+ * compare a score against a bound derived from the EXACT float table, so they
+ * have to know. */
+static int
+bench_kernel_is_approx(const WeaveScoreKernel *k)
+{
+	if (k == &bench_kernel_lut8_ref)
+		return 1;
+#ifdef __AVX2__
+	if (k == &bench_kernel_lut8_avx2)
+		return 1;
+#endif
+	return 0;
+}
+
+static int
+bench_kernel_list(const WeaveScoreKernel **out, int max, int bits)
+{
+	int			n = weave_score_kernel_list(out, max);
+
+	/* The byte kernels are 4-bit-only; at other widths they refuse every block,
+	 * so listing them would just abort the run. */
+	if (bits != 4)
+		return n;
+	if (n < max)
+		out[n++] = &bench_kernel_lut8_ref;
+#ifdef __AVX2__
+	if (n < max)
+		out[n++] = &bench_kernel_lut8_avx2;
+#endif
+	return n;
+}
+
+/* --------------------------------------------------------------- self-check
+ *
+ * THE GATE ON THE TWO KERNELS ABOVE.  AGENTS.md rule 8: verify correctness before
+ * recording a latency, because a benchmark of a broken fast path is worse than no
+ * benchmark.  Two DIFFERENT questions, and conflating them is the mistake this
+ * separates:
+ *
+ * 1. lut-byte vs lut-byte-ref must be BIT-IDENTICAL.  Same integer accumulator,
+ *    same reconstruction expression, and integer addition is associative, so
+ *    there is no tolerance to argue about.  Any difference is a SIMD bug -- a
+ *    wrong nibble, a wrong 128-bit half, or a 16-bit overflow -- and it FAILS
+ *    this harness with a non-zero exit.
+ *
+ * 2. lut-byte-ref vs the exact `scalar` oracle is REPORTED, never asserted.  That
+ *    deviation IS the 8-bit query table's rounding error; it is the number this
+ *    measurement exists to produce, so treating it as a failure would be
+ *    measuring the tolerance instead of the kernel.
+ *
+ * The blocks are randomized over the things that go wrong: dim parity, the
+ * 256-coordinate flush boundary, short blocks, dead lanes, an allowlist at a
+ * non-zero and non-64-aligned firstwarp, and a scalestride above 1.  Codes are
+ * written through weave_pack_lane(), so the layout the kernels assume is the
+ * layout pack.c produces and not a restatement of it.
+ *
+ * WHAT THE RANDOM POPULATION DOES NOT REACH, and why there is a deterministic set
+ * as well: a 16-bit accumulator only wraps if the byte values are large, and a
+ * global step means most rows quantize to small numbers.  Raising
+ * LUT8_FLUSH_PAIRS to 4096 -- i.e. removing the widening this kernel exists to
+ * get right -- passed 600 random blocks.  The saturating set below fails it
+ * immediately.  A gate that a known bug walks through is worse than no gate.
+ * ------------------------------------------------------------------------- */
+
+/* Dims that bracket every structural boundary in the AVX2 kernel: odd/even, the
+ * flush period (256 coordinates = 128 pair-iterations), and dims past the point
+ * where a 16-bit accumulator would overflow without the flush. */
+static const int selfcheck_dims[] = {
+	1, 2, 3, 4, 15, 16, 17, 31, 32, 33, 63, 64, 127, 128,
+	254, 255, 256, 257, 258, 511, 512, 513, 959, 960, 961, 1024
+};
+
+#define SELFCHECK_NDIMS ((int) (sizeof(selfcheck_dims) / sizeof(selfcheck_dims[0])))
+#define SELFCHECK_MAXDIM 1024
+
+/*
+ * Self-check accumulators.
+ *
+ * Deviation is tracked in TWO populations, because one number covering both
+ * would be the adversarial one and would then get quoted as if it were the real
+ * one:
+ *
+ *	 [0] REAL: the table comes out of weave_query_lut_build() for a random unit
+ *		 query and the codes out of weave_encode() on random unit vectors -- the
+ *		 distribution a query actually produces, and the one the recall question
+ *		 is about.
+ *	 [1] STRESS: tables built to break a single global step (one row 500x wider
+ *		 than the rest, so every other row quantizes to almost nothing), plus the
+ *		 saturating set.  Not distributions this codec produces; they are here to
+ *		 show what the failure mode looks like, and they are labelled.
+ *
+ * The bit-identity assertion does not care which population a block came from
+ * and runs over both.
+ */
+static double sc_maxabs[2],
+			sc_maxrel[2];
+static int	sc_maxabs_dim[2],
+			sc_maxrel_dim[2];
+static long sc_ncmp_dev[2],
+			sc_ncmp_bits,
+			sc_nbitfail;
+
+/* A random unit vector: what weave_encode() and weave_query_lut_build() are fed
+ * everywhere else in this harness (fvecs_read L2-normalizes). */
+static void
+selfcheck_unit(float *v, int dim)
+{
+	double		ss;
+	int			j;
+
+	do
+	{
+		ss = 0.0;
+		for (j = 0; j < dim; j++)
+		{
+			/* Box-Muller would be tidier; a sum of three uniforms is close
+			 * enough to Gaussian for a direction and needs no logf. */
+			double		u = (double) (r64() >> 11) / 9007199254740992.0
+				+ (double) (r64() >> 11) / 9007199254740992.0
+				+ (double) (r64() >> 11) / 9007199254740992.0 - 1.5;
+
+			v[j] = (float) u;
+			ss += u * u;
+		}
+	} while (ss <= 0.0);
+	ss = 1.0 / sqrt(ss);
+	for (j = 0; j < dim; j++)
+		v[j] = (float) (v[j] * ss);
+}
+
+/*
+ * Score one prepared block with all three kernels and record both comparisons.
+ * `p` selects the deviation population; `tag` only appears in a failure message.
+ */
+static void
+selfcheck_block(const WeaveScoreBlock *blk, int p, const char *tag)
+{
+	const WeaveScoreKernel *simd = bench_kernel_lookup("lut-byte");
+	float		o_exact[LANES],
+				o_ref[LANES],
+				o_simd[LANES];
+	int			nlanes = blk->nlanes;
+	int			s;
+
+	for (s = 0; s < LANES; s++)
+		o_exact[s] = o_ref[s] = o_simd[s] = 0.0f;
+
+	if (weave_score_kernel_scalar.score_block(blk, o_exact) != nlanes ||
+		bench_kernel_lut8_ref.score_block(blk, o_ref) != nlanes)
+		die("self-check: a kernel refused a well-formed block");
+
+	if (simd)
+	{
+		if (simd->score_block(blk, o_simd) != nlanes)
+			die("self-check: lut-byte refused a well-formed block");
+
+		/* Bit-identical, so compare the BITS.  memcmp also settles the sentinel
+		 * lanes and would catch a NaN one path produced and the other did not,
+		 * which == would not. */
+		for (s = 0; s < nlanes; s++)
+		{
+			sc_ncmp_bits++;
+			if (memcmp(&o_ref[s], &o_simd[s], sizeof(float)) != 0)
+			{
+				if (sc_nbitfail < 8)
+					fprintf(stderr,
+							"  BIT MISMATCH %s dim=%d lane=%d nlanes=%d "
+							"stride=%d allow=%d: ref=%.9g simd=%.9g\n",
+							tag, blk->lut->dim, s, nlanes, blk->scalestride,
+							blk->allow != NULL, (double) o_ref[s],
+							(double) o_simd[s]);
+				sc_nbitfail++;
+			}
+		}
+	}
+
+	for (s = 0; s < nlanes; s++)
+	{
+		double		a,
+					e;
+
+		if (o_ref[s] == WEAVE_KERNEL_NEVER || o_exact[s] == WEAVE_KERNEL_NEVER)
+		{
+			/* Both paths mask the same lanes, so one sentinel implies the other;
+			 * assert that rather than skipping quietly. */
+			if (o_ref[s] != o_exact[s])
+				die("self-check: the byte path masked a different lane set than "
+					"the oracle");
+			continue;
+		}
+		sc_ncmp_dev[p]++;
+		e = (double) o_exact[s];
+		a = fabs((double) o_ref[s] - e);
+		if (a > sc_maxabs[p])
+		{
+			sc_maxabs[p] = a;
+			sc_maxabs_dim[p] = blk->lut->dim;
+		}
+		if (e != 0.0)
+		{
+			double		rel = a / fabs(e);
+
+			if (rel > sc_maxrel[p])
+			{
+				sc_maxrel[p] = rel;
+				sc_maxrel_dim[p] = blk->lut->dim;
+			}
+		}
+	}
+}
+
+/*
+ * The deterministic saturating set: lut[j][c] = c, so the global range is 15,
+ * every row quantizes to c * 17, and a code of all-15 nibbles makes EVERY
+ * coordinate contribute the maximum 255.  At dim = 1024 the true accumulator is
+ * 261120, four times what a 16-bit lane holds, so a kernel that does not widen
+ * inside the loop wraps and this fails.  (The reconstruction is exact here --
+ * step * 255 == 15 == lut[j][15] -- so it contributes nothing to the deviation
+ * figures, only to the bit-identity one.)
+ */
+static const int selfcheck_satdims[] = {258, 511, 512, 513, 959, 960, 961, 1024};
+
+#define SELFCHECK_NSAT ((int) (sizeof(selfcheck_satdims) / sizeof(selfcheck_satdims[0])))
+
+static int
+bench_selfcheck(int nblocks)
+{
+	const WeaveScoreKernel *simd = bench_kernel_lookup("lut-byte");
+	float	   *lutbuf = xmalloc((size_t) SELFCHECK_MAXDIM * 16 * sizeof(float));
+	weave_uint8 *codes = xmalloc((size_t) weave_block_codebytes(SELFCHECK_MAXDIM, 4));
+	weave_uint8 *code = xmalloc(((size_t) SELFCHECK_MAXDIM * 4 + 7) / 8);
+	float	   *scales = xmalloc((size_t) LANES * 4 * sizeof(float));
+	float	   *fvec = xmalloc((size_t) SELFCHECK_MAXDIM * sizeof(float));
+	weave_uint64 allow[4];
+	float		o_ref[LANES],
+				o_simd[LANES];
+	int			nfellback = 0;
+	int			it;
+
+	if (nblocks < 1)
+		nblocks = 200;
+
+	printf("# self-check: %d random blocks + %d saturating blocks, bits=4, "
+		   "layout=WEAVE_PACK_LANE\n", nblocks, SELFCHECK_NSAT);
+	printf("# lut-byte: %s\n", simd ? "AVX2, present" :
+		   "ABSENT (not compiled with -mavx2; no scalar alias, by design)");
+
+	/* ---- the saturating set -------------------------------------------- */
+	for (it = 0; it < SELFCHECK_NSAT; it++)
+	{
+		WeaveQueryLut lut;
+		WeaveScoreBlock blk;
+		int			dim = selfcheck_satdims[it];
+		char		tag[32];
+		int			j,
+					c,
+					s;
+
+		for (j = 0; j < dim; j++)
+			for (c = 0; c < 16; c++)
+				lutbuf[j * 16 + c] = (float) c;
+		memset(&lut, 0, sizeof(lut));
+		lut.dim = dim;
+		lut.nlevels = 16;
+		lut.lut = lutbuf;
+		bench_lut8_bind(&lut);
+
+		memset(codes, 0xFF, (size_t) weave_block_codebytes(dim, 4));
+		for (s = 0; s < LANES; s++)
+			scales[s] = 1.0f;
+
+		memset(&blk, 0, sizeof(blk));
+		blk.lut = &lut;
+		blk.layout = WEAVE_PACK_LANE;
+		blk.codes = codes;
+		blk.scales = scales;
+		blk.scalestride = 1;
+		blk.nlanes = LANES;
+		blk.livemask = 0xffffffffu;
+
+		snprintf(tag, sizeof(tag), "sat[%d]", it);
+		selfcheck_block(&blk, 1, tag);
+	}
+
+	/* ---- the random population ----------------------------------------- */
+	for (it = 0; it < nblocks; it++)
+	{
+		WeaveQuantizer qz;
+		WeaveQueryLut lut;
+		WeaveScoreBlock blk;
+		int			dim = (it < SELFCHECK_NDIMS) ? selfcheck_dims[it]
+			: selfcheck_dims[r64() % SELFCHECK_NDIMS];
+		int			nlanes = 1 + (int) (r64() % LANES);
+		int			stride = 1 + (int) (r64() % 3);
+		int			shape = (int) (r64() % 3);
+		int			useallow = (int) (r64() % 2);
+		weave_uint32 livemask = (weave_uint32) r64();
+		int			real = (it % 3) != 0;	/* two thirds real, one third stress */
+		char		tag[32];
+		int			s,
+					j,
+					c;
+
+		memset(&qz, 0, sizeof(qz));
+		memset(&lut, 0, sizeof(lut));
+		for (s = 0; s < LANES * stride; s++)
+		{
+			double		u = (double) (r64() >> 11) / 9007199254740992.0;
+
+			/* Occasionally 0: a lane whose scale is zero must still reconstruct
+			 * identically in both kernels. */
+			scales[s] = (r64() % 16 == 0) ? 0.0f : (float) (0.05 + 4.0 * u);
+		}
+		memset(codes, 0, (size_t) weave_block_codebytes(dim, 4));
+
+		if (real && weave_quantizer_init(&qz, dim, 4, NULL, malloc, free) != 0)
+		{
+			/* The codec declines some dims (the rotation has a minimum block).
+			 * Counted and reported rather than skipped silently, so the split
+			 * between the two populations in the summary is honest. */
+			real = 0;
+			nfellback++;
+		}
+
+		if (real)
+		{
+			/* --- the real distribution ------------------------------------ */
+			selfcheck_unit(fvec, dim);
+			if (weave_query_lut_build(&lut, &qz, fvec, malloc) != 0)
+				die("self-check: query_lut_build refused a unit query");
+			for (s = 0; s < LANES; s++)
+			{
+				float		norm,
+							sc;
+
+				selfcheck_unit(fvec, dim);
+				if (weave_encode(&qz, fvec, code, &norm, &sc) != 0)
+					die("self-check: encode refused a unit vector");
+				weave_pack_lane(WEAVE_PACK_LANE, dim, 4, codes, s, code);
+				scales[(size_t) s * stride] = sc;
+			}
+		}
+		else
+		{
+			/* --- a stress table, and uniformly random codes --------------- */
+			for (j = 0; j < dim; j++)
+			{
+				for (c = 0; c < 16; c++)
+				{
+					double		u = (double) (r64() >> 11) / 9007199254740992.0;
+
+					switch (shape)
+					{
+						case 0:
+							/* One coordinate far wider than the rest, so the
+							 * global step is set by an outlier row and every
+							 * other row quantizes coarsely. */
+							lutbuf[j * 16 + c] = (float) ((j == dim / 2 ? 500.0 : 1.0) *
+														  (2.0 * u - 1.0));
+							break;
+						case 1:
+							/* Constant rows: range == 0, the step guard's case,
+							 * which must come back bit-exact. */
+							lutbuf[j * 16 + c] = (float) (j * 0.001 - 0.5);
+							break;
+						default:
+							lutbuf[j * 16 + c] = (float) (u * u * u * 4.0 - 2.0);
+							break;
+					}
+				}
+			}
+			lut.dim = dim;
+			lut.nlevels = 16;
+			lut.lut = lutbuf;
+
+			for (s = 0; s < LANES; s++)
+			{
+				size_t		nb = ((size_t) dim * 4 + 7) / 8;
+				size_t		b;
+
+				for (b = 0; b < nb; b++)
+					code[b] = (weave_uint8) r64();
+				weave_pack_lane(WEAVE_PACK_LANE, dim, 4, codes, s, code);
+			}
+		}
+		bench_lut8_bind(&lut);
+
+		for (s = 0; s < 4; s++)
+			allow[s] = r64();
+
+		memset(&blk, 0, sizeof(blk));
+		blk.lut = &lut;
+		blk.layout = WEAVE_PACK_LANE;
+		blk.codes = codes;
+		blk.scales = scales;
+		blk.scalestride = stride;
+		blk.nlanes = nlanes;
+		blk.livemask = livemask;
+		if (useallow)
+		{
+			/* A firstwarp that is neither zero nor 64-aligned, so the two-word
+			 * extract in bench_lane_avail() is exercised. */
+			blk.firstwarp = (weave_uint32) (r64() % 70);
+			blk.nwarp = blk.firstwarp + (weave_uint32) nlanes +
+				(weave_uint32) (r64() % 20);
+			if (blk.nwarp > 4 * 64)
+				blk.nwarp = 4 * 64;
+			if (blk.firstwarp + (weave_uint32) nlanes > blk.nwarp)
+				blk.firstwarp = blk.nwarp - (weave_uint32) nlanes;
+			blk.allow = allow;
+		}
+
+		snprintf(tag, sizeof(tag), "it=%d", it);
+		selfcheck_block(&blk, real ? 0 : 1, tag);
+
+		if (real)
+		{
+			free(lut._alloc);
+			weave_quantizer_free(&qz, free);
+		}
+	}
+
+	/*
+	 * Negative cases: the contract says an inconsistent block description
+	 * returns -1 without writing anything.  Cheap to check, and the alternative
+	 * is a kernel that indexes a number that came off a page.
+	 */
+	{
+		WeaveQueryLut lut;
+		WeaveScoreBlock blk;
+		int			bad = 0;
+		int			j;
+
+		for (j = 0; j < 16 * 8; j++)
+			lutbuf[j] = 0.25f;
+		memset(&lut, 0, sizeof(lut));
+		lut.dim = 8;
+		lut.nlevels = 16;
+		lut.lut = lutbuf;
+		bench_lut8_bind(&lut);
+
+		memset(&blk, 0, sizeof(blk));
+		blk.lut = &lut;
+		blk.layout = WEAVE_PACK_LANE;
+		blk.codes = codes;
+		blk.scales = scales;
+		blk.scalestride = 1;
+		blk.nlanes = 8;
+		blk.livemask = 0xffu;
+
+		{
+			WeaveScoreBlock b2 = blk;
+
+			b2.nlanes = 0;
+			if (bench_kernel_lut8_ref.score_block(&b2, o_ref) != -1)
+				bad++;
+			if (simd && simd->score_block(&b2, o_simd) != -1)
+				bad++;
+		}
+		{
+			WeaveScoreBlock b2 = blk;
+
+			b2.nlanes = WEAVE_VEC_BLOCK + 1;
+			if (bench_kernel_lut8_ref.score_block(&b2, o_ref) != -1)
+				bad++;
+			if (simd && simd->score_block(&b2, o_simd) != -1)
+				bad++;
+		}
+		{
+			WeaveScoreBlock b2 = blk;
+
+			b2.layout = (WeavePackLayout) 7;
+			if (bench_kernel_lut8_ref.score_block(&b2, o_ref) != -1)
+				bad++;
+			if (simd && simd->score_block(&b2, o_simd) != -1)
+				bad++;
+		}
+		{
+			/* A firstwarp that would read `allow` past nwarp. */
+			WeaveScoreBlock b2 = blk;
+
+			b2.allow = allow;
+			b2.nwarp = 8;
+			b2.firstwarp = 4;
+			if (bench_kernel_lut8_ref.score_block(&b2, o_ref) != -1)
+				bad++;
+			if (simd && simd->score_block(&b2, o_simd) != -1)
+				bad++;
+		}
+		{
+			/* A 2-bit table: refused outright, NOT delegated to the oracle. */
+			WeaveQueryLut l2 = lut;
+			WeaveScoreBlock b2 = blk;
+
+			l2.nlevels = 4;
+			b2.lut = &l2;
+			if (bench_kernel_lut8_ref.score_block(&b2, o_ref) != -1)
+				bad++;
+			if (simd && simd->score_block(&b2, o_simd) != -1)
+				bad++;
+		}
+		if (bad)
+		{
+			fprintf(stderr, "CONTRACT FAILURES: %d rejections not reported as -1\n",
+					bad);
+			sc_nbitfail += bad;
+		}
+	}
+
+	printf("\n");
+	printf("lut-byte vs lut-byte-ref (must be bit-identical)\n");
+	if (!simd)
+		printf("  SKIPPED: lut-byte is not present in this build\n");
+	else
+	{
+		printf("  lane comparisons           : %ld\n", sc_ncmp_bits);
+		printf("  bit mismatches             : %ld   %s\n", sc_nbitfail,
+			   sc_nbitfail ? "<-- FAIL" : "(pass)");
+	}
+	printf("\n");
+	printf("lut-byte-ref vs scalar (REPORTED, not asserted -- this is the 8-bit\n");
+	printf("query table's rounding error, the number this measurement is for).\n");
+	printf("The relative figure is |dev| / |exact score| per lane, so it is\n");
+	printf("dominated by lanes whose exact score is near zero; the absolute one is\n");
+	printf("on the scale of a unit-vector score and is the one to read.\n");
+	printf("  REAL tables (weave_query_lut_build on a unit query, weave_encode'd codes)\n");
+	printf("    live-lane comparisons    : %ld\n", sc_ncmp_dev[0]);
+	printf("    max |deviation|          : %.6g   (at dim=%d)\n",
+		   sc_maxabs[0], sc_maxabs_dim[0]);
+	printf("    max relative deviation   : %.6g   (at dim=%d)\n",
+		   sc_maxrel[0], sc_maxrel_dim[0]);
+	printf("  STRESS tables (one row 500x the rest; NOT a distribution this codec makes)\n");
+	printf("    live-lane comparisons    : %ld\n", sc_ncmp_dev[1]);
+	printf("    max |deviation|          : %.6g   (at dim=%d)\n",
+		   sc_maxabs[1], sc_maxabs_dim[1]);
+	printf("    max relative deviation   : %.6g   (at dim=%d)\n",
+		   sc_maxrel[1], sc_maxrel_dim[1]);
+	if (nfellback)
+		printf("  (%d blocks moved from REAL to STRESS: the codec declined that dim)\n",
+			   nfellback);
+	printf("\n");
+
+	free(lutbuf);
+	free(codes);
+	free(code);
+	free(scales);
+	free(fvec);
+
+	if (sc_nbitfail)
+	{
+		fprintf(stderr, "SELF-CHECK FAILED: lut-byte is not bit-identical to "
+				"lut-byte-ref, so no timing of it means anything\n");
+		return 1;
+	}
+	printf("self-check: PASS\n");
+	return 0;
+}
 
 /* ---------------------------------------------------------------- main */
 
 int
 main(int argc, char **argv)
 {
+	/*
+	 * selfcheck=<nblocks> needs no corpus, so it is answered before the corpus
+	 * arguments are demanded.  It is the gate on the byte-LUT kernels above and
+	 * it exits non-zero if lut-byte and lut-byte-ref disagree by one bit.
+	 */
+	for (int i = 1; i < argc; i++)
+	{
+		if (!strncmp(argv[i], "selfcheck=", 10))
+			return bench_selfcheck(atoi(argv[i] + 10));
+	}
+
 	if (argc < 4)
 		die("usage: code_scan <base.fvecs> <nbase> <nq> [bits=4 k=10 "
-			"order=clustered|natural lists=1024 kernel=<name> queries=<path>]");
+			"order=clustered|natural lists=1024 kernel=<name> queries=<path>]\n"
+			"       code_scan selfcheck=<nblocks>");
 
 	const char *basepath = argv[1];
 	long		nreq = atol(argv[2]);
@@ -642,21 +1762,21 @@ main(int argc, char **argv)
 	 * flops per iteration, which would not have finished, times three kernels.
 	 * Preparation is per-corpus; timing is per-kernel; the loop belongs inside.
 	 */
-	const WeaveScoreKernel *kall[8];
+	const WeaveScoreKernel *kall[16];
 	int			nkern = 0;
 
 	if (kernelname && strcmp(kernelname, "all") != 0)
 	{
-		kall[0] = weave_score_kernel_lookup(kernelname);
+		kall[0] = bench_kernel_lookup(kernelname);
 		if (!kall[0])
 			die("no such kernel on this host");
 		nkern = 1;
 	}
 	else if (kernelname)
 	{
-		const WeaveScoreKernel *list[8];
+		const WeaveScoreKernel *list[16];
 
-		nkern = weave_score_kernel_list(list, 8);
+		nkern = bench_kernel_list(list, 16, bits);
 		for (int i = 0; i < nkern; i++)
 			kall[i] = list[i];
 	}
@@ -664,6 +1784,12 @@ main(int argc, char **argv)
 	{
 		kall[0] = weave_score_kernel_best();
 		nkern = 1;
+	}
+	for (int i = 0; i < nkern; i++)
+	{
+		if (bench_kernel_is_approx(kall[i]) && bits != 4)
+			die("the byte-LUT kernels are 4-bit only; they refuse every block at "
+				"other widths rather than falling back to the oracle");
 	}
 
 	/* ---- two-stage prefix scan ----------------------------------------
@@ -768,6 +1894,10 @@ main(int argc, char **argv)
 
 					if (weave_query_lut_build(&lut, &q, qv + (size_t) t * dim, malloc) != 0)
 						die("lut_build");
+					/* Rebind the byte-LUT kernels' quantized table to THIS query's
+					 * float table; see the staleness note on Lut8.  A no-op for
+					 * every other kernel. */
+					bench_lut8_bind(&lut);
 
 					/* Stage 1: the same kernel, told the vector is m long. */
 					WeaveQueryLut plut = lut;
@@ -910,6 +2040,10 @@ main(int argc, char **argv)
 
 		if (weave_query_lut_build(&lut, &q, qv + (size_t) t * dim, malloc) != 0)
 			die("lut_build");
+		/* Rebind the byte-LUT kernels' quantized table to THIS query's float
+		 * table; see the staleness note on Lut8.  A no-op for every other
+		 * kernel. */
+		bench_lut8_bind(&lut);
 
 		/* --- arm A: flat, every block, every lane --------------------- */
 		TopK		a;
@@ -1070,18 +2204,49 @@ main(int argc, char **argv)
 	}
 	fprintf(stderr, "\r  scan done            \n");
 
+	/*
+	 * BOTH ASSERTIONS BELOW COMPARE A SCORE AGAINST A BOUND (or a top-k) DERIVED
+	 * FROM THE EXACT FLOAT TABLE, so they can only be fatal for an EXACT kernel.
+	 * The byte-LUT kernels reconstruct a score with a rounding residual of up to
+	 * step/2 per coordinate, and nothing stops that residual pushing a lane a
+	 * hair above weave_block_bound_ip()'s exact-table bound, or reordering two
+	 * near-tied lanes between the flat and the pruned arm.  Killing the run there
+	 * would blame the block bound for the query table's quantization, which is
+	 * the wrong diagnosis and would hide the right one.
+	 *
+	 * So for an approximate kernel these are REPORTED with their real cause named
+	 * and the run continues; for every exact kernel the gate is exactly as fatal
+	 * as it was.  The correctness gate for the byte kernels is
+	 * `selfcheck=<nblocks>`, which is bit-exact and does exit non-zero.
+	 */
 	if (violations)
 	{
-		fprintf(stderr, "BOUND VIOLATIONS: %ld -- the bound is UNSOUND, no timing "
-				"below this line means anything\n", violations);
-		return 1;
+		if (bench_kernel_is_approx(kern))
+			fprintf(stderr, "note: %ld lane scores exceeded the exact-table bound "
+					"-- expected for the approximate kernel %s, and it is the "
+					"8-bit table's rounding, not an unsound bound\n",
+					violations, kern->name);
+		else
+		{
+			fprintf(stderr, "BOUND VIOLATIONS: %ld -- the bound is UNSOUND, no timing "
+					"below this line means anything\n", violations);
+			return 1;
+		}
 	}
 	if (mismatches)
 	{
-		fprintf(stderr, "TOP-K MISMATCHES: %d of %d queries -- the pruned arm "
-				"returns different results from the flat arm, so it is faster and "
-				"wrong\n", (int) mismatches, nq);
-		return 1;
+		if (bench_kernel_is_approx(kern))
+			fprintf(stderr, "note: pruned top-k differs from flat top-k on %d of "
+					"%d queries under the approximate kernel %s -- near-tied "
+					"lanes reordered by the 8-bit table, see selfcheck=\n",
+					(int) mismatches, nq, kern->name);
+		else
+		{
+			fprintf(stderr, "TOP-K MISMATCHES: %d of %d queries -- the pruned arm "
+					"returns different results from the flat arm, so it is faster and "
+					"wrong\n", (int) mismatches, nq);
+			return 1;
+		}
 	}
 
 	/* Bytes: the flat arm touches every block's codes.  The pruned arm touches
@@ -1101,7 +2266,12 @@ main(int argc, char **argv)
 	printf("# kernel: %s\n", kern->name);
 	printf("# blocks=%ld lanes/block=%d block bytes=%zu lane bytes=%zu\n",
 		   nblk, LANES, blkbytes, lanebytes);
-	printf("# soundness: PASS (no bound violation, pruned top-k == flat top-k on all %d queries)\n", nq);
+	if (violations || mismatches)
+		printf("# soundness: APPROXIMATE kernel -- %ld bound excursions, %d/%d "
+			   "queries' top-k differ between arms (8-bit table rounding; the "
+			   "bit-exact gate is selfcheck=)\n", violations, (int) mismatches, nq);
+	else
+		printf("# soundness: PASS (no bound violation, pruned top-k == flat top-k on all %d queries)\n", nq);
 	printf("\n");
 	printf("why: mean over blocks and queries -- a bound prunes only if it is BELOW theta\n");
 	printf("  best score (top-1)         : %8.4f\n", sum_best / nq);

@@ -414,6 +414,77 @@ logged, both deliberate: a build flag means the numbers only exist in a binary
 nobody is running, and `log_min_messages = warning` silences `elog(LOG)`, which
 cost the sibling project a whole measurement run.
 
+### G20 — bulk ingest of term-rich documents inflates the index ~237x — **OPEN, measured 2026-09-14**
+
+Found by taking the sibling project's field shape (~1,660 terms per document,
+thousand-document batches, no maintenance in between) and running it against us
+instead of assuming our merge policy made us immune. It does not.
+
+**Measured**, 4-bit irrelevant here, PG 17, `autovacuum = off`, one session
+throughout, `bench/RESULTS_INGEST_AMPLIFICATION.md`:
+
+| arm | `fsm_reuse` | `fsm_defer` | `extend` | pages per doc |
+|---|---:|---:|---:|---:|
+| 1,000 docs per transaction, batch 3 | 76 | 18,924 | 96,415 | 96 |
+| 1,000 docs per transaction, batch 4 | 19 | 18,981 | 117,032 | **117** |
+| one doc per transaction, 200 docs | 2,793 | 1,007 | 13,407 | 67 |
+
+6,000 documents reach **4,293 MB**; 4,200 documents reach 385,295 pages and one
+`weave_vacuum()` returns them to **1,624 pages — a factor of 237**. A document's
+1,660 postings do not fill a single page, so 117 pages extended per document is
+write amplification of order **100x**, against the sibling project's measured
+12-15x on the same corpus shape.
+
+**Mechanism, discriminated by the counters rather than reasoned about.**
+`fsm_defer` sits at ~19,000 per batch with `fsm_reuse` at 19-76: the free list *is*
+consulted, ~19,000 candidates are found, and essentially every one is **rejected**
+by `weave_page_recyclable()`. The inserting transaction freed those pages itself
+via its own merge, so `GlobalVisCheckRemovableXid()` cannot clear them while that
+transaction runs. In-transaction reuse is impossible by construction, and the gate
+is correct — it is the same gate whose removal caused a real crash. Reuse is
+**0.02-0.08%**, not the sibling project's 0.3%.
+
+The trigger is `weave_insert_oversized_as_segment()` calling
+`weave_merge_segments()` after **every** document. Any document whose analyzed
+`wdoc` exceeds one pending page takes that path, and at 1,660 terms every document
+does, so each insert mints a one-document segment and immediately rewrites a
+level-0 run.
+
+**Three things this is NOT, each checked:**
+
+- Not a segment-count runaway. `nsegments` stayed at 7-8 in every arm, including
+  the one-row-per-transaction arm. Our leveled compactor is doing its job; the
+  sibling project's field report (8 -> 128 segments, then unable to merge or
+  VACUUM) does not reproduce here. The cap is not what is at risk.
+- Not G18. G18 was the vacuum-path relocation ratchet and needed a stalled xid
+  horizon. This is the insert path, and it happens with the horizon advancing.
+- Not fixed by shortening transactions. One transaction per document raises reuse
+  to 17.2%, an order of magnitude better and still overwhelmingly extension.
+
+**My own artifact, recorded because it is the same one that has now bitten this
+lineage four times.** The first run wrapped all six batches in a single `DO` block,
+which is one transaction, so the horizon could not advance between batches and
+every candidate was trivially unrecyclable. Re-running with one transaction per
+batch changed reuse from 0.00% to 0.02-0.08% — that is, the artifact was real and
+did **not** materially change the answer, which is luck rather than method. I also
+selected the `reuse` and `extend` columns and omitted `defer` on the first pass,
+which is precisely the discrimination G19 exists to provide.
+
+**Not fixed here, deliberately.** The sibling project's mitigation — gate the
+insert-time merge on there being a fan-out's worth of small runs waiting — reached
+-31% and it called that a mitigation, not a fix, because the freed pages still
+cannot pass the XID gate inside the inserting transaction. Our compactor already
+no-ops when no level is over capacity, so that particular gate buys us less than it
+bought them. The real fix is to move the merge out of the inserting transaction,
+which is a design change and not a point edit. Recorded with a measured mechanism
+and left open.
+
+Corrected as part of this: the comment on `weave_insert_oversized_as_segment()`
+said oversized documents are "Rare, so building a whole segment per such document
+is acceptable", 50 lines above another comment in the same function saying "EVERY
+insert lands here and mints a segment" for the common case of a body index. Both
+cannot be true, and the measurement says the second one is.
+
 ### Checked and NOT a gap: HOT-successor TIDs in `amgettuple`
 
 pg_tre 4.0.2 fixed a silent under-return: its always-true scan path collected TIDs

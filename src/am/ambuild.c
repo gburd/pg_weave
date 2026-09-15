@@ -3917,8 +3917,16 @@ weave_buildempty(Relation index)
  * pending page) directly as its own one-document segment, bypassing the
  * verbatim pending buffer.  Segment posting storage is a chain of FOR-packed
  * pages with no per-document size limit, so arbitrarily large documents (e.g.
- * long Wikipedia articles) can be indexed.  Rare, so building a whole segment
- * per such document is acceptable.
+ * long Wikipedia articles) can be indexed.
+ *
+ * "OVERSIZED" IS NOT RARE, and this comment used to claim it was.  A wdoc with
+ * ~1,660 terms already exceeds a pending page, so for a body index over articles,
+ * email or code EVERY document lands here -- which is what the comment further
+ * down says, and the two claims contradicted each other for as long as both were
+ * here.  Measured consequence, at 1,660 terms/doc with no maintenance: 117 pages
+ * extended per document, essentially zero page reuse, and an index 237x its
+ * compacted size.  See G20 in doc/GAPS.md; it is open, and the cost is a whole
+ * segment build plus a merge trigger per document, not an acceptable rarity.
  */
 static void
 weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)

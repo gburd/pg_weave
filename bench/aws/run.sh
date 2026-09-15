@@ -555,6 +555,59 @@ run_codescan() {
 			src/vector/pack.c src/vector/kernels.c -lm && echo built' \
 		2>&1 | tee "$OUT/build.log" || die "code_scan build failed"
 
+	# THE DIFFERENTIAL SELF-CHECK IS A GATE, AND IT RUNS ON THIS HOST, NOT ONLY ON
+	# THE WORKSTATION.  `lut-byte` is an approximate SIMD kernel: it quantizes the
+	# query table to 8 bits and accumulates in integers, so it cannot be compared
+	# against the exact oracle for equality, only against its own scalar reference
+	# `lut-byte-ref`.  -march=native here is not -mavx2 there, so the binary being
+	# timed is not the binary that was checked locally.  Timing a kernel that is
+	# wrong on THIS host would produce exactly the fast-but-wrong headline
+	# AGENTS.md rule 8 exists to forbid, so if this exits non-zero the job dies
+	# before any number is taken.
+	say "byte-LUT differential self-check on this host (gate)"
+	$SSH 'cd /scratch && ./code_scan selfcheck=2000' \
+		2>&1 | tee "$OUT/selfcheck.log" || die "byte-LUT self-check FAILED on the bench host -- no timing below would mean anything"
+
+	# THE SINGLE-CORE BANDWIDTH FLOOR, on this host, for this reason: the local
+	# analysis says the flat scan is compute-bound with about an order of magnitude
+	# of headroom, since 480 B/vector in 291 ns is only ~1.6 GB/s.  That headroom
+	# is what makes a faster kernel worth writing at all, and it is an estimate
+	# until something measures the wall it is headroom to.  A sequential read-sum
+	# over a buffer far larger than L3, single-threaded, is the right shape: the
+	# code scan reads its codes exactly once, sequentially, and never revisits
+	# them.  This bounds any kernel we could ever write on this hardware.
+	say "single-core sequential read bandwidth (the wall the kernel cannot pass)"
+	$SSH 'cat > /scratch/bw.c <<EOF
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+int main(void)
+{
+	size_t n = (size_t) 2048 * 1024 * 1024;	/* 2 GiB, far past any L3 */
+	unsigned char *b = malloc(n);
+	unsigned long long s = 0;
+	struct timespec t0, t1;
+	if (!b) return 1;
+	for (size_t i = 0; i < n; i++) b[i] = (unsigned char) i;
+	for (int rep = 0; rep < 3; rep++)
+	{
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		for (size_t i = 0; i < n; i += 64) s += b[i];
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		double sec = (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec);
+		printf("touch-every-cacheline  %.2f GB/s\n", (double) n / sec / 1e9);
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		for (size_t i = 0; i < n; i++) s += b[i];
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		sec = (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec);
+		printf("read-every-byte        %.2f GB/s\n", (double) n / sec / 1e9);
+	}
+	return (int) (s & 1);
+}
+EOF
+		gcc -O2 -march=native -o /scratch/bw /scratch/bw.c && /scratch/bw' \
+		2>&1 | tee "$OUT/bandwidth.log" || say "bandwidth probe failed (not fatal)"
+
 	# n is swept so the per-vector cost is measured at three sizes rather than
 	# extrapolated from one, and so the L3-resident case (50k = 23 MB of codes) is
 	# distinguishable from the DRAM-bound case (1M = 458 MB).
@@ -588,6 +641,20 @@ run_codescan() {
 			prefix=480,240,120 pwin=8000,20000 \
 			queries=corpus/gist/gist_query.fvecs" \
 		2>&1 | tee -a "$OUT/prefix.log" || die "prefix scan failed"
+
+	# DO V15 AND A FASTER KERNEL COMPOSE, OR DOES ONE MAKE THE OTHER POINTLESS?
+	# The prefix scan (V15) scores fewer coordinates; a byte-LUT kernel scores each
+	# coordinate more cheaply.  The two levers are independent in principle, so the
+	# same prefix/window grid runs through `lut-byte` to see whether the product
+	# holds -- and, more to the point, whether the flat byte-LUT scan is already
+	# fast enough that spending V15's recall on top of it buys nothing.  Same grid
+	# as the arm above so the two tables can be read side by side.
+	say "two-stage prefix scan through the byte-LUT kernel, n=1M"
+	$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs 1000000 \
+			${CSNQ:-10} bits=4 k=10 order=natural kernel=lut-byte \
+			prefix=480,240,120 pwin=8000,20000 \
+			queries=corpus/gist/gist_query.fvecs" \
+		2>&1 | tee -a "$OUT/prefix_byte.log" || die "byte-LUT prefix scan failed"
 
 	say "n=200000 clustered -- does the bound prune at scale on a clean host?"
 	$SSH "cd /scratch && ./code_scan corpus/gist/gist_base.fvecs 200000 \

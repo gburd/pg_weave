@@ -656,6 +656,15 @@ weave_alloc_end(void)
  * with defer = 0 means the free list was never even consulted, which is a
  * different bug entirely.  Distinguishing those two by reasoning is exactly what
  * has failed here before.
+ *
+ * THE WAY THESE LIE TO YOU, and it is not hypothetical -- the sibling project hit
+ * it and read the result as "the allocator is never called".  Because they are
+ * backend-local, a counter read in a DIFFERENT session than the operation reports
+ * that session's zeros.  A shell loop of `psql -c` is a new backend per -c, so
+ * every read is zero no matter how much the index grew.  Zero here means "nothing
+ * happened in THIS backend", never "nothing happened".  Reset, operate and read in
+ * ONE session; t/015_alloc_outcomes.pl's bracket() exists to make that structural
+ * rather than remembered.
  */
 uint64		weave_alloc_lowfree_reuse = 0;
 uint64		weave_alloc_lowfree_defer = 0;
@@ -783,6 +792,9 @@ PG_FUNCTION_INFO_V1(weave_alloc_stats_reset);
  * PARALLEL RESTRICTED, not safe: a parallel build's workers each allocate pages
  * into their own counters and the leader would report only its own, which is a
  * wrong answer rather than a slow one.
+ *
+ * A ZERO FROM THIS FUNCTION IS NOT EVIDENCE unless the operation ran in the same
+ * session as the read; see the note on the counters themselves.
  */
 Datum
 weave_alloc_stats(PG_FUNCTION_ARGS)
@@ -842,6 +854,19 @@ weave_alloc_stats_reset(PG_FUNCTION_ARGS)
  * beyond the probe window was -- which makes the caller skip a pass it could have
  * done.  That is self-correcting on the next cycle and is the safe direction: a
  * false positive would start a relocation that can only grow the file.
+ *
+ * NECESSARY, NOT SUFFICIENT, and deliberately so.  "Some page is recyclable" does
+ * not mean "enough pages are recyclable to hold the live data", so a pass can still
+ * start, pack into the few pages it has, and extend for the rest.  The sibling
+ * project asks the stronger question -- count recyclable pages against the live
+ * size -- and that stronger version is what produced its own no-reclaim regression:
+ * the count is taken from free-space records, stale records overstate the live
+ * size, and a compaction that WOULD have reclaimed is then skipped forever.  This
+ * probe asks about RECYCLABILITY instead, which is a property of the freeing
+ * transaction's xid and becomes true on its own as the horizon advances, so a
+ * skipped pass cannot become a permanently skipped pass.  Tightening this to a
+ * count therefore trades a bounded overshoot for an unbounded stall, and must not
+ * be done without a measurement that shows the overshoot matters.
  */
 #define WEAVE_RECYCLE_PROBE_MAX 256
 
