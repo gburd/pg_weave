@@ -155,7 +155,33 @@ typedef struct WeaveBuildState
 								 * so the flush count stays far under
 								 * WEAVE_MAX_SEGMENTS (0 = use the default) */
 	int			nflushes;		/* segments this participant has flushed so far */
+	AttrNumber	lexattno;		/* 1-based index attnum of the lexical column, from
+								 * weave_index_layout().  Read ONLY by
+								 * weave_build_callback(), which is handed the whole
+								 * index tuple's values[] and cannot assume the wdoc
+								 * is at 0 now that the AM is multicolumn.  Resolved
+								 * once per build rather than per heap tuple: the
+								 * lookup is a syscache probe per key column, which is
+								 * nothing once and millions of times is not nothing.
+								 * Set on every path that initializes this struct,
+								 * including the merge and pending-flush paths that do
+								 * not read it, so that a future reader cannot pick up
+								 * a stack value. */
 } WeaveBuildState;
+
+/*
+ * Which values[] slot holds the wdoc.  Wraps weave_index_layout() so the seven
+ * places that initialize a WeaveBuildState say what they want in one line and
+ * cannot accidentally keep the pre-V7 assumption that it is slot 0.
+ */
+static AttrNumber
+weave_build_lexattno(Relation index)
+{
+	WeaveIndexLayout layout;
+
+	weave_index_layout(index, &layout);
+	return layout.lexattno;
+}
 
 static int
 cmp_buildterm(const void *a, const void *b)
@@ -621,12 +647,14 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 					bool *isnull, bool tupleIsAlive, void *state)
 {
 	WeaveBuildState *bs = (WeaveBuildState *) state;
+	int			lexidx = bs->lexattno - 1;
 	WeaveDoc		doc;
 	WeaveTermEntry *entries;
 	uint32		i;
 	MemoryContext old;
 
-	if (isnull[0])
+	Assert(bs->lexattno >= 1);
+	if (isnull[lexidx])
 		return;
 
 	/*
@@ -652,7 +680,7 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 
 	old = MemoryContextSwitchTo(bs->ctx);
 
-	doc = (WeaveDoc) PG_DETOAST_DATUM(values[0]);
+	doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
 	entries = WEAVE_DOC_ENTRIES(doc);
 
 	for (i = 0; i < doc->nterms; i++)
@@ -2550,6 +2578,7 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 
 		tbs.ctx = termctx;
 		tbs.want_positions = bs->want_positions;
+		tbs.lexattno = bs->lexattno;
 		tbs.want_trigrams = bs->want_trigrams;
 		tbs.terms = NULL;
 		tbs.nterms = 0;
@@ -2808,6 +2837,7 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 	bs.want_positions = weave_index_wants_positions(index);
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
+	bs.lexattno = weave_build_lexattno(index);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -2859,6 +2889,7 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	bs.want_positions = weave_index_wants_positions(index);
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
+	bs.lexattno = weave_build_lexattno(index);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -3622,6 +3653,7 @@ weave_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	bs.want_positions = weave_index_wants_positions(index);
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
+	bs.lexattno = weave_build_lexattno(index);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -3816,6 +3848,7 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.want_positions = weave_index_wants_positions(index);
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
+	bs.lexattno = weave_build_lexattno(index);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -3940,6 +3973,7 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
 	bs.want_positions = weave_index_wants_positions(index);
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
+	bs.lexattno = weave_build_lexattno(index);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -4035,11 +4069,22 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	Buffer		tailbuf;
 	Page		tailpage;
 	bool		appended = false;
+	WeaveIndexLayout layout;
+	int			lexidx;
 
-	if (isnull[0])
+	/*
+	 * Resolved per inserted tuple rather than cached: aminsert has no per-statement
+	 * state of its own (ii_AmCache belongs to the AM but is not plumbed here), and
+	 * the cost is one syscache probe per key column against an insert that already
+	 * takes an exclusive buffer lock on the metapage and emits WAL.
+	 */
+	weave_index_layout(index, &layout);
+	lexidx = layout.lexattno - 1;
+
+	if (isnull[lexidx])
 		return false;
 
-	doc = (WeaveDoc) PG_DETOAST_DATUM(values[0]);
+	doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
 	doclen = VARSIZE(doc);
 	need = MAXALIGN(sizeof(WeavePendingItem) + doclen);
 
@@ -4194,6 +4239,7 @@ weave_flush_pending(Relation index)
 	bs.want_positions = weave_index_wants_positions(index);
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
+	bs.lexattno = weave_build_lexattno(index);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;

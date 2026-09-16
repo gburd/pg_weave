@@ -2557,11 +2557,19 @@ weave_recheck_exact(Relation index, WeaveQuery query, TidSet *set)
 	Snapshot	snap = GetActiveSnapshot();
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
+	WeaveIndexLayout layout;
+	int			lexidx;
 	int			i,
 				keep = 0;
 
 	if (set->n == 0)
 		return;
+
+	/* FormIndexDatum fills every key column, so pick the wdoc out by attnum
+	 * rather than by position -- a multicolumn weave index may list the vector
+	 * column first. */
+	weave_index_layout(index, &layout);
+	lexidx = layout.lexattno - 1;
 
 	heap = table_open(index->rd_index->indrelid, AccessShareLock);
 	indexInfo = BuildIndexInfo(index);
@@ -2589,9 +2597,9 @@ weave_recheck_exact(Relation index, WeaveQuery query, TidSet *set)
 			WeaveDoc		doc;
 
 			FormIndexDatum(indexInfo, slot, estate, values, isnull);
-			if (!isnull[0])
+			if (!isnull[lexidx])
 			{
-				doc = (WeaveDoc) PG_DETOAST_DATUM(values[0]);
+				doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
 				if (weave_doc_matches(doc, query))
 					set->tids[keep++] = set->tids[i];
 			}

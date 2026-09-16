@@ -188,20 +188,46 @@ weave_find_pushdown_index(PlannerInfo *root, RelOptInfo *rel,
 
 			if (ind->rd_rel->relam == get_index_am_oid("weave", true))
 			{
-				if (ind->rd_indexprs != NIL)
+				WeaveIndexLayout layout;
+				AttrNumber	lexkey;
+
+				/*
+				 * `d @@@ q` can only be answered by the index if `d` is the index's
+				 * LEXICAL column.  Since V7 the index may have more than one column,
+				 * so neither "the index has exactly one column" nor "the first
+				 * column" identifies it, and neither does "the first index
+				 * expression" -- the vector column is the one that could be an
+				 * expression.  Resolve the routing, then compare against whatever
+				 * that one column is.
+				 */
+				weave_index_layout(ind, &layout);
+				lexkey = ind->rd_index->indkey.values[layout.lexattno - 1];
+
+				if (lexkey == InvalidAttrNumber)
 				{
-					/* expression index (e.g. USING weave (to_wdoc(body))):
-					 * the LHS must equal the index expression. */
-					if (equal(linitial(ind->rd_indexprs), lhs))
+					/*
+					 * The lexical column is an index expression (e.g.
+					 * USING weave (to_wdoc(body))).  indkey holds 0 for each
+					 * expression column and rd_indexprs lists them in indkey order,
+					 * so the expression wanted is the (number of zeros before this
+					 * column)-th entry.
+					 */
+					int			nth = 0;
+					int			k;
+
+					for (k = 0; k < layout.lexattno - 1; k++)
+						if (ind->rd_index->indkey.values[k] == InvalidAttrNumber)
+							nth++;
+					if (nth < list_length(ind->rd_indexprs) &&
+						equal(list_nth(ind->rd_indexprs, nth), lhs))
 						found = indexoid;
 				}
-				else if (ind->rd_index->indnatts == 1 &&
-						 IsA(lhs, Var) &&
+				else if (IsA(lhs, Var) &&
 						 ((Var *) lhs)->varno == rel->relid &&
-						 ((Var *) lhs)->varattno == ind->rd_index->indkey.values[0])
+						 ((Var *) lhs)->varattno == lexkey)
 				{
 					/* plain-column index (USING weave (d)): the LHS must be the
-					 * Var for that single indexed column.  This is the stored-
+					 * Var for the indexed lexical column.  This is the stored-
 					 * wdoc-column form the docs recommend; without this the
 					 * count pushdown only fired for expression indexes and a
 					 * stored-column count(*) fell back to a slow bitmap scan. */

@@ -73,3 +73,31 @@ COMMENT ON FUNCTION weave_page_info(regclass, bigint) IS
 -- enumerate the page structure of any index in the database. No indexed content is
 -- exposed, but this is pageinspect's shape and pageinspect's precedent applies.
 REVOKE ALL ON FUNCTION weave_page_info(regclass, bigint) FROM PUBLIC;
+
+-- The vector channel's operator class, and the reason it declares no operators.
+--
+-- Task V7 makes the access method multicolumn so that
+--
+--     CREATE INDEX ON docs USING weave (body wdoc_lex_ops, embedding wvec_weave_ops)
+--
+-- is one index, one WAL stream, one vacuum over one docid space -- claim 1 in
+-- doc/ARCHITECTURE.md sect. 9. The access method routes each column to a channel by
+-- its operator class, NOT by the column's type: doc/specs/FUZZY_CHANNEL.md declares
+-- the corpus n-gram channel as `USING weave (sku gram_ops)` over an ordinary text
+-- column, so two channels will share one input type and the type cannot be the
+-- discriminator. That is why a wvec column needs an opclass of its own even before
+-- anything can query it.
+--
+-- STORAGE-only, with no operator members, is deliberate: V7 is the storage half and
+-- V8 is the scan. An opclass that advertised `<=>` before the access method could
+-- execute a vector ordering would make the planner build index paths that fail at
+-- run time -- on the query shape every pgvector user writes first. V8 adds the
+-- members with ALTER OPERATOR FAMILY, next to the code that serves them.
+--
+-- Named wvec_weave_ops, not wvec_ops: the type already has a btree wvec_ops from
+-- 0.2.0 for ordinary sorting, and the two belong to different access methods.
+CREATE OPERATOR CLASS wvec_weave_ops DEFAULT FOR TYPE wvec USING weave AS
+    STORAGE wvec;
+
+COMMENT ON OPERATOR CLASS wvec_weave_ops USING weave IS
+    'index a wvec column as the vector channel of a weave index (storage only until V8)';

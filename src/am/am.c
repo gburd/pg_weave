@@ -62,6 +62,8 @@
 #include "access/visibilitymap.h"
 #include "catalog/index.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_opclass.h"		/* Form_pg_opclass (amvalidate) */
+#include "catalog/pg_opfamily.h"		/* Form_pg_opfamily (opfamily -> weft kind) */
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/vacuum.h"
@@ -91,6 +93,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"		/* SearchSysCache1(CLAOID) in weave_index_layout */
 #include "utils/selfuncs.h"
 
 
@@ -2764,10 +2767,166 @@ weave_index_wants_doclen_sidecar(Relation index)
 	return r;
 }
 
+/*
+ * The operator-family -> weft-kind registry.  See WeaveIndexLayout in weave/am.h
+ * for why the key is a family NAME rather than a type OID or an OID of any kind.
+ * Add a channel by adding a row.
+ *
+ * The family and not the opclass, because the relcache caches `rd_opfamily[]` for
+ * every index column and does NOT cache the opclass OIDs -- `pg_index.indclass` is
+ * a varlena, reachable only by deforming the catalog tuple.  CREATE OPERATOR CLASS
+ * creates an implicit family of the same name, so the names below are the opclass
+ * names users write, and an explicit `FAMILY wvec_weave_ops` on some future opclass
+ * gets vector routing, which is what sharing a family means.
+ *
+ * `wdoc_lex_ops` predates the registry and keeps its name; the newer ones follow
+ * `<type>_weave_ops`, which is the pgvector-era convention for "this opclass is for
+ * that access method" and disambiguates from the btree `wvec_ops` the type already
+ * has.  Renaming the lexical one would break every existing index for no gain.
+ */
+static const struct
+{
+	const char *opfname;
+	WeaveWeftKind kind;
+}			weave_opfamily_kinds[] = {
+	{"wdoc_lex_ops", WEAVE_WK_LEXICAL},
+	{"wvec_weave_ops", WEAVE_WK_VECTOR},
+};
+
+/*
+ * The kind an operator-family name declares, or WEAVE_WK_INVALID if it is not ours.
+ */
+static WeaveWeftKind
+weave_opfname_kind(const char *opfname)
+{
+	int			i;
+
+	for (i = 0; i < (int) lengthof(weave_opfamily_kinds); i++)
+		if (strcmp(opfname, weave_opfamily_kinds[i].opfname) == 0)
+			return weave_opfamily_kinds[i].kind;
+	return WEAVE_WK_INVALID;
+}
+
+/*
+ * The kind declared by an operator family.  Throws if the family is not in the
+ * registry, which is what keeps a misrouted attribute from being possible: every
+ * caller either gets a kind or an error, never a default.
+ */
+static WeaveWeftKind
+weave_opfamily_kind(Oid opfamilyoid)
+{
+	HeapTuple	tup;
+	Form_pg_opfamily form;
+	WeaveWeftKind kind;
+	char		opfname[NAMEDATALEN];
+
+	tup = SearchSysCache1(OPFAMILYOID, ObjectIdGetDatum(opfamilyoid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for operator family %u", opfamilyoid);
+	form = (Form_pg_opfamily) GETSTRUCT(tup);
+	strlcpy(opfname, NameStr(form->opfname), sizeof(opfname));
+	ReleaseSysCache(tup);
+
+	kind = weave_opfname_kind(opfname);
+	if (kind == WEAVE_WK_INVALID)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("operator family \"%s\" is not a pg_weave channel family",
+						opfname),
+				 errdetail("The \"weave\" access method routes each index column to a retrieval channel by its operator class."),
+				 errhint("Use wdoc_lex_ops for a wdoc column or wvec_weave_ops for a wvec column.")));
+	return kind;
+}
+
+/*
+ * amvalidate.  The opclasses carry no support procedures (amsupport = 0) and their
+ * operator members are checked by the generic catalog machinery, so the one thing
+ * left to validate is the thing this AM actually depends on: that the opclass
+ * belongs to a family that names a channel.  An opclass that does not is one whose
+ * columns the access method would have no route for.
+ */
 static bool
 weave_validate(Oid opclassoid)
 {
+	HeapTuple	tup;
+	Oid			opfamilyoid;
+
+	tup = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclassoid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for operator class %u", opclassoid);
+	opfamilyoid = ((Form_pg_opclass) GETSTRUCT(tup))->opcfamily;
+	ReleaseSysCache(tup);
+
+	(void) weave_opfamily_kind(opfamilyoid);
 	return true;
+}
+
+/*
+ * Resolve the index's per-column channel routing.  See WeaveIndexLayout.
+ *
+ * Cheap enough to call per statement (one syscache probe per key column) but not
+ * free, so the build path resolves it once into WeaveBuildState rather than per
+ * heap tuple.
+ */
+void
+weave_index_layout(Relation index, WeaveIndexLayout *out)
+{
+	int			i;
+
+	memset(out, 0, sizeof(*out));
+	out->nkeys = IndexRelationGetNumberOfKeyAttributes(index);
+	Assert(out->nkeys > 0 && out->nkeys <= INDEX_MAX_KEYS);
+
+	for (i = 0; i < out->nkeys; i++)
+	{
+		Oid			opfamilyoid = index->rd_opfamily[i];
+		WeaveWeftKind kind = weave_opfamily_kind(opfamilyoid);
+
+		out->kind[i] = (uint16) kind;
+		switch (kind)
+		{
+			case WEAVE_WK_LEXICAL:
+				if (out->lexattno != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("index \"%s\" has more than one lexical column",
+									RelationGetRelationName(index)),
+							 errdetail("Columns %d and %d both use a lexical operator class.",
+									   out->lexattno, i + 1),
+							 errhint("Build one weave index per document column.")));
+				out->lexattno = (AttrNumber) (i + 1);
+				break;
+			case WEAVE_WK_VECTOR:
+				if (out->vecattno != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("index \"%s\" has more than one vector column",
+									RelationGetRelationName(index)),
+							 errdetail("Columns %d and %d both use a vector operator class.",
+									   out->vecattno, i + 1)));
+				out->vecattno = (AttrNumber) (i + 1);
+				break;
+			default:
+				elog(ERROR, "unhandled weave weft kind %d for index \"%s\" column %d",
+					 (int) kind, RelationGetRelationName(index), i + 1);
+		}
+	}
+
+	/*
+	 * A lexical column is required, and the reason is structural rather than a
+	 * policy choice: the docid space every other channel indexes into is assigned
+	 * by the lexical build (weave_build_callback assigns one docid per document
+	 * and the segment writers lay the postings out in that order).  Until a vector
+	 * weft can create a bolt on its own, a vector-only index would build an index
+	 * with no documents in it and answer every query with zero rows -- a wrong
+	 * answer, not a slow one.  Refuse it instead.
+	 */
+	if (out->lexattno == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a weave index requires a lexical column"),
+				 errdetail("Every channel shares the document-id space that the lexical column's build assigns."),
+				 errhint("Add a wdoc column with wdoc_lex_ops as the first index column.")));
 }
 
 Datum
@@ -2787,7 +2946,21 @@ weave_handler(PG_FUNCTION_ARGS)
 #endif
 	amroutine->amcanbackward = false;
 	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = false;
+
+	/*
+	 * amcanmulticol: TRUE since task V7.  A weave index carries one column per
+	 * channel -- `USING weave (body wdoc_lex_ops, embedding wvec_weave_ops)` is one
+	 * index, one WAL stream, one vacuum, which is claim 1 in doc/ARCHITECTURE.md
+	 * sect. 9.  Flipping the flag is the small half; the routing is
+	 * weave_index_layout(), because a column's ORDINAL says nothing about its
+	 * channel (the vector column may be written first) and four write/recheck sites
+	 * had `values[0]` compiled into them.
+	 *
+	 * Column order is not a capability question either way: no channel's on-disk
+	 * structure is shared with another's, so unlike btree there is no leading-column
+	 * prefix rule to respect.
+	 */
+	amroutine->amcanmulticol = true;
 	/*
 	 * amoptionalkey: can a scan run with no restriction clause on the first
 	 * index column?
