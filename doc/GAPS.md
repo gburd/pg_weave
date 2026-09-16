@@ -616,6 +616,43 @@ This is the third verification error in two days from the same family - the othe
 `$?` after a pipeline reading `tail`'s status, and a `grep -q` used as a pass/fail test.
 All three reported a state that had not been checked.
 
+### G22 — an unvalidated `pd_lower` in the trigram blob reader was an out-of-bounds read — **CLOSED 2026-09-16**
+
+Found by the standing per-session upstream review, not by a test. pg_fts 1.7.1's
+release note says it audited the siblings of the one `page + pd_lower` its 1.7.0
+had fixed, found **eight** more, routed them all through one validating helper,
+and recorded "I should have grepped the siblings then". pg_weave already had that
+helper — `weave_page_entry_end()` in `include/weave/am.h`, which validates in the
+integer domain and treats an implausible value as an empty page — and 20-odd call
+sites went through it. Four did not.
+
+Three of the four were benign (write paths on a page held exclusively, or an
+integer comparison that was already bounded). The fourth was real:
+
+```c
+avail = ((PageHeader) page)->pd_lower -
+    ((char *) PageGetContents(page) - (char *) page);
+avail = Min(avail, len - off);
+memcpy(buf + off, PageGetContents(page), avail);
+```
+
+`src/pages/trgm_page.c`, reading a sparsemap blob spread over a page chain under
+`BUFFER_LOCK_SHARE`. `avail` is a `Size`, so a torn or recycled page reporting
+`pd_lower` **below** the contents offset underflows it to ~2^64, and the `Min()`
+then clamps it not to this page but to the caller's remaining blob length — which
+spans the whole chain. The `memcpy` reads past the page into adjacent shared
+buffers. **It cannot overrun `buf`, which is exactly why it read as safe**: the
+destination is bounded, the source is not.
+
+Fixed by routing all four through the helper, and the audit is now a lint —
+`make check-pdlower`, in both CI workflows — that fails on any read of `pd_lower`
+outside `include/weave/am.h`. Making the grep permanent is the point: the class
+has now recurred in two codebases, and in both the first fix was one instance.
+
+Not reachable from the regression or TAP suites, which never produce a torn page;
+the fuzz harness is where a page-image mutation of this shape belongs, and adding
+one is open work.
+
 ### Checked and NOT a gap: HOT-successor TIDs in `amgettuple`
 
 pg_tre 4.0.2 fixed a silent under-return: its always-true scan path collected TIDs

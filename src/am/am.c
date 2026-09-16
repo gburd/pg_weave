@@ -1977,12 +1977,11 @@ weave_read_chandesc(Relation index, BlockNumber blk,
 	}
 
 	/* pd_lower bounds what the writer actually wrote; never read past it, and
-	 * never trust it to be sane either (a torn header can make it small). */
-	avail = 0;
-	if (((PageHeader) page)->pd_lower >=
-		(char *) PageGetContents(page) - (char *) page)
-		avail = ((PageHeader) page)->pd_lower -
-			((char *) PageGetContents(page) - (char *) page);
+	 * never trust it to be sane either (a torn header can make it small).  The
+	 * one validated reader of pd_lower in this access method is
+	 * weave_page_entry_end(); `make check-pdlower` keeps it the only one. */
+	avail = (Size) (weave_page_entry_end(page) -
+					(char *) PageGetContents(page));
 
 	err = weave_chandesc_check(PageGetContents(page), avail, nblocks, &nweft);
 	if (err != WEAVE_CD_OK)
@@ -2159,7 +2158,6 @@ weave_surf_walk(Relation index, BlockNumber root, uint8 *dst, Size cap,
 		Buffer		buf;
 		Page		page;
 		Size		avail;
-		Size		contoff;
 
 		CHECK_FOR_INTERRUPTS();	/* between pages, no buffer lock held */
 		if (blk >= nblocks)
@@ -2196,13 +2194,11 @@ weave_surf_walk(Relation index, BlockNumber root, uint8 *dst, Size cap,
 			return -1;
 		}
 
-		contoff = (Size) ((char *) PageGetContents(page) - (char *) page);
-		avail = 0;
-		if ((Size) ((PageHeader) page)->pd_lower >= contoff)
-			avail = (Size) ((PageHeader) page)->pd_lower - contoff;
+		avail = (Size) (weave_page_entry_end(page) -
+						(char *) PageGetContents(page));
 		if (avail > (Size) WEAVE_SURFPAGE_PAYLOAD)
-			avail = (Size) WEAVE_SURFPAGE_PAYLOAD;	/* a torn pd_lower cannot make us
-												 * read into the opaque area */
+			avail = (Size) WEAVE_SURFPAGE_PAYLOAD;	/* a torn page header cannot make
+												 * us read into the opaque area */
 		if (dst != NULL)
 		{
 			if ((Size) total + avail > cap)

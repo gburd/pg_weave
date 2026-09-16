@@ -57,6 +57,7 @@ jobs:
         run: |
           make check-ascii    # non-ASCII in install SQL breaks CREATE EXTENSION on LATIN1
           make check-alloc    # the unguarded corpus-scale palloc class behind 4 real crashes
+          make check-pdlower  # an unvalidated page + pd_lower; one was a real OOB read
           make check-rename   # pg_fts-era identifiers surviving the fork
 
       - name: Standalone property tests

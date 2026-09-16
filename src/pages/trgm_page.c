@@ -131,8 +131,19 @@ weave_read_blob(Relation index, BlockNumber blk, Size len)
 		b = ReadBuffer(index, blk);
 		LockBuffer(b, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(b);
-		avail = ((PageHeader) page)->pd_lower -
-			((char *) PageGetContents(page) - (char *) page);
+
+		/*
+		 * pd_lower comes off disk and this page is held under only
+		 * BUFFER_LOCK_SHARE, so the subtraction below is exactly the underflow
+		 * pg_weave's page-walk guard exists to prevent: as an unsigned Size, a
+		 * torn or recycled page reporting pd_lower BELOW the contents offset
+		 * yields a huge `avail`, and the Min() then clamps it to the caller's
+		 * remaining blob length -- which spans the whole CHAIN, not this page.
+		 * The memcpy would read past the page into adjacent shared buffers.  It
+		 * cannot overrun `buf`, which is why this looked safe.
+		 */
+		avail = (Size) (weave_page_entry_end(page) -
+						(char *) PageGetContents(page));
 		avail = Min(avail, len - off);
 		memcpy(buf + off, PageGetContents(page), avail);
 		off += avail;
@@ -283,8 +294,8 @@ weave_write_trigrams_iter(Relation index, DictNextFn next, void *nstate)
 		/* append the fixed-size directory entry, chaining a page if needed */
 		need = MAXALIGN(sizeof(WeaveTrgmEntry));
 		if (dbuf == InvalidBuffer ||
-			((PageHeader) dpage)->pd_lower + need >
-			BLCKSZ - MAXALIGN(sizeof(WeavePageOpaqueData)))
+			weave_page_entry_end(dpage) + need >
+			(char *) dpage + BLCKSZ - MAXALIGN(sizeof(WeavePageOpaqueData)))
 		{
 			Buffer		next = weave_new_buffer(index);
 			BlockNumber nextblk = BufferGetBlockNumber(next);
@@ -303,8 +314,7 @@ weave_write_trigrams_iter(Relation index, DictNextFn next, void *nstate)
 			weave_init_page(dpage, WEAVE_PK_TRGM);
 		}
 		{
-			WeaveTrgmEntry *te = (WeaveTrgmEntry *) ((char *) dpage +
-												   ((PageHeader) dpage)->pd_lower);
+			WeaveTrgmEntry *te = (WeaveTrgmEntry *) weave_page_entry_end(dpage);
 
 			te->trgm = acc->trgm;
 			te->smlen = (uint32) smlen;

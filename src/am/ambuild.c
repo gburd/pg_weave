@@ -1179,7 +1179,8 @@ weave_write_postings(WeavePostWriter *pw, BuildTerm *bt,
 		if (!start_recorded)
 		{
 			*firstblk = BufferGetBlockNumber(pw->buffer);
-			*firstoff = (uint32) ((PageHeader) pw->page)->pd_lower;
+			*firstoff = (uint32) (weave_page_entry_end(pw->page) -
+								  (char *) pw->page);
 			start_recorded = true;
 		}
 
@@ -1270,7 +1271,7 @@ weave_write_doclen_sidecar(Relation index, DoclenCollector *c)
 		if (pw.buffer != InvalidBuffer)
 		{
 			pageend = (char *) pw.page + BLCKSZ - MAXALIGN(sizeof(WeavePageOpaqueData));
-			if ((char *) pw.page + ((PageHeader) pw.page)->pd_lower + need > pageend)
+			if (weave_page_entry_end(pw.page) + need > pageend)
 			{
 				Buffer		next = weave_new_buffer(index);
 				BlockNumber nextblk = BufferGetBlockNumber(next);
@@ -1296,7 +1297,7 @@ weave_write_doclen_sidecar(Relation index, DoclenCollector *c)
 			first = BufferGetBlockNumber(pw.buffer);
 			start_recorded = true;
 		}
-		dst = (char *) pw.page + ((PageHeader) pw.page)->pd_lower;
+		dst = weave_page_entry_end(pw.page);
 		bh = (WeaveDoclenBlockHdr *) dst;
 		bh->count = (uint32) bcount | WEAVE_DOCLEN_ABS;	/* v5: absolute offsets */
 		bh->first_docid_hi = (uint32) (first_docid >> 32);
@@ -1772,8 +1773,8 @@ weave_write_dictionary_iter(Relation index, DictNextFn next, void *nstate,
 		CHECK_FOR_INTERRUPTS();		/* per-term; page-copy semantics keep it safe */
 
 		if (buffer == InvalidBuffer ||
-			((PageHeader) page)->pd_lower + need >
-			BLCKSZ - sizeof(WeavePageOpaqueData))
+			weave_page_entry_end(page) + need >
+			(char *) page + BLCKSZ - sizeof(WeavePageOpaqueData))
 		{
 			Buffer		nextbuf = weave_new_buffer(index);
 			BlockNumber nextblk = BufferGetBlockNumber(nextbuf);
@@ -1860,8 +1861,8 @@ weave_write_dictionary_iter(Relation index, DictNextFn next, void *nstate,
 			WeaveDictIndexEntry *ie;
 
 			if (ib == InvalidBuffer ||
-				((PageHeader) ip)->pd_lower + need >
-				BLCKSZ - sizeof(WeavePageOpaqueData))
+				weave_page_entry_end(ip) + need >
+				(char *) ip + BLCKSZ - sizeof(WeavePageOpaqueData))
 			{
 				Buffer		nextbuf = weave_new_buffer(index);
 				BlockNumber nextblk = BufferGetBlockNumber(nextbuf);
@@ -4111,15 +4112,14 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 		tailbuf = ReadBuffer(index, tailblk);
 		LockBuffer(tailbuf, BUFFER_LOCK_EXCLUSIVE);
 		tailpage = BufferGetPage(tailbuf);
-		if (((PageHeader) tailpage)->pd_lower + need <=
-			BLCKSZ - MAXALIGN(sizeof(WeavePageOpaqueData)))
+		if (weave_page_entry_end(tailpage) + need <=
+			(char *) tailpage + BLCKSZ - MAXALIGN(sizeof(WeavePageOpaqueData)))
 		{
 			WeavePendingItem *pi;
 
 			state = GenericXLogStart(index);
 			tailpage = GenericXLogRegisterBuffer(state, tailbuf, 0);
-			pi = (WeavePendingItem *) ((char *) tailpage +
-									 ((PageHeader) tailpage)->pd_lower);
+			pi = (WeavePendingItem *) weave_page_entry_end(tailpage);
 			pi->tid = *ht_ctid;
 			pi->doclen = doclen;
 			memcpy((char *) pi + sizeof(WeavePendingItem), doc, doclen);
@@ -4160,8 +4160,7 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 													   GENERIC_XLOG_FULL_IMAGE);
 
 			weave_init_page(np, WEAVE_PK_PENDING);
-			pi = (WeavePendingItem *) ((char *) np +
-									 ((PageHeader) np)->pd_lower);
+			pi = (WeavePendingItem *) weave_page_entry_end(np);
 			pi->tid = *ht_ctid;
 			pi->doclen = doclen;
 			memcpy((char *) pi + sizeof(WeavePendingItem), doc, doclen);
