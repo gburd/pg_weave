@@ -99,6 +99,7 @@ sources = files(
   'src/vector/quantize.c',
   'src/vector/pack.c',
   'src/vector/vecpage.c',
+  'src/vector/vecstats.c',
   'src/vector/kernels.c',
   'src/vector/kernel_ops.c',
   'src/vector/wvec.c',

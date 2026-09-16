@@ -372,8 +372,8 @@ extern void weave_quantizer_free(WeaveQuantizer *q, void (*dealloc) (void *));
  *
  *	v			input, dim floats, NOT modified
  *	code		output, q->codebytes bytes, bit-packed
- *	out_norm	output, ||v||
- *	out_scale	output, the renormalization scale (step 6 above)
+ *	out_norm	output, ||v||; may be NULL if the caller does not want it
+ *	out_scale	output, the renormalization scale (step 6 above); may be NULL
  *
  * Returns 0 on success.  Returns -1 for a zero (or denormal-norm) vector, which
  * the caller must handle explicitly rather than encode: a zero vector has no

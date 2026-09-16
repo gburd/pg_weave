@@ -1018,8 +1018,17 @@ weave_encode(const WeaveQuantizer *q, const float *v,
 	if (dot < 1e-12)
 		dot = 1e-12;
 
-	*out_norm = (float) norm;
-	*out_scale = (float) (norm / dot);
+	/*
+	 * Both outputs are OPTIONAL.  They were mandatory and unchecked, and the first
+	 * caller that wanted only the scale -- weave_vecblock_stats(), which needs the
+	 * centroid's scale and has no use for its norm -- passed NULL and got a SEGV
+	 * inside the codec.  In a backend that is a crashed process, not an error, so
+	 * the guard is worth one branch outside every loop.
+	 */
+	if (out_norm != NULL)
+		*out_norm = (float) norm;
+	if (out_scale != NULL)
+		*out_scale = (float) (norm / dot);
 	return 0;
 }
 

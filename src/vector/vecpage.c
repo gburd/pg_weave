@@ -193,41 +193,6 @@ weave_strip_scatter(weave_uint8 *block, size_t blocklen, int dim, int bits,
  * forced rather than chosen.
  * ------------------------------------------------------------------------- */
 
-/* Is every float in a directory record usable as a bound?
- *
- * "Finite" is the weak half.  The strong half is that a NEGATIVE radius or scale
- * cannot arise from any correct writer and would make bound (B3) smaller than the
- * true maximum -- an unsound bound silently drops rows (contract C2), which no
- * fixed-output test can catch.  So the validator rejects rather than clamps: a
- * clamped bound is a wrong answer that looks like a repair.
- */
-static int
-dirrec_floats_ok(const WeaveVecDirRec *rec)
-{
-	int			i;
-	const float *f = &rec->smax;
-
-	/* smax, maxrecnorm, minnorm, censcale, cenrad are contiguous by declaration;
-	 * the loop covers them plus every lane pair. */
-	for (i = 0; i < 5; i++)
-	{
-		if (!(f[i] == f[i]))	/* NaN */
-			return 0;
-		if (f[i] < 0.0f)
-			return 0;
-		if (f[i] > 3.4e38f)		/* +Inf, and anything a real scale cannot be */
-			return 0;
-	}
-	for (i = 0; i < 2 * WEAVE_VEC_BLOCK; i++)
-	{
-		float		v = rec->lane[i];
-
-		if (!(v == v) || v < 0.0f || v > 3.4e38f)
-			return 0;
-	}
-	return 1;
-}
-
 int
 weave_vecdir_page_init(void *dst, size_t dstlen, int usable,
 					   weave_uint32 first_blockno, int nrecs)
@@ -269,7 +234,7 @@ weave_vecdir_write(void *dst, size_t dstlen, int usable, int slot,
 		return -1;				/* page was never initialized, or is corrupt */
 	if (slot >= (int) h->nrecs)
 		return -1;				/* past what this page declares it holds */
-	if (!dirrec_floats_ok(rec))
+	if (!weave_vecdir_floats_ok(rec))
 		return -1;				/* refuse to write a bound that is not a bound */
 
 	off = sizeof(WeaveVecDirHdr) + (size_t) slot * sizeof(WeaveVecDirRec);
@@ -339,7 +304,7 @@ weave_vecdir_read(const void *src, size_t srclen, int usable, int slot,
 	}
 	memcpy(out, (const weave_uint8 *) src + off, sizeof(WeaveVecDirRec));
 
-	if (!dirrec_floats_ok(out))
+	if (!weave_vecdir_floats_ok(out))
 	{
 		if (why)
 			*why = "directory record carries a float that cannot be a bound";

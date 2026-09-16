@@ -39,6 +39,7 @@ OBJS = \
 	src/vector/quantize.o \
 	src/vector/pack.o \
 	src/vector/vecpage.o \
+	src/vector/vecstats.o \
 	src/vector/kernels.o \
 	src/vector/kernel_ops.o \
 	src/vector/wvec.o \
@@ -322,6 +323,11 @@ check-standalone:
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecpage test/hegel/test_vecpage.c \
 		src/vector/vecpage.c src/vector/pack.c; \
 	$$tmp/vecpage | tail -1; \
+	echo "== V7/V8 contract (C2): the block bound is an upper bound on every lane =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecbound test/hegel/test_vecbound.c \
+		src/vector/vecstats.c src/vector/quantize.c src/vector/pack.c \
+		src/vector/kernels.c -lm; \
+	$$tmp/vecbound | tail -1; \
 	echo "== Z3 surf trie: trie membership == dictionary membership, prefix enumeration =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/surf test/hegel/test_surf.c \
 		src/query/surftrie.c; \

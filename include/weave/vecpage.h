@@ -157,6 +157,41 @@ weave_vecdir_recs_per_page(int usable)
 	return avail / (int) sizeof(WeaveVecDirRec);
 }
 
+/*
+ * Is every float in a directory record usable as a bound?
+ *
+ * "Finite" is the weak half.  The strong half is that a NEGATIVE radius or scale
+ * cannot arise from any correct writer and would make bound (B3) smaller than the
+ * true maximum -- an unsound bound silently drops rows (contract C2), which no
+ * fixed-output test can catch.  So callers REJECT rather than clamp: a clamped
+ * bound is a wrong answer that looks like a repair.
+ *
+ * Inline in the header because both the page writer and the statistics builder
+ * need it and they are deliberately separate translation units -- see the note at
+ * the top of src/vector/vecstats.c.
+ */
+static inline int
+weave_vecdir_floats_ok(const WeaveVecDirRec *rec)
+{
+	int			i;
+	const float *f = &rec->smax;
+
+	/* smax, maxrecnorm, minnorm, censcale, cenrad are contiguous by declaration. */
+	for (i = 0; i < 5; i++)
+	{
+		if (!(f[i] == f[i]) || f[i] < 0.0f || f[i] > 3.4e38f)
+			return 0;
+	}
+	for (i = 0; i < 2 * WEAVE_VEC_BLOCK; i++)
+	{
+		float		v = rec->lane[i];
+
+		if (!(v == v) || v < 0.0f || v > 3.4e38f)
+			return 0;
+	}
+	return 1;
+}
+
 /* Which directory page holds block `blockno`, and which slot on it.  O(1), which
  * is the whole reason the record is fixed-size. */
 static inline int
@@ -240,5 +275,42 @@ extern int weave_strip_parse(const void *src, size_t srclen, int dim, int bits,
 extern int weave_strip_scatter(weave_uint8 *block, size_t blocklen, int dim,
 							   int bits, const WeaveVecStripHdr *hdr,
 							   const weave_uint8 *codes);
+
+/*
+ * Compute a block's directory record -- every bound field, from the block's
+ * RECONSTRUCTIONS.
+ *
+ * WHY THIS IS A FUNCTION AND NOT A LOOP AT EACH WRITE SITE.  Contract (C2) says
+ * `block_max() >= score()` for every position in the block, and a bound 1 % too low
+ * silently drops rows: the answers stay plausible, so no fixed-output regression
+ * test can catch it (AGENTS.md hard rule 1).  Insert, merge and vacuum all mutate
+ * blocks, and three independent transcriptions of these five formulas is three
+ * chances to get one wrong.  There is one.
+ *
+ * TWO TRAPS, both of which produce a bound that is TIGHTER and UNSOUND.
+ *
+ * 1. The centroid and the radius must be computed over the RECONSTRUCTIONS, never
+ *    over the original vectors: the bound is asserted about reconstructed scores,
+ *    which is what a scan computes.
+ * 2. The radius must be measured against the DEQUANTIZED centroid code, not against
+ *    the float centroid it was encoded from.  A reader only ever has the code.
+ *    include/weave/vector.h states this above WeaveVecBlockHdr, and
+ *    bench/code_scan.c got it wrong -- it measured against the float centroid --
+ *    which was harmless there only because that bound pruned 0.00 % of blocks, so
+ *    an unsound bound never dropped anything.  Getting it wrong here would.
+ *
+ * `recon` is nlive * dim reconstructions in lane order (only live lanes, packed);
+ * `lane_scale`/`lane_norm` are nlive entries in the same order; `slot[]` maps entry
+ * i to its lane index so the record's per-lane array lands in lane order.
+ *
+ * Fills *rec and writes the centroid's code to cencode (q->codebytes bytes) and its
+ * float form to cen (dim floats) for the caller to lay out as centroid strips.
+ * Returns 0, or -1 on a refusal.
+ */
+extern int weave_vecblock_stats(WeaveVecDirRec *rec, const WeaveQuantizer *q,
+								const float *recon, const float *lane_scale,
+								const float *lane_norm, const int *slot,
+								int nlive, weave_uint32 firstwarp,
+								float *cen, weave_uint8 *cencode);
 
 #endif							/* WEAVE_VECPAGE_H */
