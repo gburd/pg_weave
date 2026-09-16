@@ -238,6 +238,44 @@ check-ascii:
 check-alloc:
 	@bash ci/check-alloc.sh
 
+# --- pd_lower read-guard lint ------------------------------------------------
+# There must be exactly ONE reader of pd_lower in this codebase:
+# weave_page_entry_end() in include/weave/am.h, which validates in the integer
+# domain and returns an empty range for anything implausible. Every other
+# occurrence must be an assignment (`pd_lower =` or `pd_lower +=`) on a page the
+# writer owns.
+#
+# Why a lint and not a code review: pg_fts 1.7.0 fixed ONE unvalidated
+# `page + pd_lower` in the merge's dictionary walk, where the bad value made the
+# merge request an impossible allocation and left the index permanently
+# unvacuumable. 1.7.1 then found EIGHT more sibling sites and routed them all
+# through one helper, with the retrospective "I should have grepped the siblings
+# then". This repository had the helper first and still had four stragglers,
+# including one that was a genuine out-of-bounds READ: the trigram blob reader
+# computed `avail = pd_lower - contents_offset` as an unsigned Size, so a torn
+# page reporting pd_lower BELOW the contents offset underflowed to a huge value,
+# and the Min() against the remaining blob length then clamped it to a length
+# spanning the whole page CHAIN. It could not overrun the destination buffer,
+# which is exactly why it read safe.
+#
+# Forming the pointer at all is undefined behaviour for an absurd value -- before
+# any dereference -- so `ptr < (char *) page + pd_lower` is already UB and a
+# sanitizer build will say so.
+.PHONY: check-pdlower
+check-pdlower:
+	@bad=$$(grep -rn 'pd_lower' --include='*.c' --include='*.h' src/ include/ \
+		| grep -v '^include/weave/am.h:' \
+		| awk '{ line = $$0; sub(/^[^:]*:[0-9]*:/, "", line); \
+			 if (line ~ /^[ \t]*(\*|\/\*|\/\/)/) next; \
+			 if (line ~ /pd_lower[ \t]*\+?=/) next; \
+			 print }'); \
+	if [ -n "$$bad" ]; then \
+		echo "ERROR: pd_lower read outside weave_page_entry_end() (include/weave/am.h):" >&2; \
+		echo "$$bad" >&2; \
+		exit 1; \
+	fi; \
+	echo "pd_lower has exactly one validated reader"
+
 # --- Rename-completeness lint ------------------------------------------------
 # pg_weave was forked from pg_fts (bm25_->weave_, fts_->weave_, ftsdoc->wdoc,
 # ftsquery->wquery, AM name fts->weave, opclass wdoc_fts_ops->wdoc_lex_ops).
@@ -385,5 +423,5 @@ check-fuzz:
 	fi
 
 .PHONY: check-all
-check-all: check-ascii check-alloc check-rename check-standalone check-fuzz
+check-all: check-ascii check-alloc check-pdlower check-rename check-standalone check-fuzz
 	@echo "== ALL LINT AND STANDALONE GATES PASSED =="

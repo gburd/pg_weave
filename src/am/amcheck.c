@@ -550,9 +550,8 @@ wvck_dict_pull(WvckDictCursor *c, const char **term, uint32 *len)
 				return false;
 			}
 			contoff = (Size) ((char *) PageGetContents(page) - (char *) page);
-			avail = 0;
-			if ((Size) ((PageHeader) page)->pd_lower >= contoff)
-				avail = (Size) ((PageHeader) page)->pd_lower - contoff;
+			avail = (Size) (weave_page_entry_end(page) -
+							(char *) PageGetContents(page));
 			if (avail > BLCKSZ - contoff)
 				avail = BLCKSZ - contoff;
 			memcpy(c->pagebuf, PageGetContents(page), avail);
@@ -978,7 +977,7 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 			if (!PageIsNew(page) && WeavePageHasKind(page, WEAVE_PK_DICT))
 			{
 				char	   *ptr = (char *) PageGetContents(page);
-				char	   *end = (char *) page + ((PageHeader) page)->pd_lower;
+				char	   *end = weave_page_entry_end(page);
 
 				if (ptr < end)
 					postchain = ((WeaveDictEntry *) ptr)->firstposting;
@@ -1002,7 +1001,7 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 			if (!PageIsNew(page) && WeavePageHasKind(page, WEAVE_PK_TRGM))
 			{
 				char	   *ptr = (char *) PageGetContents(page);
-				char	   *pend = (char *) page + ((PageHeader) page)->pd_lower;
+				char	   *pend = weave_page_entry_end(page);
 
 				next = WeavePageGetOpaque(page)->nextblk;
 				wvck_mark(cx, blk);
