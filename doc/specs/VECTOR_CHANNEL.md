@@ -681,6 +681,68 @@ still passed. Only `weave_count()` and `weave_search()`, which enter the scan
 machinery directly and have no executor recheck to fall back on, actually exercise
 the site.
 
+### 7.3 The writer, its two producers, and why merge must not re-encode — decided 2026-09-16
+
+A segment's vector weft is written by **one** function. Two things produce the
+lanes it writes, and the difference between them is the whole of this section.
+
+**Producer 1, the build.** `weave_build_callback()` has the wvec in
+`values[vecattno - 1]`; it encodes and hands over 32-lane blocks.
+
+**Producer 2, the merge.** A merge renumbers docids, so lanes move between
+blocks. It reads the input segments' strips and moves lanes into the output's
+blocks with `weave_pack_move_lane()` — the O(1) swap-remove primitive V5 built
+for exactly this.
+
+**The merge MUST move codes verbatim. It must never decode to float and
+re-encode.** Quantization is lossy, so decode-then-re-encode compounds the error
+every time a segment is merged, and an index's recall would then decay with its
+*merge history* rather than its contents. No test that builds an index once can
+see that, and the size-tiered merge means a long-lived index is merged many
+times. This is the same class as the (C2) bound being 1 % low: plausible answers,
+quietly worse.
+
+**But the per-block statistics ARE recomputed on merge, and that is not
+re-encoding.** A merge changes which lanes share a block, so `livemask`, `smax`,
+`maxrecnorm`, `minnorm`, `censcale`, the centroid code and `cenrad` all change.
+They are recomputed by `weave_vecblock_stats()` from the lanes **dequantized from
+the codes that were moved** — which is required rather than merely acceptable,
+because `cenrad` must be measured against the centroid as reconstructed from
+`cencode` and not against an exact float centroid (see §7.1 and the note above
+`WeaveVecBlockHdr`; measuring against the float centroid is the unsoundness the
+V7 bench fix removed). Moving codes and keeping stale statistics is a silent (C2)
+violation.
+
+**Interim, until the merge producer exists: the merge SKIPS any group containing
+a vector-bearing segment.** It does not drop the weft, and it does not throw. It
+does not drop it because that is data loss the vector channel cannot yet notice
+(nothing queries it until V8) and would therefore ship undetected. It does not
+throw because an `ereport` reachable from VACUUM's cleanup is how an index
+becomes permanently unvacuumable — that is G15's lesson and G20's. Skipping is
+always safe: a merge is optional work, and since G20 the insert-time merge is
+deferred by default anyway.
+
+The cost of the interim is stated rather than hidden: **a vector index does not
+compact, so its segment count only grows, and it will eventually reach
+`WEAVE_MAX_SEGMENTS`.** That is the reason V8 must not start before the merge
+producer lands — a scan built against an index that cannot be maintained will be
+debugged against the wrong failure.
+
+Three traps in the surrounding code, all of which cost something if missed:
+
+- **Weft order.** `weave_chandesc_check()` requires the descriptor array to be
+  strictly ascending by `(kind, attnum)`. `WEAVE_WK_VECTOR` is 2 and
+  `WEAVE_WK_FUZZY` is 3, so the vector descriptor is emitted **between** the
+  lexical and fuzzy ones in `weave_chandesc_for_segment()`, not appended.
+- **Determinism.** `weave_block_codebytes()` returns 0–28 slack bytes that no
+  pack function ever writes, so the block buffer must be **zeroed before
+  packing** or two indexes holding identical vectors differ on disk.
+- **Reachability.** `weave_free_segment()` and `weave_check()`'s deep
+  reachability walk both enumerate a bolt's chains explicitly. A vector weft that
+  is written but not added to both shows up immediately as leaked pages — which
+  is the good failure, and `weave_index_size_detail()` needs its buckets in the
+  same commit for the same reason.
+
 ## 8. SIMD kernels
 
 Dispatch resolved once at `_PG_init` into a function-pointer table, the same
