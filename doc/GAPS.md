@@ -414,7 +414,7 @@ logged, both deliberate: a build flag means the numbers only exist in a binary
 nobody is running, and `log_min_messages = warning` silences `elog(LOG)`, which
 cost the sibling project a whole measurement run.
 
-### G20 — bulk ingest of term-rich documents inflates the index ~237x — **OPEN, measured 2026-09-14**
+### G20 — bulk ingest of term-rich documents inflates the index ~237x — **OPEN, measured 2026-09-14, partially mitigated 2026-09-16**
 
 Found by taking the sibling project's field shape (~1,660 terms per document,
 thousand-document batches, no maintenance in between) and running it against us
@@ -470,20 +470,59 @@ did **not** materially change the answer, which is luck rather than method. I al
 selected the `reuse` and `extend` columns and omitted `defer` on the first pass,
 which is precisely the discrimination G19 exists to provide.
 
-**Not fixed here, deliberately.** The sibling project's mitigation — gate the
-insert-time merge on there being a fan-out's worth of small runs waiting — reached
--31% and it called that a mitigation, not a fix, because the freed pages still
-cannot pass the XID gate inside the inserting transaction. Our compactor already
-no-ops when no level is over capacity, so that particular gate buys us less than it
-bought them. The real fix is to move the merge out of the inserting transaction,
-which is a design change and not a point edit. Recorded with a measured mechanism
-and left open.
+**Mitigated 2026-09-16; STILL OPEN.** The sibling project (pg_fts 1.7.2, commit
+c41e319) gates the insert-time merge on there being a fan-out's worth of small runs
+waiting, and calls that a mitigation rather than a fix because the freed pages still
+cannot pass the XID gate inside the inserting transaction. That gate is now ported:
+`weave_small_runs_worth_merging()` in `src/am/ambuild.c` counts smallest-level runs
+under a share lock and defers the merge until there are `WEAVE_MERGE_FANOUT` of them,
+so a rewrite is amortised over a fan-out's worth of documents instead of paid per
+document. Measured A/B, raw numbers and the exact commands in
+`bench/RESULTS_G20_MERGE_GATE.md`: 6,000 documents at 1,660 terms each go from
+550,896 to 353,181 pages (4,303 MB to 2,759 MB), and the page count after one
+`weave_vacuum()` is **2,029 in both arms** — the gate changes the scratch space the
+ingest burns, not the index it leaves behind.
 
-Corrected as part of this: the comment on `weave_insert_oversized_as_segment()`
-said oversized documents are "Rare, so building a whole segment per such document
-is acceptable", 50 lines above another comment in the same function saying "EVERY
-insert lands here and mints a segment" for the common case of a body index. Both
-cannot be true, and the measurement says the second one is.
+**What this entry previously claimed, and why it was wrong.** It said "our compactor
+already no-ops when no level is over capacity, so that particular gate buys us less
+than it bought them". Both halves are wrong. `weave_merge_segments()` has a *second*
+trigger — no level over capacity but `meta.nsegments > WEAVE_MERGE_THRESHOLD`
+compacts the lowest level with two or more runs — so it does not no-op below the
+fan-out threshold, and the gate is therefore not behaviour-neutral. The measurement
+that shows it: max live segments over 4,000 single-row transactions moved from 8 to
+15. And it did not buy us less: the before/after page counts above are on the same
+corpus shape the sibling project measured. The prediction was a plausible inference
+from the code, made without running the arm, and it was wrong in both direction and
+magnitude. (The same secondary trigger exists upstream, so the upstream rationale was
+also incomplete; upstream's measured max of 15 is the same evidence read as a
+success.)
+
+**The safety property this puts at risk, and its measurement.** The eager merge exists
+because a field deployment went 8 -> 128 segments in ~1h and could then neither merge
+nor VACUUM. Deferring the merge lets the directory sit higher between merges, so the
+worst case for segment minting was measured directly — one oversized row per
+transaction, 4,000 transactions, `weave_index_nsegments()` sampled after every commit:
+**max 15 live segments** against `WEAVE_MAX_SEGMENTS` of 128 (max 8 without the gate).
+`t/007_segment_cap.pl`'s 4 concurrent inserters, a different write pattern entirely,
+independently peak at 15 as well.
+The bound is structural, not incidental: level 0 holds at most `WEAVE_MERGE_FANOUT - 1`
+runs before the gate opens, and a merge invocation runs its convergence loop until no
+level qualifies, so the count is bounded by ~`WEAVE_MERGE_THRESHOLD +
+WEAVE_MERGE_FANOUT`. `t/007_segment_cap.pl` now asserts `nsegments <= 64` as well as
+`<= 128`, following the same reasoning upstream used to tighten its own: 128 is the
+hard cap, and an assertion that only fires there fails for the first time when the
+index is already unrecoverable.
+
+**Still open, because the mechanism is untouched.** `fsm_defer` stays at ~113,000 per
+arm-A run in both arms: the free list is still consulted and still refuses, because
+the inserting transaction freed those pages itself. The real fix moves the merge out
+of the inserting transaction — a design change, not a point edit.
+
+Corrected as part of the original measurement: the comment on
+`weave_insert_oversized_as_segment()` said oversized documents are "Rare, so building
+a whole segment per such document is acceptable", 50 lines above another comment in
+the same function saying "EVERY insert lands here and mints a segment" for the common
+case of a body index. Both cannot be true, and the measurement says the second one is.
 
 ### G21 - `t/014` reported a leaked page after double crash recovery, once - **OPEN, NOT currently reproducible, mechanism unknown 2026-09-15**
 
