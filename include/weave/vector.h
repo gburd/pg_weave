@@ -133,7 +133,22 @@ typedef struct WeaveVecMeta
 
 	uint32		nvec;			/* vectors in this segment's vector weft */
 	uint32		nblocks;		/* ceil(nvec / WEAVE_VEC_BLOCK) */
-	BlockNumber codestart;		/* first WEAVE_VCODES page */
+	BlockNumber dirstart;		/* first block-directory page: the fixed 284-byte
+								 * per-block record (firstwarp, livemask, the four
+								 * bound floats, 32 WeaveVecLane).  Separate from
+								 * the codes because it is O(1) addressable -- what
+								 * "score block i" needs -- and because the variable
+								 * part of WeaveVecBlockHdr (a dim-wide centroid
+								 * code, 8,192 B at WEAVE_MAX_DIM) does not fit on a
+								 * page at all, so a prologue-at-the-head-of-the-
+								 * first-strip rule is unimplementable at the
+								 * declared maximum dim.  See
+								 * doc/specs/VECTOR_CHANNEL.md sect. 7.1. */
+	BlockNumber codestart;		/* first WEAVE_VCODES page: coordinate-sliced strips,
+								 * block-major.  A page holds one coordinate range
+								 * of one block's 32 lanes; the centroid code is
+								 * sliced the same way and follows a block's lane
+								 * strips. */
 	BlockNumber graphstart;		/* first WEAVE_VGRAPH page, or Invalid */
 	/* No rerankstart: the exact rerank reads full precision from the HEAP, so
 	 * there is no sidecar chain to point at.  Withdrawn 2026-09-13 before it was

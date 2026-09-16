@@ -521,8 +521,83 @@ of the bytes. On a scan that is ~69 % bandwidth-bound, turning a compute saving 
 an I/O saving is worth more than the 1.43x already recorded -- and it is measurable
 before either is built.
 
-Unresolved, and **blocking V7**: an on-disk decision whose cost of being wrong is a
-REINDEX is escalated, not inferred.
+**RATIFIED 2026-09-15: shape (B).**
+### 7.1 The strip format, ratified 2026-09-15 (shape B)
+
+A `WEAVE_PK_VCODES` page holds a **strip**: one coordinate range of one block's 32
+lanes. Three facts make this exact rather than approximate.
+
+1. **A coordinate is byte-aligned in `WEAVE_PACK_LANE`.** Code (coordinate `j`, lane
+   `s`) sits at bit `(j*32 + s)*bits` (`src/vector/pack.c`), so coordinate `j`
+   occupies bits `[j*32*bits, (j+1)*32*bits)` -- exactly `4*bits` bytes, an integer
+   for every supported width (8, 12, 16 bytes at 2, 3, 4 bits). A coordinate
+   boundary is therefore a byte boundary, and a page break placed on one splits
+   nothing.
+2. **The byte-LUT kernel already crosses that boundary for free.** It walks
+   coordinates in order and widens its 16-bit accumulators every <= 256 of them, so
+   a strip boundary is a place it was going to pause anyway. No copy, no scratch
+   buffer, no reassembly of a spanning block.
+3. **`WEAVE_PACK_VECMAJOR` cannot be stored this way** -- a vector's coordinates are
+   contiguous there, so a coordinate cut splits vectors. That is acceptable because
+   no scanning kernel uses VECMAJOR (§8), and the layout is recorded in
+   `WeaveVecMeta` so a reader refuses rather than guesses. A VECMAJOR segment, if one
+   is ever written, needs a different page rule and must not silently use this one.
+
+**Block-major, not coordinate-major across the segment.** Strips are laid out block
+by block: block 0's coordinate ranges, then block 1's. The alternative -- a true
+column store, all blocks' coordinate 0, then all blocks' coordinate 1 -- makes a
+prefix scan perfectly sequential, and was rejected because it makes single-block
+access pathological: at n=1M/960-d one coordinate of all blocks is 500 kB, so
+reading *one* block would touch 960 pages for 16 bytes each. V10's rerank window and
+vacuum's lane update both do exactly that. Block-major keeps single-block access at
+`ceil(dim/coords_per_page)` pages (2 at 960-d) and still gives V15's prefix stage its
+`m/dim` byte reduction, at the cost of a strided rather than sequential read.
+
+**Per-block metadata is split, and the split is forced by `WEAVE_MAX_DIM`.**
+`WeaveVecBlockHdr` ends in a `dim`-wide centroid code, which at 16,384 dimensions and
+4 bits is 8,192 bytes -- larger than a page -- so a "prologue at the head of the
+first strip" rule is unimplementable at the declared maximum. Instead:
+
+- **The fixed part goes in a block directory**: `WeaveWarp firstwarp`, `uint32
+  livemask`, the four bound floats, and the 32 `WeaveVecLane` sidecars. 284 bytes at
+  every `dim`, so directory record `i` is at a computable page and offset -- O(1),
+  which is what "score block `i`" needs. 28 records per page; 3,125 blocks at
+  n=1M/960-d is 112 pages against 3,847 pages of codes, under 3 %.
+- **The centroid code becomes strips of its own**, sliced by coordinate exactly like
+  the lanes and written after the block's code strips. It is an input to bound (B3)
+  only, and `bench/RESULTS_BOUND_PRUNING.md` measured that bound pruning **0.00 %**
+  of blocks on both real corpora, so a scan that does not prune never reads these
+  pages at all. Cost is `1/32` of the code bytes, matching the 3 % the note above
+  `weave_codebook_solve()` already predicted.
+
+Every page self-describes, following L17's precedent (a per-object discriminator, not
+a per-index one, because after an upgrade one relation holds both generations):
+
+    WeaveVecStripHdr { uint32 blockno; uint16 j0; uint16 ncoords; uint16 flags;
+                       uint16 pad; }        /* 12 bytes */
+
+`flags` distinguishes a lane strip from a centroid strip. 12 bytes of 8,160 is 0.15 %,
+and it buys a `weave_check()` that can validate any page in isolation and a reader
+that cannot mistake one block's strip for another's.
+
+**Geometry, 4 bits, 8,160 usable bytes per page** (8,192 less the 24-byte page header
+and our 8-byte opaque area), 16 bytes per coordinate, so `510` coordinates per page:
+
+| `dim` | code strips/block | centroid strips/block | pages/block | vs. one-block-per-page |
+|---:|---:|---:|---:|---:|
+| 128 | 1 (128 coords, 2,048 B) | 1 | 2 | packs 3/page under (A); see below |
+| 256 | 1 | 1 | 2 | (A) wasted 45 % |
+| 960 | 2 (510 + 450) | 2 | 4 | (A) needed 2 and could not share |
+| 1536 | 4 (510x3 + 6) | 4 | 8 | (A) needed 4 |
+
+**The small-`dim` waste is real and is not fixed by this shape.** A 128-d block's
+lane strip is 2,048 bytes on an 8,160-byte page: 75 % waste, worse than (A)'s 12 %.
+The fix is to let one page carry several strips -- the header already names
+`blockno`, so a page holding strips for blocks `b, b+1, b+2` needs no new field --
+and the writer packs greedily while a strip fits. That is a writer-side decision with
+no format consequence, which is the reason to state it here and implement it once
+there is a low-`dim` corpus to measure it on. Until then the writer emits one strip
+per page and the waste is recorded rather than claimed away.
 
 Two pack layouts, recorded in `WeaveVecMeta` because a reader that guesses wrong
 returns wrong distances rather than an error: `WEAVE_PACK_LANE`
