@@ -86,9 +86,18 @@ exactly the column that discriminates the two candidate causes.
 ## Not fixed here
 
 The sibling project's mitigation gates the insert-time merge on a fan-out's worth of
-small runs waiting, reaching -31%, and it calls that a mitigation rather than a fix
-because the freed pages still cannot pass the XID gate inside the inserting
-transaction. Our compactor already no-ops when no level is over capacity, so that
-gate buys us less than it bought them. The real fix moves the merge out of the
-inserting transaction — a design change, not a point edit. G20 stays open with a
-measured mechanism.
+small runs waiting, and it calls that a mitigation rather than a fix because the freed
+pages still cannot pass the XID gate inside the inserting transaction. The real fix
+moves the merge out of the inserting transaction — a design change, not a point edit.
+G20 stays open with a measured mechanism.
+
+**Retracted 2026-09-16, and the retraction is the point.** This section originally
+went on to predict that "our compactor already no-ops when no level is over capacity,
+so that gate buys us less than it bought them." Both halves are false.
+`weave_merge_segments()` also compacts when `nsegments > WEAVE_MERGE_THRESHOLD` with
+no level over capacity, so it does not no-op below the fan-out threshold; and when the
+gate was actually built and A/B'd on this same corpus shape, 6,000 documents went from
+550,896 pages to 353,181. The prediction was read off the code without running the
+arm — in a file whose entire purpose is that reading merge policy off the code had
+already been wrong three times. Numbers and commands:
+`bench/RESULTS_G20_MERGE_GATE.md`.
