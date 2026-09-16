@@ -1209,6 +1209,12 @@ main(int argc, char **argv)
 	 * lanevec for it would make the harness O(n) per candidate. */
 	long	   *vipos = xmalloc((size_t) n * sizeof(long));
 	int		   *nlanes = xmalloc((size_t) nblk * sizeof(int));
+	/* The centroid's code and scale, and scratch for its dequantized form.  The
+	 * bound scores the CODE, so the radius must be measured from the code's
+	 * reconstruction -- see the comment at the radius loop below. */
+	weave_uint8 *cencode = xmalloc((size_t) nblk * q.codebytes);
+	float	   *censcale = xmalloc((size_t) nblk * sizeof(float));
+	float	   *chat = xmalloc((size_t) dim * sizeof(float));
 
 	for (long b = 0; b < nblk; b++)
 	{
@@ -1245,10 +1251,22 @@ main(int argc, char **argv)
 			if (rn > mrec[b])
 				mrec[b] = (float) rn;
 		}
-		/* Centroid and radius over the block's RECONSTRUCTIONS, because the
-		 * bound is asserted about reconstructed scores, not about the original
-		 * vectors.  Using the originals would give a bound that is tighter and
-		 * unsound. */
+		/* Centroid over the block's RECONSTRUCTIONS, because the bound is
+		 * asserted about reconstructed scores, not about the original vectors.
+		 * Using the originals would give a bound that is tighter and unsound.
+		 *
+		 * The RADIUS is not computed here any more, and that is a bug fix.  It used
+		 * to be `max ||rec_s - cen||` against this FLOAT centroid, while the bound
+		 * scores the centroid's CODE -- so R was measured from a point the reader
+		 * never sees, and quantizing `cen` can move it away from the block, which
+		 * makes R too small and the bound UNSOUND.  include/weave/vector.h states
+		 * the requirement above WeaveVecBlockHdr; this file did not follow it.  It
+		 * was harmless in every recorded result only because this bound prunes
+		 * 0.00 % of blocks on both corpora, so an unsound bound never dropped a
+		 * row.  The radius is now computed below, after the centroid is encoded,
+		 * against the DEQUANTIZED code -- and test/hegel/test_vecbound.c holds the
+		 * shipping path to the same requirement with a mutation that plants exactly
+		 * this bug. */
 		for (int j = 0; j < dim; j++)
 		{
 			double		a = 0;
@@ -1257,6 +1275,25 @@ main(int argc, char **argv)
 				a += rec[(size_t) s * dim + j];
 			cen[(size_t) b * dim + j] = (float) (a / m);
 		}
+
+		/*
+		 * Encode the centroid HERE, while the reconstructions are still live, and
+		 * measure the radius against the DEQUANTIZED code.  Doing it in a second
+		 * pass is what made the old code measure against the float centroid: `rec`
+		 * is per-block scratch, so by the time the centroid was encoded the
+		 * reconstructions it had to be compared against were gone.
+		 */
+		if (weave_encode(&q, cen + (size_t) b * dim,
+						 cencode + (size_t) b * q.codebytes, NULL,
+						 &censcale[b]) != 0)
+		{
+			/* A degenerate all-zero centroid cannot be encoded.  Zero the code and
+			 * give the bound a scale of 0, which makes <q,c> zero and leaves
+			 * (B1)/(B2) to carry the block -- looser, never unsound. */
+			memset(cencode + (size_t) b * q.codebytes, 0, (size_t) q.codebytes);
+			censcale[b] = 0;
+		}
+		weave_decode(&q, cencode + (size_t) b * q.codebytes, censcale[b], chat);
 		rad[b] = 0;
 		for (int s = 0; s < m; s++)
 		{
@@ -1264,7 +1301,7 @@ main(int argc, char **argv)
 
 			for (int j = 0; j < dim; j++)
 			{
-				double		t = (double) rec[(size_t) s * dim + j] - cen[(size_t) b * dim + j];
+				double		t = (double) rec[(size_t) s * dim + j] - chat[j];
 
 				d += t * t;
 			}
@@ -1276,30 +1313,6 @@ main(int argc, char **argv)
 			fprintf(stderr, "\r  encode %ld/%ld   ", b, nblk);
 	}
 	fprintf(stderr, "\r  encode done            \n");
-
-	/* The centroid is stored as a quantized code in the real format (contract
-	 * C3: the bound reads only header-resident data), so quantize it here too --
-	 * scoring a float centroid would make the bound tighter than the shipping
-	 * one and the pruning rate optimistic. */
-	weave_uint8 *cencode = xmalloc((size_t) nblk * q.codebytes);
-	float	   *censcale = xmalloc((size_t) nblk * sizeof(float));
-
-	for (long b = 0; b < nblk; b++)
-	{
-		float		norm,
-					scale;
-
-		if (weave_encode(&q, cen + (size_t) b * dim, cencode + (size_t) b * q.codebytes,
-						 &norm, &scale) != 0)
-		{
-			/* A degenerate all-zero centroid cannot be encoded.  Zero the code
-			 * and give the bound a scale of 0, which makes <q,c> zero and leaves
-			 * (B2)/(B1) to carry the block -- looser, never unsound. */
-			memset(cencode + (size_t) b * q.codebytes, 0, q.codebytes);
-			scale = 0;
-		}
-		censcale[b] = scale;
-	}
 
 	/* ---- queries ------------------------------------------------------- */
 	float	   *qv;
