@@ -1,0 +1,125 @@
+-- Task V7: the access method accepts a wvec attribute.
+--
+-- What is under test is the ROUTING, not the vector channel: no vector structure
+-- is written yet (V7's page writers) and nothing queries one (V8).  What must hold
+-- now is that a weave index can carry a wvec column at all, that every write and
+-- recheck path finds the wdoc by ATTNUM rather than at values[0], and that the
+-- combinations the access method cannot honour are refused with a message instead
+-- of building an index that answers queries wrongly.
+--
+-- The four sites this exercises are the build callback and weave_insert
+-- (src/am/ambuild.c), the scan-side exact recheck (src/am/amscan.c) and the
+-- count-pushdown planner match (src/am/customscan.c).  Each is reached by a
+-- different query below, and each is reached with the vector column listed FIRST,
+-- because "first column" was the assumption they all shared.
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+ALTER EXTENSION pg_weave UPDATE;
+
+CREATE TABLE vi (id serial, d wdoc, v wvec(4), v2 wvec(4));
+INSERT INTO vi(d, v, v2)
+  SELECT to_wdoc('shared common' || (g % 7) || ' rare' || g),
+         ('[' || g || ',' || (g + 1) || ',' || (g + 2) || ',' || (g + 3) || ']')::wvec,
+         '[0,0,0,1]'::wvec
+  FROM generate_series(1, 300) g;
+
+-- ---- what the access method accepts -------------------------------------
+CREATE INDEX vi_lex ON vi USING weave (d);
+CREATE INDEX vi_both ON vi USING weave (d, v);
+DROP INDEX vi_both;
+DROP INDEX vi_lex;
+-- The vector column FIRST, and from here on the ONLY weave index on the table, so
+-- every query below is answered through it.  Nothing about a weave index's column
+-- order is a capability question -- no channel's structure is shared with another's,
+-- so there is no leading-column prefix rule -- and this is the order that breaks any
+-- surviving values[0] assumption.
+CREATE INDEX vi_vecfirst ON vi USING weave (v, d);
+ANALYZE vi;
+
+-- ---- what it refuses, and with what message ----------------------------
+-- No lexical column: the docid space every channel indexes into is assigned by the
+-- lexical build, so a vector-only index would answer every query with zero rows.
+CREATE INDEX vi_bad ON vi USING weave (v);
+-- Two of the same channel: which one is "the" document column would be arbitrary.
+CREATE INDEX vi_bad ON vi USING weave (d, v, v2);
+CREATE INDEX vi_bad ON vi USING weave (d, d);
+-- An opclass on this access method that the registry does not know.  The routing is
+-- keyed on the operator family, so an unrecognized one has no channel and must not
+-- silently default to one.  amvalidate() is where that is reported; whether CREATE
+-- OPERATOR CLASS itself reaches the validator is a core detail, so the create is
+-- allowed to succeed here and the validator is called explicitly.
+CREATE OPERATOR CLASS wi_bogus_ops FOR TYPE int4 USING weave AS STORAGE int4;
+SELECT amvalidate(oid) FROM pg_opclass
+  WHERE opcname = 'wi_bogus_ops' AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'weave');
+-- ... and the two real ones validate.
+SELECT opcname, amvalidate(oid) FROM pg_opclass
+  WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'weave') AND opcname <> 'wi_bogus_ops'
+  ORDER BY opcname;
+-- An index built on it is refused too, by the same registry lookup.
+CREATE INDEX vi_bad ON vi USING weave (d, id wi_bogus_ops);
+DROP OPERATOR CLASS wi_bogus_ops USING weave;
+
+-- ---- the build callback found the wdoc ---------------------------------
+-- 300 documents indexed through a two-column index whose FIRST column is the
+-- vector.  A build that read values[0] would have indexed a wvec as a wdoc.
+SET enable_seqscan = off;
+SELECT count(*) FROM vi WHERE d @@@ 'shared'::wquery;
+SELECT count(*) FROM vi WHERE d @@@ 'rare42'::wquery;
+
+-- ---- weave_insert found the wdoc --------------------------------------
+INSERT INTO vi(d, v, v2)
+  VALUES (to_wdoc('inserted afterwards rare9001'), '[9,9,9,9]', '[1,0,0,0]');
+SELECT count(*) FROM vi WHERE d @@@ 'rare9001'::wquery;
+SELECT weave_merge('vi_vecfirst') AS merged;
+SELECT count(*) FROM vi WHERE d @@@ 'rare9001'::wquery;
+
+-- ---- the exact recheck found the wdoc ---------------------------------
+-- weave_recheck_exact() runs ONLY for query shapes the posting lists over-generate
+-- (PHRASE/NEAR/fuzzy/regex), which is why the first version of this test missed the
+-- site entirely: a plain two-term AND sets recheck=false and never calls it.  A
+-- mutation that reverted this site to values[0] passed the whole suite.
+--
+-- These two documents differ only in adjacency, so the phrase answer (1) differs
+-- from the AND answer (2).  That distinguishes three states rather than two: the
+-- recheck not running at all, the recheck reading the wrong column, and the recheck
+-- working.  Both callers are exercised -- weave_count_visible() below and the ranked
+-- <=> scan, neither of which gets an executor recheck.
+INSERT INTO vi(d, v, v2) VALUES
+  (to_wdoc('alpha beta gamma'), '[1,1,1,1]', '[0,0,0,1]'),
+  (to_wdoc('alpha gamma beta'), '[2,2,2,2]', '[0,0,0,1]');
+SELECT count(*) AS and_set FROM vi WHERE d @@@ 'alpha & beta'::wquery;
+SELECT count(*) AS phrase_set FROM vi WHERE d @@@ '"alpha beta"'::wquery;
+SELECT id FROM vi WHERE d @@@ '"alpha beta"'::wquery
+  ORDER BY d <=> '"alpha beta"'::wquery LIMIT 10;
+-- The three queries above go through the PLANNER, which is free to answer a phrase
+-- with a bitmap heap scan and the executor's own recheck of @@@ -- so they do not
+-- prove our recheck ran.  A second mutation run showed exactly that: values[0] at
+-- this site still passed them.  weave_count() and weave_search() enter the scan
+-- machinery directly and have no executor recheck to fall back on, which is the
+-- whole reason weave_recheck_exact() exists.
+--
+-- Merged first because the ranked scan does not score pending documents at all: the
+-- WAND cursors come from segment dictionaries and a pending doc has none, which
+-- src/am/amscan.c (above weave_gettuple's ranked path) records as an intentional
+-- deferral -- "pending is transient and bounded".  So weave_search() returns 0 rows
+-- for these two rows until they are merged, while weave_count() finds them in both
+-- states.  Not what this test is about, but worth knowing before reading the numbers.
+SELECT weave_merge('vi_vecfirst') AS merged_again;
+SELECT weave_count('vi_vecfirst', 'alpha & beta'::wquery) AS and_set_direct;
+SELECT weave_count('vi_vecfirst', '"alpha beta"'::wquery) AS phrase_set_direct;
+SELECT count(*) AS phrase_ranked_direct
+  FROM weave_search('vi_vecfirst', '"alpha beta"'::wquery, 10);
+
+-- ---- the count pushdown matched the lexical column --------------------
+-- Vector column first, so a match against indkey.values[0] would find a wvec.
+EXPLAIN (COSTS OFF) SELECT count(*) FROM vi WHERE d @@@ 'shared'::wquery;
+SELECT count(*) FROM vi WHERE d @@@ 'shared'::wquery;
+RESET enable_seqscan;
+
+-- ---- the index is structurally sound ----------------------------------
+SELECT count(*) AS violations FROM weave_check('vi_vecfirst', true) WHERE NOT ok;
+-- No vector weft is registered on the bolt yet: V7's page writers are the next
+-- step, and a descriptor pointing at nothing would be worse than none.  The
+-- coverage invariant is what will change when they land.
+SELECT detail FROM weave_check('vi_vecfirst') WHERE invariant = 'chandesc_coverage';
+
+DROP TABLE vi;

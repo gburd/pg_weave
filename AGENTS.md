@@ -112,6 +112,17 @@ nix build ... >/dev/null 2>&1; echo "$?"  # right
 Three verification errors in two days came from this family. A gate that reports a
 state it never checked is the failure mode `make check-alloc` was widened for.
 
+**And one level down: the suite running is not the SITE running.** On 2026-09-16 a
+mutation that reintroduced the pre-V7 `values[0]` bug in the scan-side recheck passed
+the whole regression suite twice. First because `weave_recheck_exact()` is only called
+for query shapes the posting lists over-generate, so the test's plain two-term AND
+never reached it; then, once the test used a phrase, because **the planner answered it
+with a bitmap heap scan whose executor recheck re-evaluates `@@@` itself** -- the right
+answer by a path that does not touch the mutated code. Only `weave_count()` and
+`weave_search()`, which enter the scan machinery directly, exercise it. Writing SQL
+that reaches a specific C function is not the same as writing SQL that returns the
+right answer, and a mutation run is the only thing that tells the two apart.
+
 Standalone codec tests, no backend needed:
 
 ```sh

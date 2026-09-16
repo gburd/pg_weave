@@ -887,6 +887,49 @@ extern bool weave_index_wants_trigrams(Relation index);
 extern bool weave_index_wants_doclen_sidecar(Relation index);
 
 /*
+ * Which index column feeds which channel.
+ *
+ * Until task V7 the access method was single-attribute: every write and recheck
+ * path read `values[0]` and `isnull[0]` and assumed a `wdoc`.  There were exactly
+ * four such sites (the build callback and weave_insert in ambuild.c, the scan-side
+ * recheck in amscan.c, and the planner's first-column match in customscan.c); the
+ * other `values[0]` uses in the AM are tuplestore output arrays and are unrelated.
+ *
+ * THE DISCRIMINATOR IS THE OPCLASS, NOT THE COLUMN TYPE.  A type-keyed mapping
+ * works today (`wdoc` is lexical, `wvec` is vector) and stops working at Z4/Z8:
+ * doc/specs/FUZZY_CHANNEL.md declares the corpus-n-gram channel as
+ * `USING weave (sku gram_ops)` over an ordinary text column, so two different weft
+ * kinds will share one input type.  Keyed on the opclass, adding a channel is one
+ * row in weave_opfamily_kinds[] in src/am/am.c.
+ *
+ * The key within that table is the operator FAMILY name (`pg_opfamily.opfname`),
+ * for two reasons.  Not an OID, because the extension is `relocatable = true` and an
+ * OID would have to be resolved by name anyway.  The family rather than the class,
+ * because the relcache caches `rd_opfamily[]` per index column and does not cache
+ * opclass OIDs at all -- `pg_index.indclass` is a varlena attribute, reachable only
+ * by deforming the catalog tuple.  CREATE OPERATOR CLASS makes an implicit family of
+ * the same name, so the registry's entries are the names users write.
+ *
+ * weave_validate() rejects a family it does not know, so a stray third-party opclass
+ * on this access method is reported by `amvalidate()` (which core's opr_sanity and
+ * sql/vecindex.sql both call) instead of misrouting an attribute at build time.
+ */
+typedef struct WeaveIndexLayout
+{
+	int			nkeys;			/* key attributes (INCLUDE columns excluded; the
+								 * AM sets amcaninclude = false, so they are equal) */
+	uint16		kind[INDEX_MAX_KEYS];	/* WeaveWeftKind of each key attribute */
+	AttrNumber	lexattno;		/* 1-based index attnum of the lexical column;
+								 * never 0 -- weave_index_layout() throws if the
+								 * index has no lexical column, because every
+								 * write path builds the docid space from it */
+	AttrNumber	vecattno;		/* 1-based index attnum of the vector column, or
+								 * 0 if the index has none */
+} WeaveIndexLayout;
+
+extern void weave_index_layout(Relation index, WeaveIndexLayout *out);
+
+/*
  * src/am/ambuild.c -- ambuild/aminsert, the segment writers, and the size-tiered
  * merge.  weave_build/_buildempty/_insert are consumed by am.c (the amhandler
  * fills them in); the merge entry points are also consumed by amvacuum.c, which

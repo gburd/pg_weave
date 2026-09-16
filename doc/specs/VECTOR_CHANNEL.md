@@ -624,6 +624,63 @@ gains a channel-descriptor pointer, which changes `segs[]` stride, so v4
 metapages are read through a versioned reader. The codebase already does this
 for v3 (`WeaveMetaPageDataV3`); follow that pattern.
 
+### 7.2 How a `wvec` column reaches the access method — landed 2026-09-16
+
+`CREATE INDEX docs_weave ON docs USING weave (body wdoc_lex_ops, embedding
+wvec_weave_ops)` is the declaration. Three things had to change for it to be
+accepted, and the small one was the flag.
+
+**`amcanmulticol = true`.** Column order is not a capability question the way it
+is for btree: no channel's on-disk structure is shared with another's, so there
+is no leading-column prefix rule to respect, and `USING weave (embedding
+wvec_weave_ops, body wdoc_lex_ops)` is exactly as valid. That freedom is what
+makes the routing mandatory rather than cosmetic.
+
+**The routing, `weave_index_layout()` in `src/am/am.c`.** The AM's
+single-attribute assumption was **four sites**, not the seventeen a `values[0]`
+grep suggests — the build callback and `weave_insert` (`src/am/ambuild.c`), the
+scan-side exact recheck (`src/am/amscan.c`) and the planner's count-pushdown
+column match (`src/am/customscan.c`). Everything else spelled `values[0]` is a
+tuplestore output array. Each of the four now indexes by attnum; the build path
+resolves the layout once into `WeaveBuildState` rather than per heap tuple.
+
+**The discriminator is the operator family, not the column type.** A type-keyed
+map works today and breaks at Z4/Z8: `doc/specs/FUZZY_CHANNEL.md` declares the
+corpus-n-gram channel as `USING weave (sku gram_ops)` over an ordinary `text`
+column, so two weft kinds will share one input type. It is keyed on the family
+*name* rather than an OID because the extension is `relocatable = true`, and on
+the family rather than the class because the relcache caches `rd_opfamily[]` per
+index column and does not cache opclass OIDs at all — `pg_index.indclass` is a
+varlena, reachable only by deforming the catalog tuple. `amvalidate` rejects a
+family the registry does not know, so adding a channel is one row in
+`weave_opfamily_kinds[]`.
+
+`wvec_weave_ops` deliberately declares **no operator members**: V7 is the storage
+half and V8 is the scan. An opclass advertising `<=>` before the AM can execute a
+vector ordering would make the planner build paths that fail at run time, on the
+query shape every pgvector user writes first.
+
+**Two combinations are refused rather than half-supported.** More than one column
+of the same kind (which document is "the" document is arbitrary), and — the one
+that is a real restriction — **an index with no lexical column at all**. The
+docid space every channel indexes into is assigned by the lexical build, so a
+vector-only weave index would build with no documents in it and answer every
+query with zero rows: a wrong answer, not a slow one. Lifting it means letting a
+vector weft create a bolt on its own, and it is not on V7's path.
+
+**What the test can and cannot see.** `sql/vecindex.sql` builds the index with the
+vector column *first*, because "the first column" was the assumption all four
+sites shared. Eight mutations that reintroduce `values[0]` at one site or drop one
+refusal are all caught — but only after the recheck arm was rewritten twice, and
+both failures are the same lesson: **the first version of that arm never reached
+the code it was testing.** `weave_recheck_exact()` runs only for query shapes the
+posting lists over-generate (PHRASE/NEAR/fuzzy/regex), so a plain two-term AND
+never calls it; and once a phrase was used, the *planner* answered it with a
+bitmap heap scan whose executor recheck re-evaluates `@@@` itself, so the mutation
+still passed. Only `weave_count()` and `weave_search()`, which enter the scan
+machinery directly and have no executor recheck to fall back on, actually exercise
+the site.
+
 ## 8. SIMD kernels
 
 Dispatch resolved once at `_PG_init` into a function-pointer table, the same
