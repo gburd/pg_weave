@@ -389,6 +389,255 @@ refusals(void)
 		  "parse accepted a strip whose range runs past dim");
 }
 
+/* ---------------------------------------------------------------------------
+ * The block directory: fixed-size records, O(1) addressing
+ *
+ * D1  every record written reads back identically
+ * D2  the page image is deterministic, including the slack past the last record
+ * D3  page_index/slot_index address every block exactly once, in order
+ * D4  every refusal refuses: bad slot, uninitialized page, non-finite or negative
+ *     bound floats, a page too small, an impossible nrecs
+ * D5  records per page against a hard-coded number, not against the function that
+ *     computes it -- the M5 lesson
+ * ------------------------------------------------------------------------- */
+
+static void
+fill_rec(WeaveVecDirRec *r, weave_uint32 blockno)
+{
+	int			i;
+
+	memset(r, 0, sizeof(*r));
+	r->firstwarp = blockno * WEAVE_VEC_BLOCK;
+	r->livemask = (weave_uint32) (rng() | 1u);
+	r->smax = 1.0f + (float) (rng() & 0xFF) / 256.0f;
+	r->maxrecnorm = (float) (rng() & 0xFFFF) / 65536.0f;
+	r->minnorm = (float) (rng() & 0xFFFF) / 65536.0f;
+	r->censcale = 1.0f + (float) (rng() & 0xFF) / 256.0f;
+	r->cenrad = (float) (rng() & 0xFFFF) / 65536.0f;
+	for (i = 0; i < 2 * WEAVE_VEC_BLOCK; i++)
+		r->lane[i] = (float) (rng() & 0xFFFF) / 65536.0f;
+}
+
+static void
+directory(int usable)
+{
+	int			rpp = weave_vecdir_recs_per_page(usable);
+	weave_uint8 *pagebuf,
+			   *altbuf,
+			   *page,
+			   *alt;
+	WeaveVecDirRec *recs;
+	int			i;
+	const char *why;
+
+	if (rpp <= 0)
+	{
+		weave_uint8 tiny[512];
+		WeaveVecDirRec r;
+
+		fill_rec(&r, 0);
+		CHECK(weave_vecdir_page_init(tiny, sizeof(tiny), usable, 0, 1) < 0,
+			  "usable=%d: page_init succeeded on a page too small for a record",
+			  usable);
+		return;
+	}
+
+	/*
+	 * Guard bytes on both sides, as test_pack.c does.  Mutation D6 -- a
+	 * recs_per_page() that forgot the page header -- overflows the page at some
+	 * sizes, and without guards the plain build did not notice because malloc
+	 * padding absorbed it.  A property test that catches an out-of-bounds write
+	 * only under a sanitizer catches it in one of the two builds that run.
+	 */
+	pagebuf = malloc(GUARD + (size_t) usable + GUARD);
+	altbuf = malloc(GUARD + (size_t) usable + GUARD);
+	recs = malloc(sizeof(WeaveVecDirRec) * (size_t) rpp);
+	if (!pagebuf || !altbuf || !recs)
+	{
+		printf("out of memory\n");
+		exit(2);
+	}
+	memset(pagebuf, SENTINEL, GUARD + (size_t) usable + GUARD);
+	memset(altbuf, SENTINEL, GUARD + (size_t) usable + GUARD);
+	page = pagebuf + GUARD;
+	alt = altbuf + GUARD;
+
+	/* Two buffers pre-filled with DIFFERENT garbage, then the same sequence of
+	 * calls: D2 demands the images match, which is only possible if page_init
+	 * zeroes the whole usable area including the slack past the last record. */
+	memset(page, 0x11, (size_t) usable);
+	for (i = 0; i < usable; i++)
+		alt[i] = (weave_uint8) (rng() & 0xFF);
+
+	CHECK(weave_vecdir_page_init(page, (size_t) usable, usable, 100, rpp) == 0,
+		  "usable=%d: page_init refused a valid page", usable);
+	CHECK(weave_vecdir_page_init(alt, (size_t) usable, usable, 100, rpp) == 0,
+		  "usable=%d: page_init refused a valid page (alt)", usable);
+
+	for (i = 0; i < rpp; i++)
+	{
+		fill_rec(&recs[i], (weave_uint32) (100 + i));
+		CHECK(weave_vecdir_write(page, (size_t) usable, usable, i, &recs[i]) == 0,
+			  "usable=%d slot=%d: write refused a valid record", usable, i);
+		CHECK(weave_vecdir_write(alt, (size_t) usable, usable, i, &recs[i]) == 0,
+			  "usable=%d slot=%d: write refused a valid record (alt)", usable, i);
+	}
+
+	/* D2 */
+	CHECK(memcmp(page, alt, (size_t) usable) == 0,
+		  "usable=%d: directory page image is NOT deterministic", usable);
+
+	/* D1 */
+	for (i = 0; i < rpp; i++)
+	{
+		WeaveVecDirRec got;
+
+		CHECK(weave_vecdir_read(page, (size_t) usable, usable, i, &got, &why) == 0,
+			  "usable=%d slot=%d: read refused (%s)", usable, i,
+			  why ? why : "no reason");
+		CHECK(memcmp(&got, &recs[i], sizeof(got)) == 0,
+			  "usable=%d slot=%d: record did not round-trip", usable, i);
+	}
+
+	/* D4: a slot past what the page declares, and one past capacity. */
+	{
+		WeaveVecDirRec got;
+
+		CHECK(weave_vecdir_read(page, (size_t) usable, usable, rpp, &got, &why) < 0,
+			  "usable=%d: read accepted slot %d past capacity", usable, rpp);
+		CHECK(weave_vecdir_write(page, (size_t) usable, usable, rpp, &recs[0]) < 0,
+			  "usable=%d: write accepted slot %d past capacity", usable, rpp);
+	}
+
+	/* D4: a page nobody initialized.  Garbage almost never satisfies the header
+	 * rules, but "almost never" is not a test -- force the pad nonzero, which is
+	 * exactly what an uninitialized page looks like to the validator. */
+	{
+		WeaveVecDirRec got;
+
+		memset(alt, 0xEE, (size_t) usable);
+		CHECK(weave_vecdir_read(alt, (size_t) usable, usable, 0, &got, &why) < 0,
+			  "usable=%d: read accepted an uninitialized page", usable);
+		CHECK(weave_vecdir_write(alt, (size_t) usable, usable, 0, &recs[0]) < 0,
+			  "usable=%d: write accepted an uninitialized page", usable);
+	}
+
+	/* D4: bound floats that cannot be bounds.  A NaN or negative radius makes
+	 * (B3) smaller than the true maximum, which drops rows silently, so these are
+	 * refusals rather than clamps. */
+	{
+		WeaveVecDirRec bad = recs[0];
+
+		CHECK(weave_vecdir_page_init(page, (size_t) usable, usable, 100, rpp) == 0,
+			  "re-init failed");
+		bad.cenrad = -1.0f;
+		CHECK(weave_vecdir_write(page, (size_t) usable, usable, 0, &bad) < 0,
+			  "usable=%d: write accepted a negative radius", usable);
+		bad = recs[0];
+		bad.smax = 0.0f / 0.0f;
+		CHECK(weave_vecdir_write(page, (size_t) usable, usable, 0, &bad) < 0,
+			  "usable=%d: write accepted a NaN scale", usable);
+		bad = recs[0];
+		bad.lane[7] = -0.5f;
+		CHECK(weave_vecdir_write(page, (size_t) usable, usable, 0, &bad) < 0,
+			  "usable=%d: write accepted a negative lane norm", usable);
+	}
+
+	/* D4: nrecs larger than the page can hold. */
+	CHECK(weave_vecdir_page_init(page, (size_t) usable, usable, 0, rpp + 1) < 0,
+		  "usable=%d: page_init accepted nrecs=%d past capacity %d",
+		  usable, rpp + 1, rpp);
+	CHECK(weave_vecdir_page_init(page, (size_t) usable, usable, 0, 0) < 0,
+		  "usable=%d: page_init accepted nrecs=0", usable);
+
+	/*
+	 * D2': a page that declares FEWER records than it could hold must refuse a
+	 * write past its own nrecs.  The first version always used nrecs == rpp, so
+	 * "past nrecs" and "past capacity" coincided and the capacity check alone
+	 * satisfied it -- so dropping the nrecs check entirely survived (mutation D2).
+	 */
+	if (rpp >= 2)
+	{
+		int			half = rpp / 2;
+
+		CHECK(weave_vecdir_page_init(page, (size_t) usable, usable, 0, half) == 0,
+			  "usable=%d: page_init refused nrecs=%d", usable, half);
+		CHECK(weave_vecdir_write(page, (size_t) usable, usable, half - 1,
+								 &recs[0]) == 0,
+			  "usable=%d: write refused the last declared slot", usable);
+		CHECK(weave_vecdir_write(page, (size_t) usable, usable, half, &recs[0]) < 0,
+			  "usable=%d: write accepted slot %d past the page's own nrecs=%d",
+			  usable, half, half);
+	}
+
+	/*
+	 * D8': a page whose header is internally impossible but whose pad is zero.
+	 * The uninitialized-page case above is caught by the pad check, so it never
+	 * reached the nrecs validation, which is why dropping that validation
+	 * survived.  Forge both directions.
+	 */
+	{
+		WeaveVecDirRec got;
+		WeaveVecDirHdr *h;
+
+		CHECK(weave_vecdir_page_init(page, (size_t) usable, usable, 0, rpp) == 0,
+			  "re-init failed");
+		h = (WeaveVecDirHdr *) page;
+		h->nrecs = 0;
+		CHECK(weave_vecdir_read(page, (size_t) usable, usable, 0, &got, &why) < 0,
+			  "usable=%d: read accepted a page declaring nrecs=0", usable);
+		h->nrecs = (weave_uint16) (rpp + 5);
+		CHECK(weave_vecdir_read(page, (size_t) usable, usable, 0, &got, &why) < 0,
+			  "usable=%d: read accepted nrecs=%d past capacity %d",
+			  usable, rpp + 5, rpp);
+	}
+
+	/* Guards: nothing outside either page moved. */
+	for (i = 0; i < GUARD; i++)
+	{
+		CHECK(pagebuf[i] == SENTINEL, "usable=%d: dir underflow at %d", usable, i);
+		CHECK(pagebuf[GUARD + usable + i] == SENTINEL,
+			  "usable=%d: dir overflow at %d", usable, i);
+		CHECK(altbuf[GUARD + usable + i] == SENTINEL,
+			  "usable=%d: dir overflow (alt) at %d", usable, i);
+	}
+
+	free(recs);
+	free(altbuf);
+	free(pagebuf);
+}
+
+static void
+directory_addressing(void)
+{
+	int			rpp = weave_vecdir_recs_per_page(8160);
+	weave_uint32 blk;
+	int			expect_page = 0,
+				expect_slot = 0;
+
+	/* D3: walking blocks in order must walk pages in order and slots 0..rpp-1,
+	 * with no gap and no repeat.  An addressing formula that is off by one page
+	 * boundary answers for the wrong block, which is a wrong distance rather than
+	 * an error -- so this is checked exhaustively over a range that crosses many
+	 * page boundaries. */
+	for (blk = 0; blk < 10000; blk++)
+	{
+		CHECK(weave_vecdir_page_index(blk, rpp) == expect_page,
+			  "block %u: page_index %d, expected %d", blk,
+			  weave_vecdir_page_index(blk, rpp), expect_page);
+		CHECK(weave_vecdir_slot_index(blk, rpp) == expect_slot,
+			  "block %u: slot_index %d, expected %d", blk,
+			  weave_vecdir_slot_index(blk, rpp), expect_slot);
+		if (++expect_slot == rpp)
+		{
+			expect_slot = 0;
+			expect_page++;
+		}
+	}
+	CHECK(weave_vecdir_page_index(0, 0) < 0, "rpp=0 did not refuse");
+	CHECK(weave_vecdir_slot_index(0, 0) < 0, "rpp=0 did not refuse");
+}
+
 int
 main(void)
 {
@@ -415,6 +664,29 @@ main(void)
 	CHECK(weave_strip_coordbytes(2) == 8, "2-bit coordinate stride is not 8 bytes");
 	CHECK(weave_strip_coordbytes(3) == 12, "3-bit coordinate stride is not 12 bytes");
 	CHECK(weave_strip_coordbytes(4) == 16, "4-bit coordinate stride is not 16 bytes");
+
+	/*
+	 * D5, same discipline: 284 bytes per record and 8 bytes of page header, so an
+	 * 8,160-byte page holds 28 records with 208 bytes of slack.  Hard-coded so a
+	 * struct that grows silently is caught here rather than by a reader that
+	 * addresses the wrong slot.
+	 */
+	CHECK(sizeof(WeaveVecDirRec) == 284, "WeaveVecDirRec is %zu bytes, not 284",
+		  sizeof(WeaveVecDirRec));
+	CHECK(sizeof(WeaveVecDirHdr) == 8, "WeaveVecDirHdr is %zu bytes, not 8",
+		  sizeof(WeaveVecDirHdr));
+	CHECK(weave_vecdir_recs_per_page(8160) == 28,
+		  "an 8,160-byte page holds %d directory records, not 28",
+		  weave_vecdir_recs_per_page(8160));
+
+	directory_addressing();
+	{
+		static const int dusables[] = {8160, 4096, 1024, 292, 291, 32};
+		int				k;
+
+		for (k = 0; k < (int) (sizeof(dusables) / sizeof(dusables[0])); k++)
+			directory(dusables[k]);
+	}
 
 	for (di = 0; di < (int) (sizeof(dims) / sizeof(dims[0])); di++)
 	{
