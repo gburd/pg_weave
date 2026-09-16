@@ -110,6 +110,13 @@ weave_strip_count(int ncoord, int coords_per_page)
  * offset.  That O(1) addressing is what "score block i" needs, and it is why the
  * dim-wide centroid code is not here (it would make the record variable AND
  * exceed a page at WEAVE_MAX_DIM).
+ *
+ * All five bound fields must be maintained by every path that mutates a block --
+ * insert, vacuum's lane zero, merge -- or the bound stops being an upper bound and
+ * the fused scorer silently drops rows.  That is contract (C2) in
+ * include/weave/channel.h, and it is a correctness requirement rather than
+ * bookkeeping: no fixed-output regression test can catch a bound that is 1 % too
+ * low, because the answers stay plausible.
  */
 typedef struct WeaveVecDirRec
 {
@@ -125,13 +132,70 @@ typedef struct WeaveVecDirRec
 											 * this header needs no backend type */
 } WeaveVecDirRec;
 
+/*
+ * Header on each directory page.  A page whose records can only be located by
+ * arithmetic done elsewhere cannot be validated in isolation, which is what
+ * weave_check() needs and what L17's per-object-discriminator precedent asks for.
+ * Eight bytes buys the cross-check that `first_blockno` is where the O(1) formula
+ * says this page starts -- so a mislinked directory chain is caught instead of
+ * silently answering for the wrong blocks.
+ */
+typedef struct WeaveVecDirHdr
+{
+	weave_uint32 first_blockno; /* block of record 0 on this page */
+	weave_uint16 nrecs;			/* records present, >= 1 */
+	weave_uint16 pad;			/* must be zero: part of the page image */
+} WeaveVecDirHdr;
+
 static inline int
 weave_vecdir_recs_per_page(int usable)
 {
-	if (usable < (int) sizeof(WeaveVecDirRec))
+	int			avail = usable - (int) sizeof(WeaveVecDirHdr);
+
+	if (avail < (int) sizeof(WeaveVecDirRec))
 		return 0;
-	return usable / (int) sizeof(WeaveVecDirRec);
+	return avail / (int) sizeof(WeaveVecDirRec);
 }
+
+/* Which directory page holds block `blockno`, and which slot on it.  O(1), which
+ * is the whole reason the record is fixed-size. */
+static inline int
+weave_vecdir_page_index(weave_uint32 blockno, int rpp)
+{
+	return rpp > 0 ? (int) (blockno / (weave_uint32) rpp) : -1;
+}
+
+static inline int
+weave_vecdir_slot_index(weave_uint32 blockno, int rpp)
+{
+	return rpp > 0 ? (int) (blockno % (weave_uint32) rpp) : -1;
+}
+
+/*
+ * Zero a directory page and write its header.  SEPARATE from
+ * weave_vecdir_write() because a page holds many records and only the first
+ * writer may zero it -- but the zeroing is not optional, for the same reason
+ * weave_strip_build() zeroes: the slack past the last record (208 bytes at an
+ * 8,160-byte page) is part of the page image, so a GenericXLog delta and any
+ * fixture hash depend on it.  Returns 0 or -1.
+ */
+extern int weave_vecdir_page_init(void *dst, size_t dstlen, int usable,
+								  weave_uint32 first_blockno, int nrecs);
+
+/* Write one record into slot `slot` of an initialized page.  Refuses a slot past
+ * the header's nrecs, and refuses a record whose floats are not finite -- a NaN
+ * bound is not an upper bound. */
+extern int weave_vecdir_write(void *dst, size_t dstlen, int usable, int slot,
+							  const WeaveVecDirRec *rec);
+
+/*
+ * Read record `slot`.  Validates the page header, the slot, and every float,
+ * because on-disk bytes are not trusted (doc/CONVENTIONS.md decision 2) and a
+ * non-finite or negative bound field would make the (C2) comparison meaningless
+ * rather than merely wrong.  Returns 0 or -1 with *why set.
+ */
+extern int weave_vecdir_read(const void *src, size_t srclen, int usable, int slot,
+							 WeaveVecDirRec *out, const char **why);
 
 /*
  * Build one strip's payload into `dst`, which must have room for

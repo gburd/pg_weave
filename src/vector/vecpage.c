@@ -183,3 +183,178 @@ weave_strip_scatter(weave_uint8 *block, size_t blocklen, int dim, int bits,
 	memcpy(block + off, codes, len);
 	return 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * The block directory
+ *
+ * Fixed-size records so record i is at a computable page and offset.  Everything
+ * dim-dependent lives in the strips instead, which is what makes this possible --
+ * see the header, and doc/specs/VECTOR_CHANNEL.md sect. 7.1 for why the split was
+ * forced rather than chosen.
+ * ------------------------------------------------------------------------- */
+
+/* Is every float in a directory record usable as a bound?
+ *
+ * "Finite" is the weak half.  The strong half is that a NEGATIVE radius or scale
+ * cannot arise from any correct writer and would make bound (B3) smaller than the
+ * true maximum -- an unsound bound silently drops rows (contract C2), which no
+ * fixed-output test can catch.  So the validator rejects rather than clamps: a
+ * clamped bound is a wrong answer that looks like a repair.
+ */
+static int
+dirrec_floats_ok(const WeaveVecDirRec *rec)
+{
+	int			i;
+	const float *f = &rec->smax;
+
+	/* smax, maxrecnorm, minnorm, censcale, cenrad are contiguous by declaration;
+	 * the loop covers them plus every lane pair. */
+	for (i = 0; i < 5; i++)
+	{
+		if (!(f[i] == f[i]))	/* NaN */
+			return 0;
+		if (f[i] < 0.0f)
+			return 0;
+		if (f[i] > 3.4e38f)		/* +Inf, and anything a real scale cannot be */
+			return 0;
+	}
+	for (i = 0; i < 2 * WEAVE_VEC_BLOCK; i++)
+	{
+		float		v = rec->lane[i];
+
+		if (!(v == v) || v < 0.0f || v > 3.4e38f)
+			return 0;
+	}
+	return 1;
+}
+
+int
+weave_vecdir_page_init(void *dst, size_t dstlen, int usable,
+					   weave_uint32 first_blockno, int nrecs)
+{
+	WeaveVecDirHdr *h;
+	int			rpp = weave_vecdir_recs_per_page(usable);
+
+	if (dst == NULL || usable <= 0 || (size_t) usable > dstlen)
+		return -1;
+	if (rpp <= 0 || nrecs < 1 || nrecs > rpp)
+		return -1;
+
+	/* Zero the whole usable area, not just the header: the slack past the last
+	 * record is part of the page image (208 bytes at an 8,160-byte page), and a
+	 * page image that carries whatever the buffer held is nondeterministic. */
+	memset(dst, 0, (size_t) usable);
+	h = (WeaveVecDirHdr *) dst;
+	h->first_blockno = first_blockno;
+	h->nrecs = (weave_uint16) nrecs;
+	h->pad = 0;
+	return 0;
+}
+
+int
+weave_vecdir_write(void *dst, size_t dstlen, int usable, int slot,
+				   const WeaveVecDirRec *rec)
+{
+	WeaveVecDirHdr *h;
+	int			rpp = weave_vecdir_recs_per_page(usable);
+	size_t		off;
+
+	if (dst == NULL || rec == NULL || usable <= 0 || (size_t) usable > dstlen)
+		return -1;
+	if (rpp <= 0 || slot < 0 || slot >= rpp)
+		return -1;
+
+	h = (WeaveVecDirHdr *) dst;
+	if (h->pad != 0 || h->nrecs < 1 || (int) h->nrecs > rpp)
+		return -1;				/* page was never initialized, or is corrupt */
+	if (slot >= (int) h->nrecs)
+		return -1;				/* past what this page declares it holds */
+	if (!dirrec_floats_ok(rec))
+		return -1;				/* refuse to write a bound that is not a bound */
+
+	off = sizeof(WeaveVecDirHdr) + (size_t) slot * sizeof(WeaveVecDirRec);
+	/*
+	 * Check the record FITS before writing it, even though `slot < rpp` should
+	 * already guarantee it.  This is the same arithmetic tested from the other
+	 * side, and mutation D6 is why it is here: a weave_vecdir_recs_per_page() that
+	 * forgot the page header returns an rpp that is too large at some page sizes,
+	 * and every slot check derived from that rpp agrees with it -- so the only
+	 * thing between a wrong geometry and a heap overflow was a bound expressed in
+	 * the same wrong terms.
+	 */
+	if (off + sizeof(WeaveVecDirRec) > (size_t) usable)
+		return -1;
+	memcpy((weave_uint8 *) dst + off, rec, sizeof(WeaveVecDirRec));
+	return 0;
+}
+
+int
+weave_vecdir_read(const void *src, size_t srclen, int usable, int slot,
+				  WeaveVecDirRec *out, const char **why)
+{
+	const WeaveVecDirHdr *h;
+	int			rpp = weave_vecdir_recs_per_page(usable);
+	size_t		off;
+
+	if (why != NULL)
+		*why = NULL;
+	if (src == NULL || out == NULL || usable <= 0 || (size_t) usable > srclen)
+	{
+		if (why)
+			*why = "bad arguments";
+		return -1;
+	}
+	if (rpp <= 0)
+	{
+		if (why)
+			*why = "page too small for a directory record";
+		return -1;
+	}
+	h = (const WeaveVecDirHdr *) src;
+	if (h->pad != 0)
+	{
+		if (why)
+			*why = "directory page header pad is nonzero";
+		return -1;
+	}
+	if (h->nrecs < 1 || (int) h->nrecs > rpp)
+	{
+		if (why)
+			*why = "directory page declares an impossible record count";
+		return -1;
+	}
+	if (slot < 0 || slot >= (int) h->nrecs)
+	{
+		if (why)
+			*why = "slot past the records this page holds";
+		return -1;
+	}
+
+	off = sizeof(WeaveVecDirHdr) + (size_t) slot * sizeof(WeaveVecDirRec);
+	if (off + sizeof(WeaveVecDirRec) > (size_t) usable)
+	{
+		if (why)
+			*why = "record would extend past the page";
+		return -1;
+	}
+	memcpy(out, (const weave_uint8 *) src + off, sizeof(WeaveVecDirRec));
+
+	if (!dirrec_floats_ok(out))
+	{
+		if (why)
+			*why = "directory record carries a float that cannot be a bound";
+		return -1;
+	}
+	if (out->livemask == 0)
+	{
+		/*
+		 * Not a corruption: vacuum can empty a block and the space is reclaimed
+		 * later.  But a caller that scores it would read 32 dead lanes, so say so
+		 * rather than leaving every caller to remember.  Reported through the
+		 * return value's absence, not an error: the record is returned and valid.
+		 */
+		if (why)
+			*why = "block has no live lanes";
+	}
+	return 0;
+}
