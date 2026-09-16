@@ -89,6 +89,19 @@ sources = files(
   'src/query/pattern_cache.c',
   'src/query/trgm_similarity.c',
   'src/util/utf8.c',
+  # Vector channel.  These were MISSING from this list while present in the
+  # Makefile's OBJS, so a meson build produced an .so with no wvec type and no
+  # quantizer -- CREATE EXTENSION would have failed on an undefined symbol.  Two
+  # build systems that disagree about which translation units exist is a broken
+  # build system, not a stale comment, so keep this list and OBJS in step.
+  # src/vector/vector.c and src/vector/graph.c are deliberately absent from both:
+  # they are stubs with no callers (tasks V7-V14).
+  'src/vector/quantize.c',
+  'src/vector/pack.c',
+  'src/vector/vecpage.c',
+  'src/vector/kernels.c',
+  'src/vector/kernel_ops.c',
+  'src/vector/wvec.c',
 )
 
 # Vendored TRE (laurikari/tre @ f864ed0, BSD-2; see doc/LICENSING.md).  Built

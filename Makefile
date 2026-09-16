@@ -38,6 +38,7 @@ OBJS = \
 	src/query/match.o \
 	src/vector/quantize.o \
 	src/vector/pack.o \
+	src/vector/vecpage.o \
 	src/vector/kernels.o \
 	src/vector/kernel_ops.o \
 	src/vector/wvec.o \
@@ -317,6 +318,10 @@ check-standalone:
 	echo "== V5 32-lane packing: round-trip, lane isolation, move_lane/zero_lane, bounds =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/pack test/hegel/test_pack.c src/vector/pack.c; \
 	$$tmp/pack | tail -1; \
+	echo "== V7 code strips: coordinate slicing, page-image determinism, refusals =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecpage test/hegel/test_vecpage.c \
+		src/vector/vecpage.c src/vector/pack.c; \
+	$$tmp/vecpage | tail -1; \
 	echo "== Z3 surf trie: trie membership == dictionary membership, prefix enumeration =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/surf test/hegel/test_surf.c \
 		src/query/surftrie.c; \
