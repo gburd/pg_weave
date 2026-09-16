@@ -354,6 +354,9 @@ check-standalone:
 	echo "== v6 channel descriptor: pure validator on well-formed and corrupt images =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/cd test/fuzz/fuzz_chandesc.c; \
 	$$tmp/cd | tail -1; \
+	echo "== page-bound guard (G22): end offset in range, avail never underflows =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/pb test/fuzz/fuzz_pagebound.c; \
+	$$tmp/pb | tail -1; \
 	echo "== V5 32-lane packing: round-trip, lane isolation, move_lane/zero_lane, bounds =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/pack test/hegel/test_pack.c src/vector/pack.c; \
 	$$tmp/pack | tail -1; \

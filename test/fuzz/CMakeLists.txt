@@ -43,6 +43,25 @@ add_executable(fuzz_block_randstream fuzz_block.c)
 target_include_directories(fuzz_block_randstream PRIVATE ${PG_FTS_ROOT})
 target_compile_definitions(fuzz_block_randstream PRIVATE FUZZ_RANDOM_STREAM=1)
 
+# The page-bound arithmetic (include/weave/pagebound.h): the integer-domain guard
+# every entry walk and blob read takes its end bound from.  doc/GAPS.md G22.
+add_executable(fuzz_pagebound fuzz_pagebound.c)
+target_include_directories(fuzz_pagebound PRIVATE ${PG_FTS_ROOT} ${PG_FTS_ROOT}/include)
+add_test(NAME fuzz_pagebound COMMAND fuzz_pagebound)
+
+# Planted-bug variants, again compile-time removals in the REAL header:
+#  - _rawsub: the pre-G22 `avail = pd_lower - contents_offset`, unsigned and
+#    unguarded, which underflows to ~2^64 and reads past the page.
+#  - _nolow: only the `lower > blcksz` half of the bound, which is how the bug
+#    actually gets written.  Both are EXPECTED to abort; run.sh asserts they do.
+add_executable(fuzz_pagebound_rawsub fuzz_pagebound.c)
+target_include_directories(fuzz_pagebound_rawsub PRIVATE ${PG_FTS_ROOT} ${PG_FTS_ROOT}/include)
+target_compile_definitions(fuzz_pagebound_rawsub PRIVATE WEAVE_PAGEBOUND_PLANT_RAW_SUB=1)
+
+add_executable(fuzz_pagebound_nolow fuzz_pagebound.c)
+target_include_directories(fuzz_pagebound_nolow PRIVATE ${PG_FTS_ROOT} ${PG_FTS_ROOT}/include)
+target_compile_definitions(fuzz_pagebound_nolow PRIVATE WEAVE_PAGEBOUND_PLANT_NO_LOW_GUARD=1)
+
 # The Z3 surf vocabulary trie (include/weave/surftrie.h + src/query/surftrie.c).
 # The only fuzz target with a companion .c: the builder and reader are too big to
 # live in a header, so the target links the REAL implementation rather than a

@@ -25,6 +25,7 @@
 #include "utils/rel.h"			/* RelationGetRelationName, rd_options */
 
 #include "weave/chandesc.h"
+#include "weave/pagebound.h"
 #include "weave/pagekind.h"
 #include "weave/surftrie.h"
 
@@ -485,16 +486,42 @@ extern void weave_endscan(IndexScanDesc scan);
  * page (walk terminates immediately) rather than an error: these walks run in
  * VACUUM, cleanup and merge, and an ereport there is how an index becomes
  * permanently unvacuumable.
+ *
+ * THE ARITHMETIC ITSELF LIVES IN include/weave/pagebound.h, which has no
+ * PostgreSQL dependency, so test/fuzz/fuzz_pagebound.c drives the same code this
+ * runs instead of a transcription of it.  This function's whole job is to read
+ * pd_lower in its proper backend context, hand it over as an integer, and turn
+ * the returned offset back into a pointer.
  */
 static inline char *
 weave_page_entry_end(Page page)
 {
-	uint32		lower = ((PageHeader) page)->pd_lower;
 	Size		contents = (Size) ((char *) PageGetContents(page) - (char *) page);
 
-	if ((Size) lower > (Size) BLCKSZ || (Size) lower < contents)
-		return (char *) page + contents;	/* implausible: treat page as empty */
-	return (char *) page + lower;
+	return (char *) page +
+		weave_page_entry_end_off((size_t) BLCKSZ, (size_t) contents,
+								 ((PageHeader) page)->pd_lower);
+}
+
+/*
+ * How many bytes may a blob reader copy out of `page`, when it is `off` bytes
+ * into a blob of `len` bytes spread over a page chain?
+ *
+ * Both bounds -- the bytes this page actually carries, and the bytes the
+ * destination still wants -- are applied by weave_page_blob_chunk_len(), so no
+ * caller can apply only one.  Applying only the second is doc/GAPS.md G22: it
+ * bounds the destination across the WHOLE CHAIN and therefore says nothing about
+ * this page, which is why an underflowed `avail` clamped against it produced a
+ * plausible length and an out-of-bounds READ.
+ */
+static inline Size
+weave_page_blob_chunk(Page page, Size len, Size off)
+{
+	Size		contents = (Size) ((char *) PageGetContents(page) - (char *) page);
+
+	return (Size) weave_page_blob_chunk_len((size_t) BLCKSZ, (size_t) contents,
+											((PageHeader) page)->pd_lower,
+											(size_t) len, (size_t) off);
 }
 
 /*

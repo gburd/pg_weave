@@ -649,9 +649,33 @@ Fixed by routing all four through the helper, and the audit is now a lint —
 outside `include/weave/am.h`. Making the grep permanent is the point: the class
 has now recurred in two codebases, and in both the first fix was one instance.
 
-Not reachable from the regression or TAP suites, which never produce a torn page;
-the fuzz harness is where a page-image mutation of this shape belongs, and adding
-one is open work.
+Not reachable from the regression or TAP suites, which never produce a torn page.
+
+**The open work is now done (2026-09-16).** The guard's integer half was extracted
+to `include/weave/pagebound.h` — `weave_page_entry_end_off(blcksz, contents_off,
+lower)` plus the available-bytes and blob-chunk functions derived from it — with no
+PostgreSQL dependency, following the `include/weave/chandesc.h` and
+`include/weave/docvalid.h` precedent. `weave_page_entry_end()` and the new
+`weave_page_blob_chunk()` in `include/weave/am.h` are thin wrappers: they read
+`pd_lower` (still the only place in the AM permitted to, per `make check-pdlower`)
+and turn the returned **offset** into a pointer. The offset return type is
+load-bearing rather than stylistic — the hazard is UB *at pointer formation*, so
+the guard has to finish before a pointer exists.
+
+`test/fuzz/fuzz_pagebound.c` then drives that arithmetic over 868,560 cases
+(`make check-fuzz` under ASan+UBSan, and again without sanitizers under `make
+check-standalone`), including a transcription of `weave_read_blob()`'s chain loop
+whose pages are `malloc`'d at exactly BLCKSZ so ASan's redzone sits immediately
+past the last readable byte. Two planted-bug builds — compile-time removals in the
+real header, not a weakened copy in the test — prove it has teeth:
+`WEAVE_PAGEBOUND_PLANT_RAW_SUB` restores the expression above verbatim and
+`WEAVE_PAGEBOUND_PLANT_NO_LOW_GUARD` keeps only the `lower > blcksz` half of the
+bound (which is how the bug actually gets written). Both abort with
+`AddressSanitizer: heap-buffer-overflow ... READ of size 49597 ... 0 bytes after
+8192-byte region`, and both also trip the target's independent integer
+postconditions (`avail == end - low`, `end >= low`) with the chain pass removed —
+so the target catches the class by two independent mechanisms, not just because a
+sanitizer happened to be on.
 
 ### Checked and NOT a gap: HOT-successor TIDs in `amgettuple`
 

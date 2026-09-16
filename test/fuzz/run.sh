@@ -8,7 +8,7 @@
 # Exit !0 = a fuzzer detected an overflow/UB, OR the planted-bug check failed
 #           to detect a reverted 0.3.4 clamp (i.e. the harness is toothless).
 #
-# No CMake required: this compiles the three self-contained fuzzers directly.
+# No CMake required: this compiles the self-contained fuzzers directly.
 # The CI-wiring agent can invoke this as-is (see test/fuzz/README.md).
 set -euo pipefail
 
@@ -25,7 +25,7 @@ export ASAN_OPTIONS="abort_on_error=1:detect_leaks=1"
 export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
 
 echo "== building fuzzers ($CC, ASan+UBSan) =="
-for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_dictwalk; do
+for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_dictwalk fuzz_pagebound; do
     $CC $CFLAGS "$here/$f.c" -o "$out/$f"
 done
 # fuzz_surftrie is the one fuzzer with a companion .c: the Z3 trie's builder and
@@ -60,10 +60,20 @@ $CC $CFLAGS -DWEAVE_SURF_PLANT_NO_SELECT_GUARD=1 "$here/fuzz_surftrie.c" \
 # that the fuzz target is what corrected the claim.
 $CC $CFLAGS -DFUZZ_NO_FITS_GUARD=1 "$here/fuzz_dictwalk.c" -o "$out/fuzz_dictwalk_nofits"
 $CC $CFLAGS -DFUZZ_RAW_PDLOWER=1 "$here/fuzz_dictwalk.c" -o "$out/fuzz_dictwalk_rawlower"
+# planted-bug binaries for the page-bound arithmetic (G22).  Like the surf-trie
+# ones these are compile-time removals in the REAL header (include/weave/pagebound.h),
+# not a weakened copy in the test: the guard the backend runs and the guard the
+# fuzzer runs are the same function, so a teeth build proves something about
+# shipped code.  Both MUST abort.
+$CC $CFLAGS -DWEAVE_PAGEBOUND_PLANT_RAW_SUB=1 "$here/fuzz_pagebound.c" \
+    -o "$out/fuzz_pagebound_rawsub"
+$CC $CFLAGS -DWEAVE_PAGEBOUND_PLANT_NO_LOW_GUARD=1 "$here/fuzz_pagebound.c" \
+    -o "$out/fuzz_pagebound_nolow"
 
 echo "== running fuzzers =="
 rc=0
-for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_surftrie fuzz_dictwalk; do
+for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_surftrie fuzz_dictwalk \
+         fuzz_pagebound; do
     if "$out/$f"; then
         echo "PASS: $f"
     else
@@ -165,6 +175,30 @@ if "$out/fuzz_dictwalk_rawlower" >/dev/null 2>&1; then
     rc=1
 else
     echo "PASS: fuzz_dictwalk_rawlower aborted as expected (pd_lower-as-integer teeth)"
+fi
+
+# The page-bound teeth (G22).  #1 restores the pre-fix expression verbatim --
+# `avail = pd_lower - contents_offset` in an unsigned type -- so a page reporting a
+# low pd_lower underflows avail to ~2^64, the clamp against the caller's remaining
+# blob length (which spans the whole page CHAIN) leaves a plausible number, and the
+# memcpy reads past the page.  ASan must abort with a heap-buffer-overflow READ of
+# the 8192-byte source page; that is the G22 bug, reproduced on demand.
+if "$out/fuzz_pagebound_rawsub" >/dev/null 2>&1; then
+    echo "FAIL: fuzz_pagebound_rawsub exited 0 -- harness did NOT catch the raw pd_lower subtraction!"
+    rc=1
+else
+    echo "PASS: fuzz_pagebound_rawsub aborted as expected (G22 raw-subtraction teeth)"
+fi
+
+# #2 keeps only the `lower > blcksz` half of the guard -- the half someone writes
+# when thinking "the page is 8 kB, so bound it by 8 kB".  A pd_lower BELOW the
+# contents offset passes it, and that is G22's actual mechanism, so a fuzz target
+# that only caught #1 would not cover the way the bug is really written.
+if "$out/fuzz_pagebound_nolow" >/dev/null 2>&1; then
+    echo "FAIL: fuzz_pagebound_nolow exited 0 -- harness did NOT catch the one-sided bound!"
+    rc=1
+else
+    echo "PASS: fuzz_pagebound_nolow aborted as expected (below-contents teeth)"
 fi
 
 if [ "$rc" -eq 0 ]; then

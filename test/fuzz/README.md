@@ -25,7 +25,7 @@ bash test/fuzz/run.sh          # exit 0 = all clean
 CC=clang bash test/fuzz/run.sh # if clang is not the default CC
 ```
 
-`run.sh` is self-contained: it compiles the three fuzzers directly (no CMake
+`run.sh` is self-contained: it compiles every fuzzer directly (no CMake
 needed) with `-fsanitize=address,undefined`, runs them, and then runs the
 "teeth" builds and asserts they abort. **Exit 0 = every fuzzer clean AND every
 planted bug caught.** A `CMakeLists.txt` is also provided (mirrors
@@ -44,7 +44,7 @@ No hegel server, no cmocka, no network. The fuzzers are deterministic (fixed
 PRNG seeds), so a failure is reproducible. Each fuzzer runs a few hundred
 thousand iterations and finishes in a few seconds under ASan.
 
-## The three fuzzers
+## The fuzzers
 
 Deterministic xorshift64* PRNG with a fixed seed (reproducible), no hegel /
 cmocka -- a plain loop is simpler and runs in CI with zero dependencies.
@@ -148,6 +148,48 @@ reader dereferences. One wrong number walks off the page.
   immediately past the last readable byte.
 - Iterations: 278,387. Seed: splitmix64 from `0x5A5FF00DDEADBEEF`.
 
+### `fuzz_pagebound.c` -- the page-bound arithmetic (`weave/pagebound.h`)
+Exercises `weave_page_entry_end_off()`, `weave_page_entry_avail()` and
+`weave_page_blob_chunk_len()` -- **the real guard, not a model**: this is the same
+arithmetic `weave_page_entry_end()` and `weave_page_blob_chunk()` in
+`include/weave/am.h` run, those two being thin wrappers that read `pd_lower` in
+its proper backend context and hand it over as an integer.
+
+Every variable-length walk in this AM takes its end bound from `pd_lower`, which
+comes off disk on a page held under only `BUFFER_LOCK_SHARE`. `doc/GAPS.md` G22
+is what happens when that value is used unguarded: `avail = pd_lower -
+contents_offset` is unsigned, so a torn or recycled page reporting `pd_lower`
+below the contents offset underflows `avail` to ~2^64, and a `Min()` against the
+caller's remaining blob length -- which spans the whole page **chain** -- clamps
+it to something plausible. The `memcpy` then reads past the page into adjacent
+shared buffers. It cannot overrun the destination, which is exactly why it read
+as safe. G22 recorded that no test in the tree could reach the class, because
+neither `pg_regress` nor TAP can produce a torn page. This target is that test.
+
+- **(1)** the blob-chain read itself -- a transcription of `weave_read_blob()`'s
+  loop -- over 1..6 pages `malloc`'d at **exactly** BLCKSZ, so ASan's redzone sits
+  immediately past the last readable byte, with a destination sized exactly to the
+  declared blob length and `pd_lower` drawn from nine adversarial shapes (zeroed,
+  torn below the contents offset, exactly full, past the page, all-ones, the
+  3.4 GB shape from the field report, plausible, random). It runs **first** so a
+  planted-bug build reports the bug in its own terms: a heap-buffer-overflow READ
+  of the source page;
+- **(2)** the full grid of `(blcksz, contents_off, lower, len, off)` over five
+  block sizes, twelve contents offsets (including `> blcksz`, which no caller can
+  produce) and seventeen `lower` values, with `off` before, at and past `len`;
+- **(3)** 400,000 fully random triples, assuming nothing about the page layout;
+- **(4)** 400,000 real-BLCKSZ pages with adversarial `pd_lower`.
+- The postconditions are restated independently of the code under test (the low
+  bound is recomputed locally): the end offset is in
+  `[min(contents_off, blcksz), blcksz]`; `avail == end - low` and
+  `avail <= blcksz - low`, so it can never have underflowed; the blob chunk
+  exceeds **neither** the page's readable bytes **nor** the destination's
+  remaining bytes. And a fourth, which the sanitizers cannot see: for a
+  *plausible* `lower` the end offset is exactly `lower` -- a guard hard-wired to
+  "empty page" would satisfy every safety property and silently lose every
+  trigram in the index.
+- Iterations: 868,560. Seed: splitmix64 from `0x9E3779B97F4A7C15`.
+
 ## The extraction (one non-test change, behavior-identical)
 
 To fuzz `weave_doc_is_valid` standalone (it lives in `pg_weave_doc.c` which
@@ -157,6 +199,17 @@ To fuzz `weave_doc_is_valid` standalone (it lives in `pg_weave_doc.c` which
   transcription of the validator with no PG dependencies (fixed-width struct
   mirror, local MAXALIGN, VARSIZE passed in by the caller). Single source of
   truth, mirroring how `weave/for.h` is shared with `test/hegel/`.
+- **`weave/pagebound.h`** (new, 2026-09-16, for `fuzz_pagebound.c`): the
+  integer-domain half of the `pd_lower` guard --
+  `weave_page_entry_end_off(blcksz, contents_off, lower)` and the two functions
+  derived from it. `weave_page_entry_end()` and the new
+  `weave_page_blob_chunk()` in `include/weave/am.h` are thin wrappers: they read
+  `pd_lower` (still the only place in the AM allowed to, per `make
+  check-pdlower`) and turn the returned **offset** back into a pointer. The split
+  is what makes the guard fuzzable at all -- it used to need `PageHeader` and
+  `PageGetContents` -- and the offset return type is not incidental: the hazard is
+  UB *at pointer formation*, so the guard must finish its work before a pointer
+  exists.
 - **`pg_weave_doc.c`**: `weave_doc_is_valid` is now a thin wrapper -- it reads
   `VARSIZE` in its proper backend context and calls `weave_doc_check`. Five
   `StaticAssertStmt`s guard the mirror against layout drift.
@@ -202,11 +255,12 @@ elsewhere); the fuzzer's "teeth" builds reproduce them on demand.
 
 ## Teeth (planted-bug discipline)
 
-`run.sh` compiles `fuzz_block.c` in four "teeth" modes and `fuzz_chandesc.c` in
-one (`FUZZ_NO_ARRAY_GUARD`, a copy of the validator with the
+`run.sh` compiles `fuzz_block.c` in four "teeth" modes, `fuzz_chandesc.c` in one
+(`FUZZ_NO_ARRAY_GUARD`, a copy of the validator with the
 descriptor-array-fits-avail guard deleted -- the single most likely guard to drop,
-since the magic and version checks look like they already bound the page), and
-asserts each
+since the magic and version checks look like they already bound the page),
+`fuzz_surftrie.c` in two, `fuzz_dictwalk.c` in two and `fuzz_pagebound.c` in two,
+and asserts each
 **aborts** under ASan -- if any exited 0, the harness would be toothless and the
 whole run fails:
 
@@ -219,8 +273,13 @@ whole run fails:
 | `FUZZ_NO_ARRAY_GUARD` | the chandesc array-fits-avail guard deleted | a corrupt `nweft` walking the descriptor array past the buffer |
 | `WEAVE_SURF_PLANT_NO_SIZE_GUARD` | the surf trie's "length must equal what the counts imply" guard | a corrupt count putting a whole section past the buffer |
 | `WEAVE_SURF_PLANT_NO_SELECT_GUARD` | the surf trie's select-sample recomputation | an unvalidated sample: a wrong answer first (caught by the independent postcondition), an out-of-bounds read second |
+| `FUZZ_NO_FITS_GUARD` | the dictionary walk's entry-fits guard | a corrupt `termlen` overstepping the page (the shipped-for-months shape) |
+| `FUZZ_RAW_PDLOWER` | the dict walk's validated end bound | `page + pd_lower` as UB at pointer formation, no dereference needed (UBSan) |
+| `WEAVE_PAGEBOUND_PLANT_RAW_SUB` | the pre-G22 `avail = pd_lower - contents_offset`, unsigned and unguarded | the underflow to ~2^64 that the caller's-length clamp turns into a page-crossing `memcpy` -- ASan reports `READ of size 49597` `0 bytes after 8192-byte region` |
+| `WEAVE_PAGEBOUND_PLANT_NO_LOW_GUARD` | the `lower < contents_off` half of the bound, keeping the `> blcksz` half | G22's actual mechanism: a `pd_lower` *below* the contents offset, which the "bound it by 8 kB" half does not catch |
 
-The last two differ from the rest in kind, and deliberately: they are
+The `WEAVE_SURF_PLANT_*` and `WEAVE_PAGEBOUND_PLANT_*` rows differ from the rest
+in kind, and deliberately: they are
 **compile-time removals in the real validator**, not a weakened transcription of
 it the way `fuzz_chandesc.c`'s `weak_check()` is. A transcribed copy drifts out of
 step with the code it models, and then the teeth check proves something about a
