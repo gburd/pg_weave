@@ -51,15 +51,23 @@ sub inserter_sql {
     $expr =~ s/\$SID/$sid/g;
     return qq{
 DO \$\$
-DECLARE b int := 0;
+DECLARE b int := 0; ns int; mx int := 0;
 BEGIN
   WHILE b < 60 LOOP
     INSERT INTO docs(body)
       SELECT 'capterm ' || string_agg('t'||s||'x'||$sid||'r'||b||'w'||g, ' ')
       FROM generate_series(1,1) g, generate_series(1,4000) s;
+    -- Sample the LIVE segment count, not just the count at the end.  The
+    -- metapage directory is read off a physical page rather than through a
+    -- snapshot, so this sees every backend's segment adds and merges as they
+    -- happen -- which is the only way a transient spike shows up at all.  A
+    -- reading taken after everything has quiesced is taken exactly when the
+    -- compactor has had time to catch up.
+    SELECT weave_index_nsegments('docs_bm25') INTO ns;
+    IF ns > mx THEN mx := ns; END IF;
     b := b + 1;
   END LOOP;
-  RAISE NOTICE 'INSERTER_DONE sid=$sid rows=%', b;
+  RAISE NOTICE 'INSERTER_DONE sid=$sid rows=% maxseg=%', b, mx;
 END \$\$;
 };
 }
@@ -117,6 +125,39 @@ is($match, $total, "every inserted doc ($total) is searchable after the cap chur
 my $nseg = $node->safe_psql('postgres', q{SELECT weave_index_nsegments('docs_bm25')});
 diag("final segments = $nseg (hard cap 128), rows = $total");
 cmp_ok($nseg, '<=', 128, 'live segment count stayed within the hard cap');
+
+# ...and comfortably under it, not merely inside it.
+#
+# The insert-time merge is deliberately NOT run on every insert: at 1,660 terms/doc
+# every document mints a one-document segment and merging immediately rewrote a whole
+# level-0 run per document (measured: 550,895 pages extended for 6,000 documents whose
+# compacted form is 2,029 pages -- G20 in doc/GAPS.md).  It is now gated on there
+# being WEAVE_MERGE_FANOUT smallest-level runs waiting.
+#
+# That gate is exactly what this bound protects, and the gate is NOT behaviour-neutral:
+# weave_merge_segments() also compacts when nsegments exceeds WEAVE_MERGE_THRESHOLD
+# with no level over capacity, so deferring lets the directory sit higher between
+# merges.  Measured with the gate in place under the worst case for segment minting
+# (one oversized row per transaction, 4,000 transactions): max 15 live segments, up
+# from max 8 without it -- see bench/RESULTS_G20_MERGE_GATE.md.
+#
+# A `<= 128` assertion alone cannot protect it: 128 is the hard cap, and by the time
+# the directory reaches it the index is already in the state a field deployment hit
+# (8 -> 128 segments in ~1h, after which it could neither merge nor VACUUM).  A bound
+# that only fails once recovery is impossible is not a guard.
+cmp_ok($nseg, '<=', 64, 'segment count stays well under the cap, not just inside it');
+
+# ...and the same bound on the PEAK, not just on the resting value.  Each inserter
+# tracked the highest live segment count it observed between its own inserts.  Without
+# that, every assertion above is taken after all four backends have quiesced and the
+# compactor has had all the time it wants -- which is precisely the one moment at
+# which a deferral bug cannot be seen.
+my @maxes = ($ins_err =~ /INSERTER_DONE sid=\d+ rows=\d+ maxseg=(\d+)/g);
+my $peak = 0;
+foreach my $m (@maxes) { $peak = $m if $m > $peak; }
+diag("peak live segments observed by inserters = $peak (from " . scalar(@maxes) . " backends)");
+cmp_ok(scalar(@maxes), '==', 4, 'every inserter reported its peak segment count');
+cmp_ok($peak, '<=', 64, 'peak live segment count stayed well under the cap');
 
 $node->stop;
 done_testing();
