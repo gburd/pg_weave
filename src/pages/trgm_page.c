@@ -134,17 +134,19 @@ weave_read_blob(Relation index, BlockNumber blk, Size len)
 
 		/*
 		 * pd_lower comes off disk and this page is held under only
-		 * BUFFER_LOCK_SHARE, so the subtraction below is exactly the underflow
-		 * pg_weave's page-walk guard exists to prevent: as an unsigned Size, a
-		 * torn or recycled page reporting pd_lower BELOW the contents offset
-		 * yields a huge `avail`, and the Min() then clamps it to the caller's
-		 * remaining blob length -- which spans the whole CHAIN, not this page.
-		 * The memcpy would read past the page into adjacent shared buffers.  It
-		 * cannot overrun `buf`, which is why this looked safe.
+		 * BUFFER_LOCK_SHARE, so subtracting the contents offset from it is
+		 * exactly the underflow pg_weave's page-bound guard exists to prevent:
+		 * in an unsigned Size, a torn or recycled page reporting pd_lower BELOW
+		 * the contents offset yields a huge `avail`, and clamping that against
+		 * the caller's remaining blob length -- which spans the whole CHAIN, not
+		 * this page -- leaves a plausible-looking length.  The memcpy would read
+		 * past the page into adjacent shared buffers.  It cannot overrun `buf`,
+		 * which is why this looked safe (doc/GAPS.md G22).
+		 *
+		 * weave_page_blob_chunk() applies BOTH bounds, and the arithmetic it
+		 * wraps is fuzzed directly (test/fuzz/fuzz_pagebound.c).
 		 */
-		avail = (Size) (weave_page_entry_end(page) -
-						(char *) PageGetContents(page));
-		avail = Min(avail, len - off);
+		avail = weave_page_blob_chunk(page, len, off);
 		memcpy(buf + off, PageGetContents(page), avail);
 		off += avail;
 		blk = WeavePageGetOpaque(page)->nextblk;
