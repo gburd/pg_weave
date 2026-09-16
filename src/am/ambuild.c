@@ -3960,8 +3960,61 @@ weave_buildempty(Relation index)
  * here.  Measured consequence, at 1,660 terms/doc with no maintenance: 117 pages
  * extended per document, essentially zero page reuse, and an index 237x its
  * compacted size.  See G20 in doc/GAPS.md; it is open, and the cost is a whole
- * segment build plus a merge trigger per document, not an acceptable rarity.
+ * segment build per document.  The merge that used to fire per document as well is
+ * now gated; see weave_small_runs_worth_merging() below.
  */
+
+/*
+ * Are there enough smallest-level runs waiting to make an insert-time merge worth
+ * the run rewrite it costs?
+ *
+ * Reading the metapage under a share lock is cheap; rewriting a level-0 run is not.
+ * Returning false defers the merge to a later insert (or to VACUUM / weave_merge()),
+ * so the directory stays bounded -- a merge still runs as soon as there is a
+ * fan-in's worth of work, which is the same trigger the leveled compactor uses for
+ * level 0.  What it stops is rewriting a whole run for every single document.
+ *
+ * THIS IS NOT A PURE NO-OP GATE, and assuming it was would be wrong.
+ * weave_merge_segments() has a SECOND trigger: when no level is over capacity but
+ * meta.nsegments > WEAVE_MERGE_THRESHOLD it compacts the lowest level holding >= 2
+ * runs.  So below the fan-in threshold the compactor is not always idle, and
+ * skipping it lets nsegments rise above WEAVE_MERGE_THRESHOLD between merges.  The
+ * bound that replaces it: level 0 can hold at most FANOUT-1 runs before this gate
+ * opens, and a merge invocation runs its convergence loop (including the
+ * over-threshold trigger) until no level qualifies, so nsegments is bounded by
+ * roughly WEAVE_MERGE_THRESHOLD + WEAVE_MERGE_FANOUT rather than by
+ * WEAVE_MAX_SEGMENTS.  t/007_segment_cap.pl asserts a bound far below the hard cap
+ * precisely because that is the property this gate puts at risk; see G20 in
+ * doc/GAPS.md for the measurement.
+ */
+static bool
+weave_small_runs_worth_merging(Relation index)
+{
+	Buffer		buf;
+	WeaveMetaPageData meta;
+	uint32		i;
+	int			small = 0;
+
+	buf = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	weave_meta_from_page(BufferGetPage(buf), &meta);
+	UnlockReleaseBuffer(buf);
+
+	/*
+	 * Count runs in the smallest level.  A one-document segment always lands in
+	 * level 0, so this is the number of un-amortised inserts waiting to be folded
+	 * in.
+	 */
+	for (i = 0; i < meta.nsegments; i++)
+	{
+		if (meta.segs[i].dictstart == InvalidBlockNumber)
+			continue;
+		if (weave_seg_level(meta.segs[i].ndocs - meta.segs[i].ndeleted) == 0)
+			small++;
+	}
+	return small >= WEAVE_MERGE_FANOUT;
+}
+
 static void
 weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
 {
@@ -4028,8 +4081,21 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
 	 * next insert/vacuum, keeps nsegments bounded.  (Adding the segment above is
 	 * an extend-only metapage write and needs no mutex; only the recycling merge
 	 * does.)
+	 *
+	 * ...but NOT on every insert.  Each oversized document mints a one-document
+	 * segment, and merging immediately means one document in causes a whole
+	 * level-0 run to be rewritten out: write amplification at the smallest
+	 * possible unit.  Measured at 1,660 terms/doc, where every document takes this
+	 * path: up to 117 index pages extended per document against ~2 pages of real
+	 * postings, with page reuse of 0.02-0.08% -- because the merge frees its input
+	 * pages inside the inserting transaction and weave_page_recyclable()'s
+	 * GlobalVisCheckRemovableXid() gate correctly refuses to hand them back while
+	 * that transaction can still see them.  That gate must stand (removing it
+	 * caused a real crash), so in-transaction reuse is impossible by construction
+	 * and the only lever left is to rewrite less often.  See G20 in doc/GAPS.md.
 	 */
-	if (weave_maintenance_lock_conditional(index))
+	if (weave_small_runs_worth_merging(index) &&
+		weave_maintenance_lock_conditional(index))
 	{
 		PG_TRY();
 		{
