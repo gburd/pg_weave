@@ -479,9 +479,15 @@ under a share lock and defers the merge until there are `WEAVE_MERGE_FANOUT` of 
 so a rewrite is amortised over a fan-out's worth of documents instead of paid per
 document. Measured A/B, raw numbers and the exact commands in
 `bench/RESULTS_G20_MERGE_GATE.md`: 6,000 documents at 1,660 terms each go from
-550,896 to 353,181 pages (4,303 MB to 2,759 MB), and the page count after one
-`weave_vacuum()` is **2,029 in both arms** — the gate changes the scratch space the
-ingest burns, not the index it leaves behind.
+550,896 to 353,181 pages (4,303 MB to 2,759 MB) — **-35.9 %, one run per arm** — and
+the page count after one `weave_vacuum()` is **2,029 in both arms**, so the gate
+changes the scratch space the ingest burns, not the index it leaves behind. Under one
+transaction per document the reduction is larger (271,083 -> 127,248 pages, -53.1 %),
+and the two arms must not be compared: arm A's freed pages are refused by the recycle
+gate (`fsm_defer` ~113,000) while arm B's xid horizon advances between commits
+(`fsm_defer` 0). **The gate did not improve page reuse and could not** -- arm B's
+`fsm_reuse` is 75,848 in *both* arms and only `extend` moved. It reduces the amount of
+work, which is the whole of the claim.
 
 **What this entry previously claimed, and why it was wrong.** It said "our compactor
 already no-ops when no level is over capacity, so that particular gate buys us less

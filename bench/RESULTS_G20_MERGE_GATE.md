@@ -166,3 +166,46 @@ The replacement bound is structural rather than incidental: level 0 holds at mos
 convergence loop — including the over-threshold trigger — until no level qualifies.
 So the live count is bounded by roughly `WEAVE_MERGE_THRESHOLD + WEAVE_MERGE_FANOUT`,
 i.e. ~16, and 15 is what was measured.
+
+## The arithmetic (coordinator, 2026-09-16)
+
+Computed from the raw table above; the raw numbers are the record and these are
+derived. Every figure is **one run per arm**.
+
+| quantity | before | after | change |
+|---|---:|---:|---|
+| arm A peak pages (6,000 docs, 6 txns) | 550,896 | 353,181 | **−35.9 %** (1.56×) |
+| arm A wall clock | 427.6 s | 344.1 s | −19.5 % (1.24×) |
+| arm B peak pages (4,000 docs, 4,000 txns) | 271,083 | 127,248 | **−53.1 %** (2.13×) |
+| arm B wall clock | 386.8 s | 175.7 s | −54.6 % (2.20×) |
+| arm A pages after one `weave_vacuum()` | 2,029 | 2,029 | **0.0 %** |
+| arm A peak ÷ compacted | 271.5× | 174.1× | — |
+| arm B max live segments | 8 | 15 | **+7, against a cap of 128** |
+
+The MB columns in the raw table are pages × 8 KB, so they are the same measurement
+twice and are not independent corroboration.
+
+**What is and is not claimed.**
+
+- The reduction is real and reproduces the sibling project's direction and rough
+  magnitude on the comparable arm (upstream measured −31 % on 6 × 5,000 documents;
+  arm A is −35.9 % on 6 × 1,000). That is independent corroboration of the
+  *mechanism*, not of the number.
+- **The two arms must not be averaged or compared.** Arm A has `fsm_defer` ≈ 113,000
+  and arm B has 0, because one transaction per document lets the xid horizon advance
+  between commits so the recycle gate clears the freed pages instead of refusing
+  them. They measure the gate under two different reuse regimes, and that is why arm
+  B gains more.
+- **The gate did not improve page reuse and was never going to.** Arm B's `fsm_reuse`
+  is 75,848 in *both* arms; only `extend` moved (271,082 → 127,247). The reuse
+  *fraction* rises from 21.9 % to 37.3 % purely because the denominator shrank.
+  Quoting that fraction as an improvement would be a reporting artifact.
+- Single run per arm. The *before* arm reproduces the 2026-09-14 G20 measurement to
+  0.2 % (batch 3: 255,372 vs 254,856 pages; `fsm_reuse` 76 in both), which validates
+  the harness and says nothing about the after arm's variance.
+- Wall clock is recorded, not claimed: the host was doing other work.
+- The cost is a real behaviour change, not a free win — see the section above. Peak
+  live segments 8 → 15 is the price, `t/007_segment_cap.pl` now asserts ≤ 64, and the
+  bound is a derivation plus two measurements under different write patterns, not a
+  proof.
+
