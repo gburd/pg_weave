@@ -1221,6 +1221,66 @@ across the whole weft once instead of incrementally, and folds
 `max maxrecnorm × ||q||`. Looser, and looser is right for a value whose only job
 is the MaxScore partition.
 
+### The metric was a placeholder, and V8 is where that comes due
+
+V7 wrote `WeaveVecMeta.metric = WEAVE_METRIC_L2` into every weft with a comment
+saying so: nothing in the catalog selected a metric, `wvec_weave_ops` declares no
+operator members, and 0 is not a valid `WeaveMetric` so a zeroed field must not
+validate as one. It changed no stored byte — codes are metric-independent — and it
+left the decision to V8. Two things had to be settled here.
+
+**First, the domain.** A kernel returns an inner product and is handed no norms
+at all, on purpose. `weave_block_bound_l2()` returns a bound on −‖q−v‖². Those are
+different quantities in different units, so a channel that reported an L2 bound
+next to an IP score would not have a bound that is slightly wrong — it would have
+two numbers that cannot be compared, and (C2) would be *meaningless* rather than
+violated. The conversion therefore lives in the decision core, in one function,
+and the bound goes through the same switch. A caller never sees a raw kernel
+score. For L2 the per-lane term is the lane's **stored** norm — the second half of
+the interleaved `(scale, norm)` pair in the directory record, which the kernel
+does not receive and the core does — and the bound uses the block's `minnorm`,
+because subtracting the smallest norm is what maximizes the expression, which is
+what an upper bound needs.
+
+Cosine is **refused**, not approximated: a sound bound has to switch on the sign
+of the numerator, dividing by the smallest norm when it is positive and by a
+largest norm when it is negative, and no maximum *true* norm is stored.
+`WEAVE_METRIC_HAS_BOUND()` admits cosine because a bound exists; V8 does not
+implement it, and inventing unmeasured arithmetic to fill a table cell is how §6's
+bound got specified wrong the first time.
+
+**Second, where the metric comes from.** Not a GUC: two segments of one index
+could then disagree, which is the G26 failure class. The eventual user-facing form
+is **one operator family per metric** — `wvec_l2_ops`, `wvec_ip_ops` — because §7.2
+established that the AM can only discriminate on the *family* (the relcache caches
+`rd_opfamily[]` and no opclass OIDs, and `indclass` is `CATALOG_VARLEN` so it does
+not compile), and because that is the shape pgvector users already know. That
+wiring belongs with the `ORDER BY … <-> …` path, which V8 does not build.
+
+So V8 takes the smaller step that makes the field mean something today: a
+**reloption**, recorded per segment in the field that already exists. This is
+consistent with `doc/CONVENTIONS.md` rule 1 read carefully — the rule's subject is
+"anything that changes bytes on disk", and while the metric changes none, the
+clause that decides it here is the second one: *"the value used is recorded in the
+segment so a reader never has to guess"*. That is precisely what
+`WeaveVecMeta.metric` is for. Default `l2`, because every weft already on disk
+says `l2` and format v8 shipped two days ago.
+
+### Warp → docid needs no random access, because the scan is monotone
+
+The dense warp→docid map on the `WEAVE_PK_VWARP` chain has only a sequential
+cursor; `src/vector/vecwrite.c` says an O(1) by-warp reader "is not written until
+there is a caller" and names V8 as that caller. It turns out V8 is not, and the
+reason is worth stating because it is a general property of this channel: **the
+scan visits warps in ascending order, and candidates therefore enter the top-k
+heap in ascending warp order too.** A third forward-only cursor over the warp map,
+advanced in lockstep with the other two, resolves every docid the scan needs at
+`O(pages)` total. Random access would be `O(pages)` *per lookup* over an unindexed
+chain — the G27 shape — and it is not needed at all.
+
+Three lockstep monotone cursors — directory, codes, warp map — and no random read
+anywhere. That is the whole traversal.
+
 ### What V8 is not
 
 No exact rerank (V10), no coordinate-prefix first stage (V15), no graph. Every

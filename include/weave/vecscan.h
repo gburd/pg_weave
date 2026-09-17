@@ -36,6 +36,43 @@
 #include "weave/vecweft.h"
 
 /*
+ * THE DOMAIN RULE, AND IT IS (C2) RATHER THAN BOOKKEEPING.  A scoring kernel
+ * returns an INNER PRODUCT: <q_rot, recon(code)> scaled by the lane's stored
+ * scale.  It is handed no norms at all, deliberately (include/weave/kernels.h:
+ * "the norms are not here because scoring does not need them").  But
+ * weave_block_bound_l2() returns a bound on -||q - v||^2, which is a different
+ * quantity in a different unit.  Handing a fused loop an L2-domain bound and an
+ * IP-domain score does not produce a bound that is slightly wrong; it produces
+ * two incommensurable numbers, and (C2) is then meaningless rather than violated.
+ *
+ * So the conversion from the kernel's inner product to the metric's score domain
+ * is THIS core's job, it happens in exactly one function
+ * (weave_vec_scan_lane_score()), and the bound is produced in the same domain by
+ * the same switch.  A caller never sees a raw kernel score.
+ *
+ * V8 serves WEAVE_METRIC_IP and WEAVE_METRIC_L2 and refuses the rest:
+ *
+ *	 IP	 score = ip;  bound = weave_block_bound_ip()
+ *	 L2	 score = -||q||^2 + 2*ip - ||v||^2, with ||v|| the lane's STORED norm --
+ *		 the second half of the interleaved (scale, norm) pair in the directory
+ *		 record, which the kernel does not get and this core does.  The bound uses
+ *		 the block's minnorm, because subtracting the smallest norm in the block
+ *		 is what maximizes the expression, which is what an upper bound needs.
+ *	 COSINE	 refused.  It is <q,v>/(||q|| ||v||), and a sound bound has to switch
+ *		 on the sign of the numerator -- divide by minnorm when it is positive and
+ *		 by a maximum norm when it is negative, and no maximum true norm is
+ *		 stored.  Deriving one is a task, not a line; refusing is honest.  Note
+ *		 that WEAVE_METRIC_HAS_BOUND() admits cosine, because a bound EXISTS; this
+ *		 core does not implement it.
+ *	 L1	 refused, as everywhere else: no compressed-domain bound exists.
+ *
+ * WHERE THE METRIC COMES FROM.  WeaveVecMeta.metric, which V7 wrote as a
+ * placeholder because no catalog entry selected a metric yet.  V8 makes it a
+ * reloption recorded per segment (doc/specs/VECTOR_CHANNEL.md sect. 8b) so that a
+ * reader never guesses, and the caller of this core does NOT get to override it.
+ */
+
+/*
  * What to do with the block the cursor is sitting on.
  *
  * The order of the three live outcomes is the order of their cost, and the
@@ -120,10 +157,11 @@ typedef struct WeaveVecScanState
 
 /*
  * Initialize.  Returns -1 (and sets st->why) for a geometry this core cannot
- * scan: a non-LANE pack layout, a metric with no compressed-domain bound, or an
- * allowlist shorter than the weft's own lane count while `allow` is non-NULL --
- * the last because a bitmap that does not cover the segment cannot be intended
- * for it, and trimming it would score real lanes against absent bits.
+ * scan: a non-LANE pack layout, a metric this core does not serve (see the domain
+ * rule above -- IP and L2 only), or an allowlist shorter than the weft's own lane
+ * count while `allow` is non-NULL -- the last because a bitmap that does not cover
+ * the segment cannot be intended for it, and trimming it would score real lanes
+ * against absent bits.
  */
 extern int	weave_vec_scan_begin(WeaveVecScanState *st,
 								 const WeaveVecWeftGeom *geom,
@@ -140,6 +178,15 @@ extern int	weave_vec_scan_begin(WeaveVecScanState *st,
  * equal score does not displace an incumbent, so a block that can only equal the
  * floor cannot contribute.  Pass -INFINITY to disable bound pruning without
  * disabling the bound's computation.
+ *
+ * THE THRESHOLD BELONGS TO THE DRIVER, NOT TO THE SHUTTLE.  A shuttle has no way
+ * to learn the fused scorer's floor -- include/weave/channel.h deliberately does
+ * not tell it, because the floor is a property of the fusion and the shuttle is a
+ * cursor.  So SKIP_BOUND is reachable only from a driver that maintains its own
+ * top-k, which today means the weave_vec_scan() SRF; a shuttle driven by the
+ * fused loop passes -INFINITY here and lets block_max() do the work.  That is the
+ * contract working as designed and not a hole, but it is worth knowing before
+ * wondering why a shuttle never prunes.
  *
  * *bound_out receives the bound whenever the return is SCORE or SKIP_BOUND, so
  * that a caller implementing WeaveShuttleOps.block_max() can cache it and
@@ -178,6 +225,24 @@ extern void weave_vec_scan_scoreblk(WeaveScoreBlock *blk,
 									int nlanes);
 
 /*
+ * Convert one lane's kernel inner product into a score in the metric's domain.
+ *
+ * `norm` is the lane's stored norm -- rec->lane[2*s + 1].  Ignored for IP.
+ *
+ * This is the only place the conversion happens, and weave_vec_scan_block()'s
+ * bound goes through the same switch, because (C2) is a statement about two
+ * numbers being in the same units.  A caller that converts scores itself has
+ * reintroduced the bug this function exists to prevent.
+ *
+ * WEAVE_KERNEL_NEVER in must produce WEAVE_KERNEL_NEVER out: a dead or masked
+ * lane stays a sentinel, and -inf must not be turned into a finite number by
+ * arithmetic.
+ */
+extern float weave_vec_scan_lane_score(const WeaveVecScanState *st,
+									   const WeaveQueryLut *lut,
+									   float ip, float norm);
+
+/*
  * The bolt-wide ceiling required by WeaveShuttle.maxscore, folded one directory
  * record at a time.
  *
@@ -188,9 +253,14 @@ extern void weave_vec_scan_scoreblk(WeaveScoreBlock *blk,
  * the correct trade for a value whose only job is the MaxScore partition
  * (doc/specs/FUSED_TOPK.md sect. 5).
  *
- * Call with *acc = 0.0 before the first record.  The scan's maxscore is then
- * lut->qnorm * *acc for an inner-product metric.
+ * Call with *acc = 0.0 before the first record, then pass the folded value to
+ * weave_vec_scan_maxscore() to reach the metric's domain -- which for L2 means
+ * substituting a norm of 0, the only value guaranteed not to exceed any lane's.
+ * Two functions rather than one because the fold runs per record in a loop and
+ * the conversion runs once.
  */
 extern void weave_vec_scan_maxscore_fold(float *acc, const WeaveVecDirRec *rec);
+extern float weave_vec_scan_maxscore(const WeaveVecScanState *st,
+									 const WeaveQueryLut *lut, float acc);
 
 #endif							/* WEAVE_VECSCAN_H */
