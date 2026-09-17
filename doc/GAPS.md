@@ -875,6 +875,26 @@ thing between that index and a merge that either throws inside VACUUM's cleanup 
 re-quantizes half its corpus. The guard is implemented now precisely because the
 change that makes it reachable is one someone will make without reading §7.3.
 
+### Checked and NOT a gap: the doclen sidecar has the same posting-derived hole, and it is harmless
+
+Merge producer 2 found that a weft could not map a lane back to a row, because the
+derivation it relied on -- "warp *i* is the *i*-th smallest docid in the bolt, and the
+bolt's docids are all in its lexical weft" -- is false: a document reaches the lexical
+weft only if it has at least one **posting**, and a non-NULL `wdoc` whose text is empty
+or entirely stopwords has none. One such document shifts every later warp's derived
+docid by one, and nothing counts wrong. That is why `WEAVE_PK_VWARP` exists.
+
+**The doclen sidecar is built from the same posting stream and therefore has the same
+gap -- and there it does not matter.** The sidecar is consulted only for *candidates*,
+and a candidate arrives from a posting list. A document with no postings is never a
+candidate, so its absent entry is never looked up; its `doclen` would be 0 in any case,
+and it still counts toward the corpus `N` that BM25 needs, because `ndocs` is
+incremented in the build callback rather than derived from the postings.
+
+Recorded because the structural similarity is alarming at a glance and someone will
+notice it again. The question to ask of any docid-keyed structure is not "is it built
+from postings" but **"is it ever addressed for a document that has none"** -- the
+sidecar is not, and the vector weft is, on every row it returns.
 ### Checked and NOT a gap: HOT-successor TIDs in `amgettuple`
 
 pg_tre 4.0.2 fixed a silent under-return: its always-true scan path collected TIDs
