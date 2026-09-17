@@ -58,6 +58,7 @@
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
 #include "weave/am.h"
+#include "weave/vector.h"
 
 PG_FUNCTION_INFO_V1(weave_check);
 
@@ -381,6 +382,29 @@ wvck_chandesc(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 									 "%sbolt %u lexical weft root %u != dictstart %u",
 									 root.len > 0 ? "; " : "", s,
 									 weft[i].root, seg->dictstart);
+				}
+			}
+			else if (weft[i].kind == (uint16) WEAVE_WK_VECTOR)
+			{
+				/*
+				 * The other half of the cross-check doc/specs/SEGMENT_FORMAT.md
+				 * sect. 9 promised: "when the vector weft lands, its root must
+				 * equal the WEAVE_VMETA page and this is where that gets
+				 * asserted".  WeaveSegMeta has no vector field to compare against
+				 * -- that is the point of the descriptor page -- so what is
+				 * checkable is that the root IS a readable VMETA page whose
+				 * geometry is self-consistent, which weave_vec_weft_open() decides.
+				 */
+				WeaveVecWeft w;
+				const char *why = NULL;
+
+				if (!weave_vec_weft_open(cx->index, weft[i].root, &w, &why))
+				{
+					ok_root = false;
+					appendStringInfo(&root,
+									 "%sbolt %u vector weft root %u: %s",
+									 root.len > 0 ? "; " : "", s,
+									 weft[i].root, why != NULL ? why : "unreadable");
 				}
 			}
 		}
@@ -823,6 +847,217 @@ wvck_surf(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 }
 
 /*
+ * Invariants over a bolt's VECTOR weft, and the one that matters is (C2) ON DISK.
+ *
+ * doc/specs/SEGMENT_FORMAT.md sect. 9 asks for the per-block statistics to be
+ * "recomputed against the centroid as decoded from its stored code", and that is
+ * what this does: for every block it reads the codes back, dequantizes them, runs
+ * weave_vecblock_stats() -- the same one function every writer uses -- and compares
+ * the result to the record on disk, byte for byte.
+ *
+ * WHY THAT COMPARISON IS THE POINT.  Contract (C2) in include/weave/channel.h says
+ * block_max() >= score() for every lane in the block, and every bound the fused
+ * scorer will derive comes from these five floats.  A bound that is 1 % too low
+ * silently drops rows: the answers stay plausible, so no fixed-expected-output test
+ * can see it (AGENTS.md hard rule 1).  The failure mode this catches is not a
+ * corrupt page, it is a WRITER that moved codes and kept stale statistics -- which
+ * sect. 7.3 names as the trap the merge producer will walk into, and which is
+ * invisible to every other check in this file.
+ *
+ * The comparison is EXACT, not epsilon-tolerant, and that is deliberate: the
+ * recomputation runs the identical code over the identical stored inputs, so any
+ * difference at all means the stored record was not produced from these codes.  An
+ * epsilon would turn "a lane changed and nobody updated the bound" into a pass for
+ * any change small enough.
+ */
+static void
+wvck_vector(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
+{
+	uint32		s;
+	int64		nwith = 0;
+	int64		nblocks_checked = 0;
+	bool		ok = true;
+	StringInfoData d;
+
+	initStringInfo(&d);
+
+	for (s = 0; s < meta->nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		const WeaveSegMeta *seg = &meta->segs[s];
+		BlockNumber vecroot;
+		WeaveVecWeft w;
+		WeaveQuantizer q;
+		const char *why = NULL;
+		uint8	   *block;
+		uint8	   *cencode;
+		uint8	   *tmpcode;
+		uint8	   *recode;
+		float	   *recon;
+		float	   *cen;
+		float		lane_scale[WEAVE_VEC_BLOCK];
+		float		lane_norm[WEAVE_VEC_BLOCK];
+		int			slot[WEAVE_VEC_BLOCK];
+		uint32		b;
+
+		if (seg->dictstart == InvalidBlockNumber)
+			continue;			/* consumed slot */
+		vecroot = weave_vec_weft_root(cx->index, seg);
+		if (vecroot == InvalidBlockNumber)
+			continue;			/* no vector weft: not a violation */
+
+		nwith++;
+		if (!weave_vec_weft_open(cx->index, vecroot, &w, &why))
+		{
+			ok = false;
+			appendStringInfo(&d, "%sbolt %u: %s", d.len > 0 ? "; " : "", s,
+							 why != NULL ? why : "unreadable vector weft");
+			continue;
+		}
+		if (weave_quantizer_init(&q, w.geom.dim, w.geom.bits, NULL,
+								 palloc, pfree) != 0)
+		{
+			ok = false;
+			appendStringInfo(&d, "%sbolt %u: no %d-bit quantizer for %d dimensions",
+							 d.len > 0 ? "; " : "", s, w.geom.bits, w.geom.dim);
+			continue;
+		}
+
+		block = (uint8 *) palloc(w.geom.blockbytes);
+		cencode = (uint8 *) palloc(w.geom.codebytes);
+		recode = (uint8 *) palloc(w.geom.codebytes);
+		tmpcode = (uint8 *) palloc(w.geom.codebytes);
+		cen = (float *) palloc((Size) w.geom.dim * sizeof(float));
+		recon = (float *) palloc((Size) WEAVE_VEC_BLOCK * w.geom.dim * sizeof(float));
+
+		for (b = 0; b < w.geom.nblocks && ok; b++)
+		{
+			WeaveVecDirRec stored;
+			WeaveVecDirRec fresh;
+			int			nlive = 0;
+			int			i;
+
+			CHECK_FOR_INTERRUPTS();
+
+			if (!weave_vec_dir_read(&w, b, &stored, &why))
+			{
+				ok = false;
+				appendStringInfo(&d, "%sbolt %u block %u: %s",
+								 d.len > 0 ? "; " : "", s, b,
+								 why != NULL ? why : "unreadable directory record");
+				break;
+			}
+			if (stored.firstwarp != b * (uint32) WEAVE_VEC_BLOCK)
+			{
+				ok = false;
+				appendStringInfo(&d, "%sbolt %u block %u: firstwarp %u should be %u",
+								 d.len > 0 ? "; " : "", s, b, stored.firstwarp,
+								 b * (uint32) WEAVE_VEC_BLOCK);
+				break;
+			}
+			if (!weave_vec_block_read(&w, b, block, cencode, &why))
+			{
+				ok = false;
+				appendStringInfo(&d, "%sbolt %u block %u: %s",
+								 d.len > 0 ? "; " : "", s, b,
+								 why != NULL ? why : "unreadable codes");
+				break;
+			}
+
+			/* Gather this block's live lanes in ascending lane order, exactly as
+			 * the writer did, from the STORED per-lane pairs (they are inputs to
+			 * the bound, not derived from the codes) and the STORED codes. */
+			for (i = 0; i < WEAVE_VEC_BLOCK; i++)
+			{
+				if ((stored.livemask & (1u << i)) == 0)
+					continue;
+				weave_unpack_lane(WEAVE_PACK_LANE, w.geom.dim, w.geom.bits,
+								  block, i, tmpcode);
+				weave_decode(&q, tmpcode, stored.lane[2 * i],
+							 recon + (Size) nlive * w.geom.dim);
+				lane_scale[nlive] = stored.lane[2 * i];
+				lane_norm[nlive] = stored.lane[2 * i + 1];
+				slot[nlive] = i;
+				nlive++;
+			}
+
+			if (nlive == 0)
+			{
+				/*
+				 * An empty block is legitimate -- 32 documents with no vector, or a
+				 * vacuum that emptied it -- but then it must state no bound at all.
+				 * A nonzero float on an empty block is a bound with nothing behind
+				 * it, and a scan would trust it.
+				 */
+				if (stored.smax != 0.0f || stored.maxrecnorm != 0.0f ||
+					stored.minnorm != 0.0f || stored.censcale != 0.0f ||
+					stored.cenrad != 0.0f)
+				{
+					ok = false;
+					appendStringInfo(&d, "%sbolt %u block %u: no live lanes but a nonzero bound",
+									 d.len > 0 ? "; " : "", s, b);
+				}
+				nblocks_checked++;
+				continue;
+			}
+
+			if (weave_vecblock_stats(&fresh, &q, recon, lane_scale, lane_norm,
+									 slot, nlive, stored.firstwarp, cen,
+									 recode) != 0)
+			{
+				ok = false;
+				appendStringInfo(&d, "%sbolt %u block %u: its own codes do not yield usable statistics",
+								 d.len > 0 ? "; " : "", s, b);
+				break;
+			}
+
+			if (memcmp(&fresh, &stored, sizeof(WeaveVecDirRec)) != 0)
+			{
+				ok = false;
+				appendStringInfo(&d, "%sbolt %u block %u: the stored directory record is not what its codes compute (livemask 0x%08X, cenrad %g stored vs %g recomputed, smax %g vs %g, maxrecnorm %g vs %g)",
+								 d.len > 0 ? "; " : "", s, b, stored.livemask,
+								 (double) stored.cenrad, (double) fresh.cenrad,
+								 (double) stored.smax, (double) fresh.smax,
+								 (double) stored.maxrecnorm,
+								 (double) fresh.maxrecnorm);
+				break;
+			}
+			if (memcmp(recode, cencode, (Size) w.geom.codebytes) != 0)
+			{
+				ok = false;
+				appendStringInfo(&d, "%sbolt %u block %u: the stored centroid code is not the centroid of its codes",
+								 d.len > 0 ? "; " : "", s, b);
+				break;
+			}
+			nblocks_checked++;
+		}
+
+		weave_quantizer_free(&q, pfree);
+		pfree(recon);
+		pfree(cen);
+		pfree(tmpcode);
+		pfree(recode);
+		pfree(cencode);
+		pfree(block);
+	}
+
+	wvck_emit(cx, "vector_block_stats_match_codes", ok, ok ? NULL : d.data);
+	pfree(d.data);
+
+	/* Informational, the same shape as chandesc_coverage and surf_coverage: how
+	 * many bolts carry a vector weft, and how many blocks were actually verified.
+	 * The block count is what distinguishes "clean" from "there was nothing to
+	 * check", which is the state every vacuous pass of this invariant would
+	 * otherwise report as success. */
+	{
+		initStringInfo(&d);
+		appendStringInfo(&d, "%lld bolt(s) carry a vector weft, %lld block(s) verified",
+						 (long long) nwith, (long long) nblocks_checked);
+		wvck_emit(cx, "vector_coverage", true, d.data);
+		pfree(d.data);
+	}
+}
+
+/*
  * Bolt-directory invariants: every root block is in bounds and has the kind the
  * directory says it has.  This is the sect. 9 line "every segs[i] root block is
  * within relation bounds and has the expected kind", and walking the chains (not
@@ -961,9 +1196,36 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 		if (seg->chandesc != InvalidBlockNumber)
 		{
 			BlockNumber surfroot = wvck_surf_root(cx, seg);
+			BlockNumber vecroot = weave_vec_weft_root(cx->index, seg);
 
 			if (surfroot != InvalidBlockNumber)
 				(void) wvck_walk_chain(cx, surfroot, WEAVE_PK_SURF, &e);
+
+			/*
+			 * The vector weft is THREE chains and the descriptor names only the
+			 * first: the WEAVE_VMETA page, which names the directory and the code
+			 * strips.  Marking only the root would report every strip page as a
+			 * leak -- and, worse, "fixing" that by exempting the kind instead of
+			 * following the chains is precisely the hole that would then hide a
+			 * REAL leak of the same pages.  weave_free_segment() follows the same
+			 * three, through weave_vec_free_weft(); if the two ever disagree, this
+			 * invariant is what says so.
+			 */
+			if (vecroot != InvalidBlockNumber)
+			{
+				WeaveVecWeft w;
+				const char *why = NULL;
+
+				(void) wvck_walk_chain(cx, vecroot, WEAVE_PK_VMETA, &e);
+				if (weave_vec_weft_open(cx->index, vecroot, &w, &why))
+				{
+					(void) wvck_walk_chain(cx, w.meta.dirstart, WEAVE_PK_VDIR, &e);
+					(void) wvck_walk_chain(cx, w.meta.codestart, WEAVE_PK_VCODES, &e);
+					if (w.meta.graphstart != InvalidBlockNumber)
+						(void) wvck_walk_chain(cx, w.meta.graphstart,
+											   WEAVE_PK_VGRAPH, &e);
+				}
+			}
 		}
 
 		/* the shared posting chain: named by the first dict entry */
@@ -1176,6 +1438,7 @@ weave_check(PG_FUNCTION_ARGS)
 	wvck_segments(&cx, &meta);
 	wvck_chandesc(&cx, &meta);
 	wvck_surf(&cx, &meta);
+	wvck_vector(&cx, &meta);
 
 	if (deep)
 	{

@@ -553,6 +553,26 @@ vacuum's lane update both do exactly that. Block-major keeps single-block access
 `ceil(dim/coords_per_page)` pages (2 at 960-d) and still gives V15's prefix stage its
 `m/dim` byte reduction, at the cost of a strided rather than sequential read.
 
+**Correction, from V7's reader: single-block access is not O(1) today, it is O(pages
+in the weft).** Block-major makes a block's strips *consecutive* on the code chain,
+but nothing records *where* they start, and `WeaveVecDirRec` is full at 284 bytes --
+fixed by the O(1)-addressing requirement the directory exists for -- so there is no
+room to record it without a format change. `weave_vec_block_read()` therefore walks
+from `codestart` and takes the strips whose header names the block it wants. V7's
+callers (`weave_check()`, the round-trip test, `weave_vec_strips()`) walk the whole
+weft anyway, so it costs them nothing; **V10's rerank window and vacuum's lane update
+cannot afford it, and the task that needs them owes the format an index over the
+strips.** Stated here rather than left implicit because the block-major argument above
+is what makes single-block access sound cheap, and by itself it does not.
+
+**The slicing is asserted end to end, at a dim that slices.** `weave_vec_strips()`
+reports every code page's header as stored, and `sql/vecindex.sql` pins the
+`(blockno, j0, ncoords, centroid)` sequence of a 1024-dimension weft -- three lane
+strips per block plus one centroid strip -- against the chain order. That test exists
+because the format's central rule was **untested by construction** until 2026-09-17:
+every dim in the suite was under 509, so every block was one strip, every `j0` was 0,
+and a writer that ignored the strip plan's `j0` entirely passed everything.
+
 **Per-block metadata is split, and the split is forced by `WEAVE_MAX_DIM`.**
 `WeaveVecBlockHdr` ends in a `dim`-wide centroid code, which at 16,384 dimensions and
 4 bits is 8,192 bytes -- larger than a page -- so a "prologue at the head of the
@@ -581,14 +601,27 @@ and it buys a `weave_check()` that can validate any page in isolation and a read
 that cannot mistake one block's strip for another's.
 
 **Geometry, 4 bits, 8,160 usable bytes per page** (8,192 less the 24-byte page header
-and our 8-byte opaque area), 16 bytes per coordinate, so `510` coordinates per page:
+and our 8-byte opaque area), 16 bytes per coordinate, so `510` coordinates per page --
+**509 as shipped**, because the 12-byte `WeaveVecStripHdr` comes off the payload
+first: `weave_strip_coords_per_page()` computes `(8160 - 12) / 16`. The table below
+keeps the round number it was ratified with; the writer, the reader and
+`sql/vecindex.sql` all use the function, and the one number a test may state
+literally is the function's:
 
 | `dim` | code strips/block | centroid strips/block | pages/block | vs. one-block-per-page |
 |---:|---:|---:|---:|---:|
 | 128 | 1 (128 coords, 2,048 B) | 1 | 2 | packs 3/page under (A); see below |
 | 256 | 1 | 1 | 2 | (A) wasted 45 % |
-| 960 | 2 (510 + 450) | 2 | 4 | (A) needed 2 and could not share |
-| 1536 | 4 (510x3 + 6) | 4 | 8 | (A) needed 4 |
+| 960 | 2 (509 + 451) | 1 | 3 | (A) needed 2 and could not share |
+| 1536 | 4 (509x3 + 9) | 1 | 5 | (A) needed 4 |
+
+Two corrections in that table, both from the shipped geometry rather than from the
+estimate: the lane split is 509-wide, and **a centroid needs one strip, not `dim`/510
+of them.** A centroid coordinate is `bits` *bits* (not 32 lanes' worth), so 16,296 of
+them fit a page at 4 bits and every `dim` this AM accepts fits in a single centroid
+strip. That is the 1/32 pricing this section already promised, arrived at by
+`weave_censtrip_build()`'s own stride; `include/weave/vecweft.h` explains why
+`weave_strip_build()` could not have been used for it.
 
 **The small-`dim` waste is real and is not fixed by this shape.** A 128-d block's
 lane strip is 2,048 bytes on an 8,160-byte page: 75 % waste, worse than (A)'s 12 %.
@@ -727,6 +760,23 @@ compact, so its segment count only grows, and it will eventually reach
 `WEAVE_MAX_SEGMENTS`.** That is the reason V8 must not start before the merge
 producer lands — a scan built against an index that cannot be maintained will be
 debugged against the wrong failure.
+
+**A second cost of the interim, found by V7's mutation run: the free path is
+unreachable, so it is untested.** `weave_free_segment()`'s `WEAVE_WK_VECTOR` arm
+calls `weave_vec_free_weft()`, and nothing calls `weave_free_segment()` except the
+two merge commit paths — which, by the rule above, never take a vector-bearing bolt
+as an input. Nothing else reclaims a weft page by page either: compaction *is* a
+merge, `ambulkdelete()` only rewrites the livedocs bitmap, and `REINDEX`,
+`VACUUM FULL` and `DROP INDEX` all discard a whole relfilenode. A build whose
+`weave_vec_free_weft()` begins with `elog(ERROR)` passes the entire suite, so a
+mutation that deletes the strip-chain free cannot be caught by any test that exists.
+The function is kept and the exception is written down (`doc/GAPS.md` G24) rather
+than closed with a test-only entry point, because **the merge producer above is
+exactly what makes it reachable**: on the first merge after that exclusion comes
+out, a free path that forgot the strip chain leaks every code page of every merged
+bolt. The merge producer's commit therefore owes this gate — merge two
+vector-bearing bolts, `weave_check(deep)` reports zero unreachable pages, and the
+`meta.codestart` mutation is proven to fail it.
 
 Three traps in the surrounding code, all of which cost something if missed:
 

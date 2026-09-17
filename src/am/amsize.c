@@ -113,6 +113,19 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 		{"pending", WEAVE_PK_PENDING, 0, 0},
 		{"chandesc", WEAVE_PK_CHANDESC, 0, 0},
 		{"surf_trie", WEAVE_PK_SURF, 0, 0},
+		/*
+		 * The vector weft's three page kinds (task V7).  Needed in the SAME commit
+		 * as the writer, not as a follow-up: this function must sum to
+		 * pg_relation_size(), so an unbucketed kind lands in "unclassified" and the
+		 * only report that says where the index bytes go starts lying about the
+		 * largest structure in a vector index.  vector_codes is expected to
+		 * dominate -- and its free_bytes column is the measurement that decides
+		 * whether the low-dim strip waste doc/specs/VECTOR_CHANNEL.md sect. 7.1
+		 * records is worth the greedy several-strips-per-page writer.
+		 */
+		{"vector_meta", WEAVE_PK_VMETA, 0, 0},
+		{"vector_dir", WEAVE_PK_VDIR, 0, 0},
+		{"vector_codes", WEAVE_PK_VCODES, 0, 0},
 	};
 	int			nbuckets = lengthof(buckets);
 	int64		unknown_pages = 0;

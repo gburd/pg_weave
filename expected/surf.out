@@ -61,7 +61,7 @@ SELECT detail FROM weave_check('sf_weave')
  WHERE invariant = 'metapage_version_recognized';
                      detail                     
 ------------------------------------------------
- format v7 (this build reads v3..v7, writes v7)
+ format v8 (this build reads v3..v8, writes v8)
 (1 row)
 
 -- ---- the new page kind is accounted for, not "unclassified" ---------------

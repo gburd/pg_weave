@@ -52,6 +52,7 @@
 #include "weave/weave.h"
 #include "weave/am.h"
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
+#include "weave/vector.h"			/* V7: producer 1, the vector weft accumulator */
 #include <math.h>
 #include "access/genam.h"
 #include "access/generic_xlog.h"
@@ -167,6 +168,18 @@ typedef struct WeaveBuildState
 								 * including the merge and pending-flush paths that do
 								 * not read it, so that a future reader cannot pick up
 								 * a stack value. */
+	AttrNumber	vecattno;		/* 1-based index attnum of the vector column, or 0
+								 * when the index has none.  Same resolve-once
+								 * reasoning as lexattno above. */
+	WeaveVecAccum vec;			/* producer 1: one lane per document this state
+								 * accumulated, in warp order.  INACTIVE on every
+								 * path that has no vector to accumulate -- the
+								 * merge (which skips vector-bearing bolts until
+								 * the merge producer lands, sect. 7.3) and the
+								 * pending flush (a WeavePendingItem carries the
+								 * wdoc and nothing else, so an inserted row's
+								 * vector is not available at flush time; see
+								 * doc/GAPS.md G23). */
 } WeaveBuildState;
 
 /*
@@ -181,6 +194,24 @@ weave_build_lexattno(Relation index)
 
 	weave_index_layout(index, &layout);
 	return layout.lexattno;
+}
+
+/*
+ * Which values[] slot holds the wvec, or 0 when the index has no vector column.
+ *
+ * Separate from weave_build_lexattno() rather than one call returning both,
+ * because the seven WeaveBuildState initializers do not all want a vector
+ * producer: only the two that scan the heap do (see WeaveVecAccum on the struct
+ * field).  A helper that returned both would make it easy to wire an accumulator
+ * into the merge, which must not have one.
+ */
+static AttrNumber
+weave_build_vecattno(Relation index)
+{
+	WeaveIndexLayout layout;
+
+	weave_index_layout(index, &layout);
+	return layout.vecattno;
 }
 
 static int
@@ -631,7 +662,13 @@ weave_build_flush_segment(Relation index, WeaveBuildState *bs)
 		bs->flush_budget < weave_build_mem_ceiling())
 		bs->flush_budget *= 2;
 
-	/* reset: free everything in the build context and start a fresh segment */
+	/*
+	 * reset: free everything in the build context and start a fresh segment.
+	 * weave_vec_accum_reset() FIRST -- the reset below frees the accumulator's
+	 * arrays and the quantizer's rotation tables, so every pointer in it would
+	 * otherwise dangle into freed memory.
+	 */
+	weave_vec_accum_reset(&bs->vec);
 	MemoryContextReset(bs->ctx);
 	bs->terms = NULL;
 	bs->nterms = 0;
@@ -679,6 +716,34 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 		weave_build_flush_segment(index, bs);
 
 	old = MemoryContextSwitchTo(bs->ctx);
+
+	/*
+	 * PRODUCER 1 (doc/specs/VECTOR_CHANNEL.md sect. 7.3): this document's lane.
+	 *
+	 * BEFORE the postings, and unconditionally when the index has a vector
+	 * column, because every document indexed here occupies a warp position and the
+	 * two wefts must agree on which.  A NULL or zero vector therefore occupies its
+	 * lane and leaves it dead; it is not a skipped document.  Skipping would shift
+	 * every later document's warp position, which mis-associates every vector after
+	 * the first NULL with someone else's document -- and nothing counts wrong, so
+	 * no test that counts rows can see it.
+	 *
+	 * The tid goes with it because THE WEFT IS WRITTEN IN DOCID ORDER, not in
+	 * callback order: a heap scan does not visit tuples in ascending ctid order.
+	 * See vec_docid_order() in src/vector/vecwrite.c -- that was a real bug caught
+	 * by sql/vecindex.sql, not a precaution.
+	 *
+	 * Inside bs->ctx on purpose: MemoryContextMemAllocated(bs->ctx, true) is what
+	 * bounds a build, and a code is dim*bits/8 bytes per document.  Allocating
+	 * these anywhere else would hide them from the budget that exists to stop a
+	 * large build from exhausting the host.
+	 */
+	if (bs->vecattno != 0)
+	{
+		int			vecidx = bs->vecattno - 1;
+
+		weave_vec_accum_add(&bs->vec, index, tid, values[vecidx], isnull[vecidx]);
+	}
 
 	doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
 	entries = WEAVE_DOC_ENTRIES(doc);
@@ -2008,6 +2073,7 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 	DoclenCollector dc;
 	WeaveVocab	voc;
 	BlockNumber surfroot;
+	BlockNumber vecroot;
 	int			i;
 
 	postings = (BlockNumber *) palloc(Max(bs->nterms, 1) * sizeof(BlockNumber));	/* alloc-ok: bs->nterms is a single build/pending segment, bounded by maintenance_work_mem (the merge path spills to disk instead) */
@@ -2048,7 +2114,14 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 	/* v7 fuzzy weft, from the vocabulary the dictionary write just collected */
 	surfroot = weave_build_surf_weft(index, &voc);
 	weave_vocab_free(&voc);
-	weave_attach_chandesc(index, seg, surfroot);	/* v6: last, so every root is known */
+	/*
+	 * v8 vector weft, from producer 1's accumulator.  InvalidBlockNumber when this
+	 * state has no vector column, no vectors, or no LIVE vector -- in which case
+	 * the bolt carries no VECTOR descriptor and costs zero vector bytes, which is
+	 * the promise sect. 7.2 makes for an index built without one.
+	 */
+	vecroot = weave_vec_write_weft(index, &bs->vec);
+	weave_attach_chandesc(index, seg, surfroot, vecroot);	/* v6: last, so every root is known */
 	doclen_collector_free(&dc);
 	pfree(postings);
 	pfree(offsets);
@@ -2580,6 +2653,8 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 		tbs.ctx = termctx;
 		tbs.want_positions = bs->want_positions;
 		tbs.lexattno = bs->lexattno;
+		tbs.vecattno = 0;
+		weave_vec_accum_init(&tbs.vec, termctx, false, WEAVE_VEC_DEFAULT_BITS);
 		tbs.want_trigrams = bs->want_trigrams;
 		tbs.terms = NULL;
 		tbs.nterms = 0;
@@ -2738,7 +2813,10 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	 */
 	surfroot = weave_build_surf_weft(index, &voc);
 	weave_vocab_free(&voc);
-	weave_attach_chandesc(index, seg, surfroot);	/* v6: last, so every root is known */
+	/* No vector weft on a merge output: the merge SKIPS vector-bearing bolts
+	 * (weave_merge_selected), so it never has codes to move.  When producer 2
+	 * lands this is where its root goes. */
+	weave_attach_chandesc(index, seg, surfroot, InvalidBlockNumber);
 
 	for (i = 0; i < nsel; i++)
 		weave_doclens_free(&srcv[i].doclens);
@@ -2775,7 +2853,7 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
  * size (not stored), so there is no on-disk format change.
  */
 #define WEAVE_MERGE_FANOUT 8			/* runs per level before it compacts + promotes */
-#define WEAVE_MAX_LEVELS 24			/* FANOUT^24 = 8^24 docs -- far beyond any real corpus */
+#define WEAVE_MERGE_MAX_LEVELS 24	/* FANOUT^24 = 8^24 docs -- far beyond any real corpus */
 
 /* Derive a segment's level from its live doc count (level 0 = smallest). */
 static int
@@ -2785,8 +2863,8 @@ weave_seg_level(double livesize)
 	int			level = 0;
 	double		cap = (double) WEAVE_MERGE_FANOUT;
 
-	/* level L covers sizes [FANOUT^L, FANOUT^(L+1)); clamp to WEAVE_MAX_LEVELS-1 */
-	while (s >= cap && level < WEAVE_MAX_LEVELS - 1)
+	/* level L covers sizes [FANOUT^L, FANOUT^(L+1)); clamp to WEAVE_MERGE_MAX_LEVELS-1 */
+	while (s >= cap && level < WEAVE_MERGE_MAX_LEVELS - 1)
 	{
 		cap *= (double) WEAVE_MERGE_FANOUT;
 		level++;
@@ -2839,6 +2917,13 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
 	bs.lexattno = weave_build_lexattno(index);
+	/* No vector producer on a merge path: sect. 7.3's interim rule is that a merge
+	 * SKIPS any group containing a vector-bearing bolt (weave_merge_selected()
+	 * refuses one), so a merge never has codes to move and must never write a
+	 * weft.  Initialized inactive rather than left alone so a future reader cannot
+	 * pick up a stack value -- the same rule the lexattno comment states. */
+	bs.vecattno = 0;
+	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -2852,6 +2937,39 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 	out->sumdoclen = bs.sumdoclen;
 
 	MemoryContextDelete(bs.ctx);
+}
+
+/*
+ * Does this bolt carry a vector weft?
+ *
+ * THE INTERIM MERGE RULE, doc/specs/VECTOR_CHANNEL.md sect. 7.3: until producer 2
+ * exists, a merge SKIPS any group containing a vector-bearing bolt.  It does not
+ * drop the weft and it does not throw, and both halves matter:
+ *
+ *	 DROPPING would be data loss that nothing can notice before V8 -- no query
+ *	 reads a weft yet -- so it would ship undetected, which is the worst kind.
+ *
+ *	 THROWING would put an ereport on a path VACUUM's cleanup reaches
+ *	 (weave_vacuumcleanup -> weave_merge_segments), and an error there is how an
+ *	 index becomes permanently unvacuumable.  That is doc/GAPS.md G15's lesson and
+ *	 G20's, and it is not hypothetical -- it is the exact shape of the upstream bug
+ *	 doc/GAPS.md records under the pd_lower lint.
+ *
+ * Skipping is always safe because a merge is optional work: the index stays
+ * correct, queryable and vacuumable, it just does not compact.  The cost is stated
+ * rather than hidden -- a vector index's segment count only grows, and will
+ * eventually reach WEAVE_MAX_SEGMENTS -- which is why sect. 7.3 makes producer 2 a
+ * prerequisite for V8 rather than a follow-up.
+ *
+ * Note this is a DIFFERENT and unconditional exclusion from
+ * weave_small_runs_worth_merging() (commit d2bb962), which is an insert-time
+ * heuristic about write amplification.  That one decides whether a merge is worth
+ * doing now; this one decides whether it may happen at all.
+ */
+static bool
+weave_seg_has_vector(Relation index, const WeaveSegMeta *seg)
+{
+	return weave_vec_weft_root(index, seg) != InvalidBlockNumber;
 }
 
 bool
@@ -2882,6 +3000,26 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 		indocs += chosen[i].ndocs - chosen[i].ndeleted;
 	}
 
+	/*
+	 * The interim vector rule (weave_seg_has_vector above).  Checked HERE, before
+	 * the build context exists and before a single page is allocated, so a skipped
+	 * merge leaves the metapage and the bolt directory exactly as it found them.
+	 * The selectors below filter vector-bearing bolts out of their candidate lists
+	 * too -- so a mixed index still compacts the bolts it can -- but this is the
+	 * chokepoint every caller goes through, including weave_merge_selected()'s
+	 * direct callers, and a rule enforced only in the selectors is a rule the next
+	 * selector forgets.
+	 */
+	for (i = 0; i < nsel; i++)
+	{
+		if (weave_seg_has_vector(index, &chosen[i]))
+		{
+			elog(DEBUG1, "pg_weave merge: index \"%s\": skipping a group containing a vector-bearing segment (the merge producer is task V7's successor)",
+				 RelationGetRelationName(index));
+			return false;
+		}
+	}
+
 	elog(DEBUG1, "pg_weave merge: index \"%s\": merging %u of %u segments (%.0f live docs) into one",
 		 RelationGetRelationName(index), nsel, meta.nsegments, indocs);
 
@@ -2891,6 +3029,8 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
 	bs.lexattno = weave_build_lexattno(index);
+	bs.vecattno = 0;			/* see weave_merge_group_to_seg() */
+	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -3141,12 +3281,24 @@ weave_merge_all_parallel(Relation index, int request)
 	ms->indexrelid = RelationGetRelid(index);
 	SpinLockInit(&ms->mutex);
 
-	/* collect the live source segments */
+	/* collect the live source segments, EXCLUDING vector-bearing ones: sect. 7.3's
+	 * interim rule, applied where the groups are formed so a group containing one
+	 * is never built.  weave_merge_group_to_seg() has no way to refuse afterwards
+	 * -- it runs in a worker and returns a segment descriptor by value -- which is
+	 * why the exclusion has to happen here and not there. */
 	nsrc = 0;
 	for (i = 0; i < (int) meta.nsegments; i++)
-		if (meta.segs[i].dictstart != InvalidBlockNumber)
+		if (meta.segs[i].dictstart != InvalidBlockNumber &&
+			!weave_seg_has_vector(index, &meta.segs[i]))
 			ms->src[nsrc++] = meta.segs[i];
 	ms->nsrc = nsrc;
+	if (nsrc <= 2)
+	{
+		/* nothing left to parallelize once the vector-bearing bolts are out */
+		DestroyParallelContext(pcxt);
+		ExitParallelMode();
+		return false;
+	}
 
 	/* groups = min(participants, nsrc); participant 0 = leader */
 	ngroups = request + 1;
@@ -3308,7 +3460,8 @@ weave_merge_all(Relation index, bool try_parallel)
 		 * step per pass) and still reach a single segment.
 		 */
 		for (i = 0; i < meta.nsegments; i++)
-			if (meta.segs[i].dictstart != InvalidBlockNumber)
+			if (meta.segs[i].dictstart != InvalidBlockNumber &&
+				!weave_seg_has_vector(index, &meta.segs[i]))
 			{
 				cand[ncand].idx = i;
 				cand[ncand].size = meta.segs[i].ndocs - meta.segs[i].ndeleted;
@@ -3452,7 +3605,7 @@ weave_merge_segments(Relation index)
 		WeaveMetaPageData meta;
 		uint32		sel[WEAVE_MAX_SEGMENTS];
 		uint32		nsel = 0;
-		int			lvlcount[WEAVE_MAX_LEVELS];
+		int			lvlcount[WEAVE_MERGE_MAX_LEVELS];
 		int			target = -1;
 		uint32		i;
 
@@ -3472,11 +3625,17 @@ weave_merge_segments(Relation index)
 		{
 			if (meta.segs[i].dictstart == InvalidBlockNumber)
 				continue;
+			/* A vector-bearing bolt is not a merge candidate (sect. 7.3), so it
+			 * must not count toward a level's occupancy either -- counting it
+			 * would select a level whose runs cannot be merged and spin the loop
+			 * until the guard stopped it. */
+			if (weave_seg_has_vector(index, &meta.segs[i]))
+				continue;
 			lvlcount[weave_seg_level(meta.segs[i].ndocs - meta.segs[i].ndeleted)]++;
 		}
 
 		/* lowest level that is over capacity (>= FANOUT runs) is compacted first */
-		for (i = 0; i < WEAVE_MAX_LEVELS; i++)
+		for (i = 0; i < WEAVE_MERGE_MAX_LEVELS; i++)
 			if (lvlcount[i] >= WEAVE_MERGE_FANOUT)
 			{
 				target = (int) i;
@@ -3490,7 +3649,7 @@ weave_merge_segments(Relation index)
 		 * level's worth (bounded fan-in).
 		 */
 		if (target < 0 && meta.nsegments > WEAVE_MERGE_THRESHOLD)
-			for (i = 0; i < WEAVE_MAX_LEVELS; i++)
+			for (i = 0; i < WEAVE_MERGE_MAX_LEVELS; i++)
 				if (lvlcount[i] >= 2)
 				{
 					target = (int) i;
@@ -3513,6 +3672,8 @@ weave_merge_segments(Relation index)
 
 				if (meta.segs[i].dictstart == InvalidBlockNumber)
 					continue;
+				if (weave_seg_has_vector(index, &meta.segs[i]))
+					continue;	/* sect. 7.3 */
 				sz = meta.segs[i].ndocs - meta.segs[i].ndeleted;
 				if (weave_seg_level(sz) != target)
 					continue;
@@ -3655,6 +3816,9 @@ weave_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
 	bs.lexattno = weave_build_lexattno(index);
+	bs.vecattno = weave_build_vecattno(index);
+	weave_vec_accum_init(&bs.vec, bs.ctx, bs.vecattno != 0,
+						 weave_index_vec_bits(index));
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -3850,6 +4014,9 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
 	bs.lexattno = weave_build_lexattno(index);
+	bs.vecattno = weave_build_vecattno(index);
+	weave_vec_accum_init(&bs.vec, bs.ctx, bs.vecattno != 0,
+						 weave_index_vec_bits(index));
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -4028,6 +4195,13 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
 	bs.lexattno = weave_build_lexattno(index);
+	/* An oversized INSERT reaches here with the wdoc alone -- weave_insert() has
+	 * the whole values[] but hands over only the document, and changing that is
+	 * the same problem the pending buffer has (doc/GAPS.md G23).  No weft is
+	 * written for this segment, which costs zero bytes and leaves the row absent
+	 * from vector answers rather than present with a wrong vector. */
+	bs.vecattno = 0;
+	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -4305,6 +4479,13 @@ weave_flush_pending(Relation index)
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
 	bs.lexattno = weave_build_lexattno(index);
+	/* A WeavePendingItem carries the tid and the wdoc, and nothing else, so the
+	 * vector of an inserted row is not available here at all: this segment gets no
+	 * vector weft.  That is a real limitation, recorded as doc/GAPS.md G23 rather
+	 * than papered over -- writing a weft of dead lanes would claim to cover these
+	 * documents, which is worse than not claiming to. */
+	bs.vecattno = 0;
+	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;

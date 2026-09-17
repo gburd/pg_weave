@@ -67,12 +67,13 @@ use constant {
 	WEAVE_MAX_SEGMENTS    => 128,
 	INVALID_BLOCK         => 0xFFFFFFFF,
 	WEAVE_VERSION_V5      => 5,
-	# The version this build WRITES.  v7 added the fuzzy weft; the metapage is
-	# byte-identical to v6, so everything this test manufactures is unaffected --
-	# but the version word it reads back is not, and hard-coding 6 here would have
-	# turned a correct version bump into a test failure.  See WEAVE_VERSION in
-	# include/weave/am.h for why a weft that changes no struct still bumps it.
-	WEAVE_VERSION_CUR     => 7,
+	# The version this build WRITES.  v7 added the fuzzy weft and v8 the vector
+	# one; the metapage is byte-identical to v6 in both cases, so everything this
+	# test manufactures is unaffected -- but the version word it reads back is not,
+	# and hard-coding 6 here would have turned a correct version bump into a test
+	# failure.  See WEAVE_VERSION in include/weave/am.h for why a weft that changes
+	# no struct still bumps it.
+	WEAVE_VERSION_CUR     => 8,
 };
 
 # Rewrite the metapage of an index file into the v5 on-disk shape.  Server MUST be
@@ -290,7 +291,7 @@ is(read_metapage_version($abspath), WEAVE_VERSION_CUR,
 like($node->safe_psql('postgres',
 		q{SELECT detail FROM weave_check('docs_weave')
 		   WHERE invariant = 'metapage_version_recognized'}),
-	qr/^format v7 /, 'weave_check() now reports format v7');
+	qr/^format v8 /, 'weave_check() now reports the current format (v8)');
 
 my $cd_after = $node->safe_psql('postgres',
 	q{SELECT detail FROM weave_check('docs_weave')
