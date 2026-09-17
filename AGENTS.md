@@ -123,6 +123,29 @@ answer by a path that does not touch the mutated code. Only `weave_count()` and
 that reaches a specific C function is not the same as writing SQL that returns the
 right answer, and a mutation run is the only thing that tells the two apart.
 
+**Sixth member, and it was in the mutation harness itself: a BUILD error dressed as a
+test result.** A V7 mutation leg substituted a call to a function that does not exist,
+so the derivation failed to compile and the harness -- which treats "the check did not
+succeed" as "the mutation was caught" -- reported a pass. The mutation was never run at
+all, and the compiling equivalent turned out to **survive**. So a mutation harness needs
+the same discipline as any other gate: assert that the mutant BUILT, not merely that the
+check failed. The generalization that now covers all six: **a result needs evidence that
+the specific thing you meant to run, ran.**
+
+*And the bug that leg was hiding is worth knowing on its own,* because no amount of
+regression SQL would have found it: the vector weft's docid ordering looked untested
+because a sequential scan visits pages in ascending order, so the build callback's
+order already IS docid order and sorting is the identity. It stops being the identity
+only when a **synchronized scan starts mid-relation**, which needs a relation larger
+than `NBuffers/4` -- unreachable from `installcheck`, where `shared_buffers` cannot be
+set. It takes a TAP test with its own cluster (`t/017_vector_syncscan.pl`). A guard whose
+input is identical to its output under every condition your harness can produce is not
+tested by that harness.
+
+**`flake.nix`'s `PROVE_TESTS` is an explicit list, and a TAP file that is not named in
+it runs nowhere while the suite reports success.** Both new V7 TAP files hit this. Add
+the file to the list in the same commit that adds the file.
+
 Standalone codec tests, no backend needed:
 
 ```sh
