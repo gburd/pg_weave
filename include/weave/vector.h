@@ -99,20 +99,14 @@ typedef struct WVec
  * products), so it is supported exact-only: the opclass accepts it, the planner
  * costs it as a full scan, and the graph is not used.  Saying that here is
  * cheaper than having someone discover it from a slow query.
+ *
+ * WeaveMetric itself and WEAVE_METRIC_HAS_BOUND() now live in weave/quantize.h,
+ * which this header includes, so every existing spelling still resolves.  Task V8
+ * moved them because the code-scan decision core switches on the metric to pick a
+ * bound formulation and is deliberately backend-free -- an enum behind postgres.h
+ * could not be reached from it.  The strategy numbers above are the part that
+ * belongs to the opclass, so they stayed.
  * ------------------------------------------------------------------------- */
-
-typedef enum WeaveMetric
-{
-	WEAVE_METRIC_L2 = 1,
-	WEAVE_METRIC_IP = 2,
-	WEAVE_METRIC_COSINE = 3,
-	WEAVE_METRIC_L1 = 4
-} WeaveMetric;
-
-/* Does this metric admit a compressed-domain block bound?  If not, the fused
- * scorer must treat the channel as exact-only. */
-#define WEAVE_METRIC_HAS_BOUND(m) \
-	((m) == WEAVE_METRIC_L2 || (m) == WEAVE_METRIC_IP || (m) == WEAVE_METRIC_COSINE)
 
 /* ---------------------------------------------------------------------------
  * On-page layouts

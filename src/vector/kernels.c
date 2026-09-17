@@ -129,38 +129,17 @@ bits_from_nlevels(int nlevels)
  * The 32 `allow` bits covering this block, as a lane-indexed mask, plus the
  * dead-lane and short-block trims.
  *
- * Lane s sits at warp firstwarp + s, so the block's slice of the allowlist is at
- * most two 64-bit words and is extracted with one shift.  A NULL allowlist means
- * "everything is allowed" -- the unfiltered scan -- and must not be confused with
- * an all-zero bitmap, which means the opposite.
- *
- * The second word is addressed from firstwarp + nlanes - 1 and NOT from
- * firstwarp + WEAVE_VEC_BLOCK - 1: block_bits() has already established that
- * warp firstwarp + nlanes - 1 is inside the bitmap, whereas a short block at the
- * end of a weft can have firstwarp + WEAVE_VEC_BLOCK past its end.  Bits above
- * nlanes are trimmed off `m` before the allowlist is consulted, so reading fewer
- * words loses nothing.
+ * The arithmetic itself is weave_lane_avail_mask() in weave/kernels.h, because
+ * the code-scan decision core (weave/vecscan.h) performs the same test one step
+ * earlier and there must be exactly one copy of it; the reasons are stated there.
+ * This is the projection from a WeaveScoreBlock onto its four arguments, kept so
+ * the five call sites below read as they did.
  */
 static inline weave_uint32
 lane_avail_mask(const WeaveScoreBlock *blk)
 {
-	weave_uint32 m = blk->livemask;
-
-	if (blk->nlanes < WEAVE_VEC_BLOCK)
-		m &= (weave_uint32) ((1u << blk->nlanes) - 1);
-
-	if (blk->allow != NULL)
-	{
-		size_t		w0 = (size_t) (blk->firstwarp >> 6);
-		size_t		w1 = (size_t) ((blk->firstwarp + (weave_uint32) blk->nlanes - 1) >> 6);
-		int			off = (int) (blk->firstwarp & 63);
-		weave_uint64 a = blk->allow[w0] >> off;
-
-		if (w1 != w0 && off != 0)
-			a |= blk->allow[w1] << (64 - off);
-		m &= (weave_uint32) a;
-	}
-	return m;
+	return weave_lane_avail_mask(blk->livemask, blk->nlanes, blk->allow,
+								 blk->firstwarp);
 }
 
 /*

@@ -42,6 +42,7 @@ OBJS = \
 	src/vector/vecweft.o \
 	src/vector/vecwrite.o \
 	src/vector/vecstats.o \
+	src/vector/vecscan.o \
 	src/vector/kernels.o \
 	src/vector/kernel_ops.o \
 	src/vector/wvec.o \
@@ -376,6 +377,12 @@ check-standalone:
 		src/vector/vecstats.c src/vector/quantize.c src/vector/pack.c \
 		src/vector/kernels.c -lm; \
 	$$tmp/vecbound | tail -1; \
+	echo "== V8 code-scan core: (C1) ascent, (C2) in the METRIC'S domain, mask skips =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecscan test/hegel/test_vecscan.c \
+		src/vector/vecscan.c src/vector/vecweft.c src/vector/vecpage.c \
+		src/vector/vecstats.c src/vector/kernels.c src/vector/quantize.c \
+		src/vector/pack.c -lm; \
+	$$tmp/vecscan | tail -2; \
 	echo "== Z3 surf trie: trie membership == dictionary membership, prefix enumeration =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/surf test/hegel/test_surf.c \
 		src/query/surftrie.c; \
