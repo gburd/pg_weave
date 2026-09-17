@@ -126,6 +126,7 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 		{"vector_meta", WEAVE_PK_VMETA, 0, 0},
 		{"vector_dir", WEAVE_PK_VDIR, 0, 0},
 		{"vector_codes", WEAVE_PK_VCODES, 0, 0},
+		{"vector_warp", WEAVE_PK_VWARP, 0, 0},
 	};
 	int			nbuckets = lengthof(buckets);
 	int64		unknown_pages = 0;

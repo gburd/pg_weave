@@ -44,7 +44,8 @@ SELECT invariant, ok FROM weave_check('cd_weave') ORDER BY invariant;
  uninitialized_page_count         | t
  vector_block_stats_match_codes   | t
  vector_coverage                  | t
-(13 rows)
+ vector_warp_map_ascending        | t
+(14 rows)
 
 -- The deep pass adds full-relation page reachability and the
 -- no-two-chains-overlap assertion (SEGMENT_FORMAT.md section 8 item 5).
@@ -66,7 +67,8 @@ SELECT invariant, ok FROM weave_check('cd_weave', true) ORDER BY invariant;
  uninitialized_page_count         | t
  vector_block_stats_match_codes   | t
  vector_coverage                  | t
-(15 rows)
+ vector_warp_map_ascending        | t
+(16 rows)
 
 -- The only assertion that matters: nothing is violated.
 SELECT count(*) AS violations FROM weave_check('cd_weave', true) WHERE NOT ok;

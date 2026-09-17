@@ -189,6 +189,22 @@ typedef enum WeavePageKind
 	 */
 	WEAVE_PK_VDIR = 27,			/* vector: the fixed 284-byte per-block records */
 
+	/*
+	 * Allocated by the merge producer (doc/specs/VECTOR_CHANNEL.md sect. 7.3),
+	 * because a weft that cannot say WHICH DOCUMENT a lane belongs to cannot be
+	 * merged and cannot return a row.  A warp position is an ordinal, not a
+	 * docid; the derivation "warp i is the i-th smallest docid in the bolt" that
+	 * include/weave/vector.h used to offer is FALSE for a document whose lexical
+	 * column is non-NULL but yields no postings (empty or stopword-only text):
+	 * such a document occupies a lane and appears in no posting list, so the
+	 * lexical weft's docid set is a strict subset of the lane set.  A separate
+	 * chain, and not four more bytes per lane in WEAVE_PK_VDIR, because sect.
+	 * 7.1's directory record is deliberately small enough that 28 fit a page and
+	 * record i is O(1) -- the block bound reads it for every block scored, and
+	 * the docid is read once per RETURNED row.
+	 */
+	WEAVE_PK_VWARP = 28,		/* vector: warp -> docid, 8 bytes per lane */
+
 	WEAVE_PK_NKINDS				/* first unassigned id; not a kind */
 } WeavePageKind;
 

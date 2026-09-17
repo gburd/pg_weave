@@ -235,39 +235,127 @@ SELECT (SELECT count(*) FROM dead_warps) AS dead_lanes,
                               EXCEPT SELECT w FROM dead_warps) x)
          AS null_but_not_dead;
 
--- weave_merge() SKIPS a vector-bearing group: no merge, no error, still clean.
-SELECT weave_index_nsegments('vw_weave') AS segments_before;
-SELECT weave_merge('vw_weave') AS merged_should_be_false;
-SELECT weave_index_nsegments('vw_weave') AS segments_after;
-SELECT count(*) AS violations_after_skipped_merge
+-- ------------------------------------------------------------------------
+-- THE MERGE PRODUCER (doc/specs/VECTOR_CHANNEL.md sect. 7.3)
+--
+-- What must be asserted here, and why each one is not optional:
+--
+--   * THE MOVED CODES ARE BYTE-IDENTICAL.  Sect. 7.3 forbids the merge from
+--     decoding to float and re-encoding: quantization is lossy, so an index's
+--     recall would decay with its MERGE HISTORY rather than its contents.  A
+--     re-encoding merge leaves every count right, every directory record
+--     recomputable and every strip header plausible -- so the only assertion that
+--     can see it compares the code BYTES across the merge, per document.  That is
+--     what weave_vec_lanes() exists for.
+--   * NO LANE CHANGES DOCUMENT.  A lane moved to the wrong output slot is another
+--     document's vector, and nothing counts wrong.  The comparison is keyed on the
+--     docid the warp map records, not on the warp, because the warp is exactly what
+--     a merge changes.
+--   * THE FREE PATH RUNS.  This is doc/GAPS.md G24's condition: until producer 2
+--     existed, weave_vec_free_weft() was unreachable and a mutation deleting its
+--     strip-chain free could not be caught by any test.  A merge frees its inputs'
+--     wefts, so weave_check(deep)'s page reachability is now the test that catches
+--     it -- and a leak here is thousands of pages per merge.
+--   * A DELETED DOCUMENT IS DROPPED, NOT SHIFTED ONTO SOMEBODY ELSE.  Its postings
+--     go and so must its lane; every surviving lane must still carry its own code.
+-- ------------------------------------------------------------------------
+
+-- The pre-merge picture, kept so the post-merge one can be compared to it rather
+-- than to a constant.  Only LIVE lanes: a dead lane has no code to preserve.
+CREATE TEMP TABLE vw_lanes_before AS
+  SELECT docid, code, scale, norm FROM weave_vec_lanes('vw_weave') WHERE live;
+SELECT count(*) AS live_lanes_before FROM vw_lanes_before;
+
+-- A second bolt, then a merge.  The second bolt carries NO vector weft: an inserted
+-- row's wvec is not available at pending-flush time (doc/GAPS.md G23), so this is
+-- also the MIXED case -- an input with a weft and an input without one must produce
+-- an output weft covering the union, with dead lanes for the documents that had no
+-- vector.
+INSERT INTO vw(d, v) SELECT to_wdoc('later arrival tag' || g), NULL
+  FROM generate_series(1001, 1010) g;
+SELECT weave_index_nsegments('vw_weave') AS segments_before_merge;
+SELECT weave_merge('vw_weave') AS merged;
+SELECT weave_index_nsegments('vw_weave') AS segments_after_merge;
+
+-- Zero violations, deep, AFTER the merge.  Two invariants carry this: page
+-- reachability (the inputs' wefts were freed page by page -- G24) and
+-- vector_block_stats_match_codes (every re-grouped block's bounds recompute from
+-- the codes that were moved into it, which is contract (C2) after a merge).
+SELECT count(*) AS violations_after_merge
   FROM weave_check('vw_weave', true) WHERE NOT ok;
--- ... and the lexical half still answers, so "skip" did not mean "break".
+SELECT invariant, ok, detail FROM weave_check('vw_weave', true)
+  WHERE NOT ok ORDER BY invariant;
+
+-- THE NO-RE-ENCODE PROPERTY.  Every live lane before the merge is a live lane after
+-- it, attached to the same document, with byte-identical codes and an unchanged
+-- (scale, norm) pair.  Both directions, because a merge that dropped a lane and one
+-- that invented one are different bugs.
+CREATE TEMP TABLE vw_lanes_after AS
+  SELECT docid, code, scale, norm FROM weave_vec_lanes('vw_weave') WHERE live;
+SELECT (SELECT count(*) FROM (SELECT * FROM vw_lanes_before
+                              EXCEPT SELECT * FROM vw_lanes_after) x)
+         AS lanes_lost_or_altered,
+       (SELECT count(*) FROM (SELECT * FROM vw_lanes_after
+                              EXCEPT SELECT * FROM vw_lanes_before) x)
+         AS lanes_invented,
+       (SELECT count(*) FROM vw_lanes_after) AS live_lanes_after;
+
+-- The output weft covers the UNION: the 10 documents that arrived without a vector
+-- occupy dead lanes rather than being absent, so the lane count grew by 10 while the
+-- live count did not change at all.
+SELECT sum(nlanes) AS lane_slots, sum(nlive) AS live_lanes
+  FROM weave_vec_blocks('vw_weave');
+SELECT nvec FROM weave_vec_meta('vw_weave');
+
+-- The warp map is a real chain with real pages, and the size report knows about it.
+-- A weft whose map was written but not bucketed would land in "unclassified", and a
+-- weft whose map was written but never freed shows up in the deep check above.
+SELECT kind, npages > 0 AS has_pages
+  FROM weave_index_size_detail('vw_weave')
+ WHERE kind = 'vector_warp';
+
+-- ... and the lexical half still answers, so the merge did not trade one channel
+-- for the other.
 SET enable_seqscan = off;
 SELECT count(*) FROM vw WHERE d @@@ 'vecweft'::wquery;
 SELECT weave_count('vw_weave', 'tag42'::wquery) AS one_doc;
 RESET enable_seqscan;
 
--- A second bolt, then a merge, then the deep check.  This is the FREE path: the
--- inserted rows flush into a bolt of their own (no vector weft -- a pending item
--- carries the wdoc alone, doc/GAPS.md G23), the merge must still refuse the group
--- that contains the vector-bearing bolt, and nothing may be left unreachable.
-INSERT INTO vw(d, v) SELECT to_wdoc('later arrival tag' || g), NULL
-  FROM generate_series(1001, 1010) g;
--- true here means the PENDING FLUSH did work, not that a merge happened:
--- weave_merge() flushes the pending buffer first and reports that.  The segment
--- count below is what says whether the merge itself ran.
-SELECT weave_merge('vw_weave') AS merged_again;
-SELECT weave_index_nsegments('vw_weave') AS segments_still_unmerged;
-SELECT count(*) AS violations_after_second_merge
+-- A DELETED document is DROPPED by the merge -- its postings and its lane together
+-- -- and no survivor's code slides onto its docid.
+--
+-- Two assertions, and the second is the one that would catch a lane placed at the
+-- wrong output slot: every live (docid, code) pair after the merge was already a
+-- live (docid, code) pair before it (a slid lane produces a pair that never
+-- existed), and the live count fell by exactly the number of deleted documents that
+-- HAD a vector.  Counting is done from the heap before the DELETE rather than from
+-- docid arithmetic, because turning a ctid into a docid in SQL means hardcoding
+-- WEAVE_OFFSET_FACTOR.
+CREATE TEMP TABLE vw_lanes_live AS
+  SELECT docid, code FROM weave_vec_lanes('vw_weave') WHERE live;
+SELECT count(*) AS deleted_with_a_vector FROM vw WHERE id % 50 = 0 AND v IS NOT NULL;
+DELETE FROM vw WHERE id % 50 = 0;
+VACUUM vw;                       -- writes the tombstones into the bolt
+INSERT INTO vw(d, v) SELECT to_wdoc('third bolt tag' || g), NULL
+  FROM generate_series(2001, 2005) g;
+SELECT weave_merge('vw_weave') AS merged_after_delete;
+SELECT count(*) AS violations_after_delete_merge
   FROM weave_check('vw_weave', true) WHERE NOT ok;
+SELECT (SELECT count(*) FROM (SELECT docid, code FROM weave_vec_lanes('vw_weave')
+                               WHERE live
+                              EXCEPT SELECT * FROM vw_lanes_live) x)
+         AS lanes_invented_or_shifted,
+       (SELECT count(*) FROM vw_lanes_live)
+         - (SELECT count(*) FROM weave_vec_lanes('vw_weave') WHERE live)
+         AS live_lanes_dropped;
+DROP TABLE vw_lanes_before, vw_lanes_after, vw_lanes_live;
 
 -- REINDEX rewrites the weft from scratch, and what that does NOT do is exercise the
 -- free path: a REINDEX builds into a new relfilenode and the old one is unlinked
--- whole, so not a page of it is freed individually.  Nothing in V7 reaches
--- weave_vec_free_weft() at all -- the merge refuses every group containing a
--- vector-bearing bolt (sect. 7.3), and that is the only caller's only caller; see
--- doc/GAPS.md G24, which records the free path as untested-because-unreachable and
--- names the change that ends it.  What this DOES assert is that a rebuild produces a
+-- whole, so not a page of it is freed individually.  That used to make
+-- weave_vec_free_weft() unreachable altogether (doc/GAPS.md G24); the merges above
+-- are what reach it now, and the deep check after each of them is what says the four
+-- chains were all reclaimed.  What this DOES assert is that a rebuild produces a
 -- weft as clean as the first one and that the size report still adds up.
 REINDEX INDEX vw_weave;
 SELECT count(*) AS violations_after_reindex
@@ -283,6 +371,87 @@ SELECT count(*) = 0 AS no_vector_pages
   FROM weave_index_size_detail('vw_lexonly')
  WHERE kind IN ('vector_meta', 'vector_dir', 'vector_codes') AND npages > 0;
 SELECT detail FROM weave_check('vw_lexonly') WHERE invariant = 'vector_coverage';
+
+-- ------------------------------------------------------------------------
+-- A WEFT THAT WAS MERGED k WAYS IS BYTE-IDENTICAL TO ONE BUILT IN ONE PASS
+--
+-- Everything above merged a weft-bearing bolt with a weftless one, because an
+-- inserted row's wvec is not available at pending-flush time (doc/GAPS.md G23), so
+-- the only way to get a SECOND bolt that carries codes is a build that flushes more
+-- than once.  A high-vocabulary corpus at a small maintenance_work_mem does that
+-- (the shape sql/weave.sql's `hivocab` uses): the budget floor is 32MB and the build
+-- state is dominated by the term hash, so 24,000 documents of 40 distinct terms each
+-- flushes about eleven bolts, every one of them carrying codes.
+--
+-- WHY THE ASSERTION IS A COMPARISON BETWEEN TWO INDEXES rather than a before/after
+-- snapshot: that multi-bolt state is TRANSIENT.  A build ends with the tiered merge
+-- and then weave_vacuum_compact(), both of which are merges, so by the time SQL can
+-- look there is one bolt again -- and every one of those merges was producer 2.  So
+-- the thing to compare against is a weft built in ONE pass over the same vectors:
+-- `vmulti_plain` indexes a LOW-vocabulary column of the same table, so its build
+-- never flushes and its weft is producer 1's work alone.  Producer 1 is
+-- deterministic given (dim, bits) and the vectors, so the two wefts must agree
+-- BYTE FOR BYTE on every lane -- and a merge that decoded and re-encoded, or that
+-- attached a code to the wrong docid, differs here and nowhere else.
+--
+-- The limit of this test, stated rather than discovered later: if per-term build
+-- memory ever falls enough that this corpus fits one bolt, it degrades into
+-- comparing two single-pass builds and asserts nothing about the merge.  The mixed
+-- merge above is what catches a re-encoding producer in that case, which is why both
+-- exist.
+-- ------------------------------------------------------------------------
+CREATE TABLE vmulti (id serial, d wdoc, d2 wdoc, v wvec(8));
+INSERT INTO vmulti(d, d2, v)
+  SELECT to_wdoc(array_to_string(ARRAY(SELECT 'id' || g || 'x' || k
+                                         FROM generate_series(1, 40) k), ' ')),
+         to_wdoc('shared t' || (g % 7)),
+         ('[' || g || ',' || (g % 13) || ',' || (g % 7) || ',' || (g % 5) || ','
+               || (g % 3) || ',' || (g % 11) || ',' || (g % 17) || ',' || (g % 19)
+               || ']')::wvec
+    FROM generate_series(1, 24000) g;
+SET maintenance_work_mem = '1MB';   -- floor is 32MB; the corpus exceeds it
+CREATE INDEX vmulti_merged ON vmulti USING weave (d, v);
+RESET maintenance_work_mem;
+CREATE INDEX vmulti_plain ON vmulti USING weave (d2, v);
+SELECT (SELECT count(*) FROM weave_vec_lanes('vmulti_merged') WHERE live) AS merged_live,
+       (SELECT count(*) FROM weave_vec_lanes('vmulti_plain') WHERE live) AS plain_live;
+-- Both directions: a lane that changed and a lane that was invented are different
+-- bugs, and a k-way merge can make either.
+SELECT (SELECT count(*) FROM (SELECT docid, code, scale, norm
+                                FROM weave_vec_lanes('vmulti_merged') WHERE live
+                              EXCEPT SELECT docid, code, scale, norm
+                                FROM weave_vec_lanes('vmulti_plain') WHERE live) x)
+         AS merged_lanes_not_in_a_one_pass_weft,
+       (SELECT count(*) FROM (SELECT docid, code, scale, norm
+                                FROM weave_vec_lanes('vmulti_plain') WHERE live
+                              EXCEPT SELECT docid, code, scale, norm
+                                FROM weave_vec_lanes('vmulti_merged') WHERE live) x)
+         AS one_pass_lanes_missing_from_the_merged_weft;
+SELECT count(*) AS violations FROM weave_check('vmulti_merged', true) WHERE NOT ok;
+SELECT invariant, ok FROM weave_check('vmulti_merged')
+ WHERE invariant = 'vector_warp_map_ascending';
+DROP TABLE vmulti;
+
+-- MERGING BOLTS THAT ALL LACK A WEFT MUST PRODUCE NO WEFT.  An index whose vector
+-- column is entirely NULL writes no weft at all (a weft of nothing but dead lanes
+-- carries no information and sect. 7.2 promises zero vector bytes), and the merge
+-- must not invent one -- an empty weft claims to cover documents it cannot answer
+-- for, which is a silent recall loss that looks like a working index (the same
+-- argument G23 makes for pending-flushed bolts).
+CREATE TABLE vnone (id serial, d wdoc, v wvec(8));
+INSERT INTO vnone(d, v) SELECT to_wdoc('nothing here tag' || g), NULL
+  FROM generate_series(1, 40) g;
+CREATE INDEX vnone_weave ON vnone USING weave (d, v);
+INSERT INTO vnone(d, v) SELECT to_wdoc('second bolt tag' || g), NULL
+  FROM generate_series(41, 60) g;
+SELECT weave_merge('vnone_weave') AS merged;
+SELECT count(*) AS wefts_after_merge FROM weave_vec_meta('vnone_weave');
+SELECT count(*) = 0 AS no_vector_pages
+  FROM weave_index_size_detail('vnone_weave')
+ WHERE kind IN ('vector_meta', 'vector_dir', 'vector_codes', 'vector_warp')
+   AND npages > 0;
+SELECT count(*) AS violations FROM weave_check('vnone_weave', true) WHERE NOT ok;
+DROP TABLE vnone;
 
 -- A wvec column of fewer than 4 dimensions cannot be indexed: the analytic
 -- codebook is fit from a Beta shape of (dim-3)/2, so it does not exist below 4.

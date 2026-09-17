@@ -366,7 +366,7 @@ check-standalone:
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecpage test/hegel/test_vecpage.c \
 		src/vector/vecpage.c src/vector/pack.c; \
 	$$tmp/vecpage | tail -1; \
-	echo "== V7 vector weft: strip plan is a partition, round trip, statistics recompute =="; \
+	echo "== V7 vector weft: partition, round trip, statistics recompute, the merge MOVE =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecweft test/hegel/test_vecweft.c \
 		src/vector/vecweft.c src/vector/vecpage.c src/vector/vecstats.c \
 		src/vector/quantize.c src/vector/pack.c -lm; \

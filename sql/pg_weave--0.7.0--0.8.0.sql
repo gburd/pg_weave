@@ -120,7 +120,8 @@ COMMENT ON OPERATOR CLASS wvec_weave_ops USING weave IS
 CREATE FUNCTION weave_vec_meta(idx regclass)
 RETURNS TABLE (segno integer, root bigint, dim integer, bits integer,
                metric integer, layout integer, nvec bigint, nblocks bigint,
-               dirstart bigint, codestart bigint, attnum integer)
+               dirstart bigint, codestart bigint, warpstart bigint,
+               attnum integer)
 AS 'MODULE_PATHNAME', 'weave_vec_meta'
 LANGUAGE C STRICT PARALLEL SAFE;
 
@@ -154,4 +155,26 @@ CREATE FUNCTION weave_vec_strips(idx regclass)
 RETURNS TABLE (segno integer, blkno bigint, blockno bigint, j0 integer,
                ncoords integer, centroid boolean)
 AS 'MODULE_PATHNAME', 'weave_vec_strips'
+LANGUAGE C STRICT PARALLEL SAFE;
+
+-- One row per LANE SLOT, with the lane's code bytes.
+--
+-- This is the merge producer's central assertion and not a convenience.
+-- doc/specs/VECTOR_CHANNEL.md sect. 7.3 forbids a merge from decoding and
+-- re-encoding -- quantization is lossy, so an index's recall would decay with its
+-- MERGE HISTORY rather than its contents -- and the only way to assert that from
+-- SQL is to read a lane's code bytes before a merge and after it and compare them.
+-- Nothing else can: weave_vec_blocks() reports statistics, which legitimately
+-- change when a merge re-groups lanes into new blocks, and weave_vec_strips()
+-- reports page headers, which move with the lane.  A re-encoding merge leaves every
+-- statistic recomputable, every count right and every header plausible.
+--
+-- `docid` comes from the warp map, so a lane moved to the wrong output slot appears
+-- as the right code attached to the WRONG DOCUMENT rather than as a missing row --
+-- which is what the failure actually is.  `code` is NULL for a dead lane, so a
+-- comparison cannot accidentally succeed by matching zeros.
+CREATE FUNCTION weave_vec_lanes(idx regclass)
+RETURNS TABLE (segno integer, warp bigint, blockno bigint, lane integer,
+               docid bigint, live boolean, scale real, norm real, code bytea)
+AS 'MODULE_PATHNAME', 'weave_vec_lanes'
 LANGUAGE C STRICT PARALLEL SAFE;
