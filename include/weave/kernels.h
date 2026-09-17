@@ -128,6 +128,60 @@ typedef struct WeaveScoreBlock
 } WeaveScoreBlock;
 
 /*
+ * The 32 `allow` bits covering one block, as a lane-indexed mask, with the
+ * dead-lane and short-block trims already applied.  Zero means the block has no
+ * live-and-allowed lane, which is the one case in which not a single code byte
+ * has to be read.
+ *
+ * IT IS SHARED, AND THAT IS THE POINT.  Every scoring kernel needs this mask, and
+ * so does the code-scan decision core (weave/vecscan.h), which asks the same
+ * question one step EARLIER -- before it holds any codes -- so that a fully
+ * masked block costs one AND and nothing else.  Two transcriptions of the word
+ * addressing below would be two chances to get it wrong, and getting it wrong
+ * reads a bitmap out of bounds on a corrupt page instead of failing
+ * (doc/CONVENTIONS.md decision 2).  So there is one, here, inline because it sits
+ * inside the per-block loop of every kernel.
+ *
+ * It takes four scalars rather than a WeaveScoreBlock so that the decision core,
+ * which has neither codes nor a LUT at the moment it asks, does not have to
+ * fabricate a half-filled block to reach it.
+ *
+ * Lane s sits at warp firstwarp + s, so the block's slice of the allowlist is at
+ * most two 64-bit words and is extracted with one shift.  A NULL allowlist means
+ * "everything is allowed" -- the unfiltered scan -- and must not be confused with
+ * an all-zero bitmap, which means the opposite.
+ *
+ * The second word is addressed from firstwarp + nlanes - 1 and NOT from
+ * firstwarp + WEAVE_VEC_BLOCK - 1: the caller has already established that warp
+ * firstwarp + nlanes - 1 is inside the bitmap, whereas a short block at the end
+ * of a weft can have firstwarp + WEAVE_VEC_BLOCK past its end.  Bits above
+ * nlanes are trimmed off `m` before the allowlist is consulted, so reading fewer
+ * words loses nothing.
+ */
+static inline weave_uint32
+weave_lane_avail_mask(weave_uint32 livemask, int nlanes,
+					  const weave_uint64 *allow, weave_uint32 firstwarp)
+{
+	weave_uint32 m = livemask;
+
+	if (nlanes < WEAVE_VEC_BLOCK)
+		m &= (weave_uint32) ((1u << nlanes) - 1);
+
+	if (allow != NULL)
+	{
+		size_t		w0 = (size_t) (firstwarp >> 6);
+		size_t		w1 = (size_t) ((firstwarp + (weave_uint32) nlanes - 1) >> 6);
+		int			off = (int) (firstwarp & 63);
+		weave_uint64 a = allow[w0] >> off;
+
+		if (w1 != w0 && off != 0)
+			a |= allow[w1] << (64 - off);
+		m &= (weave_uint32) a;
+	}
+	return m;
+}
+
+/*
  * Score one block.  Writes exactly blk->nlanes floats, WEAVE_KERNEL_NEVER for
  * any lane that is dead or masked out so the caller's indexing stays positional,
  * and returns blk->nlanes.  Returns -1 without writing anything if the block
