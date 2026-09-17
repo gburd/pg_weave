@@ -50,6 +50,7 @@
 PG_FUNCTION_INFO_V1(weave_vec_meta);
 PG_FUNCTION_INFO_V1(weave_vec_blocks);
 PG_FUNCTION_INFO_V1(weave_vec_strips);
+PG_FUNCTION_INFO_V1(weave_vec_lanes);
 
 /* ---------------------------------------------------------------------------
  * Producer 1's accumulator
@@ -160,7 +161,6 @@ vec_accum_add_dead(WeaveVecAccum *acc, ItemPointer tid)
 	acc->docid[acc->nlane] = weave_tid_to_docid(tid);
 	acc->nlane++;
 }
-
 void
 weave_vec_accum_add(WeaveVecAccum *acc, Relation index, ItemPointer tid,
 					Datum value, bool isnull)
@@ -275,6 +275,103 @@ weave_vec_accum_add(WeaveVecAccum *acc, Relation index, ItemPointer tid,
 
 	if ((Pointer) v != DatumGetPointer(value))
 		pfree(v);
+}
+
+/* ---------------------------------------------------------------------------
+ * Producer 2's accumulator entry points
+ *
+ * The same array, filled from an input weft's bytes instead of from a Datum.  No
+ * encode, no decode: sect. 7.3 forbids re-quantizing on a merge, and the way to be
+ * sure a writer never does is to give it no float to encode.
+ * ------------------------------------------------------------------------- */
+
+bool
+weave_vec_accum_init_geom(WeaveVecAccum *acc, int dim, int bits,
+						  WeaveMetric metric, WeavePackLayout layout)
+{
+	MemoryContext old;
+
+	if (!acc->active || dim <= 0 || dim > WVEC_MAX_DIM)
+		return false;
+	if (acc->ready)
+		return acc->dim == dim && acc->bits == bits;
+
+	old = MemoryContextSwitchTo(acc->ctx);
+	if (weave_quantizer_init(&acc->q, dim, bits, NULL, palloc, pfree) != 0)
+	{
+		MemoryContextSwitchTo(old);
+		return false;			/* the caller skips; it does not throw */
+	}
+	MemoryContextSwitchTo(old);
+
+	acc->dim = dim;
+	acc->bits = bits;
+	acc->codebytes = acc->q.codebytes;
+	acc->metric = metric;
+	acc->layout = layout;
+	acc->ready = true;
+
+	/*
+	 * Lanes appended before the geometry was known are impossible here -- unlike
+	 * producer 1, which can see NULLs before its first vector -- but the code
+	 * array still has to exist before the first append, and vec_accum_grow() only
+	 * allocates it once codebytes is nonzero.
+	 */
+	if (acc->lanecap > 0 && acc->code == NULL)
+	{
+		Size		sz = (Size) acc->lanecap * (Size) acc->codebytes;
+
+		old = MemoryContextSwitchTo(acc->ctx);
+		acc->code = (uint8 *) WEAVE_ALLOC_MAYBE_HUGE(sz);
+		MemSet(acc->code, 0, sz);
+		MemoryContextSwitchTo(old);
+	}
+	return true;
+}
+
+void
+weave_vec_accum_add_encoded(WeaveVecAccum *acc, const uint8 *code,
+							float scale, float norm, uint64 docid)
+{
+	if (!acc->active || !acc->ready)
+		return;
+	if (code == NULL)
+	{
+		weave_vec_accum_add_dead_docid(acc, docid);
+		return;
+	}
+
+	vec_accum_grow(acc);
+	/* memcpy, not encode: the bytes that were on the input's pages are the bytes that
+	 * go on the output's, and the (scale, norm) pair the caller read out of the input's
+	 * directory record goes with them UNCHANGED.  The pair is the load-bearing half --
+	 * a code survives decode-then-encode unchanged (it is a fixed point; see
+	 * test_reencode_idempotent in test/hegel/test_quantize.c) but a reconstruction's
+	 * norm is not its original's, so a recomputed scale makes the lane dequantize to
+	 * a different vector with every statistic still self-consistent.  sect. 7.3. */
+	memcpy(acc->code + (Size) acc->nlane * acc->codebytes, code,
+		   (Size) acc->codebytes);
+	acc->scale[acc->nlane] = scale;
+	acc->norm[acc->nlane] = norm;
+	acc->live[acc->nlane] = 1;
+	acc->docid[acc->nlane] = docid;
+	acc->nlane++;
+	acc->nlive++;
+}
+
+void
+weave_vec_accum_add_dead_docid(WeaveVecAccum *acc, uint64 docid)
+{
+	if (!acc->active)
+		return;
+	vec_accum_grow(acc);
+	if (acc->code != NULL)
+		MemSet(acc->code + (Size) acc->nlane * acc->codebytes, 0, acc->codebytes);
+	acc->scale[acc->nlane] = 0.0f;
+	acc->norm[acc->nlane] = 0.0f;
+	acc->live[acc->nlane] = 0;
+	acc->docid[acc->nlane] = docid;
+	acc->nlane++;
 }
 
 /* ---------------------------------------------------------------------------
@@ -516,6 +613,7 @@ weave_vec_write_weft(Relation index, WeaveVecAccum *acc)
 	WeaveVecWeftGeom g;
 	VecChain	codes;
 	VecChain	dir;
+	VecChain	warp;
 	uint8	   *block;
 	uint8	   *cencode;
 	uint8	   *tmpcode;
@@ -560,6 +658,7 @@ weave_vec_write_weft(Relation index, WeaveVecAccum *acc)
 
 	vec_chain_init(&codes, index, WEAVE_PK_VCODES);
 	vec_chain_init(&dir, index, WEAVE_PK_VDIR);
+	vec_chain_init(&warp, index, WEAVE_PK_VWARP);
 
 	for (b = 0; b < g.nblocks; b++)
 	{
@@ -655,6 +754,45 @@ weave_vec_write_weft(Relation index, WeaveVecAccum *acc)
 	vec_chain_close(&dir);
 
 	/*
+	 * The warp map, in its own pass over the sorted lanes.
+	 *
+	 * A SEPARATE PASS, not a third chain interleaved with the other two, because
+	 * its page boundaries have nothing to do with block boundaries -- 1,018 entries
+	 * per page against 32 lanes per block -- so interleaving would hold a third
+	 * page open for no locality and complicate the deadlock argument above for
+	 * nothing.  Chain order on disk is not part of the format.
+	 *
+	 * EVERY lane gets an entry, dead ones included: warp w's document exists
+	 * whether or not it had a vector, and a hole would make the map's own "0 is not
+	 * a docid" validation fire on a legitimate weft.
+	 */
+	for (b = 0; b < acc->nlane; b++)
+	{
+		int			slot = weave_vecwarp_slot_index(b, g.wpp);
+
+		CHECK_FOR_INTERRUPTS();
+		if (slot == 0)
+		{
+			uint32		n = acc->nlane - b;
+
+			if (n > (uint32) g.wpp)
+				n = (uint32) g.wpp;
+			page = vec_chain_append(&warp);
+			if (weave_vecwarp_page_init(PageGetContents(page),
+										WEAVE_VECPAGE_PAYLOAD,
+										WEAVE_VECPAGE_PAYLOAD, b, (int) n) != 0)
+				elog(ERROR, "could not initialize a vector warp map page at warp %u", b);
+			vec_page_used(page, (int) (sizeof(WeaveVecWarpHdr) +
+									   (Size) n * sizeof(uint64)));
+		}
+		if (weave_vecwarp_write(PageGetContents(warp.page), WEAVE_VECPAGE_PAYLOAD,
+								WEAVE_VECPAGE_PAYLOAD, slot,
+								acc->docid[perm[b]]) != 0)
+			elog(ERROR, "could not write the warp map entry for warp %u", b);
+	}
+	vec_chain_close(&warp);
+
+	/*
 	 * The VMETA page LAST, so every root it names is known -- the same ordering
 	 * rule weave_attach_chandesc() follows, and for the same reason: a root that
 	 * is computed rather than recorded is how a sibling project wrote one chain
@@ -681,6 +819,7 @@ weave_vec_write_weft(Relation index, WeaveVecAccum *acc)
 		m->nblocks = g.nblocks;
 		m->dirstart = dir.first;
 		m->codestart = codes.first;
+		m->warpstart = warp.first;
 		m->graphstart = InvalidBlockNumber;	/* V9 */
 
 		/*
@@ -705,9 +844,9 @@ weave_vec_write_weft(Relation index, WeaveVecAccum *acc)
 	pfree(block);
 	pfree(perm);
 
-	elog(DEBUG1, "pg_weave build: index \"%s\": vector weft of %u lanes (%u live) in %u blocks, %u strips, %u directory pages",
+	elog(DEBUG1, "pg_weave build: index \"%s\": vector weft of %u lanes (%u live) in %u blocks, %u strips, %u directory pages, %u warp map pages",
 		 RelationGetRelationName(index), acc->nlane, acc->nlive, g.nblocks,
-		 g.nstrips, g.ndirpages);
+		 g.nstrips, g.ndirpages, g.nwarppages);
 	return root;
 }
 
@@ -813,7 +952,10 @@ weave_vec_weft_open(Relation index, BlockNumber root, WeaveVecWeft *out,
 		out->meta.dirstart >= nblocks ||
 		out->meta.codestart == InvalidBlockNumber ||
 		out->meta.codestart == WEAVE_METAPAGE_BLKNO ||
-		out->meta.codestart >= nblocks)
+		out->meta.codestart >= nblocks ||
+		out->meta.warpstart == InvalidBlockNumber ||
+		out->meta.warpstart == WEAVE_METAPAGE_BLKNO ||
+		out->meta.warpstart >= nblocks)
 	{
 		*why = "a vector weft chain root is out of range";
 		return false;
@@ -1101,6 +1243,248 @@ weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno, uint8 *block,
 	return ok;
 }
 
+/* ---------------------------------------------------------------------------
+ * The warp map reader
+ *
+ * A forward cursor, because both of its callers walk every warp in order: the merge
+ * producer below and weave_check()'s ascending-docid invariant.  It holds no buffer
+ * lock between calls -- it copies a page's entries into its own buffer and releases
+ * -- so a caller may read code and directory pages in the same loop without any
+ * lock-ordering question.
+ *
+ * O(1) random access by warp is available from the same arithmetic
+ * (weave_vecwarp_page_index) and is what V8 will want for the few warps it returns;
+ * it is not written until there is a caller, because an untested reader is worse
+ * than an absent one.
+ * ------------------------------------------------------------------------- */
+
+void
+weave_vec_warp_begin(WeaveVecWarpCursor *c, const WeaveVecWeft *w)
+{
+	c->w = w;
+	c->blk = w->meta.warpstart;
+	c->buf = (uint64 *) palloc((Size) w->geom.wpp * sizeof(uint64));
+	c->nbuf = 0;
+	c->pos = 0;
+	c->warp = 0;
+}
+
+void
+weave_vec_warp_end(WeaveVecWarpCursor *c)
+{
+	pfree(c->buf);
+	c->buf = NULL;
+}
+
+bool
+weave_vec_warp_next(WeaveVecWarpCursor *c, uint64 *docid, const char **why)
+{
+	if (c->warp >= c->w->meta.nvec)
+	{
+		*why = "the warp map is asked for a warp past the weft";
+		return false;
+	}
+	if (c->pos >= c->nbuf)
+	{
+		BlockNumber nblocks = RelationGetNumberOfBlocks(c->w->index);
+		Buffer		buf;
+		Page		page;
+		int			want = weave_vecwarp_page_index(c->warp, c->w->geom.wpp);
+		int			i;
+
+		if (c->blk == InvalidBlockNumber || c->blk == WEAVE_METAPAGE_BLKNO ||
+			c->blk >= nblocks)
+		{
+			*why = "the vector warp map chain ends before the weft's last lane";
+			return false;
+		}
+		buf = ReadBuffer(c->w->index, c->blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (PageIsNew(page) || !WeavePageHasKind(page, WEAVE_PK_VWARP))
+		{
+			UnlockReleaseBuffer(buf);
+			*why = "a block on the vector warp map chain is not a warp map page";
+			return false;
+		}
+		if (((const WeaveVecWarpHdr *) PageGetContents(page))->firstwarp !=
+			(uint32) want * (uint32) c->w->geom.wpp)
+		{
+			/* The same cross-check the directory pages carry, for the same
+			 * reason: a mislinked chain would answer for the wrong warps
+			 * silently, and every moved lane would land on another document. */
+			UnlockReleaseBuffer(buf);
+			*why = "a vector warp map page does not start where the O(1) formula says it does";
+			return false;
+		}
+		c->nbuf = 0;
+		for (i = 0; i < c->w->geom.wpp && c->warp + (uint32) i < c->w->meta.nvec; i++)
+		{
+			if (weave_vecwarp_read(PageGetContents(page), WEAVE_VECPAGE_PAYLOAD,
+								   WEAVE_VECPAGE_PAYLOAD, i, &c->buf[i], why) != 0)
+			{
+				UnlockReleaseBuffer(buf);
+				return false;
+			}
+			c->nbuf++;
+		}
+		c->blk = WeavePageGetOpaque(page)->nextblk;
+		UnlockReleaseBuffer(buf);
+		c->pos = 0;
+		if (c->nbuf == 0)
+		{
+			*why = "a vector warp map page holds no entries";
+			return false;
+		}
+	}
+	*docid = c->buf[c->pos++];
+	c->warp++;
+	return true;
+}
+
+/* ---------------------------------------------------------------------------
+ * Producer 2, the merge
+ * ------------------------------------------------------------------------- */
+
+bool
+weave_vec_merge_geom(Relation index, const WeaveSegMeta *segs, uint32 nsegs,
+					 WeaveVecMeta *out, uint32 *nwith)
+{
+	uint32		i;
+	bool		have = false;
+
+	*nwith = 0;
+	MemSet(out, 0, sizeof(*out));
+
+	for (i = 0; i < nsegs; i++)
+	{
+		WeaveVecWeft w;
+		BlockNumber root;
+		const char *why = NULL;
+
+		if (segs[i].dictstart == InvalidBlockNumber)
+			continue;			/* consumed slot */
+		root = weave_vec_weft_root(index, &segs[i]);
+		if (root == InvalidBlockNumber)
+			continue;			/* this bolt carries no vector weft */
+		if (!weave_vec_weft_open(index, root, &w, &why))
+		{
+			/*
+			 * An unreadable weft is not a geometry disagreement, but the merge
+			 * must not proceed on it either: it would silently drop a weft it
+			 * could not read.  Refuse the group; weave_check() is what reports the
+			 * corruption, and it is not this function's job to throw about it.
+			 */
+			elog(DEBUG1, "pg_weave merge: index \"%s\": bolt %u has an unreadable vector weft (%s)",
+				 RelationGetRelationName(index), i,
+				 why != NULL ? why : "unknown");
+			return false;
+		}
+		(*nwith)++;
+		if (!have)
+		{
+			*out = w.meta;
+			have = true;
+		}
+		else if (out->dim != w.meta.dim || out->bits != w.meta.bits ||
+				 out->layout != w.meta.layout || out->metric != w.meta.metric)
+			return false;		/* see the header: re-quantizing is forbidden */
+	}
+	return true;
+}
+
+bool
+weave_vec_merge_append(Relation index, const WeaveSegMeta *src,
+					   WeaveVecAccum *acc,
+					   bool (*dropped) (void *arg, uint64 docid), void *arg,
+					   const char **why)
+{
+	WeaveVecWeft w;
+	WeaveVecWarpCursor wc;
+	BlockNumber root;
+	uint8	   *block;
+	uint8	   *code;
+	uint32		b;
+	bool		ok = true;
+
+	*why = NULL;
+	root = weave_vec_weft_root(index, src);
+	if (root == InvalidBlockNumber)
+		return true;			/* no weft: this bolt contributes no lanes */
+	if (!weave_vec_weft_open(index, root, &w, why))
+		return false;
+	if (w.geom.dim != acc->dim || w.geom.bits != acc->bits ||
+		(int) w.meta.layout != (int) acc->layout)
+	{
+		/* weave_vec_merge_geom() agreed on this before a page was written; a
+		 * disagreement here means the descriptor moved under us. */
+		*why = "the input weft's geometry is not the one the merge agreed on";
+		return false;
+	}
+
+	block = (uint8 *) palloc(w.geom.blockbytes);
+	code = (uint8 *) palloc(w.geom.codebytes);
+	weave_vec_warp_begin(&wc, &w);
+
+	/*
+	 * BLOCK BY BLOCK, sequentially, and reading each block WHOLE.  That is not a
+	 * concession: in WEAVE_PACK_LANE coordinate j of lane s lives at bit
+	 * (j*32+s)*bits, so a single lane's code is spread over every byte range of the
+	 * block and therefore over every page of it.  Reading one lane costs the block;
+	 * reading the block costs one lane.  (weave_vec_block_read() additionally walks
+	 * the chain from codestart per block -- see its header -- so a per-lane reader
+	 * would be quadratic on top.)
+	 */
+	for (b = 0; b < w.geom.nblocks && ok; b++)
+	{
+		WeaveVecDirRec rec;
+		int			nlanes = weave_vecweft_block_lanes(&w.geom, b);
+		int			s;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!weave_vec_dir_read(&w, b, &rec, why))
+		{
+			ok = false;
+			break;
+		}
+		if (!weave_vec_block_read(&w, b, block, NULL, why))
+		{
+			ok = false;
+			break;
+		}
+
+		for (s = 0; s < nlanes; s++)
+		{
+			uint64		docid;
+
+			if (!weave_vec_warp_next(&wc, &docid, why))
+			{
+				ok = false;
+				break;
+			}
+			/*
+			 * A DEAD input lane is not appended here.  The document had no vector,
+			 * so there is nothing to move, and if it survives the merge the caller
+			 * gives it a dead lane from the merged docid set -- one code path for
+			 * "this document has no vector" instead of two that must agree.
+			 */
+			if ((rec.livemask & (1u << s)) == 0)
+				continue;
+			if (dropped != NULL && dropped(arg, docid))
+				continue;		/* tombstoned: physically dropped, like its postings */
+
+			weave_unpack_lane(WEAVE_PACK_LANE, w.geom.dim, w.geom.bits,
+							  block, s, code);
+			weave_vec_accum_add_encoded(acc, code, rec.lane[2 * s],
+										rec.lane[2 * s + 1], docid);
+		}
+	}
+
+	weave_vec_warp_end(&wc);
+	pfree(code);
+	pfree(block);
+	return ok;
+}
 void
 weave_vec_free_weft(Relation index, BlockNumber root)
 {
@@ -1111,40 +1495,35 @@ weave_vec_free_weft(Relation index, BlockNumber root)
 		return;
 
 	/*
-	 * NOTHING CALLS THIS IN V7, AND THAT IS A MEASURED CLAIM RATHER THAN A GUESS.
-	 * The whole call graph is three edges: weave_vec_free_weft() has exactly one
-	 * caller, weave_free_segment() (src/am/am.c, the WEAVE_WK_VECTOR arm of its
-	 * descriptor loop), which has exactly two -- weave_merge_selected()
-	 * (src/am/ambuild.c) and weave_merge_all_parallel()'s commit pass.  Both free
-	 * only the INPUTS of a merge that committed, and sect. 7.3's interim rule
-	 * refuses any merge whose inputs include a vector-bearing bolt:
-	 * weave_merge_selected() returns false at its weave_seg_has_vector() gate
-	 * before allocating a page, and both group selectors filter such bolts out of
-	 * their candidate lists.  So no vector weft is ever an input to a committed
-	 * merge, and no other path reclaims a weft page by page: VACUUM's compaction
-	 * is implemented as a merge (weave_compact_to_one() -> weave_merge_selected(),
-	 * refused for the same reason, which is why a vector index does not compact),
-	 * bulkdelete only rewrites the livedocs bitmap, REINDEX and VACUUM FULL build
-	 * into a NEW relfilenode and the old one is unlinked whole, and DROP INDEX
-	 * unlinks the relation without walking a page of it.
+	 * REACHED, as of the merge producer, and that is the whole of doc/GAPS.md G24.
 	 *
-	 * Verified, not just argued: a build with an elog(ERROR) as the first
-	 * statement of this function passes installcheck-pg17 and tap-pg17 (14 files,
-	 * 207 tests) unchanged.  A mutation that deletes the meta.codestart line below
-	 * therefore CANNOT be caught by any test, which is recorded as
-	 * untested-because-unreachable in doc/GAPS.md G24 rather than papered over with
-	 * a test that reaches it some other way -- and the function is kept rather than
-	 * deleted because the one change that ends the exception (sect. 7.3's merge
-	 * producer 2, which removes the weave_seg_has_vector() exclusion) makes it
-	 * reachable on the very first merge, and a merge that frees a bolt without its
-	 * weft leaks every strip page it owned.
+	 * The call graph is three edges: this has exactly one caller,
+	 * weave_free_segment() (src/am/am.c, the WEAVE_WK_VECTOR arm of its descriptor
+	 * loop), which has exactly two -- weave_merge_selected() and
+	 * weave_merge_all_parallel()'s commit pass.  Both free the INPUTS of a merge
+	 * that committed.  Until producer 2 existed, sect. 7.3's interim rule refused
+	 * every merge whose inputs included a vector-bearing bolt, so no vector weft
+	 * was ever such an input; nothing else reclaims a weft page by page either
+	 * (compaction IS a merge, bulkdelete only rewrites the livedocs bitmap, and
+	 * REINDEX / VACUUM FULL / DROP INDEX all discard a whole relfilenode).  A build
+	 * with an elog(ERROR) as the first statement here passed the entire suite, and
+	 * a mutation deleting the meta.codestart line below could not be caught by any
+	 * test that existed.  G24 recorded that rather than papering over it, and named
+	 * the exact change that ends it: this one.
 	 *
-	 * Free the two chains the VMETA page names, then the page itself.  Reading it
+	 * So the statements below are now load-bearing on the FIRST merge of a
+	 * vector-bearing bolt, and a forgotten chain leaks every page of it --
+	 * thousands per merge, reclaimable by nothing short of a REINDEX.
+	 * sql/vecindex.sql merges two vector-bearing bolts and asserts
+	 * weave_check(deep) reports no unreachable pages; the mutation table's
+	 * free-omits-* legs are what prove that assertion bites.
+	 *
+	 * Free the chains the VMETA page names, then the page itself.  Reading it
 	 * first is the only way to find them: sect. 7.1 puts a weft's roots in the
 	 * weft's own header rather than in WeaveSegMeta, which is what lets a bolt
 	 * without vectors cost zero bytes -- and it means a free path that only walked
-	 * the descriptor's root would reclaim ONE page and leak every code and
-	 * directory page behind it.  weave_check(deep)'s pages_reachable_or_freed is
+	 * the descriptor's root would reclaim ONE page and leak every code, directory
+	 * and warp-map page behind it.  weave_check(deep)'s pages_reachable_or_freed is
 	 * what notices, and doc/specs/SEGMENT_FORMAT.md sect. 6 is where that argument
 	 * is made for the descriptor page itself.
 	 *
@@ -1158,6 +1537,8 @@ weave_vec_free_weft(Relation index, BlockNumber root)
 			weave_free_chain(index, meta.codestart);
 		if (meta.dirstart != InvalidBlockNumber)
 			weave_free_chain(index, meta.dirstart);
+		if (meta.warpstart != InvalidBlockNumber)
+			weave_free_chain(index, meta.warpstart);
 		if (meta.graphstart != InvalidBlockNumber)
 			weave_free_chain(index, meta.graphstart);
 		if (meta.calibstart != InvalidBlockNumber)
@@ -1295,8 +1676,8 @@ weave_vec_meta(PG_FUNCTION_ARGS)
 	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
 	{
 		WeaveVecWeft w;
-		Datum		values[11];
-		bool		nulls[11];
+		Datum		values[12];
+		bool		nulls[12];
 		uint16		attnum = 0;
 
 		if (!vec_introspect_weft(index, s, &meta.segs[s], &w, &attnum))
@@ -1313,7 +1694,8 @@ weave_vec_meta(PG_FUNCTION_ARGS)
 		values[7] = Int64GetDatum((int64) w.meta.nblocks);
 		values[8] = Int64GetDatum((int64) w.meta.dirstart);
 		values[9] = Int64GetDatum((int64) w.meta.codestart);
-		values[10] = Int32GetDatum((int32) attnum);
+		values[10] = Int64GetDatum((int64) w.meta.warpstart);
+		values[11] = Int32GetDatum((int32) attnum);
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 
@@ -1471,6 +1853,116 @@ weave_vec_strips(PG_FUNCTION_ARGS)
 
 			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 		}
+	}
+
+	index_close(index, AccessShareLock);
+	return (Datum) 0;
+}
+
+/*
+ * weave_vec_lanes(regclass) -> one row per lane slot of every vector weft
+ *
+ * WHY THIS ONE EXISTS, and it is the merge producer's central assertion rather
+ * than a convenience.  Sect. 7.3 forbids the merge from re-encoding, and the only
+ * way to assert that from SQL is to read a lane's CODE BYTES before a merge and
+ * after it and compare them.  Nothing else can: weave_vec_blocks() reports
+ * statistics, which legitimately change when a merge re-groups lanes, and
+ * weave_vec_strips() reports page headers, which move with the lane.  A merge that
+ * decoded and re-encoded would leave every statistic recomputable, every count
+ * right and every strip header plausible -- and would silently lose recall on every
+ * merge, forever, which is precisely the failure mode no fixed-output test can see.
+ *
+ * `code` is the lane's code as weave_unpack_lane() returns it (NULL for a dead
+ * lane, so a comparison cannot accidentally succeed against zeros), and `docid`
+ * comes from the warp map, so a lane moved to the wrong output slot shows up as a
+ * code attached to a different document rather than as a missing row.
+ */
+Datum
+weave_vec_lanes(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore = vec_introspect_tupstore(fcinfo, &tupdesc);
+	WeaveMetaPageData meta;
+	Relation	index = vec_introspect_open(indexoid, &meta);
+	uint32		s;
+
+	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		WeaveVecWeft w;
+		WeaveVecWarpCursor wc;
+		const char *why = NULL;
+		uint8	   *block;
+		uint8	   *code;
+		bytea	   *codebuf;
+		uint32		b;
+
+		if (!vec_introspect_weft(index, s, &meta.segs[s], &w, NULL))
+			continue;
+
+		block = (uint8 *) palloc(w.geom.blockbytes);
+		code = (uint8 *) palloc(w.geom.codebytes);
+		codebuf = (bytea *) palloc(VARHDRSZ + (Size) w.geom.codebytes);
+		SET_VARSIZE(codebuf, VARHDRSZ + w.geom.codebytes);
+		weave_vec_warp_begin(&wc, &w);
+
+		for (b = 0; b < w.geom.nblocks; b++)
+		{
+			WeaveVecDirRec rec;
+			int			nlanes = weave_vecweft_block_lanes(&w.geom, b);
+			int			i;
+
+			CHECK_FOR_INTERRUPTS();
+			if (!weave_vec_dir_read(&w, b, &rec, &why) ||
+				!weave_vec_block_read(&w, b, block, NULL, &why))
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("bolt %u of index \"%s\": block %u is unreadable",
+								s, RelationGetRelationName(index), b),
+						 errdetail("%s", why != NULL ? why : "unknown")));
+
+			for (i = 0; i < nlanes; i++)
+			{
+				Datum		values[9];
+				bool		nulls[9];
+				uint64		docid = 0;
+				bool		live = (rec.livemask & (1u << i)) != 0;
+
+				if (!weave_vec_warp_next(&wc, &docid, &why))
+					ereport(ERROR,
+							(errcode(ERRCODE_INDEX_CORRUPTED),
+							 errmsg("bolt %u of index \"%s\": warp map ends at warp %u",
+									s, RelationGetRelationName(index),
+									b * (uint32) WEAVE_VEC_BLOCK + (uint32) i),
+							 errdetail("%s", why != NULL ? why : "unknown")));
+
+				MemSet(nulls, 0, sizeof(nulls));
+				values[0] = Int32GetDatum((int32) s);
+				values[1] = Int64GetDatum((int64) (b * (uint32) WEAVE_VEC_BLOCK +
+												  (uint32) i));
+				values[2] = Int64GetDatum((int64) b);
+				values[3] = Int32GetDatum(i);
+				values[4] = Int64GetDatum((int64) docid);
+				values[5] = BoolGetDatum(live);
+				values[6] = Float4GetDatum(rec.lane[2 * i]);
+				values[7] = Float4GetDatum(rec.lane[2 * i + 1]);
+				if (live)
+				{
+					weave_unpack_lane(WEAVE_PACK_LANE, w.geom.dim, w.geom.bits,
+									  block, i, code);
+					memcpy(VARDATA(codebuf), code, (Size) w.geom.codebytes);
+					values[8] = PointerGetDatum(codebuf);
+				}
+				else
+					nulls[8] = true;
+				tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+			}
+		}
+
+		weave_vec_warp_end(&wc);
+		pfree(codebuf);
+		pfree(code);
+		pfree(block);
 	}
 
 	index_close(index, AccessShareLock);

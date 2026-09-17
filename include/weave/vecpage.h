@@ -276,6 +276,91 @@ extern int weave_strip_scatter(weave_uint8 *block, size_t blocklen, int dim,
 							   int bits, const WeaveVecStripHdr *hdr,
 							   const weave_uint8 *codes);
 
+/* ---------------------------------------------------------------------------
+ * The warp map: warp position -> docid
+ *
+ * WHY IT IS STORED AT ALL, which is the question the merge producer answered the
+ * hard way (doc/specs/VECTOR_CHANNEL.md sect. 7.3).  A warp is an ORDINAL -- lane
+ * s of block b is warp b*32+s -- and every other structure in a weft is keyed by
+ * it.  Nothing in the weft said which document a warp was, and the derivation
+ * offered instead ("warp i is the i-th smallest docid in the bolt, and the bolt's
+ * docids are all in its lexical weft") is FALSE: producer 1 gives a lane to every
+ * document whose lexical column is non-NULL, while the lexical weft only contains
+ * documents with at least one posting, and a non-NULL wdoc with no terms (empty or
+ * stopword-only text) is neither hypothetical nor rejected.  For such a document
+ * the two sets differ, every warp after it maps to the wrong docid, and nothing
+ * counts wrong.
+ *
+ * A merge needs the map to drop a tombstoned document's lane and to place a moved
+ * lane at the output docid's rank; V8's scan needs it to turn a warp back into a
+ * heap tid.  8 bytes per lane, 1.7 % of the code bytes at 960-d and 4 bits.
+ *
+ * ITS OWN CHAIN, not four more bytes per lane in WeaveVecDirRec, for a reason that
+ * is about read amplification and not about tidiness: the directory record is
+ * sized so that 28 fit a page and record i is O(1), and it is read for EVERY block
+ * a scan considers (bench/RESULTS_BOUND_PRUNING.md measured 0.00 % of blocks
+ * pruned, so "every" is literal).  Adding 256 bytes per record would halve the
+ * records per page and double that read to carry a value needed once per RETURNED
+ * row.  Warps are dense, so a chain of plain uint64s addresses warp w by
+ * arithmetic exactly as well.
+ * ------------------------------------------------------------------------- */
+
+typedef struct WeaveVecWarpHdr
+{
+	weave_uint32 firstwarp;		/* warp of entry 0 on this page */
+	weave_uint16 nwarps;		/* entries present, >= 1 */
+	weave_uint16 pad;			/* must be zero: part of the page image */
+} WeaveVecWarpHdr;
+
+/* Entries a page with `usable` payload bytes holds.  1,018 at an 8,160-byte page,
+ * so a million-lane weft's map is 983 pages against 122,071 pages of codes. */
+static inline int
+weave_vecwarp_per_page(int usable)
+{
+	int			avail = usable - (int) sizeof(WeaveVecWarpHdr);
+
+	if (avail < (int) sizeof(weave_uint64))
+		return 0;
+	return avail / (int) sizeof(weave_uint64);
+}
+
+static inline int
+weave_vecwarp_page_index(weave_uint32 warp, int wpp)
+{
+	return wpp > 0 ? (int) (warp / (weave_uint32) wpp) : -1;
+}
+
+static inline int
+weave_vecwarp_slot_index(weave_uint32 warp, int wpp)
+{
+	return wpp > 0 ? (int) (warp % (weave_uint32) wpp) : -1;
+}
+
+/*
+ * Zero a warp-map page and write its header.  Separate from the per-entry write
+ * for the same reason weave_vecdir_page_init() is: a page holds many entries and
+ * only the first writer may zero it, but the zeroing is not optional -- the slack
+ * past the last entry is part of the page image, so a GenericXLog delta and any
+ * fixture hash depend on it.  Returns 0 or -1.
+ */
+extern int weave_vecwarp_page_init(void *dst, size_t dstlen, int usable,
+								   weave_uint32 firstwarp, int nwarps);
+
+/* Write one docid into slot `slot` of an initialized page.  Returns 0 or -1. */
+extern int weave_vecwarp_write(void *dst, size_t dstlen, int usable, int slot,
+							   weave_uint64 docid);
+
+/*
+ * Read slot `slot`.  Validates the page header and the slot, because on-disk bytes
+ * are not trusted (doc/CONVENTIONS.md decision 2).  A docid of 0 is refused: warp
+ * 0 of the heap would be (block 0, offset 0) and offsets are 1-based, so 0 is the
+ * "no entry here" hole a partially written page would leave, and a merge that
+ * believed it would move a lane onto a document that does not exist.  Returns 0 or
+ * -1 with *why set.
+ */
+extern int weave_vecwarp_read(const void *src, size_t srclen, int usable, int slot,
+							  weave_uint64 *out, const char **why);
+
 /*
  * Compute a block's directory record -- every bound field, from the block's
  * RECONSTRUCTIONS.

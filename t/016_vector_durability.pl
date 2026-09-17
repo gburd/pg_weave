@@ -6,8 +6,9 @@
 # WHY A SEPARATE FILE FROM t/014_merge_durability.pl.  That test asserts that
 # weave_merge() and weave_vacuum() flush their own WAL, which is a property of the
 # maintenance functions.  This one asserts a property of the WRITER: the vector
-# weft -- a WEAVE_VMETA page, a WEAVE_PK_VDIR directory chain and a WEAVE_PK_VCODES
-# strip chain, hundreds of pages of it -- is written entirely through GenericXLog
+# weft -- a WEAVE_VMETA page, a WEAVE_PK_VDIR directory chain, a WEAVE_PK_VCODES
+# strip chain and a WEAVE_PK_VWARP map, hundreds of pages of it -- is written
+# entirely through GenericXLog
 # (AGENTS.md hard rule 2), so an immediate shutdown must leave a weft that is
 # complete, reachable, and whose every directory record still recomputes from the
 # codes stored beside it.
@@ -100,7 +101,8 @@ $node->safe_psql('postgres', q{
 my ($nblocks_before, $npages_before) = split /\|/, $node->safe_psql('postgres', q{
 	SELECT (SELECT count(*) FROM weave_vec_blocks('vd_weave')),
 	       (SELECT sum(npages) FROM weave_index_size_detail('vd_weave')
-	         WHERE kind IN ('vector_meta', 'vector_dir', 'vector_codes'))});
+	         WHERE kind IN ('vector_meta', 'vector_dir', 'vector_codes',
+	                        'vector_warp'))});
 cmp_ok($nblocks_before, '>', 28,
 	"the weft has $nblocks_before blocks, so its directory is a multi-page chain");
 cmp_ok($npages_before, '>', 100,
@@ -128,7 +130,8 @@ $node->start;
 my ($nblocks_after, $npages_after) = split /\|/, $node->safe_psql('postgres', q{
 	SELECT (SELECT count(*) FROM weave_vec_blocks('vd_weave')),
 	       (SELECT sum(npages) FROM weave_index_size_detail('vd_weave')
-	         WHERE kind IN ('vector_meta', 'vector_dir', 'vector_codes'))});
+	         WHERE kind IN ('vector_meta', 'vector_dir', 'vector_codes',
+	                        'vector_warp'))});
 is($nblocks_after, $nblocks_before,
 	"every one of the $nblocks_before vector blocks is still readable after recovery");
 is($npages_after, $npages_before,
@@ -159,33 +162,78 @@ check_clean($node, 'after the crash');
 is($node->safe_psql('postgres', q{SELECT count(*) FROM vd}), $rows_before,
 	'the lexical half still answers over every row after recovery');
 
-# --- a merge on a vector index, then a crash ------------------------------
-# sect. 7.3's interim rule is that a merge SKIPS a group containing a vector-bearing
-# bolt.  A skipped merge must leave the index EXACTLY as it found it -- including
-# after a crash, which is the state where "it left the metapage half-updated" would
-# show up.  weave_merge() is reachable from VACUUM's cleanup, so this is also the
-# assertion that the skip is not an ereport.
+# --- A MERGE THAT MOVES A WEFT, THEN A CRASH ------------------------------
+#
+# This section used to assert the opposite: sect. 7.3's INTERIM rule was that a merge
+# skipped any group containing a vector-bearing bolt, and the assertion was that the
+# index came back byte-for-byte unchanged.  Producer 2 landed, so the merge now
+# rewrites the weft -- and a rewritten weft is a much harder durability case than an
+# untouched one, because THREE things have to be in the WAL together: the output
+# weft's four chains, the metapage swap that installs the merged bolt, and the free
+# of the input bolts' pages.  A merge whose output pages were written outside
+# GenericXLog gives an index that is perfect until the first crash and then has a
+# strip chain that stops halfway -- and the LEXICAL half still answers over all of
+# it, which is why the assertion is weave_check(deep) and a hash of the codes rather
+# than a row count.
+#
+# NO CHECKPOINT between the merge and the crash, for the same reason as above: a
+# checkpoint would put the pages on disk and leave the WAL path untested.
+# weave_merge() does not acquire an XID, so nothing else flushes for it either --
+# that is what t/014 established.
 $node->safe_psql('postgres', q{
 	INSERT INTO vd(body, emb) SELECT 'late tag' || g, NULL
 	  FROM generate_series(9001, 9050) g});
+my $rows_before_merge = $node->safe_psql('postgres', q{SELECT count(*) FROM vd});
 my $nseg_before_merge = $node->safe_psql('postgres',
 	q{SELECT weave_index_nsegments('vd_weave')});
+my $nvec_before_merge = $node->safe_psql('postgres',
+	q{SELECT nvec FROM weave_vec_meta('vd_weave')});
+my $lanes_before_merge = $node->safe_psql('postgres', q{
+	SELECT md5(string_agg(docid || ':' || encode(code, 'hex'), ','
+	                      ORDER BY docid))
+	  FROM weave_vec_lanes('vd_weave') WHERE live});
+my $nlive_before_merge = $node->safe_psql('postgres',
+	q{SELECT count(*) FROM weave_vec_lanes('vd_weave') WHERE live});
 my $merged = $node->safe_psql('postgres', q{SELECT weave_merge('vd_weave')});
 my $nseg_after_merge = $node->safe_psql('postgres',
 	q{SELECT weave_index_nsegments('vd_weave')});
+
+# THAT THE MERGE RAN is asserted from the weft and not from the segment count, and
+# the reason is a trap worth recording: weave_merge() FLUSHES THE PENDING BUFFER
+# FIRST, so the 50 inserted rows only become a bolt inside the call.  The count is 1
+# before and 1 after -- one bolt, then two, then one merged -- and an assertion that
+# the count fell fails on a merge that did exactly what it should.  What only a merge
+# can produce is a weft whose lane count covers BOTH inputs: the inserted rows carry
+# no vector (doc/GAPS.md G23), so they must appear as dead lanes, and nvec must grow
+# by exactly 50 while the live-lane hash below stays identical.
+is($node->safe_psql('postgres',
+		q{SELECT count(*) FROM weave_vec_meta('vd_weave')}), '1',
+	'the merged bolt carries exactly one vector weft');
+is($node->safe_psql('postgres', q{SELECT nvec FROM weave_vec_meta('vd_weave')}),
+	$nvec_before_merge + 50,
+	"the merged weft covers the union: $nvec_before_merge lanes plus 50 dead ones for the weftless bolt's documents (bolts $nseg_before_merge -> $nseg_after_merge, merged: '$merged')");
 
 $node->stop('immediate');
 $node->start;
 
 is($node->safe_psql('postgres', q{SELECT weave_index_nsegments('vd_weave')}),
 	$nseg_after_merge,
-	"the segment count is unchanged by the crash "
-	. "(before merge: $nseg_before_merge, after: $nseg_after_merge, merged: '$merged')");
-is($node->safe_psql('postgres',
-		q{SELECT count(*) FROM weave_vec_blocks('vd_weave')}),
-	$nblocks_before,
-	'the skipped merge did not drop, rewrite or truncate the weft');
+	'the merged bolt directory survived an immediate shutdown');
+
+# THE MOVED CODES, ACROSS THE CRASH.  Producer 2 moves code bytes verbatim (sect.
+# 7.3 forbids re-encoding), so the hash of (docid, code) over every live lane must be
+# the SAME hash it had before the merge -- a merge that re-encoded, or a recovery
+# that replayed a strip page to an earlier version of itself, both show up here and
+# in nothing else.
+is($node->safe_psql('postgres', q{
+		SELECT md5(string_agg(docid || ':' || encode(code, 'hex'), ','
+		                      ORDER BY docid))
+		  FROM weave_vec_lanes('vd_weave') WHERE live}),
+	$lanes_before_merge,
+	"every one of the $nlive_before_merge moved lanes recovered with its own code, attached to its own document");
 check_clean($node, 'after the merge-and-crash');
+is($node->safe_psql('postgres', q{SELECT count(*) FROM vd}), $rows_before_merge,
+	'the lexical half still answers over every row after the merge and the crash');
 
 # --- VACUUM, which walks the free path, then a crash ----------------------
 # weave_vacuum() reclaims and truncates.  With a vector weft present, that exercises
