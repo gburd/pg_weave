@@ -101,3 +101,57 @@ CREATE OPERATOR CLASS wvec_weave_ops DEFAULT FOR TYPE wvec USING weave AS
 
 COMMENT ON OPERATOR CLASS wvec_weave_ops USING weave IS
     'index a wvec column as the vector channel of a weave index (storage only until V8)';
+
+-- The vector weft's geometry, per bolt, as a READER sees it (task V7).
+--
+-- The geometry comes off the WEAVE_VMETA page, not out of the `bits` reloption: a
+-- bolt records the width it was built at, so changing the reloption leaves existing
+-- bolts alone and this function is where that divergence is visible.  Without it
+-- there is no way to assert from SQL that the weft was written at the width that was
+-- asked for -- a weft at the wrong width scores wrongly and counts correctly.
+-- `attnum` is the exception and the reason it is here: it comes from the bolt's
+-- channel DESCRIPTOR, not from the VMETA page, and it is the index attribute the
+-- vector weft was recorded against.  Nothing in V7 reads it -- V8's scan is its
+-- first consumer -- so a descriptor that recorded the wrong attribute builds an
+-- index that counts correctly now and scores the wrong column later.  That is
+-- unobservable without this column: a mutation hard-coding it to 1 passed the whole
+-- suite, because every other assertion about a weft goes through its ROOT and the
+-- root is the same either way.
+CREATE FUNCTION weave_vec_meta(idx regclass)
+RETURNS TABLE (segno integer, root bigint, dim integer, bits integer,
+               metric integer, layout integer, nvec bigint, nblocks bigint,
+               dirstart bigint, codestart bigint, attnum integer)
+AS 'MODULE_PATHNAME', 'weave_vec_meta'
+LANGUAGE C STRICT PARALLEL SAFE;
+
+-- One row per 32-lane block, read through the same O(1) directory addressing a scan
+-- uses.
+--
+-- `livemask` is the bit per lane that says whether that warp position has a vector,
+-- and it is the only place a NULL vector is visible: a writer that SKIPPED a NULL
+-- instead of leaving a dead lane produces identical row counts and associates every
+-- later vector with the wrong document.  The five float columns are the (C2) bound
+-- inputs; weave_check() recomputes them from the stored codes, and this function is
+-- how a human reads them when it reports a mismatch.
+CREATE FUNCTION weave_vec_blocks(idx regclass)
+RETURNS TABLE (segno integer, blockno bigint, firstwarp bigint, nlanes integer,
+               nlive integer, livemask bigint, smax real, maxrecnorm real,
+               minnorm real, censcale real, cenrad real)
+AS 'MODULE_PATHNAME', 'weave_vec_blocks'
+LANGUAGE C STRICT PARALLEL SAFE;
+
+-- One row per code page, reporting the strip header that page carries verbatim.
+--
+-- This is the coordinate slicing of doc/specs/VECTOR_CHANNEL.md sect. 7.1 made
+-- assertable: `j0` is the first coordinate a strip stores and is the only thing that
+-- says where its bytes belong in the block.  At 4 bits a page holds 509
+-- coordinates, so a weft whose `dim` is smaller than that is ONE strip per block
+-- with j0 = 0 always -- and a writer that ignored the strip plan's j0 entirely was
+-- indistinguishable from a correct one until this function existed.  The header is
+-- reported as stored rather than through the validating parser, because what has to
+-- be assertable is what the writer wrote, not what a reader tolerates.
+CREATE FUNCTION weave_vec_strips(idx regclass)
+RETURNS TABLE (segno integer, blkno bigint, blockno bigint, j0 integer,
+               ncoords integer, centroid boolean)
+AS 'MODULE_PATHNAME', 'weave_vec_strips'
+LANGUAGE C STRICT PARALLEL SAFE;
