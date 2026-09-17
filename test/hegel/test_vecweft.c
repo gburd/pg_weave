@@ -47,6 +47,18 @@
  *		have a home outside the SQL layer.
  *	P6	every refusal refuses: VECMAJOR, nvec 0, an unaligned centroid cut, a plan
  *		index past the weft, a short destination.
+ *	P7	THE MOVE (doc/specs/VECTOR_CHANNEL.md sect. 7.3, producer 2): every live lane
+ *		is read back out of the page images, given a random docid, and written into a
+ *		SECOND weft in ascending-docid order -- a permutation of the input's warp
+ *		order.  Every code must come back BYTE-IDENTICAL at the slot the permutation
+ *		put it in, and every directory record of the output must recompute from the
+ *		codes that were moved into it.  The permuted case is why this lives here: a
+ *		serial build hands bolt 0 the lowest docids, so a merge's input runs
+ *		concatenate rather than interleave and sql/vecindex.sql cannot produce the
+ *		permutation at all.  What this does NOT cover is the production move itself
+ *		(src/vector/vecwrite.c drives its own loop); the byte-identity assertion over
+ *		weave_vec_lanes() in sql/vecindex.sql is what catches a re-encoding there.
+ *
  *	P0	the sweep is NOT VACUOUS: it contains a geometry with a middle lane strip,
  *		one whose j0 is neither the first coordinate nor the last strip's.  Checked
  *		because everything above is about WHERE bytes go and at 4 bits a page holds
@@ -158,6 +170,8 @@ weft_free(Weft *w)
 	memset(w, 0, sizeof(*w));
 }
 
+static void weft_write(Weft *w);
+
 /*
  * Build a weft the way src/vector/vecwrite.c does, into memory.  `poison` is the
  * byte every page buffer is pre-filled with, so P4 can demand that two runs with
@@ -169,7 +183,6 @@ weft_build(Weft *w, int dim, int bits, unsigned int nlane, int livemod,
 		   unsigned char poison)
 {
 	unsigned int i;
-	unsigned int b;
 	float	   *v;
 
 	memset(w, 0, sizeof(*w));
@@ -213,7 +226,24 @@ weft_build(Weft *w, int dim, int bits, unsigned int nlane, int livemod,
 	}
 	free(v);
 
-	/* pack, stat, and write every page */
+	weft_write(w);
+}
+
+/*
+ * The writer half, over whatever the accumulator holds: pack each block, recompute
+ * its statistics from the PACKED bytes, and emit its directory record and strips.
+ * Split out of weft_build() so the move property below can drive it with lanes it
+ * moved out of another weft instead of with lanes it encoded -- which is exactly the
+ * split doc/specs/VECTOR_CHANNEL.md sect. 7.3 requires of the real writer: ONE
+ * writer, two producers, and no way for the second one to re-encode.
+ */
+static void
+weft_write(Weft *w)
+{
+	unsigned int b;
+	int			dim = w->g.dim;
+	int			bits = w->g.bits;
+
 	{
 		float	   *recon = (float *) malloc((size_t) WEAVE_VEC_BLOCK *
 											 dim * sizeof(float));
@@ -667,6 +697,194 @@ prop_sweep_not_vacuous(const int *dims, int ndims)
 		  "no swept geometry has a middle lane strip (lane_strips >= 3): a j0 that is neither the first nor the last is untested");
 }
 
+/*
+ * Read one lane's code back out of a weft's PAGE IMAGES, the way producer 2 does:
+ * reassemble the block from its strips, then unpack the lane.  Returns 0, or -1 if
+ * the block could not be reassembled.
+ */
+static int
+weft_read_lane(const Weft *w, unsigned int warp, weave_uint8 *code)
+{
+	unsigned int b = warp / (unsigned int) WEAVE_VEC_BLOCK;
+	int			s = (int) (warp % (unsigned int) WEAVE_VEC_BLOCK);
+	weave_uint8 *block = (weave_uint8 *) calloc(1, (size_t) w->g.blockbytes);
+	unsigned int si;
+	int			nseen = 0;
+
+	assert(block != NULL);
+	for (si = 0; si < w->g.nstrips; si++)
+	{
+		const weave_uint8 *pg = w->codepage + (size_t) si * PAYLOAD;
+		const WeaveVecStripHdr *raw = (const WeaveVecStripHdr *) pg;
+		WeaveVecStripHdr hdr;
+		const weave_uint8 *bytes = NULL;
+		const char *why = NULL;
+
+		if (raw->blockno != b || (raw->flags & WEAVE_VSTRIP_F_CENTROID) != 0)
+			continue;
+		if (weave_strip_parse(pg, PAYLOAD, w->g.dim, w->g.bits, &hdr, &bytes,
+							  &why) <= 0 ||
+			weave_strip_scatter(block, w->g.blockbytes, w->g.dim, w->g.bits,
+								&hdr, bytes) != 0)
+		{
+			free(block);
+			return -1;
+		}
+		nseen++;
+	}
+	if (nseen != w->g.lane_strips)
+	{
+		free(block);
+		return -1;
+	}
+	weave_unpack_lane(WEAVE_PACK_LANE, w->g.dim, w->g.bits, block, s, code);
+	free(block);
+	return 0;
+}
+
+/*
+ * P7: THE MOVE.  Producer 2's whole contract, at the level where it is arithmetic.
+ *
+ * Take every live lane of `src`, read its code back out of the page images, give it
+ * a random docid, and write a second weft whose lanes are those codes in ASCENDING
+ * DOCID order -- which is a permutation of the input's warp order, and is the case
+ * a merge always produces and the SQL layer cannot reach (a serial build hands bolt
+ * 0 the lowest docids, so its runs concatenate rather than interleave; the same
+ * reason t/017_vector_syncscan.pl needs a cluster of its own).
+ *
+ * Then assert the two things sect. 7.3 says a merge must not get wrong:
+ *
+ *	 - every moved lane's code is BYTE-IDENTICAL in the output, at the slot the
+ *	   permutation put it in.  This is the no-re-encode property: a producer that
+ *	   dequantized and re-encoded would produce codes that are close and not equal,
+ *	   and every other assertion in this file would still pass.
+ *	 - every directory record of the output RECOMPUTES from the moved codes
+ *	   (prop_roundtrip on the output weft), which is the other half: statistics are
+ *	   recomputed on a merge precisely because the lanes sharing a block changed.
+ */
+static void
+prop_move(const Weft *src)
+{
+	Weft		dst;
+	unsigned int nlive = 0;
+	unsigned int i;
+	unsigned int *order;		/* dst warp -> index into the moved arrays */
+	weave_uint8 *codes;
+	float	   *scale;
+	float	   *norm;
+	unsigned long long *key;	/* the docid each moved lane was given */
+
+	for (i = 0; i < src->nlane; i++)
+		if (src->live[i])
+			nlive++;
+	if (nlive == 0)
+		return;					/* no live lane: the writer writes no weft at all */
+
+	codes = (weave_uint8 *) calloc((size_t) nlive, (size_t) src->g.codebytes);
+	scale = (float *) calloc((size_t) nlive, sizeof(float));
+	norm = (float *) calloc((size_t) nlive, sizeof(float));
+	key = (unsigned long long *) calloc((size_t) nlive, sizeof(*key));
+	order = (unsigned int *) calloc((size_t) nlive, sizeof(*order));
+	assert(codes && scale && norm && key && order);
+
+	/* the move: codes come off the PAGES, the sidecar pair off the accumulator the
+	 * writer stored it from (the real producer reads it out of the directory record,
+	 * which prop_roundtrip has already proven equals this) */
+	nlive = 0;
+	for (i = 0; i < src->nlane; i++)
+	{
+		if (!src->live[i])
+			continue;
+		CHECK(weft_read_lane(src, i, codes + (size_t) nlive * src->g.codebytes) == 0,
+			  "dim %d bits %d: lane %u could not be read back for the move",
+			  src->g.dim, src->g.bits, i);
+		scale[nlive] = src->scale[i];
+		norm[nlive] = src->norm[i];
+		key[nlive] = rnd();		/* the docid the merge output assigns it */
+		order[nlive] = nlive;
+		nlive++;
+	}
+
+	/* sort by docid: an insertion sort, because the point is the permutation and
+	 * not the sort, and nlive is at most a few hundred here */
+	for (i = 1; i < nlive; i++)
+	{
+		unsigned int j = i;
+
+		while (j > 0 && key[order[j - 1]] > key[order[j]])
+		{
+			unsigned int t = order[j - 1];
+
+			order[j - 1] = order[j];
+			order[j] = t;
+			j--;
+		}
+	}
+
+	/* write the output weft through the SAME writer, from pre-encoded lanes */
+	memset(&dst, 0, sizeof(dst));
+	assert(weave_vecweft_geom(&dst.g, PAYLOAD, src->g.dim, src->g.bits,
+							  WEAVE_PACK_LANE, nlive) == 0);
+	assert(weave_quantizer_init(&dst.q, src->g.dim, src->g.bits, NULL,
+								malloc, free) == 0);
+	dst.nlane = nlive;
+	dst.code = (weave_uint8 *) calloc((size_t) nlive, (size_t) dst.g.codebytes);
+	dst.scale = (float *) calloc((size_t) nlive, sizeof(float));
+	dst.norm = (float *) calloc((size_t) nlive, sizeof(float));
+	dst.live = (weave_uint8 *) calloc((size_t) nlive, 1);
+	dst.codepage = (weave_uint8 *) malloc((size_t) dst.g.nstrips * PAYLOAD);
+	dst.dirpage = (weave_uint8 *) malloc((size_t) dst.g.ndirpages * PAYLOAD);
+	dst.blocks = (weave_uint8 *) calloc((size_t) dst.g.nblocks,
+										(size_t) dst.g.blockbytes);
+	dst.cencodes = (weave_uint8 *) calloc((size_t) dst.g.nblocks,
+										  (size_t) dst.g.codebytes);
+	dst.recs = (WeaveVecDirRec *) calloc((size_t) dst.g.nblocks,
+										 sizeof(WeaveVecDirRec));
+	assert(dst.code && dst.scale && dst.norm && dst.live && dst.codepage &&
+		   dst.dirpage && dst.blocks && dst.cencodes && dst.recs);
+	memset(dst.codepage, 0x5A, (size_t) dst.g.nstrips * PAYLOAD);
+	memset(dst.dirpage, 0x5A, (size_t) dst.g.ndirpages * PAYLOAD);
+	for (i = 0; i < nlive; i++)
+	{
+		memcpy(dst.code + (size_t) i * dst.g.codebytes,
+			   codes + (size_t) order[i] * src->g.codebytes,
+			   (size_t) dst.g.codebytes);
+		dst.scale[i] = scale[order[i]];
+		dst.norm[i] = norm[order[i]];
+		dst.live[i] = 1;
+	}
+	weft_write(&dst);
+
+	/* every moved code is byte-identical where the permutation put it */
+	{
+		weave_uint8 *got = (weave_uint8 *) malloc((size_t) dst.g.codebytes);
+
+		assert(got != NULL);
+		for (i = 0; i < nlive; i++)
+		{
+			CHECK(weft_read_lane(&dst, i, got) == 0,
+				  "dim %d bits %d: moved lane %u unreadable in the output",
+				  dst.g.dim, dst.g.bits, i);
+			CHECK(memcmp(got, codes + (size_t) order[i] * src->g.codebytes,
+						 (size_t) dst.g.codebytes) == 0,
+				  "dim %d bits %d: moved lane %u is not byte-identical (a merge that re-encoded would look exactly like this)",
+				  dst.g.dim, dst.g.bits, i);
+		}
+		free(got);
+	}
+
+	/* and the output's statistics recompute from the codes that were moved in */
+	prop_partition(&dst);
+	prop_roundtrip(&dst);
+
+	weft_free(&dst);
+	free(order);
+	free(key);
+	free(norm);
+	free(scale);
+	free(codes);
+}
+
 static void
 one_point(int dim, int bits, unsigned int nlane, int livemod)
 {
@@ -677,6 +895,7 @@ one_point(int dim, int bits, unsigned int nlane, int livemod)
 	prop_partition(&w);
 	prop_roundtrip(&w);
 	prop_wrong_slot_detectable(&w);
+	prop_move(&w);
 
 	/*
 	 * P4: determinism.  Same vectors -- the RNG is re-seeded so the second run

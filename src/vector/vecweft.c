@@ -98,6 +98,11 @@ weave_vecweft_geom(WeaveVecWeftGeom *g, int usable, int dim, int bits,
 	g->ndirpages = (g->nblocks + (weave_uint32) g->rpp - 1) /
 		(weave_uint32) g->rpp;
 	g->nstrips = g->nblocks * (weave_uint32) g->strips_per_block;
+
+	g->wpp = weave_vecwarp_per_page(usable);
+	if (g->wpp <= 0)
+		return -1;
+	g->nwarppages = (g->nvec + (weave_uint32) g->wpp - 1) / (weave_uint32) g->wpp;
 	return 0;
 }
 

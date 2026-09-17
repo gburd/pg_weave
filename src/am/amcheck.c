@@ -876,10 +876,14 @@ wvck_vector(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 	uint32		s;
 	int64		nwith = 0;
 	int64		nblocks_checked = 0;
+	int64		nwarps_checked = 0;
 	bool		ok = true;
+	bool		warpok = true;
 	StringInfoData d;
+	StringInfoData wd;
 
 	initStringInfo(&d);
+	initStringInfo(&wd);
 
 	for (s = 0; s < meta->nsegments && s < WEAVE_MAX_SEGMENTS; s++)
 	{
@@ -1038,10 +1042,56 @@ wvck_vector(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 		pfree(recode);
 		pfree(cencode);
 		pfree(block);
+
+		/*
+		 * THE WARP MAP IS EXACTLY nvec DOCIDS, STRICTLY ASCENDING.
+		 *
+		 * Ascending is not tidiness, it is the definition: warp i is the i-th
+		 * smallest docid the weft covers (vec_docid_order() in
+		 * src/vector/vecwrite.c), so a descent or a repeat means two warps claim
+		 * one document or a lane was moved to the wrong slot -- the exact failure
+		 * the merge producer can make, and one that changes no row count.  It is
+		 * checked here rather than only in the merge because a build can make it
+		 * too, and because a checker that trusts the writer's sort is not checking
+		 * it.
+		 */
+		{
+			WeaveVecWarpCursor wc;
+			uint64		prev = 0;
+			uint32		i;
+
+			weave_vec_warp_begin(&wc, &w);
+			for (i = 0; i < w.meta.nvec; i++)
+			{
+				uint64		docid;
+
+				CHECK_FOR_INTERRUPTS();
+				if (!weave_vec_warp_next(&wc, &docid, &why))
+				{
+					warpok = false;
+					appendStringInfo(&wd, "%sbolt %u warp %u: %s",
+									 wd.len > 0 ? "; " : "", s, i,
+									 why != NULL ? why : "unreadable warp map");
+					break;
+				}
+				if (docid <= prev)
+				{
+					warpok = false;
+					appendStringInfo(&wd, "%sbolt %u warp %u: docid " UINT64_FORMAT " does not follow " UINT64_FORMAT,
+									 wd.len > 0 ? "; " : "", s, i, docid, prev);
+					break;
+				}
+				prev = docid;
+				nwarps_checked++;
+			}
+			weave_vec_warp_end(&wc);
+		}
 	}
 
 	wvck_emit(cx, "vector_block_stats_match_codes", ok, ok ? NULL : d.data);
 	pfree(d.data);
+	wvck_emit(cx, "vector_warp_map_ascending", warpok, warpok ? NULL : wd.data);
+	pfree(wd.data);
 
 	/* Informational, the same shape as chandesc_coverage and surf_coverage: how
 	 * many bolts carry a vector weft, and how many blocks were actually verified.
@@ -1050,8 +1100,9 @@ wvck_vector(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 	 * otherwise report as success. */
 	{
 		initStringInfo(&d);
-		appendStringInfo(&d, "%lld bolt(s) carry a vector weft, %lld block(s) verified",
-						 (long long) nwith, (long long) nblocks_checked);
+		appendStringInfo(&d, "%lld bolt(s) carry a vector weft, %lld block(s) verified, %lld warp(s) mapped",
+						 (long long) nwith, (long long) nblocks_checked,
+						 (long long) nwarps_checked);
 		wvck_emit(cx, "vector_coverage", true, d.data);
 		pfree(d.data);
 	}
@@ -1202,14 +1253,16 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 				(void) wvck_walk_chain(cx, surfroot, WEAVE_PK_SURF, &e);
 
 			/*
-			 * The vector weft is THREE chains and the descriptor names only the
-			 * first: the WEAVE_VMETA page, which names the directory and the code
-			 * strips.  Marking only the root would report every strip page as a
-			 * leak -- and, worse, "fixing" that by exempting the kind instead of
-			 * following the chains is precisely the hole that would then hide a
-			 * REAL leak of the same pages.  weave_free_segment() follows the same
-			 * three, through weave_vec_free_weft(); if the two ever disagree, this
-			 * invariant is what says so.
+			 * The vector weft is FOUR chains and the descriptor names only the
+			 * first: the WEAVE_VMETA page, which names the directory, the code
+			 * strips and the warp map.  Marking only the root would report every
+			 * strip page as a leak -- and, worse, "fixing" that by exempting the
+			 * kind instead of following the chains is precisely the hole that
+			 * would then hide a REAL leak of the same pages.
+			 * weave_free_segment() follows the same four, through
+			 * weave_vec_free_weft(); if the two ever disagree, this invariant is
+			 * what says so -- and since the merge producer landed it says so on
+			 * the first merge instead of never (doc/GAPS.md G24).
 			 */
 			if (vecroot != InvalidBlockNumber)
 			{
@@ -1221,6 +1274,7 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 				{
 					(void) wvck_walk_chain(cx, w.meta.dirstart, WEAVE_PK_VDIR, &e);
 					(void) wvck_walk_chain(cx, w.meta.codestart, WEAVE_PK_VCODES, &e);
+					(void) wvck_walk_chain(cx, w.meta.warpstart, WEAVE_PK_VWARP, &e);
 					if (w.meta.graphstart != InvalidBlockNumber)
 						(void) wvck_walk_chain(cx, w.meta.graphstart,
 											   WEAVE_PK_VGRAPH, &e);

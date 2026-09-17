@@ -735,16 +735,35 @@ documents it spans, and one that covers them with nothing is a silent recall los
 that looks like a working index.
 
 Closing it means carrying the vector through the pending buffer, which changes the
-pending item format. Held until the merge producer (`VECTOR_CHANNEL.md` sect. 7.3)
-lands, because both changes touch the same code and the merge producer is the one
-V8 is blocked on. Until then a vector-bearing index must be built, not incrementally
-inserted into, for its vector channel to be complete — stated in the spec and here
-rather than discovered by a user whose recall degrades with every `INSERT`.
+pending item format. It was held until the merge producer (`VECTOR_CHANNEL.md` §7.3)
+landed, because both changes touch the same code and the merge producer is the one V8
+was blocked on. **The merge producer landed 2026-09-17, so this is now the next
+vector-side gap** — and closing it also closes **G26**, because an `INSERT` after an
+`ALTER INDEX ... SET (bits = ...)` is exactly what makes two bolts disagree about
+their code width and makes the merge's geometry guard reachable.
 
-### G24 — the vector weft's free path is unreachable in V7, therefore untested — **OPEN, enumerated 2026-09-17**
+Until then a vector-bearing index must be built, not incrementally inserted into, for
+its vector channel to be complete — stated in the spec and here rather than
+discovered by a user whose recall degrades with every `INSERT`. Note what a merge
+does with such a bolt now: it carries the weft-bearing input's lanes forward and
+gives every document from the weftless input a **dead lane**, so the merged bolt's
+warp space still covers every document and the rows that were inserted are absent
+from vector answers rather than present with somebody else's vector.
 
-`weave_vec_free_weft()` (`src/vector/vecwrite.c`) frees a weft's three chains, and
-**no execution reaches it today.** A mutation deleting its `meta.codestart` line
+### G24 — the vector weft's free path was unreachable, therefore untested — **CLOSED 2026-09-17 by merge producer 2**
+
+**Closed.** Producer 2 (`VECTOR_CHANNEL.md` §7.3) removed the exclusion that made the
+free path unreachable, so `weave_free_segment()`'s `WEAVE_WK_VECTOR` arm now runs on
+every merge of a vector-bearing bolt. `sql/vecindex.sql` merges and then runs
+`weave_check(deep)`; the `free-omits-strips` mutation that survived the whole V7 suite
+is **caught by `installcheck-pg17`** (`pages_reachable_or_freed`: 5 unreachable
+pages), and so are the sibling legs for the directory chain and the new warp-map
+chain. The enumeration below is kept because the *diagnosis* — an unreachable
+statement rather than a missing assertion — is the reusable part, and because the
+warp-map chain added by the same commit is a fourth thing this function must free.
+
+*As it stood:* `weave_vec_free_weft()` (`src/vector/vecwrite.c`) frees a weft's
+chains, and **no execution reached it.** A mutation deleting its `meta.codestart` line
 survived the whole suite; the diagnosis is not a missing assertion but an
 unreachable statement, and the enumeration is short enough to state completely:
 
@@ -773,6 +792,88 @@ that commit's gate is: a merge of two vector-bearing bolts, then
 `weave_check(deep)` reporting zero unreachable pages, with the `meta.codestart`
 mutation proven to fail it. Recorded here because an untested line that nobody
 wrote down is indistinguishable from a tested one six months later.
+
+### Checked and NOT a gap: the merge's move is byte-exact, but not for the reason the spec gave
+
+`VECTOR_CHANNEL.md` §7.3 forbade the merge from re-encoding on the grounds that
+quantization error would compound with an index's merge history. **It does not.**
+A code is a fixed point of decode-then-encode — dequantizing yields exactly the
+codebook levels and re-quantizing those returns the same levels — measured at 0 of
+2,100 round trips over `bits` 2–8 at 64-d and 768-d, and 4 of 9,800 (one byte each,
+at a decision boundary) over dim 4–1536. The mutation that substitutes a
+decode-and-re-encode for the merge's move is therefore an **equivalent mutant** and
+survives the whole suite; the mutation that additionally takes the *re-encoded scale*
+is caught, because a reconstruction's norm is not its original's. §7.3 now states
+that, `test/hegel/test_quantize.c` asserts it, and the rule is unchanged — carrying
+bytes is still cheaper, and idempotency stops holding the moment two segments differ
+in width or calibration. Recorded here because a rule with a wrong reason attached is
+a rule the next person discards when they disprove the reason.
+
+### G25 — the vector half of a merge is not streaming: O(nvec · codebytes) resident — **OPEN, quantified 2026-09-17**
+
+The lexical merge is deliberately streaming: `weave_merge_segments_streaming()` is
+bounded to **one term's postings** at a time, because merging K segments by buffering
+all their postings is how a full compaction of a large index OOMs the server. Merge
+producer 2 does not match that discipline. It appends every surviving lane to
+`WeaveVecAccum` and only then calls `weave_vec_write_weft()`, so peak resident memory
+for the vector half is
+
+    nvec · (codebytes + 8 docid + 8 scale/norm + 1 live)  +  nvec · 8 (transient sort)
+
+| n (documents merged) | 960-d, 4 bits | 1536-d, 4 bits | 128-d, 4 bits |
+|---:|---:|---:|---:|
+| 100 k | 50 MB | 79 MB | 8 MB |
+| **1 M** | **497 MB** | 785 MB | 82 MB |
+| 10 M | 4.97 GB | 7.85 GB | 820 MB |
+
+**The threshold at which this starts to matter is about 1 M documents at 960-d**:
+below that the merge's peak is comparable to a default `maintenance_work_mem` and to
+what the lexical term hash already reaches during a build; above it, a full
+compaction of one index can exceed the host's RAM — and the merge is reachable from
+autovacuum, so nobody chose the moment. It is also **charged to the merge's own
+memory context and not to `maintenance_work_mem`**, so an operator who lowered that
+setting to bound maintenance memory has not bounded this.
+
+Why it shipped this way: the alternative is a second writer. The lanes must come out
+in output-docid order, and each input weft is already sorted by docid, so the
+streaming shape is a k-way merge of sorted runs feeding blocks that are written as
+they fill — which means the block writer, the statistics and the strip plan all have
+to work incrementally instead of over a filled accumulator. That is a real change to
+`weave_vec_write_weft()`, and §7.3's rule is that ONE function writes a weft; doing
+it in the same commit as producer 2 would have meant landing the move and a rewritten
+writer together, with no way to tell which one a failure came from.
+
+The fix, when it is done: give the writer a pull-based lane source (`next_lane(void
+*arg, uint8 **code, float *scale, float *norm, uint64 *docid)`), have producer 1 pull
+from the accumulator and producer 2 pull from a heap of per-input cursors, and keep
+32 lanes resident instead of `nvec`. The docid ordering is what makes this possible
+and it is already guaranteed per input (`vector_warp_map_ascending`).
+
+### G26 — the merge's geometry-mismatch skip is unreachable, therefore untested — **OPEN 2026-09-17, closed by G23**
+
+`weave_vec_merge_geom()` refuses a merge whose input wefts disagree on
+`(dim, bits, layout, metric)`, because re-quantizing on a merge is forbidden
+(`VECTOR_CHANNEL.md` §7.3). **No sequence of SQL reaches the disagreement**, and the
+enumeration is short:
+
+| how the wefts could differ | reachable? | why |
+|---|---|---|
+| `bits` (a reloption; `ALTER INDEX ... SET (bits = 2)` is legal any time) | no | only a *build* writes a weft, and one build reads the reloption once. The pending-flush path writes no weft at all (G23), so no bolt can carry the new width until a `REINDEX` — which rewrites *every* bolt at it |
+| `dim` (a `wvec` column with no typmod may hold several) | no, in practice | `weave_vec_accum_add()` throws on a dim change *within* a segment, so two bolts of different dims need a flush boundary landing exactly on the dim change. Not arrangeable from a test, and a parallel build makes it *less* likely, not more: workers see interleaved blocks, so both dims land in one participant and it throws |
+| `layout` | no | `WEAVE_PACK_LANE` is the only storable layout and the accumulator hard-codes it |
+| `metric` | no | written as `WEAVE_METRIC_L2` by both producers until V8 decides whether the metric is an opclass or a reloption |
+
+So the mutation that deletes the skip **survives**, and it is recorded here rather
+than deleted, for the reason G24 gives: an untested branch nobody wrote down is
+indistinguishable from a tested one six months later. It is not closed with a
+test-only door either.
+
+**What closes it is G23.** The moment a pending flush carries vectors, an `INSERT`
+after an `ALTER INDEX ... SET (bits = ...)` writes a second weft at the second width
+and the mismatch is three statements away — at which point this guard is the only
+thing between that index and a merge that either throws inside VACUUM's cleanup or
+re-quantizes half its corpus. The guard is implemented now precisely because the
+change that makes it reachable is one someone will make without reading §7.3.
 
 ### Checked and NOT a gap: HOT-successor TIDs in `amgettuple`
 

@@ -158,6 +158,89 @@ dot(const float *a, const float *b, int dim)
 
 /* ------------------------------------------------------------------------- */
 
+/* Totals for the sweep-wide half of the property below. */
+static long reenc_total = 0;
+static long reenc_code_differ = 0;
+static long reenc_scale_differ = 0;
+
+/*
+ * IS A CODE A FIXED POINT OF decode-then-encode?  Measured because
+ * doc/specs/VECTOR_CHANNEL.md sect. 7.3 forbids the merge from re-encoding and used
+ * to justify that with error accumulating over an index's merge history -- and the
+ * mutation run that substituted a decode-and-re-encode for the merge's move SURVIVED
+ * the whole suite.  The reason is here: dequantizing a code yields exactly the
+ * codebook levels, and re-quantizing those returns the same levels, so the map is
+ * idempotent except where a reconstruction lands on a decision boundary.
+ *
+ * So the property is stated as a BOUND rather than as equality (a handful of
+ * boundary flips is expected, not a defect), and it is here so that a future change
+ * to the codebook, the rotation or the calibration that BREAKS idempotency is caught
+ * -- because on the day it breaks, sect. 7.3's rule stops being about cost and
+ * becomes about silent recall loss again.  The other half is the fact the
+ * merge actually relies on: the SCALE is not a fixed point either, so a producer that
+ * re-encoded and took the re-encoded scale would change what a lane dequantizes to
+ * even where its bytes did not move.  HOW OFTEN that happens depends on the input
+ * distribution -- isotropic normals almost never move it at 768-d, while the
+ * structured vectors sql/vecindex.sql indexes move it for most rows, which is why
+ * that file's byte-identity assertion catches the re-encode-and-take-the-new-scale
+ * mutation and this sweep would not.  So it is asserted over the WHOLE sweep ("it
+ * happens at all"), which is the strongest form that is true.
+ */
+static void
+test_reencode_idempotent(int bits, int dim, int iters)
+{
+	WeaveQuantizer q;
+	float	   *v = (float *) malloc(sizeof(float) * (size_t) dim);
+	float	   *r = (float *) malloc(sizeof(float) * (size_t) dim);
+	unsigned char *c1;
+	unsigned char *c2;
+	int			differ = 0;
+	int			scale_differ = 0;
+	int			total = 0;
+	int			i;
+
+	CHECK(weave_quantizer_init(&q, dim, bits, NULL, malloc, free) == 0,
+		  "quantizer_init failed for dim=%d bits=%d", dim, bits);
+	c1 = (unsigned char *) malloc((size_t) q.codebytes);
+	c2 = (unsigned char *) malloc((size_t) q.codebytes);
+
+	for (i = 0; i < iters; i++)
+	{
+		float		n1 = 0,
+					s1 = 0,
+					n2 = 0,
+					s2 = 0;
+
+		fill_isotropic(v, dim);
+		if (weave_encode(&q, v, c1, &n1, &s1) != 0)
+			continue;
+		weave_decode(&q, c1, s1, r);
+		if (weave_encode(&q, r, c2, &n2, &s2) != 0)
+			continue;
+		total++;
+		if (memcmp(c1, c2, (size_t) q.codebytes) != 0)
+			differ++;
+		if (s1 != s2)
+			scale_differ++;
+	}
+
+	/* Idempotent for all but a boundary handful: measured 4 of 9,800 over dim
+	 * 4..1536 and bits 2..8 (2026-09-17), each differing in one byte. */
+	CHECK(total > 0 && differ * 100 <= total,
+		  "dim=%d bits=%d: %d of %d codes are not fixed points of decode-then-encode; sect. 7.3's prohibition is load-bearing again",
+		  dim, bits, differ, total);
+
+	reenc_total += total;
+	reenc_code_differ += differ;
+	reenc_scale_differ += scale_differ;
+
+	free(c1);
+	free(c2);
+	free(v);
+	free(r);
+	weave_quantizer_free(&q, free);
+}
+
 static void
 test_rotation(int dim)
 {
@@ -942,6 +1025,18 @@ main(void)
 		test_pack(bits, 256);
 		test_pack(bits, 200);
 	}
+
+	printf("decode-then-encode: idempotent on codes, NOT on the scale (sect. 7.3)\n");
+	for (bits = WEAVE_BITS_MIN; bits <= WEAVE_BITS_MAX; bits++)
+	{
+		test_reencode_idempotent(bits, 64, 200);
+		test_reencode_idempotent(bits, 768, 100);
+	}
+	CHECK(reenc_scale_differ > 0,
+		  "no re-encode anywhere in the sweep changed the renormalization scale (%ld round trips): if the scale were a fixed point, a merge could recompute it and sect. 7.3 would have one fewer reason",
+		  reenc_total);
+	printf("  %ld round trips: %ld codes moved, %ld scales moved\n",
+		   reenc_total, reenc_code_differ, reenc_scale_differ);
 
 	printf("block bound (channel.h contract C2)\n");
 	for (bits = WEAVE_BITS_MIN; bits <= WEAVE_BITS_MAX; bits++)
