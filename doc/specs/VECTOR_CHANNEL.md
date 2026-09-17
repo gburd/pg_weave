@@ -1118,6 +1118,120 @@ above makes it plausible, not proven. `bench/RESULTS_VECTOR.md` should carry a
 probes-vs-recall-vs-p50 sweep shaped like `bq_ivf_20260909`, not a single
 `(probes, recall, p50)` triple chosen after the fact to clear 0.99.
 
+## 8b. The code-scan shuttle — designed 2026-09-17 (task V8)
+
+This is the **first implementation of `include/weave/channel.h` in the tree.**
+Nothing implemented `WeaveShuttleOps` before it, lexical retrieval included: the
+scan in `src/am/amscan.c` runs its own WAND cursors. So V8 is simultaneously the
+vector channel's query path and the first test of whether the shuttle contract is
+implementable as written. Where the contract turned out to be under-specified,
+that is recorded here rather than quietly worked around.
+
+### The seam: a decision core with no backend, and glue with no policy
+
+`include/weave/vecscan.h` + `src/vector/vecscan.c` hold the per-block decision —
+mask, then bound, then score — and nothing else. No `Relation`, no `Buffer`, no
+`palloc`. `src/vector/vecshuttle.c` reads pages and contains no policy.
+
+The reason is (C1) and (C2). Both are the class of requirement where **a wrong
+implementation returns plausible answers**: a bound 1 % low drops rows that look
+like they were merely outranked. That makes a property test mandatory (hard rule
+1), and a property test reachable only through a built index, a heap and a page
+cache will not be run at the scale that finds anything. `test/hegel/test_vecscan.c`
+links the core with a bare compiler, as `test_vecweft.c` and `test_vecbound.c` do.
+
+### (C1) is a property of untrusted data, so it is checked, not assumed
+
+`WeaveVecDirRec.firstwarp` comes off a page. The writer sets it to
+`blockno * 32` for every block and `weave_check()` asserts that equality — but a
+*scan* that assumes it is taking a number from a possibly-corrupt page and using
+it to index an allowlist. The core therefore requires **both** halves: the O(1)
+formula, and a strictly ascending sequence across the blocks it visits. A
+mismatch is a refusal.
+
+When V13 assigns warps in cluster order the formula half has to be lifted. The
+ascent half must not be, because the ascent *is* what (C1) says.
+
+### The order of the three outcomes is the order of their cost
+
+| outcome | cost | does it pay? |
+|---|---|---|
+| skip on the allowlist | one AND, one branch. No code byte read, no strip scattered, no kernel call | **yes** — this is the mechanism behind claim 3 |
+| skip on the block bound | one LUT pass over the centroid code (`dim` gathers = 1/32 of scoring the block), three comparisons | **no** — measured to prune **0.00 %** of blocks on both real corpora (`bench/RESULTS_CODE_SCAN.md`) |
+| score | 32 lanes × `dim` gathers | — |
+
+The bound is implemented anyway, because (C2) is a contract: the fused loop is
+entitled to a true upper bound from every channel, and a channel that returns
+`+inf` to avoid the arithmetic has removed itself from the algorithm. What is
+*not* permitted is quoting its existence as a speedup. On the corpora measured so
+far it is a ~3 % tax, and `§6` explains why it is structural rather than a tuning
+failure.
+
+### The finding that shaped the traversal: there is no block→page index
+
+`weave_vec_block_read()` walks the **entire** codes chain from `codestart` on
+every call, matching `blockno` as it goes. That is fine for `weave_check()` and
+for introspection. For a scan it is O(blocks × pages) — quadratic in the weft —
+so **V8 does not use it.** The shuttle carries a *forward-only sequential cursor*
+over the codes chain, advanced in lockstep with a second cursor over the
+directory chain, which makes a full scan O(pages) as it must be.
+
+Two consequences, and the second one limits a claim:
+
+1. **`seek()` is forward-only.** A backward target is a caller bug and raises.
+   This is consistent with (C1) — the contract already says seek walks in
+   ascending warp order — but the contract did not say what a *backward* seek
+   does, and "returns the current position" would let a fused-loop bug become a
+   wrong answer instead of an error.
+2. **The mask short-circuit saves scoring and strip scatter. It does not save
+   page reads.** The chain must still be walked to find the next link, so a
+   skipped block costs its `ReadBuffer`s regardless. Since the scan is
+   compute-bound at every measured size for the exact kernels (1.6 GB/s against
+   an 11.8 GB/s wall, `bench/RESULTS_CODE_SCAN.md`) this is the cheap half of the
+   cost — but claim 3 must be stated as *less scoring*, not *less I/O*, until a
+   block→page index exists. Opened as a gap rather than implemented here: it is a
+   format change, and V8 is not.
+
+### Scan-time quantizer reconstruction, and the guard it needs
+
+A scan needs a `WeaveQueryLut`, which needs the `WeaveQuantizer` the codes were
+built with. Neither the codebook nor the rotation is stored on disk, and neither
+needs to be: `weave_codebook_get(bits, dim, ...)` is a memoized pure solve and
+`weave_rotation_init(dim, ...)` derives its permutation and signs from a fixed
+seed. Both are bit-identical whenever recomputed from `(dim, bits)`, and both are
+in `WeaveVecMeta`. So the scan rebuilds the quantizer exactly.
+
+**That holds only while TQ+ calibration is off.** `WeaveVecMeta` reserves
+`calibstart`/`calibsample`/`calibtime` for a calibration blob, there is no
+on-disk format for one, and the writer always sets `calibstart =
+InvalidBlockNumber`. A scan that built `cal = NULL` against a weft encoded *with*
+a calibration would get a syntactically valid, silently wrong quantizer. So the
+shuttle **refuses a weft whose `calibstart` is not `InvalidBlockNumber`**. That
+turns a future silent-wrong-answer into a startup error, and it costs one
+comparison.
+
+### `maxscore` is (B2), from one directory pass
+
+`WeaveShuttle.maxscore` must dominate `block_max()` everywhere. Folding (B3) over
+every block would need every centroid *code*, which lives on the code pages — a
+full pass over the weft before the scan starts. (B2) needs one float per
+directory record, and the directory is roughly 1/56 of the code pages at 960
+dimensions. So `begin()` makes one directory pass, which also validates (C1)
+across the whole weft once instead of incrementally, and folds
+`max maxrecnorm × ||q||`. Looser, and looser is right for a value whose only job
+is the MaxScore partition.
+
+### What V8 is not
+
+No exact rerank (V10), no coordinate-prefix first stage (V15), no graph. Every
+score V8 produces is a quantized-domain score, so **no recall number comes out of
+this task** — the quantizer alone tops out at 0.8780 recall@10 on GIST-960d
+(§2.1), and closing that is V10's job. A `weave_vec_scan()` SRF exists so the
+scan machinery is reachable *directly* from SQL, which after 2026-09-16 is a
+requirement and not a convenience: a mutation in scan code that can only be
+reached through the planner may be answered by a bitmap heap scan's own recheck
+and survive the entire suite (`AGENTS.md`).
+
 ## 9. Filtering makes queries faster
 
 Two mechanisms, both from `include/weave/channel.h`:
