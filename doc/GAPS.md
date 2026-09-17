@@ -722,6 +722,58 @@ postconditions (`avail == end - low`, `end >= low`) with the chain pass removed 
 so the target catches the class by two independent mechanisms, not just because a
 sanitizer happened to be on.
 
+### G23 — a row inserted after the build has no vector, in any segment — **OPEN, by construction, V7**
+
+A `WeavePendingItem` carries the tid and the `wdoc` and nothing else, so when the
+pending buffer flushes into a bolt, or when an oversized `INSERT` writes a bolt of
+its own, the row's `wvec` is not available at that point at all
+(`src/am/ambuild.c:4200`, `src/am/ambuild.c:4484`). Those bolts therefore carry **no
+vector weft**, and the rows in them are absent from vector answers rather than
+present with a wrong vector — which is the safer of the two, and the reason the
+writer does not instead emit a weft of dead lanes: a weft claims to cover the
+documents it spans, and one that covers them with nothing is a silent recall loss
+that looks like a working index.
+
+Closing it means carrying the vector through the pending buffer, which changes the
+pending item format. Held until the merge producer (`VECTOR_CHANNEL.md` sect. 7.3)
+lands, because both changes touch the same code and the merge producer is the one
+V8 is blocked on. Until then a vector-bearing index must be built, not incrementally
+inserted into, for its vector channel to be complete — stated in the spec and here
+rather than discovered by a user whose recall degrades with every `INSERT`.
+
+### G24 — the vector weft's free path is unreachable in V7, therefore untested — **OPEN, enumerated 2026-09-17**
+
+`weave_vec_free_weft()` (`src/vector/vecwrite.c`) frees a weft's three chains, and
+**no execution reaches it today.** A mutation deleting its `meta.codestart` line
+survived the whole suite; the diagnosis is not a missing assertion but an
+unreachable statement, and the enumeration is short enough to state completely:
+
+| candidate path | reaches it? | why |
+|---|---|---|
+| `weave_merge_selected()` → `weave_free_segment()` | no | refuses at its `weave_seg_has_vector()` gate before allocating a page (sect. 7.3's interim rule) |
+| `weave_merge_all()` / `weave_merge_all_parallel()` group selectors | no | filter vector-bearing bolts out of the candidate lists, so no group containing one is ever formed |
+| `weave_vacuum()` / VACUUM cleanup → `weave_vacuum_compact()` → `weave_compact_to_one()` | no | compaction *is* a merge; it selects every live bolt and is refused for the same reason. This is the cost sect. 7.3 already states: a vector index does not compact |
+| `ambulkdelete()` | no | tombstones live in the livedocs bitmap; it frees only the previous bitmap chain |
+| tombstone-driven single-bolt rewrite (task L18) | no | not implemented, and when it is, it is a merge of one bolt and inherits the same gate |
+| `REINDEX`, `VACUUM FULL` | no | build into a new relfilenode; the old one is unlinked whole, not freed page by page |
+| `DROP INDEX` | no | unlinks the relation without reading a page of it |
+
+Verified rather than only argued: a build whose `weave_vec_free_weft()` begins with
+`elog(ERROR)` passes `installcheck-pg17` and `tap-pg17` (14 files, 207 tests)
+unchanged.
+
+**The function is kept, not deleted, and it is deliberately not reached by a
+test-only door.** The exact condition that makes it reachable is sect. 7.3's merge
+producer 2: the moment the `weave_seg_has_vector()` exclusion at
+`src/am/ambuild.c:3015` comes out, every merge frees its inputs' wefts, and a free
+path that forgot the strip chain leaks every code page of every merged bolt —
+thousands per merge, reclaimable by nothing short of a `REINDEX`. So the mutation
+that survives here is a hole that **the merge producer's commit must close**, and
+that commit's gate is: a merge of two vector-bearing bolts, then
+`weave_check(deep)` reporting zero unreachable pages, with the `meta.codestart`
+mutation proven to fail it. Recorded here because an untested line that nobody
+wrote down is indistinguishable from a tested one six months later.
+
 ### Checked and NOT a gap: HOT-successor TIDs in `amgettuple`
 
 pg_tre 4.0.2 fixed a silent under-return: its always-true scan path collected TIDs

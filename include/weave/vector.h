@@ -389,9 +389,31 @@ extern bool weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno,
  */
 extern BlockNumber weave_vec_weft_root(Relation index, const WeaveSegMeta *seg);
 
-/* Free the VMETA page, the directory chain and the strip chain.  Called from
+/*
+ * The same lookup, also reporting the ATTRIBUTE the descriptor records the weft
+ * against (*attnum, untouched when there is no vector weft; may be NULL).
+ *
+ * It exists because the attnum is otherwise write-only in V7: nothing reads it
+ * until V8 routes a scan key by it, so a writer that recorded the wrong attribute
+ * would build an index that counts correctly today and scores the wrong column
+ * later.  A mutation that replaced `layout.vecattno` with the literal 1 in
+ * weave_chandesc_for_segment() survived the whole suite for exactly that reason:
+ * every assertion about a weft went through the root, and the root is right in
+ * both worlds.  weave_vec_meta() reports it so a regression test can pin it on an
+ * index whose vector column is NOT the first one.
+ */
+extern BlockNumber weave_vec_weft_locate(Relation index, const WeaveSegMeta *seg,
+										 uint16 *attnum);
+
+/*
+ * Free the VMETA page, the directory chain and the strip chain.  Called from
  * weave_free_segment(): a weft that is written but not freed is a leak of the
- * whole structure on every merge (doc/specs/SEGMENT_FORMAT.md sect. 6). */
+ * whole structure on every merge (doc/specs/SEGMENT_FORMAT.md sect. 6).
+ *
+ * UNREACHABLE IN V7, and deliberately kept -- see the comment on the definition
+ * in src/vector/vecwrite.c and doc/GAPS.md G24 for the enumeration that proves it
+ * and the one change that ends it.
+ */
 extern void weave_vec_free_weft(Relation index, BlockNumber root);
 
 
@@ -536,5 +558,6 @@ extern Datum wvec_l1_distance(PG_FUNCTION_ARGS);
  * properties are not assertable from SQL without them. */
 extern Datum weave_vec_meta(PG_FUNCTION_ARGS);
 extern Datum weave_vec_blocks(PG_FUNCTION_ARGS);
+extern Datum weave_vec_strips(PG_FUNCTION_ARGS);
 
 #endif							/* WEAVE_VECTOR_H */
