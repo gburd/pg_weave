@@ -47,6 +47,15 @@
  *		have a home outside the SQL layer.
  *	P6	every refusal refuses: VECMAJOR, nvec 0, an unaligned centroid cut, a plan
  *		index past the weft, a short destination.
+ *	P0	the sweep is NOT VACUOUS: it contains a geometry with a middle lane strip,
+ *		one whose j0 is neither the first coordinate nor the last strip's.  Checked
+ *		because everything above is about WHERE bytes go and at 4 bits a page holds
+ *		509 coordinates: a dim list that drifted below that would make every block
+ *		one strip with j0 == 0, and P1-P4 would all still pass while asserting
+ *		nothing about the coordinate cut.  That is not hypothetical -- it is exactly
+ *		the shape task V7's mutation run found in the SQL layer, where every
+ *		indexed dim was 96 and a writer passing the literal 0 for j0 was
+ *		indistinguishable from a correct one.
  *
  * Build and run:
  *		gcc -O2 -I include -o /tmp/tvw test/hegel/test_vecweft.c \
@@ -619,6 +628,45 @@ prop_refusals(void)
 	}
 }
 
+/*
+ * P0: the sweep below must contain a geometry that actually slices a block into
+ * several lane strips, including one with a MIDDLE strip.  This asserts a property
+ * of the TEST rather than of the code, which is unusual and is the point: P1-P4 are
+ * all statements about which coordinates land on which page, and they hold trivially
+ * when there is only ever one page per block.  Mirrors the sweep's own
+ * dim > 600 => bits == 4 restriction so it measures the geometries actually visited.
+ */
+static void
+prop_sweep_not_vacuous(const int *dims, int ndims)
+{
+	int			di;
+	int			bits;
+	int			multi = 0;
+	int			middle = 0;
+
+	for (di = 0; di < ndims; di++)
+	{
+		for (bits = WEAVE_BITS_MIN; bits <= WEAVE_BITS_MAX; bits++)
+		{
+			WeaveVecWeftGeom g;
+
+			if (dims[di] > 600 && bits != 4)
+				continue;
+			if (weave_vecweft_geom(&g, PAYLOAD, dims[di], bits, WEAVE_PACK_LANE,
+								   32) != 0)
+				continue;
+			if (g.lane_strips >= 2)
+				multi++;
+			if (g.lane_strips >= 3)
+				middle++;
+		}
+	}
+	CHECK(multi > 0,
+		  "no swept geometry has more than one lane strip per block: every j0 is 0 and the coordinate cut is untested");
+	CHECK(middle > 0,
+		  "no swept geometry has a middle lane strip (lane_strips >= 3): a j0 that is neither the first nor the last is untested");
+}
+
 static void
 one_point(int dim, int bits, unsigned int nlane, int livemod)
 {
@@ -671,6 +719,8 @@ main(void)
 	int			di;
 	int			bits;
 	int			li;
+
+	prop_sweep_not_vacuous(dims, (int) (sizeof(dims) / sizeof(dims[0])));
 
 	for (di = 0; di < (int) (sizeof(dims) / sizeof(dims[0])); di++)
 	{

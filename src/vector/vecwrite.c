@@ -49,6 +49,7 @@
 
 PG_FUNCTION_INFO_V1(weave_vec_meta);
 PG_FUNCTION_INFO_V1(weave_vec_blocks);
+PG_FUNCTION_INFO_V1(weave_vec_strips);
 
 /* ---------------------------------------------------------------------------
  * Producer 1's accumulator
@@ -378,18 +379,33 @@ vec_page_used(Page page, int nbytes)
 /*
  * The order the lanes are written in: ascending docid.
  *
- * NOT the order the callback saw them, and the difference is a bug this task's own
- * regression test caught.  A heap scan does not visit tuples in ascending ctid
- * order -- RelationGetBufferForTuple() places a small row on an earlier page when
- * the current one has no room for it, and a row whose vector is NULL is exactly the
- * small one -- so callback order made warp i "the i-th tuple the scan reached".
- * Two things break:
+ * NOT the order the callback saw them, and the difference is reachable -- which took
+ * a measurement to establish, because the first version of this comment named the
+ * wrong mechanism.  It said a heap scan does not visit tuples in ascending ctid
+ * order because RelationGetBufferForTuple() puts a small row on an earlier page;
+ * that is true of where a row LANDS relative to its insertion order, and it is why
+ * an expectation written against `g` rather than against ctid rank was wrong, but a
+ * sequential scan still visits pages in ascending order, so it does not by itself
+ * make callback order differ from docid order.
+ *
+ * What does: pg_weave's build passes allow_sync = true to table_index_build_scan()
+ * (src/am/ambuild.c), so a SYNCHRONIZED sequential scan may start anywhere in the
+ * relation and wrap -- and then warp i is "the i-th tuple the scan reached", counting
+ * from the middle of the table.  Two things break:
  *
  *	 - "the warp is the bolt's dense docid space" (doc/ARCHITECTURE.md sect. 3) is
  *	   the property every cross-modal skip rests on, and it is a claim about docids.
- *	 - the page image stops being deterministic, which sect. 7 forbids: a
- *	   synchronized seqscan may start anywhere in the relation, so two builds of one
- *	   table would order the same lanes differently and differ on disk.
+ *	   A lane at the wrong warp is another document's vector, and every row count
+ *	   stays right.
+ *	 - the page image stops being deterministic, which sect. 7 forbids: two builds of
+ *	   one table would order the same lanes differently and differ on disk.
+ *
+ * t/017_vector_syncscan.pl covers it and needs a cluster of its own to: synchronized
+ * scanning only engages above NBuffers/4 pages, and the recorded position is only
+ * nonzero after a scan that STOPPED EARLY -- a completed scan leaves it back at its
+ * own start block, which is measured there.  A regression test cannot set
+ * shared_buffers, so at 128MB the threshold is thousands of pages and a mutation
+ * deleting the sort below passes sql/vecindex.sql untouched.
  *
  * Returns a palloc'd permutation: perm[w] is the accumulator index of warp w.
  */
@@ -818,7 +834,7 @@ weave_vec_weft_open(Relation index, BlockNumber root, WeaveVecWeft *out,
 }
 
 BlockNumber
-weave_vec_weft_root(Relation index, const WeaveSegMeta *seg)
+weave_vec_weft_locate(Relation index, const WeaveSegMeta *seg, uint16 *attnum)
 {
 	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
 	int			nweft = 0;
@@ -831,8 +847,18 @@ weave_vec_weft_root(Relation index, const WeaveSegMeta *seg)
 		return InvalidBlockNumber;
 	for (i = 0; i < nweft; i++)
 		if (weft[i].kind == (uint16) WEAVE_WK_VECTOR)
+		{
+			if (attnum != NULL)
+				*attnum = weft[i].attnum;
 			return weft[i].root;
+		}
 	return InvalidBlockNumber;
+}
+
+BlockNumber
+weave_vec_weft_root(Relation index, const WeaveSegMeta *seg)
+{
+	return weave_vec_weft_locate(index, seg, NULL);
 }
 
 bool
@@ -1085,6 +1111,34 @@ weave_vec_free_weft(Relation index, BlockNumber root)
 		return;
 
 	/*
+	 * NOTHING CALLS THIS IN V7, AND THAT IS A MEASURED CLAIM RATHER THAN A GUESS.
+	 * The whole call graph is three edges: weave_vec_free_weft() has exactly one
+	 * caller, weave_free_segment() (src/am/am.c, the WEAVE_WK_VECTOR arm of its
+	 * descriptor loop), which has exactly two -- weave_merge_selected()
+	 * (src/am/ambuild.c) and weave_merge_all_parallel()'s commit pass.  Both free
+	 * only the INPUTS of a merge that committed, and sect. 7.3's interim rule
+	 * refuses any merge whose inputs include a vector-bearing bolt:
+	 * weave_merge_selected() returns false at its weave_seg_has_vector() gate
+	 * before allocating a page, and both group selectors filter such bolts out of
+	 * their candidate lists.  So no vector weft is ever an input to a committed
+	 * merge, and no other path reclaims a weft page by page: VACUUM's compaction
+	 * is implemented as a merge (weave_compact_to_one() -> weave_merge_selected(),
+	 * refused for the same reason, which is why a vector index does not compact),
+	 * bulkdelete only rewrites the livedocs bitmap, REINDEX and VACUUM FULL build
+	 * into a NEW relfilenode and the old one is unlinked whole, and DROP INDEX
+	 * unlinks the relation without walking a page of it.
+	 *
+	 * Verified, not just argued: a build with an elog(ERROR) as the first
+	 * statement of this function passes installcheck-pg17 and tap-pg17 (14 files,
+	 * 207 tests) unchanged.  A mutation that deletes the meta.codestart line below
+	 * therefore CANNOT be caught by any test, which is recorded as
+	 * untested-because-unreachable in doc/GAPS.md G24 rather than papered over with
+	 * a test that reaches it some other way -- and the function is kept rather than
+	 * deleted because the one change that ends the exception (sect. 7.3's merge
+	 * producer 2, which removes the weave_seg_has_vector() exclusion) makes it
+	 * reachable on the very first merge, and a merge that frees a bolt without its
+	 * weft leaks every strip page it owned.
+	 *
 	 * Free the two chains the VMETA page names, then the page itself.  Reading it
 	 * first is the only way to find them: sect. 7.1 puts a weft's roots in the
 	 * weft's own header rather than in WeaveSegMeta, which is what lets a bolt
@@ -1194,14 +1248,14 @@ vec_introspect_tupstore(FunctionCallInfo fcinfo, TupleDesc *tupdesc)
  * is reported identically by each. */
 static bool
 vec_introspect_weft(Relation index, uint32 s, const WeaveSegMeta *seg,
-					WeaveVecWeft *w)
+					WeaveVecWeft *w, uint16 *attnum)
 {
 	BlockNumber root;
 	const char *why = NULL;
 
 	if (seg->dictstart == InvalidBlockNumber)
 		return false;			/* consumed slot */
-	root = weave_vec_weft_root(index, seg);
+	root = weave_vec_weft_locate(index, seg, attnum);
 	if (root == InvalidBlockNumber)
 		return false;			/* this bolt carries no vector weft */
 	if (!weave_vec_weft_open(index, root, w, &why))
@@ -1220,6 +1274,13 @@ vec_introspect_weft(Relation index, uint32 s, const WeaveSegMeta *seg,
  * reloption: the two disagree exactly when the reloption changed after the weft was
  * written, which is legal (each bolt records the width it was built at) and is one
  * of the things this function exists to make visible.
+ *
+ * `attnum` is the one column that does NOT come off the VMETA page: it is what the
+ * bolt's channel DESCRIPTOR records the vector weft against, and it is here
+ * because in V7 nothing else reads it -- V8's scan is the first consumer, so a
+ * descriptor written with the wrong attribute is invisible until then.  A mutation
+ * that hard-coded it to 1 survived the whole suite; sql/vecindex.sql now pins it
+ * on an index whose vector column is second as well as one where it is first.
  */
 Datum
 weave_vec_meta(PG_FUNCTION_ARGS)
@@ -1234,10 +1295,11 @@ weave_vec_meta(PG_FUNCTION_ARGS)
 	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
 	{
 		WeaveVecWeft w;
-		Datum		values[10];
-		bool		nulls[10];
+		Datum		values[11];
+		bool		nulls[11];
+		uint16		attnum = 0;
 
-		if (!vec_introspect_weft(index, s, &meta.segs[s], &w))
+		if (!vec_introspect_weft(index, s, &meta.segs[s], &w, &attnum))
 			continue;
 
 		MemSet(nulls, 0, sizeof(nulls));
@@ -1251,6 +1313,7 @@ weave_vec_meta(PG_FUNCTION_ARGS)
 		values[7] = Int64GetDatum((int64) w.meta.nblocks);
 		values[8] = Int64GetDatum((int64) w.meta.dirstart);
 		values[9] = Int64GetDatum((int64) w.meta.codestart);
+		values[10] = Int32GetDatum((int32) attnum);
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 
@@ -1283,7 +1346,7 @@ weave_vec_blocks(PG_FUNCTION_ARGS)
 		const char *why = NULL;
 		uint32		b;
 
-		if (!vec_introspect_weft(index, s, &meta.segs[s], &w))
+		if (!vec_introspect_weft(index, s, &meta.segs[s], &w, NULL))
 			continue;
 
 		for (b = 0; b < w.geom.nblocks; b++)
@@ -1312,6 +1375,100 @@ weave_vec_blocks(PG_FUNCTION_ARGS)
 			values[8] = Float4GetDatum(rec.minnorm);
 			values[9] = Float4GetDatum(rec.censcale);
 			values[10] = Float4GetDatum(rec.cenrad);
+			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+		}
+	}
+
+	index_close(index, AccessShareLock);
+	return (Datum) 0;
+}
+
+/*
+ * weave_vec_strips(regclass) -> one row per WEAVE_PK_VCODES page of every weft
+ *
+ * The coordinate slicing sect. 7.1 ratified, read back off the pages as the RAW
+ * strip headers store it: which block a strip belongs to, which coordinate range it
+ * claims, and whether it carries the 32 lanes or the block centroid.
+ *
+ * WHY IT EXISTS, which is the whole of task V7's second mutation hole.  A strip's
+ * j0 is the only thing that says WHERE in a block its bytes belong, and the writer
+ * had no test that could tell a right j0 from a wrong one: at 4 bits a page holds
+ * weave_strip_coords_per_page(8160, 4) = 509 coordinates, and every dimension the
+ * regression suite used was smaller than that, so every block was one strip and
+ * every j0 was 0.  A mutation passing the literal 0 instead of the plan's j0
+ * changed nothing anywhere.  Reporting the header makes the slicing assertable at
+ * whatever dimension the test chooses, and it reports the header VERBATIM rather
+ * than through weave_strip_parse(): validating here would report what a reader
+ * accepts, and what this has to expose is what the writer wrote.
+ *
+ * Deliberately not a per-page dump of the codes: those are the indexed content,
+ * and nothing about the format needs them to be assertable from SQL --
+ * weave_check()'s vector_block_stats_match_codes recomputes every directory record
+ * from the codes read back through weave_vec_block_read(), which is the round trip
+ * against what was written and is checked in C where the comparison can be exact.
+ */
+Datum
+weave_vec_strips(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore = vec_introspect_tupstore(fcinfo, &tupdesc);
+	WeaveMetaPageData meta;
+	Relation	index = vec_introspect_open(indexoid, &meta);
+	BlockNumber nrel = RelationGetNumberOfBlocks(index);
+	uint32		s;
+
+	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		WeaveVecWeft w;
+		BlockNumber blk;
+		int			npages = 0;
+
+		if (!vec_introspect_weft(index, s, &meta.segs[s], &w, NULL))
+			continue;
+
+		/* The same guarded walk weave_vec_block_read() makes, and guarded for the
+		 * same reason: the chain comes off disk, so a cycle or an out-of-relation
+		 * link is a corrupt index and not a loop to run forever. */
+		blk = w.meta.codestart;
+		while (blk != InvalidBlockNumber)
+		{
+			Buffer		buf;
+			Page		page;
+			const WeaveVecStripHdr *hdr;
+			Datum		values[6];
+			bool		nulls[6];
+
+			CHECK_FOR_INTERRUPTS();
+			if (blk == WEAVE_METAPAGE_BLKNO || blk >= nrel ||
+				++npages > (int) nrel)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("bolt %u of index \"%s\": the vector code chain leaves the relation or cycles at block %u",
+								s, RelationGetRelationName(index), blk)));
+			buf = ReadBuffer(index, blk);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			if (PageIsNew(page) || !WeavePageHasKind(page, WEAVE_PK_VCODES))
+			{
+				UnlockReleaseBuffer(buf);
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("bolt %u of index \"%s\": block %u is on the vector code chain but is not a code page",
+								s, RelationGetRelationName(index), blk)));
+			}
+			hdr = (const WeaveVecStripHdr *) PageGetContents(page);
+
+			MemSet(nulls, 0, sizeof(nulls));
+			values[0] = Int32GetDatum((int32) s);
+			values[1] = Int64GetDatum((int64) blk);
+			values[2] = Int64GetDatum((int64) hdr->blockno);
+			values[3] = Int32GetDatum((int32) hdr->j0);
+			values[4] = Int32GetDatum((int32) hdr->ncoords);
+			values[5] = BoolGetDatum((hdr->flags & WEAVE_VSTRIP_F_CENTROID) != 0);
+			blk = WeavePageGetOpaque(page)->nextblk;
+			UnlockReleaseBuffer(buf);
+
 			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 		}
 	}

@@ -118,6 +118,13 @@ RESET enable_seqscan;
 -- ---- the index is structurally sound ----------------------------------
 SELECT count(*) AS violations FROM weave_check('vi_vecfirst', true) WHERE NOT ok;
 SELECT detail FROM weave_check('vi_vecfirst') WHERE invariant = 'chandesc_coverage';
+-- The VECTOR descriptor records the weft against the ATTRIBUTE it indexes, and on
+-- this index that attribute is 1 -- the pre-V7 assumption, kept as coverage rather
+-- than replaced by the vector-second case below (see vw_weave): losing the
+-- vector-first shape to gain the attnum assertion would be a bad trade, since
+-- "the first column" is what four write and recheck paths used to assume.
+SELECT dim, attnum, count(*) AS bolts FROM weave_vec_meta('vi_vecfirst')
+ GROUP BY 1, 2 ORDER BY 1, 2;
 
 DROP TABLE vi;
 
@@ -186,8 +193,13 @@ SELECT count(*) = 0 AS nothing_unclassified
   FROM weave_index_size_detail('vw_weave')
  WHERE kind = 'unclassified' AND npages > 0;
 
--- The weft's geometry is the one that was asked for, read off the page.
-SELECT dim, bits, nvec, nblocks FROM weave_vec_meta('vw_weave');
+-- The weft's geometry is the one that was asked for, read off the page -- and the
+-- ATTNUM the descriptor recorded it against, which here is 2, because this index is
+-- (d, v) and the vector column is NOT first.  That column is the only thing that
+-- can catch a descriptor written with a hard-coded attribute: nothing reads the
+-- attnum until V8's scan, so such an index counts correctly today and would score
+-- the wrong column later.
+SELECT dim, bits, nvec, nblocks, attnum FROM weave_vec_meta('vw_weave');
 
 -- A NULL vector leaves a DEAD LANE; it does not shift the warp.  And the warp is
 -- the bolt's DENSE DOCID SPACE, so warp w is the w-th smallest ctid in the table --
@@ -249,9 +261,14 @@ SELECT weave_index_nsegments('vw_weave') AS segments_still_unmerged;
 SELECT count(*) AS violations_after_second_merge
   FROM weave_check('vw_weave', true) WHERE NOT ok;
 
--- REINDEX rewrites the weft from scratch and frees the old one.  A free path that
--- forgot the strip chain leaves thousands of unreachable pages here, which is the
--- one place in this file where the leak is large enough to be unmissable.
+-- REINDEX rewrites the weft from scratch, and what that does NOT do is exercise the
+-- free path: a REINDEX builds into a new relfilenode and the old one is unlinked
+-- whole, so not a page of it is freed individually.  Nothing in V7 reaches
+-- weave_vec_free_weft() at all -- the merge refuses every group containing a
+-- vector-bearing bolt (sect. 7.3), and that is the only caller's only caller; see
+-- doc/GAPS.md G24, which records the free path as untested-because-unreachable and
+-- names the change that ends it.  What this DOES assert is that a rebuild produces a
+-- weft as clean as the first one and that the size report still adds up.
 REINDEX INDEX vw_weave;
 SELECT count(*) AS violations_after_reindex
   FROM weave_check('vw_weave', true) WHERE NOT ok;
@@ -282,6 +299,63 @@ SELECT count(*) AS violations FROM weave_check('vw_bits2', true) WHERE NOT ok;
 SELECT dim, bits, nvec, nblocks FROM weave_vec_meta('vw_bits2');
 -- ... and a width outside 2..8 is refused by the reloption, not clamped silently.
 CREATE INDEX vw_bits9 ON vw USING weave (d, v) WITH (bits = 9);
+
+-- ---- the coordinate slicing, at a dim that actually slices --------------
+-- Every weft above is ONE lane strip per block, which makes sect. 7.1's coordinate
+-- cut vacuous: weave_strip_coords_per_page(8160, 4) is (8160 - 12) / (4 * 4) = 509
+-- coordinates per page, every dim used so far is below that, so every block is a
+-- single strip whose j0 is 0 -- and a writer that ignored the strip plan and always
+-- wrote 0 satisfied every assertion in this file.  That is how the mutation run
+-- found this hole; the standalone sweep in test/hegel/test_vecweft.c does cover
+-- 510..1536 and does catch a wrong j0 there, but nothing exercised the BACKEND
+-- writer's slicing.
+--
+-- 1024 dimensions is three lane strips per block -- j0 = 0, 509 and 1018, the last
+-- carrying a 6-coordinate tail -- plus one centroid strip, because a centroid
+-- coordinate is `bits` BITS rather than 32 lanes' worth, so 16,296 of them fit a
+-- page and one strip covers any dim this AM accepts.  40 rows is two blocks, the
+-- second partial: 8 code pages, which keeps the section cheap.
+CREATE TABLE vwbig (id serial, d wdoc, v wvec(1024));
+INSERT INTO vwbig(d, v)
+  SELECT to_wdoc('slice tag' || g),
+         (SELECT '[' || string_agg(((g * 31 + k * 17) % 199 - 99)::text, ',') || ']'
+            FROM generate_series(1, 1024) k)::wvec
+    FROM generate_series(1, 40) g;
+CREATE INDEX vwbig_weave ON vwbig USING weave (d, v);
+SELECT dim, bits, nvec, nblocks, attnum FROM weave_vec_meta('vwbig_weave');
+
+-- The strips as the PAGES record them.  Three lane strips per block, each claiming
+-- the coordinate range its position in the weft calls for, and one centroid strip
+-- covering the whole dim: a literal 0 for j0 shows up here as three lane strips
+-- claiming coordinate 0.
+SELECT blockno, j0, ncoords, centroid FROM weave_vec_strips('vwbig_weave')
+ ORDER BY blockno, centroid, j0;
+
+-- ... and they are on the chain in WRITE ORDER, which sect. 7.1 fixed as
+-- block-major (block 0's lane strips, then its centroid strips, then block 1's) and
+-- not coordinate-major.  weave_vec_strips() reports chain order, so comparing it to
+-- the (blockno, centroid, j0) ordering is the assertion; a reader that walks the
+-- chain and a writer that emits it must agree on this or one block's codes are read
+-- as another's.
+WITH s AS (SELECT row_number() OVER () AS seq, blockno, j0, centroid
+             FROM weave_vec_strips('vwbig_weave'))
+SELECT bool_and(seq = rk) AS chain_order_is_write_order
+  FROM (SELECT seq, row_number() OVER (ORDER BY blockno, centroid, j0) AS rk
+          FROM s) x;
+
+-- The ROUND TRIP, checked where the comparison can be exact: weave_check()
+-- recomputes every directory record and the centroid code from the codes it reads
+-- back through weave_vec_block_read() and compares them byte for byte to what the
+-- writer stored.  A strip at the wrong coordinate fails this twice over -- the
+-- reader cannot even reassemble a block whose strips claim one range twice, and a
+-- block reassembled wrongly does not recompute its own bounds.
+SELECT invariant, ok FROM weave_check('vwbig_weave')
+ WHERE invariant IN ('chandesc_roots_agree', 'vector_block_stats_match_codes')
+ ORDER BY invariant;
+SELECT count(*) AS violations FROM weave_check('vwbig_weave', true) WHERE NOT ok;
+SELECT sum(bytes) = pg_relation_size('vwbig_weave') AS sums_to_relation_size
+  FROM weave_index_size_detail('vwbig_weave');
+DROP TABLE vwbig;
 
 DROP VIEW dead_warps, null_warps;
 DROP TABLE vw;
