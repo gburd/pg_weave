@@ -101,3 +101,33 @@ CREATE OPERATOR CLASS wvec_weave_ops DEFAULT FOR TYPE wvec USING weave AS
 
 COMMENT ON OPERATOR CLASS wvec_weave_ops USING weave IS
     'index a wvec column as the vector channel of a weave index (storage only until V8)';
+
+-- The vector weft's geometry, per bolt, as a READER sees it (task V7).
+--
+-- The geometry comes off the WEAVE_VMETA page, not out of the `bits` reloption: a
+-- bolt records the width it was built at, so changing the reloption leaves existing
+-- bolts alone and this function is where that divergence is visible.  Without it
+-- there is no way to assert from SQL that the weft was written at the width that was
+-- asked for -- a weft at the wrong width scores wrongly and counts correctly.
+CREATE FUNCTION weave_vec_meta(idx regclass)
+RETURNS TABLE (segno integer, root bigint, dim integer, bits integer,
+               metric integer, layout integer, nvec bigint, nblocks bigint,
+               dirstart bigint, codestart bigint)
+AS 'MODULE_PATHNAME', 'weave_vec_meta'
+LANGUAGE C STRICT PARALLEL SAFE;
+
+-- One row per 32-lane block, read through the same O(1) directory addressing a scan
+-- uses.
+--
+-- `livemask` is the bit per lane that says whether that warp position has a vector,
+-- and it is the only place a NULL vector is visible: a writer that SKIPPED a NULL
+-- instead of leaving a dead lane produces identical row counts and associates every
+-- later vector with the wrong document.  The five float columns are the (C2) bound
+-- inputs; weave_check() recomputes them from the stored codes, and this function is
+-- how a human reads them when it reports a mismatch.
+CREATE FUNCTION weave_vec_blocks(idx regclass)
+RETURNS TABLE (segno integer, blockno bigint, firstwarp bigint, nlanes integer,
+               nlive integer, livemask bigint, smax real, maxrecnorm real,
+               minnorm real, censcale real, cenrad real)
+AS 'MODULE_PATHNAME', 'weave_vec_blocks'
+LANGUAGE C STRICT PARALLEL SAFE;

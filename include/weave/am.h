@@ -30,7 +30,23 @@
 #include "weave/surftrie.h"
 
 #define WEAVE_MAGIC			0x42324635	/* "B2F5" */
-#define WEAVE_VERSION		7		/* v7: a bolt carries the FUZZY weft -- the
+#define WEAVE_VERSION		8		/* v8: a bolt carries the VECTOR weft -- a
+										 * WEAVE_PK_VMETA page naming a WEAVE_PK_VDIR
+										 * block directory and a WEAVE_PK_VCODES strip
+										 * chain, registered as a WEAVE_WK_VECTOR
+										 * descriptor (task V7,
+										 * doc/specs/VECTOR_CHANNEL.md sect. 7.1).
+										 * The metapage is again BYTE-IDENTICAL to the
+										 * previous generation, and the bump is again
+										 * about FREEING rather than parsing: a v7
+										 * .so reads the descriptor page fine and
+										 * frees only the wefts it knows, so every
+										 * merge under it would leak the whole weft --
+										 * thousands of pages per bolt, not one.
+										 * SEGMENT_FORMAT.md sect. 8 item 1
+										 * generalizes it: a new weft kind needs a
+										 * version bump even when it moves no field.
+										 * v7: a bolt carries the FUZZY weft -- the
 										 * LOUDS-Sparse SuRF trie over its vocabulary, on
 										 * a WEAVE_PK_SURF page chain, registered as a
 										 * WEAVE_WK_FUZZY descriptor.  The metapage is
@@ -67,6 +83,7 @@
 #define WEAVE_VERSION_DOCLEN_ABS 5	/* first version writing absolute-offset sidecars */
 #define WEAVE_VERSION_CHANDESC	6	/* first version with per-bolt weft descriptors */
 #define WEAVE_VERSION_SURF		7	/* first version writing the fuzzy (SuRF) weft */
+#define WEAVE_VERSION_VECTOR	8	/* first version writing the vector weft */
 
 /*
  * Set in WeaveDoclenBlockHdr.count to mark a sidecar block whose docid column is
@@ -820,8 +837,14 @@ extern void weave_meta_upcast_page(Page page);
 extern bool weave_meta_add_segment(Relation index, const WeaveSegMeta *seg);
 extern void weave_add_segment_with_room(Relation index, const WeaveSegMeta *seg);
 
+/*
+ * Attach a descriptor page to a just-written bolt.  Call AFTER every other chain
+ * of the bolt is written, so every root is known.  `surfroot` and `vecroot` are
+ * InvalidBlockNumber when the bolt carries no such weft, which is what makes an
+ * absent weft cost zero bytes -- including its descriptor slot.
+ */
 extern void weave_attach_chandesc(Relation index, WeaveSegMeta *seg,
-								  BlockNumber surfroot);
+								  BlockNumber surfroot, BlockNumber vecroot);
 
 /* ---------------------------------------------------------------------------
  * The fuzzy weft: the SuRF trie over the bolt vocabulary (task Z3)
@@ -912,6 +935,11 @@ extern WeaveDoclenDirCache *weave_doclendir_cache(Relation index,
 extern bool weave_index_wants_positions(Relation index);
 extern bool weave_index_wants_trigrams(Relation index);
 extern bool weave_index_wants_doclen_sidecar(Relation index);
+
+/* The vector code width for this index's next weft, from the `bits` reloption.
+ * Here rather than in weave/vector.h because it reads WeaveOptions, which is
+ * private to src/am/am.c, and ambuild.c is its only caller. */
+extern int	weave_index_vec_bits(Relation index);
 
 /*
  * Which index column feeds which channel.

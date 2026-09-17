@@ -178,6 +178,17 @@ typedef enum WeavePageKind
 	WEAVE_PK_DOCVALS = 25,		/* reserved: scalar/facet forward store */
 	WEAVE_PK_CGRAM = 26,		/* reserved: opt-in corpus character trigrams */
 
+	/*
+	 * Allocated by task V7, because doc/specs/VECTOR_CHANNEL.md sect. 7.1
+	 * specified the per-block directory without allocating a page kind for it.
+	 * It cannot share WEAVE_PK_VMETA's: a bolt has exactly one VMETA page and
+	 * many directory pages, and a page that cannot say which of the two it is
+	 * cannot be validated in isolation -- which is the whole of L17's
+	 * per-object-discriminator precedent and what weave_check() needs.  Appended
+	 * rather than inserted; these ids are on-disk ABI.
+	 */
+	WEAVE_PK_VDIR = 27,			/* vector: the fixed 284-byte per-block records */
+
 	WEAVE_PK_NKINDS				/* first unassigned id; not a kind */
 } WeavePageKind;
 

@@ -39,6 +39,8 @@ OBJS = \
 	src/vector/quantize.o \
 	src/vector/pack.o \
 	src/vector/vecpage.o \
+	src/vector/vecweft.o \
+	src/vector/vecwrite.o \
 	src/vector/vecstats.o \
 	src/vector/kernels.o \
 	src/vector/kernel_ops.o \
@@ -364,6 +366,11 @@ check-standalone:
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecpage test/hegel/test_vecpage.c \
 		src/vector/vecpage.c src/vector/pack.c; \
 	$$tmp/vecpage | tail -1; \
+	echo "== V7 vector weft: strip plan is a partition, round trip, statistics recompute =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecweft test/hegel/test_vecweft.c \
+		src/vector/vecweft.c src/vector/vecpage.c src/vector/vecstats.c \
+		src/vector/quantize.c src/vector/pack.c -lm; \
+	$$tmp/vecweft | tail -1; \
 	echo "== V7/V8 contract (C2): the block bound is an upper bound on every lane =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecbound test/hegel/test_vecbound.c \
 		src/vector/vecstats.c src/vector/quantize.c src/vector/pack.c \
