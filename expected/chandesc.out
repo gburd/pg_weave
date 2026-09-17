@@ -42,7 +42,9 @@ SELECT invariant, ok FROM weave_check('cd_weave') ORDER BY invariant;
  surf_coverage                    | t
  surf_trie_matches_dictionary     | t
  uninitialized_page_count         | t
-(11 rows)
+ vector_block_stats_match_codes   | t
+ vector_coverage                  | t
+(13 rows)
 
 -- The deep pass adds full-relation page reachability and the
 -- no-two-chains-overlap assertion (SEGMENT_FORMAT.md section 8 item 5).
@@ -62,7 +64,9 @@ SELECT invariant, ok FROM weave_check('cd_weave', true) ORDER BY invariant;
  surf_coverage                    | t
  surf_trie_matches_dictionary     | t
  uninitialized_page_count         | t
-(13 rows)
+ vector_block_stats_match_codes   | t
+ vector_coverage                  | t
+(15 rows)
 
 -- The only assertion that matters: nothing is violated.
 SELECT count(*) AS violations FROM weave_check('cd_weave', true) WHERE NOT ok;
@@ -76,7 +80,7 @@ SELECT detail FROM weave_check('cd_weave')
  WHERE invariant = 'metapage_version_recognized';
                      detail                     
 ------------------------------------------------
- format v7 (this build reads v3..v7, writes v7)
+ format v8 (this build reads v3..v8, writes v8)
 (1 row)
 
 -- Every bolt is self-describing on a fresh v6 build.

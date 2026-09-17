@@ -32,7 +32,7 @@ cd "$(dirname "$0")/.."
 # file until task L1 split it), pg_fts_doc.c -> src/query/doc.c,
 # pg_fts_analyze.c -> src/query/analyze.c, pg_fts_tsanalyze.c ->
 # src/query/tsanalyze.c.
-FILES="src/am/am.c src/am/ambuild.c src/am/amvacuum.c src/am/amscan.c src/pages/trgm_page.c src/query/doc.c src/query/analyze.c src/query/tsanalyze.c"
+FILES="src/am/am.c src/am/ambuild.c src/am/amvacuum.c src/am/amscan.c src/pages/trgm_page.c src/query/doc.c src/query/analyze.c src/query/tsanalyze.c src/vector/vecwrite.c"
 
 # Size-drivers that scale with the corpus / vocabulary / one document (unbounded
 # in principle) -- as opposed to query size or fixed structs. Matched as whole

@@ -49,6 +49,7 @@
 #include "weave/weave.h"
 #include "weave/am.h"
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
+#include "weave/vector.h"			/* V7: the vector weft's writer, reader and free path */
 #include <math.h>
 #include "access/genam.h"
 #include "access/generic_xlog.h"
@@ -125,6 +126,14 @@ typedef struct WeaveOptions
 								 * decoder, so an index can mix sidecar and inline
 								 * segments and needs no REINDEX to change the option
 								 * (new segments follow the current setting). */
+	int			bits;			/* vector code width, 2..8, default
+								 * WEAVE_VEC_DEFAULT_BITS (4).  A RELOPTION and not a
+								 * GUC because it changes the bytes on disk
+								 * (doc/CONVENTIONS.md decision 1): a GUC would make
+								 * one index's segments disagree about their code
+								 * width depending on which session wrote them.  The
+								 * value used is recorded in each weft's WEAVE_VMETA
+								 * page, so a reader never consults this. */
 } WeaveOptions;
 
 static relopt_kind weave_relopt_kind;
@@ -144,6 +153,18 @@ weave_init_reloptions(void)
 	add_bool_reloption(weave_relopt_kind, "doclen_sidecar",
 					   "store doclen in a per-segment quantized sidecar (on) or inline in postings (off)",
 					   true, AccessExclusiveLock);
+	/*
+	 * 4 bits is the ratified Phase V shape: with an exact top-25 rerank it reaches
+	 * recall@10 0.9920 at n = 1M on GIST-960d for 512 B/vector, and 4 is the
+	 * widest width that still has a SIMD scoring kernel.  Widths up to 8 are
+	 * accepted because the codec supports them and the recall ceiling at each is
+	 * measured (bench/RESULTS_BITWIDTH_SWEEP.md); they are not recommended.  See
+	 * include/weave/vector.h.
+	 */
+	add_int_reloption(weave_relopt_kind, "bits",
+					  "vector code width in bits (2..8)",
+					  WEAVE_VEC_DEFAULT_BITS, WEAVE_BITS_MIN, WEAVE_BITS_MAX,
+					  AccessExclusiveLock);
 }
 
 /* ----- posting compression (delta + varint) ----- */
@@ -979,6 +1000,8 @@ weave_page_kind_name(WeavePageKind kind)
 			return "docvalues";
 		case WEAVE_PK_CGRAM:
 			return "corpus_trigram";
+		case WEAVE_PK_VDIR:
+			return "vector_dir";
 		case WEAVE_PK_NKINDS:
 			break;
 	}
@@ -2019,7 +2042,8 @@ weave_read_chandesc(Relation index, BlockNumber blk,
  */
 static int
 weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
-						   BlockNumber surfroot, WeaveChannelDesc *weft)
+						   BlockNumber surfroot, BlockNumber vecroot,
+						   WeaveChannelDesc *weft)
 {
 	int			n = 0;
 
@@ -2044,6 +2068,38 @@ weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
 	 * WEAVE_WK_LEXICAL (1).  Adding a weft with a kind BELOW an existing one
 	 * means sorting here, not appending.
 	 */
+	/*
+	 * v8: the VECTOR weft, rooted at its WEAVE_VMETA page.
+	 *
+	 * EMITTED HERE, BETWEEN LEXICAL AND FUZZY, NOT APPENDED.
+	 * weave_chandesc_check() requires the array to be strictly ascending by
+	 * (kind, attnum), and WEAVE_WK_VECTOR is 2 while WEAVE_WK_FUZZY is 3.
+	 * Appending it after the fuzzy entry produces a descriptor page the validator
+	 * rejects with WEAVE_CD_ORDER -- which means the bolt cannot be read at all,
+	 * so its wefts cannot be freed either and every merge leaks the lot.  The
+	 * order is a correctness property of the page, not a formatting choice, and
+	 * the reason the check is strict rather than tolerant is that it lets a reader
+	 * binary-search for a kind and lets weave_chandesc_check() detect two
+	 * descriptors for the same weft in one pass.
+	 *
+	 * attnum is the INDEX attribute the weft indexes, from weave_index_layout():
+	 * unlike the lexical weft's hard-coded 1, this one genuinely varies --
+	 * sql/vecindex.sql builds the vector column first, so it is attribute 1 there
+	 * and attribute 2 in the documented column order.
+	 */
+	if (vecroot != InvalidBlockNumber)
+	{
+		WeaveIndexLayout layout;
+
+		weave_index_layout(index, &layout);
+		Assert(layout.vecattno != 0);
+		weft[n].kind = (uint16) WEAVE_WK_VECTOR;
+		weft[n].attnum = (uint16) layout.vecattno;
+		weft[n].flags = 0;
+		weft[n].root = vecroot;
+		n++;
+	}
+
 	if (surfroot != InvalidBlockNumber)
 	{
 		weft[n].kind = (uint16) WEAVE_WK_FUZZY;
@@ -2058,10 +2114,12 @@ weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
 /* Attach a descriptor page to a just-written bolt.  Call AFTER every other
  * chain of the bolt has been written, so each root is known. */
 void
-weave_attach_chandesc(Relation index, WeaveSegMeta *seg, BlockNumber surfroot)
+weave_attach_chandesc(Relation index, WeaveSegMeta *seg, BlockNumber surfroot,
+					  BlockNumber vecroot)
 {
 	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
-	int			nweft = weave_chandesc_for_segment(index, seg, surfroot, weft);
+	int			nweft = weave_chandesc_for_segment(index, seg, surfroot, vecroot,
+												   weft);
 
 	seg->chandesc = weave_write_chandesc(index, weft, nweft);
 }
@@ -2618,6 +2676,23 @@ weave_free_segment(Relation index, const WeaveSegMeta *seg)
 				 * would push the same block on the free list twice. */
 				if (weft[i].kind == (uint16) WEAVE_WK_LEXICAL)
 					continue;
+
+				/*
+				 * The VECTOR weft is THREE chains, not one: its descriptor root is
+				 * the WEAVE_VMETA page, which NAMES the directory and code chains.
+				 * weave_free_chain() on the root alone would reclaim one page and
+				 * leak every strip and directory page behind it -- thousands of
+				 * pages per merged bolt, unreachable and reclaimable by nothing
+				 * short of a REINDEX.  This is exactly the failure mode
+				 * doc/specs/SEGMENT_FORMAT.md sect. 6 describes for a weft the free
+				 * path cannot see, and the reason the descriptor-driven loop is not
+				 * by itself sufficient for a weft with internal structure.
+				 */
+				if (weft[i].kind == (uint16) WEAVE_WK_VECTOR)
+				{
+					weave_vec_free_weft(index, weft[i].root);
+					continue;
+				}
 				weave_free_chain(index, weft[i].root);
 			}
 		}
@@ -2709,6 +2784,7 @@ weave_options(Datum reloptions, bool validate)
 		{"positions", RELOPT_TYPE_BOOL, offsetof(WeaveOptions, positions)},
 		{"trigrams", RELOPT_TYPE_BOOL, offsetof(WeaveOptions, trigrams)},
 		{"doclen_sidecar", RELOPT_TYPE_BOOL, offsetof(WeaveOptions, doclen_sidecar)},
+		{"bits", RELOPT_TYPE_INT, offsetof(WeaveOptions, bits)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,
@@ -2761,6 +2837,27 @@ weave_index_wants_doclen_sidecar(Relation index)
 	bool		r = opts ? opts->doclen_sidecar : true;
 
 	return r;
+}
+
+/*
+ * The vector code width this index's next weft is written at.
+ *
+ * Clamped rather than trusted: rd_options comes from the catalog, and while
+ * add_int_reloption() validates the range on CREATE INDEX, a pg_class row written
+ * by a future version must not reach weave_quantizer_init() with a width the codec
+ * cannot pack.  The width actually used is recorded in the weft's WEAVE_VMETA page,
+ * so changing this reloption never invalidates an existing segment -- a reader
+ * takes the geometry from the page, never from here.
+ */
+int
+weave_index_vec_bits(Relation index)
+{
+	WeaveOptions *opts = (WeaveOptions *) index->rd_options;
+	int			bits = opts ? opts->bits : WEAVE_VEC_DEFAULT_BITS;
+
+	if (bits < WEAVE_BITS_MIN || bits > WEAVE_BITS_MAX)
+		bits = WEAVE_VEC_DEFAULT_BITS;
+	return bits;
 }
 
 /*
