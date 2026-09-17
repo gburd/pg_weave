@@ -323,3 +323,123 @@ weave_vecdir_read(const void *src, size_t srclen, int usable, int slot,
 	}
 	return 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * The warp map
+ *
+ * Dense uint64 docids, so warp w is at a computable page and offset.  See the
+ * block comment above WeaveVecWarpHdr in the header for why the map exists and why
+ * it is not four more fields in the directory record.
+ * ------------------------------------------------------------------------- */
+
+int
+weave_vecwarp_page_init(void *dst, size_t dstlen, int usable,
+						weave_uint32 firstwarp, int nwarps)
+{
+	WeaveVecWarpHdr *h;
+	int			wpp = weave_vecwarp_per_page(usable);
+
+	if (dst == NULL || usable <= 0 || (size_t) usable > dstlen)
+		return -1;
+	if (wpp <= 0 || nwarps < 1 || nwarps > wpp)
+		return -1;
+
+	/* The slack past the last entry is part of the page image; see
+	 * weave_vecdir_page_init(). */
+	memset(dst, 0, (size_t) usable);
+	h = (WeaveVecWarpHdr *) dst;
+	h->firstwarp = firstwarp;
+	h->nwarps = (weave_uint16) nwarps;
+	h->pad = 0;
+	return 0;
+}
+
+int
+weave_vecwarp_write(void *dst, size_t dstlen, int usable, int slot,
+					weave_uint64 docid)
+{
+	WeaveVecWarpHdr *h;
+	int			wpp = weave_vecwarp_per_page(usable);
+	size_t		off;
+
+	if (dst == NULL || usable <= 0 || (size_t) usable > dstlen)
+		return -1;
+	if (wpp <= 0 || slot < 0 || slot >= wpp)
+		return -1;
+	if (docid == 0)
+		return -1;				/* the hole an unwritten slot leaves; see the header */
+
+	h = (WeaveVecWarpHdr *) dst;
+	if (h->pad != 0 || h->nwarps < 1 || (int) h->nwarps > wpp)
+		return -1;
+	if (slot >= (int) h->nwarps)
+		return -1;
+
+	off = sizeof(WeaveVecWarpHdr) + (size_t) slot * sizeof(weave_uint64);
+	/* Checked against `usable` and not only against wpp, for the reason mutation
+	 * D6 established in weave_vecdir_write(): a wrong per-page count makes every
+	 * slot bound derived from it agree with itself. */
+	if (off + sizeof(weave_uint64) > (size_t) usable)
+		return -1;
+	memcpy((weave_uint8 *) dst + off, &docid, sizeof(weave_uint64));
+	return 0;
+}
+
+int
+weave_vecwarp_read(const void *src, size_t srclen, int usable, int slot,
+				   weave_uint64 *out, const char **why)
+{
+	const WeaveVecWarpHdr *h;
+	int			wpp = weave_vecwarp_per_page(usable);
+	size_t		off;
+
+	if (why != NULL)
+		*why = NULL;
+	if (src == NULL || out == NULL || usable <= 0 || (size_t) usable > srclen)
+	{
+		if (why)
+			*why = "bad arguments";
+		return -1;
+	}
+	if (wpp <= 0)
+	{
+		if (why)
+			*why = "page too small for a warp map entry";
+		return -1;
+	}
+	h = (const WeaveVecWarpHdr *) src;
+	if (h->pad != 0)
+	{
+		if (why)
+			*why = "warp map page header pad is nonzero";
+		return -1;
+	}
+	if (h->nwarps < 1 || (int) h->nwarps > wpp)
+	{
+		if (why)
+			*why = "warp map page declares an impossible entry count";
+		return -1;
+	}
+	if (slot < 0 || slot >= (int) h->nwarps)
+	{
+		if (why)
+			*why = "slot past the entries this page holds";
+		return -1;
+	}
+
+	off = sizeof(WeaveVecWarpHdr) + (size_t) slot * sizeof(weave_uint64);
+	if (off + sizeof(weave_uint64) > (size_t) usable)
+	{
+		if (why)
+			*why = "entry would extend past the page";
+		return -1;
+	}
+	memcpy(out, (const weave_uint8 *) src + off, sizeof(weave_uint64));
+	if (*out == 0)
+	{
+		if (why)
+			*why = "warp map entry is zero, which is not a docid";
+		return -1;
+	}
+	return 0;
+}

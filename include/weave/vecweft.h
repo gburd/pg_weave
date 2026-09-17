@@ -101,6 +101,9 @@ typedef struct WeaveVecWeftGeom
 	int			rpp;			/* directory records per page */
 	weave_uint32 ndirpages;
 	weave_uint32 nstrips;		/* strips in the whole weft */
+
+	int			wpp;			/* warp map entries per page */
+	weave_uint32 nwarppages;	/* ceil(nvec / wpp) */
 } WeaveVecWeftGeom;
 
 /*

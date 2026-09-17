@@ -722,18 +722,80 @@ lanes it writes, and the difference between them is the whole of this section.
 **Producer 1, the build.** `weave_build_callback()` has the wvec in
 `values[vecattno - 1]`; it encodes and hands over 32-lane blocks.
 
-**Producer 2, the merge.** A merge renumbers docids, so lanes move between
-blocks. It reads the input segments' strips and moves lanes into the output's
-blocks with `weave_pack_move_lane()` — the O(1) swap-remove primitive V5 built
-for exactly this.
+**Producer 2, the merge — landed 2026-09-17.** A merge changes which documents
+share a bolt, so every lane changes warp position and lanes move between blocks. It
+reads each input weft **block by block**, takes each live lane's code bytes out with
+`weave_unpack_lane()`, and appends them to the **same accumulator producer 1 fills**
+(`weave_vec_accum_add_encoded()`); `weave_vec_write_weft()` then does the geometry,
+the directory, the strips and the statistics. One writer, two producers.
+
+*Not* `weave_pack_move_lane()`, and the reason is worth recording because §7.3 named
+it for two days. That primitive moves a lane **within a pair of blocks that both
+already exist**, which is the vacuum swap-remove it was built for. A merge does not
+have the destination block: the output's block membership is only known once every
+input's lanes have been collected and sorted into output docid order, because a
+document's output warp depends on which *other* documents survived. Unpacking to code
+bytes and repacking through the tested writer moves the identical bytes, reuses the
+`weave_pack_lane`/`weave_unpack_lane` pair every build already exercises, and needs no
+second implementation of the block geometry. Reading the block whole costs nothing
+either: in `WEAVE_PACK_LANE` coordinate `j` of lane `s` is at bit `(j*32+s)*bits`, so
+one lane's code touches every page of the block anyway.
+
+**What the merge needed that the format did not have: warp → docid.** A warp is an
+ordinal. Nothing in a v1 weft said which *document* a lane belonged to, and the
+derivation this spec offered instead — "warp i is the i-th smallest docid in the
+bolt, and the bolt's docids are all in its lexical weft" — is **false**. Producer 1
+gives a lane to every document whose lexical column is non-NULL; a document reaches
+the lexical weft only if it has at least one posting; and a non-NULL `wdoc` with no
+terms (empty text, stopwords only) has none. One such document shifts every later
+warp's derived docid by one, mis-attributing every vector after it, and nothing
+counts wrong. A merge needs the docid to drop a tombstoned document's lane and to
+place a moved lane at the output's rank; V8 needs it to turn a warp back into a heap
+tid.
+
+So a weft carries a fourth chain, `WEAVE_PK_VWARP`: `nvec` dense `uint64` docids,
+addressed by arithmetic, 8 bytes per lane — 1.7 % of the code bytes at 960-d and 4
+bits. Its own chain rather than four more fields in `WeaveVecDirRec` because that
+record is sized so 28 fit a page and record `i` is O(1), and it is read for **every**
+block a scan considers (bound pruning measured 0.00 %, so "every" is literal), to
+carry a value needed once per **returned** row. `WEAVE_VMETA_VERSION` is 2; a v1 weft
+is refused rather than read best-effort, and no released version ever wrote one.
 
 **The merge MUST move codes verbatim. It must never decode to float and
-re-encode.** Quantization is lossy, so decode-then-re-encode compounds the error
-every time a segment is merged, and an index's recall would then decay with its
-*merge history* rather than its contents. No test that builds an index once can
-see that, and the size-tiered merge means a long-lived index is merged many
-times. This is the same class as the (C2) bound being 1 % low: plausible answers,
-quietly worse.
+re-encode** — and the reason this section originally gave for that is **wrong**,
+which the mutation run found and which is worth more than the rule itself.
+
+*The claim was:* quantization is lossy, so decode-then-re-encode compounds the error
+on every merge and an index's recall decays with its *merge history* rather than its
+contents. *The measurement* (`test/hegel/test_quantize.c`,
+`test_reencode_idempotent`): **a code is a fixed point of decode-then-encode.**
+Dequantizing yields exactly the codebook levels, and re-quantizing those returns the
+same levels — 0 of 2,100 codes moved over `bits` 2–8 at 64-d and 768-d, and 4 of
+9,800 over dim 4–1536 in a wider throwaway sweep, each of those by a single byte at a
+decision boundary. A merge that decoded and re-encoded, *keeping the stored scale*,
+therefore produces the same bytes: it is an **equivalent mutation**, and it survives
+the whole suite. Error does not accumulate with merge history.
+
+*What is actually true, and what the rule protects:*
+
+1. **The SCALE is not a fixed point.** A reconstruction's norm is not its original's,
+   so a producer that re-encoded *and took the re-encoded scale* changes what the lane
+   dequantizes to even where its bytes did not move — 264 of those same 2,100 round
+   trips moved the scale, and on the structured vectors `sql/vecindex.sql` indexes it
+   moves for most rows. That mutation **is** caught, by comparing the stored
+   `(scale, norm)` pair across the merge. So the operative rule is: **carry the stored
+   sidecar pair; never recompute it from a reconstruction.**
+2. **Idempotency is a property of THIS codebook at THIS width.** It fails the moment
+   the output's codebook, width or TQ+ calibration (§5) differs from the input's —
+   which is exactly what the geometry-agreement guard below refuses, and exactly what
+   a future calibration would introduce.
+3. **Cost.** A decode plus an encode per lane is a rotation, a `dim`-wide dequantize
+   and a `dim`-wide quantize on the merge's critical path, to reproduce bytes it
+   already had.
+
+The general lesson is the one AGENTS.md keeps: a rule with a wrong reason attached is
+a rule someone will discard when they disprove the reason. The property is now a
+test, so if idempotency ever breaks, the day it breaks is the day something fails.
 
 **But the per-block statistics ARE recomputed on merge, and that is not
 re-encoding.** A merge changes which lanes share a block, so `livemask`, `smax`,
@@ -746,23 +808,65 @@ because `cenrad` must be measured against the centroid as reconstructed from
 V7 bench fix removed). Moving codes and keeping stale statistics is a silent (C2)
 violation.
 
-**Interim, until the merge producer exists: the merge SKIPS any group containing
-a vector-bearing segment.** It does not drop the weft, and it does not throw. It
-does not drop it because that is data loss the vector channel cannot yet notice
-(nothing queries it until V8) and would therefore ship undetected. It does not
-throw because an `ereport` reachable from VACUUM's cleanup is how an index
-becomes permanently unvacuumable — that is G15's lesson and G20's. Skipping is
-always safe: a merge is optional work, and since G20 the insert-time merge is
-deferred by default anyway.
+**What is left of the interim rule, and why it kept its shape.** The interim rule
+was "the merge SKIPS any group containing a vector-bearing segment". What survives is
+narrower: **all the input wefts must agree on (dim, bits, layout, metric), and a
+group whose wefts disagree is skipped.** Re-quantizing to a common width is
+forbidden by the paragraph above, so there is nothing else a merge could do. It is
+still a skip and not an `ereport`, because an error reachable from VACUUM's cleanup
+is how an index becomes permanently unvacuumable (G15, G20), and still not a drop,
+because dropping a weft is data loss nothing notices before V8. Skipping is always
+safe: a merge is optional work.
 
-The cost of the interim is stated rather than hidden: **a vector index does not
-compact, so its segment count only grows, and it will eventually reach
-`WEAVE_MAX_SEGMENTS`.** That is the reason V8 must not start before the merge
-producer lands — a scan built against an index that cannot be maintained will be
-debugged against the wrong failure.
+The rule is enforced at the two **chokepoints** (`weave_merge_selected()` and
+`weave_merge_group_to_seg()`), before a page is allocated, and the four candidate
+selectors apply it to their lists as well so a mixed index still compacts the bolts
+it can. Both halves are needed for the reason the interim comment already gave: a
+rule enforced only in the selectors is a rule the next selector forgets.
 
-**A second cost of the interim, found by V7's mutation run: the free path is
-unreachable, so it is untested.** `weave_free_segment()`'s `WEAVE_WK_VECTOR` arm
+**Is a mismatch reachable? Not today, and that is recorded as a gap rather than
+claimed as a guarantee** (`doc/GAPS.md` G26). `bits` is a reloption, so `ALTER INDEX
+... SET (bits = 2)` is legal at any time — but only a *build* writes a weft, and one
+build reads the reloption once, so the two bolts a mismatch needs cannot both exist.
+`dim` can differ between bolts in principle (a `wvec` column with no typmod), but
+`weave_vec_accum_add()` throws on a dim change *within* a segment, so producing two
+bolts of different dims needs a flush boundary landing exactly on the dim change --
+not something a test can arrange. `layout` and `metric` are constants today. The
+guard becomes reachable the moment **G23** closes: once a pending flush carries
+vectors, an `INSERT` after an `ALTER INDEX ... SET (bits = ...)` writes a second weft
+at the new width. It is implemented now, with the mismatch-skip mutation recorded as
+a **surviving** mutation for the same reason G24's was — an untested branch that
+nobody wrote down is indistinguishable from a tested one six months later.
+
+**The interim's cost is paid off.** "A vector index does not compact, so its segment
+count only grows, and it will eventually reach `WEAVE_MAX_SEGMENTS`" no longer holds:
+compaction is a merge, and a merge now carries the weft. That was the reason V8 was
+blocked on this task.
+
+**MEMORY: the vector half of a merge is NOT streaming, and that is a deliberate,
+bounded debt.** `weave_merge_segments_streaming()` is bounded to one term's postings
+at a time, specifically so a full compaction of a large index does not buffer the
+index in RAM. Producer 2 does the opposite: the accumulator holds **every output
+lane's code** before the writer runs, so a vector merge is `O(nvec · codebytes)`
+resident — **480 MB of codes at a million documents, 960 dimensions and 4 bits**,
+plus 8 bytes per lane of docid and 9 of sidecar and one transient 8-byte-per-lane
+sort array, so ~500 MB — and it is charged to the merge's own context rather than to
+`maintenance_work_mem`. That is acceptable at the scale this AM is tested at and it
+is *not* acceptable at 10M. The streaming shape (merge the input wefts as
+sorted-by-docid runs, write each block as it fills) is `doc/GAPS.md` G25 with the
+threshold worked out. The in-memory version shipped because it reuses the one tested
+writer; the follow-up is recorded rather than assumed.
+
+**The second cost of the interim is now paid too: the free path is reachable.**
+Every merge frees its inputs, so `weave_free_segment()`'s `WEAVE_WK_VECTOR` arm and
+all four of `weave_vec_free_weft()`'s chain frees now run on the first merge of a
+vector-bearing bolt, and `weave_check(deep)`'s reachability walk is what catches a
+forgotten one — a leak of every code page of every merged bolt. `sql/vecindex.sql`
+merges and then checks deep; the mutation table's `free-omits-strips` leg, which
+survived V7 by construction, is **caught**. The history is kept below because the
+diagnosis matters more than the fix.
+
+*Before this commit:* **the free path was unreachable, so it was untested.** `weave_free_segment()`'s `WEAVE_WK_VECTOR` arm
 calls `weave_vec_free_weft()`, and nothing calls `weave_free_segment()` except the
 two merge commit paths — which, by the rule above, never take a vector-bearing bolt
 as an input. Nothing else reclaims a weft page by page either: compaction *is* a

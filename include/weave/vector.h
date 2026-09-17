@@ -51,6 +51,7 @@
 										 * blocks, each preceded by a
 										 * WeaveVecBlockHdr */
 #define WEAVE_VGRAPH		WEAVE_PK_VGRAPH /* Vamana CSR adjacency (weave/graph.h) */
+#define WEAVE_VWARP			WEAVE_PK_VWARP	/* warp -> docid (weave/vecpage.h) */
 #define WEAVE_VRERANK		WEAVE_PK_VRERANK	/* WITHDRAWN -- see pagekind.h.  The
 										 * rerank reads the heap, not a sidecar. */
 
@@ -150,6 +151,14 @@ typedef struct WeaveVecMeta
 								 * of one block's 32 lanes; the centroid code is
 								 * sliced the same way and follows a block's lane
 								 * strips. */
+	BlockNumber warpstart;		/* first WEAVE_PK_VWARP page: warp -> docid, 8 bytes
+								 * per lane.  Never Invalid on a weft that exists --
+								 * a weft that cannot name the document behind a warp
+								 * cannot be merged and cannot return a row.  See the
+								 * block comment above WeaveVecWarpHdr in
+								 * weave/vecpage.h for why the derivation it replaced
+								 * was unsound, and sect. 7.3 for the merge that
+								 * needs it. */
 	BlockNumber graphstart;		/* first WEAVE_VGRAPH page, or Invalid */
 	/* No rerankstart: the exact rerank reads full precision from the HEAP, so
 	 * there is no sidecar chain to point at.  Withdrawn 2026-09-13 before it was
@@ -163,7 +172,15 @@ typedef struct WeaveVecMeta
 } WeaveVecMeta;
 
 #define WEAVE_VMETA_MAGIC		0x57565431	/* "WVT1" */
-#define WEAVE_VMETA_VERSION		1
+/*
+ * 2 since the merge producer: the struct gained `warpstart` and a weft gained the
+ * warp-map chain it names.  A v1 weft has no way to say which document a lane
+ * belongs to, so it cannot be merged or scanned -- there is no best-effort read of
+ * one, and vec_meta_read() refuses it (doc/CONVENTIONS.md decision 3).  No released
+ * version ever wrote a v1 weft: the vector weft and this change are both after tag
+ * v2026.09.06, so the refusal is reachable only from a working tree.
+ */
+#define WEAVE_VMETA_VERSION		2
 
 #define WEAVE_VMETA_F_NORMALIZED	0x01	/* inputs were unit-normalized at
 											 * build; cosine == ip */
@@ -267,8 +284,13 @@ typedef struct WeaveVecLane
 #define WEAVE_VECPAGE_PAYLOAD	WEAVE_SURFPAGE_PAYLOAD
 
 /*
- * Producer 1's accumulator: one lane slot per document the build indexed, in warp
- * order, holding the CODE rather than the float vector.
+ * The lane accumulator, filled by EITHER producer (doc/specs/VECTOR_CHANNEL.md
+ * sect. 7.3): one lane slot per document, holding the CODE rather than the float
+ * vector.  Producer 1 (the build) encodes a Datum into a slot with
+ * weave_vec_accum_add(); producer 2 (the merge) appends a code it MOVED verbatim
+ * with weave_vec_accum_add_encoded().  Neither knows about the other, and the
+ * writer cannot tell them apart -- which is the point: one writer, one set of
+ * statistics, no second implementation of the geometry.
  *
  * WHY THE CODE AND NOT THE VECTOR.  The build budget is what bounds a build
  * (MemoryContextMemAllocated(bs->ctx, true) in weave_build_callback), and a
@@ -300,10 +322,14 @@ typedef struct WeaveVecLane
  *	   its lanes differently.  Sorting by docid makes the weft a function of the
  *	   segment's CONTENTS, which is what that requirement means.
  *
- * It also makes warp -> docid derivable rather than lost: warp i is the i-th
- * smallest docid in the bolt, and the bolt's docids are all in its lexical weft.
- * That derivation is expensive and V8 will want it recorded instead -- see
- * doc/GAPS.md G24 -- but "expensive" and "impossible" are different problems.
+ * THE DOCID IS ALSO WRITTEN TO DISK, in the warp-map chain, and the reason is that
+ * the derivation this comment used to offer instead is FALSE.  It said warp i is
+ * the i-th smallest docid in the bolt and the bolt's docids are all in its lexical
+ * weft.  The second half does not hold: producer 1 gives a lane to every document
+ * whose LEXICAL column is non-NULL, while a document only reaches the lexical weft
+ * if it has at least one posting, and a non-NULL wdoc with no terms (empty text,
+ * stopwords only) has none.  One such document shifts every later warp's derived
+ * docid by one and nothing counts wrong.  See WeaveVecWarpHdr in weave/vecpage.h.
  */
 typedef struct WeaveVecAccum
 {
@@ -332,6 +358,102 @@ extern void weave_vec_accum_init(WeaveVecAccum *acc, MemoryContext ctx,
 extern void weave_vec_accum_reset(WeaveVecAccum *acc);
 extern void weave_vec_accum_add(WeaveVecAccum *acc, Relation index,
 								ItemPointer tid, Datum value, bool isnull);
+
+/* ---------------------------------------------------------------------------
+ * Producer 2, the merge (doc/specs/VECTOR_CHANNEL.md sect. 7.3)
+ *
+ * THE MERGE MOVES CODES AND NEVER RE-ENCODES -- and the operative half of that is
+ * NEVER RECOMPUTES THE (scale, norm) PAIR.  A code IS a fixed point of
+ * decode-then-encode (dequantizing gives the codebook levels back and re-quantizing
+ * those returns the same levels; measured in test/hegel/test_quantize.c), so
+ * re-encoding does not by itself change a byte -- but a reconstruction's norm is not
+ * its original's, so the scale a re-encode computes is a DIFFERENT number, and a lane
+ * carrying a recomputed scale dequantizes to a different vector while every statistic
+ * still recomputes self-consistently.  Idempotency is also a property of this
+ * codebook at this width: it fails the moment the output's width or TQ+ calibration
+ * differs from the input's, which is what the geometry guard below refuses.  See
+ * doc/specs/VECTOR_CHANNEL.md sect. 7.3, which stated a different (and wrong) reason
+ * until the mutation run disproved it.
+ *
+ * MEMORY, stated here because it is the one thing this producer does worse than
+ * the lexical merge it runs beside.  weave_merge_segments_streaming() is
+ * deliberately bounded to ONE TERM's postings; this accumulator holds EVERY output
+ * lane's code before the writer runs, so a vector merge is
+ * O(nvec * codebytes) resident: 480 MB of codes at a million documents, 960
+ * dimensions and 4 bits, plus 8 bytes per lane of docid and 9 of sidecar (~497 MB
+ * total), and it is charged to the merge context rather than to
+ * maintenance_work_mem.  That is acceptable at the scale the AM is tested at and
+ * it is NOT acceptable at 10M; the streaming shape (merge the input wefts as
+ * sorted-by-docid runs and write blocks as they fill) is doc/GAPS.md G25 with the
+ * threshold worked out.  Do not raise the bound without reading it.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Make an accumulator ready to take PRE-ENCODED lanes of this geometry.
+ *
+ * Separate from weave_vec_accum_init() because producer 1 learns dim from the first
+ * vector it sees and lets weave_vec_accum_add() build the quantizer, while producer
+ * 2 knows the geometry up front -- it agreed on it across the inputs before a page
+ * was written -- and has no Datum to learn it from.  Returns false when the
+ * quantizer cannot be built for (dim, bits); the caller then skips the merge rather
+ * than throwing, because this runs where VACUUM can reach it.
+ */
+extern bool weave_vec_accum_init_geom(WeaveVecAccum *acc, int dim, int bits,
+									  WeaveMetric metric, WeavePackLayout layout);
+
+/*
+ * Append one already-encoded lane: `code` is codebytes of packed code taken
+ * verbatim from an input weft, `scale` and `norm` are that lane's stored sidecar
+ * pair, `docid` is the document it belongs to.  A dead lane (no vector for this
+ * document) passes code = NULL.
+ *
+ * Does NOT sort: the writer's vec_docid_order() puts the lanes in output warp
+ * order, so a caller may append in any order and MUST NOT rely on the order it
+ * used -- the same guarantee producer 1 gets, from the same sort.
+ */
+extern void weave_vec_accum_add_encoded(WeaveVecAccum *acc, const uint8 *code,
+										float scale, float norm, uint64 docid);
+extern void weave_vec_accum_add_dead_docid(WeaveVecAccum *acc, uint64 docid);
+
+/*
+ * The geometry every input weft of a merge must agree on, and whether they do.
+ *
+ * `*nwith` counts the inputs that carry a weft.  Returns false when two of them
+ * disagree on (dim, bits, layout, metric), which is REACHABLE: `bits` is a
+ * reloption with AccessExclusiveLock and no REINDEX requirement, so ALTER INDEX
+ * ... SET (bits = 3) followed by an INSERT produces a second bolt at a second
+ * width; and a wvec column with no typmod may hold a different dim in a later
+ * bolt.  Re-quantizing to a common width is forbidden (sect. 7.3), so the caller
+ * SKIPS the merge -- the same shape as the interim rule and for the same reason:
+ * skipping is always safe, and an ereport reachable from VACUUM's cleanup is how an
+ * index becomes permanently unvacuumable (doc/GAPS.md G15, G20).
+ *
+ * Never throws, for that reason.
+ */
+extern bool weave_vec_merge_geom(Relation index, const WeaveSegMeta *segs,
+								 uint32 nsegs, WeaveVecMeta *out, uint32 *nwith);
+
+/*
+ * Move one input bolt's live lanes into `acc`.
+ *
+ * Walks the input's blocks IN ORDER and reads each one whole, which is not a
+ * pessimization: in WEAVE_PACK_LANE coordinate j of lane s is at byte j*4*bits +
+ * s*bits/8, so one lane's code touches every one of the block's pages anyway.  The
+ * codes come back through weave_vec_block_read() + weave_unpack_lane(), i.e. the
+ * pair every build already exercises, and go out through
+ * weave_vec_accum_add_encoded() unaltered.
+ *
+ * `dropped` is the caller's tombstone test, by docid; a lane whose document is
+ * dropped is not appended, which leaves the output with fewer lanes rather than a
+ * hole -- warps are dense and the warp map says which document each one is.
+ * Returns false (with nothing appended past the failure) if the input weft cannot
+ * be read; the caller must then abandon the vector half of the merge, which is why
+ * it is checked before any page is written.
+ */
+extern bool weave_vec_merge_append(Relation index, const WeaveSegMeta *src,
+								   WeaveVecAccum *acc,
+								   bool (*dropped) (void *arg, uint64 docid),
+								   void *arg, const char **why);
 
 /*
  * Write the weft and return its WEAVE_VMETA block, or InvalidBlockNumber when
@@ -381,6 +503,32 @@ extern bool weave_vec_dir_read(const WeaveVecWeft *w, uint32 blockno,
 extern bool weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno,
 								 uint8 *block, uint8 *cencode,
 								 const char **why);
+
+/*
+ * A forward cursor over a weft's warp map: warp 0's docid, then warp 1's, for all
+ * nvec of them.  Every caller walks the whole map in order -- the merge producer,
+ * weave_check()'s ascending-docid invariant, weave_vec_lanes() -- so a cursor is
+ * the honest shape, and it holds no buffer lock between calls (it copies a page's
+ * entries out) so a caller may read directory and code pages in the same loop.
+ *
+ * O(1) random access by warp is the same arithmetic (weave_vecwarp_page_index in
+ * weave/vecpage.h) and is what V8's per-returned-row lookup wants.  It is not
+ * written until it has a caller: an untested reader is worse than an absent one.
+ */
+typedef struct WeaveVecWarpCursor
+{
+	const WeaveVecWeft *w;
+	BlockNumber blk;			/* next page of the chain to read */
+	uint64	   *buf;			/* the entries of the page last read */
+	int			nbuf;
+	int			pos;
+	uint32		warp;			/* warp of buf[pos] */
+} WeaveVecWarpCursor;
+
+extern void weave_vec_warp_begin(WeaveVecWarpCursor *c, const WeaveVecWeft *w);
+extern bool weave_vec_warp_next(WeaveVecWarpCursor *c, uint64 *docid,
+								const char **why);
+extern void weave_vec_warp_end(WeaveVecWarpCursor *c);
 
 /*
  * The bolt's VECTOR weft root, from its channel descriptor, or
@@ -557,6 +705,7 @@ extern Datum wvec_l1_distance(PG_FUNCTION_ARGS);
  * comment there for why these are not in src/am/amcheck.c and why two of V7's
  * properties are not assertable from SQL without them. */
 extern Datum weave_vec_meta(PG_FUNCTION_ARGS);
+extern Datum weave_vec_lanes(PG_FUNCTION_ARGS);
 extern Datum weave_vec_blocks(PG_FUNCTION_ARGS);
 extern Datum weave_vec_strips(PG_FUNCTION_ARGS);
 

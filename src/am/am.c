@@ -1002,6 +1002,8 @@ weave_page_kind_name(WeavePageKind kind)
 			return "corpus_trigram";
 		case WEAVE_PK_VDIR:
 			return "vector_dir";
+		case WEAVE_PK_VWARP:
+			return "vector_warp";
 		case WEAVE_PK_NKINDS:
 			break;
 	}
