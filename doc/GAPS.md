@@ -916,6 +916,35 @@ Recorded rather than left unstated: "we don't have that bug" is only worth
 anything with the mechanism attached, and the next person to add a heap-reading
 path needs to know this is the constraint they are working under.
 
+### G27 — the codes chain has no block→page index, so a skipped block still costs its page reads — **OPEN 2026-09-17, found by V8**
+
+`weave_vec_block_read()` locates block `b` by walking the **entire** `WEAVE_PK_VCODES`
+chain from `codestart` and matching `blockno` on each strip. Two separate costs come
+out of that, and only the first was already written down (`src/vector/vecwrite.c`
+flags it in a comment):
+
+1. **Random access is O(pages in the weft).** A rerank window of 25 blocks costs 25
+   full chain walks. V8 sidesteps this rather than fixing it: the shuttle uses a
+   forward-only sequential cursor, so a full scan is O(pages). V10's rerank window
+   and any in-place vacuum lane update cannot sidestep it.
+2. **A skipped block cannot skip its I/O.** This is the part V8 found. Even with a
+   sequential cursor, the chain must be read to find the next link, so the
+   allowlist short-circuit saves the strip scatter and the kernel call and saves
+   **nothing** on `ReadBuffer`. Claim 3 for this channel therefore has to be stated
+   as *less scoring*, not *less I/O*, and the measured figure it rests on has to be
+   a CPU figure.
+
+Both are closed by the same thing: a per-block page pointer, or an extent-based
+directory that gives `blockno → BlockNumber`. There is a natural place for it — the
+directory record already exists per block and has room — but adding a field to
+`WeaveVecDirRec` is a **format change** (`WEAVE_VERSION`, `amcheck`, the strip
+invariants, the fuzz target), and V8 is not a format change. Sizing, so the decision
+is not re-litigated from scratch: 4 bytes × `nblocks` = 122 kB at n = 1M, 960-d,
+which is 0.02 % of the 512 MB of codes.
+
+Not yet a *correctness* gap, which is why it is here rather than blocking V8: every
+answer is right, the constant is wrong, and one claim's wording is constrained by it.
+
 ## 4. Gaps against the rest of the stack
 
 These are absences rather than regressions, and they are larger than everything in
