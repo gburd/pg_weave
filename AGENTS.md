@@ -278,6 +278,44 @@ constraint nobody had written down. Both facts were invisible to correctness
 tests. That measurement took an afternoon and would otherwise have surfaced
 months in.
 
+**10. Re-run an arm against itself before believing a difference between arms.**
+Adopted 2026-09-18 from the sibling project's review, where an 8.5 % "win" turned
+out to be a single baseline outlier. This rule indicts our own
+`bench/RESULTS_G20_MERGE_GATE.md`, which is **one run per arm**;
+`bench/RESULTS_G20_SNAPSHOT_ALLOC.md` is two and is the new house minimum. A
+between-arm delta smaller than the within-arm spread is not a result, and the
+within-arm spread is unknown until you measure it twice.
+
+**11. A number is provisional until it reproduces at a second scale**, and a
+projected ratio is not a measurement — report what was measured, or write
+"unmeasured". Corollary, learned the hard way twice in one week: **a harness can
+make a number up.** `t/007`'s four "concurrent" inserters were serial, so every
+segment-count figure this project published came through a test that was not
+testing concurrency (G28); and `bench/code_scan.c`'s stage 2 scored a whole
+32-lane block per survivor, which moved the V15 verdict three times. Before
+quoting a figure, ask what the harness would have to be doing for it to be wrong,
+and check that.
+
+**12. When a release touches tombstones, merge or vacuum, "local green" is not
+evidence.** The sibling project shipped the same P0 through a green local gate
+twice. Those paths need a run at scale — which is what `bench/aws/` and the
+`weave-bench` skill exist for — before the work counts as done.
+
+**13. Retractions get a named home, not a quiet edit.** Hard rule 8 says record
+losses as prominently as wins; this says *where*. A claim this project published
+and has since disproved gets a marked **RETRACTED** or **SUPERSEDED** note left in
+place at the point of the original claim, with the date and the mechanism —
+`bench/RESULTS_CODE_SCAN.md`'s threading note and `VECTOR_CHANNEL.md` §8a are the
+worked examples. Deleting a wrong claim destroys the evidence that the process
+works.
+
+**14. No AWS account id, VPC id, security-group id, AMI id or key name in the
+repository.** The harness takes a profile name and derives everything else; the
+sibling project needed `git-filter-repo` to undo the alternative. Related, and it
+has already paid for itself elsewhere: **pull benchmark artefacts incrementally,
+never in one final scp** — a burner expiring mid-run cost them an instance and
+zero data, because the data was already on disk.
+
 ## Where things are
 
 | subsystem | code | spec |

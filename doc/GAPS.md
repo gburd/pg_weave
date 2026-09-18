@@ -954,6 +954,28 @@ Recorded rather than left unstated: "we don't have that bug" is only worth
 anything with the mechanism attached, and the next person to add a heap-reading
 path needs to know this is the constraint they are working under.
 
+**Re-argued 2026-09-18, because the argument above was borrowing a premise.** It was
+written against pg_tre's diagnosis, which located the bug in an `amgettuple` path and
+treated `amgetbitmap` as immune. That second half does not transfer: our
+`amgetbitmap` calls `tbm_add_tuples()`, and a TID bitmap is *lossy-capable* and
+resolved by the executor through `heap_hot_search_buffer()`, so tuple-level TIDs
+handed to it are chased to their successors rather than dropped. Inheriting
+"amgetbitmap was immune" from a project whose bitmap path differs from ours is not
+an argument about our code.
+
+The immunity therefore rests on **two** properties, and both are checkable:
+
+1. *Production* — every TID we emit is a chain root. The only heap scan in the tree is
+   `table_index_build_scan()`, and posting lists store roots.
+2. *Consumption* — the only way we resolve a TID to a tuple is
+   `table_index_fetch_tuple()`, which performs the HOT walk itself. We never open a
+   buffer and read a line pointer directly.
+
+Property 2 is the one the borrowed argument skipped, and it is what makes the
+conclusion independent of which of `amgettuple` / `amgetbitmap` the planner picks. If
+someone adds a path that reads a heap page directly, property 2 is what breaks, and
+no test will say so.
+
 ### G27 — the codes chain has no block→page index, so a skipped block still costs its page reads — **OPEN 2026-09-17, found by V8**
 
 `weave_vec_block_read()` locates block `b` by walking the **entire** `WEAVE_PK_VCODES`
@@ -982,6 +1004,70 @@ which is 0.02 % of the 512 MB of codes.
 
 Not yet a *correctness* gap, which is why it is here rather than blocking V8: every
 answer is right, the constant is wrong, and one claim's wording is constrained by it.
+
+### G28 — under genuine concurrency the segment directory runs AT its cap, and the margin is a retry loop — **OPEN 2026-09-18, and it falsified a number this file published**
+
+`t/007_segment_cap.pl`'s four "concurrent" inserters **were serial.** `finish($h) for @ins`
+pumps one `IPC::Run` handle to completion while the others sit in `ClientRead` on empty
+stdin — the exact harness trap the sibling project hit and documented, already present in
+our copy of the test. Everything this file said about peak segment counts came through
+that harness.
+
+With the pumping fixed, the peak is **119–126 against a cap of 128**, not 15. Bisected
+across five configurations, so the attribution is not a guess:
+
+| tree | peak / resting |
+|---|---|
+| pre-sprint `main` | 113 / 6 and 123 / 7 |
+| + merge serialization | 119 / 7 |
+| + parallel-merge claim discipline | 120 / 6 |
+| + snapshot allocator | 119 / 7 |
+
+End page counts move by less than 0.4 % across all five, so this is **pre-existing and not
+caused by the 2026-09-18 sprint**. Two consequences:
+
+1. **G20's "four concurrent inserters independently peak at 15" is an artifact**, and so is
+   the comfort that `peak <= 64` provided. The assertion has moved to the *resting* count
+   (which is 1); the peak is now bounded by the hard cap, with the diagnostic as the
+   measurement rather than a threshold nobody had justified.
+2. **The sibling project's "max 15 against a cap of 128" is likely the same artifact**,
+   since we inherited the test's shape from them. That belongs in the upstream report.
+
+Phase B of the rewritten test — a `VACUUM` every 0.2 s against the inserters under a 300 s
+deadline — has reached **128 of 128 with no cap error**. That is not an outage:
+`weave_add_segment_with_room()` merges to make room and its retry loop is doing exactly its
+job. But the margin is the retry loop rather than the design, and a retry loop that exhausts
+`WEAVE_MAX_SEGMENTS` passes throws, which surfaces as a failed `INSERT`.
+
+Candidate lever, unmeasured and therefore not implemented: make the insert-time merge
+**block** rather than skip above some fraction of the cap, so pressure becomes back-pressure
+instead of directory growth. That is a latency-for-safety trade and it needs its own
+measurement before anyone picks a fraction (hard rule 9).
+
+### Checked and NOT a gap, then made into one by our own change: the recyclability liveness gate
+
+Worth recording as a pair, because the sequence is the lesson.
+
+`weave_page_recyclable()` returns `true` for a page with no `WEAVE_FREED` flag — the same
+shape as a bug the sibling project fixed in 1.8.3, where a live page was handed out as merge
+output and the merge self-deadlocked on its own buffer. I checked it on 2026-09-18 and
+concluded **not a gap**, with a mechanism: the only writer of "free" into the FSM is
+`weave_free_page()`, which sets the flag first; both allocator paths clear the FSM entry on
+handout (`RecordUsedIndexPage`, and `GetFreeIndexPage` removes it by construction);
+`RelationTruncate` truncates the FSM; and every acquisition uses `ConditionalLockBuffer`, so
+a backend cannot be handed a page it already holds — it takes the contended branch instead of
+deadlocking.
+
+**That reasoning was correct, and the snapshot allocator invalidated it the same day.** A
+snapshot entry can be taken and filled by another backend between the snapshot and the
+handout, and `GetPageWithFreeSpace()` can hand one block to two backends: the snapshot is
+itself a new staleness window, which is exactly the premise whose absence the "not a gap"
+verdict rested on. The liveness gate now runs **before** the AccessExclusiveLock bypass.
+
+The generalizable part: **a "not a gap" verdict is only valid against the code that was there
+when it was made,** and it should name the property it depends on so the change that breaks
+the property is forced to notice. This one depended on "nothing advertises a page as free
+except the free path", and the fix in the very next commit added something that did.
 
 ## 4. Gaps against the rest of the stack
 
