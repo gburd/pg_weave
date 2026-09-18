@@ -856,16 +856,73 @@ typedef struct TidSet
  * src/pages/trgm_page.c.
  *
  * weave_alloc_extend_only is a process-wide mode flag on the page allocator, not
- * a parameter: weave_new_buffer() consults it, and the three callers that need
- * pages to come off the END of the file rather than the free list
- * (weave_merge_all's low-bias end-of-build merge in ambuild.c, weave_merge_
- * segments' likewise, and weave_compact_to_one's relocation pass in amvacuum.c)
- * set it around a region and restore the previous value.  It was a file-scope
- * static in the unity build and is a global for exactly the same reason
- * everything else in this section is declared: it now crosses a file boundary.
- * Save-and-restore, not set-and-clear -- the regions nest.
+ * a parameter: weave_new_buffer() consults it, and the caller that needs pages to
+ * come off the END of the file rather than the free list
+ * (weave_compact_to_one's relocation pass in amvacuum.c) sets it around a region
+ * and restores the previous value.  It was a file-scope static in the unity build
+ * and is a global for exactly the same reason everything else in this section is
+ * declared: it now crosses a file boundary.  Save-and-restore, not
+ * set-and-clear -- the regions nest.
+ *
+ * weave_alloc_no_fsm is the other half of SNAPSHOT allocation (see
+ * weave_alloc_snapshot_enter below): it suppresses the live-FSM fallback, so the
+ * only reuse is from the snapshot gathered at scope entry.
  */
 extern bool weave_alloc_extend_only;
+extern bool weave_alloc_no_fsm;
+
+/*
+ * Saved allocator state for one nested allocation scope.  The allocator's state
+ * is a handful of file-scope variables in am.c (the low-free snapshot and the two
+ * mode flags), and the regions nest, so a scope saves the whole of it rather than
+ * one flag.  Opaque to callers except as a stack variable.
+ */
+typedef struct WeaveAllocScope
+{
+	BlockNumber *lowfree;
+	int			lowfree_n;
+	int			lowfree_i;
+	bool		extend_only;
+	bool		no_fsm;
+	bool		giveup;			/* snapshot abandoned by the bounded probe */
+	int			probe_at_entry;
+	uint64		reuse_at_entry;
+} WeaveAllocScope;
+
+/*
+ * Enter SNAPSHOT allocation: gather the free list ONCE, now, and for the rest of
+ * the scope hand out only from that snapshot, then extend.  Never re-consult the
+ * live FSM.  Leave with weave_alloc_scope_leave(), which restores the enclosing
+ * scope's state.
+ *
+ * THIS IS WHAT MAKES REUSE SAFE INSIDE A MERGE LOOP, and it replaced the
+ * extend-only mode that made it merely impossible.  The hazard is precise: a
+ * committed merge frees its input pages, and if the NEXT merge in the same loop
+ * took one of those blocks for its output while a reader of ours still threads
+ * through it (an on-page nextblk pointing into a rewritten or past-EOF block),
+ * the result is a wrong read or a SIGBUS.  Extend-only is exact against that and
+ * over-approximates badly: it also refuses pages freed by EARLIER calls, already
+ * committed, with no reader of ours anywhere near them -- which on a body index
+ * over term-rich documents is nearly all of them, because every oversized
+ * document mints a segment and merges, so the merge is the dominant writer.
+ *
+ * A snapshot taken BEFORE this call frees anything cannot contain a page this
+ * call goes on to free, so merge N cannot hand its freed pages to merge N+1 by
+ * construction, while pages from previous calls are in the snapshot and are
+ * reused.  weave_page_recyclable() still gates every candidate.
+ *
+ * Two preconditions, both held by every caller today and neither optional:
+ *   - the caller holds the maintenance mutex (weave_maintenance_lock), so no
+ *     other backend frees, merges, compacts or TRUNCATES this index while the
+ *     snapshot is in hand.  A truncation would leave the snapshot holding blocks
+ *     past EOF.
+ *   - no parallel worker of this operation is allocating concurrently.  The
+ *     allocator is backend-local, so the leader's snapshot does not remove a
+ *     block from the FSM that a worker can then also take.  weave_merge_all()
+ *     therefore enters the scope AFTER its parallel pass, not around it.
+ */
+extern void weave_alloc_snapshot_enter(Relation index, WeaveAllocScope *saved);
+extern void weave_alloc_scope_leave(const WeaveAllocScope *saved);
 
 extern void weave_alloc_begin(Relation index);
 extern void weave_alloc_end(void);
