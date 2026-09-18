@@ -3632,6 +3632,8 @@ weave_merge_all(Relation index, bool try_parallel)
 	int			guard;
 	bool		saved_extend_only = weave_alloc_extend_only;
 
+	weave_assert_merge_serialized(index);
+
 	/*
 	 * Try a parallel merge first (unless already inside a parallel operation,
 	 * e.g. the parallel build leader -- no nested parallelism).  It compacts
@@ -3757,6 +3759,21 @@ weave_build_finalize(Relation index)
 	WeaveMetaPageData meta;
 
 	/*
+	 * UNDER THE MAINTENANCE MUTEX, like every other merger.  A plain CREATE
+	 * INDEX holds AccessExclusiveLock and nothing else can see this index, so
+	 * the mutex is free and redundant there; a CREATE INDEX CONCURRENTLY holds
+	 * only ShareUpdateExclusiveLock, the not-yet-valid index IS visible to
+	 * autovacuum's index cleanup, and that cleanup merges -- so here the mutex
+	 * is required, not decorative.  Cheap either way: uncontended in the common
+	 * case, and taken once per build.
+	 *
+	 * This site was found by weave_assert_merge_serialized() rather than by
+	 * reading the code, which is the argument for having that check at all.
+	 */
+	weave_maintenance_lock(index);
+	PG_TRY();
+	{
+	/*
 	 * Bounded size-tiered merge (LSM), serial.  We do NOT start a parallel
 	 * merge context here: this runs inside ambuild, after the build-scan's own
 	 * parallel context was torn down (weave_end_parallel), and re-entering
@@ -3800,6 +3817,12 @@ weave_build_finalize(Relation index)
 		elog(LOG, "pg_weave build: index \"%s\": leaving %d size-tiered segments (%lu MB > collapse cap %d MB); run weave_merge('%s') to collapse to one",
 			 RelationGetRelationName(index), nseg, (unsigned long) sizemb,
 			 pg_weave_build_collapse_max_mb, RelationGetRelationName(index));
+	}
+	PG_FINALLY();
+	{
+		weave_maintenance_unlock(index);
+	}
+	PG_END_TRY();
 }
 
 void
@@ -3807,6 +3830,8 @@ weave_merge_segments(Relation index)
 {
 	int			guard;
 	bool		saved_extend_only = weave_alloc_extend_only;
+
+	weave_assert_merge_serialized(index);
 
 	/*
 	 * Leveled (HanoiDB/LSM) compaction: each pass, assign every live segment a

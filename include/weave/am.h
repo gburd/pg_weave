@@ -620,10 +620,20 @@ weave_docid_to_tid(uint64 docid, ItemPointer tid)
  * A heavyweight page lock on the metapage block, used for NOTHING else, gives a
  * per-index mutex independent of the relation lock (exactly how GIN serializes
  * pending-list cleanup).  Explicit/required maintenance (VACUUM cleanup,
- * weave_merge, weave_vacuum) takes it blocking; opportunistic maintenance (the
+ * weave_merge, weave_vacuum, a build's finalize, and the insert path's
+ * full-directory merge) takes it blocking; opportunistic maintenance (the
  * insert-triggered tiered merge) takes it CONDITIONALLY and simply skips when a
  * cleanup is already running -- another writer or the next insert/vacuum will
  * compact, so nsegments still stays bounded.
+ *
+ * Blocking and conditional differ in whether the caller has an alternative.  The
+ * opportunistic merge does: skipping it costs a slightly longer segment
+ * directory.  weave_add_segment_with_room() does not: its alternative is to
+ * refuse the INSERT, which is the outage that function exists to prevent.
+ *
+ * The lock is re-entrant in the ordinary heavyweight sense -- a caller that
+ * already holds it (weave_flush_pending -> weave_add_segment_with_room) gets it
+ * again for free -- so a nested acquisition is a reference count, not a wait.
  */
 static inline void
 weave_maintenance_lock(Relation index)
@@ -641,6 +651,39 @@ static inline void
 weave_maintenance_unlock(Relation index)
 {
 	UnlockPage(index, WEAVE_METAPAGE_BLKNO, ExclusiveLock);
+}
+
+/*
+ * Every merger must run under the maintenance mutex above -- or on an index no
+ * other backend can reach, which for this AM means AccessExclusiveLock (plain
+ * CREATE INDEX, REINDEX, weave_vacuum).
+ *
+ * ENFORCED RATHER THAN DOCUMENTED, because the comment form of this rule was
+ * already in the tree and two callers still did not follow it: the insert path's
+ * full-directory merge (weave_add_segment_with_room) and CREATE INDEX
+ * CONCURRENTLY's weave_build_finalize, which holds only
+ * ShareUpdateExclusiveLock and so can run beside an autovacuum merge on the same
+ * index.  The sibling project found its second site the same way -- by adding
+ * this check, not by reading the code again.
+ *
+ * elog(ERROR), not Assert(): the gate that matters is a release build, and an
+ * unserialized merger's symptom (two mergers handing out the same block once
+ * merges reuse freed pages) is a hang, which is the single hardest failure to
+ * attribute after the fact.  ERRCODE_INTERNAL_ERROR is right here -- no client
+ * can do anything about it and reaching it is a programming error, which is
+ * exactly what elog is for.
+ */
+static inline void
+weave_assert_merge_serialized(Relation index)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_PAGE(tag, index->rd_lockInfo.lockRelId.dbId,
+					 index->rd_lockInfo.lockRelId.relId, WEAVE_METAPAGE_BLKNO);
+	if (unlikely(!LockHeldByMe(&tag, ExclusiveLock, false) &&
+				 !CheckRelationLockedByMe(index, AccessExclusiveLock, true)))
+		elog(ERROR, "pg_weave: merge entered without the maintenance mutex on index \"%s\"",
+			 RelationGetRelationName(index));
 }
 /* --- doclen sidecar: the on-page block header (written by ambuild.c,
  * read by am.c's cursor) -------------------------------------------------- */

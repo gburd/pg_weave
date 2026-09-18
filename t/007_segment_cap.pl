@@ -15,6 +15,10 @@
 # each) to blow WAY past 128 segments, from several concurrent inserters plus a
 # concurrent reader, and asserts: no insert ever hit the cap error, and every
 # inserted row is searchable afterward.
+#
+# It also runs a repeated VACUUM alongside them, under a deadline, which is the
+# only arm in the suite that exercises TWO backends merging the same index at once
+# -- see the long comment at that arm for what it does and does not prove.
 
 use strict;
 use warnings;
@@ -85,6 +89,11 @@ END $$;
 
 sub psql_proc {
     my ($sql) = @_;
+    # Terminate the script with \q.  With stdin fed from a scalar and pumped
+    # non-blocking, psql otherwise sits in ClientRead forever after its last
+    # statement, pumpable() never goes false, and the deadline loop below cannot
+    # tell that from the hang it is hunting.  (Upstream hit this for real.)
+    $sql .= "\n\\q\n" unless $sql =~ /\\q\s*$/;
     my ($in, $out, $err) = ($sql, '', '');
     my $h = start(['psql', '-X', '-v', 'ON_ERROR_STOP=0', '-d', $node->connstr('postgres')],
                   '<', \$in, '>', \$out, '2>', \$err);
@@ -97,11 +106,68 @@ my @ins;
 push @ins, [ psql_proc(inserter_sql($_)) ] for (1 .. 4);
 my ($rh, $rout, $rerr) = psql_proc($reader_sql);
 
-finish($_->[0]) for @ins;
-finish($rh);
+# ...plus a CONCURRENT VACUUM, which runs the index cleanup's merge in its own
+# backend while the inserters' full-directory merges run in theirs.
+#
+# This is the arm that makes the merge-serialization rule falsifiable.  Until the
+# maintenance mutex was taken by weave_add_segment_with_room() (the insert path's
+# "directory is full, merge to make room") and by weave_build_finalize(), those two
+# were the only mergers in the tree that ran with no mutex, so an insert-path merge
+# could run concurrently with VACUUM's cleanup merge on the same index.
+#
+# What that costs TODAY is bounded and is deliberately not overstated here: merge
+# output is allocated extend-only, so two mergers are never handed the same block,
+# and weave_merge_selected() re-verifies its inputs under the metapage buffer lock
+# and abandons if another merge consumed them -- a wasted merge and a leaked output
+# segment, not a deadlock.  It becomes a deadlock as soon as merges reuse freed
+# pages (the snapshot allocator), because then both mergers draw from one free list
+# and hand out the same block; the sibling project observed exactly that, an INSERT
+# and an autovacuum worker both parked on one buffer's content lock.
+#
+# Repeated VACUUMs rather than one, because the window is narrow: the inserters take
+# seconds to fill the directory and cleanup has to be merging AT that moment.
+my $vac_sql = join("\n", map { "VACUUM docs;\nSELECT pg_sleep(0.2);" } 1 .. 40);
+my ($vh, $vout, $verr) = psql_proc($vac_sql);
+
+# If a merge deadlock is present, nothing below returns.  IPC::Run's finish() has
+# no timeout of its own, so bound the whole phase: a hang is the FAILURE this arm
+# exists to detect and it must surface as a failed test, not as a CI job that is
+# killed 30 minutes later with no diagnosis.
+my @all = (@ins, [ $rh, $rout, $rerr ], [ $vh, $vout, $verr ]);
+my $deadline = time() + 300;
+my $hung = 0;
+# Pump EVERY handle each iteration.  Pumping one at a time starves the others --
+# their psql never receives its stdin -- and because the inserters contend on the
+# segment directory they need each other to make progress, so one-at-a-time pumping
+# MIMICS this very deadlock on correct code.  Upstream chased that for a while; the
+# wait events said ClientRead, which is what gave it away.
+while (time() < $deadline) {
+    my $live = 0;
+    for my $p (@all) {
+        next unless $p->[0]->pumpable;
+        $live++;
+        $p->[0]->pump_nb;
+    }
+    last if $live == 0;
+    select(undef, undef, undef, 0.1);
+}
+$hung = 1 if time() >= $deadline;
+if ($hung) {
+    diag('HUNG: inserters + concurrent VACUUM did not finish in 300s'
+         . ' (concurrent-merge deadlock)');
+    diag($node->safe_psql('postgres',
+        q{SELECT pid, wait_event_type, wait_event, left(query, 40) FROM pg_stat_activity
+           WHERE backend_type IN ('client backend', 'autovacuum worker')
+             AND pid <> pg_backend_pid()}));
+    $_->[0]->kill_kill for @all;
+}
+else {
+    finish($_->[0]) for @all;
+}
+is($hung, 0, 'inserters filling the segment directory and a concurrent VACUUM both finish (no concurrent-merge deadlock)');
 
 my $ins_err = join("\n", map { ${ $_->[2] } } @ins);
-my $all_err = "$ins_err\n$$rerr";
+my $all_err = "$ins_err\n$$rerr\n$$verr";
 
 # THE assertion: no write ever failed because the directory filled.
 my $cap_hit = ($all_err =~ /maximum of \d+ segments|reached the maximum|could not free a segment-directory slot/i) ? 1 : 0;
