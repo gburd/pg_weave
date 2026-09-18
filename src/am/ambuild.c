@@ -2765,7 +2765,13 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 		tbs.want_positions = bs->want_positions;
 		tbs.lexattno = bs->lexattno;
 		tbs.vecattno = 0;
-		weave_vec_accum_init(&tbs.vec, termctx, false, WEAVE_VEC_DEFAULT_BITS,
+		/* Inactive (active = false), so no weft is written and this width is
+		 * never read -- it gets the reloption's real value anyway, because the
+		 * day doc/GAPS.md G23 closes is the day `active` flips to true on
+		 * exactly these paths, and a hardcoded default would then silently
+		 * produce default-width codes for an index built with another width. */
+		weave_vec_accum_init(&tbs.vec, termctx, false,
+							 weave_index_vec_bits(index),
 							 WEAVE_METRIC_L2);
 		tbs.want_trigrams = bs->want_trigrams;
 		tbs.terms = NULL;
@@ -4224,6 +4230,77 @@ weave_end_parallel(WeaveLeader *weaveleader)
 	return worker_tuples;
 }
 
+/*
+ * Refuse an unlogged relation, because pg_weave cannot initialize the init fork
+ * an unlogged index needs.
+ *
+ * WHY AN UNLOGGED INDEX NEEDS A WRITTEN INIT FORK.  Crash recovery resets an
+ * unlogged relation's main fork FROM its init fork: ResetUnloggedRelations()
+ * deletes the main fork and copies the init fork over it.  So the init fork has
+ * to contain a valid EMPTY index.  An init fork left at zero blocks yields a
+ * zero-block main fork, and a weave index whose block 0 does not exist is not an
+ * empty index, it is a corrupt one -- every reader starts at the metapage.
+ *
+ * WHY GenericXLog CANNOT WRITE IT, which is the interesting part.  The plumbing
+ * is fine: a Buffer from ReadBufferExtended(index, INIT_FORKNUM, P_NEW, ...)
+ * carries its fork number in the buffer tag, XLogRegisterBuffer() records it,
+ * and generic_redo() -> XLogReadBufferForRedo() replays into that same fork.
+ * What defeats it is one line of policy in
+ * src/backend/access/transam/generic_xlog.c: GenericXLogStart() sets
+ * `isLogged = RelationNeedsWAL(relation)`, RelationNeedsWAL() is false for
+ * RELPERSISTENCE_UNLOGGED, and GenericXLogFinish() then takes its "unlogged
+ * relation: skip xlog-related stuff" branch and emits NO WAL AT ALL.  There is
+ * no way to override it: GenericXLogState is private to that file and the API
+ * has no flag.  Everywhere else in the backend that writes an init fork adds an
+ * explicit exception for it -- smgr_bulk_start_rel() passes
+ * `RelationNeedsWAL(rel) || forknum == INIT_FORKNUM`, RelationCopyStorageUsingBuffer()
+ * uses `permanent || forkNum == INIT_FORKNUM`, and PinBufferForBlock() sets
+ * BM_PERMANENT on `relpersistence == RELPERSISTENCE_PERMANENT || forkNum ==
+ * INIT_FORKNUM`.  GenericXLog has no such clause.
+ *
+ * Which means the core AMs are not a template we can copy.  btbuildempty() and
+ * spgbuildempty() get their WAL from log_newpage_buffer() or from the bulk-write
+ * facility, both forbidden by AGENTS.md hard rule 2.  contrib/bloom -- the one
+ * in-core GenericXLog access method -- DOES write its init fork through
+ * ReadBufferExtended + GenericXLog (PG 16+, commit ccadf73163), and therefore
+ * depends on the init-fork buffer being BM_PERMANENT, i.e. on a checkpoint,
+ * rather than on WAL.  That leaves a window between the CREATE INDEX commit and
+ * the next checkpoint in which a crash loses the metapage, and it gives a
+ * standby or a pg_basebackup nothing at all.  Copying bloom would trade a loud
+ * refusal for a quiet corruption, which is the worse of the two.
+ *
+ * SO WE REFUSE, rather than violate hard rule 2 -- 100% GenericXLog is what
+ * makes crash safety auditable by inspection and the extension `trusted`, and
+ * it is not tradeable for a feature nothing in this tree used or tested.
+ *
+ * THE ROUTE TO REAL UNLOGGED SUPPORT, if it is ever wanted, stays inside rule 2:
+ * teach every reader to treat a zero-block main fork as a valid empty index and
+ * initialize the metapage lazily under the extension lock on first insert.  Then
+ * an init fork of zero blocks -- which index_build()'s own smgrcreate() already
+ * produces, and which its log_smgrcreate() already WAL-logs -- is a correct
+ * empty index and ambuildempty() legitimately does nothing.  That is a design
+ * change across every page reader, not a bug fix, so it is not done here.
+ *
+ * TEMP indexes are deliberately unaffected.  RelationNeedsWAL() is false for
+ * them too, so they also get no WAL, but a temp relation is discarded on crash
+ * and never has an init fork: there is nothing to recover and ambuildempty() is
+ * never called for one.  Hence the test below is on RELPERSISTENCE_UNLOGGED
+ * specifically and not on RelationNeedsWAL(), which would refuse temp indexes
+ * for a hazard they do not have.
+ */
+static void
+weave_reject_unlogged(Relation index)
+{
+	if (index->rd_rel->relpersistence != RELPERSISTENCE_UNLOGGED)
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("access method \"weave\" does not support unlogged relations"),
+			 errdetail("Crash recovery rebuilds an unlogged relation's main fork from its init fork, and pg_weave writes every page through GenericXLog, which emits no WAL for an unlogged relation and so cannot initialize that fork."),
+			 errhint("Use a permanent or a temporary table.")));
+}
+
 IndexBuildResult *
 weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 {
@@ -4231,6 +4308,14 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	WeaveBuildState bs;
 	double		reltuples;
 	WeaveLeader *weaveleader = NULL;
+
+	/*
+	 * Before any page is written, and before any worker is launched: an
+	 * unlogged index would need an init fork we cannot produce.  This is also
+	 * the check that covers ALTER TABLE ... SET UNLOGGED, which rebuilds the
+	 * indexes through this same callback.
+	 */
+	weave_reject_unlogged(index);
 
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "index \"%s\" already contains data",
@@ -4351,10 +4436,33 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	return result;
 }
 
+/*
+ * ambuildempty: initialize the INIT fork of an unlogged index.
+ *
+ * UNREACHABLE, because weave_build() has already refused the relation by the
+ * time index_build() gets here -- see weave_reject_unlogged() above for why we
+ * refuse rather than write this fork.  index_build() calls ambuildempty only
+ * for RELPERSISTENCE_UNLOGGED, so a non-unlogged relation arriving here means
+ * the AM contract changed under us, which is an elog case and not a user error.
+ *
+ * WHAT USED TO BE HERE, because the shape of the mistake is worth keeping: a
+ * bare weave_init_metapage(index) call.  That writes block 0 of the MAIN fork,
+ * a fork ambuild has already filled by this point, so the Assert in
+ * weave_init_metapage() fired in an assert build, and in a release build the
+ * call appended a stray metapage to -- or, if the build left a page in the FSM,
+ * overwrote a live page of -- a perfectly good index, while the init fork the
+ * function was supposed to write stayed empty.  The identical bug existed in
+ * contrib/bloom until Tom Lane fixed it in 2016 (abaffa9075, bug #14155:
+ * "blbuildempty did not do even approximately the right thing: it tried to add
+ * a metapage to the relation's regular data fork, which already has one at that
+ * point").  We inherited the shape of the bug without inheriting its fix.
+ */
 void
 weave_buildempty(Relation index)
 {
-	weave_init_metapage(index);
+	weave_reject_unlogged(index);
+	elog(ERROR, "weave_buildempty called for index \"%s\", which is not unlogged",
+		 RelationGetRelationName(index));
 }
 
 /*
@@ -4445,7 +4553,9 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
 	 * written for this segment, which costs zero bytes and leaves the row absent
 	 * from vector answers rather than present with a wrong vector. */
 	bs.vecattno = 0;
-	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS,
+	/* Inactive, so this width is dead data today -- passed for real anyway, for
+	 * the reason given on the same call in weave_merge_segments_streaming(). */
+	weave_vec_accum_init(&bs.vec, bs.ctx, false, weave_index_vec_bits(index),
 						 WEAVE_METRIC_L2);
 	bs.terms = NULL;
 	bs.nterms = 0;
@@ -4730,7 +4840,9 @@ weave_flush_pending(Relation index)
 	 * than papered over -- writing a weft of dead lanes would claim to cover these
 	 * documents, which is worse than not claiming to. */
 	bs.vecattno = 0;
-	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS,
+	/* Inactive, so this width is dead data today -- passed for real anyway, for
+	 * the reason given on the same call in weave_merge_segments_streaming(). */
+	weave_vec_accum_init(&bs.vec, bs.ctx, false, weave_index_vec_bits(index),
 						 WEAVE_METRIC_L2);
 	bs.terms = NULL;
 	bs.nterms = 0;
