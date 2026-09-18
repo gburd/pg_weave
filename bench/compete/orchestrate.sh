@@ -24,7 +24,7 @@
 #
 set -uo pipefail
 
-PROFILE=${AWS_PROFILE:-lava}
+PROFILE=${AWS_PROFILE:-hotdog}
 CORPUS=${1:?usage: orchestrate.sh <corpus> <engine> [engine ...]}
 shift
 ENGINES=("$@")
