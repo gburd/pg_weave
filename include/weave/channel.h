@@ -110,6 +110,18 @@ typedef struct WeaveShuttle WeaveShuttle;
  */
 typedef struct WeaveShuttleOps
 {
+	/*
+	 * Advance to the first position >= target that this channel can contribute
+	 * to, or WEAVE_WARP_END.  Monotone: (C1).
+	 *
+	 * NOT IDEMPOTENT, and V8's implementation made that concrete: a channel is
+	 * entitled to reject a target below its current position outright, because a
+	 * forward-only cursor over a page chain cannot honour one and returning the
+	 * current position instead would let a fused-loop bug become a wrong answer
+	 * rather than an error.  So seek(p) twice is not guaranteed to be legal --
+	 * the second call is a backward seek whenever the first returned more than p.
+	 * A caller must remember what it was given back.
+	 */
 	WeaveWarp	(*seek) (WeaveShuttle *s, WeaveWarp target);
 	float4		(*block_max) (WeaveShuttle *s);
 	float4		(*score) (WeaveShuttle *s);
@@ -118,7 +130,17 @@ typedef struct WeaveShuttleOps
 	 * worth of candidates more cheaply than one seek() per position -- the
 	 * vector code scan does 32 lanes in a few SIMD instructions.  When present,
 	 * the scorer prefers it.  Writes at most nwarp entries into out[] and
-	 * returns the count. */
+	 * returns the count.
+	 *
+	 * `nwarp` carries TWO obligations and V8 found them conflated, so they are
+	 * spelled out: it is the capacity of out[], AND -- when `allow` is non-NULL --
+	 * it fixes the extent the bitmap must cover.  `allow` is indexed by ABSOLUTE
+	 * warp, the same convention as weave/kernels.h, so a caller passing `allow`
+	 * must guarantee at least `first + nwarp` bits exist.  Saying only "writes at
+	 * most nwarp entries" left the bitmap's length unstated next to an index that
+	 * comes off a page, which is the unbounded out-of-bounds read that
+	 * kernels.h refuses to permit and doc/CONVENTIONS.md rule 2 forbids.  A
+	 * channel that cannot satisfy it must raise, not clamp. */
 	int			(*score_block) (WeaveShuttle *s, WeaveWarp first, int nwarp,
 								const uint64 *allow, float4 *out);
 
@@ -165,9 +187,11 @@ struct WeaveShuttle
 	void	   *state;			/* channel-private */
 };
 
-/* Convenience wrappers.  Apply the weight in exactly one place, here, so that
+/*
+ * Convenience wrappers.  Apply the weight in exactly one place, here, so that
  * (C2) survives weighting: w * bound >= w * score for w >= 0, and w < 0 is
- * rejected at parse time. */
+ * rejected at parse time.
+ */
 static inline WeaveWarp
 weave_shuttle_seek(WeaveShuttle *s, WeaveWarp target)
 {
@@ -186,6 +210,42 @@ weave_shuttle_score(WeaveShuttle *s)
 {
 	s->nscore++;
 	return s->weight * s->ops->score(s);
+}
+
+/*
+ * The bulk path, weighted -- and it did not exist until V8 pointed out that its
+ * absence was a trap.  score() and block_max() are weighted by their wrappers
+ * above; score_block() is the path the scorer PREFERS, so a fused loop that
+ * reached for the fast one got unweighted scores sitting next to weighted
+ * bounds, and the arithmetic would have been wrong in the direction that keeps
+ * looking plausible.  Weighting here rather than in each channel is the same
+ * argument as above: one place, so (C2) survives it.
+ *
+ * WEAVE_SCORE_NEVER must survive the multiply, which it does for w > 0 and which
+ * is why w = 0 has no business reaching a shuttle: 0 * -inf is NaN, and a NaN
+ * score compares false against every threshold, so it would be silently dropped
+ * rather than skipped.  A zero-weighted channel must be left out of the fusion,
+ * not weighted to nothing.
+ */
+static inline int
+weave_shuttle_score_block(WeaveShuttle *s, WeaveWarp first, int nwarp,
+						  const uint64 *allow, float4 *out)
+{
+	int			n;
+	int			i;
+
+	if (s->ops->score_block == NULL)
+		return -1;
+
+	n = s->ops->score_block(s, first, nwarp, allow, out);
+	s->nscore += n;
+
+	if (s->weight != 1.0f)
+	{
+		for (i = 0; i < n; i++)
+			out[i] = s->weight * out[i];
+	}
+	return n;
 }
 
 #endif							/* WEAVE_CHANNEL_H */
