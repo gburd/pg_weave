@@ -5823,3 +5823,208 @@ SELECT count(*) = 200 AS phrase_ok FROM zold WHERE d @@@ '"vacuum lock"'::wquery
 
 RESET enable_seqscan;
 DROP TABLE zold;
+-- ============================================================================
+-- Intra-word '-', '.' and '/' are TERM bytes, not operators.
+--
+-- to_wquery('pkg-config') used to parse as ('pkg' & !'config'): the NOT clause
+-- actively EXCLUDED the documents being searched for, so a search for
+-- pkg-config returned everything except pkg-config (upstream pg_fts measured
+-- install-info matching 1 row instead of 10).  '/' was worse -- it opened a
+-- /regex/ and swallowed the rest of the query -- and '.' split the term.  A
+-- silently wrong row set is a worse failure than a parse error.
+--
+-- The separator set is what the CONFIGURED document analyzer joins, pinned
+-- here: '-', '.' and '/' stay inside a token while '_' and '+' split.  The
+-- built-in 1-arg analyzer splits on every non-alphanumeric byte, which is the
+-- one place the two analyzers disagree -- pinned too, so a change to either
+-- side shows up as a diff rather than as silently unmatchable query terms.
+-- ============================================================================
+SELECT to_wdoc('simple','a-b c/d e.f g_h i+j')::text AS cfg_analyzer_joins;
+                              cfg_analyzer_joins                               
+-------------------------------------------------------------------------------
+ 'a':1@2 'a-b':1@1 'b':1@3 'c/d':1@4 'e.f':1@5 'g':1@6 'h':1@7 'i':1@8 'j':1@9
+(1 row)
+
+SELECT to_wdoc('a-b c/d e.f g_h i+j')::text AS builtin_analyzer_splits;
+                             builtin_analyzer_splits                              
+----------------------------------------------------------------------------------
+ 'a':1@1 'b':1@2 'c':1@3 'd':1@4 'e':1@5 'f':1@6 'g':1@7 'h':1@8 'i':1@9 'j':1@10
+(1 row)
+
+-- parsed form: the separator is part of the term, on both parse paths
+SELECT to_wquery('pkg-config')::text AS hyphen_is_literal;
+ hyphen_is_literal 
+-------------------
+ 'pkg-config'
+(1 row)
+
+SELECT to_wquery('install-info')::text AS hyphen_is_literal2;
+ hyphen_is_literal2 
+--------------------
+ 'install-info'
+(1 row)
+
+SELECT to_wquery('foo/bar')::text AS slash_is_literal;
+ slash_is_literal 
+------------------
+ 'foo/bar'
+(1 row)
+
+SELECT to_wquery('a.b')::text AS dot_is_literal;
+ dot_is_literal 
+----------------
+ 'a.b'
+(1 row)
+
+SELECT to_wquery('python3.14')::text AS dot_is_literal2;
+ dot_is_literal2 
+-----------------
+ 'python3.14'
+(1 row)
+
+SELECT to_wquery('simple','pkg-config')::text AS hyphen_literal_cfg;
+ hyphen_literal_cfg 
+--------------------
+ 'pkg-config'
+(1 row)
+
+SELECT to_wquery('simple','install-info | pkg-config')::text AS both_literal_cfg;
+        both_literal_cfg         
+---------------------------------
+ ('install-info' | 'pkg-config')
+(1 row)
+
+-- suffixes still bind to the whole term
+SELECT to_wquery('simple','pkg-config*')::text AS prefix_of_hyphenated;
+ prefix_of_hyphenated 
+----------------------
+ 'pkg-config'*
+(1 row)
+
+SELECT to_wquery('simple','pkg-config:A')::text AS label_on_hyphenated;
+ label_on_hyphenated 
+---------------------
+ 'pkg-config':A
+(1 row)
+
+SELECT to_wquery('simple','"pkg-config tool"')::text AS phrase_with_hyphenated;
+  phrase_with_hyphenated   
+---------------------------
+ ('pkg-config' <-> 'tool')
+(1 row)
+
+-- the operators these bytes still are: only a separator FLANKED by word
+-- characters is literal, so prefix '-' is NOT and a standalone /re/ is a regex
+SELECT to_wquery('-b')::text AS leading_minus_is_not;
+ leading_minus_is_not 
+----------------------
+ !'b'
+(1 row)
+
+SELECT to_wquery('a -b')::text AS prefix_minus_is_not;
+ prefix_minus_is_not 
+---------------------
+ ('a' & !'b')
+(1 row)
+
+SELECT to_wquery('a - b')::text AS spaced_minus_is_not;
+ spaced_minus_is_not 
+---------------------
+ ('a' & !'b')
+(1 row)
+
+SELECT to_wquery('a-(b)')::text AS minus_before_nontoken_is_not;
+ minus_before_nontoken_is_not 
+------------------------------
+ ('a' & !'b')
+(1 row)
+
+SELECT to_wquery('/^ab.*$/')::text AS regex_still_parses;
+ regex_still_parses 
+--------------------
+ /^ab.*$/
+(1 row)
+
+-- a trailing separator is dropped (to_tsvector and our analyzer both do that)
+SELECT to_wquery('c++')::text AS trailing_plus_drops;
+ trailing_plus_drops 
+---------------------
+ 'c'
+(1 row)
+
+SELECT to_wquery('gtk+')::text AS trailing_plus_drops2;
+ trailing_plus_drops2 
+----------------------
+ 'gtk'
+(1 row)
+
+SELECT to_wquery('foo-')::text AS trailing_minus_is_still_not;   -- ERROR: NOT with no operand
+ERROR:  syntax error in wquery: "foo-"
+-- end to end: the query now matches the document it was typed for
+SELECT to_wdoc('simple','the pkg-config tool') @@@ to_wquery('simple','pkg-config') AS hyphen_matches_doc;   -- t
+ hyphen_matches_doc 
+--------------------
+ t
+(1 row)
+
+SELECT to_wdoc('simple','see foo/bar path') @@@ to_wquery('simple','foo/bar') AS slash_matches_doc;          -- t
+ slash_matches_doc 
+-------------------
+ t
+(1 row)
+
+SELECT to_wdoc('simple','python3.14 release') @@@ to_wquery('simple','python3.14') AS dot_matches_doc;       -- t
+ dot_matches_doc 
+-----------------
+ t
+(1 row)
+
+-- negation is unchanged: excludes when present, matches when absent
+SELECT to_wdoc('simple','only a here') @@@ to_wquery('simple','a -b') AS neg_matches_when_absent;   -- t
+ neg_matches_when_absent 
+-------------------------
+ t
+(1 row)
+
+SELECT to_wdoc('simple','a and b here') @@@ to_wquery('simple','a -b') AS neg_excludes_when_present; -- f
+ neg_excludes_when_present 
+---------------------------
+ f
+(1 row)
+
+-- ...and the row set through a real index: upstream's "1 instead of 10".  The
+-- 10 install-info rows are the answer; the 5 'install' rows are what the old
+-- ('install' & !'info') parse returned instead.
+CREATE TABLE zsep (id serial, d wdoc);
+INSERT INTO zsep(d) SELECT to_wdoc('simple','install-info manual page '||g) FROM generate_series(1,10) g;
+INSERT INTO zsep(d) SELECT to_wdoc('simple','install other thing '||g) FROM generate_series(1,5) g;
+INSERT INTO zsep(d) SELECT to_wdoc('simple','info other thing '||g) FROM generate_series(1,5) g;
+CREATE INDEX zsep_weave ON zsep USING weave (d);
+SET enable_seqscan = off;
+SELECT count(*) AS idx_install_info FROM zsep WHERE d @@@ to_wquery('simple','install-info');   -- 10
+ idx_install_info 
+------------------
+               10
+(1 row)
+
+SELECT weave_count('zsep_weave', to_wquery('simple','install-info')) AS cnt_install_info;       -- 10
+ cnt_install_info 
+------------------
+               10
+(1 row)
+
+SELECT weave_count('zsep_weave', to_wquery('simple','install & !info')) AS cnt_old_parse;       -- 5
+ cnt_old_parse 
+---------------
+             5
+(1 row)
+
+SET enable_indexscan = off; SET enable_bitmapscan = off;
+SELECT count(*) AS seq_install_info FROM zsep WHERE d @@@ to_wquery('simple','install-info');   -- 10
+ seq_install_info 
+------------------
+               10
+(1 row)
+
+RESET enable_indexscan; RESET enable_bitmapscan; RESET enable_seqscan;
+DROP TABLE zsep;

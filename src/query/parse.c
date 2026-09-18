@@ -10,8 +10,13 @@
  *	  or_expr := and_expr ( ('|' | 'OR') and_expr )*
  *	  and_expr:= unary ( ('&' | 'AND')? unary )*        -- implicit AND
  *	  unary   := ('!' | 'NOT' | '-') unary | primary
+ *
+ *	  '-' is negation only in PREFIX position; between two word characters it is
+ *	  part of the term ('pkg-config'), as are '.' and '/'.  See
+ *	  is_term_infix_byte().
  *	  primary := '(' expr ')' | term
- *	  term    := run of token bytes (folded like the analyzer)
+ *	  term    := run of token bytes (folded like the analyzer), which may contain
+ *	             an intra-word '-', '.' or '/'
  *
  * The parser emits a postfix (RPN) item list, the same shape tsquery uses, so
  * evaluation is a simple stack machine.  Supported: AND, OR, NOT, parenthesised
@@ -97,6 +102,35 @@ is_token_byte(unsigned char c)
 		(c >= '0' && c <= '9');
 }
 
+/*
+ * May this byte appear INSIDE a term, i.e. between two word characters?
+ *
+ * The set is not a guess: it is what the DOCUMENT analyzer joins.  Verified on
+ * this tree against to_wdoc('simple', 'a-b c/d e.f g_h i+j'), which yields
+ *	 'a':1@2 'a-b':1@1 'b':1@3 'c/d':1@4 'e.f':1@5 'g':1@6 'h':1@7 'i':1@8 'j':1@9
+ * -- '-', '/' and '.' are kept inside a token (PostgreSQL's parser classifies
+ * them asciihword / file / file) while '_' and '+' SPLIT.  The query lexer has
+ * to agree with that or a token the user typed can never match the token we
+ * stored: before this rule, to_wquery('simple', 'pkg-config') could not produce
+ * the lexeme 'pkg-config' at all, no matter what the index contained.
+ *
+ * The built-in 1-arg to_wdoc(text) analyzer is a deliberate exception: it splits
+ * on every non-alphanumeric byte, so on that path 'pkg-config' stores 'pkg' and
+ * 'config' and a literal 'pkg-config' query matches nothing.  That is still the
+ * right trade: the old parse returned a *wrong* row set (see lex_raw below),
+ * while this one returns an empty one, and the configured analyzer -- the one an
+ * index is built with -- matches exactly.
+ *
+ * A trailing separator is deliberately not covered by this rule, because it is
+ * not between two word characters: `c++` and `notepad++` lex to 'c' /
+ * 'notepad', which is what both PostgreSQL and our own document analyzer do.
+ */
+static inline bool
+is_term_infix_byte(unsigned char c)
+{
+	return c == '-' || c == '.' || c == '/';
+}
+
 static void
 emit(ParseState *st, uint8 type, uint8 op, char *term, int termlen,
 	 uint16 flags)
@@ -130,7 +164,9 @@ emit_dist(ParseState *st, uint8 type, uint8 op, char *term, int termlen,
  * Raw lexer.  Recognizes &, |, !, - and parentheses as punctuation; the
  * keywords AND/OR/NOT (case-insensitive) as operators; everything else is a
  * term.  A bare "and"/"or"/"not" is treated as an operator only when it stands
- * alone as a token, which is the standard, least-surprising behavior.
+ * alone as a token, which is the standard, least-surprising behavior.  '-', '.'
+ * and '/' are punctuation only where they are not part of a word; see
+ * is_term_infix_byte().
  *
  * Callers use next_token()/peek() rather than calling this directly, so that a
  * peeked token is lexed (and its term palloc'd) exactly once.
@@ -143,11 +179,46 @@ lex_raw(ParseState *st)
 	int			flen;
 	char	   *folded;
 
-	/* skip whitespace */
+	/*
+	 * Skip whitespace and punctuation -- except that a '-', '.' or '/' sitting
+	 * between two word characters belongs to the TERM, not to the operator set,
+	 * so break out and hand it to the term scanner below.
+	 *
+	 * This is a wrong-answer fix, not a niceness: to_wquery('pkg-config') used
+	 * to parse as ('pkg' & !'config'), and that NOT clause actively EXCLUDED the
+	 * pkg-config documents being searched for -- upstream (the project this
+	 * parser was forked from) measured `install-info` matching 1 row instead of
+	 * 10.  A silently different answer
+	 * is a worse failure mode than a visible parse error.  '/' was worse still:
+	 * it opened a /regex/, so the rest of the query was swallowed and `foo/bar`
+	 * became just 'foo'.
+	 *
+	 * The st->pos > 0 guard is what keeps the operators these bytes still are in
+	 * prefix position, and it is the non-obvious half of the rule:
+	 *
+	 *	- without it, a leading '-' would start a term, so '-b' would lex as the
+	 *	  term 'b' instead of !'b' -- prefix NOT would silently stop negating.
+	 *	  (`a -b` is safe either way: the byte before '-' is a space, not a token
+	 *	  byte.  Only the position-0 case needs the guard.)
+	 *	- without it, a standalone '/regex/' would never reach the regex branch
+	 *	  below, because its opening '/' is followed by a token byte; the query
+	 *	  would become a term containing the regex text.  Every regex in
+	 *	  expected/weave.out is of exactly that shape.
+	 *
+	 * The flanking test also means a separator next to a non-token byte stays an
+	 * operator, so `a-(b)` is still ('a' & !'b'), and a TRAILING separator is
+	 * dropped by construction: `c++` is 'c'.
+	 */
 	while (st->pos < st->len &&
 		   !is_token_byte((unsigned char) st->buf[st->pos]))
 	{
 		char		c = st->buf[st->pos];
+
+		if (is_term_infix_byte((unsigned char) c) && st->pos > 0 &&
+			is_token_byte((unsigned char) st->buf[st->pos - 1]) &&
+			st->pos + 1 < st->len &&
+			is_token_byte((unsigned char) st->buf[st->pos + 1]))
+			break;				/* intra-word separator: part of the term */
 
 		switch (c)
 		{
@@ -215,11 +286,31 @@ lex_raw(ParseState *st)
 	if (st->pos >= st->len)
 		return tok;				/* TOK_EOF */
 
-	/* a term: run of token bytes, folded */
+	/*
+	 * A term: a run of token bytes, folded, which may contain '-', '.' or '/'
+	 * provided each one is flanked by token bytes (see is_term_infix_byte).
+	 * That keeps 'pkg-config', 'foo/bar' and 'python3.14' whole, exactly as the
+	 * configured document analyzer stores them, while a leading or trailing
+	 * separator still terminates the term.
+	 */
 	start = st->pos;
-	while (st->pos < st->len &&
-		   is_token_byte((unsigned char) st->buf[st->pos]))
-		st->pos++;
+	while (st->pos < st->len)
+	{
+		unsigned char ch = (unsigned char) st->buf[st->pos];
+
+		if (is_token_byte(ch))
+		{
+			st->pos++;
+			continue;
+		}
+		if (is_term_infix_byte(ch) && st->pos + 1 < st->len &&
+			is_token_byte((unsigned char) st->buf[st->pos + 1]))
+		{
+			st->pos++;			/* separator between word characters */
+			continue;
+		}
+		break;
+	}
 	flen = st->pos - start;
 
 	/* fold identically to the document analyzer; folded length may differ from
