@@ -2765,7 +2765,13 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 		tbs.want_positions = bs->want_positions;
 		tbs.lexattno = bs->lexattno;
 		tbs.vecattno = 0;
-		weave_vec_accum_init(&tbs.vec, termctx, false, WEAVE_VEC_DEFAULT_BITS,
+		/* Inactive (active = false), so no weft is written and this width is
+		 * never read -- it gets the reloption's real value anyway, because the
+		 * day doc/GAPS.md G23 closes is the day `active` flips to true on
+		 * exactly these paths, and a hardcoded default would then silently
+		 * produce default-width codes for an index built with another width. */
+		weave_vec_accum_init(&tbs.vec, termctx, false,
+							 weave_index_vec_bits(index),
 							 WEAVE_METRIC_L2);
 		tbs.want_trigrams = bs->want_trigrams;
 		tbs.terms = NULL;
@@ -4547,7 +4553,9 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
 	 * written for this segment, which costs zero bytes and leaves the row absent
 	 * from vector answers rather than present with a wrong vector. */
 	bs.vecattno = 0;
-	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS,
+	/* Inactive, so this width is dead data today -- passed for real anyway, for
+	 * the reason given on the same call in weave_merge_segments_streaming(). */
+	weave_vec_accum_init(&bs.vec, bs.ctx, false, weave_index_vec_bits(index),
 						 WEAVE_METRIC_L2);
 	bs.terms = NULL;
 	bs.nterms = 0;
@@ -4832,7 +4840,9 @@ weave_flush_pending(Relation index)
 	 * than papered over -- writing a weft of dead lanes would claim to cover these
 	 * documents, which is worse than not claiming to. */
 	bs.vecattno = 0;
-	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS,
+	/* Inactive, so this width is dead data today -- passed for real anyway, for
+	 * the reason given on the same call in weave_merge_segments_streaming(). */
+	weave_vec_accum_init(&bs.vec, bs.ctx, false, weave_index_vec_bits(index),
 						 WEAVE_METRIC_L2);
 	bs.terms = NULL;
 	bs.nterms = 0;
