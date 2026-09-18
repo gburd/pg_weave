@@ -1191,6 +1191,19 @@ Two consequences, and the second one limits a claim:
    cost — but claim 3 must be stated as *less scoring*, not *less I/O*, until a
    block→page index exists. Opened as a gap rather than implemented here: it is a
    format change, and V8 is not.
+3. **The lazy scatter is decided by the MASK and cannot be decided by the BOUND**,
+   and that is a consequence of the on-disk order rather than a choice. A block's
+   strips are block-major with the lane strips first and the centroid strips after
+   them, while the bound needs the centroid — so by the time the core could say
+   "this block is pruned", its lane strips are already behind the forward-only
+   cursor. The mask needs only the directory record, which the directory cursor has
+   produced already, and the shuttle asks with `weave_lane_avail_mask()`, the *same*
+   shared inline the core and every kernel use, so this is one function answering a
+   resource question and not a second copy of the policy. Consequence: a block
+   skipped on the **bound** still pays its strip scatter. That costs nothing
+   measurable — the bound prunes 0.00 % of blocks on real corpora and a fused-loop
+   driver passes `-INFINITY` — but a block→page index (point 2) would not fix it
+   either; only a format that put the centroid strip first would.
 
 ### Scan-time quantizer reconstruction, and the guard it needs
 
@@ -1216,10 +1229,20 @@ comparison.
 every block would need every centroid *code*, which lives on the code pages — a
 full pass over the weft before the scan starts. (B2) needs one float per
 directory record, and the directory is roughly 1/56 of the code pages at 960
-dimensions. So `begin()` makes one directory pass, which also validates (C1)
-across the whole weft once instead of incrementally, and folds
+dimensions. So `begin()` makes one directory pass and folds
 `max maxrecnorm × ||q||`. Looser, and looser is right for a value whose only job
 is the MaxScore partition.
+
+**Correction, from implementing it.** This section said the same pass "also
+validates (C1) across the whole weft once instead of incrementally". It does not,
+and it cannot through the core's API as declared: `weave_vec_scan_maxscore_fold()`
+takes an accumulator and a record, holds no state and has no `why` to report
+through, and the (C1) witness lives inside `weave_vec_scan_block()`, which needs a
+query LUT and a centroid code — i.e. the code pages this pass exists to avoid
+touching. So (C1) is checked **incrementally**, one block at a time, as the scan
+reaches it. That is strictly better anyway: a weft whose 400th block breaks the
+ascent still answers the first 399 blocks' worth of query correctly and then
+errors, instead of refusing every query on the weft before reading a code.
 
 ### The metric was a placeholder, and V8 is where that comes due
 
@@ -1281,6 +1304,35 @@ chain — the G27 shape — and it is not needed at all.
 Three lockstep monotone cursors — directory, codes, warp map — and no random read
 anywhere. That is the whole traversal.
 
+### What implementing the contract found in the contract
+
+V8 is the first executed implementation of `include/weave/channel.h`, so three
+things it left open had to be decided. Recorded here because the next channel hits
+them too.
+
+1. **A backward `seek()` raises, and so does a repeated one.** The check is
+   `target < s->cur`, i.e. against the previous *return*, not the previous target.
+   So `seek(0)` twice is an error whenever the first call returned a warp above 0.
+   That is deliberate — the cursors are one block ahead by construction, and the
+   alternative is a shuttle that quietly re-answers from a block it may already
+   have walked past — but it means **`seek()` is not idempotent**, which (C1) does
+   not say and a fused loop must not assume.
+2. **`score_block()`'s `allow` argument has no length**, while every other
+   consumer of a warp-indexed bitmap in this channel requires one, because
+   `firstwarp` comes off a page and `include/weave/kernels.h` is explicit that an
+   untrusted index into an unlengthed bitmap is an unbounded out-of-bounds read.
+   The vector shuttle therefore honours a non-NULL `allow` here only within the
+   length its own allowlist was opened with, and refuses it otherwise. The
+   contract should grow an `nwarp` parameter; changing it is not V8's business.
+3. **`score_block()` has no weight-applying wrapper.** `weave_shuttle_score()` and
+   `weave_shuttle_block_max()` exist precisely so that `WeaveShuttle.weight` is
+   applied in exactly one place, and (C2) survives weighting because both go
+   through it — but the bulk path the scorer is told to *prefer* has no such
+   wrapper, so a scorer that calls `ops->score_block()` directly gets unweighted
+   scores next to weighted bounds. V8's own driver uses weight 1.0, so nothing is
+   wrong today; the fused scorer must either add the wrapper or apply the weight
+   itself.
+
 ### What V8 is not
 
 No exact rerank (V10), no coordinate-prefix first stage (V15), no graph. Every
@@ -1290,7 +1342,10 @@ this task** — the quantizer alone tops out at 0.8780 recall@10 on GIST-960d
 scan machinery is reachable *directly* from SQL, which after 2026-09-16 is a
 requirement and not a convenience: a mutation in scan code that can only be
 reached through the planner may be answered by a bitmap heap scan's own recheck
-and survive the entire suite (`AGENTS.md`).
+and survive the entire suite (`AGENTS.md`). Its allowlist argument is a **docid**
+array converted to warps per bolt, not a warp array: a warp is segment-local, so
+warp 7 names a different document in every bolt and a warp array is ambiguous the
+moment an index has two of them.
 
 ## 9. Filtering makes queries faster
 

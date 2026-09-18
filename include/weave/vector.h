@@ -38,6 +38,7 @@
 #include "weave/am.h"
 #include "weave/channel.h"
 #include "weave/quantize.h"
+#include "weave/vecscan.h"
 #include "weave/vecweft.h"
 
 /* ---------------------------------------------------------------------------
@@ -230,10 +231,23 @@ typedef struct WeaveVecLane
  * Set on the index, not by GUC, because they change the bytes on disk:
  *
  *		bits			2..8				code width			default 4
+ *		metric			l2 | ip				score domain		default l2
  *		graph			bool				build the Vamana weft	default true
  *		graph_degree	int					R, out-degree		default 32
  *		graph_beam		int					L, build beam width	default 64
  *		calibrate		int					TQ+ sample rows, 0=off	default 0
+ *
+ * `metric` is the odd one out and is here anyway, because doc/CONVENTIONS.md
+ * decision 1 has two clauses and it satisfies the second: it changes NO stored
+ * byte -- the codes are metric-independent -- but "the value used is recorded in
+ * the segment so a reader never has to guess" is exactly what WeaveVecMeta.metric
+ * is for, and a GUC would let two bolts of one index disagree about what their
+ * scores MEAN.  `cosine` and `l1` parse and are refused at build time with the
+ * reason (src/am/am.c, weave_index_vec_metric): neither has a sound
+ * compressed-domain bound, and a channel whose bound is unsound violates contract
+ * (C2) silently.  The eventual user-facing form is one operator family per metric
+ * -- wvec_l2_ops, wvec_ip_ops -- which belongs with the ORDER BY ... <-> ... path;
+ * see doc/specs/VECTOR_CHANNEL.md sect. 8b.
  *
  * `bits` defaults to 4 because that is the ratified Phase V shape (doc/PHASES.md,
  * "the committed shape"): with an exact top-25 rerank it reaches recall@10 0.9920
@@ -348,7 +362,7 @@ typedef struct WeaveVecAccum
 } WeaveVecAccum;
 
 extern void weave_vec_accum_init(WeaveVecAccum *acc, MemoryContext ctx,
-								 bool active, int bits);
+								 bool active, int bits, WeaveMetric metric);
 extern void weave_vec_accum_reset(WeaveVecAccum *acc);
 extern void weave_vec_accum_add(WeaveVecAccum *acc, Relation index,
 								ItemPointer tid, Datum value, bool isnull);
@@ -491,12 +505,33 @@ extern bool weave_vec_dir_read(const WeaveVecWeft *w, uint32 blockno,
  * format has no index over the strips and WeaveVecDirRec has no room for one, so
  * O(1) single-block access is not available to a reader; see the note in
  * doc/specs/VECTOR_CHANNEL.md sect. 7.1.  V7's callers (weave_check(), the round
- * trip) walk the whole weft anyway; V8's rerank window cannot afford this and is
- * the task that has to fix the format.
+ * trip) walk the whole weft anyway.  THE SCAN DOES NOT USE THIS AT ALL: once per
+ * block it is O(blocks x pages), quadratic in the weft, so task V8 carries a
+ * forward-only cursor over the same chain instead (src/vector/vecshuttle.c),
+ * sharing weave_vec_strip_take() below.  V10's rerank window and vacuum's lane
+ * update still want single-block access, and that is the task that has to add the
+ * index.
  */
 extern bool weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno,
 								 uint8 *block, uint8 *cencode,
 								 const char **why);
+
+/*
+ * Take one WEAVE_PK_VCODES page's strip into the block it belongs to, validating
+ * it against the weft's strip plan first.  The shared half of the two readers of
+ * the code chain: weave_vec_block_read() above, which walks the whole chain per
+ * block, and the forward-only cursor the scan uses (src/vector/vecshuttle.c),
+ * which cannot afford to.  Exported for that second caller and for no other
+ * reason -- two implementations of the strip format would not crash, they would
+ * return wrong distances (src/vector/pack.c).
+ *
+ * `block` and `cencode` may be NULL: a strip whose destination is NULL is still
+ * parsed and still counted, so a chain walk that wants no bytes -- which is what a
+ * block skipped on the allowlist is -- validates the chain without scattering.
+ */
+extern bool weave_vec_strip_take(const WeaveVecWeft *w, const void *contents,
+								 uint32 blockno, uint8 *block, uint8 *cencode,
+								 bool *seen, int *nseen, const char **why);
 
 /*
  * A forward cursor over a weft's warp map: warp 0's docid, then warp 1's, for all
@@ -561,6 +596,19 @@ extern void weave_vec_free_weft(Relation index, BlockNumber root);
 
 /* ---------------------------------------------------------------------------
  * GUCs (query-time only; anything that changes stored bytes is a reloption)
+ *
+ * Defined in src/vector/kernel_ops.c, beside pg_weave.vec_kernel.  They used to
+ * live in src/vector/vector.c, which task V8 DELETED: it was in neither the
+ * Makefile's OBJS nor meson.build, and every other symbol in it was a stale
+ * duplicate of a live one in src/vector/wvec.c -- one Makefile edit away from a
+ * duplicate-symbol link failure.  Only these three definitions were unique to it,
+ * so only these three moved.
+ *
+ * The three below back GUCs that are NOT REGISTERED YET, and that is deliberate:
+ * the code each one steers is the graph traversal and the exact rerank, neither of
+ * which exists (tasks V10 and the graph tasks).  A registered GUC that changes
+ * nothing is worse than an unregistered variable, because a user can set it and
+ * believe something happened.
  * ------------------------------------------------------------------------- */
 
 /* Candidate multiplier for the graph traversal: visit oversample * k nodes. */
@@ -662,6 +710,15 @@ extern const WeaveVecKernelOps *weave_vec_kernels;
 extern void weave_vec_kernels_init(void);
 extern const char *weave_vec_kernel_name(void);
 
+/*
+ * Dispatch a block already in WeaveScoreBlock shape (what the decision core's
+ * weave_vec_scan_scoreblk() produces) through the resolved kernel, honouring
+ * pg_weave.vec_kernel and turning a rejected block description into a clean ERROR.
+ * See the comment on the definition for why the scan cannot use the
+ * WeaveVecBlockHdr-shaped entry point above.
+ */
+extern int	weave_vec_score_block(const WeaveScoreBlock *blk, float4 *out);
+
 /* ---------------------------------------------------------------------------
  * The code-scan shuttle
  *
@@ -673,15 +730,88 @@ extern const char *weave_vec_kernel_name(void);
  * and allow-bitmap do not intersect, which is why a selective predicate makes
  * this channel FASTER rather than slower -- the opposite of over-fetch-then-
  * filter.  See doc/specs/VECTOR_CHANNEL.md sect. 9.
+ *
+ * THE METRIC IS NOT A PARAMETER, and it used to be.  It comes from the weft's own
+ * WeaveVecMeta, because the conversion from the kernel's inner product to the
+ * metric's score domain is what makes a bound and a score commensurable, and a
+ * caller that could override it could ask for an L2 bound next to an IP score --
+ * two numbers in different units, which makes contract (C2) meaningless rather
+ * than violated.  include/weave/vecscan.h "THE DOMAIN RULE" is the authority and
+ * it says the caller does not get to override it; the parameter this prototype
+ * carried until task V8 contradicted that.
+ *
+ * `qdim` is the length of `query` and must equal the weft's dim.  It is here
+ * because `query` is a bare float pointer: without a length, a caller that passed
+ * a shorter array than the weft's dim would be a read past the end of it, and the
+ * rotation inside weave_query_lut_build() reads all dim of them.  The query is
+ * passed RAW -- unrotated -- because the LUT builder rotates internally.
+ *
+ * IT TAKES AN ALREADY-OPENED WEFT rather than (Relation, segno), which is what
+ * this prototype said until task V8 implemented it.  Every driver has to open the
+ * weft before it can begin a shuttle, because `nwarp` must cover the weft's own
+ * lane count and only the weft knows that count -- so an allowlist cannot be built
+ * before weave_vec_weft_open() has run.  Opening it a second time in here would be
+ * a second answer to "which root belongs to this bolt" for no gain.  `segno` is
+ * carried for error messages only.  `*w` is COPIED, but it holds a Relation
+ * pointer, so the caller must keep the index open for the shuttle's lifetime.
  * ------------------------------------------------------------------------- */
 
-extern WeaveShuttle *weave_vec_shuttle_begin(Relation index, int segno,
-											 const float *query, WeaveMetric metric,
+extern WeaveShuttle *weave_vec_shuttle_begin(const WeaveVecWeft *w, int segno,
+											 const float *query, int qdim,
 											 const uint64 *allow, WeaveWarp nwarp,
 											 float4 weight);
 
+/*
+ * The driver's current top-k floor, handed to the decision core so that
+ * WEAVE_VSCAN_SKIP_BOUND is reachable at all.
+ *
+ * NOT part of WeaveShuttleOps, and that is the contract working as designed:
+ * weave/channel.h deliberately does not tell a shuttle the fused scorer's floor,
+ * because the floor is a property of the FUSION and a shuttle is a cursor.  A
+ * shuttle driven by the fused loop therefore never calls this, passes -INFINITY to
+ * the core, and lets block_max() do the pruning; a driver that maintains its own
+ * top-k -- today the weave_vec_scan() SRF -- sets it here.  See the note above
+ * weave_vec_scan_block() in weave/vecscan.h.
+ *
+ * Rejection is on `s <= theta`, so pass the k-th best score itself: an equal score
+ * does not displace an incumbent, so a block that can only equal the floor cannot
+ * contribute.
+ */
+extern void weave_vec_shuttle_set_threshold(WeaveShuttle *s, float4 theta);
+
+/*
+ * The document behind a warp position, from the third of the shuttle's three
+ * lockstep cursors.
+ *
+ * FORWARD-ONLY, and a target below the last one asked for is an ERROR rather than
+ * a re-read: the warp map chain has no index over its pages, so random access
+ * would be O(pages) PER LOOKUP -- the doc/GAPS.md G27 shape -- where a monotone
+ * cursor is O(pages) in total.  That is affordable only because the scan visits
+ * warps in ascending order, and candidates therefore enter a top-k in ascending
+ * warp order too (doc/specs/VECTOR_CHANNEL.md sect. 8b).  A driver must resolve a
+ * docid when the candidate is admitted, not after it has sorted by score.
+ */
+extern uint64 weave_vec_shuttle_docid(WeaveShuttle *s, WeaveWarp warp);
+
+/*
+ * The shuttle's view of the decision core's counters, so the mask short-circuit is
+ * MEASURED rather than asserted -- which is task V8's gate.  Valid until
+ * ops->end().  A skipped block still costs its page reads, so nblk_mask counts
+ * saved SCORING and saved strip scatter, never saved I/O (sect. 8b).
+ */
+extern const WeaveVecScanState *weave_vec_shuttle_stats(WeaveShuttle *s);
+
+/*
+ * The scan SRFs (src/vector/vecshuttle.c).  They exist because a mutation in scan
+ * code reachable only through the planner can be answered by a bitmap heap scan's
+ * own recheck and survive the entire suite (AGENTS.md, 2026-09-16), so the scan
+ * machinery needs an entry point with no executor recheck behind it.
+ */
+extern Datum weave_vec_scan(PG_FUNCTION_ARGS);
+extern Datum weave_vec_scan_stats(PG_FUNCTION_ARGS);
+
 /* ---------------------------------------------------------------------------
- * SQL-callable surface (defined in src/vector/vector.c)
+ * SQL-callable surface (defined in src/vector/wvec.c)
  * ------------------------------------------------------------------------- */
 
 extern Datum wvec_in(PG_FUNCTION_ARGS);
@@ -702,5 +832,14 @@ extern Datum weave_vec_meta(PG_FUNCTION_ARGS);
 extern Datum weave_vec_lanes(PG_FUNCTION_ARGS);
 extern Datum weave_vec_blocks(PG_FUNCTION_ARGS);
 extern Datum weave_vec_strips(PG_FUNCTION_ARGS);
+
+/*
+ * Open an index by OID for one of the vector channel's SQL-callable functions:
+ * refuse anything that is not a weave index, and read the metapage through the
+ * version-aware reader.  Non-static so the scan SRF (src/vector/vecshuttle.c)
+ * enters by the same door the introspection SRFs do; a second opener would be a
+ * second definition of which relations these functions accept.
+ */
+extern Relation weave_vec_introspect_open(Oid indexoid, WeaveMetaPageData *meta);
 
 #endif							/* WEAVE_VECTOR_H */

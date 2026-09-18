@@ -134,9 +134,38 @@ typedef struct WeaveOptions
 								 * width depending on which session wrote them.  The
 								 * value used is recorded in each weft's WEAVE_VMETA
 								 * page, so a reader never consults this. */
+	int			metric;			/* WeaveMetric the next vector weft is scored with,
+								 * default WEAVE_METRIC_L2.  A reloption for the
+								 * SECOND clause of doc/CONVENTIONS.md decision 1
+								 * rather than the first: it changes no stored byte
+								 * (codes are metric-independent), but "the value
+								 * used is recorded in the segment so a reader never
+								 * has to guess" is exactly what
+								 * WeaveVecMeta.metric is for, and a GUC would let
+								 * two bolts of one index disagree about what their
+								 * scores MEAN (doc/GAPS.md G26).  The eventual
+								 * user-facing form is one operator family per
+								 * metric -- wvec_l2_ops, wvec_ip_ops -- which
+								 * belongs with the ORDER BY ... <-> ... path that
+								 * task V8 does not build; see
+								 * doc/specs/VECTOR_CHANNEL.md sect. 8b. */
 } WeaveOptions;
 
 static relopt_kind weave_relopt_kind;
+
+/*
+ * The `metric` reloption's members.  Every WeaveMetric is accepted by the parser;
+ * two of them are refused by weave_index_vec_metric() with the reason, which the
+ * comment at add_enum_reloption() below explains.
+ */
+static relopt_enum_elt_def weave_metric_options[] =
+{
+	{"l2", WEAVE_METRIC_L2},
+	{"ip", WEAVE_METRIC_IP},
+	{"cosine", WEAVE_METRIC_COSINE},
+	{"l1", WEAVE_METRIC_L1},
+	{(const char *) NULL}
+};
 
 void		weave_init_reloptions(void);
 
@@ -165,6 +194,26 @@ weave_init_reloptions(void)
 					  "vector code width in bits (2..8)",
 					  WEAVE_VEC_DEFAULT_BITS, WEAVE_BITS_MIN, WEAVE_BITS_MAX,
 					  AccessExclusiveLock);
+
+	/*
+	 * The metric, default l2.  Every weft already on disk says l2 (V7 wrote it as
+	 * a placeholder), so the default is the value that keeps existing bolts
+	 * meaning what they already meant.
+	 *
+	 * COSINE AND L1 ARE MEMBERS HERE AND REFUSED AT BUILD TIME, which looks
+	 * redundant and is not.  Leaving them out of the member list makes
+	 * WITH (metric = 'cosine') fail with "invalid value", which tells a user
+	 * nothing about WHY -- and the why is specific and worth saying: cosine's
+	 * bound has to switch on the sign of its numerator and no maximum true norm is
+	 * stored, and L1 admits no compressed-domain bound at all
+	 * (doc/specs/VECTOR_CHANNEL.md sect. 8b, sect. 11).  So they parse, and
+	 * weave_index_vec_metric() refuses them with the reason.
+	 */
+	add_enum_reloption(weave_relopt_kind, "metric",
+					   "distance metric the vector weft is scored with",
+					   weave_metric_options, WEAVE_METRIC_L2,
+					   "Valid values are \"l2\", \"ip\", \"cosine\" and \"l1\".",
+					   AccessExclusiveLock);
 }
 
 /* ----- posting compression (delta + varint) ----- */
@@ -2787,6 +2836,7 @@ weave_options(Datum reloptions, bool validate)
 		{"trigrams", RELOPT_TYPE_BOOL, offsetof(WeaveOptions, trigrams)},
 		{"doclen_sidecar", RELOPT_TYPE_BOOL, offsetof(WeaveOptions, doclen_sidecar)},
 		{"bits", RELOPT_TYPE_INT, offsetof(WeaveOptions, bits)},
+		{"metric", RELOPT_TYPE_ENUM, offsetof(WeaveOptions, metric)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,
@@ -2860,6 +2910,51 @@ weave_index_vec_bits(Relation index)
 	if (bits < WEAVE_BITS_MIN || bits > WEAVE_BITS_MAX)
 		bits = WEAVE_VEC_DEFAULT_BITS;
 	return bits;
+}
+
+/*
+ * The metric this index's next vector weft is scored with.
+ *
+ * Refuses the two metrics the channel has no sound compressed-domain bound for.
+ * That refusal is HERE and not in the reloption validator because it is a
+ * statement about this channel's arithmetic rather than about the catalog: a
+ * bound for cosine has to switch on the sign of its numerator and divide by a
+ * maximum true norm, which is not stored, and L1 has no compressed-domain bound
+ * at all.  Inventing either would put an unsound bound behind contract (C2),
+ * which silently drops rows and which no fixed-expected-output test can catch
+ * (AGENTS.md hard rule 1).
+ *
+ * An out-of-range value is clamped to the default rather than refused, for the
+ * reason weave_index_vec_bits() gives: rd_options comes from a pg_class row a
+ * future version may have written, and the value actually used is recorded in the
+ * weft's WEAVE_VMETA page, so a reader never consults this.
+ */
+int
+weave_index_vec_metric(Relation index)
+{
+	WeaveOptions *opts = (WeaveOptions *) index->rd_options;
+	int			metric = opts ? opts->metric : WEAVE_METRIC_L2;
+
+	if (metric == WEAVE_METRIC_COSINE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the weave vector channel cannot index the cosine metric"),
+				 errdetail("A sound block bound for cosine has to divide by a "
+						   "maximum vector norm when its numerator is negative, and "
+						   "no maximum true norm is stored."),
+				 errhint("Normalize the vectors and use metric = ip, which is "
+						 "equal to cosine similarity on unit vectors.")));
+	if (metric == WEAVE_METRIC_L1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the weave vector channel cannot index the l1 metric"),
+				 errdetail("The quantizer is built around inner products and L1 "
+						   "admits no compressed-domain bound, so an L1 weft could "
+						   "not satisfy the channel contract."),
+				 errhint("Use metric = l2 or metric = ip.")));
+	if (metric != WEAVE_METRIC_L2 && metric != WEAVE_METRIC_IP)
+		metric = WEAVE_METRIC_L2;
+	return metric;
 }
 
 /*
