@@ -45,8 +45,12 @@
 #	 NDOCS / VOCAB environment variables size the lexical corpus (default 1M /
 #	 200k).  A 1M-document run takes a few minutes to generate.
 #
-# The AWS profile is `lava`.  Everything this script creates is tagged
-# Project=pg_weave and named with the run id, so a stray is identifiable.
+# The AWS profile is a BURNER and it changes -- `hotdog` as of 2026-09-18,
+# `lava` before it, `bene` before that.  It is a default here and nowhere else,
+# and no account id or AMI id is hardcoded anywhere in this harness, which is
+# the only reason each swap has cost minutes instead of a rewrite.  Override
+# with AWS_PROFILE.  Everything this script creates is tagged Project=pg_weave
+# and named with the run id, so a stray is identifiable.
 #
 # TERMINATION IS NOT OPTIONAL.  The trap fires on EXIT, which covers success,
 # failure, and Ctrl-C.  A forgotten bare-metal instance costs more than any
@@ -55,7 +59,7 @@
 #
 set -uo pipefail
 
-PROFILE=${AWS_PROFILE:-lava}
+PROFILE=${AWS_PROFILE:-hotdog}
 ITYPE=${1:-c7i.4xlarge}
 JOB=${2:-smoke}
 # Root volume size in GiB.  80 is fine for the code-only jobs; the corpus jobs

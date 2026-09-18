@@ -85,8 +85,10 @@ months into implementation.
 
 ## EC2, with the burner profile
 
-**The profile is a burner and it changes.** As of 2026-09-11 it is `lava`
-(account 769093516156, `us-east-2`). Before that it was `bene`
+**The profile is a burner and it changes.** As of 2026-09-18 it is `hotdog`
+(account 585335547908, `us-east-2`; note it has **no region configured**, so pass
+`--region us-east-2` explicitly). Before that it was `lava`
+(account 769093516156) and before that `bene`
 (account 292759875395), which **expired with its credentials already dead** — a
 `describe-instances` at transition time returned `InvalidClientTokenId`, so
 nothing in it could be enumerated or terminated any more.
@@ -105,7 +107,7 @@ Two consequences worth carrying:
 Verify the current profile before doing anything:
 
 ```sh
-aws sts get-caller-identity --profile lava
+aws sts get-caller-identity --profile hotdog
 ```
 
 Workflow: launch, tune, load, measure, record, **terminate**.
@@ -126,20 +128,20 @@ measure, so an unrecorded setting makes the result unusable.
 instance dies on the error path too:
 
 ```sh
-trap 'aws ec2 terminate-instances --profile lava --instance-ids "$IID"' EXIT
+trap 'aws ec2 terminate-instances --profile hotdog --region us-east-2 --instance-ids "$IID"' EXIT
 ```
 
 Then verify it actually died:
 
 ```sh
-aws ec2 describe-instances --profile lava --instance-ids "$IID" \
+aws ec2 describe-instances --profile hotdog --region us-east-2 --instance-ids "$IID" \
   --query 'Reservations[].Instances[].State.Name'
 ```
 
 Check for strays before finishing a session:
 
 ```sh
-aws ec2 describe-instances --profile lava \
+aws ec2 describe-instances --profile hotdog --region us-east-2 \
   --filters Name=instance-state-name,Values=running \
   --query 'Reservations[].Instances[].[InstanceId,InstanceType,LaunchTime]'
 ```
