@@ -609,6 +609,20 @@ static int	weave_lowfree_n = 0;
 static int	weave_lowfree_i = 0;
 
 /*
+ * Snapshot-scope probe guard.  See the bounded-probe comment in
+ * weave_new_buffer(): a snapshot whose first WEAVE_ALLOC_SNAPSHOT_PROBE_MAX
+ * candidates all fail the recycle gate is abandoned for the rest of the scope,
+ * because probing costs a buffer read each and inside one long transaction the
+ * whole snapshot is usually doomed.  `_at_entry` are the values the scope started
+ * with, so the test is per scope and not cumulative across a backend.
+ */
+#define WEAVE_ALLOC_SNAPSHOT_PROBE_MAX 64
+
+static bool weave_lowfree_giveup = false;
+static int	weave_lowfree_probe_at_entry = 0;
+static uint64 weave_lowfree_reuse_at_entry = 0;
+
+/*
  * Extend-only allocation mode.  When set, weave_new_buffer() skips ALL free-page
  * reuse (the low-free list AND the FSM) and only extends the relation, so a
  * rewrite writes its whole output to fresh high blocks.  Used by the vacuum
@@ -617,6 +631,14 @@ static int	weave_lowfree_i = 0;
  * the following "pack" phase to relocate the segment to the front and truncate.
  */
 bool		weave_alloc_extend_only = false;
+
+/*
+ * SNAPSHOT allocation mode: hand out only what weave_alloc_begin() gathered, then
+ * extend, and never consult the live FSM.  See weave_alloc_snapshot_enter() in
+ * include/weave/am.h for why a merge loop needs exactly this and why extend-only
+ * was the wrong shape of the same guard.
+ */
+bool		weave_alloc_no_fsm = false;
 
 /* forward decl: the recycle gate, defined with the page-free code below */
 static bool weave_page_recyclable(Relation index, Page page);
@@ -699,6 +721,57 @@ weave_alloc_end(void)
 }
 
 /*
+ * Enter/leave a SNAPSHOT allocation scope.  The contract, the hazard it is exact
+ * against, and the two preconditions are in include/weave/am.h; this is only the
+ * state handling.
+ *
+ * The snapshot IS the low-free list -- the same gather, the same ascending order,
+ * the same per-candidate recycle gate -- with the live-FSM fallback switched off.
+ * Reusing it rather than adding a second gathering path is deliberate: there is
+ * one place where a free-page candidate can be produced, so there is one place to
+ * get the recycle gate wrong.  It also means a merge's reuse shows up in the
+ * lowfree_* allocator counters rather than the fsm_* ones -- see the counter
+ * comment, which exists because a zero in the wrong column has been misread as
+ * "the free list was never consulted" before.
+ */
+void
+weave_alloc_snapshot_enter(Relation index, WeaveAllocScope *saved)
+{
+	saved->lowfree = weave_lowfree;
+	saved->lowfree_n = weave_lowfree_n;
+	saved->lowfree_i = weave_lowfree_i;
+	saved->extend_only = weave_alloc_extend_only;
+	saved->no_fsm = weave_alloc_no_fsm;
+	saved->giveup = weave_lowfree_giveup;
+	saved->probe_at_entry = weave_lowfree_probe_at_entry;
+	saved->reuse_at_entry = weave_lowfree_reuse_at_entry;
+
+	/* NULL first so the gather cannot be mistaken for owning the saved array */
+	weave_lowfree = NULL;
+	weave_alloc_begin(index);	/* gather ONCE, before this scope frees anything */
+	weave_alloc_extend_only = false;
+	weave_alloc_no_fsm = true;
+	weave_lowfree_giveup = false;
+	weave_lowfree_probe_at_entry = weave_lowfree_i;		/* 0, from the gather */
+	weave_lowfree_reuse_at_entry = weave_alloc_lowfree_reuse;
+}
+
+void
+weave_alloc_scope_leave(const WeaveAllocScope *saved)
+{
+	if (weave_lowfree != NULL && weave_lowfree != saved->lowfree)
+		pfree(weave_lowfree);
+	weave_lowfree = saved->lowfree;
+	weave_lowfree_n = saved->lowfree_n;
+	weave_lowfree_i = saved->lowfree_i;
+	weave_alloc_extend_only = saved->extend_only;
+	weave_alloc_no_fsm = saved->no_fsm;
+	weave_lowfree_giveup = saved->giveup;
+	weave_lowfree_probe_at_entry = saved->probe_at_entry;
+	weave_lowfree_reuse_at_entry = saved->reuse_at_entry;
+}
+
+/*
  * ALLOCATOR OUTCOME COUNTERS.
  *
  * Backend-local, always compiled in, read via weave_alloc_stats().  They exist
@@ -730,6 +803,14 @@ weave_alloc_end(void)
  * different bug entirely.  Distinguishing those two by reasoning is exactly what
  * has failed here before.
  *
+ * WHICH COLUMN A MERGE LANDS IN CHANGED, and reading the old column will tell you
+ * a merge stopped reusing pages when it started.  A merge now allocates in
+ * SNAPSHOT mode (weave_alloc_snapshot_enter), whose candidates come from the
+ * gathered list, so merge reuse is counted as lowfree_reuse / lowfree_defer and
+ * a merge's fsm_reuse is 0 BY CONSTRUCTION -- it never consults the live FSM.
+ * Before that change the same pages were counted in fsm_*, and the mode before
+ * THAT (extend-only) consulted neither.  Compare the sum, or compare extend.
+ *
  * THE WAY THESE LIE TO YOU, and it is not hypothetical -- the sibling project hit
  * it and read the result as "the allocator is never called".  Because they are
  * backend-local, a counter read in a DIFFERENT session than the operation reports
@@ -754,9 +835,17 @@ weave_new_buffer(Relation index)
 
 	/*
 	 * Low-bias reuse: during a compaction, prefer the lowest free block so
-	 * live pages pack at the front of the file.
+	 * live pages pack at the front of the file.  In SNAPSHOT mode this same list
+	 * is the merge's whole supply of reusable pages (weave_alloc_snapshot_enter).
+	 *
+	 * A deferred candidate here does `continue`, not `break`: the list is ours and
+	 * a block we skip is not handed back to us on the next iteration, so one
+	 * not-yet-recyclable page costs one page and not the rest of the sequence.
+	 * That is the difference from the FSM loop below, and it is the whole reason
+	 * the snapshot is a list rather than repeated GetFreeIndexPage() calls.
 	 */
-	while (!weave_alloc_extend_only && weave_lowfree && weave_lowfree_i < weave_lowfree_n)
+	while (!weave_alloc_extend_only && weave_lowfree &&
+		   weave_lowfree_i < weave_lowfree_n && !weave_lowfree_giveup)
 	{
 		BlockNumber blk = weave_lowfree[weave_lowfree_i++];
 
@@ -771,6 +860,32 @@ weave_new_buffer(Relation index)
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				ReleaseBuffer(buffer);
 				RecordFreeIndexPage(index, blk);
+				/*
+				 * BOUNDED PROBE, snapshot mode only, and it is a measured cost
+				 * rather than a precaution.  Every candidate costs a buffer read
+				 * plus an FSM update, and a merge inside ONE long transaction
+				 * frees its own input pages, so its snapshot is almost entirely
+				 * pages the recycle gate must refuse -- and the scope is re-entered
+				 * per merge call, which at one merge per inserted document means
+				 * the same doomed candidates are re-probed every time.  Measured
+				 * on the G20 bulk arm (6,000 documents at 1,660 terms, six
+				 * transactions): 33,915,333 deferred candidates and 0 reuses in
+				 * the first two batches, with the arm's wall clock rising from
+				 * ~1m20s to ~2m10s while the page count fell.
+				 *
+				 * So: if a scope has probed this many candidates without a single
+				 * reuse, treat its snapshot as unusable and extend for the rest of
+				 * the scope.  The list is sorted ascending and the lowest free
+				 * blocks are the OLDEST frees -- the most likely to be past the
+				 * horizon -- so a run of failures at the front is evidence about
+				 * the whole list, not just its head.  The compaction path is
+				 * deliberately exempt (it must pack into the low region to be able
+				 * to truncate, and under AccessExclusiveLock its candidates pass
+				 * the gate anyway).
+				 */
+				if (weave_alloc_no_fsm && weave_alloc_lowfree_reuse == weave_lowfree_reuse_at_entry &&
+					weave_lowfree_i - weave_lowfree_probe_at_entry >= WEAVE_ALLOC_SNAPSHOT_PROBE_MAX)
+					weave_lowfree_giveup = true;
 				continue;
 			}
 			RecordUsedIndexPage(index, blk);
@@ -781,8 +896,14 @@ weave_new_buffer(Relation index)
 		ReleaseBuffer(buffer);
 	}
 
-	/* Try to reuse a page freed by a previous merge before extending. */
-	while (!weave_alloc_extend_only)
+	/*
+	 * Try to reuse a page freed by a previous merge before extending.
+	 *
+	 * SKIPPED IN SNAPSHOT MODE.  The live FSM may by now hold pages THIS
+	 * operation freed a moment ago, while a reader chain of ours still threads
+	 * through them; the snapshot gathered at scope entry provably does not.
+	 */
+	while (!weave_alloc_extend_only && !weave_alloc_no_fsm)
 	{
 		BlockNumber blk = GetFreeIndexPage(index);
 
@@ -808,6 +929,13 @@ weave_new_buffer(Relation index)
 				 * growth, and is why weave_alloc_fsm_defer is counted separately
 				 * from weave_alloc_extend.  Do not "fix" this into a loop without
 				 * a way to skip a block rather than re-queue it.
+				 *
+				 * THE MERGE PATH NO LONGER COMES THROUGH HERE, which is how that
+				 * mechanism was dealt with: a merge allocates in SNAPSHOT mode over
+				 * a gathered list it owns, where a deferred candidate is skipped
+				 * with `continue` and costs one page.  The remaining users of this
+				 * loop are ordinary segment writes, for which one deferred page
+				 * ending the sequence is a bounded cost, not a ratchet.
 				 */
 				weave_alloc_fsm_defer++;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -2600,6 +2728,34 @@ weave_page_recyclable(Relation index, Page page)
 
 	if (PageIsNew(page))
 		return true;
+	op = WeavePageGetOpaque(page);
+
+	/*
+	 * LIVENESS FIRST, before any lock-based bypass.  A page without WEAVE_FREED
+	 * is a LIVE page -- part of some segment's chain -- and must never be handed
+	 * out, whatever the free-space records say about it.  The FSM is a free-SPACE
+	 * hint, not a liveness oracle, and there are two ways a live page reaches a
+	 * candidate list: an entry in a gathered low-free/snapshot list that another
+	 * backend has since taken and filled (the snapshot is held for the length of a
+	 * whole merge loop, and an insert in another backend allocates from the live
+	 * FSM throughout), and GetPageWithFreeSpace()'s approximate answer handing the
+	 * same block to two backends at once.  Until now this function returned TRUE
+	 * for exactly that case ("older free, or in-use race") -- so the second taker
+	 * would initialize and write a page the first taker was already using.
+	 *
+	 * Upstream hit the consequence in the field rather than in review: a live
+	 * mid-chain posting page handed out as merge output while the same merge held
+	 * it pinned as input, self-deadlocking on its own buffer (the sibling
+	 * project, 1.8.3).
+	 *
+	 * Cost of the stricter rule: a page freed by a build older than the flag is no
+	 * longer reusable through the free list.  It is still reclaimed by
+	 * weave_truncate_free_tail() when it sits in the tail, which is where old
+	 * frees accumulate.  Safety over that corner.
+	 */
+	if ((op->flags & WEAVE_FREED) == 0)
+		return false;
+
 	/*
 	 * The recycle gate protects a CONCURRENT scan from reading a page we free
 	 * and hand back to the allocator (the scan holds only AccessShareLock, which
@@ -2617,9 +2773,6 @@ weave_page_recyclable(Relation index, Page page)
 	if ((weave_lowfree != NULL || weave_alloc_extend_only) &&
 		CheckRelationLockedByMe(index, AccessExclusiveLock, true))
 		return true;
-	op = WeavePageGetOpaque(page);
-	if ((op->flags & WEAVE_FREED) == 0)
-		return true;			/* not gated (older free, or in-use race) */
 	/*
 	 * Is the freeing xid old enough that no snapshot can still reference this
 	 * page?  Use the GLOBAL visibility horizon (NULL relation): the per-relation
