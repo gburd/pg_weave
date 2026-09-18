@@ -3565,6 +3565,34 @@ weave_merge_all_parallel(Relation index, int request)
 	 * (content-match) and install each group's merged descriptor.  Groups that
 	 * did not actually merge (singleton) keep their one source, so we simply
 	 * don't drop it.
+	 *
+	 * SAME CLAIM DISCIPLINE AS THE SERIAL PATH (weave_merge_selected), and for
+	 * the same reason.  This used to drop metapage entries that matched a source
+	 * and then free EVERY source of every valid group unconditionally -- never
+	 * checking that each source was still in the directory at commit time.  A
+	 * source that another merge had already consumed was therefore freed a
+	 * SECOND time: a double free into the FSM, and, once the first consumer's
+	 * output has been written over those blocks, weave_free_segment() walking
+	 * chains that now belong to somebody else.  The serial path has always
+	 * checked this ("we only abort if a chosen input is genuinely gone"); the
+	 * parallel commit did not.
+	 *
+	 * WHY THE FREE MUST BE GATED ON THE PRESENCE CHECK AND NOT ON outvalid[g]
+	 * ALONE.  outvalid[g] says only that the WORKER wrote an output segment --
+	 * a statement about a computation that finished minutes ago, in another
+	 * backend, before this metapage lock was taken.  It says nothing about
+	 * whether the sources it read are still live descriptors now.  The only
+	 * statement that licenses freeing a segment's pages is "this descriptor was
+	 * in the directory under the very metapage lock in which I removed it", and
+	 * that is what the claim array records.  Freeing under any weaker condition
+	 * is freeing pages we do not own.
+	 *
+	 * ABANDONMENT IS PER GROUP, because a group IS one merge: the serial path
+	 * abandons the one merge whose input vanished and leaks that merge's output
+	 * until the next merge/REINDEX, and the faithful analogue of that here is to
+	 * abandon the one group.  Groups have disjoint sources, so an incomplete
+	 * group cannot invalidate a complete one; aborting all W groups instead
+	 * would discard W merges' work and leak W output segments to punish one.
 	 */
 	{
 		Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
@@ -3575,6 +3603,8 @@ weave_merge_all_parallel(Relation index, int request)
 		uint32		nkept = 0;
 		uint32		j;
 		int			k;
+		bool		claimed[WEAVE_MAX_SEGMENTS];
+		bool		gcommit[WEAVE_MAX_SEGMENTS];
 
 		LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
 		state = GenericXLogStart(index);
@@ -3582,28 +3612,64 @@ weave_merge_all_parallel(Relation index, int request)
 		weave_meta_upcast_page(mp);	/* v3 -> v4 before struct write */
 		m = WeavePageGetMeta(mp);
 
-		/* keep any segment that is NOT a consumed source of a merged group */
-		for (j = 0; j < m->nsegments; j++)
+		/*
+		 * Claim each merged group's sources by CONTENT in the CURRENT directory,
+		 * one slot per source (a claim array, so two identical descriptors cannot
+		 * both match the same slot).  Provisional while a group is being matched:
+		 * if any source of the group is gone the claims it already made are
+		 * released, leaving those sources in the directory and unfreed.
+		 */
+		memset(claimed, 0, sizeof(bool) * m->nsegments);
+		for (g = 0; g < ngroups; g++)
 		{
-			bool		consumed = false;
+			int			slot[WEAVE_MAX_SEGMENTS];
+			int			nslot = 0;
+			bool		allfound = true;
 
-			for (g = 0; g < ngroups && !consumed; g++)
+			gcommit[g] = false;
+			if (!ms->outvalid[g])
+				continue;		/* singleton group, or a worker that merged nothing */
+
+			for (k = ms->groupoff[g]; k < ms->groupoff[g + 1]; k++)
 			{
-				if (!ms->outvalid[g])
-					continue;	/* singleton group merged nothing */
-				for (k = ms->groupoff[g]; k < ms->groupoff[g + 1]; k++)
-					if (memcmp(&m->segs[j], &ms->src[k], sizeof(WeaveSegMeta)) == 0)
+				bool		found = false;
+
+				for (j = 0; j < m->nsegments; j++)
+					if (!claimed[j] &&
+						memcmp(&m->segs[j], &ms->src[k], sizeof(WeaveSegMeta)) == 0)
 					{
-						consumed = true;
+						slot[nslot++] = (int) j;
+						claimed[j] = true;
+						found = true;
 						break;
 					}
+				if (!found)
+				{
+					allfound = false;
+					break;
+				}
 			}
-			if (!consumed)
-				kept[nkept++] = m->segs[j];
+
+			if (allfound)
+				gcommit[g] = true;
+			else
+			{
+				int			s;
+
+				for (s = 0; s < nslot; s++)
+					claimed[slot[s]] = false;
+				elog(DEBUG1, "pg_weave merge: index \"%s\": abandoning parallel merge group %d, an input was already consumed (its output segment leaks until the next merge)",
+					 RelationGetRelationName(index), g);
+			}
 		}
-		/* append each merged group's new segment */
+
+		/* keep every segment not claimed by a group that is committing */
+		for (j = 0; j < m->nsegments; j++)
+			if (!claimed[j])
+				kept[nkept++] = m->segs[j];
+		/* append the new segment of each committing group */
 		for (g = 0; g < ngroups; g++)
-			if (ms->outvalid[g])
+			if (gcommit[g])
 				kept[nkept++] = ms->outseg[g];
 
 		memcpy(m->segs, kept, nkept * sizeof(WeaveSegMeta));
@@ -3612,9 +3678,14 @@ weave_merge_all_parallel(Relation index, int request)
 		GenericXLogFinish(state);
 		UnlockReleaseBuffer(mb);
 
-		/* recycle the consumed source segments' pages */
+		/*
+		 * Recycle the source pages of the committing groups ONLY -- these are
+		 * exactly the descriptors this commit removed from the directory while
+		 * holding its lock, so this backend is the one and only owner of their
+		 * pages now.
+		 */
 		for (g = 0; g < ngroups; g++)
-			if (ms->outvalid[g])
+			if (gcommit[g])
 				for (k = ms->groupoff[g]; k < ms->groupoff[g + 1]; k++)
 					weave_free_segment(index, &ms->src[k]);
 	}
