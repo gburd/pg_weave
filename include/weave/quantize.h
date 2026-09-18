@@ -556,6 +556,34 @@ weave_block_bound_l2(const WeaveQueryLut *lut, float smax, float maxrecnorm,
 	return -lut->qnorm2 + 2.0f * ipb - minnorm * minnorm;
 }
 
+/*
+ * Which similarity a query asks for, and therefore which of the two bound
+ * formulations above applies.
+ *
+ * MOVED HERE FROM weave/vector.h BY TASK V8, and the move is the domain rule in
+ * weave/vecscan.h made compilable.  The metric selects between
+ * weave_block_bound_ip() and weave_block_bound_l2(), and the switch that selects
+ * is in a deliberately backend-free translation unit (src/vector/vecscan.c), so
+ * an enum behind postgres.h was unreachable from the one file whose correctness
+ * turns on it.  It costs nothing here: this header is already where the bounds
+ * live.  The operator and strategy numbers that explain the VALUES stay in
+ * weave/vector.h, beside the opclass that assigns them.
+ */
+typedef enum WeaveMetric
+{
+	WEAVE_METRIC_L2 = 1,
+	WEAVE_METRIC_IP = 2,
+	WEAVE_METRIC_COSINE = 3,
+	WEAVE_METRIC_L1 = 4
+} WeaveMetric;
+
+/* Does this metric admit a compressed-domain block bound?  If not, the fused
+ * scorer must treat the channel as exact-only.  Note that admitting a bound is
+ * not the same as one being IMPLEMENTED: src/vector/vecscan.c serves IP and L2
+ * and refuses cosine, because no maximum true norm is stored (weave/vecscan.h). */
+#define WEAVE_METRIC_HAS_BOUND(m) \
+	((m) == WEAVE_METRIC_L2 || (m) == WEAVE_METRIC_IP || (m) == WEAVE_METRIC_COSINE)
+
 /* ---------------------------------------------------------------------------
  * Bit packing
  *

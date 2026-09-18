@@ -96,10 +96,21 @@ sources = files(
   # build system, not a stale comment, so keep this list and OBJS in step.
   # src/vector/vector.c and src/vector/graph.c are deliberately absent from both:
   # they are stubs with no callers (tasks V7-V14).
+  #
+  # IT DRIFTED AGAIN, and the second time cost more than the first: vecweft.c and
+  # vecwrite.c -- the vector weft's strip layout and the writer/reader that puts it
+  # on pages, task V7 -- were in OBJS and not here, so a meson build had no weft
+  # writer and no weft reader while the Makefile build had both.  Found while
+  # adding vecscan.c (task V8).  A new src/vector/*.c goes in BOTH lists in the
+  # same commit, and `git grep -c "src/vector" Makefile meson.build` is the
+  # cheapest way to notice.
   'src/vector/quantize.c',
   'src/vector/pack.c',
   'src/vector/vecpage.c',
+  'src/vector/vecweft.c',
+  'src/vector/vecwrite.c',
   'src/vector/vecstats.c',
+  'src/vector/vecscan.c',
   'src/vector/kernels.c',
   'src/vector/kernel_ops.c',
   'src/vector/wvec.c',
