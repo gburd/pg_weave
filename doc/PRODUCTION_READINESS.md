@@ -203,24 +203,36 @@ when the scope was read as "BM25 + vector", then back when it was restated as al
 six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
 hard rule was weakened on an inference about scope rather than a question about it.*
 
-**33 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 1 partial (V6) and
-5 withdrawn (L2, L21, V9, V10, V13). By phase: X 4/4, L 16/20, Z 4/9, V 8/17, P 2/4,
-F 0/5, M 0/6, R 0/5. **One of the six retrieval kinds answers a query** -- BM25 lexical.
-The vector channel now has a complete on-disk format (V7: format v8 + VMETA v2, written,
-merged and crash-tested) but **no scan path**, so it still answers nothing; and
-fuzzy/regex/prefix/n-gram are imported but unwired. Two costs of V7 are stated rather
-than hidden: the vector half of a merge is not streaming and holds
-`O(nvec * codebytes)` resident (~497 MB per million 960-dimensional vectors,
-`doc/GAPS.md` G25), and a row inserted after the build has no vector in any segment
-until a rebuild (G23). The ordering below is
-forced by three things: hard rule 7 (F waits for L, Z **and** V), every new on-disk
-structure owing the adversity gates (7–11) before it counts, and hard rule 9 — which
-is why one *measurement* from phase V jumps ahead of both channels. The page-kind
-exhaustion that used to force the ordering is closed.
-forced by three things: hard rule 7 (F waits for L, Z **and** V), every new on-disk
-structure owing the adversity gates (7–11) before it counts, and hard rule 9 — which
-is why one *measurement* from phase V jumps ahead of both channels. The page-kind
-exhaustion that used to force the ordering is closed.
+**34 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 1 partial (V6) and
+5 withdrawn (L2, L21, V9, V10, V13). By phase: X 4/4, L 16/20, Z 4/9, V 9/17, P 2/4,
+F 0/5, M 0/6, R 0/5. **Two of the six retrieval kinds answer a query** -- BM25 lexical
+and, as of V8 on 2026-09-18, quantized-vector ANN. Fuzzy, regex, prefix and n-gram are
+imported but unwired.
+
+What V8 does *not* deliver is as load-bearing as what it does. It is the first
+implementation of the shuttle contract in `include/weave/channel.h`, which found five
+defects in that contract -- two before any code was written, three by executing it --
+and the most serious was an L2-domain bound reported next to an IP-domain score, which
+would have made (C2) *meaningless* rather than violated. It also made the block bound's
+case **weaker**: a block's lane strips precede its centroid strip on disk, so the bound
+cannot decide anything in a single forward pass, which means it saves the kernel call
+and nothing else. And its second gate is **unmet and unattempted** -- "a selective mask
+makes the scan measurably faster" needs a corpus, and the only one wired up is 300
+synthetic rows whose warp order is nearly spatial by construction. Measuring latency
+there would be a benchmark of an unrepresentative case, which hard rule 8 rates as
+worse than no benchmark. That measurement is the vector channel's next milestone.
+
+Three costs are stated rather than hidden: the vector half of a merge is not streaming
+and holds `O(nvec * codebytes)` resident (~497 MB per million 960-dimensional vectors,
+`doc/GAPS.md` G25); a row inserted after the build has no vector in any segment until a
+rebuild (G23); and the codes chain has no block→page index, so a block skipped on the
+allowlist still costs its page reads, which constrains claim 3 for this channel to
+*less scoring* rather than *less I/O* (G27).
+
+The ordering below is forced by three things: hard rule 7 (F waits for L, Z **and** V),
+every new on-disk structure owing the adversity gates (7–11) before it counts, and hard
+rule 9 — which is why one *measurement* from phase V jumps ahead of both channels. The
+page-kind exhaustion that used to force the ordering is closed.
 
 ### Stage 1 — finish the lexical channel (weeks)
 
