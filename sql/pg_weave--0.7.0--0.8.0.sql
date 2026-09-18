@@ -178,3 +178,64 @@ RETURNS TABLE (segno integer, warp bigint, blockno bigint, lane integer,
                docid bigint, live boolean, scale real, norm real, code bytea)
 AS 'MODULE_PATHNAME', 'weave_vec_lanes'
 LANGUAGE C STRICT PARALLEL SAFE;
+
+-- The code-scan shuttle, reachable directly from SQL (task V8).
+--
+-- THIS IS NOT A CONVENIENCE FUNCTION.  On 2026-09-16 a mutation that reintroduced a
+-- known scan-side bug survived the entire regression suite twice: once because the
+-- query shape never reached the mutated function, and then because the planner
+-- answered the query with a bitmap heap scan whose executor recheck re-evaluated the
+-- operator itself -- the right answer by a path that never entered the mutated code.
+-- Only the functions that enter the scan machinery DIRECTLY make a mutation in it
+-- observable (AGENTS.md).  V8 wires no operator and no ORDER BY, so without this
+-- function nothing in the suite would execute the vector scan at all.
+--
+-- `query` is a RAW, unrotated wvec of the weft's own dimension; the rotation happens
+-- inside the query-table builder.  `k` bounds a top-k whose floor is fed back to the
+-- decision core as its pruning threshold, and rejection is on `score <= floor`, so an
+-- equal score does not displace an incumbent.
+--
+-- `docids` is a DOCID allowlist, not a warp allowlist, and the difference matters: a
+-- warp is segment-local, so warp 7 names a different document in every bolt and an
+-- array of warps is ambiguous on any index with more than one.  Each bolt converts
+-- the docid list to its own warps in one pass over the warp map.  NULL means "no
+-- filter"; the EMPTY array means "admit nothing" and returns no rows -- the two are
+-- deliberately different, because conflating them turns an empty candidate set into
+-- a full scan.
+--
+-- `score` is in the metric's own domain, higher is better: the inner product for
+-- metric = ip, and -||q - v||^2 (a NEGATIVE number) for metric = l2.  It is a
+-- QUANTIZED-domain score -- V8 does no exact rerank -- so it approximates the exact
+-- distance rather than equalling it.
+--
+-- MVCC is NOT applied, per contract (C6) in include/weave/channel.h: tombstones are
+-- the fused scorer's job, and this reports what the weft contains.  A docid here is
+-- an index-resident document id, exactly as weave_vec_lanes() reports it.
+CREATE FUNCTION weave_vec_scan(idx regclass, query wvec, k integer DEFAULT 10,
+                               docids bigint[] DEFAULT NULL)
+RETURNS TABLE (segno integer, warp bigint, docid bigint, score real)
+AS 'MODULE_PATHNAME', 'weave_vec_scan'
+LANGUAGE C PARALLEL SAFE;
+
+-- The same scan, reporting per-bolt COUNTERS instead of rows.
+--
+-- A SECOND FUNCTION RATHER THAN EXTRA COLUMNS, because the counters matter most in
+-- the cases that return no rows at all: an allowlist that admits nothing, and a scan
+-- pruned away entirely.  Counter columns hung off result rows would disappear in
+-- exactly the two measurements this exists for, and would otherwise repeat one
+-- per-bolt value on every row.
+--
+-- `blocks_skipped_mask` is the number of 32-lane blocks whose live lanes did not
+-- intersect the allowlist, so no strip was scattered and no kernel ran for them.  It
+-- counts saved SCORING, never saved I/O: the code chain has no block -> page index,
+-- so a skipped block still costs its page reads (doc/specs/VECTOR_CHANNEL.md
+-- sect. 8b).  `blocks_skipped_bound` is the (C2) block bound doing its job; it is
+-- measured to prune 0.00 % of blocks on real corpora and is implemented because the
+-- contract requires a true upper bound, not because it is a speedup.
+CREATE FUNCTION weave_vec_scan_stats(idx regclass, query wvec, k integer DEFAULT 10,
+                                     docids bigint[] DEFAULT NULL)
+RETURNS TABLE (segno integer, blocks_seen bigint, blocks_skipped_mask bigint,
+               blocks_skipped_bound bigint, blocks_scored bigint,
+               lanes_scored bigint, maxscore real)
+AS 'MODULE_PATHNAME', 'weave_vec_scan_stats'
+LANGUAGE C PARALLEL SAFE;

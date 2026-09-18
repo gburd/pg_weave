@@ -61,7 +61,8 @@ PG_FUNCTION_INFO_V1(weave_vec_lanes);
  * ------------------------------------------------------------------------- */
 
 void
-weave_vec_accum_init(WeaveVecAccum *acc, MemoryContext ctx, bool active, int bits)
+weave_vec_accum_init(WeaveVecAccum *acc, MemoryContext ctx, bool active, int bits,
+					 WeaveMetric metric)
 {
 	MemSet(acc, 0, sizeof(*acc));
 	acc->ctx = ctx;
@@ -70,16 +71,22 @@ weave_vec_accum_init(WeaveVecAccum *acc, MemoryContext ctx, bool active, int bit
 	acc->layout = WEAVE_PACK_LANE;
 
 	/*
-	 * The metric is NOT known at build time, and recording that is better than
-	 * pretending otherwise.  wvec_weave_ops declares no operator members on
-	 * purpose (V7 is storage, V8 is the scan -- sect. 7.2), so nothing in the
-	 * catalog selects L2 over inner product yet.  L2 is written because 0 is not a
-	 * WeaveMetric and a zeroed field must not validate as one; it changes no
-	 * stored byte, since the codes are metric-independent and the inputs are not
-	 * unit-normalized (WEAVE_VMETA_F_NORMALIZED stays clear).  V8 decides whether
-	 * the metric is an opclass or a reloption, and must revisit this.
+	 * The metric comes from the `metric` reloption (task V8,
+	 * doc/specs/VECTOR_CHANNEL.md sect. 8b) and is recorded in the weft's
+	 * WEAVE_VMETA page, so a reader never guesses and two bolts of one index
+	 * cannot disagree about what their scores mean.  It changes no stored code
+	 * byte -- the codes are metric-independent and the inputs are not
+	 * unit-normalized, so WEAVE_VMETA_F_NORMALIZED stays clear -- but it changes
+	 * which bound formulation a scan is entitled to use, which is why it must be
+	 * stored rather than supplied at query time.
+	 *
+	 * V7 wrote WEAVE_METRIC_L2 unconditionally as a placeholder and left the
+	 * decision to V8; l2 is still the DEFAULT, because every weft already on disk
+	 * says l2.  Cosine and l1 are refused at build time by
+	 * weave_index_vec_metric(): neither has a sound compressed-domain bound, and a
+	 * channel whose bound is unsound violates contract (C2) silently.
 	 */
-	acc->metric = WEAVE_METRIC_L2;
+	acc->metric = metric;
 }
 
 /*
@@ -1089,6 +1096,105 @@ weave_vec_dir_read(const WeaveVecWeft *w, uint32 blockno, WeaveVecDirRec *out,
 	return false;
 }
 
+/*
+ * Take ONE strip page's payload into the block it belongs to.
+ *
+ * `contents` is PageGetContents() of a WEAVE_PK_VCODES page whose strip header
+ * already names `blockno`; the caller has established that much because it is the
+ * caller that knows which block it is assembling.  `block` receives lane strips
+ * (geom.blockbytes) and `cencode` the centroid strips (geom.codebytes); either may
+ * be NULL, and a strip whose destination is NULL is validated and DISCARDED rather
+ * than skipped, so a chain walk that wants no bytes still cannot mistake a corrupt
+ * page for an absent one.
+ *
+ * `seen` is strips_per_block booleans and `*nseen` their count, both owned by the
+ * caller across a block's strips: they are what turns "two strips claim the same
+ * coordinate range" and "a strip is missing" into detected faults.
+ *
+ * WHY THIS IS ITS OWN FUNCTION.  It was the body of weave_vec_block_read()'s loop
+ * until task V8, which needs the identical scatter from a forward-only cursor
+ * (src/vector/vecshuttle.c) because weave_vec_block_read() walks the whole chain
+ * per call and a scan cannot afford that.  Two copies of this would be two
+ * definitions of the strip format, and the failure mode of a disagreement is not a
+ * crash: weave_strip_scatter() puts bytes at a computed offset, so a reader that
+ * computed it differently returns wrong distances (src/vector/pack.c).  One
+ * implementation, two callers.
+ */
+bool
+weave_vec_strip_take(const WeaveVecWeft *w, const void *contents,
+					 uint32 blockno, uint8 *block, uint8 *cencode,
+					 bool *seen, int *nseen, const char **why)
+{
+	const WeaveVecStripHdr *raw = (const WeaveVecStripHdr *) contents;
+	WeaveVecStripHdr hdr;
+	const uint8 *bytes = NULL;
+	bool		iscen = (raw->flags & WEAVE_VSTRIP_F_CENTROID) != 0;
+	int			want = -1;
+	int			k;
+	int			n;
+
+	*why = NULL;
+	if (iscen)
+		n = weave_censtrip_parse(contents, WEAVE_VECPAGE_PAYLOAD, &w->geom,
+								 &hdr, &bytes, why);
+	else
+		n = weave_strip_parse(contents, WEAVE_VECPAGE_PAYLOAD, w->geom.dim,
+							  w->geom.bits, &hdr, &bytes, why);
+	if (n < 0)
+		return false;
+
+	/*
+	 * A strip is only accepted where the PLAN says it belongs.  This is what
+	 * turns "the writer used the wrong j0" from a wrong answer into a detected
+	 * fault: the coordinates a strip claims must be the coordinates its position
+	 * in the weft calls for.
+	 */
+	for (k = 0; k < w->geom.strips_per_block; k++)
+	{
+		WeaveVecStripPlan p;
+		uint32		i = blockno * (uint32) w->geom.strips_per_block + (uint32) k;
+
+		if (weave_vecweft_strip_plan(&w->geom, i, &p) != 0)
+			continue;
+		if (p.j0 == (int) hdr.j0 && p.ncoords == (int) hdr.ncoords &&
+			((p.flags & WEAVE_VSTRIP_F_CENTROID) != 0) == iscen)
+		{
+			want = k;
+			break;
+		}
+	}
+	if (want < 0)
+	{
+		*why = "a vector strip carries a coordinate range the weft's layout does not call for";
+		return false;
+	}
+	if (seen[want])
+	{
+		*why = "two vector strips claim the same coordinate range of one block";
+		return false;
+	}
+	if (iscen)
+	{
+		if (cencode != NULL &&
+			weave_censtrip_scatter(cencode, w->geom.codebytes, &w->geom,
+								   &hdr, bytes) != 0)
+		{
+			*why = "a centroid strip does not fit the code it belongs to";
+			return false;
+		}
+	}
+	else if (block != NULL &&
+			 weave_strip_scatter(block, w->geom.blockbytes, w->geom.dim,
+								 w->geom.bits, &hdr, bytes) != 0)
+	{
+		*why = "a lane strip does not fit the block it belongs to";
+		return false;
+	}
+	seen[want] = true;
+	(*nseen)++;
+	return true;
+}
+
 bool
 weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno, uint8 *block,
 					 uint8 *cencode, const char **why)
@@ -1098,7 +1204,6 @@ weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno, uint8 *block,
 	bool	   *seen;
 	int			nseen = 0;
 	int			npages = 0;
-	int			k;
 	bool		ok = true;
 
 	*why = NULL;
@@ -1121,15 +1226,17 @@ weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno, uint8 *block,
 	 * A reader therefore walks from codestart, which is O(pages in the weft) and
 	 * not the ceil(dim/coords_per_page) the block-major argument promises.  V7's
 	 * callers walk every block anyway (weave_check(), the round-trip test); V8's
-	 * rerank window and vacuum's lane update cannot, and that is the task that has
-	 * to add the index.  Recorded in sect. 7.1 as a correction, not left implicit.
+	 * SCAN cannot -- O(blocks x pages) is quadratic in the weft -- so it carries a
+	 * forward-only cursor over the same chain instead (src/vector/vecshuttle.c),
+	 * sharing weave_vec_strip_take() above.  V10's rerank window and vacuum's lane
+	 * update still want single-block access, and that is the task that has to add
+	 * the index.  Recorded in sect. 7.1 as a correction, not left implicit.
 	 */
 	while (blk != InvalidBlockNumber && ok)
 	{
 		Buffer		buf;
 		Page		page;
 		const WeaveVecStripHdr *raw;
-		WeaveVecStripHdr hdr;
 
 		CHECK_FOR_INTERRUPTS();
 		if (blk == WEAVE_METAPAGE_BLKNO || blk >= nblocks ||
@@ -1151,85 +1258,8 @@ weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno, uint8 *block,
 		}
 		raw = (const WeaveVecStripHdr *) PageGetContents(page);
 		if (raw->blockno == blockno)
-		{
-			const uint8 *bytes = NULL;
-			int			n;
-			bool		iscen = (raw->flags & WEAVE_VSTRIP_F_CENTROID) != 0;
-
-			if (iscen)
-				n = weave_censtrip_parse(PageGetContents(page),
-										 WEAVE_VECPAGE_PAYLOAD, &w->geom,
-										 &hdr, &bytes, why);
-			else
-				n = weave_strip_parse(PageGetContents(page),
-									  WEAVE_VECPAGE_PAYLOAD, w->geom.dim,
-									  w->geom.bits, &hdr, &bytes, why);
-			if (n < 0)
-				ok = false;
-			else
-			{
-				/*
-				 * A strip is only accepted where the PLAN says it belongs.  This
-				 * is what turns "the writer used the wrong j0" from a wrong answer
-				 * into a detected fault: the coordinates a strip claims must be
-				 * the coordinates its position in the weft calls for.
-				 */
-				int			want = -1;
-
-				for (k = 0; k < w->geom.strips_per_block; k++)
-				{
-					WeaveVecStripPlan p;
-					uint32		i = blockno * (uint32) w->geom.strips_per_block +
-						(uint32) k;
-
-					if (weave_vecweft_strip_plan(&w->geom, i, &p) != 0)
-						continue;
-					if (p.j0 == (int) hdr.j0 && p.ncoords == (int) hdr.ncoords &&
-						((p.flags & WEAVE_VSTRIP_F_CENTROID) != 0) == iscen)
-					{
-						want = k;
-						break;
-					}
-				}
-				if (want < 0)
-				{
-					*why = "a vector strip carries a coordinate range the weft's layout does not call for";
-					ok = false;
-				}
-				else if (seen[want])
-				{
-					*why = "two vector strips claim the same coordinate range of one block";
-					ok = false;
-				}
-				else if (iscen)
-				{
-					if (cencode != NULL &&
-						weave_censtrip_scatter(cencode, w->geom.codebytes,
-											   &w->geom, &hdr, bytes) != 0)
-					{
-						*why = "a centroid strip does not fit the code it belongs to";
-						ok = false;
-					}
-					else
-					{
-						seen[want] = true;
-						nseen++;
-					}
-				}
-				else if (weave_strip_scatter(block, w->geom.blockbytes,
-											 w->geom.dim, w->geom.bits,
-											 &hdr, bytes) != 0)
-				{
-					*why = "a lane strip does not fit the block it belongs to";
-					ok = false;
-				}
-				else
-				{
-					seen[want] = true;
-					nseen++;
-				}
-			}
-		}
+			ok = weave_vec_strip_take(w, PageGetContents(page), blockno, block,
+									  cencode, seen, &nseen, why);
 		blk = WeavePageGetOpaque(page)->nextblk;
 		UnlockReleaseBuffer(buf);
 	}
@@ -1576,10 +1606,13 @@ weave_vec_free_weft(Relation index, BlockNumber root)
  * ------------------------------------------------------------------------- */
 
 /* Open an index by oid, refusing anything that is not a weave index, and read its
- * metapage.  Shared by both functions below; the metapage gate ERRORs on an unknown
+ * metapage.  Shared by the four functions below and, since task V8, by the scan
+ * SRF in src/vector/vecshuttle.c: "is this a weave index, and what does its
+ * metapage say" needs one answer, or the SRF and the introspection disagree about
+ * which relations they will even look at.  The metapage gate ERRORs on an unknown
  * version rather than reading segs[] at an offset it cannot justify. */
-static Relation
-vec_introspect_open(Oid indexoid, WeaveMetaPageData *meta)
+Relation
+weave_vec_introspect_open(Oid indexoid, WeaveMetaPageData *meta)
 {
 	Relation	index = index_open(indexoid, AccessShareLock);
 	Buffer		mb;
@@ -1670,7 +1703,7 @@ weave_vec_meta(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	Tuplestorestate *tupstore = vec_introspect_tupstore(fcinfo, &tupdesc);
 	WeaveMetaPageData meta;
-	Relation	index = vec_introspect_open(indexoid, &meta);
+	Relation	index = weave_vec_introspect_open(indexoid, &meta);
 	uint32		s;
 
 	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
@@ -1719,7 +1752,7 @@ weave_vec_blocks(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	Tuplestorestate *tupstore = vec_introspect_tupstore(fcinfo, &tupdesc);
 	WeaveMetaPageData meta;
-	Relation	index = vec_introspect_open(indexoid, &meta);
+	Relation	index = weave_vec_introspect_open(indexoid, &meta);
 	uint32		s;
 
 	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
@@ -1796,7 +1829,7 @@ weave_vec_strips(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	Tuplestorestate *tupstore = vec_introspect_tupstore(fcinfo, &tupdesc);
 	WeaveMetaPageData meta;
-	Relation	index = vec_introspect_open(indexoid, &meta);
+	Relation	index = weave_vec_introspect_open(indexoid, &meta);
 	BlockNumber nrel = RelationGetNumberOfBlocks(index);
 	uint32		s;
 
@@ -1884,7 +1917,7 @@ weave_vec_lanes(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	Tuplestorestate *tupstore = vec_introspect_tupstore(fcinfo, &tupdesc);
 	WeaveMetaPageData meta;
-	Relation	index = vec_introspect_open(indexoid, &meta);
+	Relation	index = weave_vec_introspect_open(indexoid, &meta);
 	uint32		s;
 
 	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)

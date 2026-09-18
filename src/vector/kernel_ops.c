@@ -35,6 +35,25 @@
 
 int			weave_vec_kernel = WEAVE_KERNEL_AUTO;
 
+/*
+ * The other three vector-channel GUC backing variables, homeless since task V8
+ * deleted src/vector/vector.c -- a file that was in neither OBJS nor meson.build
+ * and whose every other symbol was a stale copy of a live one in
+ * src/vector/wvec.c.  They are here rather than in a new file because this is
+ * already the vector channel's GUC translation unit.
+ *
+ * NONE OF THE THREE IS REGISTERED WITH DefineCustom*Variable YET, on purpose: the
+ * code each one steers -- the graph traversal, the exact float32 rerank -- is not
+ * written (doc/PHASES.md V10 and the graph tasks).  A GUC a user can set that
+ * changes nothing is worse than an absent one.  The task that implements the
+ * consumer registers the variable in the same commit, next to the enum GUC below.
+ * See include/weave/vector.h for what each value means and for the measurements
+ * behind the defaults.
+ */
+int			weave_vec_oversample = 4;
+int			weave_vec_recall = WEAVE_RECALL_GRAPH;
+int			weave_vec_rerank_window = 25;
+
 static const WeaveScoreKernel *vec_core = &weave_score_kernel_scalar;
 
 /*
@@ -130,6 +149,42 @@ weave_score_block_ops(const WeaveQueryLut *lut,
 				 errdetail("dim %d, %d levels, pack layout %d: not a geometry "
 						   "this index can have written.",
 						   lut->dim, lut->nlevels, (int) layout)));
+	return n;
+}
+
+/*
+ * Dispatch a block that is ALREADY in WeaveScoreBlock shape.
+ *
+ * The shuttle (src/vector/vecshuttle.c) does not have a WeaveVecBlockHdr: the
+ * ratified format splits per-block metadata into a directory record and a strip
+ * of centroid code (doc/specs/VECTOR_CHANNEL.md sect. 7.1), so there is no header
+ * struct on a page to hand the adapter above.  weave_vec_scan_scoreblk() in the
+ * decision core fills a WeaveScoreBlock from the directory record instead -- one
+ * conversion, in one place, because the record stores the per-lane (scale, norm)
+ * pairs INTERLEAVED and getting that stride wrong returns wrong distances rather
+ * than failing.  This entry point exists so that conversion still dispatches
+ * through pg_weave.vec_kernel: calling weave_score_block() from weave/kernels.h
+ * would silently pin the scan to weave_score_kernel_best() and make the GUC --
+ * whose only job is reproducing a bug report from another host -- a no-op on the
+ * one path that scores anything.
+ */
+int
+weave_vec_score_block(const WeaveScoreBlock *blk, float4 *out)
+{
+	int			n;
+
+	if (blk == NULL || out == NULL)
+		elog(ERROR, "weave vector kernel called with a NULL block argument");
+
+	n = vec_core->score_block(blk, out);
+	if (n < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("weave vector code block is inconsistent"),
+				 errdetail("%d lanes, pack layout %d, first warp %u of %u: not "
+						   "a geometry this index can have written.",
+						   blk->nlanes, (int) blk->layout,
+						   (unsigned) blk->firstwarp, (unsigned) blk->nwarp)));
 	return n;
 }
 

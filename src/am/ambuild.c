@@ -2765,7 +2765,8 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 		tbs.want_positions = bs->want_positions;
 		tbs.lexattno = bs->lexattno;
 		tbs.vecattno = 0;
-		weave_vec_accum_init(&tbs.vec, termctx, false, WEAVE_VEC_DEFAULT_BITS);
+		weave_vec_accum_init(&tbs.vec, termctx, false, WEAVE_VEC_DEFAULT_BITS,
+							 WEAVE_METRIC_L2);
 		tbs.want_trigrams = bs->want_trigrams;
 		tbs.terms = NULL;
 		tbs.nterms = 0;
@@ -3076,7 +3077,8 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 	/* No producer 1 here: no heap tuple, no Datum.  Producer 2 is active exactly
 	 * when an input carries a weft (see weave_merge_selected for both halves). */
 	bs.vecattno = 0;
-	weave_vec_accum_init(&bs.vec, bs.ctx, nvecbolts > 0, (int) vgeom.bits);
+	weave_vec_accum_init(&bs.vec, bs.ctx, nvecbolts > 0, (int) vgeom.bits,
+						 (WeaveMetric) vgeom.metric);
 	if (nvecbolts > 0 &&
 		!weave_vec_accum_init_geom(&bs.vec, (int) vgeom.dim, (int) vgeom.bits,
 								   (WeaveMetric) vgeom.metric,
@@ -3223,7 +3225,8 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	/* PRODUCER 2: active exactly when an input carries a weft, and made ready for
 	 * pre-encoded lanes at the geometry the inputs agreed on -- not at the current
 	 * `bits` reloption, which may have changed since they were written. */
-	weave_vec_accum_init(&bs.vec, bs.ctx, nvecbolts > 0, (int) vgeom.bits);
+	weave_vec_accum_init(&bs.vec, bs.ctx, nvecbolts > 0, (int) vgeom.bits,
+						 (WeaveMetric) vgeom.metric);
 	if (nvecbolts > 0 &&
 		!weave_vec_accum_init_geom(&bs.vec, (int) vgeom.dim, (int) vgeom.bits,
 								   (WeaveMetric) vgeom.metric,
@@ -4042,8 +4045,16 @@ weave_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
 	bs.lexattno = weave_build_lexattno(index);
 	bs.vecattno = weave_build_vecattno(index);
+	/* The metric is only consulted when there IS a vector column: it is the one
+	 * reloption accessor that THROWS (cosine and l1 have no compressed-domain
+	 * bound -- src/am/am.c), and throwing over the metric of a channel this index
+	 * does not carry would refuse a purely lexical build for a reason that cannot
+	 * affect it. */
 	weave_vec_accum_init(&bs.vec, bs.ctx, bs.vecattno != 0,
-						 weave_index_vec_bits(index));
+						 weave_index_vec_bits(index),
+						 (WeaveMetric) (bs.vecattno != 0 ?
+										weave_index_vec_metric(index) :
+										WEAVE_METRIC_L2));
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -4240,8 +4251,16 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
 	bs.lexattno = weave_build_lexattno(index);
 	bs.vecattno = weave_build_vecattno(index);
+	/* The metric is only consulted when there IS a vector column: it is the one
+	 * reloption accessor that THROWS (cosine and l1 have no compressed-domain
+	 * bound -- src/am/am.c), and throwing over the metric of a channel this index
+	 * does not carry would refuse a purely lexical build for a reason that cannot
+	 * affect it. */
 	weave_vec_accum_init(&bs.vec, bs.ctx, bs.vecattno != 0,
-						 weave_index_vec_bits(index));
+						 weave_index_vec_bits(index),
+						 (WeaveMetric) (bs.vecattno != 0 ?
+										weave_index_vec_metric(index) :
+										WEAVE_METRIC_L2));
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -4426,7 +4445,8 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
 	 * written for this segment, which costs zero bytes and leaves the row absent
 	 * from vector answers rather than present with a wrong vector. */
 	bs.vecattno = 0;
-	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS);
+	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS,
+						 WEAVE_METRIC_L2);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -4710,7 +4730,8 @@ weave_flush_pending(Relation index)
 	 * than papered over -- writing a weft of dead lanes would claim to cover these
 	 * documents, which is worse than not claiming to. */
 	bs.vecattno = 0;
-	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS);
+	weave_vec_accum_init(&bs.vec, bs.ctx, false, WEAVE_VEC_DEFAULT_BITS,
+						 WEAVE_METRIC_L2);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
