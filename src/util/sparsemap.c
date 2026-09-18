@@ -34,15 +34,37 @@
  * different copy of sparsemap loaded by another extension in the same backend
  * cannot cause dynamic-linker symbol collisions.  Must match weave/sparsemap.h.
  *
- * Vendored from sparsemap v5.5.0 (upstream sm.c), a CORRECTNESS release: it fixed
- * big-endian miscomputation in every counting and navigation operation (which
- * includes sm_next_member, used here to iterate tombstones and trigram term
- * ordinals), silent data loss in sm_difference, and structurally invalid maps from
- * sm_offset.  The big-endian bug affects every release from v1.0.0 and is latent
- * on x86-64/aarch64 but not on the big-endian platforms PostgreSQL supports.
- * Upstream states the wire format is unchanged (still version 2); that claim is
- * VERIFIED against 5.4.0-written bytes by test/hegel/test_sparsemap_wire.c rather
- * than trusted, because existing indexes on disk contain 5.4.0 blobs.
+ * Vendored from sparsemap v5.5.1 (upstream sm.c).  Two releases' worth of
+ * reasons, kept separate because they are separate hazards:
+ *
+ * v5.5.0 was a CORRECTNESS release: it fixed big-endian miscomputation in every
+ * counting and navigation operation (which includes sm_next_member, used here to
+ * iterate tombstones and trigram term ordinals), silent data loss in
+ * sm_difference, and structurally invalid maps from sm_offset.  The big-endian
+ * bug affects every release from v1.0.0 and is latent on x86-64/aarch64 but not
+ * on the big-endian platforms PostgreSQL supports.
+ *
+ * v5.5.1 is a HARDENING release, and pg_weave is the reason it matters here:
+ * __sm_append_data() now returns bool and is warn_unused_result, so a caller that
+ * skips its capacity check is a compile error rather than a silent heap overflow.
+ * We reach that code through sm_add_many_grow() (src/am/amvacuum.c), whose whole
+ * grow-and-retry loop is driven by ENOSPC being SIGNALLED -- an append that
+ * overflowed instead of reporting would corrupt the tombstone map the loop is
+ * trying to grow, and the loop would never grow it.  Upstream's own case was
+ * sm_split(), where the missing check surfaced much later as an unrelated glibc
+ * "realloc(): invalid next size".
+ *
+ * Upstream states the wire format is unchanged across both (still version 2);
+ * that claim is VERIFIED against 5.4.0-written bytes by
+ * test/hegel/test_sparsemap_wire.c and `make check-sparsemap-wire` rather than
+ * trusted, because existing indexes on disk contain 5.4.0 blobs.
+ *
+ * This file is a NAMESPACED fork, so re-vendoring is a manual merge, not a drop.
+ * The mechanical part of that merge is small and worth stating: apart from the
+ * include block immediately below, src/util/sparsemap.c is byte-identical to
+ * upstream sm.c, and include/weave/sparsemap_impl.h is byte-identical to upstream
+ * sm.h.  Check that before and after any bump (diff against the tag) so the next
+ * bump stays mechanical.
  */
 #ifndef SPARSEMAP_PREFIX
 #define SPARSEMAP_PREFIX __pg_weave_
@@ -326,16 +348,23 @@ void
  * usual "static inline": on gcc/clang it forces inlining, on MSVC it
  * uses __forceinline, elsewhere it degrades to a plain static inline.
  * SM_HOT marks a hot function.
+ * SM_WARN_UNUSED makes the compiler complain when a return value that
+ * reports failure is discarded; it is how the "someone checked the
+ * capacity" invariant is enforced at compile time rather than by an
+ * assert that vanishes in release builds.
  */
 #if defined(__GNUC__) || defined(__clang__)
 #define SM_ALWAYS_INLINE static inline __attribute__((always_inline))
 #define SM_HOT __attribute__((hot))
+#define SM_WARN_UNUSED __attribute__((warn_unused_result))
 #elif defined(_MSC_VER)
 #define SM_ALWAYS_INLINE static __forceinline
 #define SM_HOT
+#define SM_WARN_UNUSED _Check_return_
 #else
 #define SM_ALWAYS_INLINE static inline
 #define SM_HOT
+#define SM_WARN_UNUSED
 #endif
 
 typedef uint64_t __sm_bitvec_t;
@@ -2268,21 +2297,47 @@ __sm_set_chunk_count(const sm_t *map, const size_t new_count)
 /**
  * @brief Appends data to the sparsemap's internal buffer.
  *
- * This function appends the provided buffer to the sparsemap's internal data
- * storage, ensuring that there is enough capacity in the buffer to accommodate
- * the new data.
+ * Copies @a buffer_size bytes to the end of the map's data region and
+ * advances m_data_used.
  *
- * @param[in] map Pointer to the sparsemap structure where data will be appended.
- * @param[in,out] buffer Pointer to the data buffer to be appended to the sparsemap.
- * @param[in] buffer_size Size of the data buffer to be appended.
+ * The caller must have established capacity first, because there is no
+ * single correct response to "it does not fit" at this level: the
+ * library-owned result maps in sm_union() and friends grow (see
+ * __sm_ensure_capacity(), which may reallocate and reassign the
+ * caller's pointer), while operations on a caller-supplied buffer must
+ * instead fail with errno=ENOSPC (see the SM_ENOUGH_SPACE() macro).
+ * A callee cannot pick between grow-and-continue and fail-fast, so the
+ * policy stays with the caller.
+ *
+ * What this function *can* do is refuse to perform an overflowing copy
+ * and say so.  It previously returned void and only noted the problem
+ * through __sm_assert(), which expands to ((void)0) unless
+ * SPARSEMAP_DIAGNOSTIC is defined -- so in a release build a caller
+ * that forgot its capacity check got a silent heap overflow instead of
+ * a diagnostic.  sm_split() did forget, and the corruption surfaced
+ * much later as an unrelated glibc "realloc(): invalid next size".
+ * Returning bool makes the compiler point at any caller that does not
+ * check (warn_unused_result), which is the property the assert was
+ * standing in for.
+ *
+ * @param[in,out] map          Map whose buffer is appended to.
+ * @param[in]     buffer       Bytes to append.
+ * @param[in]     buffer_size  Number of bytes to append.
+ * @return true on success; false without copying anything if the bytes
+ *         would not fit, which indicates a missing caller-side check.
  */
-static void
+SM_WARN_UNUSED static bool
 __sm_append_data(sm_t *map, const uint8_t *buffer, const size_t buffer_size)
 {
-	__sm_assert(map->m_data_used + buffer_size <= __sm_cap(map));
+	if (SM_UNLIKELY(map->m_data_used + buffer_size > __sm_cap(map))) {
+		__sm_assert(map->m_data_used + buffer_size <= __sm_cap(map));
+		errno = ENOSPC;
+		return (false);
+	}
 
 	memcpy(&map->m_data[map->m_data_used], buffer, buffer_size);
 	map->m_data_used += buffer_size;
+	return (true);
 }
 
 /**
@@ -4197,7 +4252,12 @@ __sm_map_set(sm_t *map, uint64_t idx, const bool coalesce, sm_cursor_t *cur)
 		 */
 		const uint8_t buf[SM_SIZEOF_OVERHEAD +
 		    (sizeof(__sm_bitvec_t) * 2)] = { 0 };
-		__sm_append_data(map, &buf[0], sizeof(buf));
+		/* Capacity was established by the SM_ENOUGH_SPACE() above; a
+		 * failure here would mean that check and this size disagree,
+		 * so propagate ENOSPC rather than corrupt the buffer. */
+		if (SM_UNLIKELY(!__sm_append_data(map, &buf[0], sizeof(buf)))) {
+			return (SM_IDX_MAX);
+		}
 		p = __sm_get_chunk_data(map, 0);
 		__sm_store_idx((uint8_t *)p,
 		    __sm_get_chunk_aligned_offset(idx));
@@ -5147,14 +5207,22 @@ __sm_append_sparse_chunk(sm_t **resultp, __sm_idx_t start, __sm_bitvec_t desc,
 	}
 	sm_t *result = *resultp;
 
-	/* Write start offset */
-	__sm_append_data(result, (const uint8_t *)&start, SM_SIZEOF_OVERHEAD);
-	/* Write descriptor */
-	__sm_append_data(result, (const uint8_t *)&desc, sizeof(__sm_bitvec_t));
-	/* Write vectors */
+	/* Capacity for the whole chunk was reserved above, so these appends
+	 * cannot fail; check anyway so the invariant is enforced by the
+	 * compiler rather than by a comment. */
+	if (SM_UNLIKELY(!__sm_append_data(result, (const uint8_t *)&start,
+	        SM_SIZEOF_OVERHEAD))) {
+		return (false);
+	}
+	if (SM_UNLIKELY(!__sm_append_data(result, (const uint8_t *)&desc,
+	        sizeof(__sm_bitvec_t)))) {
+		return (false);
+	}
 	for (int i = 0; i < nvecs; i++) {
-		__sm_append_data(result, (const uint8_t *)&vecs[i],
-		    sizeof(__sm_bitvec_t));
+		if (SM_UNLIKELY(!__sm_append_data(result,
+		        (const uint8_t *)&vecs[i], sizeof(__sm_bitvec_t)))) {
+			return (false);
+		}
 	}
 
 	__sm_set_chunk_count(result, __sm_get_chunk_count(result) + 1);
@@ -5279,8 +5347,11 @@ __sm_append_rle_chunk(sm_t **resultp, __sm_idx_t start, size_t capacity,
 	}
 	result = *resultp;
 
-	/* Write start offset */
-	__sm_append_data(result, (const uint8_t *)&start, SM_SIZEOF_OVERHEAD);
+	/* Capacity for the whole chunk was reserved above. */
+	if (SM_UNLIKELY(!__sm_append_data(result, (const uint8_t *)&start,
+	        SM_SIZEOF_OVERHEAD))) {
+		return (false);
+	}
 
 	/* Build and write the RLE word */
 	SM_ALIGNAS(__sm_bitvec_t) uint8_t rle_buf[sizeof(__sm_bitvec_t)] = { 0 };
@@ -5289,7 +5360,10 @@ __sm_append_rle_chunk(sm_t **resultp, __sm_idx_t start, size_t capacity,
 	__sm_chunk_set_rle(&tmp);
 	__sm_chunk_rle_set_capacity(&tmp, capacity);
 	__sm_chunk_rle_set_length(&tmp, length);
-	__sm_append_data(result, rle_buf, sizeof(__sm_bitvec_t));
+	if (SM_UNLIKELY(
+	        !__sm_append_data(result, rle_buf, sizeof(__sm_bitvec_t)))) {
+		return (false);
+	}
 
 	__sm_set_chunk_count(result, __sm_get_chunk_count(result) + 1);
 	return (true);
@@ -7112,7 +7186,10 @@ __sm_copy_chunk_to_result(sm_t **resultp, const uint8_t *chunk_ptr)
 	if (!__sm_ensure_capacity(resultp, chunk_bytes)) {
 		return (false);
 	}
-	__sm_append_data(*resultp, chunk_ptr, chunk_bytes);
+	if (SM_UNLIKELY(
+	        !__sm_append_data(*resultp, chunk_ptr, chunk_bytes))) {
+		return (false);
+	}
 	__sm_set_chunk_count(*resultp, __sm_get_chunk_count(*resultp) + 1);
 	return (true);
 }
@@ -8370,8 +8447,16 @@ sm_split(sm_t *map, uint64_t idx, sm_t *other)
 		size_t chunk_size =
 		    SM_SIZEOF_OVERHEAD + __sm_chunk_get_size(&chunk);
 
-		/* Copy chunk to other */
-		__sm_append_data(other, src, chunk_size);
+		/* Copy chunk to other.  The total was reserved before the
+		 * loop started, so this cannot fail; if it ever did, the
+		 * move would already be half-applied, so treat it as
+		 * unreachable rather than pretending it can be unwound. */
+		if (SM_UNLIKELY(!__sm_append_data(other, src, chunk_size))) {
+			__sm_assert(!"sm_split: capacity check disagreed with "
+			             "the move loop");
+			errno = ENOSPC;
+			return (SM_IDX_MAX);
+		}
 		__sm_set_chunk_count(other, __sm_get_chunk_count(other) + 1);
 
 		src += chunk_size;
