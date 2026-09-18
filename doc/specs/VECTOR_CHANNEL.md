@@ -1014,6 +1014,19 @@ task V9 all specified a **Vamana graph over the quantized codes** as the route p
 the flat scan's measured 490x loss to pgvector HNSW. That is withdrawn, on the
 strength of the source project's own matched-recall data rather than on reasoning.
 
+> **SUPERSEDED FOR OUR CONFIGURATION, 2026-09-18.** The table below is v2.5.0 data and
+> it is what demoted the graph, which still holds. But read as a positive case for IVF it
+> is now stale: at **v2.8.3** the same project measured 1M x 1024-d and found **4-bit flat
+> beating `lists=1024` at every target** (4-bit flat 6.08 ms at R@10 1.000 -- a 4-thread
+> figure, see `bench/RESULTS_CODE_SCAN.md`), with **4-bit IVF's recall ceiling at 0.959**
+> (p=128) and unmoved by any rerank window. So at *our* 4 bits, IVF does not reach 0.98 at
+> all, and the "yes" in the right-hand column does not apply to us. Their IVF/flat
+> crossover survives only at **1 bit**, where the quantizer is lossy enough to demand a
+> wide rerank window (w=800 at 1 bit against 25-32 at 4). That is consistent with our
+> 4-bit choice rather than a warning about it, and it independently corroborates V9's
+> demotion. The withdrawal of the graph rests on the table; the withdrawal of IVF now
+> rests on this note.
+
 pg_turbovec added exactly that structure in v1.23.0 for exactly that reason, and
 **deprecated it in v2.5.0**. GIST-10M, 960-d, at **R@10 >= 0.98**:
 

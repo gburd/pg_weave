@@ -313,8 +313,18 @@ it are internally valid. Do not ratio these against the 291.2 ns above: that was
 the hardware, not drift.
 
 Why this was measured at all: a sibling project reports a 4-bit flat scan at 6.08 ms
-for 1M x 1024-d, against our 293 ms for 1M x 960-d, in the same algorithm family and
-with neither side threaded. Our 291-319 ns/vector is about one cycle per coordinate,
+for 1M x 1024-d, against our 293 ms for 1M x 960-d, in the same algorithm family.
+
+> **RETRACTED 2026-09-18: "with neither side threaded" was false.** Their
+> `scan_parallelism=0` means *auto*, which resolves to 4 threads, so the comparison was
+> 1 thread against 4 from the start. The conclusion below survives untouched, and what is
+> interesting is that **this document already refuted its own premise 200 lines later**:
+> the measured 11.77 GB/s wall makes a single-threaded 512 MB scan cost >= 43.5 ms, so
+> 6.08 ms "is either parallel across workers or is not scanning everything" (see "The
+> 6.08 ms that started this is not a full flat scan"). The arithmetic got there before
+> the fact did. Treat the 6.08 ms as a 4-thread figure.
+
+Our 291-319 ns/vector is about one cycle per coordinate,
 which is exactly what one LUT gather per coordinate costs, so the arithmetic said the
 kernel was the gap rather than the algorithm. `src/vector/pack.c`'s header had said so
 all along: `WEAVE_PACK_LANE` exists so "a byte-LUT kernel loads 32 lanes' codes for
