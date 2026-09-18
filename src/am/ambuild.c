@@ -3565,6 +3565,34 @@ weave_merge_all_parallel(Relation index, int request)
 	 * (content-match) and install each group's merged descriptor.  Groups that
 	 * did not actually merge (singleton) keep their one source, so we simply
 	 * don't drop it.
+	 *
+	 * SAME CLAIM DISCIPLINE AS THE SERIAL PATH (weave_merge_selected), and for
+	 * the same reason.  This used to drop metapage entries that matched a source
+	 * and then free EVERY source of every valid group unconditionally -- never
+	 * checking that each source was still in the directory at commit time.  A
+	 * source that another merge had already consumed was therefore freed a
+	 * SECOND time: a double free into the FSM, and, once the first consumer's
+	 * output has been written over those blocks, weave_free_segment() walking
+	 * chains that now belong to somebody else.  The serial path has always
+	 * checked this ("we only abort if a chosen input is genuinely gone"); the
+	 * parallel commit did not.
+	 *
+	 * WHY THE FREE MUST BE GATED ON THE PRESENCE CHECK AND NOT ON outvalid[g]
+	 * ALONE.  outvalid[g] says only that the WORKER wrote an output segment --
+	 * a statement about a computation that finished minutes ago, in another
+	 * backend, before this metapage lock was taken.  It says nothing about
+	 * whether the sources it read are still live descriptors now.  The only
+	 * statement that licenses freeing a segment's pages is "this descriptor was
+	 * in the directory under the very metapage lock in which I removed it", and
+	 * that is what the claim array records.  Freeing under any weaker condition
+	 * is freeing pages we do not own.
+	 *
+	 * ABANDONMENT IS PER GROUP, because a group IS one merge: the serial path
+	 * abandons the one merge whose input vanished and leaks that merge's output
+	 * until the next merge/REINDEX, and the faithful analogue of that here is to
+	 * abandon the one group.  Groups have disjoint sources, so an incomplete
+	 * group cannot invalidate a complete one; aborting all W groups instead
+	 * would discard W merges' work and leak W output segments to punish one.
 	 */
 	{
 		Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
@@ -3575,6 +3603,8 @@ weave_merge_all_parallel(Relation index, int request)
 		uint32		nkept = 0;
 		uint32		j;
 		int			k;
+		bool		claimed[WEAVE_MAX_SEGMENTS];
+		bool		gcommit[WEAVE_MAX_SEGMENTS];
 
 		LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
 		state = GenericXLogStart(index);
@@ -3582,28 +3612,64 @@ weave_merge_all_parallel(Relation index, int request)
 		weave_meta_upcast_page(mp);	/* v3 -> v4 before struct write */
 		m = WeavePageGetMeta(mp);
 
-		/* keep any segment that is NOT a consumed source of a merged group */
-		for (j = 0; j < m->nsegments; j++)
+		/*
+		 * Claim each merged group's sources by CONTENT in the CURRENT directory,
+		 * one slot per source (a claim array, so two identical descriptors cannot
+		 * both match the same slot).  Provisional while a group is being matched:
+		 * if any source of the group is gone the claims it already made are
+		 * released, leaving those sources in the directory and unfreed.
+		 */
+		memset(claimed, 0, sizeof(bool) * m->nsegments);
+		for (g = 0; g < ngroups; g++)
 		{
-			bool		consumed = false;
+			int			slot[WEAVE_MAX_SEGMENTS];
+			int			nslot = 0;
+			bool		allfound = true;
 
-			for (g = 0; g < ngroups && !consumed; g++)
+			gcommit[g] = false;
+			if (!ms->outvalid[g])
+				continue;		/* singleton group, or a worker that merged nothing */
+
+			for (k = ms->groupoff[g]; k < ms->groupoff[g + 1]; k++)
 			{
-				if (!ms->outvalid[g])
-					continue;	/* singleton group merged nothing */
-				for (k = ms->groupoff[g]; k < ms->groupoff[g + 1]; k++)
-					if (memcmp(&m->segs[j], &ms->src[k], sizeof(WeaveSegMeta)) == 0)
+				bool		found = false;
+
+				for (j = 0; j < m->nsegments; j++)
+					if (!claimed[j] &&
+						memcmp(&m->segs[j], &ms->src[k], sizeof(WeaveSegMeta)) == 0)
 					{
-						consumed = true;
+						slot[nslot++] = (int) j;
+						claimed[j] = true;
+						found = true;
 						break;
 					}
+				if (!found)
+				{
+					allfound = false;
+					break;
+				}
 			}
-			if (!consumed)
-				kept[nkept++] = m->segs[j];
+
+			if (allfound)
+				gcommit[g] = true;
+			else
+			{
+				int			s;
+
+				for (s = 0; s < nslot; s++)
+					claimed[slot[s]] = false;
+				elog(DEBUG1, "pg_weave merge: index \"%s\": abandoning parallel merge group %d, an input was already consumed (its output segment leaks until the next merge)",
+					 RelationGetRelationName(index), g);
+			}
 		}
-		/* append each merged group's new segment */
+
+		/* keep every segment not claimed by a group that is committing */
+		for (j = 0; j < m->nsegments; j++)
+			if (!claimed[j])
+				kept[nkept++] = m->segs[j];
+		/* append the new segment of each committing group */
 		for (g = 0; g < ngroups; g++)
-			if (ms->outvalid[g])
+			if (gcommit[g])
 				kept[nkept++] = ms->outseg[g];
 
 		memcpy(m->segs, kept, nkept * sizeof(WeaveSegMeta));
@@ -3612,9 +3678,14 @@ weave_merge_all_parallel(Relation index, int request)
 		GenericXLogFinish(state);
 		UnlockReleaseBuffer(mb);
 
-		/* recycle the consumed source segments' pages */
+		/*
+		 * Recycle the source pages of the committing groups ONLY -- these are
+		 * exactly the descriptors this commit removed from the directory while
+		 * holding its lock, so this backend is the one and only owner of their
+		 * pages now.
+		 */
 		for (g = 0; g < ngroups; g++)
-			if (ms->outvalid[g])
+			if (gcommit[g])
 				for (k = ms->groupoff[g]; k < ms->groupoff[g + 1]; k++)
 					weave_free_segment(index, &ms->src[k]);
 	}
@@ -3630,7 +3701,9 @@ weave_merge_all(Relation index, bool try_parallel)
 {
 	bool		didwork = false;
 	int			guard;
-	bool		saved_extend_only = weave_alloc_extend_only;
+	WeaveAllocScope saved_alloc;
+
+	weave_assert_merge_serialized(index);
 
 	/*
 	 * Try a parallel merge first (unless already inside a parallel operation,
@@ -3654,9 +3727,19 @@ weave_merge_all(Relation index, bool try_parallel)
 			didwork = true;
 	}
 
-	/* extend-only serial collapse (same recycle-race avoidance as
-	 * weave_merge_segments; freed inputs are reclaimed later) */
-	weave_alloc_extend_only = true;
+	/*
+	 * Serial collapse under SNAPSHOT allocation -- same exact-rather-than-
+	 * conservative recycle guard as weave_merge_segments(), whose comment derives
+	 * it.
+	 *
+	 * ENTERED HERE, AFTER THE PARALLEL PASS, not around it.  The allocator is
+	 * backend-local: a snapshot in the leader does not remove a block from the FSM,
+	 * so a worker allocating from the live FSM could be handed a block the leader
+	 * is also about to hand out.  The parallel pass therefore allocates the way it
+	 * always did, and the snapshot covers only the serial loop -- which is also
+	 * where the pages the parallel pass just freed become reusable.
+	 */
+	weave_alloc_snapshot_enter(index, &saved_alloc);
 
 	PG_TRY();
 	{
@@ -3716,7 +3799,7 @@ weave_merge_all(Relation index, bool try_parallel)
 	}
 	PG_FINALLY();
 	{
-		weave_alloc_extend_only = saved_extend_only;
+		weave_alloc_scope_leave(&saved_alloc);
 	}
 	PG_END_TRY();
 	return didwork;
@@ -3756,6 +3839,21 @@ weave_build_finalize(Relation index)
 	int			nseg;
 	WeaveMetaPageData meta;
 
+	/*
+	 * UNDER THE MAINTENANCE MUTEX, like every other merger.  A plain CREATE
+	 * INDEX holds AccessExclusiveLock and nothing else can see this index, so
+	 * the mutex is free and redundant there; a CREATE INDEX CONCURRENTLY holds
+	 * only ShareUpdateExclusiveLock, the not-yet-valid index IS visible to
+	 * autovacuum's index cleanup, and that cleanup merges -- so here the mutex
+	 * is required, not decorative.  Cheap either way: uncontended in the common
+	 * case, and taken once per build.
+	 *
+	 * This site was found by weave_assert_merge_serialized() rather than by
+	 * reading the code, which is the argument for having that check at all.
+	 */
+	weave_maintenance_lock(index);
+	PG_TRY();
+	{
 	/*
 	 * Bounded size-tiered merge (LSM), serial.  We do NOT start a parallel
 	 * merge context here: this runs inside ambuild, after the build-scan's own
@@ -3800,13 +3898,21 @@ weave_build_finalize(Relation index)
 		elog(LOG, "pg_weave build: index \"%s\": leaving %d size-tiered segments (%lu MB > collapse cap %d MB); run weave_merge('%s') to collapse to one",
 			 RelationGetRelationName(index), nseg, (unsigned long) sizemb,
 			 pg_weave_build_collapse_max_mb, RelationGetRelationName(index));
+	}
+	PG_FINALLY();
+	{
+		weave_maintenance_unlock(index);
+	}
+	PG_END_TRY();
 }
 
 void
 weave_merge_segments(Relation index)
 {
 	int			guard;
-	bool		saved_extend_only = weave_alloc_extend_only;
+	WeaveAllocScope saved_alloc;
+
+	weave_assert_merge_serialized(index);
 
 	/*
 	 * Leveled (HanoiDB/LSM) compaction: each pass, assign every live segment a
@@ -3819,16 +3925,36 @@ weave_merge_segments(Relation index)
 	 * first (cheapest), converging in O(log) passes; the guard bounds it (each
 	 * successful merge strictly reduces nsegments).
 	 *
-	 * Allocate merge output EXTEND-ONLY for the whole loop: a committed merge
-	 * frees its input pages to the FSM, and without this the NEXT merge's
-	 * weave_new_buffer would recycle those freed blocks for its output while it is
-	 * still reading input posting/dict chains -- whose on-page nextblk pointers
-	 * may thread through a just-recycled (rewritten, or past-EOF) block, giving a
-	 * wrong read or a SIGBUS.  Extending to fresh high blocks means no in-flight
-	 * read chain ever points at a block this loop hands out; freed pages are
-	 * reclaimed later (VACUUM / weave_truncate_free_tail).
+	 * ALLOCATION MODE, and this choice is the difference between an index that
+	 * stays near its live size under ingest and one that grows tens of pages per
+	 * document.
+	 *
+	 * The hazard: a committed merge frees its input pages, and if the NEXT merge in
+	 * this loop took those blocks for its output while still reading input
+	 * posting/dict chains -- whose on-page nextblk pointers may thread through a
+	 * just-recycled block -- the result is a wrong read or a SIGBUS.
+	 *
+	 * This used to be EXTEND_ONLY, which forbids ALL reuse.  That is exact against
+	 * the hazard and over-approximates it badly: it also forbids reusing pages
+	 * freed by EARLIER calls -- previous inserts' merges, already committed, with
+	 * no reader of ours anywhere near them.  Because at high terms-per-document
+	 * every document mints a one-doc segment and triggers a merge, the merge is the
+	 * dominant writer, so that was nearly every page: measured at 1,660 terms/doc,
+	 * 550,896 pages extended for 6,000 documents whose compacted form is 2,029
+	 * pages (bench/RESULTS_G20_MERGE_GATE.md, doc/GAPS.md G20).
+	 *
+	 * SNAPSHOT mode makes the guard exact instead of conservative: the free list is
+	 * gathered ONCE at scope entry, before this call frees anything, and the loop
+	 * hands out only from that snapshot, then extends.  A page freed by merge N in
+	 * this loop cannot reach merge N+1 -- it is not in the snapshot.  Pages from
+	 * previous calls ARE in it and are reused.  weave_page_recyclable() still gates
+	 * every candidate against concurrent scans holding directory snapshots.
+	 *
+	 * The snapshot is only sound because this function runs under the maintenance
+	 * mutex (weave_assert_merge_serialized above): nothing else may free, merge,
+	 * compact or truncate this index while the snapshot is in hand.
 	 */
-	weave_alloc_extend_only = true;
+	weave_alloc_snapshot_enter(index, &saved_alloc);
 
 	PG_TRY();
 	{
@@ -3928,7 +4054,7 @@ weave_merge_segments(Relation index)
 	}
 	PG_FINALLY();
 	{
-		weave_alloc_extend_only = saved_extend_only;
+		weave_alloc_scope_leave(&saved_alloc);
 	}
 	PG_END_TRY();
 }
@@ -4616,12 +4742,24 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
 	 * level-0 run to be rewritten out: write amplification at the smallest
 	 * possible unit.  Measured at 1,660 terms/doc, where every document takes this
 	 * path: up to 117 index pages extended per document against ~2 pages of real
-	 * postings, with page reuse of 0.02-0.08% -- because the merge frees its input
-	 * pages inside the inserting transaction and weave_page_recyclable()'s
-	 * GlobalVisCheckRemovableXid() gate correctly refuses to hand them back while
-	 * that transaction can still see them.  That gate must stand (removing it
-	 * caused a real crash), so in-transaction reuse is impossible by construction
-	 * and the only lever left is to rewrite less often.  See G20 in doc/GAPS.md.
+	 * postings, with page reuse of 0.02-0.08%.  See G20 in doc/GAPS.md.
+	 *
+	 * WHAT THIS COMMENT USED TO CONCLUDE FROM THAT, AND WHY IT WAS WRONG.  It said
+	 * the merge frees its input pages inside the inserting transaction, so
+	 * weave_page_recyclable()'s GlobalVisCheckRemovableXid() gate correctly refuses
+	 * them, so "in-transaction reuse is impossible by construction and the only
+	 * lever left is to rewrite less often".  The first half is true and the gate
+	 * still stands (removing it caused a real crash).  The conclusion does not
+	 * follow: the pages this path could have reused were overwhelmingly freed by
+	 * EARLIER, already-committed transactions, and the merge never asked for them,
+	 * because weave_merge_segments() allocated extend-only and consulted no free
+	 * list at all.  The sibling project falsified the horizon explanation by
+	 * measurement -- one transaction per row changed its page-per-document figure
+	 * by only 1.4x -- and then fixed the growth with a point edit to the
+	 * allocator, not a design change.  weave_merge_segments() now allocates in
+	 * SNAPSHOT mode (see weave_alloc_snapshot_enter in include/weave/am.h), so
+	 * cross-call reuse happens; rewriting less often, below, remains worth doing
+	 * on its own terms because it is write amplification either way.
 	 */
 	if (weave_small_runs_worth_merging(index) &&
 		weave_maintenance_lock_conditional(index))

@@ -414,7 +414,7 @@ logged, both deliberate: a build flag means the numbers only exist in a binary
 nobody is running, and `log_min_messages = warning` silences `elog(LOG)`, which
 cost the sibling project a whole measurement run.
 
-### G20 — bulk ingest of term-rich documents inflates the index ~237x — **OPEN, measured 2026-09-14, partially mitigated 2026-09-16**
+### G20 — bulk ingest of term-rich documents inflates the index ~237x — **mechanism corrected and addressed 2026-09-18; measured 2026-09-14, mitigated 2026-09-16**
 
 Found by taking the sibling project's field shape (~1,660 terms per document,
 thousand-document batches, no maintenance in between) and running it against us
@@ -440,9 +440,23 @@ write amplification of order **100x**, against the sibling project's measured
 consulted, ~19,000 candidates are found, and essentially every one is **rejected**
 by `weave_page_recyclable()`. The inserting transaction freed those pages itself
 via its own merge, so `GlobalVisCheckRemovableXid()` cannot clear them while that
-transaction runs. In-transaction reuse is impossible by construction, and the gate
-is correct — it is the same gate whose removal caused a real crash. Reuse is
-**0.02-0.08%**, not the sibling project's 0.3%.
+transaction runs. Reuse is **0.02-0.08%**, not the sibling project's 0.3%.
+
+**That reading was half the picture, and the missing half is the one that mattered.**
+The counters above are the *segment writer's* allocations. The merge's own output
+allocations appear in none of the three reuse columns, because
+`weave_merge_segments()` ran the whole loop `extend_only`: it consulted no free list
+at all, neither for pages it had just freed (the hazard extend-only guards) nor for
+pages freed by earlier, committed calls (safe, and the vast majority — at 1,660
+terms/doc the merge is the dominant writer). The entry originally concluded that
+"in-transaction reuse is impossible by construction" and that "the real fix moves
+the merge out of the inserting transaction — a design change, not a point edit".
+The first clause is true of pages freed inside the current transaction and the
+recycle gate must keep refusing those. The conclusion was wrong: the sibling
+project falsified the horizon explanation by measurement — a fresh transaction per
+row moved its pages-per-document figure by only **1.4x** (49.2 bulk vs 34.3
+single-txn, both ~70-100x their compacted size) — and then closed its equivalent
+gap with a point edit to the allocator.
 
 The trigger is `weave_insert_oversized_as_segment()` calling
 `weave_merge_segments()` after **every** document. Any document whose analyzed
@@ -470,7 +484,8 @@ did **not** materially change the answer, which is luck rather than method. I al
 selected the `reuse` and `extend` columns and omitted `defer` on the first pass,
 which is precisely the discrimination G19 exists to provide.
 
-**Mitigated 2026-09-16; STILL OPEN.** The sibling project (pg_fts 1.7.2, commit
+**Mitigated 2026-09-16 (the rewrite-rate half); still open at that date.** The
+sibling project (pg_fts 1.7.2, commit
 c41e319) gates the insert-time merge on there being a fan-out's worth of small runs
 waiting, and calls that a mitigation rather than a fix because the freed pages still
 cannot pass the XID gate inside the inserting transaction. That gate is now ported:
@@ -519,10 +534,33 @@ WEAVE_MERGE_FANOUT`. `t/007_segment_cap.pl` now asserts `nsegments <= 64` as wel
 hard cap, and an assertion that only fires there fails for the first time when the
 index is already unrecoverable.
 
-**Still open, because the mechanism is untouched.** `fsm_defer` stays at ~113,000 per
-arm-A run in both arms: the free list is still consulted and still refuses, because
-the inserting transaction freed those pages itself. The real fix moves the merge out
-of the inserting transaction — a design change, not a point edit.
+**Addressed 2026-09-18 by the snapshot allocator, and the mechanism this entry
+named is the one that was fixed.** `weave_merge_segments()` and `weave_merge_all()`
+now allocate in SNAPSHOT mode (`weave_alloc_snapshot_enter()`,
+`include/weave/am.h`): the free list is gathered **once at scope entry, before the
+call frees anything**, the loop hands out only from that snapshot and then extends,
+and it never re-consults the live FSM. A page freed by merge N cannot reach merge
+N+1 — it is not in the snapshot — so the recycle-race guard extend-only
+over-approximated is now exact, while pages freed by earlier calls are reused.
+Raw before/after page counts, one measurement per arm per run and no arithmetic,
+are in `bench/RESULTS_G20_SNAPSHOT_ALLOC.md`; the arithmetic and any claim belong
+to whoever reads that file.
+
+Two things it does **not** fix, recorded so the entry is not read as closed:
+
+- The single-large-statement shape. Inside one statement the freeing xid *is* the
+  horizon, so no page freed during it can pass the recycle gate before it ends, and
+  no allocation policy changes that. `weave_vacuum()` after a bulk load remains the
+  guidance for that one shape.
+- `fsm_defer` for the *segment writer's* allocations in a long transaction. The
+  gate still refuses those, correctly.
+
+Two prerequisites had to land first, and did, as separate commits: every merger is
+now serialized under the maintenance mutex and that is enforced by
+`weave_assert_merge_serialized()`, and the parallel merge's commit now frees only
+sources it confirmed present. Without the first, two mergers reusing pages draw
+from one free list and hand out the same block — which is how the sibling project
+turned this fix into a deadlock and then had to find the two unserialized sites.
 
 Corrected as part of the original measurement: the comment on
 `weave_insert_oversized_as_segment()` said oversized documents are "Rare, so building
