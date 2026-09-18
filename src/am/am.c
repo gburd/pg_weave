@@ -2471,6 +2471,32 @@ weave_meta_add_segment(Relation index, const WeaveSegMeta *seg)
  * flurry of flushes keeps the directory full.  This runs OUTSIDE the metapage
  * lock (merging takes that lock itself), so concurrent inserters serialize
  * naturally on the actual add.
+ *
+ * THE MERGES RUN UNDER THE MAINTENANCE MUTEX, BLOCKING.  Until now this was the
+ * one merger in the tree that took no mutex at all, so a full directory on the
+ * insert path could merge CONCURRENTLY with autovacuum's cleanup merge on the
+ * same index.  Today's exposure is bounded and should not be overstated: both
+ * mergers allocate extend-only, so they are never handed the same block, and
+ * weave_merge_selected() re-verifies its inputs against the live directory under
+ * the metapage buffer lock and abandons if another merge consumed them.  The cost
+ * today is therefore a wasted merge plus a leaked output segment -- not a
+ * deadlock and not corruption.  It becomes a deadlock the moment a merge is
+ * allowed to reuse freed pages, because then both mergers draw from one free list
+ * and hand out the same block (the sibling project observed exactly that: an
+ * INSERT and an autovacuum worker both parked on the same buffer's content lock).
+ * Taking the mutex before that change lands is the whole point of the ordering.
+ *
+ * BLOCKING, NOT CONDITIONAL, and the latency cost is real but narrow.  An INSERT
+ * that reaches here may now wait for another backend's merge to finish, and on a
+ * large index that merge is measured in seconds.  Conditional would be worse than
+ * useless: skipping the merge leaves the directory full, so the retry loop would
+ * spin WEAVE_MAX_SEGMENTS times changing nothing and then ereport -- i.e. it would
+ * convert a wait into the failed INSERT this function exists to prevent.  What
+ * bounds the cost is that only a FULL directory arrives here (the ordinary
+ * insert-time compaction is the conditional one in weave_insert_oversized_as_
+ * segment), and a full directory is already a degraded state.  Acquired per retry
+ * rather than around the loop so a concurrent backend's segment adds and the
+ * weave_meta_add_segment below still interleave.
  */
 void
 weave_add_segment_with_room(Relation index, const WeaveSegMeta *seg)
@@ -2489,10 +2515,19 @@ weave_add_segment_with_room(Relation index, const WeaveSegMeta *seg)
 		 * the smallest-first collapse, which always reduces the count while any
 		 * two segments remain.
 		 */
-		if ((try & 1) == 0)
-			weave_merge_segments(index);
-		else
-			weave_merge_all(index, false);
+		weave_maintenance_lock(index);
+		PG_TRY();
+		{
+			if ((try & 1) == 0)
+				weave_merge_segments(index);
+			else
+				weave_merge_all(index, false);
+		}
+		PG_FINALLY();
+		{
+			weave_maintenance_unlock(index);
+		}
+		PG_END_TRY();
 		if (weave_meta_add_segment(index, seg))
 			return;
 	}
