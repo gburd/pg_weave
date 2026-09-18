@@ -94,8 +94,12 @@ sources = files(
   # quantizer -- CREATE EXTENSION would have failed on an undefined symbol.  Two
   # build systems that disagree about which translation units exist is a broken
   # build system, not a stale comment, so keep this list and OBJS in step.
-  # src/vector/vector.c and src/vector/graph.c are deliberately absent from both:
-  # they are stubs with no callers (tasks V7-V14).
+  # src/vector/graph.c is deliberately absent from both: it is a stub with no
+  # callers (the graph tasks).  src/vector/vector.c used to be named here as the
+  # other such stub and is GONE -- task V8 deleted it, because every symbol in it
+  # except three GUC backing variables was a stale duplicate of a live one in
+  # src/vector/wvec.c, which made a file that was one Makefile edit away from a
+  # duplicate-symbol link error.  The three variables moved to kernel_ops.c.
   #
   # IT DRIFTED AGAIN, and the second time cost more than the first: vecweft.c and
   # vecwrite.c -- the vector weft's strip layout and the writer/reader that puts it
@@ -111,6 +115,7 @@ sources = files(
   'src/vector/vecwrite.c',
   'src/vector/vecstats.c',
   'src/vector/vecscan.c',
+  'src/vector/vecshuttle.c',
   'src/vector/kernels.c',
   'src/vector/kernel_ops.c',
   'src/vector/wvec.c',

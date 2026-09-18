@@ -942,6 +942,22 @@ extern bool weave_index_wants_doclen_sidecar(Relation index);
 extern int	weave_index_vec_bits(Relation index);
 
 /*
+ * The distance metric this index's next weft is written with, from the `metric`
+ * reloption -- a WeaveMetric value, spelled int here because weave/am.h must not
+ * depend on weave/vector.h.
+ *
+ * THROWS for a metric the vector channel cannot serve (cosine, l1), and it throws
+ * from HERE rather than from the reloption validator on purpose: a value is only
+ * unserviceable because no bound formulation exists for it
+ * (doc/specs/VECTOR_CHANNEL.md sect. 8b), which is a property of the channel and
+ * not of the catalog, and the build is the first place that property is actually
+ * needed.  The refusal therefore lands on CREATE INDEX, which is where a user can
+ * still choose differently, instead of on the first query against a finished
+ * index.
+ */
+extern int	weave_index_vec_metric(Relation index);
+
+/*
  * Which index column feeds which channel.
  *
  * Until task V7 the access method was single-attribute: every write and recheck
