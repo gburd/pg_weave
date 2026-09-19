@@ -129,7 +129,7 @@ so the derivation failed to compile and the harness -- which treats "the check d
 succeed" as "the mutation was caught" -- reported a pass. The mutation was never run at
 all, and the compiling equivalent turned out to **survive**. So a mutation harness needs
 the same discipline as any other gate: assert that the mutant BUILT, not merely that the
-check failed. The generalization that now covers all six: **a result needs evidence that
+check failed. The generalization that now covers all nine: **a result needs evidence that
 the specific thing you meant to run, ran.**
 
 *And the bug that leg was hiding is worth knowing on its own,* because no amount of
@@ -145,6 +145,38 @@ tested by that harness.
 **`flake.nix`'s `PROVE_TESTS` is an explicit list, and a TAP file that is not named in
 it runs nowhere while the suite reports success.** Both new V7 TAP files hit this. Add
 the file to the list in the same commit that adds the file.
+
+**Eighth member: a pipe that KILLS the process under test.** `psql -f t.sql | head -90`
+sends SIGPIPE to psql at line 90, so the file never reaches its own `DROP TABLE` --
+and the next run silently inherited the table and reported 134 lanes where 67 was
+correct (2026-09-19, G23). Redirect the output of anything being measured to a file
+and read the file; never truncate its stdout.
+
+**Ninth member: a stale artifact makes a failed build look like a pass.**
+`make 2>&1 | grep error; test -f pg_weave.so && echo OK` printed OK while the build
+had ERRORED -- the `.so` was left over from the previous build. Same day, same
+session, and it is the first member wearing a different hat: `| tail`, `| head` and
+`test -f` all report on something other than the build. Take `make`'s own exit status,
+and `make clean` first.
+
+**A gate that reports FAIL and nothing else costs a round trip**, which on a remote
+build host is minutes. Print the compiler's own error lines on a build failure and the
+install log's tail on an install failure. Two round trips were burned on
+"FAIL pg17: build" before the gate script was taught to say why.
+
+**On a host with both majors packaged, DERIVE the port; never assume it.** PG18 took
+5432 and PG17 got 5433 on the 2026-09-19 EC2 host, and a run that assumed the opposite
+sent PG17's `installcheck` at the PG18 server: all nine regression tests red with an
+EMPTY `regression.diffs`. Nine failures that were one wrong port. Read the port from
+`pg_lsclusters` and then assert `show server_version_num` matches the major just built
+for. (Also: installing `postgresql-17` and `postgresql-18` in one apt transaction
+created only the 18 cluster.)
+
+**PostgreSQL 18 turns data checksums ON by default and 17 does not.** Any TAP test
+that rewrites page bytes behind the server's back -- the manufacture-the-old-image
+pattern in `t/010` and `t/019` -- passes on 17 and dies on 18 with "invalid page in
+block N" unless it inits with `no_data_checksums => 1`. Upstream added that option for
+exactly this class of test; PG17's `init()` ignores the unknown key.
 
 Standalone codec tests, no backend needed:
 
