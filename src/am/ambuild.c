@@ -4661,7 +4661,8 @@ weave_small_runs_worth_merging(Relation index)
 }
 
 static void
-weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
+weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
+								 Datum vecval, bool vecisnull)
 {
 	WeaveBuildState bs;
 	WeaveTermEntry *entries = WEAVE_DOC_ENTRIES(doc);
@@ -4673,16 +4674,15 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
 	bs.lexattno = weave_build_lexattno(index);
-	/* An oversized INSERT reaches here with the wdoc alone -- weave_insert() has
-	 * the whole values[] but hands over only the document, and changing that is
-	 * the same problem the pending buffer has (doc/GAPS.md G23).  No weft is
-	 * written for this segment, which costs zero bytes and leaves the row absent
-	 * from vector answers rather than present with a wrong vector. */
-	bs.vecattno = 0;
-	/* Inactive, so this width is dead data today -- passed for real anyway, for
-	 * the reason given on the same call in weave_merge_segments_streaming(). */
-	weave_vec_accum_init(&bs.vec, bs.ctx, false, weave_index_vec_bits(index),
-						 WEAVE_METRIC_L2);
+	/* An oversized INSERT is a one-document segment, and it carries that
+	 * document's vector: weave_insert() hands the Datum over rather than dropping
+	 * it (doc/GAPS.md G23, closed).  A NULL vector still occupies its lane. */
+	bs.vecattno = weave_build_vecattno(index);
+	weave_vec_accum_init(&bs.vec, bs.ctx, bs.vecattno != 0,
+						 weave_index_vec_bits(index),
+						 (WeaveMetric) (bs.vecattno != 0 ?
+										weave_index_vec_metric(index) :
+										WEAVE_METRIC_L2));
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -4694,6 +4694,11 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
 
 	{
 		MemoryContext old = MemoryContextSwitchTo(bs.ctx);
+
+		/* PRODUCER 1, before the postings, for the reason given in the build
+		 * callback: the lane and the postings must agree on the warp position. */
+		if (bs.vecattno != 0)
+			weave_vec_accum_add(&bs.vec, index, tid, vecval, vecisnull);
 
 		for (j = 0; j < doc->nterms; j++)
 		{
@@ -4777,6 +4782,38 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid)
 }
 
 /*
+ * Write one pending item into a page's item area.  Shared by both append paths
+ * so the layout exists in ONE place; see WeavePendingItem in weave/am.h.
+ *
+ * The two alignment gaps are zeroed EXPLICITLY.  They would in fact be zero
+ * anyway -- weave_init_page() calls PageInit(), which memsets the page, and no
+ * other writer touches these bytes -- but this page image goes into a WAL
+ * record, and a page image that depends on "nothing else happened to have
+ * written here" is the kind of thing that holds until the day it does not.
+ */
+static void
+weave_pending_item_write(WeavePendingItem *pi, ItemPointer tid,
+						 WeaveDoc doc, uint32 doclen,
+						 const void *vec, uint32 veclen)
+{
+	Size		docend = sizeof(WeavePendingItem) + doclen;
+	Size		vecoff = MAXALIGN(docend);
+
+	pi->tid = *tid;
+	pi->doclen = doclen;
+	pi->veclen = veclen;
+	memcpy((char *) pi + sizeof(WeavePendingItem), doc, doclen);
+	if (vecoff > docend)
+		MemSet((char *) pi + docend, 0, vecoff - docend);
+	if (veclen > 0)
+	{
+		memcpy((char *) pi + vecoff, vec, veclen);
+		if (MAXALIGN(veclen) > veclen)
+			MemSet((char *) pi + vecoff + veclen, 0, MAXALIGN(veclen) - veclen);
+	}
+}
+
+/*
  * aminsert: append the new document to the pending list.
  *
  * The document is stored verbatim (its wdoc bytes) on a chain of pending
@@ -4805,6 +4842,9 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	bool		appended = false;
 	WeaveIndexLayout layout;
 	int			lexidx;
+	const void *vec = NULL;
+	uint32		veclen = 0;
+	WeavePageKind wantkind;
 
 	/*
 	 * Resolved per inserted tuple rather than cached: aminsert has no per-statement
@@ -4820,13 +4860,57 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 
 	doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
 	doclen = VARSIZE(doc);
-	need = MAXALIGN(sizeof(WeavePendingItem) + doclen);
+
+	/*
+	 * PRODUCER 1's INPUT, CARRIED FORWARD (doc/GAPS.md G23).  weave_insert() has
+	 * the whole values[] but the flush that folds this document into a segment
+	 * runs much later, from another transaction, with nothing but the pending
+	 * page -- so a vector that is not written down here is gone, and the row is
+	 * absent from vector answers while being present in lexical ones.  That is
+	 * claim 1 (one index, one docid space, one visibility rule) being false, not
+	 * a missing optimization, which is why this is stored even though it is by
+	 * far the largest thing on a pending page.
+	 *
+	 * A NULL vector stores nothing and occupies its lane dead at flush time; see
+	 * weave_vec_accum_add(), which requires the lane either way because the warp
+	 * position is shared with the lexical weft.
+	 */
+	if (layout.vecattno != 0)
+	{
+		int			vecidx = layout.vecattno - 1;
+
+		if (!isnull[vecidx])
+		{
+			vec = (const void *) PG_DETOAST_DATUM(values[vecidx]);
+			veclen = VARSIZE(vec);
+		}
+	}
+
+	/*
+	 * ...and the page kind is the v9 layout either way, including for an index
+	 * with no vector column, whose items just carry veclen == 0.  The kind names
+	 * the ITEM LAYOUT; see WEAVE_PK_PENDING_V9 in weave/pagekind.h for what
+	 * happened when it named the payload instead.
+	 */
+	wantkind = WEAVE_PK_PENDING_V9;
+
+	need = weave_pending_item_size(doclen, veclen);
 
 	if (need > BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(WeavePageOpaqueData)))
 	{
 		/* Too large for the verbatim pending buffer: index it directly as its
-		 * own one-document segment (no per-doc size limit there). */
-		weave_insert_oversized_as_segment(index, doc, ht_ctid);
+		 * own one-document segment (no per-doc size limit there).
+		 *
+		 * The vector is part of `need`, so a vector column makes this path more
+		 * likely and, above WVEC_MAX_DIM/2 or so, unavoidable: a 16,384-d wvec is
+		 * 65,544 bytes and can never share a page with anything.  That is why the
+		 * oversized path also has to carry the vector -- routing around the
+		 * pending buffer must not route around the vector weft. */
+		weave_insert_oversized_as_segment(index, doc, ht_ctid,
+										 layout.vecattno != 0 ?
+										 values[layout.vecattno - 1] : (Datum) 0,
+										 layout.vecattno == 0 ||
+										 isnull[layout.vecattno - 1]);
 		return true;
 	}
 
@@ -4845,7 +4929,16 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 		tailbuf = ReadBuffer(index, tailblk);
 		LockBuffer(tailbuf, BUFFER_LOCK_EXCLUSIVE);
 		tailpage = BufferGetPage(tailbuf);
-		if (weave_page_entry_end(tailpage) + need <=
+		/*
+		 * The KIND check is not defensive: an index upgraded across
+		 * WEAVE_VERSION_PENDING_VEC can have a tail page of v8 items, whose stride
+		 * is MAXALIGN(12 + doclen) rather than this item's.  Mixing the two on one
+		 * page makes the page unparseable by either reader, so start a fresh page
+		 * instead -- the old page stays valid and the flush reads it with the v8
+		 * parser.
+		 */
+		if (WeavePageHasKind(tailpage, wantkind) &&
+			weave_page_entry_end(tailpage) + need <=
 			(char *) tailpage + BLCKSZ - MAXALIGN(sizeof(WeavePageOpaqueData)))
 		{
 			WeavePendingItem *pi;
@@ -4853,9 +4946,7 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			state = GenericXLogStart(index);
 			tailpage = GenericXLogRegisterBuffer(state, tailbuf, 0);
 			pi = (WeavePendingItem *) weave_page_entry_end(tailpage);
-			pi->tid = *ht_ctid;
-			pi->doclen = doclen;
-			memcpy((char *) pi + sizeof(WeavePendingItem), doc, doclen);
+			weave_pending_item_write(pi, ht_ctid, doc, doclen, vec, veclen);
 			((PageHeader) tailpage)->pd_lower += need;
 			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
 			meta = WeavePageGetMeta(metapage);
@@ -4892,11 +4983,9 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			Page		np = GenericXLogRegisterBuffer(state, newbuf,
 													   GENERIC_XLOG_FULL_IMAGE);
 
-			weave_init_page(np, WEAVE_PK_PENDING);
+			weave_init_page(np, wantkind);
 			pi = (WeavePendingItem *) weave_page_entry_end(np);
-			pi->tid = *ht_ctid;
-			pi->doclen = doclen;
-			memcpy((char *) pi + sizeof(WeavePendingItem), doc, doclen);
+			weave_pending_item_write(pi, ht_ctid, doc, doclen, vec, veclen);
 			((PageHeader) np)->pd_lower += need;
 		}
 
@@ -4972,16 +5061,25 @@ weave_flush_pending(Relation index)
 	bs.want_trigrams = weave_index_wants_trigrams(index);
 	bs.want_sidecar = weave_index_wants_doclen_sidecar(index);
 	bs.lexattno = weave_build_lexattno(index);
-	/* A WeavePendingItem carries the tid and the wdoc, and nothing else, so the
-	 * vector of an inserted row is not available here at all: this segment gets no
-	 * vector weft.  That is a real limitation, recorded as doc/GAPS.md G23 rather
-	 * than papered over -- writing a weft of dead lanes would claim to cover these
-	 * documents, which is worse than not claiming to. */
-	bs.vecattno = 0;
-	/* Inactive, so this width is dead data today -- passed for real anyway, for
-	 * the reason given on the same call in weave_merge_segments_streaming(). */
-	weave_vec_accum_init(&bs.vec, bs.ctx, false, weave_index_vec_bits(index),
-						 WEAVE_METRIC_L2);
+	/*
+	 * PRODUCER 1 over the pending buffer (doc/GAPS.md G23, closed).  A pending
+	 * item now carries the inserted row's vector, so this segment gets a real
+	 * vector weft instead of none, and a row inserted after the build is no
+	 * longer absent from vector answers while being present in lexical ones.
+	 *
+	 * The geometry comes from the CURRENT reloptions, unlike a merge, which must
+	 * use the geometry its inputs agreed on: a flush writes a brand-new segment
+	 * out of raw vectors, so the current `bits` is the right answer and an
+	 * ALTER INDEX ... SET (bits = ...) between two inserts legitimately produces
+	 * two segments of different widths.  That is what makes the merge's
+	 * geometry-mismatch guard reachable -- doc/GAPS.md G26, which G23 closes.
+	 */
+	bs.vecattno = weave_build_vecattno(index);
+	weave_vec_accum_init(&bs.vec, bs.ctx, bs.vecattno != 0,
+						 weave_index_vec_bits(index),
+						 (WeaveMetric) (bs.vecattno != 0 ?
+										weave_index_vec_metric(index) :
+										WEAVE_METRIC_L2));
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -4997,59 +5095,101 @@ weave_flush_pending(Relation index)
 	{
 		Buffer		buffer = ReadBuffer(index, blk);
 		Page		page;
-		char	   *ptr,
-				   *end;
+		WeavePendingIter it;
+		WeavePendingRec rec;
 		BlockNumber next;
 		MemoryContext old = MemoryContextSwitchTo(bs.ctx);
 
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
-		ptr = (char *) PageGetContents(page);
-		end = weave_page_entry_end(page);
+		weave_pending_iter_init(&it, page);
 		next = WeavePageGetOpaque(page)->nextblk;
-		while (ptr < end)
+		while (weave_pending_iter_next(&it, &rec))
 		{
-			WeavePendingItem *pi = (WeavePendingItem *) ptr;
-			WeaveDoc		pdoc;
 			WeaveTermEntry *entries;
 			uint32		j;
-
-			/* Stop if the item header or its doclen-sized body runs past the page
-			 * (a torn/recycled page with a garbage doclen would otherwise advance
-			 * ptr off the page and read out of bounds). */
-			if ((char *) pi + sizeof(WeavePendingItem) > end ||
-				(char *) pi + MAXALIGN(sizeof(WeavePendingItem) + (Size) pi->doclen) > end)
-				break;
-			pdoc = (WeaveDoc) ((char *) pi + sizeof(WeavePendingItem));
 
 			/* Never trust raw pending-page bytes: a torn page or any producing
 			 * bug could give a bad nterms/len/posoff that turns into a wild
 			 * write in add_posting.  Validate against the item's own doclen and
-			 * skip (not crash) a corrupt doc so autovacuum can make progress. */
-			if (!weave_doc_is_valid(pdoc, pi->doclen))
+			 * skip (not crash) a corrupt doc so autovacuum can make progress.
+			 *
+			 * Skipping takes the document out of this segment ENTIRELY -- no
+			 * postings and no lane -- which is why it happens before producer 1
+			 * and not between it and the postings.  Occupying a lane for a
+			 * document that contributes no postings would be legal (an empty
+			 * document does exactly that), but counting it in neither place is
+			 * simpler and keeps bs.ndocs honest. */
+			if (!weave_doc_is_valid(rec.doc, rec.doclen))
 			{
 				ereport(WARNING,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg("pg_weave: skipping malformed pending document in index \"%s\" during flush",
 								RelationGetRelationName(index)),
 						 errhint("REINDEX the index to rebuild it from the heap.")));
-				ptr += MAXALIGN(sizeof(WeavePendingItem) + pi->doclen);
 				continue;
 			}
-			entries = WEAVE_DOC_ENTRIES(pdoc);
 
-			for (j = 0; j < pdoc->nterms; j++)
+			/*
+			 * PRODUCER 1, before the postings, for the reason given in the build
+			 * callback: the two wefts must agree on this document's warp position.
+			 *
+			 * THREE WAYS TO GET A DEAD LANE HERE, and all three must stay lanes
+			 * rather than skips, or every later document's vector is
+			 * mis-associated:
+			 *   - the row's vector was NULL (veclen == 0);
+			 *   - the stored bytes are not a wvec (corruption; WARN);
+			 *   - the wvec's dim disagrees with the one this segment already
+			 *     started writing.  weave_vec_accum_add() would ERROR on that,
+			 *     which inside a flush is worse than it looks: the flush would
+			 *     fail, the pending buffer would never drain, and every later
+			 *     flush would fail on the same item.  A column declared
+			 *     wvec(dim) makes this unreachable, which is what the errhint on
+			 *     that ERROR has always recommended.
+			 */
+			if (bs.vecattno != 0)
 			{
-				const uint32 *pos = (bs.want_positions && WEAVE_DOC_HAS_POS(pdoc))
-					? WEAVE_DOC_TERMPOS(pdoc, &entries[j]) : NULL;
+				bool		dead = (rec.vec == NULL);
 
-				add_posting(&bs, WEAVE_DOC_TERMTEXT(pdoc, &entries[j]),
-							entries[j].len, &pi->tid, entries[j].tf,
-							pdoc->doclen, pos, pos ? (int) entries[j].tf : 0);
+				if (rec.vec != NULL && !weave_wvec_is_valid(rec.vec, rec.veclen))
+				{
+					ereport(WARNING,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("pg_weave: skipping malformed pending vector in index \"%s\" during flush",
+									RelationGetRelationName(index)),
+							 errhint("REINDEX the index to rebuild it from the heap.")));
+					dead = true;
+				}
+				if (!dead && bs.vec.ready &&
+					((const WVec *) rec.vec)->dim != bs.vec.dim)
+				{
+					ereport(WARNING,
+							(errcode(ERRCODE_DATA_EXCEPTION),
+							 errmsg("pg_weave: pending wvec has %d dimensions but the segment being flushed indexes %d, in index \"%s\"",
+									((const WVec *) rec.vec)->dim, bs.vec.dim,
+									RelationGetRelationName(index)),
+							 errdetail("The row is indexed for text search and left out of vector answers."),
+							 errhint("Declare the column as wvec(%d) so the mismatch is refused at INSERT time.",
+									 bs.vec.dim)));
+					dead = true;
+				}
+				weave_vec_accum_add(&bs.vec, index, rec.tid,
+									dead ? (Datum) 0 : PointerGetDatum(rec.vec),
+									dead);
+			}
+
+			entries = WEAVE_DOC_ENTRIES(rec.doc);
+
+			for (j = 0; j < rec.doc->nterms; j++)
+			{
+				const uint32 *pos = (bs.want_positions && WEAVE_DOC_HAS_POS(rec.doc))
+					? WEAVE_DOC_TERMPOS(rec.doc, &entries[j]) : NULL;
+				add_posting(&bs, WEAVE_DOC_TERMTEXT(rec.doc, &entries[j]),
+							entries[j].len, rec.tid, entries[j].tf,
+							rec.doc->doclen, pos, pos ? (int) entries[j].tf : 0);
 			}
 			bs.ndocs += 1.0;
-			bs.sumdoclen += pdoc->doclen;
-			ptr += MAXALIGN(sizeof(WeavePendingItem) + pi->doclen);
+			bs.sumdoclen += rec.doc->doclen;
 		}
 		UnlockReleaseBuffer(buffer);
 		MemoryContextSwitchTo(old);

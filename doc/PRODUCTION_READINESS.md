@@ -209,6 +209,17 @@ F 0/5, M 0/6, R 0/5. **Two of the six retrieval kinds answer a query** -- BM25 l
 and, as of V8 on 2026-09-18, quantized-vector ANN. Fuzzy, regex, prefix and n-gram are
 imported but unwired.
 
+*The count did not move on 2026-09-19, and that is the honest reading.* V7's second
+half closed **G23** -- a row inserted after the build kept no vector, so it was present
+in lexical answers and absent from vector ones, which is claim 1 being false in
+practice rather than a missing optimization -- and closed **G26** with it. Neither is a
+task; both are defects in a task already marked done. What the day bought is that the
+vector channel now covers rows the index acquired after its build, on both write paths
+(pending buffer and oversized insert), at format v9. What it did not buy is a channel:
+four of six still answer nothing, and **G29** is the residue -- the vector scan does
+not read the pending buffer, so the asymmetry survives in the window between an
+`INSERT` and the next flush.
+
 What V8 does *not* deliver is as load-bearing as what it does. It is the first
 implementation of the shuttle contract in `include/weave/channel.h`, which found five
 defects in that contract -- two before any code was written, three by executing it --

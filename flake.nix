@@ -178,7 +178,7 @@
               # This is what makes `nix flake check` actually exercise TAP
               # instead of silently skipping it.
               make installcheck REGRESS= ISOLATION= \
-                PROVE_TESTS='t/003_corruption.pl t/004_encodings.pl t/005_concurrency.pl t/006_concurrent_extend.pl t/007_segment_cap.pl t/008_vacuum_reclaim.pl t/009_doclen_sidecar.pl t/010_format_v6_upgrade.pl t/011_chandesc_corruption.pl t/012_surf_crash_recovery.pl t/013_surf_corruption.pl t/014_merge_durability.pl t/015_alloc_outcomes.pl t/016_vector_durability.pl t/017_vector_syncscan.pl t/018_unlogged_init_fork.pl' \
+                PROVE_TESTS='t/003_corruption.pl t/004_encodings.pl t/005_concurrency.pl t/006_concurrent_extend.pl t/007_segment_cap.pl t/008_vacuum_reclaim.pl t/009_doclen_sidecar.pl t/010_format_v6_upgrade.pl t/011_chandesc_corruption.pl t/012_surf_crash_recovery.pl t/013_surf_corruption.pl t/014_merge_durability.pl t/015_alloc_outcomes.pl t/016_vector_durability.pl t/017_vector_syncscan.pl t/018_unlogged_init_fork.pl t/019_pending_v8_upgrade.pl' \
                 PG_CONFIG=${pgConfigWrapped}/bin/pg_config \
                 || { echo '--- TAP logs ---'; cat tmp_check/log/*.log tmp_check/log/regress_log_* 2>/dev/null; exit 1; }
               touch $out

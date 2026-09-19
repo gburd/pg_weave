@@ -205,6 +205,33 @@ typedef enum WeavePageKind
 	 */
 	WEAVE_PK_VWARP = 28,		/* vector: warp -> docid, 8 bytes per lane */
 
+	/*
+	 * Allocated by task V7's second half (doc/GAPS.md G23), which made a pending
+	 * item carry the inserted row's vector so a post-build INSERT is not absent
+	 * from vector answers.
+	 *
+	 * A NEW KIND AND NOT A FLAG, because the item HEADER grew: WeavePendingItem
+	 * gained a veclen word, which moved the wdoc from byte 12 to byte 16 and
+	 * changed the item stride from MAXALIGN(12 + doclen) to
+	 * MAXALIGN(16 + doclen) + MAXALIGN(veclen).  Those two strides are not
+	 * distinguishable from the bytes, so a page must DECLARE which layout its
+	 * items use, and weave_insert() must never append a new item to a page of old
+	 * ones.  A version word in the metapage cannot do this job: weave_insert()
+	 * deliberately does not upcast the metapage (only a DIRECTORY change does), so
+	 * one index can hold pages of both layouts at once and the discriminator has
+	 * to be per page.
+	 *
+	 * EVERY pending page this version writes is this kind, including in an index
+	 * with no vector column, where every item simply has veclen == 0.  The first
+	 * version of this change kept WEAVE_PK_PENDING for those indexes so their
+	 * page-kind census would not move -- and wrote NEW-layout items onto it, so
+	 * the reader parsed them with the old 12-byte stride and the regression suite
+	 * filled up with "skipping malformed pending document".  The kind names the
+	 * LAYOUT, not the payload.  There is one writer, and WEAVE_PK_PENDING is from
+	 * here on a read-only legacy format.
+	 */
+	WEAVE_PK_PENDING_V9 = 29,	/* pending page in the v9 item layout */
+
 	WEAVE_PK_NKINDS				/* first unassigned id; not a kind */
 } WeavePageKind;
 
