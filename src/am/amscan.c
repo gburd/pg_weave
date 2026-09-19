@@ -1049,6 +1049,14 @@ weave_fuzzy_terms(Relation index, const WeaveSegMeta *seg,
 				 const char *term, int termlen, int k, TidSet *out)
 {
 	WeaveLevAut	aut;
+
+	/*
+	 * THE FUZZY MECHANISM.  Counted after the applicability test below, not
+	 * here, because a term longer than the automaton bound leaves through
+	 * `return false` and is served by the trigram funnel instead -- counting on
+	 * entry would attribute the funnel's work to this route.  See
+	 * include/weave/weave.h for why these counters exist.
+	 */
 	BlockNumber blk;
 	ItemPointerData *tids;
 	unsigned char nextkey[WEAVE_LEV_MAXQ + 2];
@@ -1062,6 +1070,7 @@ weave_fuzzy_terms(Relation index, const WeaveSegMeta *seg,
 
 	if (termlen > WEAVE_LEV_MAXQ)
 		return false;			/* fall back to trigram funnel + recheck */
+	weave_chan_fuzzy_dict++;
 
 	aut.q = (const unsigned char *) term;
 	aut.m = termlen;

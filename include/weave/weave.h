@@ -276,18 +276,36 @@ extern uint64 weave_alloc_extend;
  * counter read from SQL covers every plan shape, including the bitmap scan that is
  * the common @@@ path.
  *
- * SOME OF THESE ARE STRUCTURALLY ZERO TODAY, and that is information rather than
- * an omission: four of the six retrieval kinds answer nothing yet, and these
- * counters are where that stops being a claim in a document.  The task that makes
- * each one nonzero is named beside it.  A zero from any of them still means only
- * "this mechanism served nothing in THIS backend" -- never "nothing happened".
+ * WHAT "ANSWERS A QUERY" MEANS, because the first version of these counters got it
+ * wrong and asserted the wrong zeros.  Prefix, fuzzy and regex all return CORRECT
+ * ROWS today: prefix through a dictionary range walk, fuzzy through a Levenshtein
+ * automaton walked over the sorted dictionary with dead-end prefix skipping
+ * (weave_fuzzy_terms), and regex -- plus any fuzzy term too long for that automaton
+ * -- through the trigram funnel followed by an exact heap recheck.  What they do NOT
+ * have is a shuttle implementing include/weave/channel.h with a real bound, which is
+ * what lets a channel participate in fused top-k, and that is the sense in which
+ * doc/PRODUCTION_READINESS.md counts them as not answering.  These counters measure
+ * the first thing, not the second; do not read a nonzero fuzzy_dict as "Z5 is done".
+ *
+ * THE _surf COLUMNS AND prefix_surf ARE STRUCTURALLY ZERO, with the task that makes
+ * each nonzero named beside it above.  A zero from any column still means only "this
+ * mechanism served nothing in THIS backend" -- never "nothing happened".
+ *
+ * A FUZZY OR REGEX QUERY THAT RAN WITH BOTH ITS COLUMNS AT ZERO fell back to a full
+ * scan with recheck: weave_trgm_candidates() refuses a pattern with too few usable
+ * trigrams and the caller then scans.  That case is deliberately derivable rather
+ * than given its own column, because the funnel's refusal is a property of the
+ * pattern and the pair of zeros says it exactly.
  */
 extern uint64 weave_chan_lex_term;		/* exact-term leaf via the dictionary */
 extern uint64 weave_chan_prefix_dict;	/* term* via the dictionary range walk */
 extern uint64 weave_chan_prefix_surf;	/* term* via a SuRF enumeration (Z4) */
-extern uint64 weave_chan_fuzzy_dict;	/* term~k via a dictionary scan (Z5) */
+extern uint64 weave_chan_fuzzy_dict;	/* term~k via the Levenshtein automaton
+										 * walked over the sorted dictionary */
+extern uint64 weave_chan_fuzzy_trgm;	/* term~k too long for the automaton:
+										 * trigram funnel + exact recheck */
 extern uint64 weave_chan_fuzzy_surf;	/* term~k via the trie (Z5 + Z4's cache) */
-extern uint64 weave_chan_regex_dict;	/* /re/ via a dictionary scan (Z6) */
+extern uint64 weave_chan_regex_trgm;	/* /re/ via the trigram funnel + recheck */
 extern uint64 weave_chan_regex_surf;	/* /re/ via trigram tiling + trie (Z6) */
 extern uint64 weave_chan_vector_scan;	/* a vector shuttle was opened (V8) */
 extern uint64 weave_chan_terms_expanded;	/* vocabulary terms a leaf expanded to */
