@@ -243,6 +243,7 @@ extern int pg_weave_wand_initial_k;
 extern int pg_weave_build_collapse_max_mb;
 extern int pg_weave_build_mem_ceiling_mb;
 extern double pg_weave_vacuum_tombstone_frac;
+extern int pg_weave_surf_cache_mb;
 
 /* Allocator outcome counters (src/am/am.c).  Backend-local; read from SQL via
  * weave_alloc_stats().  See the block comment above weave_new_buffer() for why
@@ -312,5 +313,23 @@ extern uint64 weave_chan_terms_expanded;	/* vocabulary terms a leaf expanded to 
 extern uint64 weave_chan_dict_pages;	/* dictionary pages those expansions read */
 extern uint64 weave_chan_surf_loads;	/* whole-image trie loads */
 extern uint64 weave_chan_surf_bytes;	/* and their total size */
+
+/*
+ * THE FOUR RESIDENT-TRIE COLUMNS (Z4 part 2).  surf_loads/surf_bytes above count
+ * WHOLE-IMAGE LOADS and must keep doing exactly that: a cache hit does not
+ * increment them, and that separation is the entire measurement -- "the trie is
+ * resident" is the claim that consults outnumber loads, which is unreadable if a
+ * hit also counts as a load.
+ *
+ * surf_cache_bytes IS NOT A COUNTER, IT IS A GAUGE: bytes the cache is holding
+ * right now.  weave_channel_stats_reset() deliberately leaves it alone, because
+ * zeroing it would report 0 resident bytes while the backend still holds the
+ * memory -- the same false zero the first draft of these counters shipped (see
+ * the note above).  It returns to zero only when the entries are actually freed.
+ */
+extern uint64 weave_chan_surf_cache_hits;	/* consults served from a resident image */
+extern uint64 weave_chan_surf_cache_misses; /* consults that had to load */
+extern uint64 weave_chan_surf_cache_evicts; /* images dropped to stay in budget */
+extern uint64 weave_chan_surf_cache_bytes;	/* resident image bytes RIGHT NOW */
 
 #endif							/* WEAVE_H */

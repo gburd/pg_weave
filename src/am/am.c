@@ -90,6 +90,7 @@
 #include "tcop/tcopprot.h"
 #include "utils/array.h"
 #include "utils/acl.h"			/* object_ownercheck, aclcheck_error (maintenance-fn guard) */
+#include "utils/inval.h"		/* CacheRegisterRelcacheCallback (surf trie cache) */
 #include "utils/lsyscache.h"	/* get_rel_name (maintenance-fn guard) */
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -677,6 +678,12 @@ double		pg_weave_vacuum_tombstone_frac = 0.2;
  * registered in _PG_init (pg_weave_customscan.c). */
 int			pg_weave_build_mem_ceiling_mb = 0;
 
+/* GUC: backend-local budget, in MB, for resident SuRF trie images.  0 disables
+ * the cache and restores the pre-Z4-part-2 behaviour exactly (every consult is a
+ * whole-image load).  Defined here because the cache it bounds is below in this
+ * file; registered in _PG_init (src/am/customscan.c) with the other GUCs. */
+int			pg_weave_surf_cache_mb = 32;
+
 static int
 cmp_blocknumber(const void *a, const void *b)
 {
@@ -847,6 +854,10 @@ uint64		weave_chan_terms_expanded = 0;
 uint64		weave_chan_dict_pages = 0;
 uint64		weave_chan_surf_loads = 0;
 uint64		weave_chan_surf_bytes = 0;
+uint64		weave_chan_surf_cache_hits = 0;
+uint64		weave_chan_surf_cache_misses = 0;
+uint64		weave_chan_surf_cache_evicts = 0;
+uint64		weave_chan_surf_cache_bytes = 0;
 
 Buffer
 weave_new_buffer(Relation index)
@@ -1075,8 +1086,8 @@ Datum
 weave_channel_stats(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[13];
-	bool		nulls[13];
+	Datum		values[17];
+	bool		nulls[17];
 	HeapTuple	tuple;
 	int			i;
 
@@ -1084,7 +1095,7 @@ weave_channel_stats(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 	tupdesc = BlessTupleDesc(tupdesc);
 
-	for (i = 0; i < 13; i++)
+	for (i = 0; i < 17; i++)
 		nulls[i] = false;
 
 	values[0] = Int64GetDatum((int64) weave_chan_lex_term);
@@ -1100,6 +1111,10 @@ weave_channel_stats(PG_FUNCTION_ARGS)
 	values[10] = Int64GetDatum((int64) weave_chan_dict_pages);
 	values[11] = Int64GetDatum((int64) weave_chan_surf_loads);
 	values[12] = Int64GetDatum((int64) weave_chan_surf_bytes);
+	values[13] = Int64GetDatum((int64) weave_chan_surf_cache_hits);
+	values[14] = Int64GetDatum((int64) weave_chan_surf_cache_misses);
+	values[15] = Int64GetDatum((int64) weave_chan_surf_cache_evicts);
+	values[16] = Int64GetDatum((int64) weave_chan_surf_cache_bytes);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
@@ -1123,6 +1138,12 @@ weave_channel_stats_reset(PG_FUNCTION_ARGS)
 	weave_chan_dict_pages = 0;
 	weave_chan_surf_loads = 0;
 	weave_chan_surf_bytes = 0;
+	weave_chan_surf_cache_hits = 0;
+	weave_chan_surf_cache_misses = 0;
+	weave_chan_surf_cache_evicts = 0;
+	/* surf_cache_bytes is NOT reset: it is a gauge of memory this backend is
+	 * still holding, and zeroing it here would report a false zero for as long as
+	 * the images stay resident.  weave.h says the same thing next to the counter. */
 	PG_RETURN_VOID();
 }
 
@@ -2583,36 +2604,50 @@ weave_read_surf(Relation index, BlockNumber root, Size *len_out,
 	return img;
 }
 
-bool
-weave_surf_load(Relation index, const WeaveSegMeta *seg, WeaveSurfTrie *t,
-				uint8 **img, Size *len)
+/*
+ * Which block is this bolt's fuzzy weft rooted at?  InvalidBlockNumber when the
+ * bolt has no fuzzy weft at all (a pre-v6 bolt, or a v7 bolt whose vocabulary the
+ * format cannot represent) -- not an error, just nothing to consult.
+ *
+ * Split out of weave_surf_load() because the resident cache (below) needs the
+ * root as part of its KEY, i.e. before it decides whether to read anything.
+ */
+static BlockNumber
+weave_surf_root(Relation index, const WeaveSegMeta *seg)
 {
 	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
 	int			nweft;
 	int			i;
 	BlockNumber root = InvalidBlockNumber;
-	const char *detail = NULL;
-	WeaveSurfError err;
 
-	*img = NULL;
-	*len = 0;
 	if (seg->chandesc == InvalidBlockNumber)
-		return false;			/* pre-v6 bolt: lexical only, by definition */
+		return InvalidBlockNumber;	/* pre-v6 bolt: lexical only, by definition */
 
 	nweft = weave_chandesc_required(index, seg->chandesc, weft, WEAVE_MAX_WEFTS);
 	for (i = 0; i < nweft; i++)
 		if (weft[i].kind == (uint16) WEAVE_WK_FUZZY)
 			root = weft[i].root;
-	if (root == InvalidBlockNumber)
-		return false;			/* v6 bolt, or a v7 bolt whose vocabulary the
-								 * format cannot represent: nothing to consult */
+	return root;
+}
+
+/*
+ * Read + open + validate the image on the chain at `root`.  Split from
+ * weave_surf_load() so the resident cache can load an image whose root it has
+ * already resolved for its key, instead of walking the channel descriptor twice.
+ */
+static void
+weave_surf_load_at(Relation index, BlockNumber root, WeaveSurfTrie *t,
+				   uint8 **img, Size *len)
+{
+	const char *detail = NULL;
+	WeaveSurfError err;
 
 	*img = weave_read_surf(index, root, len, &detail);
 	/* Counted here and not at the callers, because this is the ONE place the
 	 * whole-image cost is paid: weave_read_surf() reassembles the entire trie
-	 * into one contiguous palloc, ~5.52 B/term, with no cache.  Whether that is
-	 * affordable per query is the measurement doc/PHASES.md Z4 turns on, and it
-	 * cannot be taken without these two numbers. */
+	 * into one contiguous palloc, ~5.52 B/term.  A cache HIT must not touch
+	 * these two -- "the trie is resident" is precisely the claim that consults
+	 * outnumber loads, and it is unreadable if a hit counts as a load. */
 	weave_chan_surf_loads++;
 	if (*img == NULL)
 		ereport(ERROR,
@@ -2645,6 +2680,296 @@ weave_surf_load(Relation index, const WeaveSegMeta *seg, WeaveSurfTrie *t,
 						   weave_surftrie_errstr(err), root),
 				 errhint("REINDEX the index to rebuild it.")));
 	}
+}
+
+bool
+weave_surf_load(Relation index, const WeaveSegMeta *seg, WeaveSurfTrie *t,
+				uint8 **img, Size *len)
+{
+	BlockNumber root;
+
+	*img = NULL;
+	*len = 0;
+	root = weave_surf_root(index, seg);
+	if (root == InvalidBlockNumber)
+		return false;
+
+	weave_surf_load_at(index, root, t, img, len);
+	return true;
+}
+
+/* ---------------------------------------------------------------------------
+ * THE RESIDENT SuRF TRIE CACHE (task Z4 part 2)
+ *
+ * WHY.  weave_surf_load() above reassembles the whole image every call -- about
+ * 5.52 bytes per vocabulary term, ~11 MB per bolt at a 2M-term vocabulary -- and
+ * until this cache existed nothing reused it.  Nothing in production paid that
+ * per query yet, because the only SQL-reachable caller was the weave_surf_stats()
+ * diagnostic; the point is that EVERY remaining Z-phase task (Z4 part 3's prefix
+ * routing, Z5's trie-accelerated fuzzy, Z6's regex tiling) has to consult the trie
+ * at QUERY time, and none of them is measurable while one consult costs a whole
+ * image.  Making the image resident is the prerequisite, not an optimization.
+ *
+ * WHY (relfilenode, root, generation) IS A SAFE KEY.  A bolt is immutable once
+ * written, so an image never changes in place -- but freed pages ARE recycled, so
+ * a root block number can later belong to a DIFFERENT bolt.  What rules that out
+ * is that every path which frees a bolt's pages bumps the metapage `generation`
+ * first, under the metapage's exclusive lock, in the same GenericXLog record that
+ * removes the segment from the directory: weave_meta_add_segment() above,
+ * ambuild.c's two merge commit points, and amvacuum.c's livedocs rewrite.  So
+ * within one generation, (relfilenode, root) -> image bytes is a function, and a
+ * generation change makes every entry for that relation unusable by key mismatch
+ * rather than by anybody remembering to invalidate it.  relfilenode rather than
+ * relation OID because REINDEX keeps the OID and changes the file.
+ *
+ * WHAT A STALE SNAPSHOT GETS.  The caller passes the generation of the metapage
+ * snapshot its `seg` came from, so if that snapshot is stale the entry served is
+ * the image that WAS at that root at that generation -- which is exactly what an
+ * uncached read of a stale snapshot was trying to get and is strictly better than
+ * what it would actually have got (whatever now lives on those recycled pages).
+ * The scan's own generation re-check is what discards a stale result;
+ * see weave_read_meta_generation() in src/am/amscan.c.
+ *
+ * MEMORY.  One dedicated MemoryContext child of TopMemoryContext, created lazily,
+ * so the resident bytes are visible in a memory-context dump under their own name
+ * instead of hiding inside CacheMemoryContext.
+ *
+ * WHO FREES WHAT, and this is the load-bearing rule (see the LIFETIME RULE in
+ * include/weave/am.h): the trie a consult hands back points INTO an entry's image,
+ * so an entry must not be freed while a caller might still be reading it.  Entries
+ * are therefore freed ONLY from inside weave_surf_consult().  The relcache callback
+ * merely MARKS entries dead -- an invalidation message can arrive at any
+ * CHECK_FOR_INTERRUPTS, and a callback that pfree'd would be a use-after-free with
+ * no call site to audit -- and the GUC has no assign hook, because lowering the
+ * budget mid-query would otherwise free an image the running query is walking.  The
+ * next consult enforces the new budget, which is the first moment at which no
+ * caller can be holding anything.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Cap on the number of resident images, independent of the byte budget, because
+ * the entry list is searched LINEARLY.  128 = WEAVE_MAX_SEGMENTS: one image per
+ * bolt of one index is the shape a query actually consults, and at that size a
+ * hash table would be more code than the thing it indexes.  Without the cap a
+ * small-vocabulary index under a large budget could accumulate thousands of
+ * entries and turn every lookup into a scan of them.
+ */
+#define WEAVE_SURF_CACHE_MAX_IMAGES WEAVE_MAX_SEGMENTS
+
+typedef struct WeaveSurfCacheEntry
+{
+	struct WeaveSurfCacheEntry *next;
+	RelFileNumber relnumber;	/* key part 1 (REINDEX changes it, OID does not) */
+	BlockNumber root;			/* key part 2: the fuzzy weft's root block */
+	uint32		generation;		/* key part 3: the directory generation */
+	Oid			reloid;			/* NOT part of the key: the relcache callback's
+								 * only handle on which entries to mark */
+	bool		dead;			/* invalidated; freed at the next consult */
+	uint64		used;			/* LRU clock stamp */
+	Size		len;
+	uint8	   *img;			/* the image, in weave_surf_cache_cxt */
+	WeaveSurfTrie trie;			/* opened against img, which it only points into */
+} WeaveSurfCacheEntry;
+
+static MemoryContext weave_surf_cache_cxt = NULL;
+static WeaveSurfCacheEntry *weave_surf_cache_head = NULL;
+static int	weave_surf_cache_nimages = 0;
+static uint64 weave_surf_cache_clock = 0;
+
+/*
+ * DROP/REINDEX/anything that invalidates the relcache entry: mark, never free.
+ * Generation-keying is the correctness mechanism; this is hygiene, so that a
+ * dropped relation's image does not sit resident for the life of the backend.
+ */
+static void
+weave_surf_cache_inval(Datum arg, Oid relid)
+{
+	WeaveSurfCacheEntry *e;
+
+	for (e = weave_surf_cache_head; e != NULL; e = e->next)
+		if (!OidIsValid(relid) || e->reloid == relid)
+			e->dead = true;
+}
+
+/* Unlink and free *pp (which points at the head, or at a predecessor's next). */
+static void
+weave_surf_cache_drop(WeaveSurfCacheEntry **pp)
+{
+	WeaveSurfCacheEntry *e = *pp;
+
+	*pp = e->next;
+	Assert(weave_chan_surf_cache_bytes >= (uint64) e->len);
+	weave_chan_surf_cache_bytes -= (uint64) e->len;
+	weave_surf_cache_nimages--;
+	pfree(e->img);
+	pfree(e);
+}
+
+/*
+ * Make the cache fit `budget` bytes with `extra` more about to be added, and free
+ * anything already known to be unusable.  The ONE place entries are freed.
+ */
+static void
+weave_surf_cache_enforce(Size budget, Size extra)
+{
+	WeaveSurfCacheEntry **pp;
+
+	/* A dead entry can never be served again, so it is the cheapest thing to
+	 * give up and it goes first -- it is not counted as an eviction, because it
+	 * was not the budget that cost us the image. */
+	pp = &weave_surf_cache_head;
+	while (*pp != NULL)
+	{
+		if ((*pp)->dead)
+			weave_surf_cache_drop(pp);
+		else
+			pp = &(*pp)->next;
+	}
+
+	while (weave_surf_cache_head != NULL &&
+		   (weave_chan_surf_cache_bytes + (uint64) extra > (uint64) budget ||
+			(extra > 0 &&
+			 weave_surf_cache_nimages >= WEAVE_SURF_CACHE_MAX_IMAGES)))
+	{
+		WeaveSurfCacheEntry **victim = &weave_surf_cache_head;
+		uint64		oldest = PG_UINT64_MAX;
+
+		for (pp = &weave_surf_cache_head; *pp != NULL; pp = &(*pp)->next)
+			if ((*pp)->used < oldest)
+			{
+				oldest = (*pp)->used;
+				victim = pp;
+			}
+		weave_surf_cache_drop(victim);
+		weave_chan_surf_cache_evicts++;
+	}
+}
+
+bool
+weave_surf_consult(Relation index, const WeaveSegMeta *seg, uint32 generation,
+				   WeaveSurfTrie *t, Size *len, uint8 **owned)
+{
+	Size		budget = (Size) pg_weave_surf_cache_mb * (Size) 1024 * 1024;
+	RelFileNumber relnumber = index->rd_locator.relNumber;
+	BlockNumber root;
+	WeaveSurfCacheEntry **pp;
+	WeaveSurfCacheEntry *e;
+	uint8	   *img = NULL;
+	WeaveSurfError err;
+	MemoryContext oldcxt;
+
+	*owned = NULL;
+	*len = 0;
+
+	/* Here, and only here: see WHO FREES WHAT above.  Runs before the key is even
+	 * resolved so that setting the budget to 0 gives the memory back at the next
+	 * consult rather than at the next hit. */
+	if (weave_surf_cache_head != NULL)
+		weave_surf_cache_enforce(budget, 0);
+
+	root = weave_surf_root(index, seg);
+	if (root == InvalidBlockNumber)
+		return false;			/* no fuzzy weft: nothing to consult */
+
+	if (budget == 0)
+	{
+		/* Cache disabled: the pre-Z4-part-2 path exactly -- one whole-image load
+		 * per consult, which is what makes surf_cache_mb=0 usable as the control
+		 * arm of a measurement rather than merely a slower cache. */
+		weave_surf_load_at(index, root, t, &img, len);
+		*owned = img;
+		return true;
+	}
+
+	for (pp = &weave_surf_cache_head; *pp != NULL; pp = &(*pp)->next)
+	{
+		e = *pp;
+		if (e->relnumber == relnumber && e->root == root && !e->dead)
+		{
+			if (e->generation == generation)
+			{
+				e->used = ++weave_surf_cache_clock;
+				*t = e->trie;
+				*len = e->len;
+				weave_chan_surf_cache_hits++;
+				return true;	/* the whole point: no load, no surf_bytes */
+			}
+
+			/* Same root, older generation: that bolt is provably gone (the
+			 * generation bump happens in the commit that frees its pages), so
+			 * the image can never be served again.  Dropping it here is what
+			 * keeps an insert-heavy session from accumulating stale images until
+			 * the budget notices. */
+			e->dead = true;
+		}
+	}
+
+	weave_chan_surf_cache_misses++;
+	weave_surf_load_at(index, root, t, &img, len);
+
+	if (*len > budget)
+	{
+		/* Bigger than the entire budget: caching it would evict everything to
+		 * hold something that cannot be kept, so use it and let the caller free
+		 * it.  Recognizable from SQL as misses climbing with surf_cache_bytes
+		 * pinned at zero. */
+		*owned = img;
+		return true;
+	}
+
+	weave_surf_cache_enforce(budget, *len);
+
+	if (weave_surf_cache_cxt == NULL)
+	{
+		weave_surf_cache_cxt = AllocSetContextCreate(TopMemoryContext,
+													"pg_weave surf trie cache",
+													ALLOCSET_DEFAULT_SIZES);
+		/* Registered with the cache rather than from _PG_init: there is nothing
+		 * to invalidate before the first entry exists, and this keeps the
+		 * registration next to the thing it protects. */
+		CacheRegisterRelcacheCallback(weave_surf_cache_inval, (Datum) 0);
+	}
+
+	oldcxt = MemoryContextSwitchTo(weave_surf_cache_cxt);
+	e = (WeaveSurfCacheEntry *) palloc0(sizeof(WeaveSurfCacheEntry));
+	/* A COPY, not a reparent of the loaded chunk.  weave_surf_load() allocates in
+	 * the caller's context (and through the huge-safe path), and stealing that
+	 * chunk would mean either switching contexts around a function that can
+	 * ereport or reaching into MemoryContext internals.  The cost is a transient
+	 * second copy of at most `budget` bytes, paid once per miss. */
+	e->img = (uint8 *) WEAVE_ALLOC_MAYBE_HUGE(*len);
+	MemoryContextSwitchTo(oldcxt);
+	memcpy(e->img, img, *len);
+
+	/* open() only, no validate(): the bytes are a memcpy of an image
+	 * weave_surf_load() just validated, so re-deriving the semantic invariants
+	 * would be asserting that memcpy works.  open() must be re-run because
+	 * WeaveSurfTrie is all pointers INTO the image and they have to point at the
+	 * copy. */
+	err = weave_surftrie_open(e->img, *len, &e->trie);
+	if (err != WEAVE_SURF_OK)
+	{
+		/* Unreachable unless open() is byte-position-dependent, which it is not.
+		 * If it ever happens the thing to give up is the CACHE, not the query. */
+		pfree(e->img);
+		pfree(e);
+		*owned = img;
+		return true;
+	}
+
+	e->relnumber = relnumber;
+	e->root = root;
+	e->generation = generation;
+	e->reloid = RelationGetRelid(index);
+	e->len = *len;
+	e->used = ++weave_surf_cache_clock;
+	e->next = weave_surf_cache_head;
+	weave_surf_cache_head = e;
+	weave_surf_cache_nimages++;
+	weave_chan_surf_cache_bytes += (uint64) e->len;
+
+	pfree(img);					/* the caller's copy is now redundant */
+	*t = e->trie;
 	return true;
 }
 
