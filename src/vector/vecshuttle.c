@@ -810,6 +810,11 @@ weave_vec_shuttle_begin(const WeaveVecWeft *w, int segno, const float *query,
 	VecDirCursor mc;
 	const char *why = NULL;
 	float		acc = 0.0f;
+
+	/* The vector channel's mechanism counter.  One per shuttle opened, i.e.
+	 * per bolt scanned, which is the same unit the lexical counters use.
+	 * include/weave/weave.h, doc/PHASES.md Z4. */
+	weave_chan_vector_scan++;
 	uint32		b;
 
 	if (w == NULL || query == NULL)

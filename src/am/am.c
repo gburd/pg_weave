@@ -828,6 +828,25 @@ uint64		weave_alloc_fsm_defer = 0;
 uint64		weave_alloc_fsm_contended = 0;
 uint64		weave_alloc_extend = 0;
 
+/*
+ * CHANNEL-MECHANISM COUNTERS.  Contract, rationale and the list of which ones are
+ * structurally zero today are on the extern declarations in include/weave/weave.h.
+ * Defined here beside the allocator counters because they share every property
+ * that makes those readable from SQL rather than logged.
+ */
+uint64		weave_chan_lex_term = 0;
+uint64		weave_chan_prefix_dict = 0;
+uint64		weave_chan_prefix_surf = 0;
+uint64		weave_chan_fuzzy_dict = 0;
+uint64		weave_chan_fuzzy_surf = 0;
+uint64		weave_chan_regex_dict = 0;
+uint64		weave_chan_regex_surf = 0;
+uint64		weave_chan_vector_scan = 0;
+uint64		weave_chan_terms_expanded = 0;
+uint64		weave_chan_dict_pages = 0;
+uint64		weave_chan_surf_loads = 0;
+uint64		weave_chan_surf_bytes = 0;
+
 Buffer
 weave_new_buffer(Relation index)
 {
@@ -1033,6 +1052,74 @@ weave_alloc_stats_reset(PG_FUNCTION_ARGS)
 	weave_alloc_fsm_defer = 0;
 	weave_alloc_fsm_contended = 0;
 	weave_alloc_extend = 0;
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(weave_channel_stats);
+PG_FUNCTION_INFO_V1(weave_channel_stats_reset);
+
+/*
+ * weave_channel_stats() -> record : which mechanism inside the index served the
+ * query leaves this backend evaluated, and how much vocabulary work they did.
+ *
+ * Same shape, same limitations and the same "a zero is not evidence unless the
+ * query ran in this session" caveat as weave_alloc_stats(); see the counters in
+ * include/weave/weave.h.
+ *
+ * PARALLEL RESTRICTED for the reason weave_alloc_stats() is: a parallel scan's
+ * workers count into their own copies and the leader would report only its own,
+ * which is a wrong answer rather than a slow one.
+ */
+Datum
+weave_channel_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[12];
+	bool		nulls[12];
+	HeapTuple	tuple;
+	int			i;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	for (i = 0; i < 12; i++)
+		nulls[i] = false;
+
+	values[0] = Int64GetDatum((int64) weave_chan_lex_term);
+	values[1] = Int64GetDatum((int64) weave_chan_prefix_dict);
+	values[2] = Int64GetDatum((int64) weave_chan_prefix_surf);
+	values[3] = Int64GetDatum((int64) weave_chan_fuzzy_dict);
+	values[4] = Int64GetDatum((int64) weave_chan_fuzzy_surf);
+	values[5] = Int64GetDatum((int64) weave_chan_regex_dict);
+	values[6] = Int64GetDatum((int64) weave_chan_regex_surf);
+	values[7] = Int64GetDatum((int64) weave_chan_vector_scan);
+	values[8] = Int64GetDatum((int64) weave_chan_terms_expanded);
+	values[9] = Int64GetDatum((int64) weave_chan_dict_pages);
+	values[10] = Int64GetDatum((int64) weave_chan_surf_loads);
+	values[11] = Int64GetDatum((int64) weave_chan_surf_bytes);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/* Zero this backend's channel counters, so a measurement can bracket one query
+ * instead of reporting everything since connect. */
+Datum
+weave_channel_stats_reset(PG_FUNCTION_ARGS)
+{
+	weave_chan_lex_term = 0;
+	weave_chan_prefix_dict = 0;
+	weave_chan_prefix_surf = 0;
+	weave_chan_fuzzy_dict = 0;
+	weave_chan_fuzzy_surf = 0;
+	weave_chan_regex_dict = 0;
+	weave_chan_regex_surf = 0;
+	weave_chan_vector_scan = 0;
+	weave_chan_terms_expanded = 0;
+	weave_chan_dict_pages = 0;
+	weave_chan_surf_loads = 0;
+	weave_chan_surf_bytes = 0;
 	PG_RETURN_VOID();
 }
 
@@ -2518,6 +2605,12 @@ weave_surf_load(Relation index, const WeaveSegMeta *seg, WeaveSurfTrie *t,
 								 * format cannot represent: nothing to consult */
 
 	*img = weave_read_surf(index, root, len, &detail);
+	/* Counted here and not at the callers, because this is the ONE place the
+	 * whole-image cost is paid: weave_read_surf() reassembles the entire trie
+	 * into one contiguous palloc, ~5.52 B/term, with no cache.  Whether that is
+	 * affordable per query is the measurement doc/PHASES.md Z4 turns on, and it
+	 * cannot be taken without these two numbers. */
+	weave_chan_surf_loads++;
 	if (*img == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -2532,6 +2625,7 @@ weave_surf_load(Relation index, const WeaveSegMeta *seg, WeaveSurfTrie *t,
 	 * whose symptom is navigation to the WRONG NODE -- a false negative, which is
 	 * a silently dropped row rather than an error (weave/surftrie.h).
 	 */
+	weave_chan_surf_bytes += (uint64) *len;
 	err = weave_surftrie_open(*img, *len, t);
 	if (err == WEAVE_SURF_OK)
 		err = weave_surftrie_validate(t);

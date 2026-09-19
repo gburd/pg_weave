@@ -255,4 +255,44 @@ extern uint64 weave_alloc_fsm_defer;
 extern uint64 weave_alloc_fsm_contended;
 extern uint64 weave_alloc_extend;
 
+/*
+ * CHANNEL-MECHANISM COUNTERS (src/am/am.c).  Backend-local, always compiled in,
+ * read from SQL via weave_channel_stats().  Same discipline and the same
+ * limitations as the allocator counters above, for the same reasons.
+ *
+ * WHAT QUESTION THEY ANSWER: which MECHANISM served a query leaf.  Not "was the
+ * index used" -- pg_stat_user_indexes answers that already and sql/idx_scan_stats.sql
+ * asserts it -- but which of the several structures inside one index did the work.
+ * A prefix leaf can be served by a dictionary range walk or by a trie enumeration,
+ * and those have different costs; a claim about either is unfalsifiable while
+ * nothing reports which one ran.  doc/PHASES.md Z4.
+ *
+ * WHY NOT EXPLAIN, which is what Z4's gate originally asked for.  There is no
+ * AM-level EXPLAIN callback on either supported major: `amexplain` is not in
+ * PostgreSQL 17's or 18's `IndexAmRoutine` (checked against 18.4's
+ * access/amapi.h).  A CustomScan could print something, but only for the one plan
+ * shape we generate a CustomScan for -- the count(*) pushdown -- so EXPLAIN would
+ * report the channel for a minority of queries and say nothing for the rest.  A
+ * counter read from SQL covers every plan shape, including the bitmap scan that is
+ * the common @@@ path.
+ *
+ * SOME OF THESE ARE STRUCTURALLY ZERO TODAY, and that is information rather than
+ * an omission: four of the six retrieval kinds answer nothing yet, and these
+ * counters are where that stops being a claim in a document.  The task that makes
+ * each one nonzero is named beside it.  A zero from any of them still means only
+ * "this mechanism served nothing in THIS backend" -- never "nothing happened".
+ */
+extern uint64 weave_chan_lex_term;		/* exact-term leaf via the dictionary */
+extern uint64 weave_chan_prefix_dict;	/* term* via the dictionary range walk */
+extern uint64 weave_chan_prefix_surf;	/* term* via a SuRF enumeration (Z4) */
+extern uint64 weave_chan_fuzzy_dict;	/* term~k via a dictionary scan (Z5) */
+extern uint64 weave_chan_fuzzy_surf;	/* term~k via the trie (Z5 + Z4's cache) */
+extern uint64 weave_chan_regex_dict;	/* /re/ via a dictionary scan (Z6) */
+extern uint64 weave_chan_regex_surf;	/* /re/ via trigram tiling + trie (Z6) */
+extern uint64 weave_chan_vector_scan;	/* a vector shuttle was opened (V8) */
+extern uint64 weave_chan_terms_expanded;	/* vocabulary terms a leaf expanded to */
+extern uint64 weave_chan_dict_pages;	/* dictionary pages those expansions read */
+extern uint64 weave_chan_surf_loads;	/* whole-image trie loads */
+extern uint64 weave_chan_surf_bytes;	/* and their total size */
+
 #endif							/* WEAVE_H */

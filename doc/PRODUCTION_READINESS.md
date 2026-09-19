@@ -209,6 +209,21 @@ F 0/5, M 0/6, R 0/5. **Two of the six retrieval kinds answer a query** -- BM25 l
 and, as of V8 on 2026-09-18, quantized-vector ANN. Fuzzy, regex, prefix and n-gram are
 imported but unwired.
 
+*Z4 is PARTIAL as of 2026-09-19, and the interesting part is why.* Its stated shape --
+route prefix through SuRF instead of the dictionary walk -- is a strict superset of the
+work it was meant to replace: a trie hit yields a vocabulary RANK, not a posting
+address, so the dictionary range scan still has to run; that scan is already sparse-index
+seeked and stops at the first key past the prefix; and `weave_surf_load()` reads the
+whole trie image per call with no cache. The half of its gate that asked for `EXPLAIN` to
+name the channel is not implementable either -- there is no AM-level EXPLAIN callback on
+PostgreSQL 17 or 18. What shipped instead is the thing both halves actually needed:
+`weave_channel_stats()`, twelve backend-local counters naming which MECHANISM served each
+query leaf, readable from SQL for every plan shape. Five of the twelve are structurally
+zero and those zeros are asserted, each pinned to the task that will flip it -- so the
+sentence below about four of six channels answering nothing is now a query rather than a
+claim. Still owed: a resident trie, and then the measurement that either routes prefix
+through it or declines the route with a number.
+
 *The count did not move on 2026-09-19, and that is the honest reading.* V7's second
 half closed **G23** -- a row inserted after the build kept no vector, so it was present
 in lexical answers and absent from vector ones, which is claim 1 being false in
