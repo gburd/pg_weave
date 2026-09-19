@@ -64,11 +64,17 @@ SELECT vector_scan > 0 AS vector_shuttle_was_opened,
   FROM weave_channel_stats();
 
 -- ---- the trie load is visible, and it is a WHOLE-IMAGE load --------------
--- weave_surf_stats() is the only SQL-reachable caller of weave_surf_load().  The
+-- weave_surf_stats() is the only SQL-reachable caller of the trie loader.  The
 -- point of asserting it here is that surf_bytes is the per-call cost of consulting
--- the trie at query time: weave_read_surf() reassembles the entire image into one
--- contiguous palloc with no cache, so any route that consults the trie pays this
--- once per bolt per query.  Z4's re-aim rests on that number being visible.
+-- the trie with no cache: weave_read_surf() reassembles the entire image into one
+-- contiguous palloc, so any route that consults the trie pays this once per bolt
+-- per query.  Z4's re-aim rests on that number being visible.
+--
+-- surf_cache_mb = 0 PINS THAT BEHAVIOUR HERE, which is the point of the setting
+-- existing: the cache added by Z4 part 2 is on by default, so without this the
+-- section below would be measuring a cache hit and calling it a load.  It also
+-- leaves nothing resident, so the resident-trie section that follows starts cold.
+SET pg_weave.surf_cache_mb = 0;
 SELECT weave_channel_stats_reset();
 SELECT count(*) > 0 AS index_has_a_trie FROM weave_surf_stats('cs_idx');
 SELECT surf_loads > 0 AS trie_image_was_loaded,
@@ -108,12 +114,154 @@ SELECT count(*) FROM cs WHERE d @@@ 'gamma~1'::wquery;
 SELECT prefix_surf, fuzzy_surf, regex_surf
   FROM weave_channel_stats();
 
+-- ==== Z4 part 2: the trie is RESIDENT ====================================
+--
+-- WHY THESE ASSERTIONS ARE THE MEASUREMENT.  A trie image is ~5.52 bytes per
+-- vocabulary term -- about 11 MB per bolt at 2M terms -- and before this task every
+-- consult reassembled the whole thing from its page chain.  Nothing in production
+-- paid it per query (weave_surf_stats() was the only SQL-reachable caller), but
+-- every remaining Z task consults the trie at QUERY time, and none of them is
+-- measurable while one consult costs a whole image.  So the claim to pin down is
+-- exactly: a repeat consult loads NOTHING.  surf_loads/surf_bytes still count
+-- whole-image loads only; surf_cache_hits counts consults served from memory.  If a
+-- hit ever incremented surf_loads the two numbers would say the same thing and the
+-- measurement would be gone, which is why every assertion below pairs them.
+--
+-- EVERYTHING IS IN ONE SESSION because the counters are backend-local, and the
+-- cache is too -- it lives in a MemoryContext under TopMemoryContext, keyed by
+-- (relfilenode, weft root block, metapage generation).
+--
+-- The bolt count is taken while the cache is still OFF from the section above, on
+-- purpose: counting the bolts is itself a consult, and taking it with the cache on
+-- would leave the image resident and make the "first consult" below a hit.  That is
+-- not a hypothetical -- the first draft of this section did exactly that and
+-- asserted a miss that was a hit.
+CREATE TEMP TABLE cs_bolts AS
+  SELECT count(*)::bigint AS n FROM weave_surf_stats('cs_idx');
+SELECT n AS bolts_with_a_trie FROM cs_bolts;
+SET pg_weave.surf_cache_mb = 32;
+
+-- ---- the first consult is a miss, and it pays for a whole image ----------
+SELECT weave_channel_stats_reset();
+SELECT count(*) > 0 AS index_has_a_trie FROM weave_surf_stats('cs_idx');
+CREATE TEMP TABLE cs_cold AS SELECT * FROM weave_channel_stats();
+SELECT surf_cache_misses = (SELECT n FROM cs_bolts) AS one_miss_per_bolt,
+       surf_cache_hits = 0 AS and_no_hit,
+       surf_loads = surf_cache_misses AS one_whole_image_load_per_miss,
+       surf_cache_bytes = surf_bytes AS the_loaded_image_is_now_resident
+  FROM cs_cold;
+
+-- ---- the second consult of the same bolt loads NOTHING -------------------
+-- The bolt is immutable and the generation has not moved, so the key hits and the
+-- page chain is never touched.  surf_loads = 0 here is the whole of Z4 part 2.
+SELECT weave_channel_stats_reset();
+SELECT count(*) > 0 AS index_has_a_trie FROM weave_surf_stats('cs_idx');
+SELECT surf_cache_hits = (SELECT n FROM cs_bolts) AS one_hit_per_bolt,
+       surf_cache_misses = 0 AS and_no_miss,
+       surf_loads = 0 AS and_no_whole_image_load,
+       surf_bytes = 0 AS and_no_bytes_read,
+       surf_cache_bytes = (SELECT surf_cache_bytes FROM cs_cold)
+         AS resident_bytes_unchanged
+  FROM weave_channel_stats();
+
+-- ---- surf_cache_mb = 0 restores the old behaviour exactly ----------------
+-- The control arm.  With the cache off there are no cache events at all -- not
+-- hits, and not misses either, because there is no cache to miss -- and every
+-- consult is a load.  Turning it off also hands the resident bytes back, which is
+-- the only way this file can watch the gauge go DOWN: an eviction that does not
+-- decrement it would leave a permanent overcount.
+SET pg_weave.surf_cache_mb = 0;
+SELECT weave_channel_stats_reset();
+SELECT count(*) > 0 AS index_has_a_trie FROM weave_surf_stats('cs_idx');
+SELECT count(*) > 0 AS index_has_a_trie FROM weave_surf_stats('cs_idx');
+SELECT surf_cache_hits = 0 AS no_hits_with_the_cache_off,
+       surf_cache_misses = 0 AS and_no_misses_there_is_no_cache,
+       surf_loads = 2 * (SELECT n FROM cs_bolts) AS every_consult_was_a_load,
+       surf_cache_evicts > 0 AS the_resident_images_were_given_back,
+       surf_cache_bytes = 0 AS and_the_resident_gauge_is_back_to_zero
+  FROM weave_channel_stats();
+
+-- ---- an image larger than the whole budget is not cached -----------------
+-- 250k distinct vocabulary terms, which at 5.52 B/term is an image over 1 MB, so a
+-- 1 MB budget cannot hold it.  Caching it would mean evicting everything else to
+-- hold something that has to be dropped again on the next consult, so the loader
+-- hands it straight to the caller instead.  From here that reads as misses climbing
+-- while the resident gauge stays at zero -- and, load-bearing, as NOT AN ERROR: the
+-- refusal must not wedge the consult.
+CREATE TABLE csb (id serial, d wdoc);
+INSERT INTO csb(d)
+  SELECT to_wdoc('simple', (SELECT string_agg('w' || (g * 100 + i), ' ')
+                              FROM generate_series(1, 100) i))
+    FROM generate_series(1, 2500) g;
+CREATE INDEX csb_idx ON csb USING weave (d);
+SELECT count(*) = 1 AS one_bolt,
+       max(bytes) > 1024 * 1024 AS its_image_exceeds_one_megabyte
+  FROM weave_surf_stats('csb_idx');
+SET pg_weave.surf_cache_mb = 1;
+SELECT weave_channel_stats_reset();
+SELECT count(*) > 0 AS consulted FROM weave_surf_stats('csb_idx');
+SELECT count(*) > 0 AS consulted_again FROM weave_surf_stats('csb_idx');
+SELECT surf_cache_hits = 0 AS the_oversized_image_was_never_served_from_cache,
+       surf_cache_misses = 2 AS both_consults_missed,
+       surf_loads = 2 AS and_both_loaded_the_whole_image,
+       surf_cache_bytes = 0 AS and_nothing_became_resident
+  FROM weave_channel_stats();
+
+-- The same image under a budget that fits IS cached, which is what makes the
+-- refusal above a statement about the budget rather than about the image.
+SET pg_weave.surf_cache_mb = 32;
+SELECT weave_channel_stats_reset();
+SELECT count(*) > 0 AS consulted FROM weave_surf_stats('csb_idx');
+SELECT count(*) > 0 AS consulted_again FROM weave_surf_stats('csb_idx');
+SELECT surf_cache_hits = 1 AS the_second_consult_hit,
+       surf_loads = 1 AS and_only_the_first_one_loaded,
+       surf_cache_bytes > 1024 * 1024 AS the_big_image_is_resident
+  FROM weave_channel_stats();
+
+-- ---- a directory change makes a resident image unusable ------------------
+-- THE CORRECTNESS ASSERTION THAT MATTERS MOST.  A bolt is immutable once written,
+-- so a cached image never goes stale in place -- but freed pages ARE recycled, and
+-- a root block number can later belong to a DIFFERENT bolt.  This sequence
+-- manufactures exactly that: build a bolt (503 terms), add documents carrying three
+-- new terms, weave_merge() to fold them into a new bolt, then weave_vacuum(), whose
+-- pack phase relocates the surviving bolt onto the low free blocks the merge
+-- released -- putting the new trie on the SAME root block the first one occupied.
+-- A cache keyed only by (relfilenode, root) would serve the pre-merge image here and
+-- report 503 terms for a 506-term vocabulary: a wrong answer, silently.  The
+-- metapage `generation` is the third key part precisely because every path that
+-- frees a bolt's pages bumps it first, in the same commit.
+CREATE TABLE csg (id serial, d wdoc);
+INSERT INTO csg(d) SELECT to_wdoc('simple', 'alpha beta gamma doc' || g)
+  FROM generate_series(1, 500) g;
+CREATE INDEX csg_idx ON csg USING weave (d);
+SELECT nterms AS terms_before FROM weave_surf_stats('csg_idx');
+INSERT INTO csg(d) SELECT to_wdoc('simple', 'zeta eta theta doc' || g)
+  FROM generate_series(1, 200) g;
+SELECT weave_merge('csg_idx');
+SELECT weave_vacuum('csg_idx');
+SELECT weave_channel_stats_reset();
+SELECT nterms AS terms_after FROM weave_surf_stats('csg_idx');
+SELECT surf_cache_hits = 0 AS the_pre_merge_image_was_not_served,
+       surf_loads > 0 AS the_new_bolt_was_loaded_from_its_pages
+  FROM weave_channel_stats();
+
 -- ---- reset really resets -------------------------------------------------
 -- A counter surface whose reset does not work turns every later measurement into
 -- "everything since connect", which is how a bracketed number becomes a wrong one.
+--
+-- surf_cache_bytes is EXCLUDED from that, deliberately, and asserted the other way
+-- round: it is a gauge of memory this backend is still holding, so zeroing it on
+-- reset would report zero resident bytes while the images are resident -- the same
+-- false zero the first draft of this file shipped for fuzzy_dict.
 SELECT weave_channel_stats_reset();
 SELECT lex_term, prefix_dict, fuzzy_dict, fuzzy_trgm, regex_trgm, vector_scan,
-       terms_expanded, dict_pages, surf_loads, surf_bytes
+       terms_expanded, dict_pages, surf_loads, surf_bytes,
+       surf_cache_hits, surf_cache_misses, surf_cache_evicts
+  FROM weave_channel_stats();
+SELECT surf_cache_bytes > 0 AS the_resident_gauge_survives_a_reset
   FROM weave_channel_stats();
 
+RESET pg_weave.surf_cache_mb;
 DROP TABLE cs;
+DROP TABLE csb;
+DROP TABLE csg;

@@ -764,6 +764,17 @@ wvck_surf(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 			continue;			/* no fuzzy weft: a pre-v7 bolt, not a violation */
 
 		nwith++;
+		/*
+		 * weave_read_surf(), NOT weave_surf_consult(): a validator that reads a
+		 * CACHED image is not validating the bytes on disk.  The resident cache
+		 * (Z4 part 2) can only be populated from an image that already passed
+		 * open()+validate(), so a check that hit it would report "clean" by
+		 * re-reading its own earlier verdict -- and after a page-level corruption
+		 * in the same session (which is exactly what t/013_surf_corruption.pl
+		 * manufactures) it would report clean about bytes that are no longer
+		 * there.  weave_check() therefore always pays the whole-image read, which
+		 * is the right trade for a function you run when you suspect corruption.
+		 */
 		img = weave_read_surf(cx->index, root, &len, &detail);
 		if (img == NULL)
 		{

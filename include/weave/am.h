@@ -1178,6 +1178,43 @@ extern bool weave_surf_load(Relation index, const WeaveSegMeta *seg,
 							WeaveSurfTrie *t, uint8 **img, Size *len);
 
 /*
+ * THE RESIDENT CONSULT (Z4 part 2), and the reason weave_surf_load() above still
+ * exists next to it.
+ *
+ * weave_surf_load() pays the whole image every call: ~5.52 B/term, about 11 MB
+ * per bolt at a 2M-term vocabulary, with no reuse.  That is affordable for a
+ * diagnostic function (weave_surf_stats) and for amcheck, and it is NOT
+ * affordable for the per-query consults Z4 part 3, Z5 and Z6 are built on -- none
+ * of which is even measurable while one consult costs a whole-image load.  So the
+ * loader stays as the "I want to own these bytes" entry point and this is the
+ * "I want to look at the trie" one.
+ *
+ * `generation` is the caller's metapage snapshot generation, the third part of
+ * the cache key, and it must come from the SAME snapshot `seg` came from -- that
+ * is what makes a cached image safe to serve.  A bolt is immutable once written,
+ * but freed pages ARE recycled, so a root block can later belong to a different
+ * bolt; every path that frees a bolt's pages bumps `generation` first (am.c's
+ * weave_meta_add_segment, ambuild.c's two merge commits, amvacuum.c's livedocs
+ * rewrite), so within one generation (relfilenode, root) -> image bytes is a
+ * function.
+ *
+ * LIFETIME RULE, and it is the whole of the danger here: WeaveSurfTrie holds
+ * pointers INTO the image and copies nothing, so *t aliases bytes the cache owns.
+ * The trie is valid until this backend's NEXT weave_surf_consult() call, and no
+ * longer.  A caller that wants it for longer must take the owned path.
+ *
+ * *owned is set when the caller must pfree the image itself -- the cache is
+ * disabled (pg_weave.surf_cache_mb = 0) or the image is larger than the whole
+ * budget, in which case there is nothing to reuse and caching it would evict
+ * everything else to hold something that cannot be kept.  When *owned is NULL the
+ * caller must NOT free anything.  Returns false exactly when weave_surf_load()
+ * does: the bolt carries no fuzzy weft.
+ */
+extern bool weave_surf_consult(Relation index, const WeaveSegMeta *seg,
+							   uint32 generation, WeaveSurfTrie *t,
+							   Size *len, uint8 **owned);
+
+/*
  * The one posting decoder.  Every channel reads a term's postings through this:
  * ambuild.c's merge, amscan.c's boolean/phrase/ranked paths, amvacuum.c's
  * tombstone pass, and src/pages/trgm_page.c's candidate walk.  Kept in am.c
