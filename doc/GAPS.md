@@ -1247,3 +1247,56 @@ vector index and no fuzzy channel.
 
 "Better on all dimensions" is achievable against that stack. It is not achievable
 today, and the gap list above is what stands between here and there.
+
+### G30 — the heap-side fuzzy predicate returned FALSE NEGATIVES, on pure ASCII, and Z5 turned that into a cross-plan disagreement — **FOUND AND CLOSED 2026-09-19**
+
+`weave_doc_has_fuzzy()` (`src/query/doc.c`) is the heap-side evaluation of `term~k`
+and the recheck above a lossy bitmap scan. It computed an exact CHARACTER distance
+with core's `varstr_levenshtein_less_equal()` and then gated that computation behind
+two pre-filters stated in BYTES, both with the wrong bound:
+
+1. **The trigram pigeonhole bound was `nqtrg > k`.** One edit destroys the three
+   trigrams that overlap its position, not one, so the sound bound is `nqtrg > 3k`.
+   Measured: `to_wdoc('simple','abxd zzz') @@@ 'abcd~1'` returned **false** while
+   `levenshtein('abcd','abxd') = 1`. Same for `abcde` / `abxde`. **No multi-byte
+   character is involved** — this was a wrong answer on ASCII input.
+2. **The length filter compared BYTE lengths against a CHARACTER budget.**
+   `abs(candlen - termlen) > k` skips a five-character candidate that differs from a
+   five-character query by one three-byte character.
+
+The same misstated constant was in the index-side funnel: `weave_trgm_candidates()`
+was called with a flat `min_trigrams = 3` regardless of `k`, so a query with exactly
+three distinct trigrams was funnelled at `k = 1` and one substitution could destroy
+all three. That route is the inexact one, so its heap recheck can only remove rows,
+never restore them.
+
+**Why it survived this long: both paths were wrong in the same direction.** Before
+Z5 the index used the byte-wise automaton in `include/weave/lev.h`, so
+`'naive~1'` missed the U+00EF spelling from the index too — index and heap agreed by
+both being wrong, and every test in the tree compares one plan against another plan.
+Z5 made the index exact in characters, which is what turned a latent wrong answer
+into a visible disagreement. **The lesson is the one `AGENTS.md` already carries in
+another form: two implementations agreeing is not evidence when a third, independent
+oracle is available and was never asked.** `contrib/fuzzystrmatch`'s `levenshtein()`
+was that oracle all along.
+
+**Closed by** stating each pre-filter's precondition instead of its bound: the length
+filter counts characters (`pg_mbstrlen_with_len`), and the trigram filter acts only
+when `nqtrg > 3k` **and** both strings are ASCII (byte trigrams say nothing about
+character edits otherwise — `naive` and the U+00EF spelling share not one byte
+trigram and are one character apart). The funnel's minimum is now `3k+1` for fuzzy;
+regex keeps 3, because its trigrams come from the pattern AST and there is no `k` to
+budget for. `sql/fuzzyuleven.sql` asserts index / heap / `levenshtein()` agreement on
+every case, and five mutation legs — each of the two bounds, the edit unit, the
+funnel minimum, and `~0` — are each killed by it.
+
+### G31 — `term~0` silently meant `term~1` — **FOUND AND CLOSED 2026-09-19**
+
+`src/query/parse.c` lexed `~k` as `Max(k, 1)`, so a zero edit budget returned every
+term at distance 1 as well. It is the only wrong answer this parser produces on its
+own, and it is in the false-POSITIVE direction, which is the direction a recheck
+cannot repair either (there is nothing to recheck against — the query itself has been
+widened). `~0` now normalizes to the plain term: the same rows by definition, reached
+through the exact-term route rather than an automaton with an empty budget. A bare
+`term~` still means 2, which is a default rather than a value the user wrote. Visible
+in `'naive~0'::wquery` printing as `'naive'`, asserted in `sql/fuzzyuleven.sql`.
