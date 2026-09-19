@@ -183,8 +183,9 @@ pg_weave = shared_module('pg_weave',
 
 # Control + SQL script into the extension dir (layout auto-detected above).
 #
-# EVERY script, not just the base.  pg_weave.control names default_version 0.8.0
-# and there is no pg_weave--0.8.0.sql -- PostgreSQL reaches it by applying the
+# EVERY script, not just the base.  pg_weave.control names a default_version for
+# which there is no pg_weave--<default>.sql (0.8.0 when this was written, 0.10.0
+# now) -- PostgreSQL reaches it by applying the
 # upgrade chain from the 0.1.0 base.  Installing only the base therefore produced
 # an extension that could not be created at its own default version ("extension
 # \"pg_weave\" has no installation script nor update path for version 0.8.0").
@@ -200,5 +201,7 @@ install_data(
   'sql/pg_weave--0.5.0--0.6.0.sql',
   'sql/pg_weave--0.6.0--0.7.0.sql',
   'sql/pg_weave--0.7.0--0.8.0.sql',
+  'sql/pg_weave--0.8.0--0.9.0.sql',
+  'sql/pg_weave--0.9.0--0.10.0.sql',
   install_dir: pg_extension_dir,
 )

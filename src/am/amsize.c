@@ -288,7 +288,7 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
  *    pages the chain occupies.  weave_index_size_detail() gained a 'surf_trie'
  *    bucket in the same change, so no byte of a weave index is unattributed.
  *
- * 2. IT IS THE ONLY SQL-REACHABLE CALLER OF THE TRIE LOADER.  weave_surf_load()
+ * 2. IT IS THE ONLY SQL-REACHABLE CALLER OF THE TRIE LOADER.  weave_surf_consult()
  *    is the path a prefix/fuzzy/regex scan will take (Z4-Z6), including its
  *    refusal to use an image that does not validate.  An ERROR path with no
  *    caller has never run: t/011_chandesc_corruption.pl records that
@@ -296,6 +296,15 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
  *    reachable only from a C call nothing in the tree made.  Routing this
  *    diagnostic through the real loader means t/013_surf_corruption.pl exercises
  *    the production refusal rather than a test-only copy of it.
+ *
+ *    Since Z4 part 2 that means the CACHED entry point, deliberately on two
+ *    counts: it is the only way a regression test can observe the cache's
+ *    hit/miss/evict behaviour from SQL (sql/chanstats.sql), and a diagnostic
+ *    reporting the trie through a path no query takes would be describing
+ *    something other than what queries do.  The reported bytes are the image
+ *    length either way -- the cache changes where the bytes live, not what they
+ *    are.  amcheck.c deliberately does NOT do this; see the note at its
+ *    weave_read_surf() call for why a corruption check must read the disk.
  * ------------------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(weave_surf_stats);
 
@@ -362,7 +371,8 @@ weave_surf_stats(PG_FUNCTION_ARGS)
 		/* No row for a bolt with no fuzzy weft, on purpose: a pre-v7 bolt is not
 		 * a bolt with an empty trie, and reporting a zero row would blur the
 		 * difference the whole self-description design exists to keep. */
-		if (!weave_surf_load(index, &meta.segs[s], &t, &img, &len))
+		if (!weave_surf_consult(index, &meta.segs[s], meta.generation, &t,
+								&len, &img))
 			continue;
 
 		values[0] = Int32GetDatum((int32) s);
@@ -376,7 +386,15 @@ weave_surf_stats(PG_FUNCTION_ARGS)
 		values[8] = Int64GetDatum((int64) ((len + WEAVE_SURFPAGE_PAYLOAD - 1) /
 										   WEAVE_SURFPAGE_PAYLOAD));
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
-		pfree(img);
+
+		/*
+		 * Free only what the consult gave us ownership of (cache disabled, or an
+		 * image too large for the whole budget).  A cached image belongs to the
+		 * cache, and `t` points into it -- which is also why nothing after this
+		 * point in the loop reads `t`: the next iteration's consult may evict it.
+		 */
+		if (img != NULL)
+			pfree(img);
 	}
 
 	index_close(index, AccessShareLock);
