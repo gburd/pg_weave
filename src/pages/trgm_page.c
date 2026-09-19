@@ -532,5 +532,19 @@ weave_trgm_candidates(Relation index, BlockNumber trgmstart,
 	out->tids = tids;
 	out->n = n;
 	tidset_sort_uniq(out);
+
+	/*
+	 * THE TRIGRAM-FUNNEL MECHANISM, counted only on the success path: the three
+	 * `return false` exits above mean the pattern could not be funnelled and the
+	 * caller falls back to a full scan, which is a different mechanism with a
+	 * different cost.  `is_regex` splits the count because regex and
+	 * over-long-fuzzy reach the same funnel for different reasons and a
+	 * measurement that could not tell them apart would be useless for Z6.
+	 * include/weave/weave.h.
+	 */
+	if (is_regex)
+		weave_chan_regex_trgm++;
+	else
+		weave_chan_fuzzy_trgm++;
 	return true;
 }
