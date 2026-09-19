@@ -760,7 +760,7 @@ postconditions (`avail == end - low`, `end >= low`) with the chain pass removed 
 so the target catches the class by two independent mechanisms, not just because a
 sanitizer happened to be on.
 
-### G23 — a row inserted after the build has no vector, in any segment — **OPEN, by construction, V7**
+### G23 — a row inserted after the build has no vector, in any segment — **CLOSED 2026-09-19 by V7's second half**
 
 A `WeavePendingItem` carries the tid and the `wdoc` and nothing else, so when the
 pending buffer flushes into a bolt, or when an oversized `INSERT` writes a bolt of
@@ -787,6 +787,42 @@ does with such a bolt now: it carries the weft-bearing input's lanes forward and
 gives every document from the weftless input a **dead lane**, so the merged bolt's
 warp space still covers every document and the rows that were inserted are absent
 from vector answers rather than present with somebody else's vector.
+
+**CLOSED 2026-09-19.** `WeavePendingItem` grew a `veclen` word and the row's `wvec`
+is now stored verbatim after the `wdoc`; `weave_flush_pending()` and
+`weave_insert_oversized_as_segment()` both run producer 1 over it, so a flushed bolt
+carries a real weft. `sql/pendingvec.sql` is the proof and `t/019_pending_v8_upgrade.pl`
+covers the format transition.
+
+**THE VECTOR IS STORED RAW, NOT PRE-QUANTIZED**, at ~8× the bytes (3,848 against 480
+at 960-d/4-bit). Quantizing at insert time would bake the `bits` reloption into the
+pending buffer, and an `ALTER INDEX ... SET (bits = ...)` before the flush would then
+leave a pending code of the wrong width — re-widening it means reconstructing the
+vector, which recomputes the `(scale, norm)` pair from a reconstruction, the one
+thing `VECTOR_CHANNEL.md` forbids. Storing it raw means a flush runs producer 1
+exactly as a build does: **one quantization path, not two.**
+
+**THE FORMAT TRANSITION IS BY PAGE KIND, NOT BY VERSION WORD.** The header grew from
+12 to 16 bytes, which moved the `wdoc` and changed the item stride, and the two
+strides are not distinguishable from the bytes. `weave_insert()` deliberately does
+not upcast the metapage (only a directory change does), so one index can hold pages
+of both layouts at once — the discriminator has to be per page. Hence
+`WEAVE_PK_PENDING_V9`, `WEAVE_VERSION` 9, and `WEAVE_PK_PENDING` becoming a read-only
+legacy format.
+
+**A LANE COUNT CANNOT SEE THIS BUG, which is worth recording.** Run against the
+pre-fix build, `sql/pendingvec.sql` still reports 67 lanes after the flush: the merge
+already gave every document from the weftless input a dead lane, so the *count* was
+always right. What discriminates is `dead_lanes` (3 before, 1 after — only the row
+whose vector really was NULL) and retrievability (before: the top-1 for the inserted
+row's own vector was an unrelated built row at warp 53; after: the inserted row at
+warp 64). A test that counted lanes would have passed on the broken code.
+
+**THE FIRST VERSION OF THE FIX WAS WRONG AND THE SUITE CAUGHT IT.** It kept
+`WEAVE_PK_PENDING` for indexes with no vector column — to avoid churning their
+page-kind census — while writing NEW-layout items onto those pages, so the reader
+parsed them with the old stride and three regression files filled with "skipping
+malformed pending document". The kind names the **layout**, not the payload.
 
 ### G24 — the vector weft's free path was unreachable, therefore untested — **CLOSED 2026-09-17 by merge producer 2**
 
@@ -887,7 +923,7 @@ from the accumulator and producer 2 pull from a heap of per-input cursors, and k
 32 lanes resident instead of `nvec`. The docid ordering is what makes this possible
 and it is already guaranteed per input (`vector_warp_map_ascending`).
 
-### G26 — the merge's geometry-mismatch skip is unreachable, therefore untested — **OPEN 2026-09-17, closed by G23**
+### G26 — the merge's geometry-mismatch skip is unreachable, therefore untested — **CLOSED 2026-09-19 by G23, exactly as predicted**
 
 `weave_vec_merge_geom()` refuses a merge whose input wefts disagree on
 `(dim, bits, layout, metric)`, because re-quantizing on a merge is forbidden
@@ -912,6 +948,15 @@ and the mismatch is three statements away — at which point this guard is the o
 thing between that index and a merge that either throws inside VACUUM's cleanup or
 re-quantizes half its corpus. The guard is implemented now precisely because the
 change that makes it reachable is one someone will make without reading §7.3.
+
+**CLOSED 2026-09-19, and the prediction held exactly.** G23 landed, and the three
+statements are the last block of `sql/pendingvec.sql`: `ALTER INDEX pv_idx SET
+(bits = 2)`, an `INSERT`, a `weave_merge()`. `weave_vec_meta()` then reports two
+wefts of different `bits` in one index, the merge declines to combine them rather
+than mixing widths, the index keeps answering, and every `weave_check()` invariant
+holds. The first row of the table above is now false for the stated reason -- the
+pending-flush path writes a weft, at the CURRENT reloption, which is correct for a
+brand-new segment built from raw vectors and is exactly what a merge must not do.
 
 ### Checked and NOT a gap: the doclen sidecar has the same posting-derived hole, and it is harmless
 
@@ -1167,6 +1212,35 @@ lookup and cursor construction — was also wrong.** It is the doclen sidecar
 cursor: ~72% of a ranked mid k=10 scan, re-pinning the page and re-walking its
 block headers on every 128-docid block change. Recorded rather than deleted
 because it is the third hypothesis in this file that a profile overturned.
+
+### G29 — the vector channel does not scan the pending buffer, so an inserted row is absent from vector answers until a flush — **OPEN 2026-09-19, found by closing G23**
+
+G23 is closed at the SEGMENT: a flush now folds the pending vectors into a real weft.
+The window before that flush is a second, much smaller version of the same
+asymmetry. The lexical channel matches pending documents from the pending page
+itself (`weave_collect_matches()` walks `meta.pendinghead`), so an inserted row is
+searchable immediately. The vector channel cannot: the shuttle is per-bolt
+(`weave_vec_shuttle_*`, three lockstep cursors over VDIR/VCODES/VWARP), and a pending
+document is in no bolt. So between the `INSERT` and the next flush the row is in
+lexical answers and not in vector ones.
+
+**Why this is much smaller than G23 was.** The window is bounded by the flush
+cadence, and flushes are driven by VACUUM cleanup and by the insert-time tiered
+compaction, not by anything the user has to remember. G23's window was *forever*.
+
+**What closing it takes, and why it is not done here.** The vector is on the page, so
+quantizing it at scan time is possible — the codebook and rotation are pure functions
+of `(dim, bits)` — but it needs a scoring path that is not a bolt cursor, and its
+results have to enter the same top-k as the bolts'. That is the fused scorer's job
+(Phase F), and building a second, parallel top-k merge before F exists is how two
+scorers that disagree get written. Held for F, recorded here, and asserted in
+`sql/pendingvec.sql` (`lanes_before_flush`) so that closing it shows up as a diff
+rather than as nothing.
+
+**Note the asymmetry is not new to the vector channel.** Per-term `df` in the
+dictionary is also not updated until a merge, which is documented as matching GIN
+fastupdate's staleness. The difference is that stale `df` perturbs a *score* while
+this omits a *row*.
 
 Against the full separate-extension stack it is not yet a comparison: there is no
 vector index and no fuzzy channel.

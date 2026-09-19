@@ -824,19 +824,31 @@ selectors apply it to their lists as well so a mixed index still compacts the bo
 it can. Both halves are needed for the reason the interim comment already gave: a
 rule enforced only in the selectors is a rule the next selector forgets.
 
-**Is a mismatch reachable? Not today, and that is recorded as a gap rather than
-claimed as a guarantee** (`doc/GAPS.md` G26). `bits` is a reloption, so `ALTER INDEX
-... SET (bits = 2)` is legal at any time — but only a *build* writes a weft, and one
-build reads the reloption once, so the two bolts a mismatch needs cannot both exist.
-`dim` can differ between bolts in principle (a `wvec` column with no typmod), but
-`weave_vec_accum_add()` throws on a dim change *within* a segment, so producing two
-bolts of different dims needs a flush boundary landing exactly on the dim change --
-not something a test can arrange. `layout` and `metric` are constants today. The
-guard becomes reachable the moment **G23** closes: once a pending flush carries
-vectors, an `INSERT` after an `ALTER INDEX ... SET (bits = ...)` writes a second weft
-at the new width. It is implemented now, with the mismatch-skip mutation recorded as
-a **surviving** mutation for the same reason G24's was — an untested branch that
-nobody wrote down is indistinguishable from a tested one six months later.
+**Is a mismatch reachable? YES, since 2026-09-19** (`doc/GAPS.md` G26, closed). It was
+not, and the entry recorded that as a gap rather than claiming it as a guarantee: only
+a *build* wrote a weft, and one build reads the `bits` reloption once, so the two
+bolts a mismatch needs could not both exist. **G23 changed that, exactly as G26
+predicted it would.** A pending flush now writes a weft, and it uses the CURRENT
+reloption — which is correct for a brand-new segment built from raw vectors and is
+precisely what a merge must not do — so `ALTER INDEX ... SET (bits = ...)` followed by
+an `INSERT` and a `weave_merge()` produces two wefts of different widths in one index,
+three statements from a standing start. The last block of `sql/pendingvec.sql` is that
+sequence: the merge declines to combine them, the index keeps answering, every
+`weave_check()` invariant holds, and the mismatch-skip mutation is no longer a
+surviving one.
+
+`dim` remains unreachable for the reason it always was: `weave_vec_accum_add()` throws
+on a dim change *within* a segment, so two bolts of different dims need a flush
+boundary landing exactly on the dim change. `layout` and `metric` are constants today.
+
+**A third producer's worth of input, without a third producer.** The flush feeds
+producer 1 from a pending page rather than from a heap tuple, which is why
+`WeavePendingItem` stores the `wvec` **verbatim rather than pre-quantized**: a code
+would bake `bits` into the pending buffer, and re-widening it means reconstructing the
+vector and so recomputing the `(scale, norm)` pair from a reconstruction — forbidden
+in §7.3 for the same reason the merge may not re-encode. Storing the vector raw costs
+~8x the bytes on a pending page (3,848 against 480 at 960-d/4-bit) and buys **one
+quantization path instead of two.**
 
 **The interim's cost is paid off.** "A vector index does not compact, so its segment
 count only grows, and it will eventually reach `WEAVE_MAX_SEGMENTS`" no longer holds:
