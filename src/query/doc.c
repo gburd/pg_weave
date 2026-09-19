@@ -47,6 +47,7 @@
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
 #include "regex/regex.h"
+#include "mb/pg_wchar.h"		/* pg_mbstrlen_with_len: the fuzzy edit unit */
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/varlena.h"
@@ -760,11 +761,59 @@ weave_doc_has_prefix(WeaveDoc doc, const char *prefix, int prefixlen)
 }
 
 /*
+ * All bytes below 0x80, i.e. every byte of this string is one character in every
+ * server encoding PostgreSQL supports.  Both pre-filters in
+ * weave_doc_has_fuzzy() are stated in bytes and the distance they gate is in
+ * characters, so each one is only allowed to act when the strings it looks at
+ * make those two the same thing.
+ */
+static inline bool
+weave_all_ascii(const char *s, int len)
+{
+	int			i;
+
+	for (i = 0; i < len; i++)
+		if ((unsigned char) s[i] >= 0x80)
+			return false;
+	return true;
+}
+
+/*
  * weave_doc_has_fuzzy -- does any doc term lie within edit distance k of `term`?
  * Uses core's varstr_levenshtein_less_equal (bounded, so cheap for small k),
- * with two pre-filters to avoid the distance computation on most candidates:
- * a length filter (||cand|-|q|| <= k) and, when the query has more than k
- * trigrams (pigeonhole), a trigram-overlap filter.
+ * with two pre-filters to avoid the distance computation on most candidates: a
+ * length filter and a trigram-overlap filter.
+ *
+ * THE UNIT IS THE CHARACTER, because varstr_levenshtein_less_equal() counts
+ * characters and so does contrib/fuzzystrmatch's levenshtein(), which is the
+ * oracle sql/fuzzyuleven.sql holds this function to.  Both pre-filters are
+ * computed over BYTES, so each one is guarded by the condition that makes bytes
+ * and characters interchangeable for the strings it is applied to.  Before those
+ * guards existed this function returned FALSE NEGATIVES -- it is the heap-side
+ * (and recheck-side) evaluation of `@@@`, so a row that the index returns and
+ * this function rejects is the same query giving two answers depending on the
+ * plan.  Measured cases, all of which sql/fuzzyuleven.sql now pins:
+ *
+ *	  levenshtein('abcd','abxd') = 1 but 'abcd~1' did not match 'abxd'
+ *	  the same for 'naive' against 'naive' spelled with U+00EF, distance 1
+ *
+ * WHY THE TRIGRAM BOUND IS 3k AND NOT k.  The pigeonhole argument is that k
+ * edits cannot destroy every trigram of the query.  One edit at byte position p
+ * destroys the trigrams starting at p-2, p-1 and p: THREE of them, not one.  So
+ * at least nqtrg - 3k trigrams survive, and the filter is sound exactly when
+ * nqtrg > 3k.  With k = 1 and a four-byte query ('abcd', 2 trigrams) the old
+ * bound admitted the filter and one substitution destroyed both trigrams, which
+ * is the first case above: a wrong answer on pure ASCII, with no multi-byte
+ * character anywhere near it.
+ *
+ * WHY IT ALSO REQUIRES ASCII.  The trigrams are BYTE trigrams.  A single
+ * character edit can rewrite up to four bytes and destroy up to six byte
+ * trigrams, and the count of trigrams a candidate shares with the query says
+ * nothing about their character distance -- 'naive' and the same word spelled
+ * with U+00EF share not one byte trigram and are one character apart.  Rather than inflate
+ * the bound to 6k and keep reasoning about it, the filter simply does not act
+ * when either string has a byte at or above 0x80.  Single-byte server encodings
+ * are exempt: there a byte IS a character.
  */
 bool
 weave_doc_has_fuzzy(WeaveDoc doc, const char *term, int termlen, int k)
@@ -773,29 +822,35 @@ weave_doc_has_fuzzy(WeaveDoc doc, const char *term, int termlen, int k)
 	uint32		i;
 	uint32		qtrg[WEAVE_MAX_TRIGRAMS];
 	int			nqtrg;
+	bool		single_byte_enc = (pg_database_encoding_max_length() == 1);
+	bool		q_ascii = single_byte_enc || weave_all_ascii(term, termlen);
+	int			qchars = single_byte_enc ? termlen
+		: pg_mbstrlen_with_len(term, termlen);
 	bool		use_trgm;
 
-	/*
-	 * Trigram pre-filter: a term within k edits of the query must share a
-	 * trigram with it, provided the query has more than k trigrams (pigeonhole).
-	 * When it does not, the filter is unsound, so we skip it and scan fully --
-	 * results stay correct, only speed varies.
-	 */
 	nqtrg = weave_trigrams(term, termlen, qtrg, WEAVE_MAX_TRIGRAMS);
-	use_trgm = (nqtrg > k);
+	use_trgm = q_ascii && nqtrg > 3 * k;
 
 	for (i = 0; i < doc->nterms; i++)
 	{
 		const char *cand = WEAVE_DOC_TERMTEXT(doc, &entries[i]);
 		int			candlen = entries[i].len;
+		int			candchars;
 		int			d;
 
-		/* length difference alone can exceed k -> skip without computing */
-		if (abs(candlen - termlen) > k)
+		/*
+		 * Length difference alone can exceed k -> skip without computing.  In
+		 * CHARACTERS: 'naive' and 'na<CJK>ve' are five characters each and two
+		 * bytes apart, so a byte-length filter dropped a candidate at distance 1
+		 * for k = 1.
+		 */
+		candchars = single_byte_enc ? candlen
+			: pg_mbstrlen_with_len(cand, candlen);
+		if (abs(candchars - qchars) > k)
 			continue;
 
 		/* trigram pre-filter: skip candidates that share no trigram */
-		if (use_trgm)
+		if (use_trgm && (single_byte_enc || weave_all_ascii(cand, candlen)))
 		{
 			uint32		ctrg[WEAVE_MAX_TRIGRAMS];
 			int			nctrg = weave_trigrams(cand, candlen, ctrg, WEAVE_MAX_TRIGRAMS);

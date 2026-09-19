@@ -370,7 +370,30 @@ lex_raw(ParseState *st)
 				havedigit = true;
 				st->pos++;
 			}
-			tok.fuzzy_k = havedigit ? Max(k, 1) : 2;
+
+			/*
+			 * `term~0` IS AN EDIT BUDGET OF ZERO, i.e. the term itself, and it
+			 * is now normalized to a PLAIN term rather than widened to ~1.  The
+			 * old Max(k, 1) answered a stricter question with a looser one: a
+			 * user who wrote ~0 also got every term at distance 1, which is a
+			 * wrong answer in the false-POSITIVE direction and the only kind
+			 * this parser produces on its own.  Zero is also what
+			 * contrib/fuzzystrmatch's levenshtein() means by zero, and that
+			 * agreement is the basis of the oracle in sql/fuzzyuleven.sql.
+			 *
+			 * Normalized rather than carried as a fuzzy item with k = 0 because
+			 * `fuzzy_k == 0` is this lexer's sentinel for "not fuzzy" (see the
+			 * field's comment and the flag assignment below), and the two mean
+			 * the same rows: the exact-term route returns precisely the terms at
+			 * distance 0, doing less work than an automaton with an empty budget.
+			 * The visible consequence is that 'term~0'::wquery prints as 'term',
+			 * which is the normalization stated rather than hidden.
+			 *
+			 * A BARE `term~` still means 2, unchanged: there is no digit to
+			 * honour there, so the default is a convention rather than a value
+			 * the user wrote.
+			 */
+			tok.fuzzy_k = havedigit ? k : 2;
 		}
 		/*
 		 * A trailing ':' followed by a run of weight labels A/B/C/D (any case)
