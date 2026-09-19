@@ -18,7 +18,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.8.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.9.0" of extension "pg_weave" is already installed
 SET pg_weave.vec_kernel = 'scalar';
 SET enable_seqscan = off;
 -- 300 documents, 8 dimensions, every one of them with a vector, in one bolt: ten

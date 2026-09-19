@@ -489,6 +489,8 @@ weave_lookup_term(Relation index, const WeaveSegMeta *seg,
 				 const char *term, int termlen, TidSet *out)
 {
 	BlockNumber blk = weave_dict_seek(index, seg, term, termlen);
+
+	weave_chan_lex_term++;
 	bool		onlyone = (seg->dictindexstart != InvalidBlockNumber);
 
 	out->tids = NULL;
@@ -763,6 +765,14 @@ weave_lookup_prefix(Relation index, const WeaveSegMeta *seg,
 				   const char *prefix, int prefixlen, TidSet *out)
 {
 	BlockNumber blk = weave_dict_seek(index, seg, prefix, prefixlen);
+
+	/*
+	 * THE MECHANISM, counted where it is chosen rather than where it is
+	 * described.  One increment per (leaf, bolt) pair: a prefix leaf is
+	 * resolved once per bolt, and per-bolt is the unit any later comparison
+	 * against a trie route would have to be in.  doc/PHASES.md Z4.
+	 */
+	weave_chan_prefix_dict++;
 	int			cap = 32;
 	int			n = 0;
 	/* sized by the number of matching tuples, which is corpus-scale (a
@@ -784,6 +794,7 @@ weave_lookup_prefix(Relation index, const WeaveSegMeta *seg,
 		if (buffer == InvalidBuffer)
 			break;			/* block truncated by a concurrent weave_vacuum: end of chain */
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+		weave_chan_dict_pages++;
 		page = BufferGetPage(buffer);
 		ptr = (char *) PageGetContents(page);
 		end = weave_page_entry_end(page);
@@ -816,6 +827,7 @@ weave_lookup_prefix(Relation index, const WeaveSegMeta *seg,
 				break;
 			}
 			/* c == 0 and de->termlen >= prefixlen: a prefix match */
+			weave_chan_terms_expanded++;
 			{
 				WeavePosting *post;
 				int			np = weave_decode_term(index, de->firstposting,
