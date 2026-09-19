@@ -75,28 +75,45 @@ SELECT surf_loads > 0 AS trie_image_was_loaded,
        surf_bytes > 0 AS and_its_size_is_reported
   FROM weave_channel_stats();
 
--- ---- the channels that answer nothing say so -----------------------------
--- NOT filler.  Four of the six retrieval kinds are imported but unwired, and this
--- is where that stops being a sentence in doc/PRODUCTION_READINESS.md.  Each zero
--- is pinned to the task that will flip it, so routing a channel shows up here as a
--- diff rather than as nothing:
---   prefix_surf  -- Z4, and only if the measurement says the trie beats the walk
---   fuzzy_dict   -- Z5, routing uleven over the dictionary's vocabulary iterator
---   fuzzy_surf   -- Z5 plus a resident trie
---   regex_dict   -- Z6
---   regex_surf   -- Z6, via trigram tiling
+-- ---- fuzzy is served by the Levenshtein automaton over the dictionary ----
+-- CORRECTING THE FIRST DRAFT OF THIS FILE, which asserted fuzzy_dict = 0 and
+-- described the fuzzy channel as unwired.  It is not: weave_fuzzy_terms() walks the
+-- sorted dictionary under a Levenshtein automaton, skipping every term that shares a
+-- dead-end prefix, and the result is EXACT -- no heap recheck, unlike the funnel.
+-- The zero was an artifact of the counter not existing, which is precisely the
+-- failure these counters are supposed to prevent, so it is asserted the other way
+-- round here.
+SELECT weave_channel_stats_reset();
+SELECT count(*) FROM cs WHERE d @@@ 'gamma~1'::wquery;
+SELECT fuzzy_dict > 0 AS fuzzy_used_the_automaton_walk,
+       fuzzy_trgm = 0 AS and_not_the_trigram_funnel,
+       fuzzy_surf = 0 AS and_not_the_trie
+  FROM weave_channel_stats();
+
+-- ---- what is genuinely absent: a shuttle with a bound --------------------
+-- These three columns ARE structurally zero, and each is pinned to the task that
+-- will flip it, so routing a channel shows up here as a diff rather than as nothing:
+--   prefix_surf  -- Z4 part 3, and only if the measurement says the trie beats the
+--                   dictionary range walk
+--   fuzzy_surf   -- Z5 plus Z4's resident trie
+--   regex_surf   -- Z6, via regex AST -> trigram tiling
+-- Note what these counters do NOT say.  A nonzero fuzzy_dict above means fuzzy
+-- returns correct rows, not that the fuzzy CHANNEL exists: there is no shuttle
+-- implementing include/weave/channel.h with a real bound, so fuzzy cannot yet join a
+-- fused top-k.  That distinction is the whole of Z7.
 SELECT weave_channel_stats_reset();
 SELECT count(*) FROM cs WHERE d @@@ 'beta'::wquery;
 SELECT count(*) FROM cs WHERE d @@@ 'alpha*'::wquery;
-SELECT prefix_surf, fuzzy_dict, fuzzy_surf, regex_dict, regex_surf
+SELECT count(*) FROM cs WHERE d @@@ 'gamma~1'::wquery;
+SELECT prefix_surf, fuzzy_surf, regex_surf
   FROM weave_channel_stats();
 
 -- ---- reset really resets -------------------------------------------------
 -- A counter surface whose reset does not work turns every later measurement into
 -- "everything since connect", which is how a bracketed number becomes a wrong one.
 SELECT weave_channel_stats_reset();
-SELECT lex_term, prefix_dict, vector_scan, terms_expanded, dict_pages,
-       surf_loads, surf_bytes
+SELECT lex_term, prefix_dict, fuzzy_dict, fuzzy_trgm, regex_trgm, vector_scan,
+       terms_expanded, dict_pages, surf_loads, surf_bytes
   FROM weave_channel_stats();
 
 DROP TABLE cs;

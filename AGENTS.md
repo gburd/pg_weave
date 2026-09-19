@@ -172,6 +172,13 @@ EMPTY `regression.diffs`. Nine failures that were one wrong port. Read the port 
 for. (Also: installing `postgresql-17` and `postgresql-18` in one apt transaction
 created only the 18 cluster.)
 
+**An expected file generated with `REGRESS=<one-file>` does not match the full suite.**
+`CREATE EXTENSION IF NOT EXISTS pg_weave` emits `extension "pg_weave" already exists,
+skipping` in the full run -- an earlier file created it -- and nothing in a solo run.
+Both new regression files this week (`pendingvec`, `chanstats`) were generated solo and
+failed their first full-suite run on exactly that line. Generate the expected output
+from a FULL `make installcheck`, not from `REGRESS=<name>`.
+
 **PostgreSQL 18 turns data checksums ON by default and 17 does not.** Any TAP test
 that rewrites page bytes behind the server's back -- the manufacture-the-old-image
 pattern in `t/010` and `t/019` -- passes on 17 and dies on 18 with "invalid page in
