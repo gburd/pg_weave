@@ -56,6 +56,7 @@
 #include "executor/executor.h"
 #include "executor/instrument.h"
 #include "funcapi.h"
+#include "mb/pg_wchar.h"		/* pg_database_encoding_max_length: the fuzzy edit unit */
 #include "miscadmin.h"
 #include "nodes/pathnodes.h"
 #include "nodes/tidbitmap.h"
@@ -80,7 +81,7 @@
 #include "utils/snapmgr.h"
 #include "utils/selfuncs.h"
 #include "weave/for.h"			/* FOR codec + doclen quantizer (the WAND cursor) */
-#include "weave/lev.h"
+#include "weave/uleven.h"		/* the universal-Levenshtein core the fuzzy walk runs */
 
 /* forward decls: defined later in this file */
 static void weave_collect_matches(Relation index, WeaveQuery query, TidSet *out, bool *recheck);
@@ -1035,210 +1036,370 @@ weave_eval_query(Relation index, const WeaveSegMeta *seg, WeaveQuery q,
 	return result;
 }
 
+/* ---------------------------------------------------------------------------
+ * The dictionary page chain, presented to the universal-Levenshtein core as a
+ * WeaveUlevVocab (include/weave/uleven.h).
+ *
+ * WHY AN ITERATOR AND NOT A HAND-WRITTEN WALK.  The walk this replaced inlined
+ * a byte-wise automaton (include/weave/lev.h) into the page loop, which made the
+ * matcher and the storage layout one lump of code: the only test that could see
+ * the matcher was a regression test with an index in it.  uleven.h's core is the
+ * matcher alone, with 7.4M property checks behind it in test/hegel/test_uleven.c,
+ * and it takes the vocabulary as `next` + optional `skip`.  So this struct is the
+ * whole of the storage half, and the Z3 SuRF trie can be substituted for it
+ * later without touching the matcher.
+ *
+ * THE PAGE STAYS SHARE-LOCKED ACROSS THE HIT CALLBACK, deliberately.  `term`
+ * points into the buffer, and weave_uleven_expand_vocab() documents that it is
+ * valid until the following next() -- which is exactly when this iterator
+ * releases the page.  The hit callback then reads other pages (the posting
+ * chain) while holding that share lock, which is what the previous walk did too;
+ * it is a read-only share lock on a buffer, taken in no particular order, so
+ * there is no lock-ordering claim to preserve.
+ *
+ * EVERY GUARD IN THE OLD WALK IS STILL HERE AND EACH IS LOAD-BEARING, because a
+ * dictionary page is read under BUFFER_LOCK_SHARE while a concurrent merge can
+ * free it and an insert recycle it (see weave_dict_entry_fits in weave/am.h):
+ *	 - weave_scan_readbuf() returning InvalidBuffer means a concurrent
+ *	   weave_vacuum truncated the block; that is END OF CHAIN, not an error.
+ *	 - weave_dict_entry_fits() before trusting de->termlen, or the stride and the
+ *	   term compare run off the page.
+ *	 - weave_page_entry_end() as the limit, never a raw pd_lower (make
+ *	   check-pdlower).
+ *	 - CHECK_FOR_INTERRUPTS() between pages, with no buffer lock held.
+ * ------------------------------------------------------------------------- */
+typedef struct WeaveDictVocab
+{
+	Relation	index;
+	const WeaveSegMeta *seg;
+	BlockNumber blk;			/* the open page, or the next one to open */
+	Buffer		buf;			/* pinned + share-locked while positioned */
+	char	   *ptr;			/* next entry to yield on the open page */
+	char	   *end;			/* weave_page_entry_end() of the open page */
+	BlockNumber nextblk;		/* successor, read off the open page */
+	WeaveDictEntry *cur;		/* the entry next() last yielded; see below */
+	weave_ul_uint32 nyielded;	/* echoed as `ord`: the walk's term ordinal */
+
+	/*
+	 * Scratch for skip()'s successor key.  It is BLCKSZ because the dead prefix
+	 * is a prefix of a CANDIDATE term, whose length weave_dict_entry_fits()
+	 * bounds only by the page -- not by the query.  The walk this replaced sized
+	 * the same buffer WEAVE_LEV_MAXQ + 2 (257) and memcpy'd deadlen bytes into
+	 * it; deadlen is bounded by min(candlen, m + k + 1), so a query like
+	 * 'ab~300' against a 400-byte dictionary term overran that stack array.  Not
+	 * reachable from any test in the tree, which is why it survived: k has no
+	 * upper bound in the parser (src/query/parse.c) and no test uses a k above 3.
+	 */
+	unsigned char *nextkey;
+} WeaveDictVocab;
+
+/* Drop the page we are sitting on, if any.  Idempotent. */
+static void
+weave_dictvocab_release(WeaveDictVocab *v)
+{
+	if (v->buf != InvalidBuffer)
+		UnlockReleaseBuffer(v->buf);
+	v->buf = InvalidBuffer;
+	v->ptr = v->end = NULL;
+	v->cur = NULL;
+}
+
+/*
+ * WeaveUlevVocab.next: the next dictionary term in ascending unsigned-byte
+ * order across the whole chain.  Returns 0 at end of vocabulary.
+ */
+static int
+weave_dictvocab_next(void *arg, const char **term, weave_ul_uint32 *len,
+					 weave_ul_uint32 *ord)
+{
+	WeaveDictVocab *v = (WeaveDictVocab *) arg;
+
+	for (;;)
+	{
+		if (v->buf == InvalidBuffer)
+		{
+			Page		page;
+
+			if (v->blk == InvalidBlockNumber)
+				return 0;
+			CHECK_FOR_INTERRUPTS();		/* between pages, no buffer lock held: safe to let a cancel unwind */
+			v->buf = weave_scan_readbuf(v->index, v->blk);
+			if (v->buf == InvalidBuffer)
+			{
+				/* block truncated by a concurrent weave_vacuum: end of chain */
+				v->blk = InvalidBlockNumber;
+				return 0;
+			}
+			LockBuffer(v->buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(v->buf);
+			v->ptr = (char *) PageGetContents(page);
+			v->end = weave_page_entry_end(page);
+			v->nextblk = WeavePageGetOpaque(page)->nextblk;
+		}
+
+		if (v->ptr < v->end)
+		{
+			WeaveDictEntry *de = (WeaveDictEntry *) v->ptr;
+
+			if (weave_dict_entry_fits(de, v->end))
+			{
+				v->ptr += MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+				v->cur = de;
+				*term = de->term;
+				*len = de->termlen;
+				*ord = v->nyielded++;
+				return 1;
+			}
+			/* recycled/corrupt page: abandon it (see weave_dict_entry_fits) */
+		}
+
+		/* page exhausted, or refused by the fits guard: follow the chain */
+		v->blk = v->nextblk;
+		weave_dictvocab_release(v);
+	}
+}
+
+/*
+ * WeaveUlevVocab.skip: advance past every remaining term beginning with
+ * prefix[0..plen), which weave_uleven_match() has proven no within-k string can
+ * extend.  Terms are byte-sorted, so those terms are one contiguous run and the
+ * successor key is the prefix with its last non-0xff byte incremented.
+ *
+ * CORRECTNESS MUST NOT DEPEND ON THIS FUNCTION -- uleven.h says so, and the
+ * mutation leg that makes it a no-op is the check.  It is what turns an
+ * O(vocabulary) scan into roughly O(matching terms + boundaries), the effect an
+ * FST/DFA intersection gives.
+ */
+static void
+weave_dictvocab_skip(void *arg, const char *prefix, weave_ul_uint32 plen)
+{
+	WeaveDictVocab *v = (WeaveDictVocab *) arg;
+	int			kl = (int) plen;
+	BlockNumber tgt;
+
+	if (kl <= 0 || kl > BLCKSZ)
+		return;					/* no claim to act on */
+	memcpy(v->nextkey, prefix, (Size) kl);
+	while (kl > 0 && v->nextkey[kl - 1] == 0xff)
+		kl--;
+	if (kl == 0)
+	{
+		/* prefix is all 0xff: no term sorts after it, so the walk is over */
+		v->blk = InvalidBlockNumber;
+		weave_dictvocab_release(v);
+		return;
+	}
+	v->nextkey[kl - 1]++;
+
+	/*
+	 * If the very next entry is already >= nextkey the run was one term long and
+	 * a seek would only re-read pages we are holding.
+	 */
+	if (v->buf != InvalidBuffer && v->ptr < v->end)
+	{
+		WeaveDictEntry *nde = (WeaveDictEntry *) v->ptr;
+
+		if (weave_dict_entry_fits(nde, v->end))
+		{
+			int			cmplen = Min((int) nde->termlen, kl);
+			int			c = memcmp(nde->term, v->nextkey, cmplen);
+
+			if (c > 0 || (c == 0 && (int) nde->termlen >= kl))
+				return;
+		}
+	}
+
+	/*
+	 * Jump to the page that can hold nextkey, but only if it is a DIFFERENT
+	 * page: seeking onto the page we are already on would restart it from the
+	 * top and make no progress.  We do not reposition ptr inside the target
+	 * page -- the entries before nextkey there are dead too, so the automaton
+	 * kills them again and the second skip resolves to this same page and falls
+	 * through to the linear step.  Parity with the walk this replaced; the
+	 * CHECK_FOR_INTERRUPTS() in next() is what bounds the pathological case
+	 * where a stale block index keeps handing back an earlier page.
+	 */
+	tgt = weave_dict_seek(v->index, v->seg, (const char *) v->nextkey, kl);
+	if (tgt != InvalidBlockNumber && tgt != v->blk)
+	{
+		v->blk = tgt;
+		weave_dictvocab_release(v);
+	}
+}
+
+/* The per-matching-term posting runs weave_fuzzy_terms merges at the end. */
+typedef struct WeaveFuzzyHits
+{
+	Relation	index;
+	const WeaveSegMeta *seg;
+	WeaveDictVocab *voc;		/* for the current entry's posting locator */
+	ItemPointerData **runs;
+	int		   *runlen;
+	int			nruns;
+	int			runcap;
+	int64		total;
+} WeaveFuzzyHits;
+
+/*
+ * WeaveUlevHitCb: one dictionary term within k.  Read its posting list and keep
+ * the TIDs as a docid-sorted run for the k-way merge.
+ *
+ * WHY THIS REACHES BACK INTO THE ITERATOR for the posting locator.  A posting
+ * list is addressed by three fields (firstposting, firstoffset, df) and
+ * WeaveUlevVocab echoes exactly one uint32, so `ord` cannot carry it.  The
+ * callback is invoked from inside weave_uleven_expand_vocab() immediately after
+ * the next() that produced `term`, so voc->cur is exactly as valid as `term`
+ * itself -- same page, still share-locked. `ord` stays the term ordinal, which
+ * is what Z9's <@> ordering will want alongside `dist`.
+ */
+static int
+weave_fuzzy_hit(void *arg, const char *term, weave_ul_uint32 len,
+				weave_ul_uint32 ord, int dist)
+{
+	WeaveFuzzyHits *h = (WeaveFuzzyHits *) arg;
+	WeaveDictEntry *de = h->voc->cur;
+	WeavePosting *post;
+	int			np;
+
+	Assert(de != NULL && de->term == term && de->termlen == len);
+	np = weave_decode_term(h->index, de->firstposting, de->firstoffset, de->df,
+						   &post, NULL, false, NULL, true,
+						   h->seg->doclenstart == InvalidBlockNumber);
+	if (np > 0)
+	{
+		ItemPointerData *run = palloc(np * sizeof(ItemPointerData));
+		int			i;
+
+		for (i = 0; i < np; i++)
+			run[i] = post[i].tid;
+		if (h->nruns >= h->runcap)
+		{
+			h->runcap = Max(h->runcap * 2, 16);
+			/* runcap tracks the number of matching terms, each contributing a
+			 * run of matching tuples -- corpus-scale; query path, so a throw
+			 * here loses one query */
+			h->runs = h->runs ? WEAVE_REALLOC_MAYBE_HUGE(h->runs, (Size) h->runcap * sizeof(ItemPointerData *))
+				: WEAVE_ALLOC_MAYBE_HUGE((Size) h->runcap * sizeof(ItemPointerData *));
+			h->runlen = h->runlen ? WEAVE_REALLOC_MAYBE_HUGE(h->runlen, (Size) h->runcap * sizeof(int))
+				: WEAVE_ALLOC_MAYBE_HUGE((Size) h->runcap * sizeof(int));
+		}
+		h->runs[h->nruns] = run;
+		h->runlen[h->nruns] = np;
+		h->nruns++;
+		h->total += np;
+	}
+	pfree(post);
+	(void) ord;
+	(void) dist;
+	return 0;					/* no fanout cap on this route */
+}
+
 /*
  * weave_fuzzy_terms -- collect the postings of every dictionary term within edit
- * distance k of `term`, using the Levenshtein automaton (pg_weave_lev.c) directly
- * over the sorted dictionary.  This is EXACT: only true within-k terms are
- * collected, so no heap recheck is needed (unlike the trigram funnel, which
- * over-generates candidates that must be re-verified per doc).  Returns true
- * (always applicable); *out is a sorted TidSet.  For query terms longer than
- * the automaton bound, returns false so the caller falls back to the funnel.
+ * distance k of `term`, by running the universal-Levenshtein core
+ * (include/weave/uleven.h) over the segment's dictionary chain presented as a
+ * WeaveUlevVocab.  EXACT in BOTH directions, so no heap recheck is needed --
+ * unlike the trigram funnel in src/pages/trgm_page.c, which over-generates
+ * candidates that must be re-verified per document.  Returns true; *out is a
+ * sorted, de-duplicated TidSet.  Returns false when the core cannot serve the
+ * input, so the caller falls back to that funnel.
+ *
+ * WHAT CHANGED WHEN THIS STOPPED USING include/weave/lev.h, because it changes
+ * which rows a query returns and no ASCII test can see it.  lev.h's automaton
+ * counts BYTE edits; this one counts CHARACTER edits (WEAVE_ULEVEN_UTF8).
+ * Substituting one two-byte character for another is ONE character edit and TWO
+ * byte edits, so under the old matcher `naive~1` did not match `naïve` while
+ * `levenshtein('naive','naïve') = 1` says it should.  That was a FALSE NEGATIVE,
+ * and the recheck could not repair it: this route is exact, so nothing rechecks.
+ * It was also an internal disagreement -- weave_doc_has_fuzzy()
+ * (src/query/doc.c) has always used core's varstr_levenshtein_less_equal(),
+ * which counts characters, so the same query answered from a wdoc value and from
+ * the index disagreed on non-ASCII input.  sql/fuzzyuleven.sql pins both halves.
+ *
+ * KNOWN GAP, and it is not a regression: WEAVE_ULEVEN_UTF8 decodes UTF-8.  On a
+ * multi-byte server encoding that is not UTF-8 (EUC_JP, SJIS) the core's decoder
+ * escapes each byte on its own, so the unit is effectively the byte there -- the
+ * same answer the old walk gave, still short of levenshtein()'s pg_mblen()
+ * characters.  Closing it means a third WeaveUlevUnit, not a change here.
  */
 static bool
 weave_fuzzy_terms(Relation index, const WeaveSegMeta *seg,
 				 const char *term, int termlen, int k, TidSet *out)
 {
-	WeaveLevAut	aut;
+	WeaveUlevAut aut;
+	WeaveUlevVocab voc;
+	WeaveDictVocab dv;
+	WeaveFuzzyHits h;
+	ItemPointerData *tids;
 
 	/*
-	 * THE FUZZY MECHANISM.  Counted after the applicability test below, not
-	 * here, because a term longer than the automaton bound leaves through
-	 * `return false` and is served by the trigram funnel instead -- counting on
-	 * entry would attribute the funnel's work to this route.  See
-	 * include/weave/weave.h for why these counters exist.
+	 * THE APPLICABILITY TEST IS NOW THE CORE'S OWN INIT, and the bound it
+	 * enforces is not the one this function used to advertise.  lev.h bounded
+	 * the query at WEAVE_LEV_MAXQ = 255 BYTES; weave_uleven_init() bounds it at
+	 * WEAVE_ULEVEN_MAX_UNITS = 255 edit UNITS (and k at WEAVE_ULEVEN_MAX_K =
+	 * 255).  Under UTF-8 that is strictly more permissive -- a 400-byte term of
+	 * 150 characters is now served exactly here instead of being handed to the
+	 * over-generating funnel -- so asking the core rather than re-deriving a
+	 * byte threshold is both correct and the only way the two stay in step.
+	 * Refused rather than truncated: a truncated query accepts a different
+	 * language, and the difference lands in the false-negative direction.
 	 */
-	BlockNumber blk;
-	ItemPointerData *tids;
-	unsigned char nextkey[WEAVE_LEV_MAXQ + 2];
-
-	/* per-matching-term sorted runs, merged (not sorted) at the end */
-	ItemPointerData **runs = NULL;
-	int		   *runlen = NULL;
-	int			nruns = 0;
-	int			runcap = 0;
-	int64		total = 0;
-
-	if (termlen > WEAVE_LEV_MAXQ)
+	if (weave_uleven_init(&aut, term, (size_t) termlen, k,
+						  pg_database_encoding_max_length() == 1 ?
+						  WEAVE_ULEVEN_BYTE : WEAVE_ULEVEN_UTF8) != WEAVE_ULEVEN_OK)
 		return false;			/* fall back to trigram funnel + recheck */
+
+	/*
+	 * THE FUZZY MECHANISM.  Counted after the applicability test above, not
+	 * before it, because a term the core refuses leaves through `return false`
+	 * and is served by the trigram funnel instead -- counting on entry would
+	 * attribute the funnel's work to this route.  See include/weave/weave.h for
+	 * why these counters exist.
+	 */
 	weave_chan_fuzzy_dict++;
 
-	aut.q = (const unsigned char *) term;
-	aut.m = termlen;
-	aut.k = k;
+	dv.index = index;
+	dv.seg = seg;
+	dv.blk = seg->dictstart;
+	dv.buf = InvalidBuffer;
+	dv.ptr = dv.end = NULL;
+	dv.nextblk = InvalidBlockNumber;
+	dv.cur = NULL;
+	dv.nyielded = 0;
+	dv.nextkey = (unsigned char *) palloc(BLCKSZ);
 
-	/*
-	 * Automaton-guided dictionary walk.  Terms are byte-sorted, so when a term
-	 * dead-ends at prefix cand[0..deadlen), every term sharing that prefix is
-	 * also a dead end -- we jump past them by seeking (via the per-page block
-	 * index) to the smallest string greater than that prefix.  This turns an
-	 * O(all terms) scan into roughly O(matching terms + boundaries), the effect
-	 * an FST/DFA intersection gives.
-	 */
-	blk = seg->dictstart;
-	while (blk != InvalidBlockNumber)
+	voc.next = weave_dictvocab_next;
+	voc.skip = weave_dictvocab_skip;
+	voc.arg = &dv;
+
+	h.index = index;
+	h.seg = seg;
+	h.voc = &dv;
+	h.runs = NULL;
+	h.runlen = NULL;
+	h.nruns = 0;
+	h.runcap = 0;
+	h.total = 0;
+
+	PG_TRY();
 	{
-		Buffer		buffer;
-		Page		page;
-		char	   *ptr,
-				   *end;
-		BlockNumber next;
-		bool		reseek = false;
-
-		CHECK_FOR_INTERRUPTS();		/* between pages, no buffer lock held: safe to let a cancel unwind */
-		buffer = weave_scan_readbuf(index, blk);
-		if (buffer == InvalidBuffer)
-			break;			/* block truncated by a concurrent weave_vacuum: end of chain */
-		LockBuffer(buffer, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buffer);
-		ptr = (char *) PageGetContents(page);
-		end = weave_page_entry_end(page);
-		next = WeavePageGetOpaque(page)->nextblk;
-
-		while (ptr < end)
-		{
-			WeaveDictEntry *de = (WeaveDictEntry *) ptr;
-			Size		esize;
-			int			deadlen;
-			bool		match;
-
-			if (!weave_dict_entry_fits(de, end))
-				break;		/* recycled/corrupt page: stop (see weave_dict_entry_fits) */
-			esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
-
-			if (abs((int) de->termlen - termlen) <= k)
-				match = weave_lev_match_prefix(&aut,
-											 (const unsigned char *) de->term,
-											 (int) de->termlen, &deadlen);
-			else
-			{
-				/* run the automaton anyway to learn the dead prefix for skipping */
-				match = weave_lev_match_prefix(&aut,
-											 (const unsigned char *) de->term,
-											 (int) de->termlen, &deadlen);
-				match = false;		/* length filter still rules it out */
-			}
-
-			if (match)
-			{
-				WeavePosting *post;
-				int			np = weave_decode_term(index, de->firstposting,
-												  de->firstoffset, de->df,
-												  &post, NULL, false, NULL, true,
-												  seg->doclenstart == InvalidBlockNumber);
-
-				/* keep this term's docid-sorted TIDs as a run for k-way merge */
-				if (np > 0)
-				{
-					ItemPointerData *run = palloc(np * sizeof(ItemPointerData));
-					int			i;
-
-					for (i = 0; i < np; i++)
-						run[i] = post[i].tid;
-					if (nruns >= runcap)
-					{
-						runcap = Max(runcap * 2, 16);
-						/* runcap tracks the number of matching terms, each
-						 * contributing a run of matching tuples -- corpus-scale;
-						 * query path, so a throw here loses one query */
-						runs = runs ? WEAVE_REALLOC_MAYBE_HUGE(runs, (Size) runcap * sizeof(ItemPointerData *))
-							: WEAVE_ALLOC_MAYBE_HUGE((Size) runcap * sizeof(ItemPointerData *));
-						runlen = runlen ? WEAVE_REALLOC_MAYBE_HUGE(runlen, (Size) runcap * sizeof(int))
-							: WEAVE_ALLOC_MAYBE_HUGE((Size) runcap * sizeof(int));
-					}
-					runs[nruns] = run;
-					runlen[nruns] = np;
-					nruns++;
-					total += np;
-				}
-				pfree(post);
-				ptr += esize;
-				continue;
-			}
-
-			/*
-			 * Dead end at cand[0..deadlen).  The next term that could match is
-			 * >= that prefix with its last byte incremented.  If that key is
-			 * beyond the next dictionary entry, seek to it via the block index
-			 * (jumping whole pages); otherwise just step to the next entry.
-			 */
-			/*
-			 * Skip only on a GENUINE prefix death: the automaton exceeded k while
-			 * still consuming the term (deadlen < termlen), so every term sharing
-			 * cand[0..deadlen) is dead.  If deadlen == termlen the term was fully
-			 * consumed without dying (it failed only on length or final accept),
-			 * so LONGER terms with this prefix may still match -- must NOT skip.
-			 */
-			if (deadlen > 0 && deadlen < (int) de->termlen)
-			{
-				int			kl = deadlen;
-
-				memcpy(nextkey, de->term, kl);
-				/* increment the last byte of the dead prefix; carry on 0xff */
-				while (kl > 0 && nextkey[kl - 1] == 0xff)
-					kl--;
-				if (kl == 0)
-				{
-					/* prefix is all 0xff: nothing greater can match; done */
-					UnlockReleaseBuffer(buffer);
-					goto done;
-				}
-				nextkey[kl - 1]++;
-
-				/* is the very next entry already >= nextkey? then no gain */
-				{
-					char	   *nptr = ptr + esize;
-
-					if (nptr < end)
-					{
-						WeaveDictEntry *nde = (WeaveDictEntry *) nptr;
-						int			cmplen = Min((int) nde->termlen, kl);
-						int			c = memcmp(nde->term, nextkey, cmplen);
-
-						if (c > 0 || (c == 0 && (int) nde->termlen >= kl))
-						{
-							ptr = nptr;		/* next entry is past the dead run */
-							continue;
-						}
-					}
-				}
-				/* seek to the page holding nextkey; only jump if it advances to a
-				 * LATER page (else keep scanning this page linearly -- avoids
-				 * re-seeking onto the same/earlier page and looping) */
-				{
-					BlockNumber tgt = weave_dict_seek(index, seg,
-													 (const char *) nextkey, kl);
-
-					if (tgt != InvalidBlockNumber && tgt != blk)
-					{
-						reseek = true;
-						blk = tgt;
-						UnlockReleaseBuffer(buffer);
-						break;
-					}
-				}
-				/* target is on this same page: just step to the next entry */
-				ptr += esize;
-				continue;
-			}
-			ptr += esize;
-		}
-		if (reseek)
-			continue;
-		UnlockReleaseBuffer(buffer);
-		blk = next;
+		(void) weave_uleven_expand_vocab(&aut, &voc, weave_fuzzy_hit, &h,
+										 NULL, NULL);
 	}
+	PG_FINALLY();
+	{
+		/*
+		 * The iterator holds a pinned, share-locked buffer between next()
+		 * calls, so an ERROR or a cancel inside the callback (weave_decode_term
+		 * reads more pages; WEAVE_ALLOC_MAYBE_HUGE can throw) would leak the
+		 * lock out of the query.  The walk this replaced could not have this
+		 * problem because its buffer lifetime was a lexical block.
+		 */
+		weave_dictvocab_release(&dv);
+	}
+	PG_END_TRY();
+	pfree(dv.nextkey);
 
-done:
 	/*
 	 * k-way merge the per-term docid-sorted runs into one sorted, de-duplicated
 	 * TID array.  Each posting list is already docid-ordered, so merging avoids
@@ -1248,6 +1409,10 @@ done:
 	 * and cheap inline comparisons.
 	 */
 	{
+		ItemPointerData **runs = h.runs;		/* the callback's accumulator, */
+		int		   *runlen = h.runlen;			/* aliased so the merge below is */
+		int			nruns = h.nruns;			/* the code it always was */
+		int64		total = h.total;
 		int		   *pos;			/* current index into each run */
 		int		   *heap;			/* min-heap of run indices by current head TID */
 		int			hn = 0;
@@ -2233,10 +2398,36 @@ collect_retry:
 					}
 				}
 				exact = false;
+
+				/*
+				 * THE FUNNEL'S MINIMUM TRIGRAM COUNT DEPENDS ON k, and must.
+				 * weave_trgm_candidates() keeps only terms sharing at least one
+				 * trigram with the query, which is sound only while k edits
+				 * cannot destroy them all -- and one edit destroys THREE
+				 * trigrams (the ones starting at p-2, p-1 and p), so the bound
+				 * is 3k+1, not the flat 3 this passed before.  With k = 1 a
+				 * five-byte term has exactly 3 trigrams, cleared the old gate,
+				 * and a single substitution in its middle destroyed every one of
+				 * them: the funnel then returned candidates that did not include
+				 * the matching row, and since this route is the INEXACT one its
+				 * heap recheck can only remove rows, never restore them.
+				 * Refusing (returning false here) costs a full-dictionary scan
+				 * and keeps the answer right.
+				 *
+				 * Fuzzy reaches this path only when weave_fuzzy_terms() above
+				 * declines (a query over WEAVE_ULEVEN_MAX_UNITS units, or k over
+				 * WEAVE_ULEVEN_MAX_K), so the added scans are rare by
+				 * construction.  Regex keeps 3: its trigrams come from the
+				 * pattern's AST (weave_regex_trigrams), which emits only
+				 * trigrams every matching string must contain, so there is no k
+				 * to budget for.
+				 */
 				if (weave_trgm_candidates(index, sg->trgmstart,
 										 sg->dictstart,
 										 WEAVE_QUERY_ITEMTEXT(query, it),
-										 it->termlen, 3,
+										 it->termlen,
+										 (it->flags & WEAVE_QF_REGEX) != 0 ? 3 :
+										 3 * (int) it->distance + 1,
 										 (it->flags & WEAVE_QF_REGEX) != 0,
 										 sg->doclenstart == InvalidBlockNumber, &ts))
 				{
