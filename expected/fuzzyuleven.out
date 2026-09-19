@@ -1,0 +1,374 @@
+-- Task Z5: the fuzzy channel runs the universal-Levenshtein core, and its edit
+-- unit is the CHARACTER.
+--
+-- WHY THIS FILE EXISTS.  `term~k` is answered three ways in this extension and
+-- they have to be the same answer:
+--
+--   1. from the index, by walking the segment dictionary with the automaton in
+--      include/weave/uleven.h (src/am/amscan.c, weave_fuzzy_terms);
+--   2. from a wdoc value on the heap, by weave_doc_has_fuzzy() (src/query/doc.c),
+--      which is also the recheck above a lossy bitmap scan;
+--   3. by contrib/fuzzystrmatch's levenshtein(), which is nobody's
+--      implementation detail and therefore the oracle.
+--
+-- Until Z5 all three disagreed, and (1) and (2) disagreed in DIFFERENT
+-- directions, so no test that compared a plan against another plan could see it:
+-- the index counted BYTE edits (so 'naive~1' did not match the U+00EF spelling of
+-- naive, which is one character edit and two byte edits), while the heap side
+-- computed a character distance but pre-filtered candidates by byte length and by
+-- byte trigrams -- the second of which lost rows on PURE ASCII, e.g. 'abcd~1' did
+-- not match 'abxd' although levenshtein('abcd','abxd') = 1.  Every assertion
+-- below is a three-way agreement, because two-way agreement was the state that
+-- hid the bug.
+--
+-- The index arm runs with seqscan disabled; the heap arm applies @@@ to
+-- to_wdoc('simple', body), an expression no index covers, so it is evaluated per
+-- row no matter what the planner decides.
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+NOTICE:  extension "pg_weave" already exists, skipping
+ALTER EXTENSION pg_weave UPDATE;
+NOTICE:  version "0.10.0" of extension "pg_weave" is already installed
+CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE fu (id serial, body text, d wdoc);
+-- The interesting neighbourhoods.  Each pair differs by exactly one CHARACTER,
+-- and the pairs differ in how many BYTES that character is, because the byte
+-- count is what every filter this task fixed was really keyed on.
+INSERT INTO fu(body) VALUES
+  ('naive approach'),            -- 1 byte  vs 2 bytes: the classic
+  ('na' || U&'\00EF' || 've approach'),
+  ('cafe society'),              -- the differing character is LAST, so the byte
+  ('caf' || U&'\00E9' || ' society'),   -- trigrams still overlap
+  ('munchen bier'),              -- and here it is FIRST
+  ('m' || U&'\00FC' || 'nchen bier'),
+  ('na' || U&'\6F22' || 've wide'),      -- 1 byte vs 3: byte length differs by 2
+  ('abcd token'),                -- pure ASCII, one middle substitution, and the
+  ('abxd token'),                -- query has exactly 2 trigrams
+  ('abcde token'),               -- 3 trigrams, all destroyed by one edit
+  ('abxde token');
+-- ASCII filler so the vocabulary is not degenerate and the planner has a reason
+-- to prefer the index once seqscan is off.
+INSERT INTO fu(body) SELECT 'filler token number ' || g
+  FROM generate_series(100, 3000) g;
+UPDATE fu SET d = to_wdoc('simple', body);
+CREATE INDEX fu_idx ON fu USING weave (d);
+ANALYZE fu;
+-- ---- the oracle agrees that these are all distance 1 ----------------------
+-- Stated first so that every 'f' below is read as "pg_weave disagrees with
+-- levenshtein()", not as "maybe these strings are further apart than they look".
+SELECT levenshtein('naive', 'na' || U&'\00EF' || 've') AS two_byte_subst,
+       levenshtein('cafe', 'caf' || U&'\00E9') AS at_the_end,
+       levenshtein('munchen', 'm' || U&'\00FC' || 'nchen') AS at_the_start,
+       levenshtein('naive', 'na' || U&'\6F22' || 've') AS three_byte_subst,
+       levenshtein('abcd', 'abxd') AS ascii_middle,
+       levenshtein('abcde', 'abxde') AS ascii_middle_5;
+ two_byte_subst | at_the_end | at_the_start | three_byte_subst | ascii_middle | ascii_middle_5 
+----------------+------------+--------------+------------------+--------------+----------------
+              1 |          1 |            1 |                1 |            1 |              1
+(1 row)
+
+-- ---- THE THREE-WAY AGREEMENT ---------------------------------------------
+-- For each query: the ids the index returns, the ids the heap predicate returns,
+-- and the ids levenshtein() says qualify.  All three arrays must be identical.
+-- The index arm is what Z5 changed; the heap arm is what had to be fixed with it;
+-- the oracle is what neither of them gets to define.
+SET enable_seqscan = off;
+SELECT q, k,
+       (SELECT array_agg(id ORDER BY id) FROM fu
+          WHERE d @@@ (q || '~' || k)::wquery) AS from_the_index,
+       (SELECT array_agg(id ORDER BY id) FROM fu
+          WHERE to_wdoc('simple', body) @@@ (q || '~' || k)::wquery) AS from_the_heap,
+       (SELECT array_agg(id ORDER BY id) FROM fu
+          WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body, ' ')) t
+                         WHERE levenshtein_less_equal(t, q, k) <= k)) AS from_levenshtein
+  FROM (VALUES ('naive', 1), ('cafe', 1), ('munchen', 1), ('abcd', 1),
+               ('abcde', 1), ('naive', 2), ('abcd', 2)) v(q, k)
+  ORDER BY q, k;
+    q    | k | from_the_index | from_the_heap | from_levenshtein 
+---------+---+----------------+---------------+------------------
+ abcd    | 1 | {8,9,10}       | {8,9,10}      | {8,9,10}
+ abcd    | 2 | {8,9,10,11}    | {8,9,10,11}   | {8,9,10,11}
+ abcde   | 1 | {8,10,11}      | {8,10,11}     | {8,10,11}
+ cafe    | 1 | {3,4}          | {3,4}         | {3,4}
+ munchen | 1 | {5,6}          | {5,6}         | {5,6}
+ naive   | 1 | {1,2,7}        | {1,2,7}       | {1,2,7}
+ naive   | 2 | {1,2,7}        | {1,2,7}       | {1,2,7}
+(7 rows)
+
+-- The same comparison as booleans, so a future diff cannot be read as "the ids
+-- moved around a bit".  This is the whole task in one result set.
+SELECT q, k,
+       (SELECT array_agg(id ORDER BY id) FROM fu
+          WHERE d @@@ (q || '~' || k)::wquery)
+       IS NOT DISTINCT FROM
+       (SELECT array_agg(id ORDER BY id) FROM fu
+          WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body, ' ')) t
+                         WHERE levenshtein_less_equal(t, q, k) <= k))
+         AS index_agrees_with_levenshtein,
+       (SELECT array_agg(id ORDER BY id) FROM fu
+          WHERE to_wdoc('simple', body) @@@ (q || '~' || k)::wquery)
+       IS NOT DISTINCT FROM
+       (SELECT array_agg(id ORDER BY id) FROM fu
+          WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body, ' ')) t
+                         WHERE levenshtein_less_equal(t, q, k) <= k))
+         AS heap_agrees_with_levenshtein
+  FROM (VALUES ('naive', 1), ('cafe', 1), ('munchen', 1), ('abcd', 1),
+               ('abcde', 1), ('naive', 2), ('abcd', 2), ('naive', 0)) v(q, k)
+  ORDER BY q, k;
+    q    | k | index_agrees_with_levenshtein | heap_agrees_with_levenshtein 
+---------+---+-------------------------------+------------------------------
+ abcd    | 1 | t                             | t
+ abcd    | 2 | t                             | t
+ abcde   | 1 | t                             | t
+ cafe    | 1 | t                             | t
+ munchen | 1 | t                             | t
+ naive   | 0 | t                             | t
+ naive   | 1 | t                             | t
+ naive   | 2 | t                             | t
+(8 rows)
+
+-- Queries whose non-ASCII character is in the QUERY rather than in the document,
+-- which is the direction a one-sided filter gets right by accident.  U& literals
+-- keep this file's SQL readable on any client encoding; the terms themselves are
+-- folded by the analyzer on both sides (doc/specs/FUZZY_CHANNEL.md sect. 3.2).
+SELECT q, k,
+       (SELECT array_agg(id ORDER BY id) FROM fu
+          WHERE d @@@ (q || '~' || k)::wquery)
+       IS NOT DISTINCT FROM
+       (SELECT array_agg(id ORDER BY id) FROM fu
+          WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body, ' ')) t
+                         WHERE levenshtein_less_equal(t, q, k) <= k))
+         AS index_agrees_with_levenshtein,
+       (SELECT count(*) FROM fu WHERE d @@@ (q || '~' || k)::wquery) AS rows_matched
+  FROM (VALUES ('na' || U&'\00EF' || 've', 1),
+               ('caf' || U&'\00E9', 1),
+               ('m' || U&'\00FC' || 'nchen', 1),
+               ('na' || U&'\6F22' || 've', 1)) v(q, k)
+  ORDER BY q, k;
+    q    | k | index_agrees_with_levenshtein | rows_matched 
+---------+---+-------------------------------+--------------
+ café    | 1 | t                             |            2
+ münchen | 1 | t                             |            2
+ naïve   | 1 | t                             |            3
+ na漢ve  | 1 | t                             |            3
+(4 rows)
+
+-- ---- the pure-ASCII losses, named ----------------------------------------
+-- These two are the reason this file does not simply assert "non-ASCII works
+-- now".  Both are ASCII, both are distance 1, and both were missed by the heap
+-- predicate -- the first because its query has 2 byte trigrams and one middle
+-- substitution destroys both, the second because it has 3 and one substitution
+-- destroys all three.  A trigram pigeonhole filter is sound only when the query
+-- has MORE THAN 3k trigrams (one edit kills the three trigrams that overlap its
+-- position), and the bound in use was k.
+SELECT to_wdoc('simple', 'abxd token') @@@ 'abcd~1'::wquery AS two_trigrams,
+       to_wdoc('simple', 'abxde token') @@@ 'abcde~1'::wquery AS three_trigrams,
+       to_wdoc('simple', 'na' || U&'\00EF' || 've approach') @@@ 'naive~1'::wquery
+         AS two_byte_character,
+       to_wdoc('simple', 'na' || U&'\6F22' || 've wide') @@@ 'naive~1'::wquery
+         AS three_byte_character;
+ two_trigrams | three_trigrams | two_byte_character | three_byte_character 
+--------------+----------------+--------------------+----------------------
+ t            | t              | t                  | t
+(1 row)
+
+-- ---- k = 0 is an edit budget of zero, not of one -------------------------
+-- It used to be of one.  The lexer read `~k` as Max(k, 1), so a user who asked for
+-- a zero edit budget silently got every term at distance 1 as well -- a wrong answer
+-- in the false-POSITIVE direction, which is the only kind this parser can produce by
+-- itself.  `term~0` now normalizes to the plain term: the same set of rows by
+-- definition, reached through the exact-term route, and the normalization is visible
+-- in the text form rather than hidden.  A BARE `term~` still means 2.
+SELECT 'naive~0'::wquery::text AS zero_is_the_term_itself,
+       'naive~1'::wquery::text AS one_is_still_fuzzy,
+       'naive~'::wquery::text AS bare_tilde_still_means_two;
+ zero_is_the_term_itself | one_is_still_fuzzy | bare_tilde_still_means_two 
+-------------------------+--------------------+----------------------------
+ 'naive'                 | 'naive'~1          | 'naive'~2
+(1 row)
+
+SELECT (SELECT count(*) FROM fu WHERE d @@@ 'naive~0'::wquery) AS k0_index,
+       (SELECT count(*) FROM fu WHERE d @@@ 'naive'::wquery) AS exact_term,
+       (SELECT count(*) FROM fu WHERE to_wdoc('simple', body) @@@ 'naive~0'::wquery)
+         AS k0_heap,
+       (SELECT count(*) FROM fu WHERE d @@@ 'naive~1'::wquery) AS k1_index;
+ k0_index | exact_term | k0_heap | k1_index 
+----------+------------+---------+----------
+        1 |          1 |       1 |        3
+(1 row)
+
+-- ---- which mechanism served it ------------------------------------------
+-- The agreement above would also hold if every fuzzy query fell back to the
+-- trigram funnel plus a recheck, which is the slow, over-generating route.  These
+-- counters (Z4) are how the file asserts that the route under test is the one
+-- being tested: fuzzy_dict is the uleven walk over the dictionary, fuzzy_trgm is
+-- the funnel.  See sql/chanstats.sql for the counter surface itself.
+SELECT weave_channel_stats_reset();
+ weave_channel_stats_reset 
+---------------------------
+ 
+(1 row)
+
+SELECT count(*) FROM fu WHERE d @@@ 'naive~1'::wquery;
+ count 
+-------
+     3
+(1 row)
+
+SELECT count(*) FROM fu WHERE d @@@ ('na' || U&'\00EF' || 've~1')::wquery;
+ count 
+-------
+     3
+(1 row)
+
+-- fuzzy_dict is counted once per BOLT per query leaf, not once per query, so this
+-- asserts a lower bound rather than a literal: the same table merged into one bolt or
+-- left as three would otherwise disagree here for a reason that has nothing to do
+-- with fuzzy matching.
+SELECT fuzzy_dict >= 2 AS both_went_through_the_uleven_walk,
+       fuzzy_trgm = 0 AS and_neither_used_the_trigram_funnel
+  FROM weave_channel_stats();
+ both_went_through_the_uleven_walk | and_neither_used_the_trigram_funnel 
+-----------------------------------+-------------------------------------
+ t                                 | t
+(1 row)
+
+-- ---- the bound is 255 edit UNITS, not 255 bytes --------------------------
+-- include/weave/lev.h bounded the query at WEAVE_LEV_MAXQ = 255 BYTES and handed
+-- anything longer to the trigram funnel.  weave_uleven_init() bounds it at
+-- WEAVE_ULEVEN_MAX_UNITS = 255 CHARACTERS, so under UTF-8 a 300-byte query of 100
+-- characters is now served exactly by the dictionary walk instead of approximately
+-- by the funnel -- a behaviour change in the direction of fewer candidates and no
+-- recheck, and worth pinning as such.
+--
+-- THIS INDEX IS BUILT WITH (trigrams = on) DELIBERATELY.  The weft is off by
+-- default, and without it weave_trgm_candidates() returns false before it looks at
+-- anything, so `fuzzy_trgm = 0` would be an assertion about the RELOPTION and not
+-- about the route -- the "a zero is not evidence" failure that sql/chanstats.sql's
+-- header is about.  The positive control below is what makes the zeros that follow
+-- it readable: with the weft present, the funnel does run, and does get counted.
+CREATE TABLE fl (id serial, body text, d wdoc);
+INSERT INTO fl(body) VALUES
+  (repeat(U&'\6F22', 100) || ' wide'),
+  (repeat('a', 300) || ' narrow'),
+  (repeat('abc', 86) || ' triple'),
+  (repeat(md5('weave'), 10) || ' varied');
+INSERT INTO fl(body) SELECT 'filler token number ' || g
+  FROM generate_series(100, 1200) g;
+UPDATE fl SET d = to_wdoc('simple', body);
+CREATE INDEX fl_idx ON fl USING weave (d) WITH (trigrams = on);
+ANALYZE fl;
+SELECT octet_length(repeat(U&'\6F22', 100)) AS wide_bytes,
+       char_length(repeat(U&'\6F22', 100)) AS wide_characters;
+ wide_bytes | wide_characters 
+------------+-----------------
+        300 |             100
+(1 row)
+
+-- The positive control: a 320-character hex token, one substitution away, with far
+-- more than 3k+1 distinct trigrams.  Over the unit bound, so the walk declines it;
+-- the funnel takes it, narrows the vocabulary, and the exact recheck keeps the one
+-- row.  fuzzy_trgm = 1 here is what gives the zeros below their meaning.
+SELECT weave_channel_stats_reset();
+ weave_channel_stats_reset 
+---------------------------
+ 
+(1 row)
+
+SELECT count(*) AS varied_hit FROM fl
+  WHERE d @@@ (repeat(md5('weave'), 9) || substr(md5('weave'), 1, 31) || 'f~1')::wquery;
+ varied_hit 
+------------
+          1
+(1 row)
+
+SELECT fuzzy_dict = 0 AS over_the_unit_bound_so_not_the_walk,
+       fuzzy_trgm > 0 AS and_the_funnel_did_run
+  FROM weave_channel_stats();
+ over_the_unit_bound_so_not_the_walk | and_the_funnel_did_run 
+-------------------------------------+------------------------
+ t                                   | t
+(1 row)
+
+-- 100 characters in 300 bytes: the walk takes it, and does not touch the funnel
+-- even though the weft is right there.  Under the byte bound this was 300 > 255 and
+-- went to the funnel instead.
+SELECT weave_channel_stats_reset();
+ weave_channel_stats_reset 
+---------------------------
+ 
+(1 row)
+
+SELECT count(*) AS wide_hit FROM fl
+  WHERE d @@@ (repeat(U&'\6F22', 99) || U&'\6F23' || '~1')::wquery;
+ wide_hit 
+----------
+        1
+(1 row)
+
+SELECT fuzzy_dict > 0 AS a_100_character_300_byte_query_uses_the_walk,
+       fuzzy_trgm = 0 AS and_not_the_funnel
+  FROM weave_channel_stats();
+ a_100_character_300_byte_query_uses_the_walk | and_not_the_funnel 
+----------------------------------------------+--------------------
+ t                                            | t
+(1 row)
+
+-- THE CASE THAT SEPARATES THE FUNNEL'S OLD TRIGRAM BOUND FROM ITS NEW ONE.  This
+-- query is 258 characters (over the unit bound, so the walk declines it) and its
+-- trigram set is DEDUPLICATED down to exactly three: 'abc', 'bca', 'cab'.  One
+-- substitution can destroy all three, so requiring merely "shares one trigram" loses
+-- rows; the sound requirement is more than 3k trigrams, i.e. 4 at k = 1.  The old
+-- flat minimum of 3 admitted this query, the new 3k+1 refuses it and falls back to a
+-- full dictionary scan with an exact test.  The row is found either way, so the
+-- counter is the only thing that can tell the two bounds apart -- and with the
+-- positive control above in the same session, fuzzy_trgm = 0 here cannot be read as
+-- "there is no funnel".
+SELECT weave_channel_stats_reset();
+ weave_channel_stats_reset 
+---------------------------
+ 
+(1 row)
+
+SELECT count(*) AS triple_hit FROM fl
+  WHERE d @@@ (repeat('abc', 86) || '~1')::wquery;
+ triple_hit 
+------------
+          1
+(1 row)
+
+SELECT fuzzy_dict = 0 AS over_the_unit_bound_so_not_the_walk,
+       fuzzy_trgm = 0 AS three_trigrams_is_under_3k_plus_1_so_not_the_funnel
+  FROM weave_channel_stats();
+ over_the_unit_bound_so_not_the_walk | three_trigrams_is_under_3k_plus_1_so_not_the_funnel 
+-------------------------------------+-----------------------------------------------------
+ t                                   | t
+(1 row)
+
+-- And the degenerate end of the same argument: a 300-character run of one letter has
+-- two distinct trigrams, so no k above zero can be funnelled at all.
+SELECT weave_channel_stats_reset();
+ weave_channel_stats_reset 
+---------------------------
+ 
+(1 row)
+
+SELECT count(*) AS narrow_hit FROM fl
+  WHERE d @@@ (repeat('a', 299) || 'b~1')::wquery;
+ narrow_hit 
+------------
+          1
+(1 row)
+
+SELECT fuzzy_dict = 0 AS a_300_character_query_is_over_the_unit_bound,
+       fuzzy_trgm = 0 AS and_two_distinct_trigrams_is_under_3k_plus_1_too
+  FROM weave_channel_stats();
+ a_300_character_query_is_over_the_unit_bound | and_two_distinct_trigrams_is_under_3k_plus_1_too 
+----------------------------------------------+--------------------------------------------------
+ t                                            | t
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE fu;
+DROP TABLE fl;
+DROP EXTENSION fuzzystrmatch;

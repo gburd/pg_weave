@@ -10,12 +10,17 @@
  * naive "test every term" scan into "test only trigram-overlapping terms",
  * which is the pruning that makes fuzzy/regex viable on a large vocabulary.
  *
- * For fuzzy matching with edit distance k, a term of t trigrams that matches
- * within k edits must share at least (t - k*3) ... in practice we use the
- * pigeonhole guarantee that at least one trigram of the query survives k edits
- * only when k is small; for correctness we require overlap of >= 1 trigram,
- * which is a sound filter for k below the term's trigram count and falls back
- * to a full scan otherwise (so results are always correct, only speed varies).
+ * For fuzzy matching with edit distance k, a term within k edits of the query
+ * shares a trigram with it only when k edits cannot destroy them all.  One edit
+ * at byte position p destroys the trigrams starting at p-2, p-1 and p -- THREE
+ * of them -- so at least (t - 3k) of the query's t trigrams survive and the
+ * "shares >= 1 trigram" filter is sound exactly when t > 3k.  Callers that
+ * cannot meet that bound must fall back to a full scan; weave_trgm_candidates()
+ * takes the required trigram count as an argument and refuses below it, so the
+ * choice is the caller's and the failure mode is a slower scan rather than a
+ * missing row.  (The bound used to be stated as "k below the trigram count",
+ * which admitted the filter for a 5-byte term at k=1 and lost rows: see the
+ * comment at its call site in src/am/amscan.c.)
  *
  * This module implements the trigram extraction and the candidate-narrowing
  * used by the matcher; the persistent on-disk trigram posting index that the
