@@ -85,6 +85,38 @@ typedef struct WVec
 #define WVEC_SIZE(dim)			(offsetof(WVec, x) + sizeof(float4) * (dim))
 #define WVEC_MAX_DIM			WEAVE_MAX_DIM
 
+/*
+ * Is this `len` bytes of untrusted storage a wvec we can hand to producer 1?
+ *
+ * The lexical half has weave_doc_is_valid() for exactly this reason and for
+ * exactly this caller: a flush reads a pending page it must not trust, and a
+ * garbage veclen would otherwise reach weave_vec_accum_add(), which reads dim
+ * from the bytes and then reads 4*dim floats after it -- an out-of-bounds read
+ * driven entirely by on-disk data.  Every field is cross-checked against `len`,
+ * which the caller knows independently from the item header.
+ *
+ * The toast predicates come first because VARSIZE() is only meaningful on a
+ * 4-byte-header datum.  A pending item always stores the DETOASTED form, so an
+ * extended header here is corruption, not a case to handle.
+ */
+static inline bool
+weave_wvec_is_valid(const void *p, uint32 len)
+{
+	const WVec *v = (const WVec *) p;
+
+	if (len < (uint32) offsetof(WVec, x))
+		return false;
+	if (VARATT_IS_EXTERNAL(p) || VARATT_IS_COMPRESSED(p) || VARATT_IS_SHORT(p))
+		return false;
+	if ((uint32) VARSIZE(p) != len)
+		return false;
+	if (v->dim <= 0 || v->dim > WVEC_MAX_DIM)
+		return false;
+	if ((uint32) WVEC_SIZE(v->dim) != len)
+		return false;
+	return true;
+}
+
 /* ---------------------------------------------------------------------------
  * Metrics
  *

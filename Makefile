@@ -117,7 +117,7 @@ PGFILEDESC = "pg_weave - unified lexical + vector + fuzzy retrieval in one index
 # --inputdir=$(srcdir) for pg_regress), so plain REGRESS with no REGRESS_OPTS
 # picks up sql/<name>.sql + expected/<name>.out directly. No relayout fix
 # needed here.
-REGRESS = weave unicode_fold idx_scan_stats wvec orderby chandesc surf vecindex vecscan
+REGRESS = weave unicode_fold idx_scan_stats wvec orderby chandesc surf vecindex vecscan pendingvec
 
 # --- Isolation tests -------------------------------------------------------
 # pg_isolation_regress hardcodes its two lookup paths relative to a SINGLE

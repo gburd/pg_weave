@@ -1,0 +1,124 @@
+-- Task V7's second half: a row INSERTed after the build keeps its vector.
+--
+-- WHAT WAS BROKEN, and why it was a correctness bug rather than a missing feature.
+-- A WeavePendingItem carried the tid and the wdoc and nothing else, so by the time
+-- a flush folded that document into a segment the row's vector was gone.  Those
+-- segments carried no vector weft at all, and the row was therefore present in
+-- lexical answers and absent from vector ones -- claim 1 in doc/ARCHITECTURE.md
+-- sect. 9 (one index, one docid space, one visibility rule) being false in
+-- practice.  doc/GAPS.md G23.
+--
+-- EVERY ASSERTION GOES THROUGH weave_vec_scan() / weave_vec_lanes(), for the
+-- reason stated at the top of sql/vecscan.sql: no operator and no ORDER BY path
+-- reaches the vector channel yet, so a query the planner can produce proves
+-- nothing about it.
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+ALTER EXTENSION pg_weave UPDATE;
+SET pg_weave.vec_kernel = 'scalar';
+SET enable_seqscan = off;
+
+-- 64 documents in the build, 8 dimensions, two full blocks.
+CREATE TABLE pv (id serial, d wdoc, v wvec(8));
+INSERT INTO pv(d, v)
+  SELECT to_wdoc('pending tag' || g),
+         ('[' || (g % 31) || ',' || (g % 29) || ',' || (g % 23) || ','
+               || (g % 19) || ',' || (g % 17) || ',' || (g % 13) || ','
+               || (g % 11) || ',' || (g % 7) || ']')::wvec
+    FROM generate_series(1, 64) g;
+CREATE INDEX pv_idx ON pv USING weave (d, v);
+ANALYZE pv;
+
+SELECT count(*) AS wefts, sum(nvec) AS lanes, min(dim) AS dim, min(bits) AS bits
+  FROM weave_vec_meta('pv_idx');
+
+-- ---- three inserts, into the pending buffer ------------------------------
+-- In ctid order: a vector nothing in the build comes close to, then a NULL, then
+-- an ordinary one.  The order is load-bearing for the warp assertions below --
+-- lanes are written in docid order and docids ascend with ctid.
+INSERT INTO pv(d, v) VALUES (to_wdoc('pending tag 900'), '[900,900,900,900,900,900,900,900]');
+INSERT INTO pv(d, v) VALUES (to_wdoc('pending tag 901'), NULL);
+INSERT INTO pv(d, v) VALUES (to_wdoc('pending tag 902'), '[1,2,3,4,5,6,7,8]');
+
+-- The pending pages are the NEW kind, because this index has a vector column.  An
+-- index without one keeps writing the old kind, so this is the whole observable
+-- difference between the two item layouts (weave/pagekind.h).
+SELECT kind FROM weave_index_size_detail('pv_idx')
+ WHERE kind LIKE 'pending%' AND npages > 0
+ ORDER BY kind;
+
+-- Lexically visible immediately, as before: a pending document is matched from the
+-- pending page itself.
+SELECT count(*) AS lexical_sees_pending FROM pv WHERE d @@@ 'tag';
+
+-- ...and NOT yet visible to the vector channel, which is a SEPARATE, SMALLER gap
+-- that this change does not close: the shuttle scans bolts, and a pending document
+-- is in no bolt yet.  doc/GAPS.md G29.  Asserted rather than left unsaid so that
+-- closing G29 shows up here as a diff.
+SELECT sum(nvec) AS lanes_before_flush FROM weave_vec_meta('pv_idx');
+
+-- ---- flush ---------------------------------------------------------------
+SELECT weave_merge('pv_idx');
+
+-- 64 + 3 lanes: the flushed segment carries a weft over ALL THREE pending
+-- documents, including the one whose vector was NULL.  A weft must span every
+-- document in its bolt -- skipping the NULL would shift every later lane and
+-- silently mis-associate vectors with documents (weave_vec_accum_add).
+SELECT sum(nvec) AS lanes_after_flush FROM weave_vec_meta('pv_idx');
+
+-- weave_merge() flushes AND compacts, so the two wefts are one weft of 67 lanes
+-- here.  The three inserted documents are therefore warps 64, 65 and 66: lanes are
+-- written in docid order, docids ascend with ctid, and these rows were inserted
+-- last.  Exactly one lane is dead -- the NULL vector -- and that is the distinction
+-- between "this row has no vector" and "this row is not covered".
+SELECT count(*) AS lanes, count(*) FILTER (WHERE NOT live) AS dead_lanes
+  FROM weave_vec_lanes('pv_idx');
+SELECT warp, live, norm > 0 AS has_norm
+  FROM weave_vec_lanes('pv_idx')
+ WHERE warp >= 64
+ ORDER BY warp;
+
+-- THE ASSERTION THIS FILE EXISTS FOR.  A query at the inserted row's own vector
+-- returns that row first, out of the newest weft -- so the post-build INSERT is in
+-- vector answers.  Before this change the top-1 came from the build's weft and the
+-- inserted row was unreachable at every k.
+SELECT warp >= 64 AS hit_is_an_inserted_row, warp AS hit_warp
+  FROM weave_vec_scan('pv_idx', '[900,900,900,900,900,900,900,900]'::wvec, 1);
+
+-- The same hit, identified by DOCID rather than by warp, because a warp is
+-- segment-local and a docid is not: it is the same document the lane table names.
+SELECT s.docid = l.docid AS scan_and_lane_agree, l.live
+  FROM weave_vec_scan('pv_idx', '[900,900,900,900,900,900,900,900]'::wvec, 1) s
+  JOIN weave_vec_lanes('pv_idx') l ON l.segno = s.segno AND l.warp = s.warp;
+
+-- ---- the oversized path --------------------------------------------------
+-- A document too large for one pending page bypasses the pending buffer entirely
+-- and becomes its own one-document segment.  That path dropped the vector for the
+-- same reason and had to be fixed by the same change, so it is asserted separately:
+-- a fix to the buffer alone would look correct everywhere above.
+INSERT INTO pv(d, v)
+  SELECT to_wdoc(string_agg('oversized' || g, ' ')),
+         '[800,800,800,800,800,800,800,800]'
+    FROM generate_series(1, 3000) g;
+
+SELECT sum(nvec) AS lanes_after_oversized FROM weave_vec_meta('pv_idx');
+SELECT l.live AS oversized_row_has_a_live_lane
+  FROM weave_vec_scan('pv_idx', '[800,800,800,800,800,800,800,800]'::wvec, 1) s
+  JOIN weave_vec_lanes('pv_idx') l ON l.segno = s.segno AND l.warp = s.warp;
+
+-- ---- the geometry guard this makes reachable -----------------------------
+-- An ALTER INDEX ... SET (bits = ...) between two inserts makes two wefts disagree
+-- about their code width, which is the ONLY way to reach the merge's
+-- geometry-mismatch refusal (doc/GAPS.md G26, unreachable until now: every weft in
+-- an index was written by one build at one width).  The merge must decline to mix
+-- widths rather than produce a weft whose codes mean two different things, and the
+-- index must keep answering.
+ALTER INDEX pv_idx SET (bits = 2);
+INSERT INTO pv(d, v) VALUES (to_wdoc('pending tag 903'), '[700,700,700,700,700,700,700,700]');
+SELECT weave_merge('pv_idx');
+SELECT count(DISTINCT bits) > 1 AS wefts_disagree_about_width
+  FROM weave_vec_meta('pv_idx');
+SELECT count(*) = 1 AS index_still_answers
+  FROM weave_vec_scan('pv_idx', '[700,700,700,700,700,700,700,700]'::wvec, 1);
+SELECT bool_and(ok) AS all_invariants_hold FROM weave_check('pv_idx');
+
+DROP TABLE pv;
