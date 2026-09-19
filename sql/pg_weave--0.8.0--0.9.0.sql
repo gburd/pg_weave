@@ -20,10 +20,23 @@
 -- bitmap scan that is the common @@@ path.  A counter read from SQL covers every
 -- plan shape.
 --
--- SEVERAL COLUMNS ARE STRUCTURALLY ZERO TODAY.  Four of the six retrieval kinds
--- answer nothing yet, and these columns are where that stops being a sentence in a
--- document: prefix_surf waits on Z4, fuzzy_* on Z5, regex_* on Z6.  The zeros are
--- asserted in sql/chanstats.sql so that routing a channel shows up as a diff.
+-- WHAT "WHICH MECHANISM" MEANS HERE, because the first draft of these columns got it
+-- wrong.  Prefix, fuzzy and regex all return CORRECT ROWS today: prefix through a
+-- dictionary range walk, fuzzy through a Levenshtein automaton walked over the sorted
+-- dictionary with dead-end prefix skipping, and regex -- plus any fuzzy term too long
+-- for that automaton -- through the trigram funnel followed by an exact recheck.  What
+-- none of them has is a shuttle with a real bound, which is what lets a channel join a
+-- fused top-k, and that is the sense in which doc/PRODUCTION_READINESS.md counts them
+-- as not answering.  A nonzero fuzzy_dict is NOT "Z5 is done".
+--
+-- The three _surf columns and prefix_surf are the structurally-zero ones: prefix_surf
+-- waits on Z4's resident trie, fuzzy_surf on Z5 plus that trie, regex_surf on Z6's
+-- trigram tiling.  Their zeros are asserted in sql/chanstats.sql so that routing a
+-- channel shows up there as a diff.
+--
+-- A fuzzy or regex query that ran with BOTH its columns at zero fell back to a full
+-- scan with recheck: the funnel refuses a pattern with too few usable trigrams.  That
+-- is derivable from the pair of zeros, which is why it has no column of its own.
 --
 -- BACKEND-LOCAL, like weave_alloc_stats() and for the same reasons: the counters
 -- are process state, not index state, so attributing them to an index would mean
@@ -35,8 +48,9 @@ CREATE FUNCTION weave_channel_stats(
         OUT prefix_dict bigint,
         OUT prefix_surf bigint,
         OUT fuzzy_dict bigint,
+        OUT fuzzy_trgm bigint,
         OUT fuzzy_surf bigint,
-        OUT regex_dict bigint,
+        OUT regex_trgm bigint,
         OUT regex_surf bigint,
         OUT vector_scan bigint,
         OUT terms_expanded bigint,

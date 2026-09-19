@@ -205,9 +205,11 @@ hard rule was weakened on an inference about scope rather than a question about 
 
 **34 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 1 partial (V6) and
 5 withdrawn (L2, L21, V9, V10, V13). By phase: X 4/4, L 16/20, Z 4/9, V 9/17, P 2/4,
-F 0/5, M 0/6, R 0/5. **Two of the six retrieval kinds answer a query** -- BM25 lexical
-and, as of V8 on 2026-09-18, quantized-vector ANN. Fuzzy, regex, prefix and n-gram are
-imported but unwired.
+F 0/5, M 0/6, R 0/5. **Two of the six retrieval kinds are CHANNELS** -- BM25 lexical and,
+as of V8 on 2026-09-18, quantized-vector ANN -- in the sense defined above: a shuttle with
+a real bound. Prefix, fuzzy and regex return correct rows through the dictionary and the
+trigram funnel but have no shuttle, so they cannot join a fused top-k; n-gram (`cgram`,
+Z8) has neither.
 
 *Z4 is PARTIAL as of 2026-09-19, and the interesting part is why.* Its stated shape --
 route prefix through SuRF instead of the dictionary walk -- is a strict superset of the
@@ -217,12 +219,29 @@ seeked and stops at the first key past the prefix; and `weave_surf_load()` reads
 whole trie image per call with no cache. The half of its gate that asked for `EXPLAIN` to
 name the channel is not implementable either -- there is no AM-level EXPLAIN callback on
 PostgreSQL 17 or 18. What shipped instead is the thing both halves actually needed:
-`weave_channel_stats()`, twelve backend-local counters naming which MECHANISM served each
-query leaf, readable from SQL for every plan shape. Five of the twelve are structurally
-zero and those zeros are asserted, each pinned to the task that will flip it -- so the
-sentence below about four of six channels answering nothing is now a query rather than a
-claim. Still owed: a resident trie, and then the measurement that either routes prefix
-through it or declines the route with a number.
+`weave_channel_stats()`, thirteen backend-local counters naming which MECHANISM served
+each query leaf, readable from SQL for every plan shape. Still owed: a resident trie, and
+then the measurement that either routes prefix through it or declines the route with a
+number.
+
+*And the counters immediately corrected this document.* The first draft asserted that
+five of them were structurally zero "because four of the six retrieval kinds answer
+nothing" -- and two of those zeros were false. `term*` is served by a dictionary range
+walk, `term~k` by a Levenshtein automaton walked over the sorted dictionary
+(`weave_fuzzy_terms()`, exact, no recheck), and `/re/` plus any over-long fuzzy term by
+the trigram funnel with an exact recheck. **Prefix, fuzzy and regex return correct rows
+today and have for some time.** The zeros were an artifact of the counters not existing
+yet, read as evidence that nothing ran, which is the precise failure the counters were
+added to prevent.
+
+So the sentence below needs its terms defined, and this is the definition the rest of the
+document uses: a retrieval kind **answers a query** when it returns correct rows, and it
+**is a channel** when it has a shuttle implementing `include/weave/channel.h` with a real
+bound, which is what lets it join a fused top-k. By the first measure five of six answer
+today (all but n-gram). By the second, two of six are channels -- BM25 lexical and
+quantized-vector ANN -- and that is the measure Phase F depends on, so it is the one the
+count below tracks. Three of the thirteen counters are structurally zero on the second
+measure and those are the zeros now asserted: `prefix_surf`, `fuzzy_surf`, `regex_surf`.
 
 *The count did not move on 2026-09-19, and that is the honest reading.* V7's second
 half closed **G23** -- a row inserted after the build kept no vector, so it was present
