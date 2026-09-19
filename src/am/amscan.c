@@ -2386,8 +2386,8 @@ collect_retry:
 		{
 			Buffer		buffer;
 			Page		page;
-			char	   *ptr,
-					   *end;
+			WeavePendingIter it;
+			WeavePendingRec rec;
 			BlockNumber next;
 
 			CHECK_FOR_INTERRUPTS();	/* between pages, no buffer lock held: safe to let a cancel unwind */
@@ -2396,53 +2396,45 @@ collect_retry:
 				break;		/* block truncated by a concurrent weave_vacuum: end of chain */
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buffer);
-			ptr = (char *) PageGetContents(page);
-			end = weave_page_entry_end(page);
 			next = WeavePageGetOpaque(page)->nextblk;
 
-			while (ptr < end)
+			/*
+			 * The iterator bounds-guards each item before pi->doclen is trusted,
+			 * and stops the page walk when one does not fit.  That guard is
+			 * load-bearing here: the pending list is read under only
+			 * BUFFER_LOCK_SHARE, and a concurrent flush (INSERT pending-buffer ->
+			 * segment, VACUUM, weave_merge) clears the list and frees these pages,
+			 * which a concurrent insert can recycle and overwrite (pg_weave
+			 * recycles freed pages with no deletion-xid gate).  A scan that
+			 * snapshotted pendinghead before that then walks a recycled page whose
+			 * doclen is arbitrary.  When the walk stops early, the scan's
+			 * generation re-check detects the stale read and restarts.
+			 *
+			 * The VECTOR half of an item is not read here.  This is the lexical
+			 * match over not-yet-flushed documents; the vector channel's scan is a
+			 * per-bolt shuttle and a pending document is in no bolt yet, which is
+			 * a recall gap of its own -- see doc/GAPS.md G29.
+			 */
+			weave_pending_iter_init(&it, page);
+			while (weave_pending_iter_next(&it, &rec))
 			{
-				WeavePendingItem *pi = (WeavePendingItem *) ptr;
-				WeaveDoc		pdoc;
-
-				/*
-				 * Bounds-guard the pending item before trusting pi->doclen.
-				 * The pending list is read under only BUFFER_LOCK_SHARE, and a
-				 * concurrent flush (INSERT pending-buffer -> segment, VACUUM,
-				 * weave_merge) clears the list and frees these pages, which a
-				 * concurrent insert can recycle and overwrite (pg_weave recycles
-				 * freed pages with no deletion-xid gate).  A scan that snapshotted
-				 * pendinghead before that then walks a recycled page whose
-				 * pi->doclen is arbitrary; without this guard weave_doc_is_valid /
-				 * weave_doc_matches read out of bounds and the ptr advance runs off
-				 * the page (observed as a wild multi-gigabyte allocation / crash
-				 * under concurrent merge + ingestion).  If the header or the
-				 * doclen-sized body does not fit the page, stop the page walk; the
-				 * scan's generation re-check then detects the stale read and
-				 * restarts.
-				 */
-				if ((char *) pi + sizeof(WeavePendingItem) > end ||
-					(char *) pi + MAXALIGN(sizeof(WeavePendingItem) + (Size) pi->doclen) > end)
-					break;
-				pdoc = (WeaveDoc) ((char *) pi + sizeof(WeavePendingItem));
-
 				/* A pending doc is raw page bytes; validate before the matcher
 				 * walks its offsets, so a torn/corrupt page cannot segfault a
 				 * SELECT.  A malformed doc is simply not matched (and flagged). */
-				if (!weave_doc_is_valid(pdoc, pi->doclen))
+				if (!weave_doc_is_valid(rec.doc, rec.doclen))
 					ereport(WARNING,
 							(errcode(ERRCODE_DATA_CORRUPTED),
 							 errmsg("pg_weave: skipping malformed pending document in index \"%s\" during scan",
 									RelationGetRelationName(index)),
 							 errhint("REINDEX the index to rebuild it from the heap.")));
-				else if (weave_doc_matches(pdoc, query))
+				else if (weave_doc_matches(rec.doc, query))
 				{
 					TidSet		one;
 
-					one.tids = &pi->tid;
+					one.tids = rec.tid;
 					one.n = 1;
-					pending_acc = tidset_or(pending_acc, one);	/* exact per-doc match */				}
-				ptr += MAXALIGN(sizeof(WeavePendingItem) + pi->doclen);
+					pending_acc = tidset_or(pending_acc, one);	/* exact per-doc match */
+				}
 			}
 			UnlockReleaseBuffer(buffer);
 			blk = next;

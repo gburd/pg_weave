@@ -110,7 +110,12 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 		{"livedocs", WEAVE_PK_LIVEDOCS, 0, 0},
 		{"trigram_dir", WEAVE_PK_TRGM, 0, 0},
 		{"trigram_data", WEAVE_PK_TRGM_DATA, 0, 0},
-		{"pending", WEAVE_PK_PENDING, 0, 0},
+		/* The v9 layout is what every pending page written from here on uses, so it
+		 * keeps the plain name.  An index upgraded with un-flushed pending pages
+		 * still holds some of the old layout and reports them on their own row
+		 * rather than hiding a format difference inside one number. */
+		{"pending", WEAVE_PK_PENDING_V9, 0, 0},
+		{"pending_v8", WEAVE_PK_PENDING, 0, 0},
 		{"chandesc", WEAVE_PK_CHANDESC, 0, 0},
 		{"surf_trie", WEAVE_PK_SURF, 0, 0},
 		/*

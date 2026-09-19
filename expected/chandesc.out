@@ -82,7 +82,7 @@ SELECT detail FROM weave_check('cd_weave')
  WHERE invariant = 'metapage_version_recognized';
                      detail                     
 ------------------------------------------------
- format v8 (this build reads v3..v8, writes v8)
+ format v9 (this build reads v3..v9, writes v9)
 (1 row)
 
 -- Every bolt is self-describing on a fresh v6 build.

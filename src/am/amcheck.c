@@ -136,13 +136,20 @@ wvck_mark_alloc(BlockNumber nblocks)
 
 /*
  * Walk a nextblk chain from `blk`, marking each page, and verify every page on it
- * decodes as `want`.  Returns the number of pages, or -1 on a violation (which is
- * described into `err`).  Bounded by nblocks so a corrupt chain that loops or
- * points forward forever terminates.
+ * decodes as `want` or as `alt`.  Returns the number of pages, or -1 on a
+ * violation (which is described into `err`).  Bounded by nblocks so a corrupt
+ * chain that loops or points forward forever terminates.
+ *
+ * TWO ACCEPTED KINDS, for one caller: the pending chain can legitimately hold
+ * both WEAVE_PK_PENDING and WEAVE_PK_PENDING_V9 pages at once, because an index
+ * upgraded across WEAVE_VERSION_PENDING_VEC keeps its old pages and
+ * weave_insert() starts a new page rather than mixing item layouts.  Everywhere
+ * else a chain is one kind, and wvck_walk_chain() below says so by passing the
+ * same kind twice.
  */
 static int64
-wvck_walk_chain(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
-				StringInfo err)
+wvck_walk_chain_2kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
+					   WeavePageKind alt, StringInfo err)
 {
 	int64		n = 0;
 
@@ -186,7 +193,7 @@ wvck_walk_chain(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 							 blk, weave_page_kind_name(want));
 			return -1;
 		}
-		if (pk != want)
+		if (pk != want && pk != alt)
 		{
 			UnlockReleaseBuffer(buf);
 			appendStringInfo(err, "block %u on a %s chain has kind \"%s\"",
@@ -200,6 +207,13 @@ wvck_walk_chain(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 		blk = next;
 	}
 	return n;
+}
+
+static int64
+wvck_walk_chain(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
+				StringInfo err)
+{
+	return wvck_walk_chain_2kinds(cx, blk, want, want, err);
 }
 
 /*
@@ -1215,7 +1229,8 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 		StringInfoData e;
 
 		initStringInfo(&e);
-		(void) wvck_walk_chain(cx, meta->pendinghead, WEAVE_PK_PENDING, &e);
+		(void) wvck_walk_chain_2kinds(cx, meta->pendinghead, WEAVE_PK_PENDING,
+									  WEAVE_PK_PENDING_V9, &e);
 		pfree(e.data);
 	}
 
