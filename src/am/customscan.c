@@ -489,6 +489,26 @@ _PG_init(void)
 							0, 0, INT_MAX,
 							PGC_USERSET, GUC_UNIT_MB, NULL, NULL, NULL);
 
+	/*
+	 * Budget (MB) for this backend's resident SuRF trie images.  A trie image is
+	 * ~5.52 B per vocabulary term -- about 11 MB per bolt at 2M terms -- and
+	 * before Z4 part 2 every consult reassembled the whole thing, so nothing that
+	 * has to consult the trie per QUERY (prefix routing, trie-accelerated fuzzy,
+	 * regex tiling) was measurable at all.  0 disables the cache and restores that
+	 * behaviour exactly, which is the control arm for any such measurement.
+	 *
+	 * NO ASSIGN HOOK, deliberately: lowering the budget mid-query would otherwise
+	 * free an image the running query is walking (WeaveSurfTrie points INTO the
+	 * image).  The next consult enforces the new budget, which is the first moment
+	 * at which no caller can be holding one.  See src/am/am.c.
+	 */
+	DefineCustomIntVariable("pg_weave.surf_cache_mb",
+							"Budget (MB) for this backend's resident SuRF trie images; 0 disables the cache.",
+							"A fuzzy weft's trie image costs about 5.52 bytes per vocabulary term and every consult that misses this cache reassembles the whole image from its page chain. 0 makes every consult a whole-image load, which is the pre-cache behaviour. weave_channel_stats() reports hits, misses, evictions and the bytes currently resident.",
+							&pg_weave_surf_cache_mb,
+							32, 0, 1024,
+							PGC_USERSET, GUC_UNIT_MB, NULL, NULL, NULL);
+
 	DefineCustomRealVariable("pg_weave.vacuum_tombstone_frac",
 							 "Tombstone fraction above which weave_vacuum() rewrites a single segment to reclaim its space.",
 							 "Deleted rows leave tombstoned postings that still occupy pages; only a rewrite drops them. Below this fraction a single-segment index is treated as already at its size floor and no rewrite is done. Set to 0 to rewrite whenever any row has been deleted, or to 1 to disable tombstone-driven rewrites entirely. The default is a convention, not a measured optimum.",
