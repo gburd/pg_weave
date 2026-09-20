@@ -159,6 +159,13 @@ session, and it is the first member wearing a different hat: `| tail`, `| head` 
 `test -f` all report on something other than the build. Take `make`'s own exit status,
 and `make clean` first.
 
+**An access method may only return HOT-CHAIN ROOT TIDs, and returning a physical one fails
+SILENTLY.** Z8's fallback heap pass returned the TID it had just read; a HOT-updated row's
+physical TID resolves to no visible tuple, so the plan read `Bitmap Index Scan rows=2` above
+`Bitmap Heap Scan rows=0` with no error anywhere. `heap_get_root_tuples()` per page is the fix.
+Nothing about this is specific to that channel: any AM path that manufactures TIDs outside the
+build callback has the same hazard, and the symptom is a row count, not a message.
+
 **A gate that reports FAIL and nothing else costs a round trip**, which on a remote
 build host is minutes. Print the compiler's own error lines on a build failure and the
 install log's tail on an install failure. Two round trips were burned on

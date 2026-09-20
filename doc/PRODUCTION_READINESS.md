@@ -203,9 +203,15 @@ when the scope was read as "BM25 + vector", then back when it was restated as al
 six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
 hard rule was weakened on an inference about scope rather than a question about it.*
 
-**37 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 2 partials (V6,
-Z5) and 5 withdrawn (L2, L21, V9, V10, V13). By phase: X 4/4, L 16/20, Z 7/9,
-V 9/17, P 2/4, F 0/5, M 0/6, R 0/5. **Z4, Z6 and Z7 closed on 2026-09-20** -- Z4 by measuring the prefix-via-trie route and declining it (a 10-term prefix is 1-2 ms through the dictionary range walk; one uncached trie consult is 12 ms; a resident one cannot skip the walk); the regex route's
+**37 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
+Z5, Z8, Z9) and 5 withdrawn (L2, L21, V9, V10, V13). By phase: X 4/4, L 16/20, Z 7/9,
+V 9/17, P 2/4, F 0/5, M 0/6, R 0/5. **ALL NINE PHASE-Z TASKS NOW HAVE AN IMPLEMENTATION as of 2026-09-20**, and two of them are
+PARTIAL for reasons that are measurements rather than missing code: Z8's `cgram` channel is
+2.0-2.4x slower than `pg_trgm` and 1.67x its size (`bench/RESULTS_CGRAM.md`), with a
+cgram-bearing bolt not yet mergeable (`G34`) and post-build inserts unaccelerated (`G35`);
+Z9's `<@>` bound is sound at 25.4M property checks and prunes 0.0 % of dictionary pages for
+the ordinary query shape (`G33`). Both are recorded where a reader meets the feature, per hard
+rule 8. **Z4, Z6 and Z7 closed on 2026-09-20** -- Z4 by measuring the prefix-via-trie route and declining it (a 10-term prefix is 1-2 ms through the dictionary range walk; one uncached trie consult is 12 ms; a resident one cannot skip the walk); the regex route's
 gate was measured for the record (`bench/RESULTS_FUZZY_REGEX.md`) and the boolean-gate
 shuttle exists with its property test. The same run measured Z5's gate: `k=1` meets it,
 `k=2` does not (208-293 ms against 200), and that miss is recorded in the Z5 row rather than

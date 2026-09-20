@@ -1374,3 +1374,34 @@ uses. (d) is the only one of the four that needs no new bytes on disk and is not
 all, which would mean `<@>` stops being a shuttle in the (C1)-(C6) sense and becomes a walk
 with a cutoff.
 
+
+### G34 — a cgram-bearing bolt cannot be merged — **OPEN 2026-09-20, by construction, refused in code**
+
+A merge reads its inputs' dictionaries and streams terms out of them. The cgram weft's input
+is the raw column **text**, which the index does not store, so a merge cannot reconstruct the
+trigram vocabulary of the output bolt. `weave_seg_mergeable()` refuses a group containing such
+a bolt and `weave_merge_selected()` refuses again at its own chokepoint, so the failure mode is
+"this bolt is never compacted", not a wrong answer.
+
+**What it costs, and the honest part is that the cost is UNMEASURED.** The build bolt keeps its
+cgram weft forever; bolts created by later inserts carry no cgram weft (see `G35`) and merge
+among themselves normally, so the segment-directory cap is not approached by this alone. What
+is not measured is read amplification on an index whose largest bolt can never be folded into a
+later one.
+
+**The fix is known and is not large.** A cgram weft is dictionary + postings in the lexical
+shape, so `MergeSource` parameterized on `(dictstart, dictindexstart)` merges two cgram wefts
+the same way it merges two lexical ones — the trigram keys are 4-byte big-endian and therefore
+sort by `memcmp` exactly as terms do. It was left undone deliberately: Z8's gate is parity and
+size, and a merge path written without a test that can see a mis-merged trigram posting list is
+how a silent wrong answer gets shipped.
+
+### G35 — a post-build INSERT is not indexed by the cgram channel — **OPEN 2026-09-20**
+
+`WeavePendingItem` carries the row's `wdoc` and (since `G23`) its `wvec`. It does not carry the
+raw text of a `gram_ops` column, so an inserted row contributes no trigrams and is found only by
+the route's fallback — correct answer, no acceleration. This is `G23` one channel over, and the
+same two options apply: carry the text on the pending item (bytes, and the text is already in the
+heap), or teach the flush to re-read the heap tuple. `sql/cgram.sql` asserts the correct answer
+across INSERT, DELETE and VACUUM so that closing this shows up as a latency change and not as a
+correctness change.
