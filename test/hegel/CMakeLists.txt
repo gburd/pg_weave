@@ -55,3 +55,12 @@ add_test(NAME test_docvalid COMMAND test_docvalid)
 add_executable(test_bounds test_bounds.c)
 target_include_directories(test_bounds PRIVATE ${PG_FTS_ROOT}/include)
 add_test(NAME test_bounds COMMAND test_bounds)
+
+# Z9: the <@> edit-distance shuttle's bound.  Like test_bounds, it needs neither
+# hegel nor cmocka -- the whole point of keeping the core header-only is that the
+# property test is a plain compiler invocation, so `make check-standalone` can
+# gate a build on it.
+add_executable(test_edist test_edist.c)
+target_include_directories(test_edist PRIVATE ${PG_FTS_ROOT}/include)
+target_link_libraries(test_edist PRIVATE m)
+add_test(NAME test_edist COMMAND test_edist)

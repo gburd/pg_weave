@@ -37,6 +37,7 @@ OBJS = \
 	src/util/sparsemap.o \
 	src/query/match.o \
 	src/query/gate.o \
+	src/query/edist.o \
 	src/vector/quantize.o \
 	src/vector/pack.o \
 	src/vector/vecpage.o \
@@ -111,14 +112,14 @@ TRE_CPPFLAGS = \
 	-I$(srcdir)/vendor/tre/local_includes
 
 EXTENSION = pg_weave
-DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql sql/pg_weave--0.4.0--0.5.0.sql sql/pg_weave--0.5.0--0.6.0.sql sql/pg_weave--0.6.0--0.7.0.sql sql/pg_weave--0.7.0--0.8.0.sql sql/pg_weave--0.8.0--0.9.0.sql sql/pg_weave--0.9.0--0.10.0.sql sql/pg_weave--0.10.0--0.11.0.sql
+DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql sql/pg_weave--0.4.0--0.5.0.sql sql/pg_weave--0.5.0--0.6.0.sql sql/pg_weave--0.6.0--0.7.0.sql sql/pg_weave--0.7.0--0.8.0.sql sql/pg_weave--0.8.0--0.9.0.sql sql/pg_weave--0.9.0--0.10.0.sql sql/pg_weave--0.10.0--0.11.0.sql sql/pg_weave--0.11.0--0.12.0.sql
 PGFILEDESC = "pg_weave - unified lexical + vector + fuzzy retrieval in one index"
 
 # sql/ and expected/ are already at the top level (PGXS's built-in default
 # --inputdir=$(srcdir) for pg_regress), so plain REGRESS with no REGRESS_OPTS
 # picks up sql/<name>.sql + expected/<name>.out directly. No relayout fix
 # needed here.
-REGRESS = weave unicode_fold idx_scan_stats wvec orderby chandesc surf vecindex vecscan pendingvec chanstats fuzzyuleven regexdict
+REGRESS = weave unicode_fold idx_scan_stats wvec orderby chandesc surf vecindex vecscan pendingvec chanstats fuzzyuleven regexdict edist
 
 # --- Isolation tests -------------------------------------------------------
 # pg_isolation_regress hardcodes its two lookup paths relative to a SINGLE
@@ -395,6 +396,9 @@ check-standalone:
 	echo "== Z7 gate shuttle (C1)+(C2)+(C5): monotone seek == linear oracle, +/-INF, backward refused =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/bounds test/hegel/test_bounds.c; \
 	$$tmp/bounds | tail -1; \
+	echo "== Z9 edist shuttle (C1)+(C2): the bound never exceeds a true Levenshtein distance =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/edist test/hegel/test_edist.c -lm; \
+	$$tmp/edist | tail -2; \
 	echo "== TRE d0e0c997 -> f864ed0 (pg_tre 1521662): backref wrong-answer fix =="; \
 	bash test/hegel/run_tre_bump.sh backref | tail -1; \
 	echo "== pg_tre 2be8dbf (v3.2.5): literal '-' first/last in a bracket expression =="; \
@@ -410,6 +414,19 @@ check-standalone:
 # "skip loudly, do not fail CI silently" spirit as check-sparsemap-wire, but
 # this one has no external dependency to be missing, so it always runs when
 # invoked; it is just not invoked by check-standalone or check-all.
+# Task Z9's mandatory measurement (doc/specs/FUZZY_CHANNEL.md sect. 5: tightness
+# "must be measured before this is called done").  Not part of check-standalone:
+# it is a BENCHMARK, and a benchmark in a build gate is a number nobody reads.
+# It needs no server -- the bound is header-only -- so it is a plain compile.
+# Results: bench/RESULTS_EDIST_BOUND.md.
+.PHONY: bench-edist-bound
+bench-edist-bound:
+	@set -e; \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/eb bench/edist_bound.c -lm; \
+	$$tmp/eb 0; \
+	$$tmp/eb 1
+
 .PHONY: check-tre-bump-intmax
 check-tre-bump-intmax:
 	@bash test/hegel/run_tre_bump.sh intmax
