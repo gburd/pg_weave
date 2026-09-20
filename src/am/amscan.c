@@ -37,6 +37,7 @@
 #include "weave/weave.h"
 #include "weave/am.h"
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
+#include "weave/edist.h"			/* Z9: the <@> edit-distance shuttle */
 #include <math.h>
 #include "access/genam.h"
 #include "access/generic_xlog.h"
@@ -178,6 +179,31 @@ typedef struct WeaveScanOpaqueData
 	bool		plainRecheck;	/* results need a heap recheck (fuzzy/regex) */
 	IndexTuple	plainItup;		/* cached all-NULL itup for index-only scans */
 	TupleDesc	plainItupDesc;
+
+	/*
+	 * <@> edit-distance ordering scan (task Z9).  A DIFFERENT order-by operator
+	 * over the same ordered[]/cand[] machinery: `edistScan` says the order-by
+	 * argument is a text PATTERN (strategy WEAVE_STRAT_EDIST) rather than a
+	 * wquery, so the pass that fills cand[] is weave_edist_pass() and the value
+	 * in ScoredTid.score is already a DISTANCE, not a BM25 score to be inverted.
+	 *
+	 * The widening ladder is over a DISTANCE THRESHOLD rather than a candidate
+	 * width, because that is what the channel's bound prunes on: a pass at
+	 * threshold `edistThr` collects every document whose distance is <= it, and
+	 * that set is exact and complete -- any closer term would also be within the
+	 * threshold and so present.  `edistNext` is the smallest distance anything
+	 * NOT collected could have (the minimum over the exact distances seen above
+	 * the threshold and the block bounds of the pages the bound let us skip), so
+	 * the next pass jumps straight to it and no pass repeats a distance.
+	 * `edistDone` is INT_MAX arriving there: nothing further exists anywhere, an
+	 * exact stop rather than an estimate.
+	 */
+	bool		edistScan;
+	char	   *edistPat;
+	int			edistPatLen;
+	int			edistThr;
+	int			edistNext;
+	bool		edistDone;
 } WeaveScanOpaqueData;
 
 typedef WeaveScanOpaqueData *WeaveScanOpaque;
@@ -189,6 +215,8 @@ static int weave_ord_width(int k);
 static void weave_ord_pass(Relation index, WeaveScanOpaque so);
 static void weave_ord_probe(Relation index, WeaveScanOpaque so, int want);
 static bool weave_ord_grow(Relation index, WeaveScanOpaque so);
+static void weave_edist_pass(Relation index, WeaveScanOpaque so);
+static bool weave_edist_grow(Relation index, WeaveScanOpaque so);
 
 static int
 cmp_tid(const void *a, const void *b)
@@ -2106,6 +2134,12 @@ weave_beginscan(Relation r, int nkeys, int norderbys)
 	so->nplain = 0;
 	so->plainpos = 0;
 	so->plainRecheck = false;
+	so->edistScan = false;
+	so->edistPat = NULL;
+	so->edistPatLen = 0;
+	so->edistThr = 0;
+	so->edistNext = INT_MAX;
+	so->edistDone = false;
 	scan->opaque = so;
 	/* the AM owns allocation of the order-by result arrays */
 	if (norderbys > 0)
@@ -2155,10 +2189,46 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->nplain = 0;
 	so->plainpos = 0;
 	so->plainRecheck = false;
+	so->edistScan = false;
+	so->edistPat = NULL;
+	so->edistPatLen = 0;
+	so->edistThr = 0;
+	so->edistNext = INT_MAX;
+	so->edistDone = false;
 	if (scan->numberOfOrderBys >= 1)
 	{
-		so->query = DatumGetWQuery(scan->orderByData[0].sk_argument);
-		so->queryValid = true;
+		/*
+		 * WHICH order-by operator this is decides how to read its argument, and
+		 * reading it wrong is not a type error -- DatumGetWQuery() on a text
+		 * datum would interpret a varlena header as a WeaveQuery and walk
+		 * garbage.  So dispatch on sk_strategy, and treat an unknown strategy as
+		 * an error rather than as <=>.
+		 */
+		if (scan->orderByData[0].sk_strategy == WEAVE_STRAT_EDIST)
+		{
+			MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+			text	   *pat = DatumGetTextPP(scan->orderByData[0].sk_argument);
+
+			so->edistPatLen = (int) VARSIZE_ANY_EXHDR(pat);
+			so->edistPat = (char *) palloc(so->edistPatLen + 1);	/* alloc-ok: one query pattern, bounded by the query text */
+			memcpy(so->edistPat, VARDATA_ANY(pat), so->edistPatLen);
+			so->edistPat[so->edistPatLen] = '\0';
+			so->edistScan = true;
+			/*
+			 * The pattern IS the query on this path; so->query stays NULL and
+			 * queryValid says only "a WHERE clause supplied a wquery", which for
+			 * a bare `ORDER BY d <@> p` it did not.
+			 */
+			MemoryContextSwitchTo(old);
+		}
+		else if (scan->orderByData[0].sk_strategy == WEAVE_STRAT_DISTANCE)
+		{
+			so->query = DatumGetWQuery(scan->orderByData[0].sk_argument);
+			so->queryValid = true;
+		}
+		else
+			elog(ERROR, "weave: unsupported ORDER BY strategy %d",
+				 (int) scan->orderByData[0].sk_strategy);
 	}
 }
 
@@ -2247,7 +2317,16 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 				 errdetail("The scan has neither a @@@ restriction nor an ORDER BY <=> ordering clause."),
 				 errhint("Add \"WHERE col @@@ query\" or \"ORDER BY col <=> query\".")));
 
-	if (!so->queryValid || so->query == NULL)
+	if (so->edistScan)
+	{
+		/*
+		 * The <@> path has a pattern instead of a wquery; everything below that
+		 * tests so->query would reject it.
+		 */
+		if (so->edistPat == NULL)
+			return false;
+	}
+	else if (!so->queryValid || so->query == NULL)
 		return false;
 
 	/*
@@ -2281,45 +2360,68 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 	if (!so->orderInit)
 	{
-		/*
-		 * Adaptive-width WAND.  Start narrow so a small LIMIT (the common first
-		 * page) does minimal work -- WAND prunes hard for a small k -- and widen
-		 * on demand.  The pass's candidates are handed out LAZILY (visibility is
-		 * checked a batch at a time in weave_ord_probe), so the whole width of
-		 * the pass is available to the executor, not just the first
-		 * pg_weave.wand_initial_k rows of it: the x4 over-fetch that used to
-		 * exist only to survive MVCC filtering now also sets how deep a single
-		 * pass can serve.  See weave_ord_pass and doc/GAPS.md G13.
-		 */
-		double		N;
-		WeaveMetaPageData m0;
+		if (so->edistScan)
+		{
+			/*
+			 * Task Z9.  The narrowest useful threshold is 0 -- documents holding
+			 * the pattern verbatim -- because that is where the channel's block
+			 * bound prunes hardest, and the first page of an interactive `<@>`
+			 * query is usually satisfied by distance 0 or 1.  If it is not, the
+			 * pass reports the exact next distance at which a row can appear and
+			 * weave_edist_grow() jumps straight to it, so no threshold is visited
+			 * that cannot produce a row.  The cost this shape carries is one
+			 * dictionary walk per DISTINCT distance the executor drains, which an
+			 * impact-ordered dictionary would remove and which nothing in the
+			 * current format supports.
+			 */
+			pgstat_count_index_scan(scan->indexRelation);
+			so->edistThr = 0;
+			weave_edist_pass(scan->indexRelation, so);
+			so->ordpos = 0;
+			so->orderInit = true;
+		}
+		else
+		{
+			/*
+			 * Adaptive-width WAND.  Start narrow so a small LIMIT (the common first
+			 * page) does minimal work -- WAND prunes hard for a small k -- and widen
+			 * on demand.  The pass's candidates are handed out LAZILY (visibility is
+			 * checked a batch at a time in weave_ord_probe), so the whole width of
+			 * the pass is available to the executor, not just the first
+			 * pg_weave.wand_initial_k rows of it: the x4 over-fetch that used to
+			 * exist only to survive MVCC filtering now also sets how deep a single
+			 * pass can serve.  See weave_ord_pass and doc/GAPS.md G13.
+			 */
+			double		N;
+			WeaveMetaPageData m0;
 
-		pgstat_count_index_scan(scan->indexRelation);
-		weave_read_meta(scan->indexRelation, &m0);
-		N = m0.ndocs < 1.0 ? 1.0 : m0.ndocs;
-		so->maxhits = weave_query_maxhits(scan->indexRelation, so->query, N);
-		/*
-		 * Initial WAND k.  PostgreSQL gives an access method no way to learn the
-		 * query's LIMIT, so the scan starts at some k and grows x4 on demand.
-		 *
-		 * This value was 100, chosen so the whole LIMIT 11..100 range is served by
-		 * ONE pass rather than a pass-then-recompute.  The competitive benchmark
-		 * showed what that costs: pg_weave's ranked latency is IDENTICAL at
-		 * LIMIT 10 and LIMIT 100 -- measured k100/k10 ratios of 1.003, 1.007 and
-		 * 0.999 across the rare, mid and common bands -- because a LIMIT 10 query
-		 * does a k=100 pass.  Timescale pg_textsearch, over the same corpus and
-		 * query shape, scales 1.9x-4.1x with k and is 10-21x faster at k=10.
-		 * A top-k engine that does not get cheaper as k shrinks is not pruning for
-		 * the dominant query shape, which is a first page of ten results.
-		 *
-		 * Made a GUC so the trade can be swept in one benchmark run instead of
-		 * guessed at: bench/compete sweeps it and bench/RESULTS_WAND_K.md records
-		 * the frontier the default is chosen from.  See doc/GAPS.md G13.
-		 */
-		so->curk = weave_ord_width(pg_weave_wand_initial_k);
-		weave_ord_pass(scan->indexRelation, so);
-		so->ordpos = 0;
-		so->orderInit = true;
+			pgstat_count_index_scan(scan->indexRelation);
+			weave_read_meta(scan->indexRelation, &m0);
+			N = m0.ndocs < 1.0 ? 1.0 : m0.ndocs;
+			so->maxhits = weave_query_maxhits(scan->indexRelation, so->query, N);
+			/*
+			 * Initial WAND k.  PostgreSQL gives an access method no way to learn the
+			 * query's LIMIT, so the scan starts at some k and grows x4 on demand.
+			 *
+			 * This value was 100, chosen so the whole LIMIT 11..100 range is served by
+			 * ONE pass rather than a pass-then-recompute.  The competitive benchmark
+			 * showed what that costs: pg_weave's ranked latency is IDENTICAL at
+			 * LIMIT 10 and LIMIT 100 -- measured k100/k10 ratios of 1.003, 1.007 and
+			 * 0.999 across the rare, mid and common bands -- because a LIMIT 10 query
+			 * does a k=100 pass.  Timescale pg_textsearch, over the same corpus and
+			 * query shape, scales 1.9x-4.1x with k and is 10-21x faster at k=10.
+			 * A top-k engine that does not get cheaper as k shrinks is not pruning for
+			 * the dominant query shape, which is a first page of ten results.
+			 *
+			 * Made a GUC so the trade can be swept in one benchmark run instead of
+			 * guessed at: bench/compete sweeps it and bench/RESULTS_WAND_K.md records
+			 * the frontier the default is chosen from.  See doc/GAPS.md G13.
+			 */
+			so->curk = weave_ord_width(pg_weave_wand_initial_k);
+			weave_ord_pass(scan->indexRelation, so);
+			so->ordpos = 0;
+			so->orderInit = true;
+		}
 	}
 
 	/*
@@ -2351,12 +2453,23 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 				break;
 		}
 		/* candidates exhausted: widen the pass, or the scan is complete */
-		if (!weave_ord_grow(scan->indexRelation, so))
+		if (!(so->edistScan ? weave_edist_grow(scan->indexRelation, so)
+			  : weave_ord_grow(scan->indexRelation, so)))
 			return false;
 	}
 
 	scan->xs_heaptid = so->ordered[so->ordpos].tid;
 	scan->xs_recheck = false;	/* score computed exactly from the index */
+	if (so->edistScan && scan->numberOfKeys > 0)
+		/*
+		 * A `WHERE d @@@ q ORDER BY d <@> p` scan pushed the @@@ key down, and
+		 * an Index Scan does not re-evaluate a pushed-down qual unless the AM
+		 * asks.  weave_edist_pass() restricted its hits to the @@@ match set,
+		 * which for a fuzzy/regex/NOT query is the OVER-generating set (the same
+		 * one amgetbitmap reports recheck for), so say so and let the executor
+		 * re-run the original qual against the heap tuple.
+		 */
+		scan->xs_recheck = so->plainRecheck;
 	weave_set_itup(scan, so);
 	if (scan->numberOfOrderBys > 0)
 	{
@@ -5256,8 +5369,13 @@ weave_ord_probe(Relation index, WeaveScanOpaque so, int want)
 			so->maxordered = newmax;
 		}
 		so->ordered[so->nordered].tid = c->tid;
-		/* ordering distance: 1/(1+score); ascending distance == descending score */
-		so->ordered[so->nordered].score = 1.0 / (1.0 + c->score);
+		/* ordering distance: 1/(1+score); ascending distance == descending score.
+		 * On the <@> path (Z9) cand[].score is ALREADY the edit distance -- a
+		 * distance, ascending, in the units the operator returns -- so it is
+		 * carried through unchanged.  Inverting it here would have produced a
+		 * plausible monotone value and a wrong xs_orderbyvals. */
+		so->ordered[so->nordered].score = so->edistScan ? c->score
+			: 1.0 / (1.0 + c->score);
 		so->nordered++;
 	}
 
@@ -5302,6 +5420,411 @@ weave_ord_grow(Relation index, WeaveScanOpaque so)
 	so->curk = (so->curk > WEAVE_ORD_WIDTH_MAX / 4)
 		? WEAVE_ORD_WIDTH_MAX : so->curk * 4;
 	weave_ord_pass(index, so);
+	return true;
+}
+
+/* -------------------------------------------------------------------------
+ * The `<@>` edit-distance ordering pass -- task Z9
+ *
+ * One pass collects EVERY document whose edit distance to the pattern is <= the
+ * pass's threshold, exactly, and that completeness is what makes the ladder
+ * correct: a document's distance is the minimum over its terms, so if its
+ * distance is within the threshold then the term achieving it is within the
+ * threshold too and the walk saw it.  Documents beyond the threshold may be
+ * missing or (having been reached only through a farther term) mis-scored, and
+ * are simply not in this pass's output.
+ *
+ * The pass also reports `nextthr`: the smallest distance at which anything it did
+ * NOT collect could sit.  Two sources, and the second is where the channel's
+ * bound earns its place:
+ *
+ *	 - a term whose exact distance came out above the threshold contributes that
+ *	   distance;
+ *	 - a dictionary PAGE the bound ruled out contributes the page's bound, which
+ *	   is by (C2) a lower bound on every distance on it.
+ *
+ * So the next pass jumps straight to the next distance that can produce a row.
+ * nextthr == INT_MAX means nothing anywhere is farther than the threshold, i.e.
+ * this pass returned the complete match set -- the same kind of exact stop
+ * weave_ord_grow() gets from !candfull, and stronger than an estimate.
+ * ------------------------------------------------------------------------- */
+
+typedef struct EdistHit
+{
+	ItemPointerData tid;
+	int32		dist;
+}			EdistHit;
+
+typedef struct EdistAcc
+{
+	EdistHit   *hits;
+	int			n;
+	int			cap;
+}			EdistAcc;
+
+/* (tid, dist) ascending: the dedup order, so the first of each TID run carries
+ * that document's MINIMUM distance -- which is the definition of a document's
+ * distance under `<@>`. */
+static int
+cmp_edist_tid(const void *a, const void *b)
+{
+	const EdistHit *x = (const EdistHit *) a;
+	const EdistHit *y = (const EdistHit *) b;
+	int			c = ItemPointerCompare((ItemPointer) &x->tid,
+									   (ItemPointer) &y->tid);
+
+	if (c != 0)
+		return c;
+	return x->dist < y->dist ? -1 : (x->dist > y->dist ? 1 : 0);
+}
+
+/* (dist, tid) ascending: the output order.  The TID tie-break is not cosmetic --
+ * it is what makes the candidate list a TOTAL order, so a LIMIT that cuts inside
+ * a run of equal distances cuts at the same place every time.  Edit distance ties
+ * are the common case (a corpus has many terms two edits from anything), so
+ * without it the k-th row of `ORDER BY d <@> p LIMIT k` would be arbitrary and
+ * sql/edist.sql could not compare against a reference at all. */
+static int
+cmp_edist_dist(const void *a, const void *b)
+{
+	const EdistHit *x = (const EdistHit *) a;
+	const EdistHit *y = (const EdistHit *) b;
+
+	if (x->dist != y->dist)
+		return x->dist < y->dist ? -1 : 1;
+	return ItemPointerCompare((ItemPointer) &x->tid, (ItemPointer) &y->tid);
+}
+
+static void
+edist_acc_add(EdistAcc *a, ItemPointer tid, int dist)
+{
+	if (a->n >= a->cap)
+	{
+		if (a->cap > INT_MAX / 2 ||
+			(Size) a->cap * 2 * sizeof(EdistHit) > MaxAllocHugeSize)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("pg_weave: candidate set for this <@> query is too large"),
+					 errhint("Add a LIMIT, or restrict the scan with a WHERE clause.")));
+		a->cap = Max(a->cap * 2, 256);
+		/* One entry per (term, document) pair within the threshold: corpus-scale
+		 * for a threshold that admits a common term, hence the huge-safe
+		 * variant (make check-alloc). */
+		a->hits = a->hits
+			? (EdistHit *) WEAVE_REALLOC_MAYBE_HUGE(a->hits, (Size) a->cap * sizeof(EdistHit))
+			: (EdistHit *) WEAVE_ALLOC_MAYBE_HUGE((Size) a->cap * sizeof(EdistHit));
+	}
+	a->hits[a->n].tid = *tid;
+	a->hits[a->n].dist = (int32) dist;
+	a->n++;
+}
+
+/*
+ * The term the shuttle is positioned on is within the threshold: read its
+ * posting list and record (document, distance) for every posting.
+ *
+ * Valid only while the shuttle is still positioned on that term -- the entry
+ * points into a share-locked buffer, the same lifetime weave_fuzzy_hit()
+ * documents.
+ */
+static void
+edist_collect_term(Relation index, const WeaveSegMeta *sg, WeaveShuttle *sh,
+				   EdistAcc *acc, int dist, WeaveTombstones *tombs,
+				   uint32 segidx)
+{
+	const WeaveDictEntry *de = weave_edist_shuttle_entry(sh);
+	WeavePosting *post;
+	TidSet		one;
+	int			np;
+	int			i;
+
+	if (de == NULL)
+		return;
+	np = weave_decode_term(index, de->firstposting, de->firstoffset, de->df,
+						   &post, NULL, false, NULL, true,
+						   sg->doclenstart == InvalidBlockNumber);
+	if (np > 0)
+	{
+		one.tids = (ItemPointerData *)
+			WEAVE_ALLOC_MAYBE_HUGE((Size) np * sizeof(ItemPointerData));
+		for (i = 0; i < np; i++)
+			one.tids[i] = post[i].tid;
+		one.n = np;
+		/* Per-segment tombstones, applied to THIS segment's contribution only:
+		 * a docid deleted in segment A must not suppress a live document that
+		 * reused the same heap slot in a newer segment (see
+		 * weave_filter_tombstoned_seg). */
+		weave_filter_tombstoned_seg(tombs, segidx, &one);
+		for (i = 0; i < one.n; i++)
+			edist_acc_add(acc, &one.tids[i], dist);
+		if (one.tids != NULL)
+			pfree(one.tids);
+	}
+	pfree(post);
+}
+
+/* The pending list: documents inserted but not yet folded into a segment, so in
+ * no dictionary and invisible to the shuttle.  Scored with weave_doc_min_edist()
+ * -- the SAME function the `<@>` operator evaluates on a heap wdoc -- so the two
+ * cannot disagree.  Pending tuples are live and are never tombstoned. */
+static void
+edist_collect_pending(Relation index, const WeaveMetaPageData *meta,
+					  WeaveScanOpaque so, EdistAcc *acc, int *nextthr)
+{
+	BlockNumber blk = meta->pendinghead;
+
+	while (blk != InvalidBlockNumber)
+	{
+		Buffer		buffer;
+		Page		page;
+		WeavePendingIter it;
+		WeavePendingRec rec;
+		BlockNumber next;
+
+		CHECK_FOR_INTERRUPTS();	/* between pages, no buffer lock held */
+		buffer = weave_scan_readbuf(index, blk);
+		if (buffer == InvalidBuffer)
+			break;				/* truncated by a concurrent weave_vacuum */
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buffer);
+		next = WeavePageGetOpaque(page)->nextblk;
+		weave_pending_iter_init(&it, page);
+		while (weave_pending_iter_next(&it, &rec))
+		{
+			int			d;
+
+			if (!weave_doc_is_valid(rec.doc, rec.doclen))
+				continue;		/* weave_collect_matches warns about these */
+			d = weave_doc_min_edist(rec.doc, so->edistPat, so->edistPatLen);
+			if (d < 0)
+				continue;		/* term-free document: no distance */
+			if (d <= so->edistThr)
+				edist_acc_add(acc, rec.tid, d);
+			else if (d < *nextthr)
+				*nextthr = d;
+		}
+		UnlockReleaseBuffer(buffer);
+		blk = next;
+	}
+}
+
+static void
+weave_edist_pass(Relation index, WeaveScanOpaque so)
+{
+	EdistAcc	acc;
+	int			nextthr = INT_MAX;
+	int			attempt;
+	ScoredTid  *cand;
+	int			i;
+	int			j;
+
+	/*
+	 * A @@@ restriction alongside the ordering clause.  An Index Scan does not
+	 * re-evaluate a pushed-down qual, so the pass must apply it; collected once
+	 * and cached in the (otherwise unused on this path) plain-scan slots,
+	 * because the widening ladder calls this function repeatedly.
+	 */
+	if (!so->plainInit && so->queryValid && so->query != NULL)
+	{
+		TidSet		m;
+
+		weave_collect_matches(index, so->query, &m, &so->plainRecheck);
+		so->plainTids = m.tids;
+		so->nplain = m.n;
+		so->plainInit = true;
+	}
+
+	acc.hits = NULL;
+	acc.n = 0;
+	acc.cap = 0;
+
+	for (attempt = 0; attempt < 10; attempt++)
+	{
+		WeaveMetaPageData meta;
+		WeaveTombstones seg_tombs;
+		uint32		gen0;
+		uint32		s;
+
+		gen0 = weave_read_meta_generation(index);
+		weave_read_meta(index, &meta);
+		acc.n = 0;
+		nextthr = INT_MAX;
+		weave_tombstones_load(index, &meta, &seg_tombs);
+
+		for (s = 0; s < meta.nsegments; s++)
+		{
+			const WeaveSegMeta *sg = &meta.segs[s];
+			WeaveShuttle *sh;
+
+			if (sg->dictstart == InvalidBlockNumber)
+				continue;
+			sh = weave_edist_shuttle_begin(index, sg, so->edistPat,
+										   so->edistPatLen,
+										   CurrentMemoryContext);
+			PG_TRY();
+			{
+				WeaveWarp	warp = weave_shuttle_seek(sh, 0);
+
+				while (warp != WEAVE_WARP_END)
+				{
+					int			lower = weave_edist_shuttle_block_lower(sh);
+					int			d;
+
+					if (lower > so->edistThr)
+					{
+						/*
+						 * (C2) doing its job: no term on this dictionary page
+						 * can be within the threshold, so not one Levenshtein
+						 * computation is paid for it.  This is the skip whose
+						 * rate bench/RESULTS_EDIST_BOUND.md measures.
+						 */
+						if (lower < nextthr)
+							nextthr = lower;
+						warp = weave_edist_shuttle_skip_block(sh);
+						continue;
+					}
+					d = weave_edist_shuttle_dist_le(sh, so->edistThr);
+					if (d <= so->edistThr)
+					{
+						/*
+						 * Take the value through the CONTRACT face.
+						 * dist_le() is the bounded twin, used to reject
+						 * cheaply; score() is (C4), and taking the admitted
+						 * term's distance from it puts channel.h's sign
+						 * convention -- bigger is better, so a distance is
+						 * negated -- on the QUERY PATH rather than in a
+						 * function nothing calls.  A mutation run showed why
+						 * that matters: with the pass reading dist_le() only,
+						 * inverting score()'s sign changed no answer, so the
+						 * contract's own convention was untested.  The second
+						 * Levenshtein is paid only for terms within the
+						 * threshold, which is a handful of the vocabulary --
+						 * not for the terms the cheap reject discards.
+						 */
+						int			exact = -(int) weave_shuttle_score(sh);
+
+						Assert(exact == d);
+						edist_collect_term(index, sg, sh, &acc, exact,
+										   &seg_tombs, s);
+					}
+					else if (d < nextthr)
+						nextthr = d;
+					if (warp >= WEAVE_WARP_END - 1)
+						break;
+					warp = weave_shuttle_seek(sh, warp + 1);
+				}
+			}
+			PG_FINALLY();
+			{
+				/* The shuttle holds a pinned, share-locked dictionary buffer
+				 * between seeks, so an ERROR or a cancel anywhere in the loop
+				 * would otherwise leak the lock out of the query -- the
+				 * weave_fuzzy_terms() rationale, verbatim. */
+				weave_edist_shuttle_end(sh);
+			}
+			PG_END_TRY();
+		}
+
+		weave_tombstones_free(&seg_tombs);
+		edist_collect_pending(index, &meta, so, &acc, &nextthr);
+
+		/*
+		 * Concurrency guard, the same one weave_collect_matches applies: the
+		 * pages were read under per-page SHARE locks off a metapage snapshot, so
+		 * a concurrent merge/vacuum may have freed and recycled them.  If the
+		 * directory generation moved, redo from a fresh snapshot.
+		 */
+		if (weave_read_meta_generation(index) == gen0)
+			break;
+	}
+
+	/* One entry per document, carrying its MINIMUM distance. */
+	if (acc.n > 1)
+	{
+		qsort(acc.hits, acc.n, sizeof(EdistHit), cmp_edist_tid);
+		for (i = 0, j = 1; j < acc.n; j++)
+			if (ItemPointerCompare(&acc.hits[i].tid, &acc.hits[j].tid) != 0)
+				acc.hits[++i] = acc.hits[j];
+		acc.n = i + 1;
+	}
+
+	/* the @@@ restriction, if any */
+	if (so->plainInit && acc.n > 0)
+	{
+		for (i = 0, j = 0; i < acc.n; i++)
+			if (so->nplain > 0 &&
+				bsearch(&acc.hits[i].tid, so->plainTids, so->nplain,
+						sizeof(ItemPointerData), cmp_tid) != NULL)
+				acc.hits[j++] = acc.hits[i];
+		acc.n = j;
+	}
+
+	if (acc.n > 1)
+		qsort(acc.hits, acc.n, sizeof(EdistHit), cmp_edist_dist);
+
+	/*
+	 * Rows an earlier, narrower pass already materialized are removed by TID, so
+	 * a widening EXTENDS the scan instead of repeating its output -- the same
+	 * argument weave_ord_pass() makes, and here the ordering across the boundary
+	 * is trivially safe: every row already handed out had distance <= the
+	 * previous threshold, and every row this pass newly finds has distance
+	 * above it.
+	 */
+	if (acc.n > 0 && so->nordered > 0)
+	{
+		ItemPointerData *seen = (ItemPointerData *)
+			palloc(so->nordered * sizeof(ItemPointerData));	/* alloc-ok: one TID per row already materialized, bounded by the previous pass, which allocated a wider array itself */
+
+		for (i = 0; i < so->nordered; i++)
+			seen[i] = so->ordered[i].tid;
+		qsort(seen, so->nordered, sizeof(ItemPointerData), cmp_tid);
+		for (i = 0, j = 0; i < acc.n; i++)
+			if (bsearch(&acc.hits[i].tid, seen, so->nordered,
+						sizeof(ItemPointerData), cmp_tid) == NULL)
+				acc.hits[j++] = acc.hits[i];
+		acc.n = j;
+		pfree(seen);
+	}
+
+	cand = (ScoredTid *) palloc(Max(acc.n, 1) * sizeof(ScoredTid));	/* alloc-ok: one entry per candidate document, and the EdistHit array it is copied from is the same length and was huge-safe */
+	for (i = 0; i < acc.n; i++)
+	{
+		cand[i].tid = acc.hits[i].tid;
+		cand[i].score = (double) acc.hits[i].dist;
+	}
+	if (acc.hits != NULL)
+		pfree(acc.hits);
+
+	if (so->cand)
+		pfree(so->cand);
+	so->cand = cand;
+	so->ncand = acc.n;
+	so->candpos = 0;
+	so->candfull = false;		/* the <@> ladder stops on edistDone, not on this */
+	so->edistNext = nextthr;
+	so->edistDone = (nextthr == INT_MAX);
+}
+
+/*
+ * Widen the `<@>` pass to the next distance that can produce a row.  Returns
+ * false only when the previous pass PROVED there is nothing farther out, which
+ * is the same standard weave_ord_grow() holds itself to: an amcanorderbyop scan
+ * must be able to return every matching tuple in order, so a ceiling of the
+ * access method's own would silently truncate the result.
+ */
+static bool
+weave_edist_grow(Relation index, WeaveScanOpaque so)
+{
+	if (so->edistDone)
+		return false;			/* the pass returned the complete match set */
+	if (so->edistThr >= INT_MAX - 1)
+		return false;
+	/* Progress is not optional: a nextthr that failed to exceed the current
+	 * threshold would repeat the pass forever. */
+	if (so->edistNext <= so->edistThr)
+		so->edistNext = so->edistThr + 1;
+	so->edistThr = so->edistNext;
+	weave_edist_pass(index, so);
 	return true;
 }
 

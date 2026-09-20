@@ -3739,7 +3739,7 @@ weave_handler(PG_FUNCTION_ARGS)
 {
 	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
-	amroutine->amstrategies = 2;
+	amroutine->amstrategies = 3;
 	amroutine->amsupport = 0;
 	amroutine->amoptsprocnum = 0;
 	amroutine->amcanorder = false;

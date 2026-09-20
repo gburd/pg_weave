@@ -1326,3 +1326,51 @@ term), so a narrowing error can only ever be a false negative, which is why the 
 `[[:digit:]]` and `(?i)` three-way against core's `~`, and the mutation leg that removes
 both defences (the whitelist and the tokenizer's own refusal of `\d`) reproduces this gap
 exactly.
+
+### G33 — the `<@>` block bound is sound and prunes **0.0 %** of dictionary pages for the ordinary query shape — **OPEN 2026-09-20, found by measuring Z9's own gate**
+
+`doc/specs/FUZZY_CHANNEL.md` §5 specified two lower bounds on edit distance (length
+deficit, trigram deficit) for the `<@>` KNN shuttle and required the tightness to be
+measured before Z9 could be called done. It was measured (`bench/edist_bound.c`,
+`bench/RESULTS_EDIST_BOUND.md`): on a 254,000-term vocabulary in 1,004 dictionary pages,
+over 12 patterns x k in {1,2,3}, the **median** fraction of pages skipped without computing
+a single distance is **0.0 %** and the median fraction of terms whose exact Levenshtein
+distance is computed is **100.00 %**. 22 of 36 rows prune nothing at all.
+
+**The mechanism is the ordering, not the tightness.** A dictionary page is a run of
+lexicographically adjacent terms, and byte order has no relationship to term LENGTH or to
+distinct-trigram COUNT -- so every page carries a near-full spread of both, its min/max
+statistics sit near the vocabulary's global min/max, and both deficits collapse to ~0.
+Pruning only appears when the pattern is extreme in length relative to the vocabulary
+(89-99 % for a 1-2 character pattern) or when an exact match exists and sets theta to 0
+(32.7 %). For the case the feature exists to serve -- a misspelled word, several edits from
+anything -- it is exactly zero.
+
+This is **the same finding as `bench/RESULTS_BOUND_PRUNING.md`**, one channel over: a
+provably-correct bound that prunes nothing because the block's contents are unrelated to
+the quantity being bounded, and the fix there was an ordering constraint nobody had
+written down. Here the analogous constraint would be clustering the dictionary by term
+length, and the second arm of the measurement shows it is **not** sufficient either: the
+achievable-ceiling column rises to ~40 % for length-extreme patterns and stays ~0.1 % for
+the ordinary one. It is also not available -- the lexical channel's point lookups, prefix
+scans and sparse block index all require byte order.
+
+**What is NOT wrong.** (C2) holds: `test/hegel/test_edist.c` asserts bound <= true distance
+at 25.4 M positions with zero violations, and `bench/edist_bound.c` re-asserts it on every
+page of every query. Correctness parity with seq-scan `levenshtein()` holds for 12 patterns
+and for every row of the table (`sql/edist.sql`). The mutation leg that makes `block_max()`
+always +INF changes **no answer**, which is the direct proof that the scan does not depend
+on the bound for correctness -- only for speed it is not currently getting.
+
+**Open question for the coordinator**, stated rather than decided: the candidates are (a)
+accept it, because `<@>` is still far better than a Seq Scan computing min-over-terms
+Levenshtein per ROW -- the pass computes it per vocabulary TERM, which by Heaps' law is
+~sqrt(corpus); (b) store per-page min/max length in a page header and pay a format change
+for I/O the current shape still performs; (c) index the dictionary by length as a secondary
+structure, which is a new weft; (d) replace the bound with the universal-Levenshtein
+automaton's own dead-prefix skip (`include/weave/uleven.h`), which prunes on the PREFIX
+rather than on statistics and is known to work -- it is what Z5's `term~k` route already
+uses. (d) is the only one of the four that needs no new bytes on disk and is not a bound at
+all, which would mean `<@>` stops being a shuttle in the (C1)-(C6) sense and becomes a walk
+with a cutoff.
+
