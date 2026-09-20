@@ -40,6 +40,25 @@ Coverage:
   refused rather than clamped. Keys near `UINT32_MAX` and the end sentinel are
   generated on purpose: the width refusal is the open Phase F question the
   header records.
+- `test_edist.c` — the `<@>` edit-distance shuttle's bound and cursor core
+  (`weave/edist.h`), task Z9. Dependency-free (`-I include` only), wired into
+  `make check-standalone`. This is the first channel with a REAL numeric bound, so
+  it is the first place hard rule 1's failure is available in full: a lower bound
+  on edit distance that is one edit too large drops the nearest rows and leaves
+  the answer plausible. The test implements character-level Levenshtein itself —
+  the implementation calls core's `varstr_levenshtein()`, which the test cannot
+  link, and a shared helper would make the oracle agree by construction — and
+  asserts `bound <= true distance` at **every** position of every block, not just
+  at `cur`, because `block_max()` speaks for the whole closed interval. Each of
+  the two deficits (length, trigram) is additionally asserted alone, so a
+  regression in one is not masked by the other being loose. Generators cover
+  ASCII, 2/3/4-byte UTF-8, the empty pattern, single characters, repeated-character
+  terms (whose distinct-trigram count is far below their length, the case where the
+  trigram deficit beats the length deficit) and a modelled single-byte server
+  encoding. The directed cases include the one that **falsifies the formula
+  `doc/specs/FUZZY_CHANNEL.md` sect. 5 originally wrote**: a page holding both the
+  pattern itself and a much longer term, where `max_T_block - T_pattern` is large
+  and the true minimum distance is 0.
 
 Both include the real source directly (the header / the `.c`), so the tests and
 the extension share one copy — no duplicated logic to drift.
