@@ -69,6 +69,7 @@ sources = files(
   'src/pages/trgm_page.c',
   'src/util/migrate.c',
   'src/query/trgm.c',
+  'src/query/cgram.c',
   'src/util/sparsemap.c',
   'src/query/match.c',
   # Z7: the boolean-gate shuttle (include/weave/gate.h).  In OBJS too.
@@ -209,5 +210,6 @@ install_data(
   'sql/pg_weave--0.9.0--0.10.0.sql',
   'sql/pg_weave--0.10.0--0.11.0.sql',
   'sql/pg_weave--0.11.0--0.12.0.sql',
+  'sql/pg_weave--0.12.0--0.13.0.sql',
   install_dir: pg_extension_dir,
 )

@@ -1329,6 +1329,39 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 		if (postchain != InvalidBlockNumber)
 			(void) wvck_walk_chain(cx, postchain, WEAVE_PK_POSTING, &e);
 
+		/*
+		 * Z8: the cgram weft is FOUR chains behind one root page, and the
+		 * descriptor names only the root.  Marking the root alone would report
+		 * the entire trigram dictionary and every cgram posting page as a leak --
+		 * and, worse, "fixing" that by exempting the kinds instead of following
+		 * the chains is exactly the hole that would then hide a REAL leak of the
+		 * same pages.  weave_cgram_free_weft() follows the same four; if the two
+		 * ever disagree, this invariant is what says so.
+		 */
+		if (seg->chandesc != InvalidBlockNumber)
+		{
+			BlockNumber cgroot = weave_cgram_weft_root(cx->index, seg);
+
+			if (cgroot != InvalidBlockNumber)
+			{
+				WeaveCgramWeft cw;
+				const char *cwhy = NULL;
+
+				(void) wvck_walk_chain(cx, cgroot, WEAVE_PK_CGRAM, &e);
+				if (weave_cgram_weft_open(cx->index, cgroot, &cw, &cwhy))
+				{
+					(void) wvck_walk_chain(cx, cw.dictstart,
+										   WEAVE_PK_CGRAM_DICT, &e);
+					if (cw.dictindexstart != InvalidBlockNumber)
+						(void) wvck_walk_chain(cx, cw.dictindexstart,
+											   WEAVE_PK_CGRAM_DICTINDEX, &e);
+					if (cw.postingstart != InvalidBlockNumber)
+						(void) wvck_walk_chain(cx, cw.postingstart,
+											   WEAVE_PK_CGRAM_POST, &e);
+				}
+			}
+		}
+
 		/* trigram directory pages plus each entry's sparsemap blob chain */
 		blk = seg->trgmstart;
 		while (blk != InvalidBlockNumber && blk < cx->nblocks)

@@ -594,6 +594,57 @@ is to quietly imply it handles the other 5 % too. That is how a project loses
 credibility on the four claims it can actually support
 (`doc/ARCHITECTURE.md` §9).
 
+### 6.1 Commitment 2, discharged — task Z8, measured
+
+`bench/RESULTS_CGRAM.md` now exists and the promise above is kept. On the same
+1M-row, 8-token, ~250k-vocabulary corpus (96 MB heap, `c7i.2xlarge`, PG 17.11):
+
+| | bytes | pretty |
+|---|---:|---:|
+| `pg_trgm` GIN | 75,218,944 | 72 MB |
+| pg_weave **without** `cgram` | 40,378,368 | 39 MB |
+| pg_weave **with** `cgram` | 125,280,256 | 119 MB |
+
+**With `cgram` on, pg_weave's index is 1.67× the size of `pg_trgm`'s.** Turning the
+channel on costs +81 MB, a 3.10× index, of which 99.94 % is the docid postings
+themselves. That is the stated cost of the product, not a limitation to be avoided
+by defaulting the channel off (AGENTS.md, "Z8 is required, not opt-in").
+
+**And the latency is not a win against `pg_trgm` either**, which §6 did not promise
+either way and which therefore has to be said here: median of 7 (first dropped,
+two passes, pass-to-pass spread ≤ 2.1 %), pg_weave's `cgram` route is **2.0×–2.4×
+slower than `pg_trgm` GIN** on all five matching patterns, and **slower than a
+sequential scan** on the two least selective ones (`%7 t1%`, 311k matches:
+560 ms vs 144 ms; `%9 t20%`, 31k matches: 206 ms vs 156 ms). It beats a seq scan by
+3× on 3.1k matches, by 20× on 352 matches, and by four orders of magnitude on a
+no-match pattern, where it is also 2.5× faster than `pg_trgm`. §6's sentence
+"for that specific job pg_trgm's GIN is close to optimal" is confirmed by
+measurement rather than by assumption.
+
+Three facts about the implementation belong next to the thing they constrain:
+
+1. **A cgram weft is a second, LEXICAL-SHAPED weft.** One dictionary entry per
+   distinct byte trigram (a 4-byte big-endian hash key — big-endian so that the
+   dictionary's memcmp order and the writer's numeric order are the same, without
+   which the sparse block index mis-seeks and drops rows), postings being the
+   docids containing it, FOR-packed in exactly the lexical format with the same
+   per-page block index. Nothing about the posting format is new, which is the only
+   reason GenericXLog, vacuum, tombstones and the livedocs rule came for free.
+2. **A cgram-bearing bolt cannot be merged**, because a merge streams dictionary
+   terms out of its inputs and this weft's input is the raw column TEXT, which the
+   index does not store. `weave_seg_mergeable()` refuses such a group, and
+   `weave_merge_selected()` refuses again at its own chokepoint. The follow-up that
+   removes the limitation is a k-way merge of the cgram wefts themselves — they are
+   dictionary + postings in the lexical shape, so `MergeSource` parameterized on
+   `(dictstart, dictindexstart)` merges them the way it merges the lexical weft.
+3. **The recheck on this route is MANDATORY, unlike Z6's exact dictionary walk.**
+   Byte trigrams over-generate by construction (wrong order, wrong run, spanning a
+   `%`, hash collision, ASCII case fold), so the route rechecks every candidate
+   against its live heap tuple and hands the executor `recheck = false`. Mutation
+   leg 1 in `bench/RESULTS_CGRAM.md` §7 shows a false positive appearing the moment
+   the recheck is removed — and shows that only a MIXED-CASE probe pattern makes
+   that leg decidable.
+
 ## 7. Build cost model
 
 pg_tre: one emitted tuple per (trigram, occurrence) → ~64 B × 83.5 M = the
