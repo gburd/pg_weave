@@ -41,7 +41,10 @@
  *        predicate) has no score.  It reports block_max() == +INF when the
  *        block may contain a match and -INF when it provably cannot, and
  *        score() == 0.0 for a match / -INF for a non-match.  The scorer's
- *        arithmetic then does the right thing without a special case.
+ *        arithmetic then does the right thing without a special case.  The
+ *        reference implementation is include/weave/gate.h (task Z7): a
+ *        cursor over a sorted key set whose block is one position, because
+ *        for a predicate the seek IS the skip.
  *
  *   (C6) LIVEDOCS ARE NOT YOUR JOB.  Tombstones are applied once, by the
  *        scorer, from the bolt's shared livedocs bitmap.  A channel must never
@@ -94,8 +97,8 @@ typedef enum WeaveChannelKind
 	WEAVE_CH_POSITION,			/* phrase/NEAR over the lazily-decoded 4th column */
 	WEAVE_CH_VECTOR_SCAN,		/* quantized code scan, 32-lane blocks */
 	WEAVE_CH_VECTOR_GRAPH,		/* Vamana traversal over quantized codes */
-	WEAVE_CH_FUZZY,				/* vocabulary funnel: trigram + SuRF + Levenshtein */
-	WEAVE_CH_REGEX,				/* regex AST -> trigram tiling -> vocabulary funnel */
+	WEAVE_CH_FUZZY,				/* uleven walk over the dictionary (Z5); gate shuttle, gate.h */
+	WEAVE_CH_REGEX,				/* core regex engine over the dictionary, trigram-narrowed (Z6); gate shuttle */
 	WEAVE_CH_DOCVALS,			/* scalar / facet predicate from docvalues */
 	WEAVE_CH_CGRAM,				/* opt-in corpus-level character trigrams */
 	WEAVE_NUM_CHANNEL_KINDS

@@ -36,6 +36,7 @@ OBJS = \
 	src/query/trgm.o \
 	src/util/sparsemap.o \
 	src/query/match.o \
+	src/query/gate.o \
 	src/vector/quantize.o \
 	src/vector/pack.o \
 	src/vector/vecpage.o \
@@ -391,6 +392,9 @@ check-standalone:
 	echo "== Z5 uleven: exact vocabulary neighbourhood, skip soundness, char units =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/ul test/hegel/test_uleven.c -lm; \
 	$$tmp/ul | tail -1; \
+	echo "== Z7 gate shuttle (C1)+(C2)+(C5): monotone seek == linear oracle, +/-INF, backward refused =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/bounds test/hegel/test_bounds.c; \
+	$$tmp/bounds | tail -1; \
 	echo "== TRE d0e0c997 -> f864ed0 (pg_tre 1521662): backref wrong-answer fix =="; \
 	bash test/hegel/run_tre_bump.sh backref | tail -1; \
 	echo "== pg_tre 2be8dbf (v3.2.5): literal '-' first/last in a bracket expression =="; \

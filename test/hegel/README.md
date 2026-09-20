@@ -31,6 +31,15 @@ Coverage:
   written with the extended encoding, i.e. that an older `.so` fails closed instead
   of mistaking `WEAVE_PK_CHANDESC` for a posting page. Wired into
   `make check-standalone`, so it gates a build.
+- `test_bounds.c` — the boolean-gate shuttle's cursor core (`weave/gate.h`:
+  `weave_gate_check_keys`/`_init`/`_seek`/`_on_key`), task Z7. Dependency-free
+  (`-I include` only, no hegel-c), wired into `make check-standalone`. Asserts
+  (C1) against a linear-scan oracle over random strictly-ascending key sets and
+  non-decreasing seek sequences, (C2)/(C5) `block_max >= score` with `+INF` on a
+  key and `-INF` exactly when no key remains, and that a backward seek is
+  refused rather than clamped. Keys near `UINT32_MAX` and the end sentinel are
+  generated on purpose: the width refusal is the open Phase F question the
+  header records.
 
 Both include the real source directly (the header / the `.c`), so the tests and
 the extension share one copy — no duplicated logic to drift.
