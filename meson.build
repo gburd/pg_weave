@@ -71,6 +71,8 @@ sources = files(
   'src/query/trgm.c',
   'src/util/sparsemap.c',
   'src/query/match.c',
+  # Z7: the boolean-gate shuttle (include/weave/gate.h).  In OBJS too.
+  'src/query/gate.c',
   # Fuzzy/regex/prefix channel, imported from pg_tre (doc/specs/IMPORT_pg_tre.md)
   # and wired into the build by tasks Z1/Z2.  Compiled and linked but not yet
   # reachable from the access method or the planner (Z3 onward).

@@ -51,3 +51,7 @@ add_executable(test_docvalid test_docvalid.c)
 target_include_directories(test_docvalid PRIVATE ${PG_FTS_ROOT})
 target_link_libraries(test_docvalid PRIVATE hegel cmocka::cmocka)
 add_test(NAME test_docvalid COMMAND test_docvalid)
+
+add_executable(test_bounds test_bounds.c)
+target_include_directories(test_bounds PRIVATE ${PG_FTS_ROOT}/include)
+add_test(NAME test_bounds COMMAND test_bounds)
