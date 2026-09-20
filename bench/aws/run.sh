@@ -15,6 +15,10 @@
 #					  smoke	   build + regression + isolation + TAP + codec test
 #					  bound	   the block-bound pruning sweep (bench/bound_pruning.c)
 #					  lexical  smoke, then pg_weave vs tsvector+GIN on a real corpus
+#					  fuzzy	   smoke, then the Z5 (fuzzy term~1/term~2) and Z6
+#							     (character-class regex) latency gates on a 1M-row
+#							     corpus, both index arms (trigrams off/on), each
+#							     run twice (bench/fuzzy.sh)
 #					  all	   all of the above
 #					  winsweep   rerank window at n=1M, the Phase V frontier's
 #							     fragile number (CPU only, no server)
@@ -43,7 +47,8 @@
 #							     from rerankcold -- one engine per host.
 #
 #	 NDOCS / VOCAB environment variables size the lexical corpus (default 1M /
-#	 200k).  A 1M-document run takes a few minutes to generate.
+#	 200k).  A 1M-document run takes a few minutes to generate.  NDOCS / REPS size
+#	 the fuzzy corpus and rep count (default 1M / 7); see bench/fuzzy.sh.
 #
 # The AWS profile is a BURNER and it changes -- `hotdog` as of 2026-09-18,
 # `lava` before it, `bene` before that.  It is a default here and nowhere else,
@@ -376,6 +381,19 @@ run_lexical() {
 		  export PATH=/usr/lib/postgresql/17/bin:\$PATH PGDATABASE=weavebench; \
 		  bash bench/lexical.sh ${NDOCS:-1000000} ${VOCAB:-200000} 7" \
 		2>&1 | tee "$OUT/lexical.log"
+}
+
+run_fuzzy() {
+	# The Z5 (fuzzy term~1/term~2) and Z6 (character-class regex) latency gates,
+	# for the record.  Both routes are implemented (weave_fuzzy_terms(),
+	# weave_regex_terms(), src/am/amscan.c) and both were previously measured
+	# only on a dev box -- no bench/aws/run.sh run behind them, so no
+	# commit-tied number.  Correctness is gated before any timing.
+	say "fuzzy/regex benchmark: Z5 and Z6 gates"
+	$SSH "cd pg_weave && sudo -u postgres createuser -s ubuntu 2>/dev/null; \
+		  export PATH=/usr/lib/postgresql/17/bin:\$PATH PGDATABASE=weavebench; \
+		  bash bench/fuzzy.sh ${NDOCS:-1000000} ${REPS:-7}" \
+		2>&1 | tee "$OUT/fuzzy.log"
 }
 
 run_bitsweep() {
@@ -975,6 +993,7 @@ case "$JOB" in
 	smoke)   run_smoke ;;
 	bound)   run_bound ;;
 	lexical) run_smoke; run_lexical ;;
+	fuzzy)   run_smoke; run_fuzzy ;;
 	bitsweep) run_bitsweep ;;
 	p0merge) run_p0merge ;;
 	vall)    run_bitsweep; run_p0merge ;;
