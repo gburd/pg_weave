@@ -847,6 +847,7 @@ uint64		weave_chan_prefix_surf = 0;
 uint64		weave_chan_fuzzy_dict = 0;
 uint64		weave_chan_fuzzy_surf = 0;
 uint64		weave_chan_fuzzy_trgm = 0;
+uint64		weave_chan_regex_dict = 0;
 uint64		weave_chan_regex_trgm = 0;
 uint64		weave_chan_regex_surf = 0;
 uint64		weave_chan_vector_scan = 0;
@@ -1086,8 +1087,8 @@ Datum
 weave_channel_stats(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[17];
-	bool		nulls[17];
+	Datum		values[18];
+	bool		nulls[18];
 	HeapTuple	tuple;
 	int			i;
 
@@ -1095,7 +1096,7 @@ weave_channel_stats(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 	tupdesc = BlessTupleDesc(tupdesc);
 
-	for (i = 0; i < 17; i++)
+	for (i = 0; i < 18; i++)
 		nulls[i] = false;
 
 	values[0] = Int64GetDatum((int64) weave_chan_lex_term);
@@ -1104,17 +1105,18 @@ weave_channel_stats(PG_FUNCTION_ARGS)
 	values[3] = Int64GetDatum((int64) weave_chan_fuzzy_dict);
 	values[4] = Int64GetDatum((int64) weave_chan_fuzzy_trgm);
 	values[5] = Int64GetDatum((int64) weave_chan_fuzzy_surf);
-	values[6] = Int64GetDatum((int64) weave_chan_regex_trgm);
-	values[7] = Int64GetDatum((int64) weave_chan_regex_surf);
-	values[8] = Int64GetDatum((int64) weave_chan_vector_scan);
-	values[9] = Int64GetDatum((int64) weave_chan_terms_expanded);
-	values[10] = Int64GetDatum((int64) weave_chan_dict_pages);
-	values[11] = Int64GetDatum((int64) weave_chan_surf_loads);
-	values[12] = Int64GetDatum((int64) weave_chan_surf_bytes);
-	values[13] = Int64GetDatum((int64) weave_chan_surf_cache_hits);
-	values[14] = Int64GetDatum((int64) weave_chan_surf_cache_misses);
-	values[15] = Int64GetDatum((int64) weave_chan_surf_cache_evicts);
-	values[16] = Int64GetDatum((int64) weave_chan_surf_cache_bytes);
+	values[6] = Int64GetDatum((int64) weave_chan_regex_dict);
+	values[7] = Int64GetDatum((int64) weave_chan_regex_trgm);
+	values[8] = Int64GetDatum((int64) weave_chan_regex_surf);
+	values[9] = Int64GetDatum((int64) weave_chan_vector_scan);
+	values[10] = Int64GetDatum((int64) weave_chan_terms_expanded);
+	values[11] = Int64GetDatum((int64) weave_chan_dict_pages);
+	values[12] = Int64GetDatum((int64) weave_chan_surf_loads);
+	values[13] = Int64GetDatum((int64) weave_chan_surf_bytes);
+	values[14] = Int64GetDatum((int64) weave_chan_surf_cache_hits);
+	values[15] = Int64GetDatum((int64) weave_chan_surf_cache_misses);
+	values[16] = Int64GetDatum((int64) weave_chan_surf_cache_evicts);
+	values[17] = Int64GetDatum((int64) weave_chan_surf_cache_bytes);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
@@ -1131,6 +1133,7 @@ weave_channel_stats_reset(PG_FUNCTION_ARGS)
 	weave_chan_fuzzy_dict = 0;
 	weave_chan_fuzzy_surf = 0;
 	weave_chan_fuzzy_trgm = 0;
+	weave_chan_regex_dict = 0;
 	weave_chan_regex_trgm = 0;
 	weave_chan_regex_surf = 0;
 	weave_chan_vector_scan = 0;

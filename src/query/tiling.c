@@ -245,6 +245,7 @@ pg_weave_tile_spine(const SpineEntry *spine, int spine_n, int32 k,
                 {
                     TrigramDisjunct *d = &out->conjuncts[t].alts[alt_idx++];
                     d->trigram_hash = pg_weave_hash_trigram_cp(expanded[j]);
+                    memcpy(d->cp, expanded[j], sizeof(d->cp));
                     /* Widen position range by +/- k for edit distance tolerance */
                     d->min_offset = (e->pattern_offset > k) ? (e->pattern_offset - k) : 0;
                     d->max_offset = e->pattern_offset + k;
@@ -263,6 +264,7 @@ pg_weave_tile_spine(const SpineEntry *spine, int spine_n, int32 k,
                 TrigramDisjunct *d = &out->conjuncts[t].alts[i];
 
                 d->trigram_hash = pg_weave_hash_trigram_cp(e->trigram);
+                memcpy(d->cp, e->trigram, sizeof(d->cp));
                 d->min_offset = e->pattern_offset;
                 d->max_offset = e->pattern_offset;
             }
