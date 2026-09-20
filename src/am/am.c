@@ -851,6 +851,7 @@ uint64		weave_chan_regex_dict = 0;
 uint64		weave_chan_regex_trgm = 0;
 uint64		weave_chan_regex_surf = 0;
 uint64		weave_chan_vector_scan = 0;
+uint64		weave_chan_cgram_scan = 0;
 uint64		weave_chan_terms_expanded = 0;
 uint64		weave_chan_dict_pages = 0;
 uint64		weave_chan_surf_loads = 0;
@@ -1087,8 +1088,8 @@ Datum
 weave_channel_stats(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[18];
-	bool		nulls[18];
+	Datum		values[19];
+	bool		nulls[19];
 	HeapTuple	tuple;
 	int			i;
 
@@ -1096,7 +1097,7 @@ weave_channel_stats(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 	tupdesc = BlessTupleDesc(tupdesc);
 
-	for (i = 0; i < 18; i++)
+	for (i = 0; i < 19; i++)
 		nulls[i] = false;
 
 	values[0] = Int64GetDatum((int64) weave_chan_lex_term);
@@ -1117,6 +1118,7 @@ weave_channel_stats(PG_FUNCTION_ARGS)
 	values[15] = Int64GetDatum((int64) weave_chan_surf_cache_misses);
 	values[16] = Int64GetDatum((int64) weave_chan_surf_cache_evicts);
 	values[17] = Int64GetDatum((int64) weave_chan_surf_cache_bytes);
+	values[18] = Int64GetDatum((int64) weave_chan_cgram_scan);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
@@ -1137,6 +1139,7 @@ weave_channel_stats_reset(PG_FUNCTION_ARGS)
 	weave_chan_regex_trgm = 0;
 	weave_chan_regex_surf = 0;
 	weave_chan_vector_scan = 0;
+	weave_chan_cgram_scan = 0;
 	weave_chan_terms_expanded = 0;
 	weave_chan_dict_pages = 0;
 	weave_chan_surf_loads = 0;
@@ -1292,7 +1295,13 @@ weave_page_kind_name(WeavePageKind kind)
 		case WEAVE_PK_DOCVALS:
 			return "docvalues";
 		case WEAVE_PK_CGRAM:
-			return "corpus_trigram";
+			return "cgram_root";
+		case WEAVE_PK_CGRAM_DICT:
+			return "cgram_dictionary";
+		case WEAVE_PK_CGRAM_DICTINDEX:
+			return "cgram_dict_index";
+		case WEAVE_PK_CGRAM_POST:
+			return "cgram_postings";
 		case WEAVE_PK_VDIR:
 			return "vector_dir";
 		case WEAVE_PK_VWARP:
@@ -2338,7 +2347,7 @@ weave_read_chandesc(Relation index, BlockNumber blk,
 static int
 weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
 						   BlockNumber surfroot, BlockNumber vecroot,
-						   WeaveChannelDesc *weft)
+						   BlockNumber cgramroot, WeaveChannelDesc *weft)
 {
 	int			n = 0;
 
@@ -2403,6 +2412,32 @@ weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
 		weft[n].root = surfroot;
 		n++;
 	}
+
+	/*
+	 * Z8: the CGRAM weft, rooted at its WEAVE_PK_CGRAM page.
+	 *
+	 * LAST, and that is not an accident either: weave_chandesc_check() requires
+	 * strictly ascending (kind, attnum), and WEAVE_WK_CGRAM is 5, above FUZZY's
+	 * 3.  It happens to be appendable today; the next weft with a kind below 5
+	 * will have to be INSERTED, and the consequence of getting it wrong is the
+	 * one the VECTOR comment above spells out -- a descriptor page the validator
+	 * rejects, hence a bolt whose wefts can never be freed.
+	 *
+	 * attnum genuinely varies: the gram_ops column may be listed before or after
+	 * the wdoc, so it comes from weave_index_layout() rather than a constant.
+	 */
+	if (cgramroot != InvalidBlockNumber)
+	{
+		WeaveIndexLayout layout;
+
+		weave_index_layout(index, &layout);
+		Assert(layout.cgramattno != 0);
+		weft[n].kind = (uint16) WEAVE_WK_CGRAM;
+		weft[n].attnum = (uint16) layout.cgramattno;
+		weft[n].flags = 0;
+		weft[n].root = cgramroot;
+		n++;
+	}
 	return n;
 }
 
@@ -2410,13 +2445,223 @@ weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
  * chain of the bolt has been written, so each root is known. */
 void
 weave_attach_chandesc(Relation index, WeaveSegMeta *seg, BlockNumber surfroot,
-					  BlockNumber vecroot)
+					  BlockNumber vecroot, BlockNumber cgramroot)
 {
 	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
 	int			nweft = weave_chandesc_for_segment(index, seg, surfroot, vecroot,
-												   weft);
+												   cgramroot, weft);
 
 	seg->chandesc = weave_write_chandesc(index, weft, nweft);
+}
+
+/* ---------------------------------------------------------------------------
+ * The cgram weft's root page (task Z8)
+ *
+ * One page, four block numbers and a count.  See include/weave/cgram.h for why
+ * each field is there, and include/weave/am.h for why these live in am.c.
+ * ------------------------------------------------------------------------- */
+
+BlockNumber
+weave_write_cgram_root(Relation index, BlockNumber dictstart,
+					   BlockNumber dictindexstart, BlockNumber postingstart,
+					   uint32 nterms)
+{
+	Buffer		buf = weave_new_buffer(index);
+	BlockNumber blk = BufferGetBlockNumber(buf);
+	GenericXLogState *state = GenericXLogStart(index);
+	Page		page = GenericXLogRegisterBuffer(state, buf,
+												 GENERIC_XLOG_FULL_IMAGE);
+	WeaveCgramPageData *cp;
+
+	/* 100% GenericXLog (AGENTS.md hard rule 2).  FULL_IMAGE because the page is
+	 * brand new, so a delta against the pre-image would be the whole page. */
+	weave_init_page(page, WEAVE_PK_CGRAM);
+	cp = (WeaveCgramPageData *) PageGetContents(page);
+	cp->magic = WEAVE_CGRAM_MAGIC;
+	cp->version = WEAVE_CGRAM_VERSION;
+	cp->reserved = 0;
+	cp->dictstart = (uint32) dictstart;
+	cp->dictindexstart = (uint32) dictindexstart;
+	cp->postingstart = (uint32) postingstart;
+	cp->nterms = nterms;
+	/* pd_lower must cover exactly the bytes written, because every reader of
+	 * this page bounds itself with weave_page_entry_end() -- which is also the
+	 * only sanctioned way to look at pd_lower (make check-pdlower). */
+	((PageHeader) page)->pd_lower =
+		((char *) PageGetContents(page) - (char *) page) +
+		WEAVE_CGRAM_PAGEDATA_SIZE;
+
+	GenericXLogFinish(state);
+	UnlockReleaseBuffer(buf);
+	return blk;
+}
+
+bool
+weave_cgram_weft_open(Relation index, BlockNumber root, WeaveCgramWeft *out,
+					  const char **why)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	Buffer		buf;
+	Page		page;
+	const WeaveCgramPageData *cp;
+	char	   *contents;
+	char	   *end;
+
+	*why = NULL;
+	memset(out, 0, sizeof(*out));
+	out->root = InvalidBlockNumber;
+	out->dictstart = InvalidBlockNumber;
+	out->dictindexstart = InvalidBlockNumber;
+	out->postingstart = InvalidBlockNumber;
+
+	if (root == InvalidBlockNumber || root == WEAVE_METAPAGE_BLKNO ||
+		root >= nblocks)
+	{
+		*why = "cgram weft root block is invalid or out of relation bounds";
+		return false;
+	}
+
+	buf = ReadBuffer(index, root);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	if (PageIsNew(page))
+	{
+		UnlockReleaseBuffer(buf);
+		*why = "cgram weft root block is uninitialized";
+		return false;
+	}
+
+	/*
+	 * WeavePageHasKind(), never `flags & something`: WEAVE_PK_CGRAM is an
+	 * INTEGER id under the escape bit, so a bitwise AND compiles and is always
+	 * false.  That is the L17 class of bug and it has been made twice in this
+	 * tree already (see weave_surf_walk).
+	 */
+	if (!WeavePageHasKind(page, WEAVE_PK_CGRAM))
+	{
+		UnlockReleaseBuffer(buf);
+		*why = "cgram weft root block is not a cgram page";
+		return false;
+	}
+
+	/*
+	 * The fits-guard every other reader in this file uses.  These bytes come off
+	 * disk on a page held under a share lock, and a concurrent merge can free
+	 * this page while a concurrent insert recycles it, so the readable extent is
+	 * pd_lower via weave_page_entry_end() and nothing else.
+	 */
+	contents = (char *) PageGetContents(page);
+	end = weave_page_entry_end(page);
+	if (end < contents || (Size) (end - contents) < WEAVE_CGRAM_PAGEDATA_SIZE)
+	{
+		UnlockReleaseBuffer(buf);
+		*why = "cgram weft root page is too short for its header";
+		return false;
+	}
+
+	cp = (const WeaveCgramPageData *) contents;
+	if (cp->magic != WEAVE_CGRAM_MAGIC)
+	{
+		UnlockReleaseBuffer(buf);
+		*why = "bad cgram weft magic";
+		return false;
+	}
+	if (cp->version != WEAVE_CGRAM_VERSION)
+	{
+		UnlockReleaseBuffer(buf);
+		*why = "unsupported cgram weft version";
+		return false;
+	}
+	if (cp->reserved != 0)
+	{
+		UnlockReleaseBuffer(buf);
+		*why = "cgram weft reserved word is not zero";
+		return false;
+	}
+	if (cp->nterms == 0 || cp->nterms > WEAVE_CGRAM_MAX_TERMS)
+	{
+		/* Zero is a corrupt weft and not an empty one: a weft with no trigrams
+		 * is not WRITTEN at all (absent is safe), so a root page claiming zero
+		 * is a page that should not exist. */
+		UnlockReleaseBuffer(buf);
+		*why = "cgram weft term count is zero or above the 2^24 trigram bound";
+		return false;
+	}
+	if ((BlockNumber) cp->dictstart == InvalidBlockNumber ||
+		cp->dictstart == 0 || (BlockNumber) cp->dictstart >= nblocks)
+	{
+		UnlockReleaseBuffer(buf);
+		*why = "cgram weft dictionary start is invalid or out of bounds";
+		return false;
+	}
+	if ((BlockNumber) cp->dictindexstart != InvalidBlockNumber &&
+		((BlockNumber) cp->dictindexstart >= nblocks || cp->dictindexstart == 0))
+	{
+		UnlockReleaseBuffer(buf);
+		*why = "cgram weft block-index start is out of bounds";
+		return false;
+	}
+	if ((BlockNumber) cp->postingstart != InvalidBlockNumber &&
+		((BlockNumber) cp->postingstart >= nblocks || cp->postingstart == 0))
+	{
+		UnlockReleaseBuffer(buf);
+		*why = "cgram weft posting start is out of bounds";
+		return false;
+	}
+
+	out->root = root;
+	out->dictstart = (BlockNumber) cp->dictstart;
+	out->dictindexstart = (BlockNumber) cp->dictindexstart;
+	out->postingstart = (BlockNumber) cp->postingstart;
+	out->nterms = cp->nterms;
+	UnlockReleaseBuffer(buf);
+	return true;
+}
+
+BlockNumber
+weave_cgram_weft_root(Relation index, const WeaveSegMeta *seg)
+{
+	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
+	int			nweft;
+	int			i;
+	BlockNumber root = InvalidBlockNumber;
+
+	if (seg->chandesc == InvalidBlockNumber)
+		return InvalidBlockNumber;	/* pre-v6 bolt: lexical only, by definition */
+
+	nweft = weave_chandesc_required(index, seg->chandesc, weft, WEAVE_MAX_WEFTS);
+	for (i = 0; i < nweft; i++)
+		if (weft[i].kind == (uint16) WEAVE_WK_CGRAM)
+			root = weft[i].root;
+	return root;
+}
+
+void
+weave_cgram_free_weft(Relation index, BlockNumber root)
+{
+	WeaveCgramWeft w;
+	const char *why = NULL;
+
+	if (root == InvalidBlockNumber)
+		return;
+
+	/*
+	 * Free the three chains FIRST and the root LAST, so a throw part-way leaves
+	 * the root still naming what is left rather than orphaning it.  If the root
+	 * does not open, free only the root: the alternative is guessing block
+	 * numbers out of a page that just failed validation, and freeing live pages
+	 * from a corrupt read is the worst outcome in this file.
+	 * weave_check(deep)'s pages_reachable_or_freed then reports what was left.
+	 */
+	if (weave_cgram_weft_open(index, root, &w, &why))
+	{
+		weave_free_chain(index, w.dictstart);
+		if (w.dictindexstart != InvalidBlockNumber)
+			weave_free_chain(index, w.dictindexstart);
+		if (w.postingstart != InvalidBlockNumber)
+			weave_free_chain(index, w.postingstart);
+	}
+	weave_free_page(index, root);
 }
 
 /* ---------------------------------------------------------------------------
@@ -3359,6 +3604,20 @@ weave_free_segment(Relation index, const WeaveSegMeta *seg)
 					weave_vec_free_weft(index, weft[i].root);
 					continue;
 				}
+
+				/*
+				 * The CGRAM weft is THREE chains behind one root page, exactly
+				 * like the vector weft and for exactly the same reason.  Z8
+				 * DELIBERATELY DOES NOT MERGE this weft (see the comment at its
+				 * writer in ambuild.c), so every merge frees one -- which makes
+				 * this arm the hottest of the three, not the coldest, and a leak
+				 * here would compound on every merge rather than never.
+				 */
+				if (weft[i].kind == (uint16) WEAVE_WK_CGRAM)
+				{
+					weave_cgram_free_weft(index, weft[i].root);
+					continue;
+				}
 				weave_free_chain(index, weft[i].root);
 			}
 		}
@@ -3596,6 +3855,15 @@ static const struct
 }			weave_opfamily_kinds[] = {
 	{"wdoc_lex_ops", WEAVE_WK_LEXICAL},
 	{"wvec_weave_ops", WEAVE_WK_VECTOR},
+	/*
+	 * Z8.  `gram_ops` keeps the short name rather than becoming
+	 * `text_weave_ops`: the family says WHICH CHANNEL, not which type, and text
+	 * is exactly the type a future second text channel would also want.  It is
+	 * also the name the WeaveIndexLayout block comment already uses as its
+	 * worked example of why the opclass and not the column type is the
+	 * discriminator.
+	 */
+	{"gram_ops", WEAVE_WK_CGRAM},
 };
 
 /*
@@ -3639,7 +3907,7 @@ weave_opfamily_kind(Oid opfamilyoid)
 				 errmsg("operator family \"%s\" is not a pg_weave channel family",
 						opfname),
 				 errdetail("The \"weave\" access method routes each index column to a retrieval channel by its operator class."),
-				 errhint("Use wdoc_lex_ops for a wdoc column or wvec_weave_ops for a wvec column.")));
+				 errhint("Use wdoc_lex_ops for a wdoc column, wvec_weave_ops for a wvec column, or gram_ops for a text column.")));
 	return kind;
 }
 
@@ -3710,6 +3978,24 @@ weave_index_layout(Relation index, WeaveIndexLayout *out)
 							 errdetail("Columns %d and %d both use a vector operator class.",
 									   out->vecattno, i + 1)));
 				out->vecattno = (AttrNumber) (i + 1);
+				break;
+			case WEAVE_WK_CGRAM:
+				/*
+				 * One cgram column, for the same reason as the other two: the
+				 * bolt's channel descriptor keys a weft by (kind, attnum) and
+				 * the writer emits exactly one CGRAM descriptor, so a second
+				 * gram_ops column would silently index only one of them.
+				 * Refusing is the difference between an error and a column that
+				 * looks indexed and answers nothing.
+				 */
+				if (out->cgramattno != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("index \"%s\" has more than one cgram column",
+									RelationGetRelationName(index)),
+							 errdetail("Columns %d and %d both use gram_ops.",
+									   out->cgramattno, i + 1)));
+				out->cgramattno = (AttrNumber) (i + 1);
 				break;
 			default:
 				elog(ERROR, "unhandled weave weft kind %d for index \"%s\" column %d",

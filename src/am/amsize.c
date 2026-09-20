@@ -132,6 +132,26 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 		{"vector_dir", WEAVE_PK_VDIR, 0, 0},
 		{"vector_codes", WEAVE_PK_VCODES, 0, 0},
 		{"vector_warp", WEAVE_PK_VWARP, 0, 0},
+		/*
+		 * The cgram weft's four page kinds (task Z8).  This function's header
+		 * promises that no byte of a weave index is unattributed, and the whole
+		 * public claim about this channel is a SIZE COMPARISON -- doc/specs/
+		 * FUZZY_CHANNEL.md sect. 6 commits in writing that with cgram on,
+		 * pg_weave does not claim to be smaller than pg_trgm, and
+		 * bench/RESULTS_CGRAM.md has to show the delta.  That number is
+		 * measurable from inside the index ONLY because the cgram dictionary,
+		 * block index and postings carry their own page kinds rather than
+		 * sharing the lexical weft's; see WEAVE_PK_CGRAM_DICT in
+		 * weave/pagekind.h for the rest of that argument.
+		 *
+		 * cgram_postings is expected to dominate the four: at the measured 58.1
+		 * (trigram, document) pairs per document, the dictionary is a few
+		 * thousand 4-byte keys and the postings are tens of millions of docids.
+		 */
+		{"cgram_root", WEAVE_PK_CGRAM, 0, 0},
+		{"cgram_dictionary", WEAVE_PK_CGRAM_DICT, 0, 0},
+		{"cgram_dict_index", WEAVE_PK_CGRAM_DICTINDEX, 0, 0},
+		{"cgram_postings", WEAVE_PK_CGRAM_POST, 0, 0},
 	};
 	int			nbuckets = lengthof(buckets);
 	int64		unknown_pages = 0;
