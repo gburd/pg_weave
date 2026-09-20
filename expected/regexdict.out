@@ -1,0 +1,373 @@
+-- Task Z6: the regex channel is decided on the dictionary, exactly, by core's
+-- own engine -- and the trigram weft only narrows which terms it is asked about.
+--
+-- WHY THIS FILE EXISTS.  `/re/` is answered three ways in this extension and they
+-- have to be the same answer:
+--
+--   1. from the index, by compiling the pattern once and running pg_regexec over
+--      the segment's dictionary terms (src/am/amscan.c, weave_regex_terms),
+--      narrowed by the trigram weft when the index has one;
+--   2. from a wdoc value on the heap, by weave_doc_has_regex() (src/query/doc.c),
+--      which asks RE_compile_and_execute() with the same flags and collation;
+--   3. by core's `~` operator over the document's whitespace tokens, which is the
+--      same ARE engine, unanchored, and nobody's implementation detail here --
+--      therefore the oracle.
+--
+-- Until Z6, (1) was a trigram FUNNEL followed by a per-row heap recheck, and the
+-- funnel's "required trigrams" came from a literal-run scanner over the raw pattern
+-- that read `\d` as the letter d.  So with a trigram weft present, `/ab\dcd/`
+-- demanded a term sharing a trigram with "abdcd"; ab5cd shares none, and the index
+-- returned NO rows for a document containing it while (2) and (3) returned it -- a false
+-- negative (G32), and the recheck could not repair it because a recheck
+-- only removes rows.  Every assertion below is a three-way agreement, because
+-- two-way agreement between (1) and (2) would have hidden exactly that: they shared
+-- the recheck.
+--
+-- The index arm runs with seqscan disabled; the heap arm applies @@@ to
+-- to_wdoc('simple', body), an expression no index covers, so it is evaluated per
+-- row no matter what the planner decides.  The oracle splits body on spaces, which
+-- is the analyzer's tokenization for these rows by construction: every token is
+-- letters and digits, so the `simple` parser keeps each one whole.
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+NOTICE:  extension "pg_weave" already exists, skipping
+ALTER EXTENSION pg_weave UPDATE;
+NOTICE:  version "0.11.0" of extension "pg_weave" is already installed
+SET max_parallel_workers_per_gather = 0;
+-- TWO COPIES OF THE SAME TABLE, ONE WITH A TRIGRAM WEFT AND ONE WITHOUT.  The
+-- reloption defaults off, and the narrowing exists only when it is on, so a file
+-- built on the default alone would test the walk-everything path and say nothing
+-- about the narrowing -- while a file built on trigrams=on alone would never run
+-- the path a default index takes.  Both paths must give the oracle's answer.
+CREATE TABLE rd (id serial, body text, d wdoc);
+INSERT INTO rd(body) VALUES
+  ('e1234 class hit'),            --  1: e12[0-9]{2}, ^e12, [0-9]
+  ('e1299 class hit too'),        --  2: e12[0-9]{2}, ^e12
+  ('e1300 class miss'),           --  3: ^e1 but not e12[0-9]{2}
+  ('ab5cd digit escape'),         --  4: ab\dcd (G32), cd$
+  ('abdcd escape read as d'),     --  5: what the old scanner thought \d meant; cd$
+  ('abc token'),                  --  6: abc, \yabc\y, ^abc, a.c, abc$
+  ('xabcx embedded'),             --  7: abc, a.c -- but not \yabc\y, ^abc, abc$
+  ('axc dotted'),                 --  8: a.c
+  ('foobaz alternation'),         --  9: (foo|bar)baz
+  ('barbaz alternation'),         -- 10: (foo|bar)baz
+  ('bazbaz alternation control'), -- 11: not (foo|bar)baz
+  ('xxxy plus'),                  -- 12: x+y, xy
+  ('xy two chars'),               -- 13: x+y, xy
+  ('q7z posix class'),            -- 14: q[[:digit:]]z
+  ('ABC abc shouted');            -- 15: (?i)ABC; see "the dictionary is folded"
+-- ASCII filler so the vocabulary is not degenerate, the weft has thousands of
+-- terms to narrow among, and the planner has a reason to prefer the index once
+-- seqscan is off.  No filler token matches any pattern below.
+INSERT INTO rd(body) SELECT 'filler token number ' || g
+  FROM generate_series(100, 3099) g;
+UPDATE rd SET d = to_wdoc('simple', body);
+CREATE INDEX rd_on ON rd USING weave (d) WITH (trigrams = on);
+CREATE TABLE rdo AS SELECT * FROM rd;
+CREATE INDEX rdo_off ON rdo USING weave (d);
+ANALYZE rd;
+ANALYZE rdo;
+-- ---- the oracle, stated first ----------------------------------------------
+-- So that every 'f' below is read as "pg_weave disagrees with `~`", not as "maybe
+-- that pattern does not match that token".  Core's ARE reads \d as a digit, \y as
+-- a word boundary, [[:digit:]] as a POSIX class and (?i) as a case director.
+SELECT 'ab5cd' ~ 'ab\dcd' AS backslash_d_is_a_digit,
+       'abdcd' !~ 'ab\dcd' AS and_not_the_letter_d,
+       'abc' ~ '\yabc\y' AS word_boundaries,
+       'xabcx' !~ '\yabc\y' AS bind,
+       'q7z' ~ 'q[[:digit:]]z' AS posix_class,
+       'abc' ~ '(?i)ABC' AS case_director;
+ backslash_d_is_a_digit | and_not_the_letter_d | word_boundaries | bind | posix_class | case_director 
+------------------------+----------------------+-----------------+------+-------------+---------------
+ t                      | t                    | t               | t    | t           | t
+(1 row)
+
+-- ---- THE THREE-WAY AGREEMENT, trigrams = on --------------------------------
+-- For each pattern: the ids the index returns, the ids the heap predicate returns,
+-- and the ids `~` says qualify.  All three arrays must be identical.  The patterns
+-- are chosen so that each exercises a different decision in the narrowing:
+--   e12[0-9]{2}    a class with a 3-codepoint literal run: narrowed on "e12"
+--   abc            a literal: narrowed on "abc"
+--   ^e12 / cd$     anchored: anchors do not break a run, and are the engine's job
+--   (foo|bar)baz   alternation: only trigrams common to both sides are required
+--   a.c / x+y      no literal run of three: extraction yields nothing, so the walk
+--                  runs the engine over every term -- NOT narrowed, and correct
+--   xy             a 2-char literal run, same
+--   ab\dcd         an ARE escape the pg_tre dialect misreads: narrowing REFUSED
+--   \yabc\y        another; refused
+--   q[[:digit:]]z  a POSIX class; refused
+--   (?i)ABC        a director; refused
+--   zzqqzz         a literal that nothing contains: narrowed to the empty set, and
+--                  the dictionary is not read at all
+SET enable_seqscan = off;
+SELECT p,
+       (SELECT array_agg(id ORDER BY id) FROM rd
+          WHERE d @@@ ('/' || p || '/')::wquery) AS from_the_index,
+       (SELECT array_agg(id ORDER BY id) FROM rd
+          WHERE to_wdoc('simple', body) @@@ ('/' || p || '/')::wquery) AS from_the_heap,
+       (SELECT array_agg(id ORDER BY id) FROM rd
+          WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body, ' ')) t
+                         WHERE t ~ p)) AS from_core_regex
+  FROM (VALUES ('e12[0-9]{2}'), ('abc'), ('^e12'), ('cd$'), ('(foo|bar)baz'),
+               ('a.c'), ('x+y'), ('ab\dcd'), ('\yabc\y'), ('q[[:digit:]]z'),
+               ('(?i)ABC'), ('zzqqzz'), ('xy')) v(p)
+  ORDER BY p;
+       p       | from_the_index | from_the_heap | from_core_regex 
+---------------+----------------+---------------+-----------------
+ (?i)ABC       | {6,7,15}       | {6,7,15}      | {6,7,15}
+ (foo|bar)baz  | {9,10}         | {9,10}        | {9,10}
+ \yabc\y       | {6,15}         | {6,15}        | {6,15}
+ ^e12          | {1,2}          | {1,2}         | {1,2}
+ a.c           | {6,7,8,15}     | {6,7,8,15}    | {6,7,8,15}
+ ab\dcd        | {4}            | {4}           | {4}
+ abc           | {6,7,15}       | {6,7,15}      | {6,7,15}
+ cd$           | {4,5}          | {4,5}         | {4,5}
+ e12[0-9]{2}   | {1,2}          | {1,2}         | {1,2}
+ q[[:digit:]]z | {14}           | {14}          | {14}
+ x+y           | {12,13}        | {12,13}       | {12,13}
+ xy            | {12,13}        | {12,13}       | {12,13}
+ zzqqzz        |                |               | 
+(13 rows)
+
+-- The same comparison as booleans, so a future diff cannot be read as "the ids
+-- moved around a bit".  This is the whole task in one result set.
+SELECT p,
+       (SELECT array_agg(id ORDER BY id) FROM rd
+          WHERE d @@@ ('/' || p || '/')::wquery)
+       IS NOT DISTINCT FROM
+       (SELECT array_agg(id ORDER BY id) FROM rd
+          WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body, ' ')) t
+                         WHERE t ~ p))
+         AS index_agrees_with_core,
+       (SELECT array_agg(id ORDER BY id) FROM rd
+          WHERE to_wdoc('simple', body) @@@ ('/' || p || '/')::wquery)
+       IS NOT DISTINCT FROM
+       (SELECT array_agg(id ORDER BY id) FROM rd
+          WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body, ' ')) t
+                         WHERE t ~ p))
+         AS heap_agrees_with_core
+  FROM (VALUES ('e12[0-9]{2}'), ('abc'), ('^e12'), ('cd$'), ('(foo|bar)baz'),
+               ('a.c'), ('x+y'), ('ab\dcd'), ('\yabc\y'), ('q[[:digit:]]z'),
+               ('(?i)ABC'), ('zzqqzz'), ('xy')) v(p)
+  ORDER BY p;
+       p       | index_agrees_with_core | heap_agrees_with_core 
+---------------+------------------------+-----------------------
+ (?i)ABC       | t                      | t
+ (foo|bar)baz  | t                      | t
+ \yabc\y       | t                      | t
+ ^e12          | t                      | t
+ a.c           | t                      | t
+ ab\dcd        | t                      | t
+ abc           | t                      | t
+ cd$           | t                      | t
+ e12[0-9]{2}   | t                      | t
+ q[[:digit:]]z | t                      | t
+ x+y           | t                      | t
+ xy            | t                      | t
+ zzqqzz        | t                      | t
+(13 rows)
+
+-- ---- THE THREE-WAY AGREEMENT, trigrams = off -------------------------------
+-- The walk-everything path: no weft, so every dictionary term is put to the
+-- engine.  Same patterns, same oracle, same answer required.
+SELECT p,
+       (SELECT array_agg(id ORDER BY id) FROM rdo
+          WHERE d @@@ ('/' || p || '/')::wquery)
+       IS NOT DISTINCT FROM
+       (SELECT array_agg(id ORDER BY id) FROM rdo
+          WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body, ' ')) t
+                         WHERE t ~ p))
+         AS index_agrees_with_core,
+       (SELECT array_agg(id ORDER BY id) FROM rdo
+          WHERE to_wdoc('simple', body) @@@ ('/' || p || '/')::wquery)
+       IS NOT DISTINCT FROM
+       (SELECT array_agg(id ORDER BY id) FROM rdo
+          WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body, ' ')) t
+                         WHERE t ~ p))
+         AS heap_agrees_with_core,
+       (SELECT count(*) FROM rdo WHERE d @@@ ('/' || p || '/')::wquery) AS rows_matched
+  FROM (VALUES ('e12[0-9]{2}'), ('abc'), ('^e12'), ('cd$'), ('(foo|bar)baz'),
+               ('a.c'), ('x+y'), ('ab\dcd'), ('\yabc\y'), ('q[[:digit:]]z'),
+               ('(?i)ABC'), ('zzqqzz'), ('xy')) v(p)
+  ORDER BY p;
+       p       | index_agrees_with_core | heap_agrees_with_core | rows_matched 
+---------------+------------------------+-----------------------+--------------
+ (?i)ABC       | t                      | t                     |            3
+ (foo|bar)baz  | t                      | t                     |            2
+ \yabc\y       | t                      | t                     |            2
+ ^e12          | t                      | t                     |            2
+ a.c           | t                      | t                     |            4
+ ab\dcd        | t                      | t                     |            1
+ abc           | t                      | t                     |            3
+ cd$           | t                      | t                     |            2
+ e12[0-9]{2}   | t                      | t                     |            2
+ q[[:digit:]]z | t                      | t                     |            1
+ x+y           | t                      | t                     |            2
+ xy            | t                      | t                     |            2
+ zzqqzz        | t                      | t                     |            0
+(13 rows)
+
+-- ---- G32, named -----------------------------------------------------------
+-- The row that was lost.  ab5cd is in the table; the old funnel wanted "abdcd".
+SELECT (SELECT count(*) FROM rd WHERE d @@@ '/ab\dcd/'::wquery) AS index_on,
+       (SELECT count(*) FROM rdo WHERE d @@@ '/ab\dcd/'::wquery) AS index_off,
+       (SELECT count(*) FROM rd WHERE to_wdoc('simple', body) @@@ '/ab\dcd/'::wquery) AS heap,
+       (SELECT count(*) FROM rd WHERE 'ab5cd' = ANY (string_to_array(body, ' '))) AS truth;
+ index_on | index_off | heap | truth 
+----------+-----------+------+-------
+        1 |         1 |    1 |     1
+(1 row)
+
+-- ---- the dictionary is folded, and the pattern is not -----------------------
+-- Terms go through the text search configuration at index time (`simple` lowercases;
+-- doc/specs/FUZZY_CHANNEL.md sect. 3.2), and the regex text between the slashes is
+-- taken verbatim (src/query/parse.c).  So a case-SENSITIVE uppercase pattern matches
+-- nothing in the index or on the heap -- both see the folded term -- while `~` over
+-- the raw body sees "ABC".  This is the one place the oracle is expected to
+-- disagree, it is a property of the channel and not of the route, and the same
+-- disagreement holds for every case-sensitive query in pg_weave.  (?i)ABC above is
+-- how a user gets the row: the director makes the engine's answer independent of
+-- the folding, so all three arms agree on it.
+SELECT (SELECT count(*) FROM rd WHERE d @@@ '/ABC/'::wquery) AS index_case_sensitive,
+       (SELECT count(*) FROM rd WHERE to_wdoc('simple', body) @@@ '/ABC/'::wquery) AS heap_case_sensitive,
+       (SELECT count(*) FROM rd WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body, ' ')) t
+                                                WHERE t ~ 'ABC')) AS core_on_the_raw_body,
+       (SELECT count(*) FROM rd WHERE d @@@ '/(?i)ABC/'::wquery) AS index_with_director;
+ index_case_sensitive | heap_case_sensitive | core_on_the_raw_body | index_with_director 
+----------------------+---------------------+----------------------+---------------------
+                    0 |                   0 |                    1 |                   3
+(1 row)
+
+-- ---- which mechanism served it -------------------------------------------
+-- The agreement above would also hold if every regex fell back to the universe
+-- with a heap recheck, which is the 5-second route.  These counters (Z4) are how
+-- the file asserts that the route under test is the one being tested.  regex_dict
+-- is the dictionary walk; regex_trgm is the weft NARROWING that walk -- not an
+-- alternative to it, so on a trigrams=on index a narrowable pattern counts BOTH
+-- (sql/chanstats.sql, and the comment on the counters in include/weave/weave.h).
+-- Counted once per bolt per leaf, so lower bounds rather than literals: the same
+-- table merged into one bolt or left as three would otherwise disagree here for a
+-- reason that has nothing to do with regex.
+--
+-- The positive control comes first.  The class pattern on the weft-bearing index
+-- narrows on "e12", so regex_trgm > 0 here is what gives the zeros below their
+-- meaning: with the weft present, the narrowing does run, and does get counted.
+SELECT weave_channel_stats_reset();
+ weave_channel_stats_reset 
+---------------------------
+ 
+(1 row)
+
+SELECT count(*) FROM rd WHERE d @@@ '/e12[0-9]{2}/'::wquery;
+ count 
+-------
+     2
+(1 row)
+
+SELECT regex_dict > 0 AS the_dictionary_walk_served_it,
+       regex_trgm > 0 AS and_the_weft_narrowed_it,
+       terms_expanded AS dictionary_terms_the_engine_accepted
+  FROM weave_channel_stats();
+ the_dictionary_walk_served_it | and_the_weft_narrowed_it | dictionary_terms_the_engine_accepted 
+-------------------------------+--------------------------+--------------------------------------
+ t                             | t                        |                                    2
+(1 row)
+
+-- The same pattern on the index without a weft: the walk runs, nothing narrows.
+SELECT weave_channel_stats_reset();
+ weave_channel_stats_reset 
+---------------------------
+ 
+(1 row)
+
+SELECT count(*) FROM rdo WHERE d @@@ '/e12[0-9]{2}/'::wquery;
+ count 
+-------
+     2
+(1 row)
+
+SELECT regex_dict > 0 AS the_dictionary_walk_served_it,
+       regex_trgm = 0 AS and_there_was_no_weft_to_narrow_with,
+       terms_expanded AS dictionary_terms_the_engine_accepted
+  FROM weave_channel_stats();
+ the_dictionary_walk_served_it | and_there_was_no_weft_to_narrow_with | dictionary_terms_the_engine_accepted 
+-------------------------------+--------------------------------------+--------------------------------------
+ t                             | t                                    |                                    2
+(1 row)
+
+-- G32's pattern on the weft-bearing index: the narrowing is REFUSED, because the
+-- pg_tre dialect that extracts the trigrams reads \d as d, and a wrongly required
+-- trigram is a false negative the exact walk cannot see.  So regex_trgm = 0 with the
+-- weft right there -- and, with the positive control above in the same session, that
+-- zero cannot be read as "there is no weft".
+SELECT weave_channel_stats_reset();
+ weave_channel_stats_reset 
+---------------------------
+ 
+(1 row)
+
+SELECT count(*) FROM rd WHERE d @@@ '/ab\dcd/'::wquery;
+ count 
+-------
+     1
+(1 row)
+
+SELECT regex_dict > 0 AS the_dictionary_walk_served_it,
+       regex_trgm = 0 AS and_the_narrowing_refused_an_escape_it_cannot_read
+  FROM weave_channel_stats();
+ the_dictionary_walk_served_it | and_the_narrowing_refused_an_escape_it_cannot_read 
+-------------------------------+----------------------------------------------------
+ t                             | t
+(1 row)
+
+-- A literal nothing contains: narrowed to the EMPTY candidate set, which is exact
+-- because the weft skips no trigram at build time, so the dictionary chain is not
+-- opened at all.  dict_pages = 0 is that claim.
+SELECT weave_channel_stats_reset();
+ weave_channel_stats_reset 
+---------------------------
+ 
+(1 row)
+
+SELECT count(*) FROM rd WHERE d @@@ '/zzqqzz/'::wquery;
+ count 
+-------
+     0
+(1 row)
+
+SELECT regex_dict > 0 AS the_route_served_it,
+       regex_trgm > 0 AS the_weft_narrowed_it_to_nothing,
+       dict_pages = 0 AS and_no_dictionary_page_was_read,
+       terms_expanded = 0 AS and_the_engine_accepted_nothing
+  FROM weave_channel_stats();
+ the_route_served_it | the_weft_narrowed_it_to_nothing | and_no_dictionary_page_was_read | and_the_engine_accepted_nothing 
+---------------------+---------------------------------+---------------------------------+---------------------------------
+ t                   | t                               | t                               | t
+(1 row)
+
+-- No route mixes a heap recheck back in: with seqscan off and a single regex leaf
+-- the plan is a bitmap scan over the index, and the answer is the index's.  A
+-- pattern with no literal run of three is the shape the old funnel could not serve
+-- at all; it is served here without the weft's help.
+SELECT weave_channel_stats_reset();
+ weave_channel_stats_reset 
+---------------------------
+ 
+(1 row)
+
+SELECT count(*) FROM rd WHERE d @@@ '/a.c/'::wquery;
+ count 
+-------
+     4
+(1 row)
+
+SELECT regex_dict > 0 AS the_dictionary_walk_served_it,
+       regex_trgm = 0 AS and_nothing_to_narrow_on
+  FROM weave_channel_stats();
+ the_dictionary_walk_served_it | and_nothing_to_narrow_on 
+-------------------------------+--------------------------
+ t                             | t
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE rd;
+DROP TABLE rdo;

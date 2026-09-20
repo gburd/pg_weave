@@ -1354,10 +1354,12 @@ extern BlockNumber weave_write_blob(Relation index, const uint8 *data, Size len)
 extern uint8 *weave_read_blob(Relation index, BlockNumber blk, Size len);
 extern BlockNumber weave_write_trigrams_iter(Relation index, DictNextFn next,
 											 void *nstate);
+extern bool weave_trgm_ordinals(Relation index, BlockNumber trgmstart,
+								uint32 trgm, uint64 **ords, int *nords);
 extern bool weave_trgm_candidates(Relation index, BlockNumber trgmstart,
 								  BlockNumber dictstart,
 								  const char *term, int termlen,
-								  int min_trigrams, bool is_regex,
+								  int min_trigrams,
 								  bool has_doclen_col, TidSet *out);
 
 /* amscan.c's only export to a non-scan file: src/pages/trgm_page.c normalizes
