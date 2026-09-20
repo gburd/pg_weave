@@ -15,9 +15,14 @@
  * data block + byte length) lets the query side find a trigram's stream,
  * reassemble the sparsemap, and iterate its term ordinals.
  *
- * At fuzzy/regex query time the candidate term set is the union of the query
- * pattern's trigram postings -- a sound superset -- so the scan probes a small
- * candidate set and the heap recheck applies the exact test.
+ * At query time the weft serves two consumers, differently.  An over-long
+ * FUZZY term (one the universal-Levenshtein walk refuses) takes
+ * weave_trgm_candidates(): the UNION of its trigrams' ordinal sets is a sound
+ * superset of the terms within k, and the heap recheck applies the exact test.
+ * A REGEX takes weave_regex_terms() (src/am/amscan.c): the pg_tre extractor's
+ * CNF of required trigrams is evaluated over weave_trgm_ordinals() with
+ * INTERSECTION, and the surviving dictionary terms are run through the real
+ * regex engine, so that route is exact and needs no recheck.
  *
  * Layout (all pages WAL-logged via GenericXLog, one page per Xlog cycle):
  *   directory pages (WEAVE_TRGM):      fixed-size WeaveTrgmEntry[]
@@ -334,23 +339,137 @@ weave_write_trigrams_iter(Relation index, DictNextFn next, void *nstate)
 	return first;
 }
 
+
 /*
- * Gather candidate docids for a fuzzy/regex query term into a TidSet.
+ * weave_trgm_ordinals -- the set of TERM ORDINALS whose term contains one
+ * byte-trigram, read from the segment's trigram weft.
  *
- * Two-stage vocabulary funnel: (1) union the query pattern's trigram postings
- * to get a set of candidate TERM ORDINALS (small: bounded by the vocabulary);
+ * Returns true and fills ords/nords (palloc'd, ascending, unique; *nords may
+ * be 0) when the directory has an entry for `trgm`; returns false when it has
+ * none.  The two are different facts and both callers need the distinction:
+ *   - weave_trgm_candidates() below UNIONs the query's trigram sets, so an
+ *     absent trigram is one it cannot use, and if NONE is present it declines
+ *     to funnel at all (a union over nothing would be an empty candidate set,
+ *     i.e. a false negative).
+ *   - weave_regex_terms() (src/am/amscan.c) INTERSECTS required trigrams, and
+ *     for it an absent trigram IS the empty set -- exact, because no trigram is
+ *     skipped at build time (weave_write_trigrams_iter has no popularity cut),
+ *     so "no entry" means "no indexed term contains it".
+ * Ordinals index the segment's own dictionary in write order, which is the
+ * order every dictionary walk yields terms in.
+ */
+bool
+weave_trgm_ordinals(Relation index, BlockNumber trgmstart, uint32 trgm,
+					uint64 **ords, int *nords)
+{
+	BlockNumber blk = trgmstart;
+
+	*ords = NULL;
+	*nords = 0;
+	while (blk != InvalidBlockNumber)
+	{
+		Buffer		buf;
+		Page		page;
+		char	   *ptr,
+				   *end;
+		BlockNumber next;
+		uint32		smlen = 0;
+		BlockNumber firstdata = InvalidBlockNumber;
+		bool		found = false;
+
+		CHECK_FOR_INTERRUPTS();	/* between directory pages, no buffer lock held: safe to unwind */
+		buf = ReadBuffer(index, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		ptr = (char *) PageGetContents(page);
+		end = weave_page_entry_end(page);
+		next = WeavePageGetOpaque(page)->nextblk;
+		/* fixed stride, so the header-fits bound is the whole guard -- but it
+		 * IS needed: te->firstdata and te->smlen are trusted below. */
+		while (ptr + MAXALIGN(sizeof(WeaveTrgmEntry)) <= end)
+		{
+			WeaveTrgmEntry *te = (WeaveTrgmEntry *) ptr;
+
+			if (te->trgm == trgm)
+			{
+				smlen = te->smlen;
+				firstdata = te->firstdata;
+				found = true;
+				break;
+			}
+			ptr += MAXALIGN(sizeof(WeaveTrgmEntry));
+		}
+		UnlockReleaseBuffer(buf);
+
+		if (found)
+		{
+			uint8	   *smbuf = weave_read_blob(index, firstdata, smlen);
+			sm_t		sm;
+			sm_cursor_t cur = SM_CURSOR_INIT;
+			uint64_t	v;
+			int			cap = 0;
+
+			sm_open(&sm, smbuf, smlen);
+			for (v = sm_next_member(&sm, (uint64_t) -1, &cur);
+				 v != SM_IDX_MAX;
+				 v = sm_next_member(&sm, v, &cur))
+			{
+				CHECK_FOR_INTERRUPTS();	/* per candidate ordinal; blob in memory, buffer released */
+				if (*nords >= cap)
+				{
+					/* bounded by the segment's vocabulary (term ordinals), which
+					 * weave_write_trigrams_iter already held in one sparsemap;
+					 * query path, so a throw loses one query */
+					cap = cap ? cap * 2 : 64;
+					*ords = *ords ? repalloc(*ords, cap * sizeof(uint64))	/* alloc-ok: vocabulary-bounded */
+						: palloc(cap * sizeof(uint64));	/* alloc-ok: vocabulary-bounded */
+				}
+				(*ords)[(*nords)++] = v;
+			}
+			pfree(smbuf);
+			/*
+			 * A sparsemap iterates ascending, so this is a no-op in practice;
+			 * it is here because BOTH consumers merge on the ordering and a
+			 * merge over an unsorted input drops members silently, which no
+			 * regression test would see.
+			 */
+			if (*nords > 1)
+				qsort(*ords, *nords, sizeof(uint64), cmp_uint64);
+			return true;
+		}
+		blk = next;
+	}
+	return false;
+}
+
+/*
+ * Gather candidate docids for an over-long FUZZY query term into a TidSet.
+ *
+ * Two-stage vocabulary funnel: (1) union the query term's trigram postings to
+ * get a set of candidate TERM ORDINALS (small: bounded by the vocabulary);
  * (2) walk the dictionary once, and for each term whose ordinal is a candidate,
- * union its docid postings.  The heap recheck then applies the exact
- * fuzzy/regex test.  No trigrams are skipped at build time, so every query
- * trigram that has a directory entry constrains the candidate set; if the
- * pattern has too few usable trigrams (e.g. it is shorter than a trigram) we
- * return false and the caller falls back to a full scan (always correct).
+ * union its docid postings.  The heap recheck then applies the exact fuzzy
+ * test.  No trigrams are skipped at build time, so every query trigram that
+ * has a directory entry constrains the candidate set; if the term has too few
+ * usable trigrams (fewer than min_trigrams, which the caller derives from k:
+ * see src/am/amscan.c) we return false and the caller falls back to a full
+ * scan (always correct).
+ *
+ * REGEX NO LONGER COMES THROUGH HERE.  It used to, with a literal-run scanner
+ * (weave_regex_trigrams) supplying the trigrams and `is_regex` splitting the
+ * counter; that scanner read `\d` as the literal `d` and required a trigram no
+ * matching term contains -- a FALSE NEGATIVE (G32) the heap recheck
+ * cannot repair, because a recheck only removes rows.  Regex is now served
+ * exactly by weave_regex_terms() in src/am/amscan.c, which narrows with the
+ * pg_tre extractor's CNF over weave_trgm_ordinals() above and then runs the
+ * real regex engine over the surviving dictionary terms.  This function is
+ * fuzzy-only, and its one counter says so.
  */
 bool
 weave_trgm_candidates(Relation index, BlockNumber trgmstart,
 					 BlockNumber dictstart,
 					 const char *term, int termlen, int min_trigrams,
-					 bool is_regex, bool has_doclen_col, TidSet *out)
+					 bool has_doclen_col, TidSet *out)
 {
 	uint32		qtrg[WEAVE_MAX_TRIGRAMS];
 	int			nqtrg;
@@ -370,82 +489,31 @@ weave_trgm_candidates(Relation index, BlockNumber trgmstart,
 	out->n = 0;
 	if (trgmstart == InvalidBlockNumber)
 		return false;
-	if (is_regex)
-		nqtrg = weave_regex_trigrams(term, termlen, qtrg, WEAVE_MAX_TRIGRAMS);
-	else
-		nqtrg = weave_trigrams(term, termlen, qtrg, WEAVE_MAX_TRIGRAMS);
+	nqtrg = weave_trigrams(term, termlen, qtrg, WEAVE_MAX_TRIGRAMS);
 	if (nqtrg < min_trigrams)
 		return false;
 
 	/* stage 1: union the pattern trigrams' term-ordinal sets */
 	for (g = 0; g < nqtrg; g++)
 	{
-		BlockNumber blk = trgmstart;
-		bool		done = false;
+		uint64	   *one;
+		int			none;
 
-		while (blk != InvalidBlockNumber && !done)
+		if (!weave_trgm_ordinals(index, trgmstart, qtrg[g], &one, &none))
+			continue;
+		if (nords + none > maxords)
 		{
-			Buffer		buf;
-			Page		page;
-			char	   *ptr,
-					   *end;
-			BlockNumber next;
-			uint32		smlen = 0;
-			BlockNumber firstdata = InvalidBlockNumber;
-			bool		found = false;
-
-			CHECK_FOR_INTERRUPTS();	/* between directory pages, no buffer lock held: safe to unwind */
-			buf = ReadBuffer(index, blk);
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			page = BufferGetPage(buf);
-			ptr = (char *) PageGetContents(page);
-			end = weave_page_entry_end(page);
-			next = WeavePageGetOpaque(page)->nextblk;
-			/* fixed stride, so the header-fits bound is the whole guard -- but it
-			 * IS needed: te->firstdata and te->smlen are trusted below. */
-			while (ptr + MAXALIGN(sizeof(WeaveTrgmEntry)) <= end)
-			{
-				WeaveTrgmEntry *te = (WeaveTrgmEntry *) ptr;
-
-				if (te->trgm == qtrg[g])
-				{
-					smlen = te->smlen;
-					firstdata = te->firstdata;
-					found = true;
-					break;
-				}
-				ptr += MAXALIGN(sizeof(WeaveTrgmEntry));
-			}
-			UnlockReleaseBuffer(buf);
-
-			if (found)
-			{
-				uint8	   *smbuf = weave_read_blob(index, firstdata, smlen);
-				sm_t		sm;
-				sm_cursor_t cur = SM_CURSOR_INIT;
-				uint64_t	v;
-
-				sm_open(&sm, smbuf, smlen);
-				for (v = sm_next_member(&sm, (uint64_t) -1, &cur);
-					 v != SM_IDX_MAX;
-					 v = sm_next_member(&sm, v, &cur))
-				{
-					CHECK_FOR_INTERRUPTS();	/* per candidate ordinal; blob in memory, buffer released */
-					if (nords >= maxords)
-					{
-						maxords = maxords ? maxords * 2 : 64;
-						ords = ords ? repalloc(ords, maxords * sizeof(uint64))
-							: palloc(maxords * sizeof(uint64));
-					}
-					ords[nords++] = v;
-				}
-				pfree(smbuf);
-				matched_trg++;
-				done = true;
-				break;
-			}
-			blk = next;
+			/* bounded by the vocabulary, like weave_trgm_ordinals */
+			maxords = Max(nords + none, maxords ? maxords * 2 : 64);
+			ords = ords ? repalloc(ords, maxords * sizeof(uint64))
+				: palloc(maxords * sizeof(uint64));
 		}
+		if (none > 0)
+			memcpy(ords + nords, one, none * sizeof(uint64));
+		nords += none;
+		if (one)
+			pfree(one);
+		matched_trg++;
 	}
 
 	/* if no pattern trigram had a directory entry (all popular/skipped), we
@@ -535,16 +603,12 @@ weave_trgm_candidates(Relation index, BlockNumber trgmstart,
 
 	/*
 	 * THE TRIGRAM-FUNNEL MECHANISM, counted only on the success path: the three
-	 * `return false` exits above mean the pattern could not be funnelled and the
+	 * `return false` exits above mean the term could not be funnelled and the
 	 * caller falls back to a full scan, which is a different mechanism with a
-	 * different cost.  `is_regex` splits the count because regex and
-	 * over-long-fuzzy reach the same funnel for different reasons and a
-	 * measurement that could not tell them apart would be useless for Z6.
-	 * include/weave/weave.h.
+	 * different cost.  Only fuzzy arrives here now; regex_trgm is incremented
+	 * by weave_regex_terms() when ITS narrowing runs, so the two columns keep
+	 * telling the two funnels apart.  include/weave/weave.h.
 	 */
-	if (is_regex)
-		weave_chan_regex_trgm++;
-	else
-		weave_chan_fuzzy_trgm++;
+	weave_chan_fuzzy_trgm++;
 	return true;
 }

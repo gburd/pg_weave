@@ -369,6 +369,7 @@ accum_to_query(const TrigramAccum *a, int32 max_cost, TrigramQuery *out,
         c->n = 1;
         c->alts = palloc(sizeof(TrigramDisjunct));
         c->alts[0].trigram_hash = pg_weave_hash_trigram_cp(a->tris[i]);
+        memcpy(c->alts[0].cp, a->tris[i], sizeof(c->alts[0].cp));
         c->alts[0].min_offset = 0;
         c->alts[0].max_offset = INT32_MAX;
     }

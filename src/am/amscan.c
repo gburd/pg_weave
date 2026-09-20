@@ -9,8 +9,9 @@
  * evaluates an wquery by set algebra over posting lists (a term yields the
  * TIDs whose document contains it; AND intersects, OR unions, NOT complements
  * against the indexed universe) for the bitmap and index-only scans, and runs
- * block-max WAND / MaxScore top-k for the <=> ordering scan.  Fuzzy/regex use
- * a Levenshtein automaton / trigram funnel; counts use a visibility-map-aware
+ * block-max WAND / MaxScore top-k for the <=> ordering scan.  Fuzzy and regex
+ * are decided on the dictionary (a Levenshtein automaton, resp. core's regex
+ * engine narrowed by the trigram weft); counts use a visibility-map-aware
  * bulk path.  Results are exact against @@@ semantics; the boolean and ranked
  * paths need no heap access beyond MVCC visibility.
  *
@@ -82,6 +83,9 @@
 #include "utils/selfuncs.h"
 #include "weave/for.h"			/* FOR codec + doclen quantizer (the WAND cursor) */
 #include "weave/uleven.h"		/* the universal-Levenshtein core the fuzzy walk runs */
+#include "weave/regex_ast.h"	/* pg_tre parser + trigram extractor (the regex walk's narrowing) */
+#include "catalog/pg_collation.h"	/* C_COLLATION_OID: the regex walk's collation */
+#include "regex/regex.h"		/* pg_regcomp/pg_regexec: the regex walk's engine */
 
 /* forward decls: defined later in this file */
 static void weave_collect_matches(Relation index, WeaveQuery query, TidSet *out, bool *recheck);
@@ -1131,6 +1135,7 @@ weave_dictvocab_next(void *arg, const char **term, weave_ul_uint32 *len,
 				return 0;
 			}
 			LockBuffer(v->buf, BUFFER_LOCK_SHARE);
+			weave_chan_dict_pages++;	/* the work counter the prefix walk keeps too */
 			page = BufferGetPage(v->buf);
 			v->ptr = (char *) PageGetContents(page);
 			v->end = weave_page_entry_end(page);
@@ -1227,8 +1232,13 @@ weave_dictvocab_skip(void *arg, const char *prefix, weave_ul_uint32 plen)
 	}
 }
 
-/* The per-matching-term posting runs weave_fuzzy_terms merges at the end. */
-typedef struct WeaveFuzzyHits
+/*
+ * The per-matching-term posting runs a dictionary walk collects and merges at
+ * the end.  Shared by the fuzzy walk (weave_fuzzy_terms) and the regex walk
+ * (weave_regex_terms): both yield one docid-sorted run per matching dictionary
+ * term and want one sorted, de-duplicated TidSet out.
+ */
+typedef struct WeaveTermRuns
 {
 	Relation	index;
 	const WeaveSegMeta *seg;
@@ -1238,30 +1248,36 @@ typedef struct WeaveFuzzyHits
 	int			nruns;
 	int			runcap;
 	int64		total;
-} WeaveFuzzyHits;
+} WeaveTermRuns;
+
+static void
+weave_termruns_init(WeaveTermRuns *h, Relation index, const WeaveSegMeta *seg,
+					WeaveDictVocab *voc)
+{
+	h->index = index;
+	h->seg = seg;
+	h->voc = voc;
+	h->runs = NULL;
+	h->runlen = NULL;
+	h->nruns = 0;
+	h->runcap = 0;
+	h->total = 0;
+}
 
 /*
- * WeaveUlevHitCb: one dictionary term within k.  Read its posting list and keep
- * the TIDs as a docid-sorted run for the k-way merge.
- *
- * WHY THIS REACHES BACK INTO THE ITERATOR for the posting locator.  A posting
- * list is addressed by three fields (firstposting, firstoffset, df) and
- * WeaveUlevVocab echoes exactly one uint32, so `ord` cannot carry it.  The
- * callback is invoked from inside weave_uleven_expand_vocab() immediately after
- * the next() that produced `term`, so voc->cur is exactly as valid as `term`
- * itself -- same page, still share-locked. `ord` stays the term ordinal, which
- * is what Z9's <@> ordering will want alongside `dist`.
+ * The dictionary entry the iterator is positioned on matched: read its posting
+ * list and keep the TIDs as a docid-sorted run for the k-way merge.  Valid only
+ * while voc->cur is -- i.e. before the next weave_dictvocab_next(), on the same
+ * still-share-locked page.
  */
-static int
-weave_fuzzy_hit(void *arg, const char *term, weave_ul_uint32 len,
-				weave_ul_uint32 ord, int dist)
+static void
+weave_termruns_add_current(WeaveTermRuns *h)
 {
-	WeaveFuzzyHits *h = (WeaveFuzzyHits *) arg;
 	WeaveDictEntry *de = h->voc->cur;
 	WeavePosting *post;
 	int			np;
 
-	Assert(de != NULL && de->term == term && de->termlen == len);
+	Assert(de != NULL);
 	np = weave_decode_term(h->index, de->firstposting, de->firstoffset, de->df,
 						   &post, NULL, false, NULL, true,
 						   h->seg->doclenstart == InvalidBlockNumber);
@@ -1289,9 +1305,125 @@ weave_fuzzy_hit(void *arg, const char *term, weave_ul_uint32 len,
 		h->total += np;
 	}
 	pfree(post);
+}
+
+/*
+ * WeaveUlevHitCb: one dictionary term within k.  Read its posting list and keep
+ * the TIDs as a docid-sorted run for the k-way merge.
+ *
+ * WHY THIS REACHES BACK INTO THE ITERATOR for the posting locator.  A posting
+ * list is addressed by three fields (firstposting, firstoffset, df) and
+ * WeaveUlevVocab echoes exactly one uint32, so `ord` cannot carry it.  The
+ * callback is invoked from inside weave_uleven_expand_vocab() immediately after
+ * the next() that produced `term`, so voc->cur is exactly as valid as `term`
+ * itself -- same page, still share-locked. `ord` stays the term ordinal, which
+ * is what Z9's <@> ordering will want alongside `dist`.
+ */
+static int
+weave_fuzzy_hit(void *arg, const char *term, weave_ul_uint32 len,
+				weave_ul_uint32 ord, int dist)
+{
+	WeaveTermRuns *h = (WeaveTermRuns *) arg;
+
+	Assert(h->voc->cur != NULL && h->voc->cur->term == term &&
+		   h->voc->cur->termlen == len);
+	weave_termruns_add_current(h);
 	(void) ord;
 	(void) dist;
 	return 0;					/* no fanout cap on this route */
+}
+
+/*
+ * k-way merge the per-term docid-sorted runs into one sorted, de-duplicated TID
+ * array.  Each posting list is already docid-ordered, so merging avoids the
+ * O(n log n) qsort over the whole (up to ~1.3M) union -- which a profiler showed
+ * was the dominant fuzzy-count cost (a 1.28M qsort with a function-pointer
+ * comparator is ~400ms) -- replacing it with O(n log k) and cheap inline
+ * comparisons.  Must be called with no buffer lock held (the walk's chain is
+ * released first): it checks for interrupts per merged posting.
+ */
+static void
+weave_termruns_merge(const WeaveTermRuns *h, TidSet *out)
+{
+	ItemPointerData **runs = h->runs;
+	int		   *runlen = h->runlen;
+	int			nruns = h->nruns;
+	int64		total = h->total;
+	ItemPointerData *tids;
+	int		   *pos;			/* current index into each run */
+	int		   *heap;			/* min-heap of run indices by current head TID */
+	int			hn = 0;
+	int			nout = 0;
+	int			r;
+
+	tids = palloc(Max(total, 1) * sizeof(ItemPointerData));
+	pos = palloc0(Max(nruns, 1) * sizeof(int));
+	heap = palloc(Max(nruns, 1) * sizeof(int));
+
+#define RUN_HEAD(ri) (&runs[(ri)][pos[(ri)]])
+#define HEAP_LESS(x, y) (ItemPointerCompare(RUN_HEAD(heap[x]), RUN_HEAD(heap[y])) < 0)
+	/* build the heap with each non-empty run's head */
+	for (r = 0; r < nruns; r++)
+	{
+		if (runlen[r] > 0)
+		{
+			int			c = hn++;
+
+			heap[c] = r;
+			while (c > 0 && HEAP_LESS(c, (c - 1) / 2))
+			{
+				int			t = heap[c];
+
+				heap[c] = heap[(c - 1) / 2];
+				heap[(c - 1) / 2] = t;
+				c = (c - 1) / 2;
+			}
+		}
+	}
+	while (hn > 0)
+	{
+		int			best = heap[0];
+		int			c = 0;
+
+		CHECK_FOR_INTERRUPTS();	/* per merged posting; no lock held (chain released above) */
+		if (nout == 0 ||
+			ItemPointerCompare(&tids[nout - 1], RUN_HEAD(best)) != 0)
+			tids[nout++] = *RUN_HEAD(best);
+		pos[best]++;
+		if (pos[best] >= runlen[best])
+		{
+			heap[0] = heap[--hn];	/* drop exhausted run */
+		}
+		/* sift down heap[0] */
+		for (;;)
+		{
+			int			l = 2 * c + 1,
+						ri = 2 * c + 2,
+						sm = c;
+
+			if (hn == 0)
+				break;
+			if (l < hn && HEAP_LESS(l, sm))
+				sm = l;
+			if (ri < hn && HEAP_LESS(ri, sm))
+				sm = ri;
+			if (sm == c)
+				break;
+			{
+				int			t = heap[c];
+
+				heap[c] = heap[sm];
+				heap[sm] = t;
+				c = sm;
+			}
+		}
+	}
+#undef RUN_HEAD
+#undef HEAP_LESS
+	pfree(pos);
+	pfree(heap);
+	out->tids = tids;
+	out->n = nout;
 }
 
 /*
@@ -1329,8 +1461,7 @@ weave_fuzzy_terms(Relation index, const WeaveSegMeta *seg,
 	WeaveUlevAut aut;
 	WeaveUlevVocab voc;
 	WeaveDictVocab dv;
-	WeaveFuzzyHits h;
-	ItemPointerData *tids;
+	WeaveTermRuns h;
 
 	/*
 	 * THE APPLICABILITY TEST IS NOW THE CORE'S OWN INIT, and the bound it
@@ -1372,14 +1503,7 @@ weave_fuzzy_terms(Relation index, const WeaveSegMeta *seg,
 	voc.skip = weave_dictvocab_skip;
 	voc.arg = &dv;
 
-	h.index = index;
-	h.seg = seg;
-	h.voc = &dv;
-	h.runs = NULL;
-	h.runlen = NULL;
-	h.nruns = 0;
-	h.runcap = 0;
-	h.total = 0;
+	weave_termruns_init(&h, index, seg, &dv);
 
 	PG_TRY();
 	{
@@ -1400,92 +1524,448 @@ weave_fuzzy_terms(Relation index, const WeaveSegMeta *seg,
 	PG_END_TRY();
 	pfree(dv.nextkey);
 
-	/*
-	 * k-way merge the per-term docid-sorted runs into one sorted, de-duplicated
-	 * TID array.  Each posting list is already docid-ordered, so merging avoids
-	 * the O(n log n) qsort over the whole (up to ~1.3M) union -- which a profiler
-	 * showed was the dominant fuzzy-count cost (a 1.28M qsort with a
-	 * function-pointer comparator is ~400ms) -- replacing it with O(n log k)
-	 * and cheap inline comparisons.
-	 */
+	weave_termruns_merge(&h, out);
+	return true;
+}
+
+/* -------------------------------------------------------------------------
+ * The regex route: an EXACT dictionary-side walk, narrowed by the trigram weft
+ * when the index has one.
+ *
+ * WHAT IT REPLACED, AND WHY THE REPLACEMENT IS EXACT WHERE THE OLD ROUTE WAS
+ * NOT.  A regex leaf used to go to weave_trgm_candidates() with a literal-run
+ * scanner (weave_regex_trigrams, deleted) supplying "required" trigrams, then
+ * every candidate ROW was rechecked on the heap by weave_doc_has_regex().  Two
+ * things were wrong with that shape.  The scanner read `\\d` as the literal `d`
+ * and required a trigram no matching term contains, so `/ab\\dcd/` returned no
+ * rows from the index while the heap predicate matched `ab5cd` -- a FALSE
+ * NEGATIVE (G32) that no recheck can repair, because a recheck only
+ * removes rows.  And the recheck ran per DOCUMENT, so a class pattern such as
+ * /e12[0-9]{2}/ -- no literal run of three, so nothing to funnel -- fell back
+ * to weave_universe_bounded(), i.e. every document in the segment, at ~5 s per
+ * query on 1M rows.
+ *
+ * The regex is a predicate on TERMS, so it is decided on the dictionary, once
+ * per distinct term, with the SAME engine, flags and collation as
+ * weave_doc_has_regex() (pg_regcomp/pg_regexec, REG_ADVANCED, C_COLLATION_OID):
+ * the index and the heap predicate agree by construction, and the route needs no
+ * recheck -- like weave_fuzzy_terms() above, and unlike the funnel.
+ *
+ * THE NARROWING IS A PURE OPTIMISATION AND MUST STAY ONE.  With a trigram weft
+ * present, the pg_tre extractor (src/query/extract.c) turns the pattern into a
+ * CNF of trigrams every matching string must contain, and the walk runs the
+ * engine only over terms whose ordinal survives that CNF.  A trigram wrongly
+ * "required" is a false negative the exact walk cannot see, so the narrowing is
+ * refused wherever pg_tre's dialect and core's ARE could disagree
+ * (weave_regex_narrowable); removing that refusal makes /\yabc\y/ lose rows in
+ * sql/regexdict.sql, which is the mutation that shows it is load-bearing.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * weave_regex_narrowable -- may the pg_tre extractor's "required trigrams" be
+ * trusted for THIS pattern as core's ARE engine will read it?
+ *
+ * pg_tre's tokenizer (src/query/regex_tokens.c) is a subset dialect: its
+ * `default:` case reads an unknown escape as the escaped character literally
+ * (so `\\d` is `d`, `\\y` is `y`, `\\1` is `1`), it has no `(?flags)` or `(?:`
+ * groups, no POSIX classes ([:digit:]), collating elements ([.x.]) or
+ * equivalence classes ([=x=]), reads a `]` right after `[` as closing an empty
+ * class where ARE reads it as a member, and reads `{~k}` as its own approximate
+ * bound where ARE reads a literal.  Each of those can make it publish a literal
+ * run -- hence a required trigram -- that ARE never demands.  The scan is over
+ * the RAW pattern, before parsing, because a whitelist of what the two dialects
+ * agree on is checkable by reading; a blacklist of what they disagree on is
+ * checkable only by having found every disagreement.
+ *
+ * Also refused: a non-ASCII byte in the pattern on a server encoding other than
+ * UTF-8.  pg_tre decodes the pattern as UTF-8 unconditionally, and the weft is
+ * keyed by SERVER-ENCODED bytes, so re-encoding its codepoints would produce
+ * keys the weft never stored.  ASCII round-trips through every server encoding.
+ */
+static bool
+weave_regex_narrowable(const char *re, int relen)
+{
+	bool		utf8 = (GetDatabaseEncoding() == PG_UTF8);
+	int			i;
+
+	/* ARE directors (***: / ***=) change the dialect of everything after them */
+	if (relen >= 3 && memcmp(re, "***", 3) == 0)
+		return false;
+
+	for (i = 0; i < relen; i++)
 	{
-		ItemPointerData **runs = h.runs;		/* the callback's accumulator, */
-		int		   *runlen = h.runlen;			/* aliased so the merge below is */
-		int			nruns = h.nruns;			/* the code it always was */
-		int64		total = h.total;
-		int		   *pos;			/* current index into each run */
-		int		   *heap;			/* min-heap of run indices by current head TID */
-		int			hn = 0;
-		int			nout = 0;
-		int			r;
+		unsigned char c = (unsigned char) re[i];
+		unsigned char n = (i + 1 < relen) ? (unsigned char) re[i + 1] : 0;
 
-		tids = palloc(Max(total, 1) * sizeof(ItemPointerData));
-		pos = palloc0(Max(nruns, 1) * sizeof(int));
-		heap = palloc(Max(nruns, 1) * sizeof(int));
-
-#define RUN_HEAD(ri) (&runs[(ri)][pos[(ri)]])
-#define HEAP_LESS(x, y) (ItemPointerCompare(RUN_HEAD(heap[x]), RUN_HEAD(heap[y])) < 0)
-		/* build the heap with each non-empty run's head */
-		for (r = 0; r < nruns; r++)
+		if (c >= 0x80 && !utf8)
+			return false;
+		switch (c)
 		{
-			if (runlen[r] > 0)
-			{
-				int			c = hn++;
-
-				heap[c] = r;
-				while (c > 0 && HEAP_LESS(c, (c - 1) / 2))
-				{
-					int			t = heap[c];
-
-					heap[c] = heap[(c - 1) / 2];
-					heap[(c - 1) / 2] = t;
-					c = (c - 1) / 2;
-				}
-			}
+			case '\\':
+				/* the escapes both dialects read as "that character, literally" */
+				if (n == 0 || strchr("\\.[](){}|*+?^$-", n) == NULL)
+					return false;
+				i++;			/* consumed the escaped character */
+				break;
+			case '(':
+				if (n == '?')
+					return false;
+				break;
+			case '[':
+				if (n == ':' || n == '.' || n == '=' || n == ']')
+					return false;
+				if (n == '^' && i + 2 < relen && re[i + 2] == ']')
+					return false;
+				break;
+			case '{':
+				if (n == '~')
+					return false;
+				break;
+			default:
+				break;
 		}
-		while (hn > 0)
-		{
-			int			best = heap[0];
-			int			c = 0;
-
-			CHECK_FOR_INTERRUPTS();	/* per merged posting; no lock held (chain released above) */
-			if (nout == 0 ||
-				ItemPointerCompare(&tids[nout - 1], RUN_HEAD(best)) != 0)
-				tids[nout++] = *RUN_HEAD(best);
-			pos[best]++;
-			if (pos[best] >= runlen[best])
-			{
-				heap[0] = heap[--hn];	/* drop exhausted run */
-			}
-			/* sift down heap[0] */
-			for (;;)
-			{
-				int			l = 2 * c + 1,
-							ri = 2 * c + 2,
-							sm = c;
-
-				if (hn == 0)
-					break;
-				if (l < hn && HEAP_LESS(l, sm))
-					sm = l;
-				if (ri < hn && HEAP_LESS(ri, sm))
-					sm = ri;
-				if (sm == c)
-					break;
-				{
-					int			t = heap[c];
-
-					heap[c] = heap[sm];
-					heap[sm] = t;
-					c = sm;
-				}
-			}
-		}
-#undef RUN_HEAD
-#undef HEAP_LESS
-		out->tids = tids;
-		out->n = nout;
 	}
+	return true;
+}
+
+/* Merge-intersection of two ascending unique uint64 arrays into a new one. */
+static uint64 *
+weave_ords_and(const uint64 *a, int na, const uint64 *b, int nb, int *nout)
+{
+	uint64	   *r = palloc(Max(Min(na, nb), 1) * sizeof(uint64));
+	int			i = 0,
+				j = 0,
+				k = 0;
+
+	while (i < na && j < nb)
+	{
+		if (a[i] < b[j])
+			i++;
+		else if (a[i] > b[j])
+			j++;
+		else
+		{
+			r[k++] = a[i];
+			i++;
+			j++;
+		}
+	}
+	*nout = k;
+	return r;
+}
+
+/* Merge-union of two ascending unique uint64 arrays into a new one. */
+static uint64 *
+weave_ords_or(const uint64 *a, int na, const uint64 *b, int nb, int *nout)
+{
+	/* alloc-ok: two vocabulary-bounded ordinal sets; query path */
+	uint64	   *r = palloc(Max(na + nb, 1) * sizeof(uint64));
+	int			i = 0,
+				j = 0,
+				k = 0;
+
+	while (i < na || j < nb)
+	{
+		if (j >= nb || (i < na && a[i] < b[j]))
+			r[k++] = a[i++];
+		else if (i >= na || b[j] < a[i])
+			r[k++] = b[j++];
+		else
+		{
+			r[k++] = a[i];
+			i++;
+			j++;
+		}
+	}
+	*nout = k;
+	return r;
+}
+
+/*
+ * weave_regex_narrow -- the candidate TERM ORDINALS for a regex leaf, from the
+ * segment's trigram weft, or false when the pattern gives nothing to narrow on.
+ *
+ * regex_extract_query() at max_cost 0 yields CNF: the query is the AND of its
+ * conjuncts, a conjunct the OR of its alternatives, and each alternative names
+ * one CODEPOINT trigram (TrigramDisjunct.cp) every matching string contains.
+ * The weft is keyed by BYTE trigrams (weave_trigrams over the server-encoded
+ * term), so each codepoint triple is re-encoded and its byte trigrams -- all of
+ * them, because a term containing the codepoints contiguously contains every
+ * byte trigram of their encoding -- are ANDed.  A trigram with no directory
+ * entry is the EMPTY set, which is exact: weave_write_trigrams_iter skips
+ * nothing, so "no entry" means "no indexed term contains it".
+ *
+ * *cands is ascending and unique, in the caller's memory context; everything
+ * the parse allocated is freed here.
+ */
+static bool
+weave_regex_narrow(Relation index, const WeaveSegMeta *seg,
+				   const char *re, int relen, uint64 **cands, int *ncands)
+{
+	MemoryContext cxt,
+				old;
+	WeaveParseCtx pctx;
+	TrigramQuery tq;
+	uint64	   *result = NULL;
+	int			nresult = 0;
+	bool		have_result = false;
+	int			ci;
+
+	*cands = NULL;
+	*ncands = 0;
+	if (!weave_regex_narrowable(re, relen))
+		return false;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "weave regex narrowing",
+								ALLOCSET_SMALL_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	if (!weave_parse_regex(&pctx, re, relen) ||
+		!regex_extract_query(&pctx, 0, &tq) ||
+		tq.always_true || tq.n <= 0 || tq.mode != TRIGRAM_QUERY_CNF)
+	{
+		MemoryContextSwitchTo(old);
+		MemoryContextDelete(cxt);
+		return false;
+	}
+
+	for (ci = 0; ci < tq.n && (!have_result || nresult > 0); ci++)
+	{
+		const TrigramConjunct *c = &tq.conjuncts[ci];
+		uint64	   *cunion = NULL;
+		int			ncunion = 0;
+		int			ai;
+
+		for (ai = 0; ai < c->n; ai++)
+		{
+			const TrigramDisjunct *d = &c->alts[ai];
+			pg_wchar	cps[3];
+			char		bytes[3 * MAX_MULTIBYTE_CHAR_LEN + 1];
+			int			nbytes;
+			uint32		trg[WEAVE_MAX_TRIGRAMS];
+			int			ntrg;
+			uint64	   *inter = NULL;
+			int			ninter = 0;
+			int			ti;
+
+			cps[0] = (pg_wchar) d->cp[0];
+			cps[1] = (pg_wchar) d->cp[1];
+			cps[2] = (pg_wchar) d->cp[2];
+			nbytes = pg_wchar2mb_with_len(cps, bytes, 3);
+			ntrg = weave_trigrams(bytes, nbytes, trg, WEAVE_MAX_TRIGRAMS);
+			/* AND across the alternative's byte trigrams */
+			for (ti = 0; ti < ntrg; ti++)
+			{
+				uint64	   *one;
+				int			none;
+
+				(void) weave_trgm_ordinals(index, seg->trgmstart, trg[ti],
+										   &one, &none);
+				if (ti == 0)
+				{
+					inter = one;
+					ninter = none;
+				}
+				else
+				{
+					inter = weave_ords_and(inter, ninter, one, none, &ninter);
+				}
+				if (ninter == 0)
+					break;
+			}
+			/* OR across the conjunct's alternatives */
+			cunion = (ai == 0) ? inter :
+				weave_ords_or(cunion, ncunion, inter, ninter, &ncunion);
+			if (ai == 0)
+				ncunion = ninter;
+		}
+		/* AND across conjuncts */
+		if (!have_result)
+		{
+			result = cunion;
+			nresult = ncunion;
+			have_result = true;
+		}
+		else
+			result = weave_ords_and(result, nresult, cunion, ncunion, &nresult);
+	}
+	MemoryContextSwitchTo(old);
+
+	if (nresult > 0)
+	{
+		/* alloc-ok: a vocabulary-bounded ordinal set; query path */
+		*cands = palloc(nresult * sizeof(uint64));
+		memcpy(*cands, result, nresult * sizeof(uint64));
+	}
+	*ncands = nresult;
+	MemoryContextDelete(cxt);
+	return true;
+}
+
+/*
+ * weave_regex_terms -- collect the postings of every dictionary term matching
+ * the regular expression `re`, by compiling it once and running core's engine
+ * over the segment's dictionary chain -- narrowed to the terms the trigram weft
+ * says can match when the index has one.  EXACT in both directions, so no heap
+ * recheck is needed.  Returns true; *out is a sorted, de-duplicated TidSet.
+ * Returns false only when the segment has no dictionary.
+ *
+ * SAME ENGINE, SAME ANSWER.  The pattern is compiled with pg_regcomp() on its
+ * pg_wchar form under REG_ADVANCED and C_COLLATION_OID, which is precisely what
+ * weave_doc_has_regex() asks RE_compile_and_execute() for; a compile failure is
+ * reported the way core's ~ reports it.  The engine is the only thing that
+ * decides a match here -- the narrowing above only decides which terms it is
+ * asked about -- so `(?i)`, `\\d`, `\\y`, [[:digit:]] and every other ARE
+ * construct mean exactly what they mean to `~`.
+ *
+ * THE DICTIONARY IS FOLDED.  Terms went through the text search configuration
+ * at index time (doc/specs/FUZZY_CHANNEL.md sect. 3.2), and the pattern text is
+ * NOT folded (src/query/parse.c: "read until the closing slash"), so /ABC/
+ * matches nothing while /(?i)ABC/ and /abc/ match a document that said "ABC".
+ * That is the same answer weave_doc_has_regex() gives against the same folded
+ * terms, and it is a property of the channel, not of this route.
+ *
+ * WHAT IS COUNTED.  weave_chan_regex_dict once per call that serves the leaf
+ * (i.e. once per segment per leaf, like fuzzy_dict); weave_chan_regex_trgm once
+ * per call in which the weft narrowing was applied -- the funnel's old meaning,
+ * "the weft narrowed the candidates", kept.  Both can be nonzero for one leaf.
+ * terms_expanded counts terms the engine accepted; dict_pages the pages read.
+ */
+static bool
+weave_regex_terms(Relation index, const WeaveSegMeta *seg,
+				  const char *re, int relen, TidSet *out)
+{
+	regex_t		cre;
+	pg_wchar   *wpat;
+	int			wpatlen;
+	int			rc;
+	WeaveDictVocab dv;
+	WeaveTermRuns h;
+	pg_wchar   *wterm;
+	uint64	   *cands = NULL;	/* candidate ordinals, or NULL: every term */
+	int			ncands = 0;
+	bool		narrowed = false;
+
+	out->tids = NULL;
+	out->n = 0;
+	if (seg->dictstart == InvalidBlockNumber)
+		return false;
+
+	/*
+	 * Compile ONCE per (segment, leaf), not once per term: 260k terms is 260k
+	 * compiles otherwise, and core's own cache (RE_compile_and_cache) is not
+	 * reachable from here without going through text datums per term.
+	 */
+	wpat = (pg_wchar *) palloc((relen + 1) * sizeof(pg_wchar));
+	wpatlen = pg_mb2wchar_with_len(re, wpat, relen);
+	rc = pg_regcomp(&cre, wpat, wpatlen, REG_ADVANCED, C_COLLATION_OID);
+	pfree(wpat);
+	if (rc != REG_OKAY)
+	{
+		char		errMsg[100];
+
+		/* re did not compile: no pg_regfree needed, same as core */
+		pg_regerror(rc, &cre, errMsg, sizeof(errMsg));
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
+				 errmsg("invalid regular expression: %s", errMsg)));
+	}
+
+	/* THE REGEX-DICTIONARY MECHANISM: counted once the route has committed. */
+	weave_chan_regex_dict++;
+
+	dv.index = index;
+	dv.seg = seg;
+	dv.blk = seg->dictstart;
+	dv.buf = InvalidBuffer;
+	dv.ptr = dv.end = NULL;
+	dv.nextblk = InvalidBlockNumber;
+	dv.cur = NULL;
+	dv.nyielded = 0;
+	dv.nextkey = NULL;			/* skip() is the automaton's; this walk has none */
+	weave_termruns_init(&h, index, seg, &dv);
+
+	/*
+	 * A term's pg_wchar form is at most its byte length in characters, and
+	 * weave_dict_entry_fits() bounds a term by the page, so one BLCKSZ buffer
+	 * serves every term of the walk without a per-term allocation.
+	 */
+	wterm = (pg_wchar *) palloc((BLCKSZ + 1) * sizeof(pg_wchar));
+
+	PG_TRY();
+	{
+		const char *term;
+		weave_ul_uint32 len,
+					ord;
+		int			ci = 0;
+
+		if (seg->trgmstart != InvalidBlockNumber)
+			narrowed = weave_regex_narrow(index, seg, re, relen, &cands, &ncands);
+		if (narrowed)
+			weave_chan_regex_trgm++;	/* the weft narrowed the candidates */
+
+		/*
+		 * The walk itself.  weave_dictvocab_next() is the fuzzy walk's iterator
+		 * and carries every guard that walk documents (InvalidBuffer = end of
+		 * chain, weave_dict_entry_fits before termlen, weave_page_entry_end,
+		 * CHECK_FOR_INTERRUPTS between pages with no lock held); `ord` is the
+		 * yield count, which is the ordinal the weft was written with.  An
+		 * empty candidate set means no term can match and the chain is not
+		 * read at all.
+		 */
+		while ((!narrowed || ci < ncands) &&
+			   weave_dictvocab_next(&dv, &term, &len, &ord))
+		{
+			int			wlen;
+
+			if (narrowed)
+			{
+				/* both ascending: advance past ordinals the walk never yielded */
+				while (ci < ncands && cands[ci] < (uint64) ord)
+					ci++;
+				if (ci >= ncands)
+					break;
+				if (cands[ci] != (uint64) ord)
+					continue;
+				ci++;
+			}
+
+			wlen = pg_mb2wchar_with_len(term, wterm, (int) len);
+			rc = pg_regexec(&cre, wterm, wlen, 0, NULL, 0, NULL, 0);
+			if (rc == REG_NOMATCH)
+				continue;
+			if (rc != REG_OKAY)
+			{
+				char		errMsg[100];
+
+				/* REG_CANCEL arrives here; let the cancel win if it is one */
+				CHECK_FOR_INTERRUPTS();
+				pg_regerror(rc, &cre, errMsg, sizeof(errMsg));
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
+						 errmsg("regular expression failed: %s", errMsg)));
+			}
+			weave_chan_terms_expanded++;
+			weave_termruns_add_current(&h);
+		}
+	}
+	PG_FINALLY();
+	{
+		/*
+		 * The iterator holds a pinned, share-locked buffer between next() calls
+		 * and the compiled regex is malloc'd, not palloc'd: an ERROR or a cancel
+		 * anywhere above (the narrowing allocates, weave_decode_term reads more
+		 * pages, the engine can report REG_CANCEL) would otherwise leak both out
+		 * of the query.
+		 */
+		weave_dictvocab_release(&dv);
+		pg_regfree(&cre);
+	}
+	PG_END_TRY();
+	pfree(wterm);
+	if (cands)
+		pfree(cands);
+
+	weave_termruns_merge(&h, out);
 	return true;
 }
 
@@ -2248,8 +2728,8 @@ done:
 /*
  * weave_collect_matches: evaluate the scan's query across all segments + the
  * pending list; return matching TIDs (sorted, unique) and a *recheck flag
- * (true iff any term used the over-generating trigram funnel / regex / NOT-
- * universe path).  Shared by the bitmap scan and the plain gettuple scan.
+ * (true iff any term used the over-generating trigram funnel / NOT-universe
+ * path, or the query mixes several fuzzy/regex leaves).  Shared by the bitmap scan and the plain gettuple scan.
  */
 static void
 weave_collect_matches(Relation index, WeaveQuery query, TidSet *out, bool *recheck)
@@ -2397,6 +2877,32 @@ collect_retry:
 						continue;
 					}
 				}
+				else
+				{
+					/*
+					 * REGEX IS EXACT, LIKE FUZZY, AND DOES NOT CLEAR `exact`.
+					 * weave_regex_terms() decides every dictionary term with
+					 * the same engine weave_doc_has_regex() would use on the
+					 * heap, so the candidate set IS the answer and a recheck
+					 * would only re-derive it per row.  It declines only for a
+					 * segment with no dictionary, which the `continue` at the
+					 * top of this loop already skipped -- so the fallback
+					 * below is the universe, never the trigram funnel: the
+					 * funnel's trigrams come from weave_trigrams() over the
+					 * raw text, and a pattern's raw text is not a set of
+					 * trigrams every match contains.
+					 */
+					if (weave_regex_terms(index, sg,
+										  WEAVE_QUERY_ITEMTEXT(query, it),
+										  it->termlen, &ts))
+					{
+						cands = tidset_or(cands, ts);
+						any_trgm = true;
+						continue;
+					}
+					any_trgm = false;
+					break;
+				}
 				exact = false;
 
 				/*
@@ -2414,21 +2920,16 @@ collect_retry:
 				 * Refusing (returning false here) costs a full-dictionary scan
 				 * and keeps the answer right.
 				 *
-				 * Fuzzy reaches this path only when weave_fuzzy_terms() above
-				 * declines (a query over WEAVE_ULEVEN_MAX_UNITS units, or k over
-				 * WEAVE_ULEVEN_MAX_K), so the added scans are rare by
-				 * construction.  Regex keeps 3: its trigrams come from the
-				 * pattern's AST (weave_regex_trigrams), which emits only
-				 * trigrams every matching string must contain, so there is no k
-				 * to budget for.
+				 * Only fuzzy reaches this path now, and only when
+				 * weave_fuzzy_terms() above declines (a query over
+				 * WEAVE_ULEVEN_MAX_UNITS units, or k over WEAVE_ULEVEN_MAX_K),
+				 * so the added scans are rare by construction.
 				 */
 				if (weave_trgm_candidates(index, sg->trgmstart,
 										 sg->dictstart,
 										 WEAVE_QUERY_ITEMTEXT(query, it),
 										 it->termlen,
-										 (it->flags & WEAVE_QF_REGEX) != 0 ? 3 :
 										 3 * (int) it->distance + 1,
-										 (it->flags & WEAVE_QF_REGEX) != 0,
 										 sg->doclenstart == InvalidBlockNumber, &ts))
 				{
 					cands = tidset_or(cands, ts);
@@ -2454,11 +2955,12 @@ collect_retry:
 			else
 			{
 				/*
-				 * No trigram acceleration for this fuzzy/regex term (index built
-				 * without trigrams, or the pattern is too short to yield the
-				 * minimum trigrams).  We fall back to rechecking every document
-				 * in the segment against the pattern -- correct, just slower, and
-				 * the documented behavior of a trigrams-off index (see the
+				 * No trigram acceleration for this over-long fuzzy term (index
+				 * built without trigrams, or the term has too few trigrams for
+				 * 3k+1) -- or, in principle, a regex over a segment with no
+				 * dictionary.  We fall back to rechecking every document in the
+				 * segment against the pattern -- correct, just slower, and the
+				 * documented behavior of a trigrams-off index (see the
 				 * "trigrams reloption" regression test).  weave_universe_bounded
 				 * folds duplicates as it goes so the candidate scratch stays
 				 * O(ndocs); the older unbounded collect grew to Sum(df) and could
@@ -4333,10 +4835,10 @@ weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
 		weave_collect_matches(index, q, &matches, &recheck);
 		/*
 		 * matches is the SAME boolean set @@@ uses through this index (it is
-		 * built by the identical evaluator).  For fuzzy/regex/NOT-universe and
-		 * PHRASE/NEAR it OVER-generates (recheck=true): fuzzy/regex is a
-		 * trigram-funnel candidate set, and a PHRASE is the AND-set (the
-		 * positionless posting lists cannot enforce adjacency).  The bitmap-
+		 * built by the identical evaluator).  For the fuzzy funnel/NOT-universe
+		 * and PHRASE/NEAR it OVER-generates (recheck=true): an over-long fuzzy
+		 * term is a trigram-funnel candidate set, and a PHRASE is the AND-set
+		 * (the positionless posting lists cannot enforce adjacency).  The bitmap-
 		 * heap scan resolves this with an executor recheck of @@@; the ranked
 		 * scan has none, so we recheck here -- shrink matches to the EXACT set
 		 * against the heap wdoc.  After this the docid filter is precise, so
