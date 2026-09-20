@@ -73,6 +73,8 @@ sources = files(
   'src/query/match.c',
   # Z7: the boolean-gate shuttle (include/weave/gate.h).  In OBJS too.
   'src/query/gate.c',
+  # Z9: the <@> edit-distance shuttle (include/weave/edist.h).  In OBJS too.
+  'src/query/edist.c',
   # Fuzzy/regex/prefix channel, imported from pg_tre (doc/specs/IMPORT_pg_tre.md)
   # and wired into the build by tasks Z1/Z2.  Compiled and linked but not yet
   # reachable from the access method or the planner (Z3 onward).
@@ -206,5 +208,6 @@ install_data(
   'sql/pg_weave--0.8.0--0.9.0.sql',
   'sql/pg_weave--0.9.0--0.10.0.sql',
   'sql/pg_weave--0.10.0--0.11.0.sql',
+  'sql/pg_weave--0.11.0--0.12.0.sql',
   install_dir: pg_extension_dir,
 )

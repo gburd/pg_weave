@@ -43,6 +43,7 @@
 #include "weave/weave.h"
 #include "weave/am.h"			/* WEAVE_ALLOC_MAYBE_HUGE / WEAVE_REALLOC_MAYBE_HUGE */
 #include "weave/docvalid.h"
+#include "weave/edist.h"		/* weave_doc_min_edist: the <@> operator's value */
 #include "catalog/pg_collation.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
@@ -865,6 +866,70 @@ weave_doc_has_fuzzy(WeaveDoc doc, const char *term, int termlen, int k)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * weave_doc_min_edist -- the minimum character-level Levenshtein distance from
+ * `pat` to any term of the document, or -1 for a term-free document.
+ *
+ * This is what the `<@>` operator returns (task Z9, src/query/edist.c) and it is
+ * also what the ordering scan uses to score PENDING documents, which are in no
+ * segment dictionary.  One definition, two callers, so the index path and the
+ * heap path cannot disagree -- the failure weave_doc_has_fuzzy()'s comment above
+ * records having actually happened for `~k`.
+ *
+ * WHY A DOCUMENT-LEVEL DISTANCE IS A MINIMUM OVER TERMS: a document holds many
+ * terms and `<@>` has to reduce them to one number for ORDER BY.  The minimum is
+ * the only reduction under which "ascending distance" means "closest match
+ * first"; a sum or an average would rank a long document worse for containing
+ * extra words, and a maximum would rank the document that contains the pattern
+ * verbatim last.
+ *
+ * The unit is the CHARACTER, because varstr_levenshtein() counts characters and
+ * so does contrib/fuzzystrmatch's levenshtein(), which sql/edist.sql uses as the
+ * oracle.  The one prefilter is the length deficit -- |chars(a) - chars(b)| is a
+ * LOWER bound on the distance, so a candidate whose length alone puts it at or
+ * beyond the best distance found so far cannot improve on it -- and it is stated
+ * in characters for the reason G30 records: in bytes it discards candidates that
+ * are one character apart and several bytes apart.
+ */
+int
+weave_doc_min_edist(WeaveDoc doc, const char *pat, int patlen)
+{
+	WeaveTermEntry *entries = WEAVE_DOC_ENTRIES(doc);
+	uint32		i;
+	bool		single_byte_enc = (pg_database_encoding_max_length() == 1);
+	int			qchars = single_byte_enc ? patlen
+		: pg_mbstrlen_with_len(pat, patlen);
+	int			best = -1;
+
+	for (i = 0; i < doc->nterms; i++)
+	{
+		const char *cand = WEAVE_DOC_TERMTEXT(doc, &entries[i]);
+		int			candlen = entries[i].len;
+		int			candchars = single_byte_enc ? candlen
+			: pg_mbstrlen_with_len(cand, candlen);
+		int			d;
+
+		if (best >= 0 && abs(candchars - qchars) >= best)
+			continue;
+		if (best <= 0)
+			d = varstr_levenshtein(pat, patlen, cand, candlen, 1, 1, 1, true);
+		else
+		{
+			/* Bounded: anything at best or beyond is of no interest, and core
+			 * returns a value above the bound in that case. */
+			d = varstr_levenshtein_less_equal(pat, patlen, cand, candlen,
+											  1, 1, 1, best - 1, true);
+			if (d > best - 1)
+				continue;
+		}
+		if (best < 0 || d < best)
+			best = d;
+		if (best == 0)
+			break;				/* the pattern IS a term of this document */
+	}
+	return best;
 }
 
 /*

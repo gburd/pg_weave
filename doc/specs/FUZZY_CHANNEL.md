@@ -457,6 +457,11 @@ layout.
 
 ## 5. `<@>` edit-distance KNN — task Z9
 
+Status: **implemented.** `include/weave/edist.h` (bound + cursor core),
+`src/query/edist.c` (shuttle, `wdoc <@> text`), the ordering scan in
+`src/am/amscan.c` (`weave_edist_pass`/`weave_edist_grow`), strategy 3 of
+`wdoc_lex_ops` in `sql/pg_weave--0.11.0--0.12.0.sql`.
+
 This one is **not** boolean and does need a real numeric bound. Ordering by
 `text <@> pattern` returns rows by ascending edit distance, so
 `score = -edit_distance` and a bound requires a *lower* bound on edit distance for
@@ -484,11 +489,79 @@ ed_lower(block) = max( length_deficit(block),
 block_max()     = -ed_lower(block)
 ```
 
-Both terms are monotone in quantities available from the block header, satisfying
-(C3). Tightness is unmeasured and **must** be measured before this is called done
-— the lesson from the vector channel is that a provably-correct bound can prune
-0.0 % of blocks and that this is invisible without measuring the pruning rate
-directly. `bench/bound_pruning.c` is the shape to copy.
+> **RETRACTED, 2026-09-20 (task Z9): the second term above is UNSOUND as written,
+> and it is the row-dropping direction.** `max_T_block` is attained by ONE term of
+> the block; a bound over the block must hold for EVERY term in it. A page holding
+> both a term with `T = 24` and a term that IS the pattern would be credited a
+> deficit of `ceil((24 − T_pattern)/3)` while containing a term at distance 0, so
+> `block_max()` would be below `score()` there and the page holding the exact match
+> would be skipped. The statistic that direction needs is **`min_T_block`**. The
+> third term is sound as written (every term has `T(t) <= max_T_block`, so
+> `T_pattern − max_T_block <= T_pattern − T(t)`). The implemented bound is
+>
+> ```
+> ed_lower(block) = max( length_deficit(block),
+>                        ceil( (min_T_block - T_pattern) / div ),
+>                        ceil( (T_pattern - max_T_block) / div ) )
+> ```
+>
+> and the counterexample above is a pinned directed case in
+> `test/hegel/test_edist.c`, so a regression to the text of this section fails the
+> property test rather than silently losing rows.
+>
+> **`div` is 3 only when a byte trigram cannot straddle two characters.** The edit
+> unit is the CHARACTER and the trigram is a BYTE trigram; one edit splices out a
+> run of `a` bytes, so it can remove at most `a + 2` distinct trigrams, and `a` is
+> bounded by the longest character in either string. Both sides ASCII (or a
+> single-byte server encoding) gives `div = 3` as written here; anything else gives
+> `div = 2 + pg_database_encoding_max_length()`, i.e. 6 under UTF-8. Using 3 there
+> would make the bound up to twice too large. This is the same byte-versus-character
+> confusion as G30, one level up. The derivation is in `include/weave/edist.h`.
+
+**Where the block statistics come from, decided by Z9: they are computed once when
+the shuttle first enters a dictionary page, off the page it is already holding.**
+The section above says "available from the block header", which would be an on-disk
+format change — a version bump, a page-kind decision, a read path for pages the old
+writer produced, and a TAP page-surgery upgrade test — in support of a bound whose
+pruning rate was unmeasured at the time the choice had to be made. That is hard
+rule 9's warning exactly, so the no-format-change option was taken instead and a
+block is **one dictionary page**. (C3)'s letter holds: `block_max()` reads seven
+integers in `WeaveEdistStats`. Its intent — no I/O inside the bound — holds too:
+the page is the walk's own, pinned for the duration, and the statistics pass is paid
+once per page rather than once per position. The honest residual is that a pruned
+page is still READ before it is pruned, so what the bound saves is the exact
+Levenshtein per term, not the page I/O. Buying the I/O back is what a format change
+would be for, and the measurement below is what should decide that.
+
+**Tightness, measured (`bench/RESULTS_EDIST_BOUND.md`, `bench/edist_bound.c`), and
+the answer is the vector channel's answer again.** On a 254,000-term vocabulary in
+**1,004** dictionary pages, over 12 patterns × k ∈ {1,2,3}:
+
+| | median pages pruned | median terms scored | rows at 0.0 % pruned |
+|---|---:|---:|---:|
+| lexicographic pages (the real order) | **0.0 %** | **100.00 %** | 22 of 36 |
+| length-clustered pages (hypothetical) | 0.5 % | 99.58 % | 12 of 36 |
+
+Pruning is 0.0 % on every query where `d(k) >= 3` and the pattern's character
+length lies inside the vocabulary's length range — which is the ordinary case, a
+misspelled word against a corpus of words. It is 89–99 % when the pattern is very
+short or very long relative to the vocabulary, and 33 % when an exact match exists
+(`d(1) = 0`). The mechanism is structural rather than a matter of tightness: **the
+dictionary is sorted lexicographically, an order with no relationship to term
+length or trigram count, so every page carries a near-full spread of both and its
+min/max statistics sit near the vocabulary's global min/max.** That is the same
+shape as `bench/RESULTS_BOUND_PRUNING.md`, where the vector bound needed a docid
+ordering constraint nobody had written down; here the constraint would be
+clustering the dictionary by length, which the lexical channel cannot have because
+its point lookups, prefix scans and sparse block index all need byte order. The
+second arm above measures what that clustering would buy and it is **not** the fix
+either: the `pages/fin` ceiling rises to ~40 % for length-extreme patterns and
+stays ~0.1 % for the ordinary one.
+
+So (C2) holds, the bound is real, the property test is 25.4 M checks with zero
+violations, and the pruning rate for the dominant query shape is zero. What to do
+about that is not this section's call; the numbers are in
+`bench/RESULTS_EDIST_BOUND.md` with no verdict attached.
 
 ## 6. The limitation, stated plainly
 
@@ -548,7 +621,7 @@ anyone enables it on a multi-GB column.
 | Z6 | `E-[0-9]{4}` p50 ≤ 100 ms | vs pg_tre's 1.5 s |
 | Z7 | (C1)+(C2) property test for the gate shuttle | `test/hegel/test_bounds.c` |
 | Z8 | randomized differential test vs pg_trgm | thousands of generated patterns, row sets compared exactly |
-| Z9 | randomized differential test vs seq-scan `levenshtein()`; bound pruning rate measured | both required; correctness alone is not the gate |
+| Z9 | randomized differential test vs seq-scan `levenshtein()`; bound pruning rate measured | both required; correctness alone is not the gate. **Done**: `sql/edist.sql` (parity against `levenshtein()` for 12 patterns and for the whole table), `test/hegel/test_edist.c` ((C1)+(C2), 25.4 M checks), `bench/RESULTS_EDIST_BOUND.md` (the pruning rate, which is 0.0 % for the dominant query shape — see sect. 5) |
 
 The differential tests (Z8, Z9) matter more than the latency gates. A fuzzy search
 that is fast and subtly wrong is worse than pg_trgm, and the only way to know is to

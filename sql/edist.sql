@@ -1,0 +1,240 @@
+-- Task Z9: `<@>` edit-distance KNN ordering, and its gate is PARITY WITH A
+-- SEQ-SCAN levenshtein() REFERENCE.
+--
+-- WHY THAT IS THE GATE and not a fixed list of expected ids.  `<@>` is answered
+-- by an index ordering scan that prunes whole dictionary pages with a numeric
+-- lower bound on edit distance (include/weave/edist.h).  A bound that is one edit
+-- too large skips the page holding the nearest term, and the query still returns
+-- plausible rows in plausible order -- just not the closest ones.  AGENTS.md hard
+-- rule 1 is about exactly this: no fixed-expected-output test catches it.  So
+-- every assertion below compares the index's answer against the same question
+-- asked of the heap with contrib/fuzzystrmatch's levenshtein(), which is nobody's
+-- implementation detail.  doc/specs/FUZZY_CHANNEL.md sect. 8 names this as the Z9
+-- gate; the property test test/hegel/test_edist.c is the other half and covers
+-- the bound directly at 25M random positions.
+--
+-- WHY EVERY COMPARISON ORDERS BY (distance, id) IN BOTH ARMS.  Edit distance
+-- ties are the normal case -- a corpus has many terms two edits from anything --
+-- so `ORDER BY d <@> p LIMIT k` alone does not determine WHICH of the tied rows
+-- the k-th one is, in either arm.  Comparing two arbitrary choices would be a
+-- flaky test, and "flaky" here means it would fail for a reason that is not a
+-- bug, which trains people to re-run it.  (distance, id) is the only total order
+-- both arms can agree on; the access method makes it available by tie-breaking
+-- its candidate list on TID (cmp_edist_dist in src/am/amscan.c), so asking for it
+-- costs the index arm nothing.
+--
+-- THE DISTANCE PRINTED comes from the OPERATOR (the heap-side
+-- weave_doc_min_edist), while the ORDER comes from the INDEX (xs_orderbyvals).
+-- That is deliberate: xs_orderbyvals is not observable from SQL, so the only way
+-- to check it is to check the order it produced, and having the projected value
+-- come from the other implementation makes each assertion a two-sided agreement.
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+ALTER EXTENSION pg_weave UPDATE;
+CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
+SET max_parallel_workers_per_gather = 0;
+
+CREATE TABLE ed (id serial, body text, d wdoc);
+-- Every body is space-separated lowercase tokens and nothing else, so
+-- string_to_array(body, ' ') IS the term set to_wdoc('simple', body) produces.
+-- That equality is what makes the reference expressible in SQL; a hyphen or an
+-- uppercase letter would make the two sides different questions.
+INSERT INTO ed(body) VALUES
+  ('connection refused'),              -- the exact term: distance 0
+  ('connectoin refused'),              -- one transposition = TWO edits
+  ('conection refused'),               -- one deletion
+  ('connexion refused'),               -- two substitutions
+  ('disconnection refused'),           -- longer: the length deficit bites
+  ('database locked'),
+  ('databse locked'),
+  ('naive approach'),
+  ('na' || U&'\00EF' || 've approach'), -- one CHARACTER, two BYTES (G30)
+  ('cafe society'),
+  ('caf' || U&'\00E9' || ' society'),
+  ('m' || U&'\00FC' || 'nchen bier'),
+  ('zzzzzzzzzzzzzzzz filler');         -- a term whose distinct-trigram count is
+                                       -- 1 while its length is 16
+-- Filler so the dictionary spans several pages and the block bound has blocks to
+-- prune.  A one-page dictionary would make the pruning path unreachable and the
+-- test would pass without ever exercising it.
+INSERT INTO ed(body) SELECT 'filler token ' || g FROM generate_series(1000, 3000) g;
+UPDATE ed SET d = to_wdoc('simple', body);
+CREATE INDEX ed_idx ON ed USING weave (d);
+ANALYZE ed;
+
+-- The reference, in its own table with no weave index on it.
+--
+-- WHY A SEPARATE TABLE AND NOT A SUBQUERY OVER `ed`.  Everything below runs with
+-- enable_seqscan = off, and a bare `FROM ed` under that setting can be answered by
+-- an Index Scan on a weave index with NO scan key and NO ordering clause -- a plan
+-- the access method refuses ("a weave index scan requires a query").  PG17 chose a
+-- Seq Scan for it anyway and PG18 chose the index, so a reference arm that touched
+-- `ed` passed on one major and errored on the other.  The reference must not depend
+-- on which plan the reference arm gets: it lives in `edw`, one row per (document,
+-- word), which carries no index at all.  That also makes it a genuinely independent
+-- computation -- a normalized table and a GROUP BY min -- rather than a rewording of
+-- the thing under test.
+CREATE TABLE edw (id int, word text);
+INSERT INTO edw SELECT e.id, w FROM ed e, unnest(string_to_array(e.body, ' ')) w;
+CREATE FUNCTION ed_ref(pat text)
+RETURNS TABLE (id int, dist int)
+LANGUAGE sql STABLE AS $$
+  SELECT w.id, min(levenshtein(w.word, pat))::int FROM edw w GROUP BY w.id
+$$;
+
+-- enable_seqscan=off tests PATH GENERATION rather than cost: if the AM can
+-- produce an ordering path the planner takes it, and if it cannot the planner
+-- falls back to a Seq Scan even at disable_cost.  A Seq Scan below therefore
+-- means "no index path exists", which is the L7 / G1 failure this file also
+-- guards against for the new operator.
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexscan = on;
+
+-- ---- the plan --------------------------------------------------------------
+-- (1) THE BARE FORM, no WHERE clause.  This is the form a user writes first and
+-- the one task L7 measured a 7,000x cliff on for <=>.  It must be an ordering
+-- Index Scan with an Order By, and no Sort node.
+EXPLAIN (COSTS OFF)
+SELECT id FROM ed ORDER BY d <@> 'connection' LIMIT 5;
+
+-- (2) With a WHERE clause alongside.  The @@@ key is pushed down and an Index
+-- Scan does not re-evaluate a pushed-down qual, so the pass intersects with the
+-- @@@ match set itself (weave_edist_pass).
+EXPLAIN (COSTS OFF)
+SELECT id FROM ed WHERE d @@@ 'refused'::wquery
+ ORDER BY d <@> 'connection' LIMIT 5;
+
+-- ---- parity with the reference, ten patterns -------------------------------
+-- Each row: the pattern, and whether the index arm's (id, distance) list for
+-- LIMIT k is IDENTICAL to the reference's.  Any `f` in this output is a Z9 bug.
+WITH pats(p, k) AS (VALUES
+    ('connection', 5), ('connectoin', 5), ('databse', 5), ('database', 3),
+    ('naive', 5), ('na' || U&'\00EF' || 've', 5), ('cafe', 4),
+    ('munchen', 3), ('zzzzzzzzzzzzzzzz', 2), ('token', 5), ('q', 3),
+    ('', 3))
+SELECT p AS pattern, k,
+       (SELECT array_agg(ROW(id, dist)::text ORDER BY dist, id)
+          FROM (SELECT id, (d <@> p)::int AS dist
+                  FROM ed ORDER BY d <@> p, id LIMIT k) i)
+       IS NOT DISTINCT FROM
+       (SELECT array_agg(ROW(id, dist)::text ORDER BY dist, id)
+          FROM (SELECT id, dist FROM ed_ref(p) ORDER BY dist, id LIMIT k) r)
+       AS parity
+  FROM pats ORDER BY p, k;
+
+-- ---- LIMIT larger than the table ------------------------------------------
+-- The strongest form of the same check, and the one that exercises the widening
+-- ladder to exhaustion: EVERY row, with its exact distance, compared against the
+-- reference.  An amcanorderbyop scan must be able to return every tuple in order
+-- (weave_edist_grow), so a missing row here is a truncated result, not a slow one.
+WITH idx AS MATERIALIZED (
+  SELECT id, (d <@> 'databse')::int AS dist
+    FROM ed ORDER BY d <@> 'databse', id LIMIT 100000)
+SELECT (SELECT count(*) FROM idx) AS idx_rows,
+       (SELECT count(*) FROM ed_ref('databse')) AS ref_rows,
+       (SELECT count(*) FROM idx i FULL JOIN ed_ref('databse') r USING (id)
+         WHERE i.dist IS DISTINCT FROM r.dist) AS mismatches;
+
+-- ---- the order the INDEX produced is ascending -----------------------------
+-- The parity checks above re-sort, so they would survive an index that returned
+-- the right rows in the wrong order.  This one does not re-sort: it numbers the
+-- rows in the order the ordering scan emitted them and counts descents in the
+-- distance.  A non-zero count means xs_orderbyvals and the operator disagree.
+WITH q AS MATERIALIZED (
+  SELECT id, (d <@> 'connection')::int AS dist
+    FROM ed ORDER BY d <@> 'connection' LIMIT 40),
+     n AS (SELECT row_number() OVER () AS rn, dist FROM q)
+SELECT count(*) AS descents
+  FROM n a JOIN n b ON b.rn = a.rn + 1
+ WHERE b.dist < a.dist;
+
+-- ---- ascending order over the WHOLE table, four patterns ------------------
+-- The parity checks above re-sort (they must, for the tie reason at the top), so
+-- they test the row SET and not the ORDER.  The check above tests the order for one
+-- pattern over 40 rows.  This one tests it over every row for four patterns, and
+-- the patterns are chosen so that a SINGLE widening pass spans more than one
+-- distance value: `q` and the empty pattern have most of the dictionary pruned at
+-- the first threshold, so the pass that follows arrives at a threshold several
+-- edits out and collects several distances at once.  That is the only shape in
+-- which the candidate list's own sort direction is observable at all -- with one
+-- distance per pass the ladder alone produces ascending output and a reversed
+-- comparator is invisible.  Found by mutation testing, which is why the shape is
+-- spelled out rather than left to luck.
+SELECT pat,
+       (SELECT count(*)
+          FROM (SELECT dist, lag(dist) OVER () AS prev
+                  FROM (SELECT (d <@> pat)::int AS dist
+                          FROM ed ORDER BY d <@> pat) s) t
+         WHERE t.dist < t.prev) AS descents
+  FROM (VALUES ('connection'), ('q'), ('zzzzzzzzzzzzzzzz'), ('')) v(pat)
+ ORDER BY pat;
+
+-- ---- the tie-break is TID order, pinned --------------------------------
+-- 2,001 rows hold the term `token` at distance 0, so `LIMIT 5` with NO secondary
+-- sort key cuts INSIDE that tie and the five rows returned are whichever five the
+-- index handed out first.  Every comparison above deliberately re-sorts on
+-- (distance, id) to avoid depending on that -- which means none of them can see the
+-- candidate list's tie-break at all.  This statement pins it: cmp_edist_dist orders
+-- equal distances by TID, so these are the five lowest-TID rows containing `token`.
+-- A reversed comparator returns the five highest instead, and nothing else in this
+-- file notices (established by mutation testing, not assumed).
+SELECT id, (d <@> 'token')::int AS dist FROM ed ORDER BY d <@> 'token' LIMIT 5;
+
+-- ---- distance 0, and the multi-byte pattern -------------------------------
+-- A pattern that IS a term must come back at distance 0 and must come back
+-- FIRST.  Under a bound that is too large this is the row that goes missing.
+SELECT id, body, (d <@> 'connection')::int AS dist
+  FROM ed ORDER BY d <@> 'connection', id LIMIT 3;
+
+-- The multi-byte case, in both directions: an ASCII pattern against a term with a
+-- two-byte character, and the two-byte pattern against the ASCII term.  Both are
+-- distance 1 in CHARACTERS and 2 in bytes, which is the G30 shape; a byte-length
+-- bound reports 2 here and drops the row.  Reached through the ordering scan (not a
+-- LIKE on the body) so that this statement, too, is a statement about the index.
+SELECT id, body, (d <@> 'naive')::int AS ascii_pat,
+       (d <@> ('na' || U&'\00EF' || 've'))::int AS mb_pat
+  FROM ed ORDER BY d <@> 'naive', id LIMIT 2;
+
+SELECT levenshtein('naive', 'na' || U&'\00EF' || 've') AS oracle_says;
+
+-- ---- the WHERE + ORDER BY combination -------------------------------------
+-- Rows must satisfy the restriction AND be ordered by distance.  A scan that
+-- ignored the pushed-down @@@ key would return 'database locked' here.
+SELECT id, body, (d <@> 'connection')::int AS dist
+  FROM ed WHERE d @@@ 'refused'::wquery
+ ORDER BY d <@> 'connection', id LIMIT 4;
+
+-- ---- the pending list -----------------------------------------------------
+-- A document inserted after the index was built is in the pending list, in no
+-- segment dictionary, and therefore invisible to the shuttle.  It is scored by
+-- weave_doc_min_edist() -- the same function the operator calls -- so it must
+-- take its correct place in the ordering.  Before that path existed this row
+-- simply did not appear.
+WITH ins AS (
+  INSERT INTO ed(body, d) VALUES
+    ('connection', to_wdoc('simple', 'connection')),
+    ('conn', to_wdoc('simple', 'conn'))
+  RETURNING id, body)
+INSERT INTO edw SELECT id, w FROM ins, unnest(string_to_array(body, ' ')) w;
+WITH idx AS MATERIALIZED (
+  SELECT id, (d <@> 'conn')::int AS dist
+    FROM ed ORDER BY d <@> 'conn', id LIMIT 6)
+SELECT (SELECT array_agg(ROW(id, dist)::text ORDER BY dist, id) FROM idx)
+       IS NOT DISTINCT FROM
+       (SELECT array_agg(ROW(id, dist)::text ORDER BY dist, id)
+          FROM (SELECT id, dist FROM ed_ref('conn') ORDER BY dist, id LIMIT 6) r)
+       AS pending_parity;
+
+-- ---- the operator on its own ----------------------------------------------
+-- `wdoc <@> text` and its commutator must agree, and both must agree with
+-- levenshtein() on the minimum over the document's terms.  Edit distance is
+-- symmetric, so the commutator is the same number with the arguments swapped.
+SELECT to_wdoc('simple', 'alpha beta gamma') <@> 'beta' AS zero,
+       'beta' <@> to_wdoc('simple', 'alpha beta gamma') AS zero_commuted,
+       to_wdoc('simple', 'alpha beta gamma') <@> 'betta' AS one,
+       to_wdoc('simple', 'alpha') <@> '' AS empty_pattern,
+       to_wdoc('simple', '') <@> 'alpha' AS term_free_doc;
+
+DROP FUNCTION ed_ref(text);
+DROP TABLE edw;
+DROP TABLE ed;
