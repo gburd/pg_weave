@@ -203,9 +203,13 @@ when the scope was read as "BM25 + vector", then back when it was restated as al
 six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
 hard rule was weakened on an inference about scope rather than a question about it.*
 
-**34 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
-Z4, Z5, Z6) and 5 withdrawn (L2, L21, V9, V10, V13). By phase: X 4/4, L 16/20, Z 4/9,
-V 9/17, P 2/4, F 0/5, M 0/6, R 0/5. **The count did not move on 2026-09-19 although two
+**36 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 3 partials (V6,
+Z4, Z5) and 5 withdrawn (L2, L21, V9, V10, V13). By phase: X 4/4, L 16/20, Z 6/9,
+V 9/17, P 2/4, F 0/5, M 0/6, R 0/5. **Z6 and Z7 closed on 2026-09-20**: the regex route's
+gate was measured for the record (`bench/RESULTS_FUZZY_REGEX.md`) and the boolean-gate
+shuttle exists with its property test. The same run measured Z5's gate: `k=1` meets it,
+`k=2` does not (208-293 ms against 200), and that miss is recorded in the Z5 row rather than
+re-aimed -- it is fanout, and the lever is Phase F's bounded top-k. **The count did not move on 2026-09-19 although two
 days of work landed**, which is the accounting working rather than failing: Z4 part 2
 (the resident trie) and Z5's swap of the byte automaton for the character-exact `uleven`
 core are both real and both gated on measurements that have not been taken -- Z4 part 3's
@@ -216,11 +220,13 @@ the index and the heap were wrong in the same direction. Z6 (2026-09-20) is the 
 shape again: the regex leaf is now answered exactly from the dictionary in tens of
 milliseconds where it took ~5 s, the indicative read passes the gate with margin, and the
 row stays PARTIAL until `bench/aws/run.sh` says so for the record -- while `G32`, a false
-negative the old literal-run extractor produced for `\d`, is closed by deleting it. **Two of the six retrieval kinds are CHANNELS** -- BM25 lexical and,
-as of V8 on 2026-09-18, quantized-vector ANN -- in the sense defined above: a shuttle with
-a real bound. Prefix, fuzzy and regex return correct rows through the dictionary and the
-trigram funnel but have no shuttle, so they cannot join a fused top-k; n-gram (`cgram`,
-Z8) has neither.
+negative the old literal-run extractor produced for `\d`, is closed by deleting it. **Four of the six retrieval kinds are CHANNELS** -- BM25 lexical, quantized-vector ANN
+(V8, 2026-09-18), and as of Z7 on 2026-09-20 fuzzy and regex -- in the sense defined above:
+a shuttle with a real bound (for a predicate, +/-INF is exactly tight; `include/weave/gate.h`).
+The gate shuttle is key-space agnostic and is not yet driven by any query, because there is
+no fused scorer to drive it (hard rule 7); prefix returns correct rows through the dictionary
+range walk and could use the same shuttle the day a route hands it a key set; n-gram (`cgram`,
+Z8) has neither a route nor a shuttle.
 
 *Z4 is PARTIAL as of 2026-09-19, and the interesting part is why.* Its stated shape --
 route prefix through SuRF instead of the dictionary walk -- is a strict superset of the
