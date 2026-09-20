@@ -15,7 +15,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.12.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.13.0" of extension "pg_weave" is already installed
 CREATE TABLE vi (id serial, d wdoc, v wvec(4), v2 wvec(4));
 INSERT INTO vi(d, v, v2)
   SELECT to_wdoc('shared common' || (g % 7) || ' rare' || g),
@@ -59,22 +59,23 @@ SELECT amvalidate(oid) FROM pg_opclass
   WHERE opcname = 'wi_bogus_ops' AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'weave');
 ERROR:  operator family "wi_bogus_ops" is not a pg_weave channel family
 DETAIL:  The "weave" access method routes each index column to a retrieval channel by its operator class.
-HINT:  Use wdoc_lex_ops for a wdoc column or wvec_weave_ops for a wvec column.
+HINT:  Use wdoc_lex_ops for a wdoc column, wvec_weave_ops for a wvec column, or gram_ops for a text column.
 -- ... and the two real ones validate.
 SELECT opcname, amvalidate(oid) FROM pg_opclass
   WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'weave') AND opcname <> 'wi_bogus_ops'
   ORDER BY opcname;
     opcname     | amvalidate 
 ----------------+------------
+ gram_ops       | t
  wdoc_lex_ops   | t
  wvec_weave_ops | t
-(2 rows)
+(3 rows)
 
 -- An index built on it is refused too, by the same registry lookup.
 CREATE INDEX vi_bad ON vi USING weave (d, id wi_bogus_ops);
 ERROR:  operator family "wi_bogus_ops" is not a pg_weave channel family
 DETAIL:  The "weave" access method routes each index column to a retrieval channel by its operator class.
-HINT:  Use wdoc_lex_ops for a wdoc column or wvec_weave_ops for a wvec column.
+HINT:  Use wdoc_lex_ops for a wdoc column, wvec_weave_ops for a wvec column, or gram_ops for a text column.
 DROP OPERATOR CLASS wi_bogus_ops USING weave;
 -- ---- the build callback found the wdoc ---------------------------------
 -- 300 documents indexed through a two-column index whose FIRST column is the

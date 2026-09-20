@@ -24,6 +24,7 @@
 #include "utils/memutils.h"		/* MemoryContextAllocHuge (WEAVE_ALLOC_MAYBE_HUGE) */
 #include "utils/rel.h"			/* RelationGetRelationName, rd_options */
 
+#include "weave/cgram.h"		/* Z8: the cgram weft's root-page layout */
 #include "weave/chandesc.h"
 #include "weave/pagebound.h"
 #include "weave/pagekind.h"
@@ -1112,7 +1113,63 @@ extern void weave_add_segment_with_room(Relation index, const WeaveSegMeta *seg)
  * absent weft cost zero bytes -- including its descriptor slot.
  */
 extern void weave_attach_chandesc(Relation index, WeaveSegMeta *seg,
-								  BlockNumber surfroot, BlockNumber vecroot);
+								  BlockNumber surfroot, BlockNumber vecroot,
+								  BlockNumber cgramroot);
+
+/* ---------------------------------------------------------------------------
+ * The cgram weft: corpus byte trigrams -> docids (task Z8)
+ *
+ * See include/weave/cgram.h for what the channel is and why it is shaped like
+ * the lexical weft.  These are the AM half: the root page that names the weft's
+ * three chains, the reader that resolves it, and the free path.
+ *
+ * Declared here rather than as an extern at the top of a .c file because the
+ * seam is real: ambuild.c writes the root, am.c owns the page and the free path,
+ * amscan.c reads it, amcheck.c walks it and amsize.c counts it.  AGENTS.md hard
+ * rule 5's replacement says a symbol that has to cross files is declared here
+ * with a reason.
+ * ------------------------------------------------------------------------- */
+
+/* The resolved weft, as read from its WEAVE_PK_CGRAM root page. */
+typedef struct WeaveCgramWeft
+{
+	BlockNumber root;
+	BlockNumber dictstart;
+	BlockNumber dictindexstart;
+	BlockNumber postingstart;
+	uint32		nterms;
+} WeaveCgramWeft;
+
+extern BlockNumber weave_write_cgram_root(Relation index, BlockNumber dictstart,
+										  BlockNumber dictindexstart,
+										  BlockNumber postingstart,
+										  uint32 nterms);
+
+/*
+ * Which block is this bolt's cgram weft rooted at, or InvalidBlockNumber when it
+ * carries none -- a pre-Z8 bolt, an index with no gram_ops column, or a bolt
+ * whose cgram weft the writer refused to emit.  Not an error: ABSENT IS SAFE on
+ * this channel (the route then treats every document in the bolt as a candidate
+ * and the mandatory recheck sorts it out), and INCOMPLETE is not, which is why
+ * the writer omits the weft entirely rather than writing part of one.
+ */
+extern BlockNumber weave_cgram_weft_root(Relation index, const WeaveSegMeta *seg);
+
+/*
+ * Open the root page at `root`.  Returns false with *why set to a constant
+ * string when the page is out of bounds, uninitialized, the wrong kind, or fails
+ * its magic/version/reserved/bounds checks.  Never throws: weave_check() must
+ * REPORT a bad weft and a scan must be free to IGNORE it (absent is safe), so
+ * neither behaviour may be baked in here.
+ */
+extern bool weave_cgram_weft_open(Relation index, BlockNumber root,
+								  WeaveCgramWeft *out, const char **why);
+
+/* Free the weft's root page and all three of its chains.  Like the vector weft,
+ * the descriptor names only the root, so a descriptor-driven free that called
+ * weave_free_chain() on it alone would reclaim ONE page and leak the whole
+ * dictionary and every posting page -- the doc/GAPS.md G24 failure mode. */
+extern void weave_cgram_free_weft(Relation index, BlockNumber root);
 
 /* ---------------------------------------------------------------------------
  * The fuzzy weft: the SuRF trie over the bolt vocabulary (task Z3)
@@ -1301,6 +1358,13 @@ typedef struct WeaveIndexLayout
 								 * write path builds the docid space from it */
 	AttrNumber	vecattno;		/* 1-based index attnum of the vector column, or
 								 * 0 if the index has none */
+	AttrNumber	cgramattno;		/* 1-based index attnum of the cgram (text,
+								 * gram_ops) column, or 0 if the index has none.
+								 * Resolved here and not inferred from the column
+								 * TYPE for the reason this whole struct's block
+								 * comment gives: the discriminator is the opclass.
+								 * A text column is not by itself a cgram column --
+								 * `USING weave (sku gram_ops)` is the request. */
 } WeaveIndexLayout;
 
 extern void weave_index_layout(Relation index, WeaveIndexLayout *out);

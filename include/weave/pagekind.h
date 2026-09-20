@@ -232,6 +232,31 @@ typedef enum WeavePageKind
 	 */
 	WEAVE_PK_PENDING_V9 = 29,	/* pending page in the v9 item layout */
 
+	/*
+	 * Allocated by task Z8.  The cgram weft reuses the LEXICAL dictionary,
+	 * block-index and posting BYTE LAYOUTS exactly (that reuse is the whole
+	 * design, see include/weave/cgram.h) but it does NOT reuse their page kinds,
+	 * for the reason WEAVE_PK_VDIR states in the comment above: a page that
+	 * cannot say which of two structures it belongs to cannot be validated in
+	 * isolation, and three separate consumers need exactly that.
+	 *
+	 *  - weave_index_size_detail() must sum to pg_relation_size() and must be
+	 *    able to say what the cgram channel COSTS.  Sharing WEAVE_PK_DICT would
+	 *    fold trigram bytes into the lexical dictionary's row, and the one honest
+	 *    number this task owes (bench/RESULTS_CGRAM.md: pg_weave with cgram vs
+	 *    without) would be unmeasurable from inside the index.
+	 *  - weave_check()'s per-chain kind assertion would accept a cgram page where
+	 *    a lexical one belongs and vice versa.
+	 *  - the entries differ in a way the bytes do not show: a cgram dictionary
+	 *    term is a 4-byte trigram HASH, a lexical one is UTF-8 term text.  Both
+	 *    are a length plus bytes, so nothing but the kind distinguishes them.
+	 *
+	 * Appended, never inserted; these ids are on-disk ABI.
+	 */
+	WEAVE_PK_CGRAM_DICT = 30,	/* cgram: trigram -> docid-list dictionary */
+	WEAVE_PK_CGRAM_DICTINDEX = 31,	/* cgram: sparse index over those pages */
+	WEAVE_PK_CGRAM_POST = 32,	/* cgram: the shared docid posting chain */
+
 	WEAVE_PK_NKINDS				/* first unassigned id; not a kind */
 } WeavePageKind;
 

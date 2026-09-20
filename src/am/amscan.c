@@ -34,6 +34,8 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"	/* heap_get_root_tuples: an AM must return HOT-chain
+								 * ROOT tids, see weave_cgram_heapscan() */
 #include "weave/weave.h"
 #include "weave/am.h"
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
@@ -204,9 +206,41 @@ typedef struct WeaveScanOpaqueData
 	int			edistThr;
 	int			edistNext;
 	bool		edistDone;
+
+	/*
+	 * `@~` / `@~*` corpus-trigram restriction (task Z8).  A RESTRICTION key, not
+	 * an ordering one, and its argument is a raw LIKE PATTERN rather than a
+	 * wquery -- which is why weave_rescan() must decide WHICH KIND OF KEY it has
+	 * before it touches sk_argument.  DatumGetWQuery() on a text datum is not a
+	 * type error, it reads a varlena header as a WeaveQuery and walks garbage;
+	 * the ORDER BY dispatch in the same function already says exactly this.
+	 *
+	 * The discriminator is the COLUMN, via weave_index_layout(): strategy numbers
+	 * are per operator family, so gram_ops's 1 and wdoc_lex_ops's 1 are different
+	 * operators with the same number, and only the attribute tells them apart.
+	 */
+	bool		cgramScan;
+	char	   *cgramPat;
+	int			cgramPatLen;
+	bool		cgramCI;		/* the case-insensitive operator (`@~*`) */
+	bool		cgramLossy;		/* the scan carried MORE keys than the one cgram key
+								 * this route honours (`d @@@ q AND body @~ p`, or two
+								 * `@~`s on the same column).  Then the returned set is
+								 * a SUPERSET of the answer and the executor MUST
+								 * re-evaluate the whole qual, so recheck goes out as
+								 * true.  Without this flag such a query returns rows
+								 * that fail the ignored clause -- a wrong answer, and
+								 * one the planner is entitled to produce because
+								 * amcanmulticol is true. */
 } WeaveScanOpaqueData;
 
 typedef WeaveScanOpaqueData *WeaveScanOpaque;
+
+/* The cgram route (task Z8).  Defined near the bottom, next to the recheck and
+ * the fallback heap pass it composes; declared here because weave_getbitmap()
+ * and weave_gettuple() are above it. */
+static bool weave_cgram_collect(Relation index, const char *pat, int patlen,
+								bool ci, TidSet *out);
 
 /* ranked-scan growth (L14); defined next to the visibility machinery */
 static int weave_topk_candidates_guarded(Relation index, WeaveQuery q, int wantk,
@@ -459,11 +493,11 @@ weave_read_meta_generation(Relation index)
  * scan just that page.
  */
 static BlockNumber
-weave_dict_seek(Relation index, const WeaveSegMeta *seg,
-			   const char *term, int termlen)
+weave_dict_seek_at(Relation index, BlockNumber dictstart,
+				   BlockNumber dictindexstart, const char *term, int termlen)
 {
-	BlockNumber iblk = seg->dictindexstart;
-	BlockNumber best = seg->dictstart;
+	BlockNumber iblk = dictindexstart;
+	BlockNumber best = dictstart;
 
 	while (iblk != InvalidBlockNumber)
 	{
@@ -512,19 +546,37 @@ weave_dict_seek(Relation index, const WeaveSegMeta *seg,
 }
 
 /*
+ * The lexical weft's dictionary, by name.  Split from the body above by task Z8,
+ * which needs the SAME seek over a DIFFERENT dictionary chain: the cgram weft is
+ * a dictionary + block index in exactly this format (include/weave/cgram.h), and
+ * its roots live on its own WEAVE_PK_CGRAM page rather than in WeaveSegMeta.  One
+ * implementation, because two copies of a binary search that must agree with the
+ * writer's term order is how a probe starts landing on the wrong page -- a false
+ * negative, hence a silently dropped row.
+ */
+static BlockNumber
+weave_dict_seek(Relation index, const WeaveSegMeta *seg,
+			   const char *term, int termlen)
+{
+	return weave_dict_seek_at(index, seg->dictstart, seg->dictindexstart,
+							  term, termlen);
+}
+
+/*
  * Look up a term in the dictionary; on hit, read its full posting list into a
  * TidSet.  Returns true if found.  weave_dict_seek uses the segment's sparse
  * block index to jump straight to the one dictionary page that can hold the
  * term (scanning the whole chain only for a segment that predates the index).
  */
 static bool
-weave_lookup_term(Relation index, const WeaveSegMeta *seg,
-				 const char *term, int termlen, TidSet *out)
+weave_lookup_term_at(Relation index, BlockNumber dictstart,
+					 BlockNumber dictindexstart, bool has_doclen_col,
+					 const char *term, int termlen, TidSet *out)
 {
-	BlockNumber blk = weave_dict_seek(index, seg, term, termlen);
+	BlockNumber blk = weave_dict_seek_at(index, dictstart, dictindexstart,
+										 term, termlen);
 
-	weave_chan_lex_term++;
-	bool		onlyone = (seg->dictindexstart != InvalidBlockNumber);
+	bool		onlyone = (dictindexstart != InvalidBlockNumber);
 
 	out->tids = NULL;
 	out->n = 0;
@@ -578,7 +630,7 @@ weave_lookup_term(Relation index, const WeaveSegMeta *seg,
 			WeavePosting *post;
 			int			np = weave_decode_term(index, firstposting, firstoffset,
 										  df, &post, NULL, false, NULL, true,
-										  seg->doclenstart == InvalidBlockNumber);
+										  has_doclen_col);
 			ItemPointerData *tids = palloc(Max(np, 1) * sizeof(ItemPointerData));
 			int			n = 0;
 			int			i;
@@ -595,6 +647,20 @@ weave_lookup_term(Relation index, const WeaveSegMeta *seg,
 			break;				/* block index located the only possible page */
 	}
 	return false;
+}
+
+/* The lexical weft's version.  Z8 split the body above so the cgram weft can
+ * reuse it; this wrapper keeps the lexical call sites (and the lex_term counter,
+ * which is about the LEXICAL channel and must not move when a cgram probe runs)
+ * exactly as they were. */
+static bool
+weave_lookup_term(Relation index, const WeaveSegMeta *seg,
+				 const char *term, int termlen, TidSet *out)
+{
+	weave_chan_lex_term++;
+	return weave_lookup_term_at(index, seg->dictstart, seg->dictindexstart,
+								seg->doclenstart == InvalidBlockNumber,
+								term, termlen, out);
 }
 
 /* set operations on sorted TidSets */
@@ -2140,6 +2206,11 @@ weave_beginscan(Relation r, int nkeys, int norderbys)
 	so->edistThr = 0;
 	so->edistNext = INT_MAX;
 	so->edistDone = false;
+	so->cgramScan = false;
+	so->cgramPat = NULL;
+	so->cgramPatLen = 0;
+	so->cgramCI = false;
+	so->cgramLossy = false;
 	scan->opaque = so;
 	/* the AM owns allocation of the order-by result arrays */
 	if (norderbys > 0)
@@ -2161,12 +2232,83 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 				scan->numberOfKeys * sizeof(ScanKeyData));
 
 	so->queryValid = false;
+	so->cgramScan = false;
+	so->cgramPat = NULL;
+	so->cgramPatLen = 0;
+	so->cgramCI = false;
+	so->cgramLossy = false;
 	if (scan->numberOfKeys >= 1)
 	{
-		WeaveQuery	q = DatumGetWQuery(scan->keyData[0].sk_argument);
+		/*
+		 * WHICH KIND OF RESTRICTION KEY IS THIS?  Dispatch on the CHANNEL of the
+		 * key's index attribute, NOT on sk_strategy: strategy numbers are scoped
+		 * to an operator family, so gram_ops's `@~` and wdoc_lex_ops's `@@@` are
+		 * both strategy 1.  Reading the wrong one is not a type error --
+		 * DatumGetWQuery() on a text datum interprets a varlena header as a
+		 * WeaveQuery and walks garbage -- which is the same hazard, and the same
+		 * remedy, as the ORDER BY dispatch below.
+		 *
+		 * THE WHOLE KEY ARRAY IS SCANNED, not just keyData[0], because
+		 * amcanmulticol is true: the planner may hand this AM
+		 * `d @@@ q AND body @~ p` as two keys in either order.  Honouring one and
+		 * silently discarding the other returns rows that fail the discarded
+		 * clause -- and for a non-lossy bitmap the executor does not re-check an
+		 * index qual, so nothing downstream would catch it.  The first cgram key
+		 * becomes the route; ANY other key sets cgramLossy, which turns the
+		 * returned set into an admitted superset with recheck on.
+		 */
+		WeaveIndexLayout layout;
+		int			k;
 
-		so->query = q;
-		so->queryValid = true;
+		weave_index_layout(scan->indexRelation, &layout);
+		for (k = 0; k < scan->numberOfKeys; k++)
+		{
+			AttrNumber	att = scan->keyData[k].sk_attno;
+			bool		iscgram = (att >= 1 && att <= layout.nkeys &&
+								   layout.kind[att - 1] == (uint16) WEAVE_WK_CGRAM);
+
+			if (iscgram && !so->cgramScan)
+			{
+				MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+				text	   *pat = DatumGetTextPP(scan->keyData[k].sk_argument);
+
+				so->cgramPatLen = (int) VARSIZE_ANY_EXHDR(pat);
+				so->cgramPat = (char *) palloc(so->cgramPatLen + 1);	/* alloc-ok: one query pattern, bounded by the query text */
+				memcpy(so->cgramPat, VARDATA_ANY(pat), so->cgramPatLen);
+				so->cgramPat[so->cgramPatLen] = '\0';
+				so->cgramCI = (scan->keyData[k].sk_strategy ==
+							   WEAVE_STRAT_CGRAM_ILIKE);
+				so->cgramScan = true;
+				/*
+				 * The pattern IS the query on this path; so->query stays NULL and
+				 * queryValid keeps its existing meaning ("a WHERE clause supplied
+				 * a wquery"), which here it did not.
+				 */
+				MemoryContextSwitchTo(old);
+			}
+			else if (!iscgram && !so->queryValid)
+			{
+				so->query = DatumGetWQuery(scan->keyData[k].sk_argument);
+				so->queryValid = true;
+			}
+			else
+				so->cgramLossy = true;	/* a key this scan does not honour */
+		}
+
+		/*
+		 * A cgram key WINS over a lexical one when both are present, and the
+		 * lexical clause becomes the executor's business (cgramLossy is already
+		 * set by the loop, because whichever came second fell into the `else`).
+		 * Fusing the two sets is Phase F's job, not this task's -- doing it here
+		 * would be the fused scorer built against a half-working channel that
+		 * AGENTS.md hard rule 7 forbids.
+		 */
+		if (so->cgramScan && so->queryValid)
+		{
+			so->queryValid = false;
+			so->query = NULL;
+			so->cgramLossy = true;
+		}
 	}
 
 	/* ordering scan: the query is the <=> operator's right operand */
@@ -2326,6 +2468,12 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 		if (so->edistPat == NULL)
 			return false;
 	}
+	else if (so->cgramScan)
+	{
+		/* Z8: same shape -- a raw LIKE pattern, no wquery. */
+		if (so->cgramPat == NULL)
+			return false;
+	}
 	else if (!so->queryValid || so->query == NULL)
 		return false;
 
@@ -2344,7 +2492,18 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 			TidSet		m;
 
 			pgstat_count_index_scan(scan->indexRelation);
-			weave_collect_matches(scan->indexRelation, so->query, &m, &so->plainRecheck);
+			if (so->cgramScan)
+			{
+				/* The cgram route returns an EXACT set (it rechecks on the heap
+				 * itself), so plainRecheck stays false and a plain Index Scan
+				 * and a Bitmap Heap Scan return the same rows -- which is what
+				 * lets sql/cgram.sql assert parity without pinning a plan. */
+				(void) weave_cgram_collect(scan->indexRelation, so->cgramPat,
+										   so->cgramPatLen, so->cgramCI, &m);
+				so->plainRecheck = so->cgramLossy;
+			}
+			else
+				weave_collect_matches(scan->indexRelation, so->query, &m, &so->plainRecheck);
 			so->plainTids = m.tids;
 			so->nplain = m.n;
 			so->plainpos = 0;
@@ -3337,6 +3496,34 @@ weave_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 				 errdetail("The scan has neither a @@@ restriction nor an ORDER BY <=> ordering clause."),
 				 errhint("Add \"WHERE col @@@ query\" or \"ORDER BY col <=> query\".")));
 
+	/*
+	 * Z8: a `@~` / `@~*` restriction on the cgram column.  BEFORE the so->query
+	 * test below, because this path has no wquery at all.
+	 *
+	 * recheck = FALSE, and that is the load-bearing half.  weave_cgram_collect()
+	 * has ALREADY rechecked every candidate against its live heap tuple, so the
+	 * set is exact and asking the executor to re-evaluate the operator would be
+	 * duplicated work.  It also means the C recheck is the ONLY thing keeping the
+	 * answer exact: with recheck = true the executor's own bitmap-heap recheck
+	 * would mask a broken route, which is precisely the trap AGENTS.md records
+	 * under "the suite running is not the SITE running" -- a mutation that
+	 * removed our recheck passed the whole suite because the executor
+	 * re-evaluated the qual itself.  A lossy bitmap page still forces an
+	 * executor recheck, and that recheck calls the very same matcher through the
+	 * operator, so the two cannot disagree.
+	 */
+	if (so->cgramScan)
+	{
+		if (so->cgramPat == NULL)
+			return 0;
+		pgstat_count_index_scan(scan->indexRelation);
+		(void) weave_cgram_collect(scan->indexRelation, so->cgramPat,
+								   so->cgramPatLen, so->cgramCI, &matches);
+		if (matches.n > 0)
+			tbm_add_tuples(tbm, matches.tids, matches.n, so->cgramLossy);
+		return matches.n;
+	}
+
 	if (!so->queryValid || so->query == NULL)
 		return 0;
 	/* Count the index scan for pg_stat_user_indexes.idx_scan; idx_tup_read is
@@ -3433,6 +3620,450 @@ weave_recheck_exact(Relation index, WeaveQuery query, TidSet *set)
 	set->n = keep;
 }
 
+/* ---------------------------------------------------------------------------
+ * The cgram route (task Z8): `col @~ '%tion refu%'`
+ *
+ * THE SMALLEST SURFACE THAT DEMONSTRATES THE CHANNEL, and the choice is
+ * deliberate on three counts:
+ *
+ *  1. ONE OPERATOR PAIR, not `LIKE` itself.  See the migration script
+ *     sql/pg_weave--0.12.0--0.13.0.sql: putting `~~` in the family would route
+ *     every LIKE on the column here, including anchored patterns the planner has
+ *     btree-oriented machinery for and patterns this AM's cost estimator does not
+ *     model.  A query asks for this channel by name.
+ *  2. BITMAP-ORIENTED, but returning an EXACT set.  The route ANDs the docid
+ *     posting lists of the pattern's required trigrams and then rechecks on the
+ *     heap, so what comes out is precisely what LIKE admits -- which means
+ *     weave_getbitmap() can add it with recheck = false and weave_gettuple() can
+ *     serve from the same function.  One code path, one answer.
+ *  3. THE RECHECK IS MANDATORY, not an optimization.  Byte trigrams
+ *     OVER-GENERATE by construction: a document may contain every required
+ *     trigram in the wrong order, in the wrong runs, spanning a `%` boundary, or
+ *     under a hash collision, and the ASCII case fold adds more of the same (see
+ *     WEAVE_CGRAM_FOLD).  This is NOT Z6's exact dictionary walk, where the
+ *     dictionary entry IS the answer.  Delete the recheck and the channel returns
+ *     false positives -- which is what the first leg of /scratch/pg_weave/z8-mut.sh
+ *     proves.
+ *
+ * WHEN IT REFUSES TO NARROW, and what happens then.  Two cases: the pattern has
+ * no literal run of three or more bytes (`'%ab%'`, `'%'`, `'%a_c%'`), or a live
+ * bolt carries no cgram weft (built before Z8, written by a pending flush, or
+ * refused by the pair cap).  Either way the candidate set would not be a superset
+ * of the answer, so the route does not produce one: it falls back to the
+ * universe, which here means a sequential pass over the heap evaluating the
+ * predicate.  Correct and slow, which is the same stance weave_trgm_candidates()
+ * and weave_regex_terms() take when their own soundness condition fails.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * The exact LIKE/ILIKE test against each candidate's live heap tuple.
+ *
+ * Distinct from weave_recheck_exact() above, which evaluates a wquery against the
+ * indexed wdoc; this one evaluates the pattern against the gram_ops column's raw
+ * text.  Non-live tuples are dropped, which never widens the set (the caller's
+ * own MVCC pass would drop them anyway) -- the same reasoning weave_recheck_exact
+ * records.
+ */
+static void
+weave_cgram_recheck(Relation index, const char *pat, int patlen, bool ci,
+					TidSet *set)
+{
+	Relation	heap;
+	IndexInfo  *indexInfo;
+	EState	   *estate;
+	ExprContext *econtext;
+	TupleTableSlot *slot;
+	IndexFetchTableData *fetch;
+	Snapshot	snap = GetActiveSnapshot();
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	WeaveIndexLayout layout;
+	int			cgidx;
+	int			i,
+				keep = 0;
+
+	if (set->n == 0)
+		return;
+
+	weave_index_layout(index, &layout);
+	Assert(layout.cgramattno != 0);
+	cgidx = layout.cgramattno - 1;
+
+	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+	indexInfo = BuildIndexInfo(index);
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	slot = table_slot_create(heap, NULL);
+	econtext->ecxt_scantuple = slot;
+#if PG_VERSION_NUM >= 190000
+	fetch = table_index_fetch_begin(heap, SO_NONE);
+#else
+	fetch = table_index_fetch_begin(heap);
+#endif
+
+	for (i = 0; i < set->n; i++)
+	{
+		ItemPointerData tid = set->tids[i];
+		bool		call_again = false;
+		bool		all_dead = false;
+
+		CHECK_FOR_INTERRUPTS();	/* per candidate; no index buffer lock held */
+		ExecClearTuple(slot);
+		if (table_index_fetch_tuple(fetch, &tid, snap, slot,
+									&call_again, &all_dead))
+		{
+			FormIndexDatum(indexInfo, slot, estate, values, isnull);
+			if (!isnull[cgidx])
+			{
+				text	   *v = (text *) PG_DETOAST_DATUM(values[cgidx]);
+
+				if (weave_cgram_match(VARDATA_ANY(v), (int) VARSIZE_ANY_EXHDR(v),
+									  pat, patlen, ci))
+					set->tids[keep++] = set->tids[i];
+			}
+		}
+		ResetExprContext(econtext);
+	}
+
+	table_index_fetch_end(fetch);
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+	table_close(heap, AccessShareLock);
+	set->n = keep;
+}
+
+/*
+ * The fallback universe: one sequential pass over the heap, evaluating the
+ * predicate.  Returns the EXACT answer, so a caller that lands here needs no
+ * further recheck.
+ *
+ * A heap scan inside an access method reads oddly, so: the alternative is an
+ * in-index enumeration of every document, and a weave index does not have one.
+ * The lexical weft omits a document whose analyzed text yields no postings (empty
+ * or stopword-only -- the fact WEAVE_PK_VWARP exists to record), the doclen
+ * sidecar is fed from those same postings, and the cgram weft itself is what we
+ * are falling back FROM.  A candidate set built from any of those would be
+ * missing rows, i.e. wrong, and "slow" is the only acceptable way to be unable.
+ */
+static void
+weave_cgram_heapscan(Relation index, const char *pat, int patlen, bool ci,
+					 TidSet *out)
+{
+	Relation	heap;
+	IndexInfo  *indexInfo;
+	EState	   *estate;
+	ExprContext *econtext;
+	TupleTableSlot *slot;
+	TableScanDesc scan;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	WeaveIndexLayout layout;
+	int			cgidx;
+	int			cap = 0;
+	int			n = 0;
+	ItemPointerData *tids = NULL;
+	OffsetNumber *roots;
+	BlockNumber rootblk = InvalidBlockNumber;
+
+	out->tids = NULL;
+	out->n = 0;
+
+	weave_index_layout(index, &layout);
+	Assert(layout.cgramattno != 0);
+	cgidx = layout.cgramattno - 1;
+	roots = (OffsetNumber *) palloc(MaxHeapTuplesPerPage * sizeof(OffsetNumber));	/* alloc-ok: one heap page's line pointers, a compile-time bound */
+
+	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+	indexInfo = BuildIndexInfo(index);
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	slot = table_slot_create(heap, NULL);
+	econtext->ecxt_scantuple = slot;
+	scan = table_beginscan(heap, GetActiveSnapshot(), 0, NULL);
+
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		CHECK_FOR_INTERRUPTS();
+		FormIndexDatum(indexInfo, slot, estate, values, isnull);
+		if (!isnull[cgidx])
+		{
+			text	   *v = (text *) PG_DETOAST_DATUM(values[cgidx]);
+
+			if (weave_cgram_match(VARDATA_ANY(v), (int) VARSIZE_ANY_EXHDR(v),
+								  pat, patlen, ci))
+			{
+				/*
+				 * THE TID AN ACCESS METHOD MAY RETURN IS THE HOT-CHAIN ROOT LINE
+				 * POINTER, NOT THE PHYSICAL TUPLE'S.  This cost a debugging round
+				 * and is worth the paragraph.
+				 *
+				 * A heap scan hands back the physical version's TID.  After a HOT
+				 * update that version is a HEAP-ONLY tuple, and
+				 * heap_hot_search_buffer() -- which is what both a bitmap heap
+				 * scan and table_index_fetch_tuple() use to resolve a TID an index
+				 * gave them -- REFUSES a heap-only tuple as a chain start ("if
+				 * at_chain_start && HeapTupleHeaderIsHeapOnly, break").  So a
+				 * bitmap built from physical TIDs resolves to NOTHING: the Bitmap
+				 * Index Scan reports the right row count and the Bitmap Heap Scan
+				 * above it reports zero.  No error, no warning, just an empty
+				 * result -- and only for rows that have been updated, so a test
+				 * corpus built with INSERT alone never sees it.  (This tree
+				 * reaches it immediately: sql/cgram.sql populates the wdoc column
+				 * with an UPDATE, which HOT-updates every row.)
+				 *
+				 * heap_get_root_tuples() maps every line pointer on a page to its
+				 * chain root; it is what CREATE INDEX CONCURRENTLY uses for the
+				 * same reason.  Computed once per heap block because the scan
+				 * visits blocks in order, so it is one extra page read per block,
+				 * not per tuple.
+				 */
+				ItemPointerData rtid = slot->tts_tid;
+				BlockNumber blk = ItemPointerGetBlockNumber(&rtid);
+				OffsetNumber off = ItemPointerGetOffsetNumber(&rtid);
+
+				if (blk != rootblk)
+				{
+					Buffer		rb = ReadBuffer(heap, blk);
+
+					LockBuffer(rb, BUFFER_LOCK_SHARE);
+					heap_get_root_tuples(BufferGetPage(rb), roots);
+					UnlockReleaseBuffer(rb);
+					rootblk = blk;
+				}
+				if (off >= 1 && off <= MaxHeapTuplesPerPage &&
+					roots[off - 1] != InvalidOffsetNumber)
+					ItemPointerSetOffsetNumber(&rtid, roots[off - 1]);
+
+				if (n >= cap)
+				{
+					/* relation-scale: every row of the heap can match */
+					cap = cap ? cap * 2 : 256;
+					tids = tids
+						? WEAVE_REALLOC_MAYBE_HUGE(tids, (Size) cap * sizeof(ItemPointerData))
+						: WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(ItemPointerData));
+				}
+				tids[n++] = rtid;
+			}
+		}
+		ResetExprContext(econtext);
+	}
+
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+	table_close(heap, AccessShareLock);
+	pfree(roots);
+
+	out->tids = tids;
+	out->n = n;
+	tidset_sort_uniq(out);
+}
+
+/*
+ * The whole route.  Fills *out with the EXACT set of TIDs whose gram_ops column
+ * satisfies the pattern.  Returns true when the trigram weft served it (i.e. the
+ * candidate set was narrowed before the recheck), false when it fell back.
+ */
+static bool
+weave_cgram_collect(Relation index, const char *pat, int patlen, bool ci,
+					TidSet *out)
+{
+	WeaveMetaPageData meta;
+	WeaveTombstones seg_tombs;
+	TidSet		acc;
+	uint32		req[WEAVE_CGRAM_MAX_REQ];
+	int			nreq;
+	uint32		s;
+	int			t;
+	bool		served = true;
+	uint32		gen0;
+
+	out->tids = NULL;
+	out->n = 0;
+
+	nreq = weave_cgram_required(pat, patlen, ci, req, WEAVE_CGRAM_MAX_REQ);
+	if (nreq <= 0)
+	{
+		/* No sound requirement: `'%ab%'`, `'%a_c%'`, `'%'`, or a case-insensitive
+		 * pattern over non-ASCII bytes.  This is the refusal the route owes its
+		 * caller, and the counter deliberately does NOT move. */
+		weave_cgram_heapscan(index, pat, patlen, ci, out);
+		return false;
+	}
+
+	if (RelationGetNumberOfBlocks(index) == 0)
+	{
+		/* buildempty(): no metapage, hence no bolts and no documents */
+		weave_cgram_heapscan(index, pat, patlen, ci, out);
+		return false;
+	}
+
+	gen0 = weave_read_meta_generation(index);
+	weave_read_meta(index, &meta);
+
+	/*
+	 * EVERY live bolt must carry a cgram weft, or the narrowed set is not a
+	 * superset of the answer and the route must not produce one.  Checked before
+	 * a single posting list is read, so the fallback costs one descriptor probe
+	 * per bolt rather than a wasted intersection.
+	 */
+	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		if (meta.segs[s].dictstart == InvalidBlockNumber)
+			continue;			/* consumed slot */
+		if (weave_cgram_weft_root(index, &meta.segs[s]) == InvalidBlockNumber)
+		{
+			served = false;
+			break;
+		}
+	}
+	/* A pending document is in no bolt, so it has no weft either -- but its TID
+	 * is known and cheap to add as a candidate, which the recheck then filters
+	 * exactly.  That is enough; it does not force the fallback. */
+
+	if (!served)
+	{
+		weave_cgram_heapscan(index, pat, patlen, ci, out);
+		return false;
+	}
+
+	weave_tombstones_load(index, &meta, &seg_tombs);
+	acc.tids = NULL;
+	acc.n = 0;
+
+	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		WeaveCgramWeft w;
+		const char *why = NULL;
+		TidSet		cands;
+		bool		first = true;
+
+		CHECK_FOR_INTERRUPTS();
+		if (meta.segs[s].dictstart == InvalidBlockNumber)
+			continue;
+		if (!weave_cgram_weft_open(index, weave_cgram_weft_root(index, &meta.segs[s]),
+								   &w, &why))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("corrupt cgram weft in index \"%s\"",
+							RelationGetRelationName(index)),
+					 errdetail("%s", why),
+					 errhint("REINDEX the index to rebuild it.")));
+
+		cands.tids = NULL;
+		cands.n = 0;
+		for (t = 0; t < nreq; t++)
+		{
+			TidSet		one;
+			char		key[WEAVE_CGRAM_KEYLEN];
+
+			weave_cgram_key(req[t], key);
+			/*
+			 * THE INTERSECTION IS THE POINT.  Every required trigram must be
+			 * present in a matching document (weave_cgram_required states why),
+			 * so the candidate set is the AND of their posting lists.  A UNION
+			 * would also be CORRECT -- a superset of the answer, which the
+			 * mandatory recheck then filters -- and merely slower, which is what
+			 * the second leg of z8-mut.sh measures rather than "catches".
+			 *
+			 * has_doclen_col is a constant `true`: the cgram writer keeps the
+			 * inline doclen FOR column (all zeros, ~2 bytes per 128-posting
+			 * block) precisely so this argument cannot be got wrong.
+			 */
+			if (!weave_lookup_term_at(index, w.dictstart, w.dictindexstart, true,
+									  key, WEAVE_CGRAM_KEYLEN, &one))
+			{
+				/* a required trigram is absent from this bolt: no document here
+				 * can match, so the whole intersection is empty */
+				if (cands.tids)
+					pfree(cands.tids);
+				cands.tids = NULL;
+				cands.n = 0;
+				first = false;
+				break;
+			}
+			cands = first ? one : tidset_and(cands, one);
+			first = false;
+			if (cands.n == 0)
+				break;
+		}
+
+		if (cands.n > 0)
+		{
+			weave_filter_tombstoned_seg(&seg_tombs, s, &cands);
+			if (cands.n > 0)
+				acc = tidset_or(acc, cands);
+		}
+	}
+
+	weave_tombstones_free(&seg_tombs);
+
+	/*
+	 * The pending list: documents inserted since the last flush live in no bolt,
+	 * so no posting list mentions them.  Their TIDs are candidates unconditionally
+	 * and the recheck decides -- a pending doc is a live heap tuple, so unlike a
+	 * segment match it must NOT be tombstone-filtered (a reused heap slot would
+	 * otherwise be wrongly dropped, which is the reasoning weave_collect_matches
+	 * records for its own pending pass).
+	 */
+	if (meta.pendinghead != InvalidBlockNumber)
+	{
+		BlockNumber blk = meta.pendinghead;
+
+		while (blk != InvalidBlockNumber)
+		{
+			Buffer		buffer;
+			Page		page;
+			WeavePendingIter it;
+			WeavePendingRec rec;
+			BlockNumber next;
+
+			CHECK_FOR_INTERRUPTS();
+			buffer = weave_scan_readbuf(index, blk);
+			if (buffer == InvalidBuffer)
+				break;
+			LockBuffer(buffer, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buffer);
+			next = WeavePageGetOpaque(page)->nextblk;
+			weave_pending_iter_init(&it, page);
+			while (weave_pending_iter_next(&it, &rec))
+			{
+				TidSet		one;
+
+				one.tids = rec.tid;
+				one.n = 1;
+				acc = tidset_or(acc, one);
+			}
+			UnlockReleaseBuffer(buffer);
+			blk = next;
+		}
+	}
+
+	tidset_sort_uniq(&acc);
+
+	/*
+	 * Same stale-read guard the lexical collector uses: a concurrent
+	 * merge/vacuum can free and recycle the pages we just read.  One retry level
+	 * only -- the fallback is exact anyway, so on a generation change we simply
+	 * take the slow correct path rather than spinning.
+	 */
+	if (weave_read_meta_generation(index) != gen0)
+	{
+		if (acc.tids)
+			pfree(acc.tids);
+		weave_cgram_heapscan(index, pat, patlen, ci, out);
+		return false;
+	}
+
+	/* THE MANDATORY RECHECK.  See the block comment at the top of this section:
+	 * byte trigrams over-generate by construction, so this is what makes the
+	 * answer exact -- not a tightening of an already-correct set. */
+	weave_cgram_recheck(index, pat, patlen, ci, &acc);
+
+	*out = acc;
+	weave_chan_cgram_scan++;	/* the route SERVED this scan (weave/weave.h) */
+	return true;
+}
 void
 weave_endscan(IndexScanDesc scan)
 {

@@ -237,6 +237,16 @@ extern int	weave_trigrams(const char *s, int len, uint32 *out, int maxout);
 extern bool weave_trigrams_overlap(const uint32 *a, int na,
 								 const uint32 *b, int nb);
 
+/* src/query/cgram.c -- the pattern side of the corpus trigram channel (Z8).
+ * The SAME key space as weave_trigrams() above, deliberately and by
+ * construction; see the comment on weave_cgram_hash3(). */
+extern void weave_cgram_fold(char *dst, const char *src, int len);
+extern uint32 weave_cgram_hash3(const char *folded3);
+extern int	weave_cgram_required(const char *pat, int patlen, bool caseinsens,
+								 uint32 *out, int maxout);
+extern bool weave_cgram_match(const char *val, int vallen,
+							  const char *pat, int patlen, bool caseinsens);
+
 /* pg_weave_am_scan.c -- count entry point reused by the COUNT-pushdown CustomScan */
 extern int64 weave_count_visible_oid(Oid indexoid, WeaveQuery q);
 extern int pg_weave_wand_initial_k;
@@ -329,6 +339,22 @@ extern uint64 weave_chan_regex_trgm;	/* /re/ whose dictionary walk the trigram
 										 * without regex_dict; see above. */
 extern uint64 weave_chan_regex_surf;	/* /re/ via trigram tiling + trie (Z6) */
 extern uint64 weave_chan_vector_scan;	/* a vector shuttle was opened (V8) */
+extern uint64 weave_chan_cgram_scan;	/* Z8: times the CORPUS-TRIGRAM ROUTE
+										 * ACTUALLY SERVED a `@~` / `@~*`
+										 * restriction -- i.e. the pattern yielded
+										 * at least one required trigram AND the
+										 * route therefore intersected posting
+										 * lists instead of returning false.  ONE per
+										 * scan, not one per segment or per trigram,
+										 * so a test can assert exactly 1.  A zero
+										 * after a `@~` query means the pattern FELL
+										 * BACK (no literal run of 3+ bytes, or ILIKE
+										 * over non-ASCII), which is a correct slow
+										 * answer and not a failure.  It does NOT
+										 * count how many bolts had a cgram weft: a
+										 * bolt without one contributes its whole live
+										 * docid set to the candidates, and the route
+										 * still ran. */
 extern uint64 weave_chan_terms_expanded;	/* vocabulary terms a leaf expanded to */
 extern uint64 weave_chan_dict_pages;	/* dictionary pages those expansions read */
 extern uint64 weave_chan_surf_loads;	/* whole-image trie loads */
