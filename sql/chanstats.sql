@@ -96,13 +96,30 @@ SELECT fuzzy_dict > 0 AS fuzzy_used_the_automaton_walk,
        fuzzy_surf = 0 AS and_not_the_trie
   FROM weave_channel_stats();
 
+-- ---- regex is served by core's engine over the dictionary (Z6) -----------
+-- The pattern is compiled once and run over the segment's dictionary terms, so
+-- regex_dict is the counter that says the leaf went through the index at all.  This
+-- index has no trigram weft (the reloption defaults off), so regex_trgm = 0 here is
+-- a statement about the RELOPTION and nothing more; sql/regexdict.sql builds the
+-- weft and asserts the narrowing both ways, with a positive control.  The pattern is
+-- a class shape on purpose: it has no literal run of three, which is the shape the
+-- old funnel could not serve at all.
+SELECT weave_channel_stats_reset();
+SELECT count(*) FROM cs WHERE d @@@ '/gam[a-z]a/'::wquery;
+SELECT regex_dict > 0 AS regex_used_the_dictionary_walk,
+       regex_trgm = 0 AS no_weft_so_nothing_narrowed,
+       regex_surf = 0 AS and_not_the_trie,
+       terms_expanded AS vocabulary_terms_matched
+  FROM weave_channel_stats();
+
 -- ---- what is genuinely absent: a shuttle with a bound --------------------
 -- These three columns ARE structurally zero, and each is pinned to the task that
 -- will flip it, so routing a channel shows up here as a diff rather than as nothing:
 --   prefix_surf  -- Z4 part 3, and only if the measurement says the trie beats the
 --                   dictionary range walk
 --   fuzzy_surf   -- Z5 plus Z4's resident trie
---   regex_surf   -- Z6, via regex AST -> trigram tiling
+--   regex_surf   -- a regex route through the trie, if one is ever measured to win
+--                   over the dictionary walk that Z6 wired
 -- Note what these counters do NOT say.  A nonzero fuzzy_dict above means fuzzy
 -- returns correct rows, not that the fuzzy CHANNEL exists: there is no shuttle
 -- implementing include/weave/channel.h with a real bound, so fuzzy cannot yet join a
@@ -254,8 +271,8 @@ SELECT surf_cache_hits = 0 AS the_pre_merge_image_was_not_served,
 -- reset would report zero resident bytes while the images are resident -- the same
 -- false zero the first draft of this file shipped for fuzzy_dict.
 SELECT weave_channel_stats_reset();
-SELECT lex_term, prefix_dict, fuzzy_dict, fuzzy_trgm, regex_trgm, vector_scan,
-       terms_expanded, dict_pages, surf_loads, surf_bytes,
+SELECT lex_term, prefix_dict, fuzzy_dict, fuzzy_trgm, regex_dict, regex_trgm,
+       vector_scan, terms_expanded, dict_pages, surf_loads, surf_bytes,
        surf_cache_hits, surf_cache_misses, surf_cache_evicts
   FROM weave_channel_stats();
 SELECT surf_cache_bytes > 0 AS the_resident_gauge_survives_a_reset

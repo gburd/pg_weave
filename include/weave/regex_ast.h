@@ -122,6 +122,17 @@ extern int weave_tokenize_next(WeaveParseCtx *ctx, WeaveToken *out);
 typedef struct TrigramDisjunct
 {
     uint64  trigram_hash;
+    /*
+     * The codepoint triple trigram_hash was computed from, kept because the
+     * hash is ONE-WAY and pg_weave's trigram weft is keyed differently: the
+     * weft hashes 3 BYTES of the server-encoded term with hash_bytes()
+     * (weave_trigrams, src/query/trgm.c), while trigram_hash is
+     * pg_weave_hash_trigram_cp() over 3 CODEPOINTS.  A consumer that wants
+     * to probe the weft re-encodes cp[] to bytes and re-hashes (Z6,
+     * weave_regex_terms in src/am/amscan.c); nothing can get there from the
+     * hash alone.  Filled at every site that fills trigram_hash.
+     */
+    int32   cp[3];
     int32   min_offset;   /* inclusive lower bound on occurrence offset */
     int32   max_offset;   /* inclusive upper bound; INT32_MAX = unbounded */
 } TrigramDisjunct;

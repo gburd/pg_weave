@@ -230,10 +230,10 @@ extern bool weave_doc_has_regex(WeaveDoc doc, const char *re, int relen);
 /* pg_weave_rank.c -- collect distinct query term operands (shared) */
 extern int	weave_query_terms(WeaveQuery q, const char ***terms_out, int **lens_out);
 
-/* pg_weave_trgm.c -- trigram pre-filter for fuzzy/regex at scale */
+/* src/query/trgm.c -- the byte-trigram key space of the trigram weft (fuzzy
+ * funnel; regex re-encodes the AST extractor's codepoint triples through it) */
 #define WEAVE_MAX_TRIGRAMS 64
 extern int	weave_trigrams(const char *s, int len, uint32 *out, int maxout);
-extern int	weave_regex_trigrams(const char *re, int relen, uint32 *out, int maxout);
 extern bool weave_trigrams_overlap(const uint32 *a, int na,
 								 const uint32 *b, int nb);
 
@@ -281,8 +281,10 @@ extern uint64 weave_alloc_extend;
  * wrong and asserted the wrong zeros.  Prefix, fuzzy and regex all return CORRECT
  * ROWS today: prefix through a dictionary range walk, fuzzy through a Levenshtein
  * automaton walked over the sorted dictionary with dead-end prefix skipping
- * (weave_fuzzy_terms), and regex -- plus any fuzzy term too long for that automaton
- * -- through the trigram funnel followed by an exact heap recheck.  What they do NOT
+ * (weave_fuzzy_terms), regex through core's regex engine walked over the same
+ * dictionary, narrowed by the trigram weft when there is one (weave_regex_terms),
+ * and any fuzzy term too long for the automaton through the trigram funnel followed
+ * by an exact heap recheck.  What they do NOT
  * have is a shuttle implementing include/weave/channel.h with a real bound, which is
  * what lets a channel participate in fused top-k, and that is the sense in which
  * doc/PRODUCTION_READINESS.md counts them as not answering.  These counters measure
@@ -292,11 +294,20 @@ extern uint64 weave_alloc_extend;
  * each nonzero named beside it above.  A zero from any column still means only "this
  * mechanism served nothing in THIS backend" -- never "nothing happened".
  *
- * A FUZZY OR REGEX QUERY THAT RAN WITH BOTH ITS COLUMNS AT ZERO fell back to a full
- * scan with recheck: weave_trgm_candidates() refuses a pattern with too few usable
- * trigrams and the caller then scans.  That case is deliberately derivable rather
- * than given its own column, because the funnel's refusal is a property of the
- * pattern and the pair of zeros says it exactly.
+ * A FUZZY QUERY THAT RAN WITH BOTH ITS COLUMNS AT ZERO fell back to a full scan
+ * with recheck: weave_trgm_candidates() refuses a term with too few usable trigrams
+ * and the caller then scans.  That case is deliberately derivable rather than given
+ * its own column, because the funnel's refusal is a property of the term and the
+ * pair of zeros says it exactly.
+ *
+ * REGEX IS DIFFERENT: regex_dict AND regex_trgm ARE NOT ALTERNATIVES.  A regex leaf
+ * is always served by the dictionary walk (regex_dict), and the trigram weft, when
+ * the index has one and the pattern yields required trigrams, NARROWS which terms
+ * that walk asks the engine about (regex_trgm).  So one leaf on a trigrams=on index
+ * with a narrowable pattern increments BOTH; the same leaf on a trigrams=off index,
+ * or a pattern the narrowing refuses (`\d`, `(?i)`, [[:digit:]] -- see
+ * weave_regex_narrowable in src/am/amscan.c), increments regex_dict alone.  A regex
+ * query with regex_dict = 0 did not run through the index at all.
  */
 extern uint64 weave_chan_lex_term;		/* exact-term leaf via the dictionary */
 extern uint64 weave_chan_prefix_dict;	/* term* via the dictionary range walk */
@@ -306,7 +317,16 @@ extern uint64 weave_chan_fuzzy_dict;	/* term~k via the Levenshtein automaton
 extern uint64 weave_chan_fuzzy_trgm;	/* term~k too long for the automaton:
 										 * trigram funnel + exact recheck */
 extern uint64 weave_chan_fuzzy_surf;	/* term~k via the trie (Z5 + Z4's cache) */
-extern uint64 weave_chan_regex_trgm;	/* /re/ via the trigram funnel + recheck */
+extern uint64 weave_chan_regex_dict;	/* /re/ SERVED BY THE DICTIONARY WALK: the
+										 * pattern compiled once and core's engine
+										 * run over the segment's dictionary terms
+										 * (all of them, or the weft's survivors);
+										 * exact, no recheck.  Once per segment per
+										 * leaf, like fuzzy_dict. */
+extern uint64 weave_chan_regex_trgm;	/* /re/ whose dictionary walk the trigram
+										 * weft NARROWED (the pg_tre CNF was applied
+										 * to the candidate ordinals).  Never
+										 * without regex_dict; see above. */
 extern uint64 weave_chan_regex_surf;	/* /re/ via trigram tiling + trie (Z6) */
 extern uint64 weave_chan_vector_scan;	/* a vector shuttle was opened (V8) */
 extern uint64 weave_chan_terms_expanded;	/* vocabulary terms a leaf expanded to */
