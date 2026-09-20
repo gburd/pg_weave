@@ -203,8 +203,8 @@ when the scope was read as "BM25 + vector", then back when it was restated as al
 six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
 hard rule was weakened on an inference about scope rather than a question about it.*
 
-**34 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 3 partials (V6,
-Z4, Z5) and 5 withdrawn (L2, L21, V9, V10, V13). By phase: X 4/4, L 16/20, Z 4/9,
+**34 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
+Z4, Z5, Z6) and 5 withdrawn (L2, L21, V9, V10, V13). By phase: X 4/4, L 16/20, Z 4/9,
 V 9/17, P 2/4, F 0/5, M 0/6, R 0/5. **The count did not move on 2026-09-19 although two
 days of work landed**, which is the accounting working rather than failing: Z4 part 2
 (the resident trie) and Z5's swap of the byte automaton for the character-exact `uleven`
@@ -212,7 +212,11 @@ core are both real and both gated on measurements that have not been taken -- Z4
 prefix-routing number and Z5's 1M-row `k=1`/`k=2` latency gate. What did move is
 correctness: `G30` and `G31` in `doc/GAPS.md` are two wrong answers the fuzzy channel
 returned before that swap, one of them on pure ASCII input, and both were invisible while
-the index and the heap were wrong in the same direction. **Two of the six retrieval kinds are CHANNELS** -- BM25 lexical and,
+the index and the heap were wrong in the same direction. Z6 (2026-09-20) is the same
+shape again: the regex leaf is now answered exactly from the dictionary in tens of
+milliseconds where it took ~5 s, the indicative read passes the gate with margin, and the
+row stays PARTIAL until `bench/aws/run.sh` says so for the record -- while `G32`, a false
+negative the old literal-run extractor produced for `\d`, is closed by deleting it. **Two of the six retrieval kinds are CHANNELS** -- BM25 lexical and,
 as of V8 on 2026-09-18, quantized-vector ANN -- in the sense defined above: a shuttle with
 a real bound. Prefix, fuzzy and regex return correct rows through the dictionary and the
 trigram funnel but have no shuttle, so they cannot join a fused top-k; n-gram (`cgram`,

@@ -1300,3 +1300,29 @@ widened). `~0` now normalizes to the plain term: the same rows by definition, re
 through the exact-term route rather than an automaton with an empty budget. A bare
 `term~` still means 2, which is a default rather than a value the user wrote. Visible
 in `'naive~0'::wquery` printing as `'naive'`, asserted in `sql/fuzzyuleven.sql`.
+
+### G32 — the regex funnel's literal-run extractor read `\d` as the letter d: a FALSE NEGATIVE with the weft present — **FOUND AND CLOSED 2026-09-20**
+
+`weave_regex_trigrams()` (`src/query/trgm.c`, now deleted) scanned a pattern for runs of
+literal characters to extract "required" trigrams, and its escape handling was "the next
+char is a literal". Core's ARE gives a backslash-letter a meaning in many cases (`\d \w
+\s \y \m \M \A \Z` and their complements), so `/ab\dcd/` was read as requiring the run
+`abdcd`, whose trigrams no term containing `ab5cd` has. Measured on an index built
+`WITH (trigrams = on)`: the index arm returned **no rows**, the heap predicate and core's
+`~` returned the row. `/\yabc\y/` happened to survive only because the funnel UNIONed
+the run's trigrams and `abc` was among them.
+
+**Why it stayed hidden**: the weft is off by default, so the extractor ran in one
+regression test; and the funnel's union was so permissive that most wrong runs still
+admitted the right term by accident. A test that compares the index against the heap
+would have caught it the first time anyone wrote `\d` — nobody had.
+
+**Closed by** Z6: the extractor is gone. Narrowing now comes from pg_tre's regex AST, and
+is refused outright — the whole dictionary is walked instead — whenever the raw pattern
+contains any construct on which core's ARE and pg_tre's tokenizer could disagree about a
+literal run. The route that consumes the candidates is exact (core's engine over each
+term), so a narrowing error can only ever be a false negative, which is why the rule is
+"refuse when unsure" and not "recheck later". `sql/regexdict.sql` pins `\d`, `\y`,
+`[[:digit:]]` and `(?i)` three-way against core's `~`, and the mutation leg that removes
+both defences (the whitelist and the tokenizer's own refusal of `\d`) reproduces this gap
+exactly.
