@@ -36,11 +36,11 @@
 -- recognizes a query's SINGLE ORDER BY pathkey).  Adding the tie-break would
 -- therefore test the Sort fallback while looking like it tested the pushdown.
 CREATE EXTENSION IF NOT EXISTS pg_weave;
+NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-
+NOTICE:  version "0.16.0" of extension "pg_weave" is already installed
 -- Plan text stability only; nothing here is about parallelism.
 SET max_parallel_workers_per_gather = 0;
-
 -- A corpus with distinct BM25 scores per document for 'alpha', and a rare term
 -- 'zeta' in exactly two documents, so a two-channel fuse() can actually reorder
 -- relative to either channel alone.
@@ -60,7 +60,6 @@ SELECT g,
 FROM generate_series(1, 40) g;
 CREATE INDEX fd_weave ON fd USING weave (body);
 ANALYZE fd;
-
 -- TIE-FREENESS, ASSERTED BEFORE ANYTHING BELOW RELIES ON IT.  Sections (1) and
 -- (4) compare the ID SET of a fused top-10 against the ID SET of the plain
 -- `ORDER BY body <=> 'alpha'` top-10, and that comparison is only meaningful
@@ -78,6 +77,10 @@ ANALYZE fd;
 -- from) before trusting any set comparison built on it.
 SELECT count(*) = count(DISTINCT score) AS alpha_scores_are_tie_free
   FROM weave_search('fd_weave', 'alpha'::wquery, 40);
+ alpha_scores_are_tie_free 
+---------------------------
+ t
+(1 row)
 
 -- ---------------------------------------------------------------------------
 -- (1) ONE SCORED CHANNEL, sect. 4 row 1: reduces to block-max WAND.
@@ -91,22 +94,24 @@ SELECT count(*) = count(DISTINCT score) AS alpha_scores_are_tie_free
 -- already does.
 -- ---------------------------------------------------------------------------
 SET enable_seqscan = off;
-
 EXPLAIN (COSTS OFF)
 SELECT id FROM fd
  ORDER BY fuse(body <=> 'alpha'::wquery,
                body <=> 'alpha'::wquery, weights => '{1,1}') LIMIT 10;
+                                                      QUERY PLAN                                                      
+----------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using fd_weave on fd
+         Order By: ((body <=> '''alpha'''::wquery) AND (body <=> '''alpha'''::wquery) AND (body <~> '{1,1}'::real[]))
+(3 rows)
 
 CREATE TEMP TABLE d_fused AS
 SELECT id FROM fd
  ORDER BY fuse(body <=> 'alpha'::wquery,
                body <=> 'alpha'::wquery, weights => '{1,1}') LIMIT 10;
-
 CREATE TEMP TABLE d_plain AS
 SELECT id FROM fd ORDER BY body <=> 'alpha'::wquery LIMIT 10;
-
 RESET enable_seqscan;
-
 -- enable_seqscan is back ON for the aggregates below, and that is deliberate
 -- rather than tidiness: with it off, a bare count(*) or a whole-table aggregate
 -- over an indexed table fails on PostgreSQL 18 (doc/GAPS.md G39 -- the AM is asked
@@ -115,6 +120,10 @@ RESET enable_seqscan;
 SELECT (SELECT array_agg(id ORDER BY id) FROM d_fused)
        = (SELECT array_agg(id ORDER BY id) FROM d_plain)
        AS one_channel_matches_plain_lexical;
+ one_channel_matches_plain_lexical 
+-----------------------------------
+ t
+(1 row)
 
 -- ---------------------------------------------------------------------------
 -- (2) ALL CHANNELS BOOLEAN, sect. 4 row 2: reduces to a bitmap AND, no scoring.
@@ -127,6 +136,10 @@ SELECT (SELECT array_agg(id ORDER BY id) FROM d_fused)
 -- ---------------------------------------------------------------------------
 SELECT count(*) AS all_boolean_rows
   FROM fd WHERE body @@@ 'alpha & common0'::wquery;
+ all_boolean_rows 
+------------------
+               13
+(1 row)
 
 SELECT count(*) AS all_boolean_disagreements
   FROM (SELECT id FROM fd WHERE body @@@ 'alpha & common0'::wquery) a
@@ -134,6 +147,10 @@ SELECT count(*) AS all_boolean_disagreements
               WHERE body @@@ 'alpha'::wquery AND body @@@ 'common0'::wquery) b
     USING (id)
  WHERE a.id IS NULL OR b.id IS NULL;
+ all_boolean_disagreements 
+---------------------------
+                         0
+(1 row)
 
 -- ---------------------------------------------------------------------------
 -- (3) k = 1, sect. 4 row 3: best match with maximal pruning.
@@ -145,21 +162,21 @@ SELECT count(*) AS all_boolean_disagreements
 -- which is what would break if the ladder's first rung were not an exact prefix.
 -- ---------------------------------------------------------------------------
 SET enable_seqscan = off;
-
 CREATE TEMP TABLE d_k1 AS
 SELECT id FROM fd
  ORDER BY fuse(body <=> 'alpha'::wquery,
                body <=> 'zeta'::wquery, weights => '{0.25,0.75}') LIMIT 1;
-
 CREATE TEMP TABLE d_k8 AS
 SELECT id FROM fd
  ORDER BY fuse(body <=> 'alpha'::wquery,
                body <=> 'zeta'::wquery, weights => '{0.25,0.75}') LIMIT 8;
-
 RESET enable_seqscan;
-
 SELECT (SELECT count(*) FROM d_k1) AS k1_rows,
        (SELECT id FROM d_k1) IN (SELECT id FROM d_k8) AS k1_is_in_k8;
+ k1_rows | k1_is_in_k8 
+---------+-------------
+       1 | t
+(1 row)
 
 -- ---------------------------------------------------------------------------
 -- (4) A CHANNEL THAT MATCHES NOTHING.
@@ -178,18 +195,19 @@ SELECT (SELECT count(*) FROM d_k1) AS k1_rows,
 -- inherits that channel's tie-freedom (or lack of it) unchanged.
 -- ---------------------------------------------------------------------------
 SET enable_seqscan = off;
-
 CREATE TEMP TABLE d_empty AS
 SELECT id FROM fd
  ORDER BY fuse(body <=> 'alpha'::wquery,
                body <=> 'nosuchtermanywhere'::wquery,
                weights => '{1,1}') LIMIT 10;
-
 RESET enable_seqscan;
-
 SELECT (SELECT array_agg(id ORDER BY id) FROM d_empty)
        = (SELECT array_agg(id ORDER BY id) FROM d_plain)
        AS empty_channel_matches_plain_lexical;
+ empty_channel_matches_plain_lexical 
+-------------------------------------
+ t
+(1 row)
 
 -- ---------------------------------------------------------------------------
 -- (5) EQUAL WEIGHTS ARE 1.0 EACH AND NOT 1/n, over a real two-channel fusion.
@@ -200,21 +218,21 @@ SELECT (SELECT array_agg(id ORDER BY id) FROM d_empty)
 -- would break it is a default of 1/n applied to one arm only.
 -- ---------------------------------------------------------------------------
 SET enable_seqscan = off;
-
 CREATE TEMP TABLE d_default_w AS
 SELECT id FROM fd
  ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'zeta'::wquery) LIMIT 8;
-
 CREATE TEMP TABLE d_unit_w AS
 SELECT id FROM fd
  ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'zeta'::wquery,
                weights => '{1,1}') LIMIT 8;
-
 RESET enable_seqscan;
-
 SELECT (SELECT array_agg(id ORDER BY id) FROM d_default_w)
        = (SELECT array_agg(id ORDER BY id) FROM d_unit_w)
        AS default_weights_are_unit;
+ default_weights_are_unit 
+--------------------------
+ t
+(1 row)
 
 -- The weighting has to MATTER, or every assertion above would pass against a
 -- scorer that ignored the weights entirely.  'zeta' is in two documents out of
@@ -222,25 +240,25 @@ SELECT (SELECT array_agg(id ORDER BY id) FROM d_default_w)
 -- 0.01/0.99 they do not.  Recorded as a boolean rather than as ids, because which
 -- documents 'alpha' promotes is a BM25 question and not this file's subject.
 SET enable_seqscan = off;
-
 CREATE TEMP TABLE d_zeta_heavy AS
 SELECT id FROM fd
  ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'zeta'::wquery,
                weights => '{0.01,0.99}') LIMIT 2;
-
 CREATE TEMP TABLE d_alpha_heavy AS
 SELECT id FROM fd
  ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'zeta'::wquery,
                weights => '{0.99,0.01}') LIMIT 2;
-
 RESET enable_seqscan;
-
 SELECT (SELECT array_agg(id ORDER BY id) FROM d_zeta_heavy) = ARRAY[7, 19]
        AS zeta_weight_promotes_the_two_zeta_docs,
        (SELECT array_agg(id ORDER BY id) FROM d_zeta_heavy)
        IS DISTINCT FROM
        (SELECT array_agg(id ORDER BY id) FROM d_alpha_heavy)
        AS weights_change_the_answer;
+ zeta_weight_promotes_the_two_zeta_docs | weights_change_the_answer 
+----------------------------------------+---------------------------
+ t                                      | f
+(1 row)
 
 DROP TABLE d_fused, d_plain, d_k1, d_k8, d_empty,
            d_default_w, d_unit_w, d_zeta_heavy, d_alpha_heavy;

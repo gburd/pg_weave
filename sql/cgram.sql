@@ -268,11 +268,17 @@ SELECT id FROM cg WHERE body @~ '%tion refused l%' ORDER BY id;
 --     with no cgram weft makes the route fall back to a sequential heap pass,
 --     which returns the SAME rows, slower.  So the symmetric differences below
 --     are a guard against the fix, not a test of it.
---   * NEITHER DOES THE COUNTER WHILE THE ROW IS STILL PENDING.  A pending
---     document is in no bolt, its TID is added as a candidate unconditionally,
---     and the route still serves the scan: `served_while_pending` is 1 before the
---     fix and 1 after.  It is asserted precisely so that the next number cannot
---     be mistaken for it.
+--   * AND THE COUNTER WHILE THE ROW IS STILL PENDING DISCRIMINATES TOO, WHICH THIS
+--     FILE CLAIMED IT DID NOT.  The claim here was that a pending document is in no
+--     bolt, so the route serves the scan either way and `served_while_pending` is 1
+--     before the fix and 1 after.  **A pre-fix control run on 2026-09-21 measured 0**
+--     (build 5ed01e6, this file's text against that code, PG17 on the EC2 dev host),
+--     so it is 0 -> 1 like the other two.  The mechanism is the one below: by this
+--     point in the file an earlier statement has already folded a bolt without a
+--     cgram weft into the index, and ONE weft-less live bolt de-accelerates the
+--     whole index, pending row or not.  The wrong claim is left here rather than
+--     replaced because "this number does not discriminate" is exactly the kind of
+--     assertion that has to be measured rather than reasoned, and it was reasoned.
 --
 -- What DOES discriminate is the counter AFTER the pending buffer is folded into a
 -- bolt, and the segment count after a compaction:

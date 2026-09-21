@@ -27,7 +27,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.15.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.16.0" of extension "pg_weave" is already installed
 CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
 SET max_parallel_workers_per_gather = 0;
 CREATE TABLE fu (id serial, body text, d wdoc);
