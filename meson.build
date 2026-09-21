@@ -62,6 +62,8 @@ sources = files(
   'src/am/ambuild.c',
   'src/am/amvacuum.c',
   'src/am/amscan.c',
+  'src/am/fuse.c',
+  'src/am/fuseshuttle.c',
   'src/am/customscan.c',
   'src/am/amaux.c',
   'src/am/amsize.c',

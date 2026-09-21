@@ -27,6 +27,8 @@ OBJS = \
 	src/am/ambuild.o \
 	src/am/amvacuum.o \
 	src/am/amscan.o \
+	src/am/fuse.o \
+	src/am/fuseshuttle.o \
 	src/am/customscan.o \
 	src/am/amaux.o \
 	src/am/amsize.o \
@@ -397,6 +399,10 @@ check-standalone:
 	echo "== Z7 gate shuttle (C1)+(C2)+(C5): monotone seek == linear oracle, +/-INF, backward refused =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/bounds test/hegel/test_bounds.c; \
 	$$tmp/bounds | tail -1; \
+	echo "== F1/F5 fused top-k: fused == brute force, conjunctive gates, no backward seek =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/fuse test/hegel/test_fuse_props.c \
+		src/am/fuse.c -lm; \
+	$$tmp/fuse 60000 | tail -4; \
 	echo "== Z9 edist shuttle (C1)+(C2): the bound never exceeds a true Levenshtein distance =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/edist test/hegel/test_edist.c -lm; \
 	$$tmp/edist | tail -2; \
