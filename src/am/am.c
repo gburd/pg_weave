@@ -4028,13 +4028,16 @@ weave_handler(PG_FUNCTION_ARGS)
 	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
 	/*
-	 * 4, and the fourth member is WEAVE_STRAT_VEC_IP (`<#>` on wvec, task F7):
+	 * 5, and the fifth member is WEAVE_STRAT_FUSE_WEIGHTS (`<~>`, task F2.2):
 	 * ALTER OPERATOR FAMILY validates a member number against this value, so a
-	 * second vector ORDER BY member -- one per metric the scan core serves -- is
-	 * unregisterable while this says 3.  1..3 are `@@@`/`@~` (restriction),
-	 * WEAVE_STRAT_DISTANCE and WEAVE_STRAT_EDIST; see include/weave/am.h.
+	 * new ORDER BY member is unregisterable while this says one less than its
+	 * number.  It has been raised twice for that reason: 3 -> 4 for `<#>` (one
+	 * vector member per metric the scan core serves, task F7) and 4 -> 5 for the
+	 * fused scan's weights transport key.  1..4 are `@@@`/`@~`/`<->` (three
+	 * families sharing the number), WEAVE_STRAT_DISTANCE, WEAVE_STRAT_EDIST and
+	 * WEAVE_STRAT_VEC_IP; see include/weave/am.h.
 	 */
-	amroutine->amstrategies = 4;
+	amroutine->amstrategies = 5;
 	amroutine->amsupport = 0;
 	amroutine->amoptsprocnum = 0;
 	amroutine->amcanorder = false;

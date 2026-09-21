@@ -1514,6 +1514,27 @@ extern int	weave_index_vec_metric(Relation index);
 #define WEAVE_STRAT_VEC_IP		4
 
 /*
+ * THE FUSED SCAN'S WEIGHTS TRANSPORT KEY (task F2.2).
+ *
+ * `<~>` over (wdoc, float4[]) and (wvec, float4[]), a member of BOTH wdoc_lex_ops
+ * and wvec_weave_ops at this number, and the one ORDER BY member of this access
+ * method that names no channel and computes nothing.  It exists so that
+ * amrescan can SEE a float4[]: an access method is handed scan keys and nothing
+ * else, and fuse()'s per-channel weights are not expressible as a scan key over
+ * any existing operator.  Its C function (src/am/fusepath.c) raises
+ * unconditionally; sql/pg_weave--0.15.0--0.16.0.sql carries the full argument for
+ * the shape, including why the weights are transported on an ORDER BY key rather
+ * than a qual (indexqualorig is re-evaluated on an EPQ recheck, so a marker in a
+ * qual is eventually executed for real).
+ *
+ * 5 BECAUSE 1..4 ARE ALL SPOKEN FOR, and weave_rescan() dispatches order-by keys
+ * on sk_strategy ALONE: a transport key sharing a number with a real channel
+ * request would be indistinguishable from one.  amstrategies moved 4 -> 5 in
+ * src/am/am.c for it, which is a precondition of the catalog members existing.
+ */
+#define WEAVE_STRAT_FUSE_WEIGHTS	5
+
+/*
  * Which index column feeds which channel.
  *
  * Until task V7 the access method was single-attribute: every write and recheck
@@ -1698,5 +1719,21 @@ extern double weave_wand_cursor_max_contrib(WandCursor *c);
 extern struct WeaveShuttle *weave_lex_shuttle_begin(WandCursor *c,
 													MemoryContext cxt);
 extern void weave_lex_shuttle_end(struct WeaveShuttle *s);
+
+/* ---------------------------------------------------------------------------
+ * F2.2: the fused-scan planner seam
+ *
+ * src/am/fusepath.c installs a set_rel_pathlist_hook that offers a hand-built
+ * IndexPath for a recognized `ORDER BY fuse(...)`.  The hook is CHAINED from
+ * _PG_init in src/am/customscan.c, which is this module's single documented entry
+ * point and already chains create_upper_paths_hook the same way; a second
+ * _PG_init is not possible and a second place that installs hooks would be a
+ * second answer to "what does loading this library do".
+ *
+ * Declared here rather than as an extern at the top of customscan.c because
+ * AGENTS.md hard rule 5 asks for a reason next to the declaration, and because
+ * am.h is where the other cross-file AM seams are stated.
+ * ------------------------------------------------------------------------- */
+extern void weave_fuse_install_pathlist_hook(void);
 
 #endif							/* WEAVE_AM_H */

@@ -478,6 +478,88 @@ ORDER BY key. The AM therefore derives it from *where the key arrived*, never fr
 channel kind — see §3a (2) and `include/weave/channel.h`'s (C5) note, where the
 kind-based inference is the falsification that would silently drop every row `<@>` ranks.
 
+## 7b. What F2.2 found when it built the pushdown (2026-09-21)
+
+§7a staged F2 and predicted that F2.2 was "the AM-side fused scan", implying the
+only missing pieces were glue. One thing was missing that is not glue, and it is
+recorded here because it decides which shapes the planner is allowed to offer.
+
+**The channels do not share a position space, and the fused core drives exactly
+one.** Checked in code, not inferred:
+
+- The **lexical** shuttle publishes `weave_tid_to_docid()` **docids** as its warp
+  positions (`src/query/lexshuttle.c`, `lex_publish()`). So does a **gate** shuttle
+  built from a `TidSet` (`include/weave/gate.h`). These two agree.
+- The **vector** shuttle's warp is a **segment-local dense lane index**
+  (`src/vector/vecshuttle.c`), related to a docid only through the weft's warp map
+  — a forward-only page chain with no index over its pages.
+- The **`<@>`** shuttle's warp is a position in the **dictionary**, not in any
+  document space at all (`src/query/edist.c`; `weave_edist_pass()` walks terms and
+  then reads each admitted term's postings).
+
+`gate.h` already stated this as an open question and assigned it here: "the two key
+spaces are NOT the same, and reconciling them is Phase F's decision, not this
+task's." **F2.2's decision is the docid space**, on the grounds that it is the
+space two of the four channel families already use, it is bolt-independent (which
+`vecshuttle.c`'s own comment gives as the reason its allowlist argument is docids
+and not warps), and it needs no translation layer to be correct on day one.
+
+**So F2.2 ships the shapes that live in that space and its planner refuses the
+rest.** A fused path is offered for two or more lexical `<=>` channels — each
+expanding to one shuttle per query term — plus the boolean gate a `WHERE` clause
+becomes. A `fuse()` naming `<->`, `<#>` or `<@>` gets **no path**, and the Sort
+over the fallback stands. That is a refusal, not an error; `sql/fuse_pushdown.sql`
+asserts each one falls back without a message. The alternative — offering the path
+and translating badly — is G39 in `doc/GAPS.md`, an access method that advertises a
+plan and then refuses it at run time.
+
+**What the vector channel needs, so the follow-up is a task and not a rediscovery.**
+One adapter shuttle, and the design is settled by the fact that the warp map is
+written **docid-ascending** (`vec_docid_order()` in the writer; the ordering guard
+`t/017_vector_syncscan.pl` exists to keep it that way):
+
+- Materialize the bolt's `warp -> docid` array once per pass, which is one forward
+  pass of the warp-map chain — the same pass `vec_allow_from_docids()` already makes.
+- `seek(target_docid)` binary-searches the array for the first lane whose docid is
+  `>= target`, seeks the underlying vector shuttle to that **lane**, and reports the
+  docid of the lane it landed on. Monotone in both spaces, so (C1) survives.
+- `blkend` reports the docid of the block's last lane. (C2) survives and is not even
+  weakened: the docid interval `[cur, blkend]` covers the block's lanes plus docids
+  this bolt does not carry, at which the channel contributes nothing anyway, and the
+  core only sums the bound of a channel standing exactly on the pivot.
+
+Cost: `8 * nlanes` bytes per bolt per pass. That is the whole of it, and it is why
+this is recorded as owed rather than attempted — an adapter is cheap, but adding it
+in the same change as the first working fused scan would mean debugging two new
+things at once, which is the argument hard rule 7 makes about Phase F as a whole.
+
+**The `<@>` channel is a different and larger job**, and calling it an adapter would
+be wrong. Its shuttle's positions are dictionary terms, and a document's `<@>`
+distance is the *minimum over its terms*, computed by reading each admitted term's
+postings — so there is no monotone map from its warp to a document at all. Fusing
+it needs a **document-space** `<@>` shuttle, which needs the per-document minimum to
+be reachable without materializing every posting of every admitted term. That is a
+channel design question, not a plumbing one.
+
+**Two smaller findings, both stated where they bind.**
+
+1. **(C6) is not applied by the scorer on this path, and cannot be.** (C6) says
+   tombstones are applied once, by the scorer, from a warp-indexed bitmap — which
+   presumes a *dense* warp. A docid is sparse: a bitmap over it needs one bit per
+   `(heap block x MaxHeapTuplesPerPage)` slot, tens of megabytes on a large heap, to
+   carry information the channels already hold. So `live` is NULL and each channel
+   filters its own: a `WandCursor` skips **its own segment's** tombstones, which is
+   also a semantics a shared bitmap could not express (a docid deleted in segment A
+   must not suppress a live document that reused the heap slot in a newer segment).
+   The deviation is in `src/am/amscan.c`'s fused-pass header comment too.
+2. **The channel cap has to be enforced at plan time.** `weave_fuse_init()` refuses
+   more than `WEAVE_FUSE_MAX_CHAN` channels, and a lexical key becomes one shuttle
+   per term, so a query with enough terms would be a path the AM refuses at rescan
+   — G39 again. The planner therefore reads each key's `wquery` `Const` and bounds
+   the term count by `nitems` (an RPN item count, hence an over-estimate, which is
+   the safe direction). The price is that a **parameterized** `wquery` gets no fused
+   path: the term count is unknowable until the scan runs.
+
 ## 8. What must be benchmarked before this is called a win
 
 The claim being made is "no over-fetch, better quality, lower latency". All

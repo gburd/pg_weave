@@ -1,0 +1,217 @@
+-- F1's owed file, finally meaningful: the five degenerate shapes of
+-- doc/specs/FUSED_TOPK.md sect. 4, each asserted against the single-channel path
+-- that already exists.
+--
+-- WHY THIS FILE COULD NOT BE WRITTEN BEFORE F2.2.  sect. 4's table names
+-- `sql/fuse_degenerate.sql` as the test for four of its five rows, but until the
+-- pushdown existed there was no fused scan to degenerate: every fuse() query was a
+-- Sort over the executable fallback (sql/fuse_fallback.sql), and comparing that
+-- against the index would have been comparing two different rankings -- see the
+-- next paragraph.  The fifth row ("theta never rises") is a property and lives in
+-- test/hegel/test_fuse_props.c, which is where it stays.
+--
+-- WHAT IS ASSERTED, AND WHY IT IS NOT "BYTE-IDENTICAL".  sect. 4's first row says
+-- a one-channel fused query is "byte-identical to today's ranked scan".  That
+-- claim is retired here rather than tested, on two grounds recorded in sect. 7a (1)
+-- and sect. 3a:
+--
+--   1. FLOAT ADDITION IS NOT ASSOCIATIVE, so a fused score is only well defined
+--      once the summation order is.  The fused core sums required channels first
+--      and then scored channels by DESCENDING WEIGHTED CEILING; the WAND sums one
+--      term at a time in cursor order.  F5 measured 771 of 812,179 comparisons
+--      differing in the last ULP the moment the score lattice was made fine.  Two
+--      exact implementations, two definitions of one number.
+--   2. Where a shape has no fused path at all, the comparison arm is the FALLBACK,
+--      whose BM25 is approximate by necessity: weave_distance() outside an index
+--      has no corpus, so it uses df = 1 and avgdl = |D|.
+--
+-- So what each section asserts is the TOP-K AS A SET, compared with
+-- array_agg(id ORDER BY id).  That is the claim the degenerate cases actually
+-- make -- the fused scan picks the same documents -- and it is falsifiable: a
+-- dropped channel, a lost gate or an inverted sign all change the set.
+--
+-- AND ONE THING THE SET COMPARISON IS NOT PAPERING OVER: the ORDER within the k
+-- is deliberately not pinned, because pinning it would need a `, id` tie-break and
+-- a two-key ORDER BY has two pathkeys, which src/am/fusepath.c refuses (it
+-- recognizes a query's SINGLE ORDER BY pathkey).  Adding the tie-break would
+-- therefore test the Sort fallback while looking like it tested the pushdown.
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+ALTER EXTENSION pg_weave UPDATE;
+
+-- Plan text stability only; nothing here is about parallelism.
+SET max_parallel_workers_per_gather = 0;
+
+-- A corpus with distinct BM25 scores per document for 'alpha' (tf varies 1..5)
+-- and a rare term 'zeta' in exactly two documents, so a two-channel fuse() can
+-- actually reorder relative to either channel alone.
+CREATE TABLE fd (id int, body wdoc);
+INSERT INTO fd
+SELECT g,
+       to_wdoc(repeat('alpha ', 1 + (g % 5)) || 'common' || (g % 3) ||
+               (CASE WHEN g IN (7, 19) THEN ' zeta' ELSE '' END))
+FROM generate_series(1, 40) g;
+CREATE INDEX fd_weave ON fd USING weave (body);
+ANALYZE fd;
+
+-- ---------------------------------------------------------------------------
+-- (1) ONE SCORED CHANNEL, sect. 4 row 1: reduces to block-max WAND.
+--
+-- Spelled as TWO channels carrying the SAME query with equal weights, which is
+-- also sect. 4 row 4 ("all weights equal"): the fused value is -2S, and -2S is
+-- order-equivalent to the plain `<=>` distance 1/(1+S) ascending, so the two plans
+-- must choose the same documents.  It has to be spelled with two arguments because
+-- src/am/fusepath.c refuses a single-channel fuse() -- one channel is not a fusion,
+-- and offering a path for it would be offering a slower way to do what `<=>`
+-- already does.
+-- ---------------------------------------------------------------------------
+SET enable_seqscan = off;
+
+EXPLAIN (COSTS OFF)
+SELECT id FROM fd
+ ORDER BY fuse(body <=> 'alpha'::wquery,
+               body <=> 'alpha'::wquery, weights => '{1,1}') LIMIT 10;
+
+CREATE TEMP TABLE d_fused AS
+SELECT id FROM fd
+ ORDER BY fuse(body <=> 'alpha'::wquery,
+               body <=> 'alpha'::wquery, weights => '{1,1}') LIMIT 10;
+
+CREATE TEMP TABLE d_plain AS
+SELECT id FROM fd ORDER BY body <=> 'alpha'::wquery LIMIT 10;
+
+RESET enable_seqscan;
+
+-- enable_seqscan is back ON for the aggregates below, and that is deliberate
+-- rather than tidiness: with it off, a bare count(*) or a whole-table aggregate
+-- over an indexed table fails on PostgreSQL 18 (doc/GAPS.md G39 -- the AM is asked
+-- for a scan with neither a restriction key nor an ordering clause, which it
+-- refuses).  Every aggregate in this file is therefore outside the off window.
+SELECT (SELECT array_agg(id ORDER BY id) FROM d_fused)
+       = (SELECT array_agg(id ORDER BY id) FROM d_plain)
+       AS one_channel_matches_plain_lexical;
+
+-- ---------------------------------------------------------------------------
+-- (2) ALL CHANNELS BOOLEAN, sect. 4 row 2: reduces to a bitmap AND, no scoring.
+--
+-- There is no boolean ORDER BY operator and there never will be: a gate has no
+-- score to order by (contract (C5)).  A boolean channel reaches the fused scan by
+-- being a WHERE clause, so an "all channels boolean" query is a query with no
+-- fuse() call, and what this section records is that such a query is answered by
+-- the ordinary `@@@` machinery and NOT by anything F2.2 added.
+-- ---------------------------------------------------------------------------
+SELECT count(*) AS all_boolean_rows
+  FROM fd WHERE body @@@ 'alpha & common0'::wquery;
+
+SELECT count(*) AS all_boolean_disagreements
+  FROM (SELECT id FROM fd WHERE body @@@ 'alpha & common0'::wquery) a
+  FULL JOIN (SELECT id FROM fd
+              WHERE body @@@ 'alpha'::wquery AND body @@@ 'common0'::wquery) b
+    USING (id)
+ WHERE a.id IS NULL OR b.id IS NULL;
+
+-- ---------------------------------------------------------------------------
+-- (3) k = 1, sect. 4 row 3: best match with maximal pruning.
+--
+-- The interesting property is not the row, it is that a k of 1 is served by the
+-- SAME ladder as any other k: the AM never learns the LIMIT, so it runs its first
+-- rung at pg_weave.wand_initial_k regardless and the executor stops pulling.  The
+-- assertion is that the single row agrees with the first row of the wider query,
+-- which is what would break if the ladder's first rung were not an exact prefix.
+-- ---------------------------------------------------------------------------
+SET enable_seqscan = off;
+
+CREATE TEMP TABLE d_k1 AS
+SELECT id FROM fd
+ ORDER BY fuse(body <=> 'alpha'::wquery,
+               body <=> 'zeta'::wquery, weights => '{0.25,0.75}') LIMIT 1;
+
+CREATE TEMP TABLE d_k8 AS
+SELECT id FROM fd
+ ORDER BY fuse(body <=> 'alpha'::wquery,
+               body <=> 'zeta'::wquery, weights => '{0.25,0.75}') LIMIT 8;
+
+RESET enable_seqscan;
+
+SELECT (SELECT count(*) FROM d_k1) AS k1_rows,
+       (SELECT id FROM d_k1) IN (SELECT id FROM d_k8) AS k1_is_in_k8;
+
+-- ---------------------------------------------------------------------------
+-- (4) A CHANNEL THAT MATCHES NOTHING.
+--
+-- Not in sect. 4's table, and it belongs there: a term absent from every segment
+-- contributes no shuttle at all, so the run has one scored channel where the
+-- query named two.  The hazard is arithmetic rather than structural -- a channel
+-- whose ceiling were counted but whose score never arrived would leave the
+-- essential/non-essential partition believing in a contribution that cannot come,
+-- which weakens the prune but must not change the answer.  So: fusing 'alpha'
+-- with a nonexistent term must pick the same documents as 'alpha' alone.
+-- ---------------------------------------------------------------------------
+SET enable_seqscan = off;
+
+CREATE TEMP TABLE d_empty AS
+SELECT id FROM fd
+ ORDER BY fuse(body <=> 'alpha'::wquery,
+               body <=> 'nosuchtermanywhere'::wquery,
+               weights => '{1,1}') LIMIT 10;
+
+RESET enable_seqscan;
+
+SELECT (SELECT array_agg(id ORDER BY id) FROM d_empty)
+       = (SELECT array_agg(id ORDER BY id) FROM d_plain)
+       AS empty_channel_matches_plain_lexical;
+
+-- ---------------------------------------------------------------------------
+-- (5) EQUAL WEIGHTS ARE 1.0 EACH AND NOT 1/n, over a real two-channel fusion.
+--
+-- Omitting `weights` must be the same query as spelling '{1,1}'.  The value
+-- differs from '{0.5,0.5}' by a factor of two, which no ORDER BY can see -- so
+-- what this asserts is the SET equality that a rescaling cannot break, and what
+-- would break it is a default of 1/n applied to one arm only.
+-- ---------------------------------------------------------------------------
+SET enable_seqscan = off;
+
+CREATE TEMP TABLE d_default_w AS
+SELECT id FROM fd
+ ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'zeta'::wquery) LIMIT 8;
+
+CREATE TEMP TABLE d_unit_w AS
+SELECT id FROM fd
+ ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'zeta'::wquery,
+               weights => '{1,1}') LIMIT 8;
+
+RESET enable_seqscan;
+
+SELECT (SELECT array_agg(id ORDER BY id) FROM d_default_w)
+       = (SELECT array_agg(id ORDER BY id) FROM d_unit_w)
+       AS default_weights_are_unit;
+
+-- The weighting has to MATTER, or every assertion above would pass against a
+-- scorer that ignored the weights entirely.  'zeta' is in two documents out of
+-- forty, so its idf is large; at weight 0.99/0.01 those two documents lead, and at
+-- 0.01/0.99 they do not.  Recorded as a boolean rather than as ids, because which
+-- documents 'alpha' promotes is a BM25 question and not this file's subject.
+SET enable_seqscan = off;
+
+CREATE TEMP TABLE d_zeta_heavy AS
+SELECT id FROM fd
+ ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'zeta'::wquery,
+               weights => '{0.01,0.99}') LIMIT 2;
+
+CREATE TEMP TABLE d_alpha_heavy AS
+SELECT id FROM fd
+ ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'zeta'::wquery,
+               weights => '{0.99,0.01}') LIMIT 2;
+
+RESET enable_seqscan;
+
+SELECT (SELECT array_agg(id ORDER BY id) FROM d_zeta_heavy) = ARRAY[7, 19]
+       AS zeta_weight_promotes_the_two_zeta_docs,
+       (SELECT array_agg(id ORDER BY id) FROM d_zeta_heavy)
+       IS DISTINCT FROM
+       (SELECT array_agg(id ORDER BY id) FROM d_alpha_heavy)
+       AS weights_change_the_answer;
+
+DROP TABLE d_fused, d_plain, d_k1, d_k8, d_empty,
+           d_default_w, d_unit_w, d_zeta_heavy, d_alpha_heavy;
+DROP TABLE fd;
+RESET max_parallel_workers_per_gather;

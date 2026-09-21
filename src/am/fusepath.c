@@ -30,19 +30,30 @@
  * `<=>` distance is, which costs nothing: it is an ORDER BY expression, and the
  * number that "means something" is F3's score(), which is -fuse().
  *
- * WHAT THIS FILE DELIBERATELY DOES NOT DO.  There is no IndexPath here, no
- * set_rel_pathlist_hook, and no scan key: the pushdown is F2.2, which needs the
- * AM side, and sect. 7a (3) establishes that no channel this example uses is an
- * ORDER BY operand yet (tasks F6 and F7).  A path that nothing can serve is
- * worse than no path.  What F2.1 owes F2.2 instead is a SHAPE: after the
- * rewrite, a recognized channel argument is exactly
+ * WHAT THIS FILE DELIBERATELY DID NOT DO UNTIL F2.2, AND NOW DOES.  F2.1 shipped
+ * with no IndexPath, no set_rel_pathlist_hook and no scan key, on the stated
+ * grounds that the pushdown needs the AM side and that sect. 7a (3) had just
+ * established that no channel sect. 7's example uses was an ORDER BY operand
+ * (tasks F6 and F7).  Both have landed, so F2.2 adds the second half below the
+ * fallback: a chained set_rel_pathlist_hook that recognizes the shape the support
+ * function emits and offers a hand-built IndexPath for it.
+ *
+ * What F2.1 owed F2.2 was a SHAPE, and the matcher below is its only intended
+ * consumer: after the rewrite, a recognized channel argument is exactly
  *
  *	  FuncExpr(weave_lexscore | weave_cosscore, args = [ the original OpExpr ])
  *
- * with the OpExpr preserved intact, because that OpExpr is what F2.2 will lift
- * into `indexorderbys`.  This file is the only producer of that shape and F2.2's
- * matcher is its only intended consumer; if a third party starts to depend on
- * it, it needs a name and a header, not a grep.
+ * with the OpExpr preserved intact, because that OpExpr is what gets lifted into
+ * `indexorderbys`.  An argument that was never rewritten -- a bare `col <op> q`
+ * whose operator the recovery step does not know, or a plain float -- is matched
+ * directly, so the matcher reads through the wrapper rather than requiring it.
+ *
+ * THE HARD INVARIANT OF THE PLANNER HALF: NEVER OFFER A PATH THE AM CANNOT SERVE.
+ * doc/GAPS.md G39 is what the alternative looks like -- an access method that
+ * advertises a plan and then refuses it at run time, which is a query that fails
+ * rather than a query that is slow.  Every refusal below is therefore a REFUSAL:
+ * add no path, emit no message, and let the Sort over the fallback stand.
+ * A path the AM would refuse is a bug in this file, not a user error.
  *
  * AND IT NEVER GUESSES.  An argument whose operator is not one of the three
  * recognized ones is left untouched and is therefore taken as a score, which is
@@ -65,11 +76,19 @@
 
 #include <math.h>
 
+#include "access/stratnum.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "commands/extension.h"
 #include "fmgr.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/pathnodes.h"
 #include "nodes/supportnodes.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/paths.h"
 #include "parser/parse_func.h"
 #include "parser/parse_oper.h"
 #include "utils/array.h"
@@ -77,6 +96,11 @@
 #include "utils/float.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+
+#include "weave/am.h"			/* WEAVE_STRAT_*, weave_fuse_install_pathlist_hook */
+#include "weave/edist.h"		/* WEAVE_STRAT_DISTANCE, WEAVE_STRAT_EDIST */
+#include "weave/fuse.h"			/* WEAVE_FUSE_MAX_CHAN */
+#include "weave/weave.h"		/* WeaveQuery */
 
 /*
  * Every catalog OID the rewrite needs, resolved together and cached for the
@@ -448,4 +472,698 @@ weave_fuse_support(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_POINTER(ret);
+}
+
+/* ===========================================================================
+ * F2.2 -- THE PUSHDOWN
+ *
+ * One chained set_rel_pathlist_hook.  It recognizes `ORDER BY fuse(...)` on a
+ * base relation carrying a weave index, and adds an IndexPath whose
+ * `indexorderbys` are the per-channel operators plus the weights transport key.
+ * Everything it cannot serve, it declines to path -- see the header comment.
+ * =========================================================================== */
+
+/*
+ * The PathKey direction test, which moved between majors.  PostgreSQL 18 replaced
+ * PathKey.pk_strategy (a btree strategy number) with pk_cmptype (a CompareType);
+ * both spell "ascending" and reading the wrong field would not compile rather than
+ * silently invert, which is the only reason this is a macro and not a runtime
+ * check.
+ */
+#if PG_VERSION_NUM >= 180000
+#define WEAVE_PATHKEY_IS_ASC(pk)	((pk)->pk_cmptype == COMPARE_LT)
+#else
+#define WEAVE_PATHKEY_IS_ASC(pk)	((pk)->pk_strategy == BTLessStrategyNumber)
+#endif
+
+/*
+ * The catalog OIDs the PUSHDOWN needs, cached separately from the rewrite's.
+ *
+ * SEPARATE ON PURPOSE.  weave_fuse_resolve_oids() above returns false if any one
+ * of its OIDs is missing and its callers then decline to rewrite.  Folding the
+ * pushdown's objects into that struct would mean that an extension not yet
+ * updated to 0.16.0 -- no `<~>` operator, no member 5 -- made the whole resolve
+ * fail, which would silently disable F2.1's argument rewrite as well.  A missing
+ * transport operator must cost the pushdown and nothing else.
+ */
+typedef struct WeaveFusePathOids
+{
+	Oid			extoid;			/* the pg_weave these were resolved from */
+	Oid			nspoid;			/* its schema, for the fuse() name test */
+	Oid			amoid;			/* the weave access method */
+	Oid			match_op;		/* @@@ (wdoc, wquery) -- the gate clause */
+	Oid			lex_op;			/* <=> (wdoc, wquery) */
+	Oid			lex_commop;		/* <=> (wquery, wdoc) */
+	Oid			edist_op;		/* <@> (wdoc, text) */
+	Oid			vec_l2_op;		/* <-> (wvec, wvec) */
+	Oid			vec_ip_op;		/* <#> (wvec, wvec) */
+	Oid			transport_op;	/* <~> (wdoc, float4[]) */
+	Oid			lex_family;		/* wdoc_lex_ops */
+	Oid			vec_family;		/* wvec_weave_ops */
+} WeaveFusePathOids;
+
+static WeaveFusePathOids weave_fuse_path_oids = {InvalidOid};
+
+static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
+
+/*
+ * Resolve, or confirm, the pushdown's OIDs.  Keyed on pg_weave's extension OID
+ * for the reason weave_fuse_resolve_oids() gives: DROP EXTENSION + CREATE
+ * EXTENSION in one backend renumbers every object, and this cache EMITS an OID.
+ *
+ * Returns false if anything is missing, and the caller then adds no path.  Never
+ * raises: this runs inside the planner for every base relation in every query.
+ */
+static bool
+weave_fuse_path_resolve(void)
+{
+	WeaveFusePathOids n;
+	char	   *nspname;
+	Oid			wdoc;
+	Oid			wquery;
+	Oid			wvec;
+
+	n.extoid = get_extension_oid("pg_weave", true);
+	if (!OidIsValid(n.extoid))
+		return false;
+	if (weave_fuse_path_oids.extoid == n.extoid)
+		return true;
+
+	n.nspoid = get_extension_schema(n.extoid);
+	if (!OidIsValid(n.nspoid))
+		return false;
+	nspname = get_namespace_name(n.nspoid);
+	if (nspname == NULL)
+		return false;
+
+	n.amoid = get_index_am_oid("weave", true);
+	if (!OidIsValid(n.amoid))
+		return false;
+
+	wdoc = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+						   PointerGetDatum("wdoc"), ObjectIdGetDatum(n.nspoid));
+	wquery = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+							 PointerGetDatum("wquery"), ObjectIdGetDatum(n.nspoid));
+	wvec = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+						   PointerGetDatum("wvec"), ObjectIdGetDatum(n.nspoid));
+	if (!OidIsValid(wdoc) || !OidIsValid(wquery) || !OidIsValid(wvec))
+		return false;
+
+#define WEAVE_FUSE_OPER(name, l, r) \
+	OpernameGetOprid(list_make2(makeString(nspname), makeString(name)), (l), (r))
+
+	n.match_op = WEAVE_FUSE_OPER("@@@", wdoc, wquery);
+	n.lex_op = WEAVE_FUSE_OPER("<=>", wdoc, wquery);
+	n.lex_commop = WEAVE_FUSE_OPER("<=>", wquery, wdoc);
+	n.edist_op = WEAVE_FUSE_OPER("<@>", wdoc, TEXTOID);
+	n.vec_l2_op = WEAVE_FUSE_OPER("<->", wvec, wvec);
+	n.vec_ip_op = WEAVE_FUSE_OPER("<#>", wvec, wvec);
+	n.transport_op = WEAVE_FUSE_OPER("<~>", wdoc, FLOAT4ARRAYOID);
+
+#undef WEAVE_FUSE_OPER
+
+	n.lex_family = get_opfamily_oid(n.amoid,
+									list_make2(makeString(nspname),
+											   makeString("wdoc_lex_ops")),
+									true);
+	n.vec_family = get_opfamily_oid(n.amoid,
+									list_make2(makeString(nspname),
+											   makeString("wvec_weave_ops")),
+									true);
+
+	if (!OidIsValid(n.match_op) || !OidIsValid(n.lex_op) ||
+		!OidIsValid(n.lex_commop) || !OidIsValid(n.edist_op) ||
+		!OidIsValid(n.vec_l2_op) || !OidIsValid(n.vec_ip_op) ||
+		!OidIsValid(n.transport_op) ||
+		!OidIsValid(n.lex_family) || !OidIsValid(n.vec_family))
+		return false;
+
+	weave_fuse_path_oids = n;
+	return true;
+}
+
+/* One recognized fuse() argument, resolved against one candidate index. */
+typedef struct WeaveFuseChanReq
+{
+	Oid			opno;			/* the operator to EMIT (commutator normalized) */
+	Expr	   *lhs;			/* the indexed operand */
+	Expr	   *rhs;			/* the query operand */
+	int			indexcol;		/* 0-based index column it matched */
+	int			strategy;		/* the sk_strategy the AM will see */
+	bool		servable;		/* the AM can actually drive this channel today */
+	int			maxchan;		/* upper bound on shuttles this channel becomes */
+} WeaveFuseChanReq;
+
+/*
+ * Is `f` a call to pg_weave's fuse()?
+ *
+ * BY NAME AND SCHEMA RATHER THAN BY OID, because fuse() is seven overloads (one
+ * per arity from two score arguments to eight) and this test must accept all of
+ * them without caching seven OIDs that would then have to be kept in step with
+ * the SQL script.  The schema check is what stops some other extension's fuse()
+ * being recognized; pg_weave is relocatable, so a bare name test would be wrong.
+ */
+static bool
+weave_fuse_is_fuse_call(const FuncExpr *f)
+{
+	char	   *name;
+	bool		match;
+
+	if (get_func_namespace(f->funcid) != weave_fuse_path_oids.nspoid)
+		return false;
+	name = get_func_name(f->funcid);
+	if (name == NULL)
+		return false;
+	match = (strcmp(name, "fuse") == 0);
+	pfree(name);
+	return match;
+}
+
+/*
+ * The fuse() call behind a single ASC ORDER BY pathkey, or NULL.
+ *
+ * ONLY ASC MATTERS, and that is arithmetic rather than convention: fuse() returns
+ * the NEGATED weighted sum (see this file's header), so ascending IS best-first
+ * and the AM's ordering values are ascending distances.  A DESC pathkey asks for
+ * the WORST documents first, which a top-k scan cannot produce at all -- it would
+ * have to enumerate the whole match set -- so it is refused rather than served
+ * backwards.  NULLS FIRST is refused for the same reason in miniature: the AM
+ * never emits a NULL ordering value, so a plan that asked for nulls first would
+ * be satisfied by accident today and wrong the day that changes.
+ */
+static FuncExpr *
+weave_fuse_pathkey_call(PlannerInfo *root)
+{
+	PathKey    *pk;
+	ListCell   *lc;
+
+	if (list_length(root->query_pathkeys) != 1)
+		return NULL;
+	pk = (PathKey *) linitial(root->query_pathkeys);
+	if (!WEAVE_PATHKEY_IS_ASC(pk) || pk->pk_nulls_first)
+		return NULL;
+	if (pk->pk_eclass == NULL || pk->pk_eclass->ec_has_volatile)
+		return NULL;
+
+	foreach(lc, pk->pk_eclass->ec_members)
+	{
+		EquivalenceMember *em = (EquivalenceMember *) lfirst(lc);
+		Expr	   *e = em->em_expr;
+
+		while (e != NULL && IsA(e, RelabelType))
+			e = ((RelabelType *) e)->arg;
+		if (e != NULL && IsA(e, FuncExpr) &&
+			weave_fuse_is_fuse_call((FuncExpr *) e))
+			return (FuncExpr *) e;
+	}
+	return NULL;
+}
+
+/*
+ * An expression is usable as the right operand of an index ORDER BY key only if
+ * its value does not depend on the row being scanned: the executor evaluates it
+ * once per rescan, into the ScanKey.  So it must contain no Var of this relation
+ * and nothing volatile.
+ *
+ * A Var of ANOTHER relation is fine and is deliberately allowed -- that is a
+ * parameterized ordering scan under a nested loop, which is the `ORDER BY
+ * fuse(body <=> o.q, ...)` correlated shape, and the path below asks for
+ * rel->lateral_relids as its required_outer so the planner parameterizes it.
+ */
+static bool
+weave_fuse_rhs_ok(PlannerInfo *root, RelOptInfo *rel, Expr *rhs)
+{
+	Relids		varnos;
+
+	if (contain_volatile_functions((Node *) rhs))
+		return false;
+	varnos = pull_varnos(root, (Node *) rhs);
+	if (bms_is_member(rel->relid, varnos))
+		return false;
+	return true;
+}
+
+/*
+ * Attribute one fuse() score argument to a channel of `index`.
+ *
+ * Returns false when the argument cannot be attributed at all.  Returns true with
+ * req->servable false when it names a channel this access method KNOWS but cannot
+ * drive inside a fused scan yet; the caller then refuses the whole shape, because
+ * a partially fused ordering is a different ordering, not a weaker one.
+ *
+ * WHY THERE IS A `servable` FLAG AT ALL, AND IT IS THE ONE THING F2.2 DID NOT
+ * FINISH.  The fused core drives every channel in ONE warp space, and this index's
+ * channels do not yet share one:
+ *
+ *	 - The lexical shuttle publishes weave_tid_to_docid() DOCIDS as its warp
+ *	   positions (src/query/lexshuttle.c), and so does a gate shuttle built from a
+ *	   TidSet (include/weave/gate.h).  Those two agree, which is why the shapes
+ *	   this file does offer are lexical channels plus gates.
+ *	 - The vector shuttle's warp is a SEGMENT-LOCAL DENSE LANE INDEX
+ *	   (src/vector/vecshuttle.c), related to a docid only through the weft's
+ *	   warp map -- a forward-only page chain.
+ *	 - The `<@>` shuttle's warp is a position in the DICTIONARY, not in any
+ *	   document space at all (src/query/edist.c; see weave_edist_pass()).
+ *
+ * include/weave/gate.h states this as "reconciling them is Phase F's decision,
+ * not this task's".  F2.2 decides the docid space and serves what already lives
+ * in it; doc/specs/FUSED_TOPK.md sect. 7b records the decision, the translation
+ * design for the vector channel, and why a `<@>` channel needs a different
+ * shuttle rather than an adapter.  Offering a path for either today would be
+ * exactly the G39 defect this file's header refuses.
+ */
+static bool
+weave_fuse_attribute(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *index,
+					 Expr *arg, WeaveFuseChanReq *req)
+{
+	OpExpr	   *op;
+	Expr	   *lhs;
+	Expr	   *rhs;
+	Oid			wantfamily;
+	int			col;
+
+	/* Read through the support function's recovery wrapper, if it is there. */
+	if (IsA(arg, FuncExpr))
+	{
+		FuncExpr   *f = (FuncExpr *) arg;
+
+		if ((f->funcid == weave_fuse_oids.lexscore_fn ||
+			 f->funcid == weave_fuse_oids.cosscore_fn) &&
+			list_length(f->args) == 1)
+			arg = (Expr *) linitial(f->args);
+	}
+
+	if (!IsA(arg, OpExpr))
+		return false;			/* a plain score: nothing to attribute */
+	op = (OpExpr *) arg;
+	if (list_length(op->args) != 2)
+		return false;
+
+	lhs = (Expr *) linitial(op->args);
+	rhs = (Expr *) lsecond(op->args);
+	req->opno = op->opno;
+	req->maxchan = 1;
+
+	if (op->opno == weave_fuse_path_oids.lex_op)
+	{
+		req->strategy = WEAVE_STRAT_DISTANCE;
+		wantfamily = weave_fuse_path_oids.lex_family;
+		req->servable = true;
+	}
+	else if (op->opno == weave_fuse_path_oids.lex_commop)
+	{
+		/*
+		 * The commutator spelling `q <=> col`.  Normalized here rather than
+		 * relied upon to have been normalized elsewhere: an index ORDER BY key
+		 * must have the index column on the LEFT (fix_indexorderby_references
+		 * rewrites the left operand into an INDEX_VAR reference and would fail on
+		 * the query operand), and nothing in the planner commutes an ordering
+		 * operator outside of core's own index matching, which this path bypasses.
+		 */
+		lhs = (Expr *) lsecond(op->args);
+		rhs = (Expr *) linitial(op->args);
+		req->opno = weave_fuse_path_oids.lex_op;
+		req->strategy = WEAVE_STRAT_DISTANCE;
+		wantfamily = weave_fuse_path_oids.lex_family;
+		req->servable = true;
+	}
+	else if (op->opno == weave_fuse_path_oids.edist_op)
+	{
+		req->strategy = WEAVE_STRAT_EDIST;
+		wantfamily = weave_fuse_path_oids.lex_family;
+		req->servable = false;	/* dictionary-space warp; see above */
+	}
+	else if (op->opno == weave_fuse_path_oids.vec_l2_op)
+	{
+		req->strategy = WEAVE_STRAT_VEC_L2;
+		wantfamily = weave_fuse_path_oids.vec_family;
+		req->servable = false;	/* lane-space warp; see above */
+	}
+	else if (op->opno == weave_fuse_path_oids.vec_ip_op)
+	{
+		req->strategy = WEAVE_STRAT_VEC_IP;
+		wantfamily = weave_fuse_path_oids.vec_family;
+		req->servable = false;	/* lane-space warp; see above */
+	}
+	else
+		return false;			/* not one of this AM's channel operators */
+
+	/*
+	 * WHICH COLUMN, and it must be a column of THIS index and of the right
+	 * OPCLASS.  match_index_to_operand() is core's own test, so an expression
+	 * index (USING weave (to_wdoc(body))) matches on the same terms a core index
+	 * path would; the opfamily comparison then rejects a column of the right TYPE
+	 * under the wrong opclass -- a text column under gram_ops is not a lexical
+	 * column, which is the discriminator include/weave/am.h insists on.
+	 */
+	for (col = 0; col < index->nkeycolumns; col++)
+	{
+		if (index->opfamily[col] != wantfamily)
+			continue;
+		if (match_index_to_operand((Node *) lhs, col, index))
+			break;
+	}
+	if (col >= index->nkeycolumns)
+		return false;			/* the index does not carry this column */
+
+	if (!weave_fuse_rhs_ok(root, rel, rhs))
+		return false;			/* the query operand is not row-independent */
+
+	/*
+	 * HOW MANY SHUTTLES THIS CHANNEL BECOMES, needed at plan time because the
+	 * fused core refuses more than WEAVE_FUSE_MAX_CHAN of them and an AM that
+	 * refused a path at run time is G39.  A lexical key becomes ONE SHUTTLE PER
+	 * QUERY TERM (src/query/lexshuttle.c explains why, and include/weave/fuse.h
+	 * and channel.h both already assume it), and the query is a varlena the plan
+	 * carries, so the count is readable here.  q->nitems is an RPN item count and
+	 * is therefore an over-estimate of the term count -- operators are items too
+	 * -- which is the safe direction: it can only refuse a shape that would have
+	 * fitted, never admit one that would not.
+	 */
+	if (req->strategy == WEAVE_STRAT_DISTANCE && IsA(rhs, Const) &&
+		!((Const *) rhs)->constisnull)
+	{
+		WeaveQuery	q = (WeaveQuery) DatumGetPointer(((Const *) rhs)->constvalue);
+
+		req->maxchan = (int) q->nitems;
+		if (req->maxchan < 1)
+			return false;		/* an empty query matches nothing to fuse */
+	}
+	else if (req->strategy == WEAVE_STRAT_DISTANCE)
+	{
+		/*
+		 * A parameterized wquery: the term count is unknowable until the scan
+		 * runs.  Refuse, because the alternative is an AM that discovers at
+		 * rescan time that it has more channels than the core accepts.  A user
+		 * who wants a parameterized fused scan can spell the query as a literal
+		 * or, once sect. 7b's warp-space work lands, revisit this bound.
+		 */
+		return false;
+	}
+
+	req->lhs = lhs;
+	req->rhs = rhs;
+	req->indexcol = col;
+	return true;
+}
+
+/*
+ * The weights array, as a plan-time expression to hang off the transport key.
+ *
+ * A Const array is validated here (one report, before the first row, rather than
+ * one per row from the fallback) and passed through.  A NULL weights argument
+ * means equal weights of 1.0 each -- NOT 1/n, so that adding a channel does not
+ * rescale the ones already present -- and is materialized into a real array,
+ * because the AM reads an array and has no way to be told "there wasn't one".
+ *
+ * Anything else -- a Param, an expression -- is REFUSED rather than transported.
+ * It would work: the executor evaluates an ORDER BY key's right operand once per
+ * rescan and the AM would see the value.  It is refused because the AM would then
+ * be the first thing to learn that the array has the wrong length or a zero
+ * weight, and its only recourse at that point is an ERROR from inside a scan.
+ * Weights are a handful of literals in every shape sect. 7 describes.
+ */
+static Expr *
+weave_fuse_weights_expr(FuncExpr *fcall, int nscores)
+{
+	Node	   *w = (Node *) list_nth(fcall->args, nscores);
+	Datum	   *elems;
+	ArrayType  *arr;
+	int			i;
+
+	if (!IsA(w, Const))
+		return NULL;
+
+	if (!((Const *) w)->constisnull)
+	{
+		(void) weave_fuse_weights(DatumGetArrayTypeP(((Const *) w)->constvalue),
+								  nscores);
+		return (Expr *) w;
+	}
+
+	elems = (Datum *) palloc(nscores * sizeof(Datum));
+	for (i = 0; i < nscores; i++)
+		elems[i] = Float4GetDatum(1.0f);
+	arr = construct_array(elems, nscores, FLOAT4OID,
+						  sizeof(float4), true, TYPALIGN_INT);
+	pfree(elems);
+
+	return (Expr *) makeConst(FLOAT4ARRAYOID, -1, InvalidOid, -1,
+							  PointerGetDatum(arr), false, false);
+}
+
+/*
+ * The `indexclauses` to reuse, so that a WHERE clause still becomes a REQUIRED
+ * channel inside the fused scan (doc/specs/FUSED_TOPK.md sect. 3a (2): a gate is
+ * conjunctive, and `required` comes from the clause having arrived as a QUAL and
+ * never from the channel's kind).
+ *
+ * Taken from a core-generated IndexPath over the SAME index if there is one in
+ * rel->pathlist, because building an IndexClause list by hand would be a second
+ * implementation of match_clause_to_index().  NIL when there is none, and NIL is
+ * SAFE rather than merely lossy: a qual that is not an index clause stays in
+ * rel->baserestrictinfo, so create_indexscan_plan() puts it in the plan's filter
+ * qual and the executor applies it.  The answer is the same; only the gate's
+ * skipping is lost.
+ *
+ * ALL-OR-NOTHING, and only for `@@@` on a lexical column.  The fused pass honours
+ * exactly one restriction key -- the boolean match set -- so a borrowed clause it
+ * does not honour would be a pushed-down qual nobody evaluates: an Index Scan does
+ * not re-check a pushed-down index qual, so rows failing it would come back with
+ * plausible scores.  weave_rescan()'s cgram interaction is the same hazard one
+ * level down and is why this refuses the whole list rather than filtering it.
+ */
+static List *
+weave_fuse_borrow_indexclauses(RelOptInfo *rel, IndexOptInfo *index,
+							   int lexcol)
+{
+	ListCell   *lc;
+
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+		IndexPath  *ipath;
+		ListCell   *lc2;
+		bool		allmatch = true;
+
+		if (!IsA(path, IndexPath))
+			continue;
+		ipath = (IndexPath *) path;
+		if (ipath->indexinfo != index || ipath->indexclauses == NIL)
+			continue;
+
+		foreach(lc2, ipath->indexclauses)
+		{
+			IndexClause *ic = (IndexClause *) lfirst(lc2);
+			OpExpr	   *op;
+
+			if (ic->indexcol != lexcol || ic->lossy ||
+				list_length(ic->indexquals) != 1)
+			{
+				allmatch = false;
+				break;
+			}
+			op = (OpExpr *) ((RestrictInfo *) linitial(ic->indexquals))->clause;
+			if (!IsA(op, OpExpr) ||
+				op->opno != weave_fuse_path_oids.match_op)
+			{
+				allmatch = false;
+				break;
+			}
+		}
+		if (allmatch)
+			return ipath->indexclauses;
+	}
+	return NIL;
+}
+
+/*
+ * set_rel_pathlist_hook.  Strictly additive: on any doubt it adds nothing and the
+ * Sort over the fallback stands.
+ */
+static void
+weave_fuse_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
+							RangeTblEntry *rte)
+{
+	FuncExpr   *fcall;
+	int			nscores;
+	Expr	   *weights;
+	ListCell   *lc;
+
+	if (prev_set_rel_pathlist_hook)
+		prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+	if (rel->reloptkind != RELOPT_BASEREL || rte->rtekind != RTE_RELATION)
+		return;
+	if (rel->indexlist == NIL)
+		return;
+	if (!weave_fuse_resolve_oids() || !weave_fuse_path_resolve())
+		return;
+
+	fcall = weave_fuse_pathkey_call(root);
+	if (fcall == NULL)
+		return;
+	nscores = list_length(fcall->args) - 1;
+	if (nscores < 2)
+		return;					/* one channel is not a fusion */
+
+	weights = weave_fuse_weights_expr(fcall, nscores);
+	if (weights == NULL)
+		return;
+
+	/* Try each weave index; the first that can serve every channel wins. */
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
+		WeaveFuseChanReq *req;
+		List	   *orderbys = NIL;
+		List	   *orderbycols = NIL;
+		List	   *indexclauses;
+		int			lexcol = -1;
+		int			transpchan = -1;
+		int			totchan = 0;
+		int			i;
+		int			col;
+		bool		ok = true;
+		IndexPath  *ipath;
+
+		if (index->relam != weave_fuse_path_oids.amoid)
+			continue;
+
+		/*
+		 * The lexical column, which every weave index has exactly one of
+		 * (weave_index_layout() throws otherwise).  It is where the transport key
+		 * is hung, so a fused path cannot be built without it.
+		 */
+		for (col = 0; col < index->nkeycolumns; col++)
+			if (index->opfamily[col] == weave_fuse_path_oids.lex_family)
+			{
+				lexcol = col;
+				break;
+			}
+		if (lexcol < 0)
+			continue;
+
+		req = (WeaveFuseChanReq *) palloc0(nscores * sizeof(WeaveFuseChanReq));	/* alloc-ok: one per fuse() score argument, and fuse() has at most eight */
+		for (i = 0; i < nscores && ok; i++)
+		{
+			Expr	   *arg = (Expr *) list_nth(fcall->args, i);
+
+			if (!weave_fuse_attribute(root, rel, index, arg, &req[i]) ||
+				!req[i].servable)
+				ok = false;
+			else
+				totchan += req[i].maxchan;
+		}
+
+		/*
+		 * One gate channel is reserved on top of the scored ones: a `@@@`
+		 * restriction becomes one REQUIRED shuttle per segment in the fused pass,
+		 * and the core's cap is per run, so one is the right reservation.  The cap
+		 * is checked HERE because weave_fuse_init() refuses more than
+		 * WEAVE_FUSE_MAX_CHAN channels, and an AM that refuses at rescan time a
+		 * path the planner offered is doc/GAPS.md G39.
+		 */
+		if (ok && totchan + 1 > WEAVE_FUSE_MAX_CHAN)
+			ok = false;
+		if (!ok)
+		{
+			pfree(req);
+			continue;
+		}
+
+		for (i = 0; i < nscores; i++)
+		{
+			orderbys = lappend(orderbys,
+							   make_opclause(req[i].opno, FLOAT8OID, false,
+											 req[i].lhs, req[i].rhs,
+											 InvalidOid, InvalidOid));
+			orderbycols = lappend_int(orderbycols, req[i].indexcol);
+			if (transpchan < 0 && req[i].indexcol == lexcol)
+				transpchan = i;
+		}
+
+		/*
+		 * The transport key hangs off the LEXICAL column, so its left operand has
+		 * to be an operand that matches THAT column -- not merely the first
+		 * channel's, which would disagree with indexorderbycols the day a servable
+		 * channel on another column exists, and fix_indexorderby_references() would
+		 * then fail to rewrite the operand into an INDEX_VAR reference.  Every
+		 * servable channel is lexical today, so this always finds one.
+		 */
+		if (transpchan < 0)
+		{
+			pfree(req);
+			continue;
+		}
+
+		/*
+		 * THE TRANSPORT KEY, last.  Its position in the list is not load-bearing
+		 * -- weave_rescan() finds it by strategy number, not by index -- but the
+		 * scored keys' RELATIVE order is: the AM assigns weights[j] to the j-th
+		 * scored key it sees, and that order is the order of fuse()'s score
+		 * arguments, which is the order of the weights array.  Appending the
+		 * transport key after them keeps the two orders trivially aligned.
+		 */
+		orderbys = lappend(orderbys,
+						   make_opclause(weave_fuse_path_oids.transport_op,
+										 FLOAT8OID, false,
+										 (Expr *) copyObject(req[transpchan].lhs),
+										 weights, InvalidOid, InvalidOid));
+		orderbycols = lappend_int(orderbycols, lexcol);
+
+		indexclauses = weave_fuse_borrow_indexclauses(rel, index, lexcol);
+
+		/*
+		 * pathkeys = root->query_pathkeys is what elides the Sort, and it is
+		 * honest: the AM returns rows in ascending fuse() value, which is what
+		 * that pathkey asks for.  indexonly is false -- weave_canreturn() is
+		 * false, the index stores postings and not the column.
+		 */
+		ipath = create_index_path(root, index,
+								  indexclauses,
+								  orderbys, orderbycols,
+								  root->query_pathkeys,
+								  ForwardScanDirection,
+								  false,
+								  rel->lateral_relids,
+								  1.0,
+								  false);
+		add_path(rel, (Path *) ipath);
+		pfree(req);
+		return;					/* one fused path is enough */
+	}
+}
+
+void
+weave_fuse_install_pathlist_hook(void)
+{
+	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
+	set_rel_pathlist_hook = weave_fuse_set_rel_pathlist;
+}
+
+/*
+ * `<~>`, the weights transport operator, which must never be evaluated.
+ *
+ * IT IS AN UNCONDITIONAL ERROR, and that is the whole design rather than
+ * defensiveness.  sect. 7a rejected transporting the weights on a QUAL for a
+ * specific reason: `indexqualorig` is re-evaluated by the executor during an EPQ
+ * recheck, so a marker operator in a qual is eventually executed for real -- a
+ * query that works until a concurrent UPDATE makes it not.  An ORDER BY key is
+ * kept only as `indexorderbyorig`, for a reorder queue this AM does not request
+ * (xs_recheckorderby is false), so nothing evaluates this.  Raising therefore
+ * costs nothing and converts any future path that WOULD evaluate it from a silent
+ * wrong ordering into a failure with a name.
+ */
+PG_FUNCTION_INFO_V1(weave_fuse_transport);
+
+Datum
+weave_fuse_transport(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("operator <~> cannot be evaluated outside a weave index scan"),
+			 errdetail("It exists only to carry fuse() weights into the index access method as an ORDER BY scan key."),
+			 errhint("Write \"ORDER BY fuse(col <=> query, ..., weights => '{...}')\" instead.")));
+	PG_RETURN_NULL();			/* keep the compiler quiet */
 }
