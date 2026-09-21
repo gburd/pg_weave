@@ -361,8 +361,109 @@ ORDER BY weave_rrf(ARRAY[...], k => 60)
 function and turned into an `ORDER BY` operator pushdown against the `weave`
 index, the same way `<=>` is today. If the index cannot serve it (wrong
 opclasses, no matching index) the planner must fall back to a Sort over an
-executable implementation of the same arithmetic, so the query never simply
-fails. `sql/fuse_fallback.sql` tests that path.
+executable implementation of the same arithmetic **over the
+values the operators can compute outside an index — which is not the same answer, and
+cannot be; see §7a (1)** — so the query never simply
+fails. `sql/fuse_fallback.sql` tests that path. **Read §7a before implementing any of
+this section: three of its claims are corrected there, including the direction of the
+ordering and the existence of the two channels this example uses.**
+
+## 7a. What F2 found when it read the code §7 describes (2026-09-21)
+
+§7 is four sentences of SQL surface and it takes three corrections and two decisions
+before any of it can be implemented. Same pattern as §3a: written here rather than
+fixed quietly, because two of the three would otherwise become *plausible wrong
+answers* — a query that returns a different top-k depending on the plan.
+
+**(1) "Fall back to a Sort over an executable implementation of the same arithmetic"
+cannot be satisfied, and not because of an implementation gap.** `weave_distance()`
+(`src/query/rank.c:459-487`) is the `<=>` operator's out-of-index implementation, and
+it is an **approximation by necessity**: a bare operator call does not know the corpus,
+so it uses `df = 1` and `avgdl = |D|`. The index computes exact BM25. So the fallback
+already ranks differently from the pushdown *for a single `<=>` channel*, today, with no
+fusion involved — that is what pg_fts's `Limit[NO-INDEX]` plan has always been doing
+(see L7 in `doc/PHASES.md`). Fusion inherits it and cannot repair it.
+
+Consequences, and they bind `sql/fuse_fallback.sql`:
+
+- The fallback's promise is **"the query never fails and computes the same formula over
+  the values the operators can compute outside an index"** — not "the same answer".
+  §7's wording is corrected to that.
+- `sql/fuse_fallback.sql` may assert: the query runs, returns the right candidate
+  **set** where the `WHERE` clause determines it, and the fallback's arithmetic matches
+  a hand-written expression. It may **not** assert that pushdown and fallback return
+  the same order, and it should contain one case where they demonstrably do not, so the
+  divergence is a tested property rather than a surprise.
+- F5 adds a second reason the word "identical" is unavailable: float32 addition is not
+  associative, so even two exact implementations agree only if they sum in the same
+  order (771 of 812,179 comparisons differed in the last ULP until the oracle summed
+  required-first, then scored by descending weighted ceiling).
+
+**(2) §7's example is direction-inconsistent with §7's own prose, and the house
+convention settles it.** `body <=> 'q'::wquery` is a **distance** — `1/(1 + score)`,
+smaller is better (`rank.c:460-462`) — so `ORDER BY fuse(...) LIMIT 10` with an implicit
+`ASC` is a distance ordering, while the prose two lines later calls the fused value "a
+weighted sum of calibrated per-channel scores", where larger is better. Decision:
+
+- **`fuse()` takes SCORES and returns a DISTANCE**: `1 / (1 + Σ wᵢ·sᵢ)`, in `(0,1]`,
+  ascending, which is exactly the map `<=>` already uses and for the reason stated
+  there. §7's `LIMIT 10` example then works verbatim, and the *score* — the number that
+  "means something" — stays retrievable through F3's `score()`.
+- **The spelling `fuse(col <=> q, ...)` is planner-rewritten, not evaluated as written.**
+  The planner sees each argument's operator, therefore knows each argument's channel,
+  therefore knows the inverse of that channel's distance map (lexical `<=>`:
+  `s = 1/d − 1`; `wvec <=> wvec` cosine distance: `s = 1 − d`). It emits either the
+  pushdown or a fallback expression that recovers scores. A `fuse()` call whose
+  arguments the planner cannot attribute to a channel is **still well defined** —
+  its arguments are taken as scores, which is what the function's own declaration says —
+  and it is not an error, because §7 requires that the query never simply fail. The one
+  thing the implementation must never do is *guess* a distance map from a float.
+
+**(3) Neither channel in §7's example can be an ORDER BY operand today, which is the
+real scope discovery.** Checked in code before writing any:
+
+- **The lexical channel has no shuttle.** Ranked lexical is a Broder/BMW WAND over
+  `WandCursor` (`src/am/amscan.c:4361-4423`, pivot loop at `:5024-5157`), not a
+  `WeaveShuttle`. The fused core can only consume shuttles. The good news is that the
+  adaptation is **glue, not a format change**: `WandCursor` already carries the current
+  docid, the decoded block (so `blkend` is `docids[blkcount-1]`), the per-block bound
+  inputs `blk_max_tf`/`blk_min_dl` with `wand_block_max_contrib()` (`:4605-4616`)
+  computing the bound, and the term-wide ceiling `max_contrib`. `WeaveBlockHdr`
+  (`include/weave/am.h:350-363`) already stores `max_tf` and `min_doclen` per block, so
+  **no new on-disk field is needed.** New task **F6**.
+- **The vector channel has no ORDER BY operator.** `wvec_weave_ops`
+  (`sql/pg_weave--0.7.0--0.8.0.sql:99`) is `STORAGE wvec` and nothing else; V8's scan is
+  reachable only through the `weave_vec_scan()` SRF. The `<=>`, `<->`, `<#>`, `<+>`
+  operators on `wvec` exist as ordinary functions (`sql/pg_weave--0.1.0--0.2.0.sql:119-134`),
+  which is why the **fallback** works today, but none is an opfamily ORDER BY member, so
+  core cannot push one into the index and `amrescan` has no scan key for it. New task
+  **F7**.
+
+So F2 is staged. **F2.1** is the SQL surface, the planner recognition, and the fallback —
+which is precisely F2's stated gate, `sql/fuse_fallback.sql`, and is testable with zero
+fusible channels because the interesting path is the *refusal*. **F2.2** is the AM-side
+fused scan. Until F6 and F7 land, the only scored channel reachable by an ORDER BY key is
+`<@>` (`WEAVE_STRAT_EDIST`, `src/query/edist.c`), so a pushdown would have one scored
+channel plus boolean gates — the degenerate case F5 already tests as a property.
+
+**How weights reach the AM, decided 2026-09-21 (maintainer decision: plan shape (A)).**
+A hand-built `IndexPath` in `set_rel_pathlist_hook`, whose `indexorderbys` are the
+individual `col <=> q` `OpExpr`s plus **one transport key** carrying the weights array:
+a new opfamily ORDER BY member (`<~>` over `(wdoc, float4[])` and `(wvec, float4[])`)
+that exists only so that `amrescan` can see a `float4[]`. The alternatives and why they
+lost: a `CustomScan` (rejected — it would re-implement `nodeIndexscan`'s heap fetch,
+visibility, qual recheck and EPQ, which is where MVCC bugs live); a single real operator
+over a new composite query type (rejected — it works, needs no planner code at all, and
+it makes the SQL surface stop looking like §7, so it is the fallback position if (A)
+proves unworkable). A *qual* key was considered for transport and rejected on a specific
+hazard: `indexqualorig` is re-evaluated during an EPQ recheck, so a marker operator in a
+qual would eventually be executed for real; order-by expressions are not.
+
+**`required` is not transported and must not be.** A channel is required because it came
+from a `WHERE` clause (`src/query/gate.c` sets it), and scored because it came from an
+ORDER BY key. The AM therefore derives it from *where the key arrived*, never from the
+channel kind — see §3a (2) and `include/weave/channel.h`'s (C5) note, where the
+kind-based inference is the falsification that would silently drop every row `<@>` ranks.
 
 ## 8. What must be benchmarked before this is called a win
 
