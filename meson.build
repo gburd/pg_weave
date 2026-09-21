@@ -64,6 +64,9 @@ sources = files(
   'src/am/amscan.c',
   'src/am/fuse.c',
   'src/am/fuseshuttle.c',
+  # F2.1: fuse()'s SQL surface, its planner support function and its fallback.
+  # In OBJS too.
+  'src/am/fusepath.c',
   'src/am/customscan.c',
   'src/am/amaux.c',
   'src/am/amsize.c',
@@ -213,5 +216,6 @@ install_data(
   'sql/pg_weave--0.10.0--0.11.0.sql',
   'sql/pg_weave--0.11.0--0.12.0.sql',
   'sql/pg_weave--0.12.0--0.13.0.sql',
+  'sql/pg_weave--0.13.0--0.14.0.sql',
   install_dir: pg_extension_dir,
 )

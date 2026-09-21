@@ -1,0 +1,309 @@
+-- F2.1: fuse(), its planner rewrite, and its executable fallback.
+-- doc/specs/FUSED_TOPK.md sect. 7, corrected by sect. 7a.
+--
+-- WHAT THIS FILE IS FOR.  F2's stated gate.  There is no index pushdown yet
+-- (that is F2.2, and sect. 7a (3) shows neither channel in sect. 7's example is
+-- an ORDER BY operand until tasks F6 and F7), so EVERY query here is answered by
+-- a Sort over the executable implementation.  That is the interesting path, not a
+-- degraded one: sect. 7 requires that a fuse() query never simply fail.
+--
+-- The two things a green run has to prove:
+--
+--   1. THE REWRITE HAPPENED.  `fuse(col <=> q, ...)` passes DISTANCES, and
+--      fuse() is declared over SCORES.  The planner support function
+--      (src/am/fusepath.c) replaces each argument whose operator names a channel
+--      with a call that recovers that channel's score -- weave_lexscore() for
+--      the lexical `<=>`, weave_cosscore() for `wvec <=> wvec`.  The assertion
+--      is the EXPLAIN: those two names must appear in the sort key.  A test that
+--      only checked the VALUE would pass just as happily if fuse() were summing
+--      raw distances, which is the wrong ranking by the wrong formula.
+--   2. THE ARITHMETIC IS THE DOCUMENTED ONE.  fuse() returns the NEGATED
+--      weighted sum, so ascending order is best-first; it is compared against
+--      the same expression written out by hand, per row, with an equality count
+--      rather than printed floats.
+--
+-- AND ONE THING IT DELIBERATELY DOES NOT PROVE: that the fallback and the index
+-- agree.  See the last section.
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+NOTICE:  extension "pg_weave" already exists, skipping
+ALTER EXTENSION pg_weave UPDATE;
+NOTICE:  version "0.14.0" of extension "pg_weave" is already installed
+-- max_parallel_workers_per_gather = 0 only so the plans below are stable text;
+-- nothing here is about parallelism.
+SET max_parallel_workers_per_gather = 0;
+-- A corpus built so the two lexical rankings in the last section CAN diverge:
+-- 'alpha' is in every document with a tf that varies, 'zeta' is in exactly two.
+-- Exact BM25 (what the index computes) gives 'zeta' a large idf; a bare operator
+-- call has no corpus and treats every term as df = 1, so it ranks on tf alone.
+CREATE TABLE ff (id int, body wdoc, emb wvec(4));
+INSERT INTO ff
+SELECT g,
+       to_wdoc(repeat('alpha ', 1 + (g % 5)) || 'common' || (g % 3) ||
+               (CASE WHEN g IN (7, 19) THEN ' zeta' ELSE '' END)),
+       ('[' || g || ',' || (g % 4) || ',' || (g % 7) || ',1]')::wvec
+FROM generate_series(1, 30) g;
+CREATE INDEX ff_weave ON ff USING weave (body, emb);
+ANALYZE ff;
+-- ---------------------------------------------------------------------------
+-- (1) The rewrite, read off the plan.
+--
+-- A Sort is the CORRECT plan today and the expected output says so.  When F2.2
+-- lands, this EXPLAIN is the test that will change, and it should: the sort key
+-- is where the rewrite is visible, and an Index Scan with the same key ordering
+-- would be the pushdown doing the same arithmetic inside the AM.
+-- ---------------------------------------------------------------------------
+EXPLAIN (COSTS OFF)
+SELECT id FROM ff
+ ORDER BY fuse(body <=> 'alpha'::wquery,
+               emb <=> '[1,0,0,1]'::wvec,
+               weights => '{0.4,0.6}') LIMIT 5;
+                                                                 QUERY PLAN                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: (fuse(weave_lexscore((body <=> '''alpha'''::wquery)), weave_cosscore((emb <=> '[1,0,0,1]'::wvec)), '{0.4,0.6}'::real[]))
+         ->  Seq Scan on ff
+(4 rows)
+
+-- The commutator spelling `q <=> col` must be recognized too: it is a different
+-- operator OID with the same distance map, and the planner does not normalize one
+-- into the other outside of index matching.
+EXPLAIN (COSTS OFF)
+SELECT id FROM ff
+ ORDER BY fuse('alpha'::wquery <=> body,
+               emb <=> '[1,0,0,1]'::wvec,
+               weights => '{0.4,0.6}') LIMIT 5;
+                                                                 QUERY PLAN                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: (fuse(weave_lexscore(('''alpha'''::wquery <=> body)), weave_cosscore((emb <=> '[1,0,0,1]'::wvec)), '{0.4,0.6}'::real[]))
+         ->  Seq Scan on ff
+(4 rows)
+
+-- An argument whose operator names no channel is LEFT ALONE and taken as a
+-- score.  Here `id::float8` must appear unwrapped beside a wrapped
+-- weave_cosscore(): the rewrite is per argument, and it never guesses a distance
+-- map from a float.
+EXPLAIN (COSTS OFF)
+SELECT id FROM ff
+ ORDER BY fuse(id::float8,
+               emb <=> '[1,0,0,1]'::wvec,
+               weights => '{1,1}') LIMIT 3;
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: (fuse((id)::double precision, weave_cosscore((emb <=> '[1,0,0,1]'::wvec)), '{1,1}'::real[]))
+         ->  Seq Scan on ff
+(4 rows)
+
+-- ---------------------------------------------------------------------------
+-- (2) The value, against the same formula written by hand.
+-- ---------------------------------------------------------------------------
+-- Weights 0.25 / 0.75 are exactly representable in both float4 and float8, so
+-- this comparison needs no reasoning about rounding at all.
+SELECT count(*) AS fuse_value_mismatches_exact_weights
+  FROM ff
+ WHERE fuse(body <=> 'alpha'::wquery,
+            emb <=> '[1,0,0,1]'::wvec,
+            weights => '{0.25,0.75}')
+       IS DISTINCT FROM
+       -(0.25::float8 * weave_lexscore(body <=> 'alpha'::wquery)
+         + 0.75::float8 * weave_cosscore(emb <=> '[1,0,0,1]'::wvec));
+ fuse_value_mismatches_exact_weights 
+-------------------------------------
+                                   0
+(1 row)
+
+-- The same with sect. 7's own 0.4 / 0.6, which are NOT exactly representable --
+-- and the ::real casts are why this passes.  The weights array is float4, so
+-- fuse() multiplies by (float8) (float4) 0.4, while a bare `0.4` in SQL is a
+-- float8 literal and a DIFFERENT number.  Comparing against the uncast literal
+-- would fail in the last bits and look like a bug in the summation.
+SELECT count(*) AS fuse_value_mismatches_rounded_weights
+  FROM ff
+ WHERE fuse(body <=> 'alpha'::wquery,
+            emb <=> '[1,0,0,1]'::wvec,
+            weights => '{0.4,0.6}')
+       IS DISTINCT FROM
+       -(0.4::real::float8 * weave_lexscore(body <=> 'alpha'::wquery)
+         + 0.6::real::float8 * weave_cosscore(emb <=> '[1,0,0,1]'::wvec));
+ fuse_value_mismatches_rounded_weights 
+---------------------------------------
+                                     0
+(1 row)
+
+-- The recovery functions themselves, on values chosen to be exact.  The lexical
+-- distance is 1/(1+score), so d = 0.5 means score 1; cosine distance is
+-- 1 - similarity.  d <= 0 is outside the operator's range and returns the limit
+-- of 1/d - 1 rather than raising, because raising inside a sort key would turn a
+-- hand-written slip into a failed query.
+SELECT weave_lexscore(0.5::float8) AS lexscore_half,
+       weave_cosscore(0.25::float8) AS cosscore_quarter,
+       weave_lexscore(0::float8) AS lexscore_zero,
+       weave_lexscore(NULL::float8) IS NULL AS lexscore_null;
+ lexscore_half | cosscore_quarter | lexscore_zero | lexscore_null 
+---------------+------------------+---------------+---------------
+             1 |             0.75 |      Infinity | t
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- (3) fuse() on plain scores: no operator, nothing to rewrite, and the value is
+-- exactly the negated weighted sum.  This is the declared meaning of the
+-- function, and it is what an unrecognized argument gets.
+-- ---------------------------------------------------------------------------
+SELECT fuse(2::float8, 3::float8, weights => '{1,2}') AS scores_weighted,   -- -8
+       fuse(2::float8, 3::float8) AS scores_equal_weights,                  -- -5
+       fuse(2::float8, 3::float8, weights => NULL) AS scores_null_weights;  -- -5
+ scores_weighted | scores_equal_weights | scores_null_weights 
+-----------------+----------------------+---------------------
+              -8 |                   -5 |                  -5
+(1 row)
+
+-- Equal weights are 1.0 each and NOT 1/n: adding a channel must not silently
+-- rescale the channels already in the call.  Three channels of 1.0 each sum to 6,
+-- not 2.
+SELECT fuse(1::float8, 2::float8, 3::float8) AS three_equal_weights;        -- -6
+ three_equal_weights 
+---------------------
+                  -6
+(1 row)
+
+-- A NULL score argument gives NULL.  fuse() is therefore NOT STRICT -- with
+-- `weights` defaulting to NULL, a STRICT fuse() would return NULL for every call
+-- that did not spell its weights out -- so this is explicit behaviour, not the
+-- fmgr's.
+SELECT fuse(NULL::float8, 3::float8) IS NULL AS null_score_is_null,
+       fuse(2::float8, NULL::float8, weights => '{1,1}') IS NULL AS null_score_with_weights;
+ null_score_is_null | null_score_with_weights 
+--------------------+-------------------------
+ t                  | t
+(1 row)
+
+-- The widest overload.  Eight is more channels than this index carries.
+SELECT fuse(1::float8, 2::float8, 3::float8, 4::float8,
+            5::float8, 6::float8, 7::float8, 8::float8,
+            weights => '{1,1,1,1,1,1,1,1}') AS eight_channels;              -- -36
+ eight_channels 
+----------------
+            -36
+(1 row)
+
+SELECT fuse(1::float8, 2::float8, 3::float8, 4::float8,
+            5::float8, 6::float8, 7::float8, 8::float8,
+            weights => '{2,1,1,1,1,1,1,1}') AS eight_channels_weighted;     -- -37
+ eight_channels_weighted 
+-------------------------
+                     -37
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- (4) The three rejections.  Each is a wrong answer prevented, not a taste
+-- enforced (include/weave/fuse.h note 3): a negative weight breaks contract (C2)
+-- under weighting, since w * block_max() >= w * score() needs w > 0; a zero
+-- weight multiplies a gate's +INF ceiling into a NaN that makes every prune
+-- silently evaluate false.  A user who wants a channel out of the fusion leaves
+-- it out of the call.
+--
+-- The weights here are constants, so the planner const-folds the call and the
+-- error arrives at PLAN time -- which is also what the support function does with
+-- a Const weights array beside non-constant scores.  One shared validator, so
+-- the message cannot depend on which path found it.
+-- ---------------------------------------------------------------------------
+SELECT fuse(1::float8, 2::float8, weights => '{1,2,3}');
+ERROR:  fuse() was given 3 weight(s) but has 2 score argument(s)
+HINT:  Pass one weight per score argument, or omit weights for equal weights of 1.0.
+SELECT fuse(1::float8, 2::float8, weights => '{1}');
+ERROR:  fuse() was given 1 weight(s) but has 2 score argument(s)
+HINT:  Pass one weight per score argument, or omit weights for equal weights of 1.0.
+SELECT fuse(1::float8, 2::float8, weights => '{0,1}');
+ERROR:  fuse() weight 1 is 0: weights must be finite and greater than zero
+SELECT fuse(1::float8, 2::float8, weights => '{-1,1}');
+ERROR:  fuse() weight 1 is -1: weights must be finite and greater than zero
+SELECT fuse(1::float8, 2::float8, weights => '{1,NULL}');
+ERROR:  fuse() weights must not contain NULLs
+-- Plan time, with a column in the call so const-folding cannot reach it: the
+-- support function validates the Const array once instead of leaving the
+-- fallback to raise the same error on every row.
+SELECT fuse(body <=> 'alpha'::wquery, emb <=> '[1,0,0,1]'::wvec,
+            weights => '{0.4,0.6,0.2}') FROM ff LIMIT 1;
+ERROR:  fuse() was given 3 weight(s) but has 2 score argument(s)
+HINT:  Pass one weight per score argument, or omit weights for equal weights of 1.0.
+-- ---------------------------------------------------------------------------
+-- (5) THE DIVERGENCE, sect. 7a (1), recorded rather than asserted away.
+--
+-- WHY AGREEMENT IS IMPOSSIBLE, not merely unimplemented.  weave_distance()
+-- (src/query/rank.c:459) is the out-of-index implementation of `<=>`, and a bare
+-- operator call cannot know the corpus, so it scores with df = 1 and
+-- avgdl = |D|.  The index computes exact BM25 from its metapage and dictionary.
+-- The two therefore rank differently for a SINGLE lexical channel, today, with no
+-- fusion involved -- this is what pg_fts's Limit[NO-INDEX] plan has always been
+-- doing (doc/PHASES.md L7).  Fusion inherits it and cannot repair it: the
+-- fallback's promise is "the query never fails and computes the same formula over
+-- the values the operators can compute outside an index", NOT "the same answer".
+-- F5 adds a second reason the word "identical" is unavailable even between two
+-- exact implementations: float addition is not associative, and the fused scan
+-- sums in a different order from the fallback's left-to-right.
+--
+-- So the count below is EVIDENCE, not a gate.  It may be any value; what would
+-- be a bug is the rest of this file, or an arm that stops running the plan it
+-- claims to.  Hence an EXPLAIN over each arm.
+-- ---------------------------------------------------------------------------
+-- Arm A: the index's ordering scan, exact BM25.
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM ff ORDER BY body <=> 'alpha | zeta'::wquery LIMIT 5;
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Limit
+   ->  Index Scan using ff_weave on ff
+         Order By: (body <=> '(''alpha'' | ''zeta'')'::wquery)
+(3 rows)
+
+CREATE TEMP TABLE ff_idx AS
+  SELECT row_number() OVER () AS pos, id
+    FROM (SELECT id FROM ff ORDER BY body <=> 'alpha | zeta'::wquery LIMIT 5) s;
+RESET enable_seqscan;
+-- Arm B: no index path at all, so the operator is evaluated per row with df = 1.
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM ff ORDER BY body <=> 'alpha | zeta'::wquery LIMIT 5;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: ((body <=> '(''alpha'' | ''zeta'')'::wquery))
+         ->  Seq Scan on ff
+(4 rows)
+
+CREATE TEMP TABLE ff_seq AS
+  SELECT row_number() OVER () AS pos, id
+    FROM (SELECT id FROM ff ORDER BY body <=> 'alpha | zeta'::wquery LIMIT 5) s;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+-- Recorded, not asserted.
+SELECT count(*) AS lexical_ranking_positions_that_differ
+  FROM ff_idx a FULL JOIN ff_seq b USING (pos)
+ WHERE a.id IS DISTINCT FROM b.id;
+ lexical_ranking_positions_that_differ 
+---------------------------------------
+                                     5
+(1 row)
+
+-- What IS assertable about arm B, and what sect. 7a (1) permits this file to
+-- assert: every row it returns is a row the query matches.  A ranking that is
+-- approximate may not also be wrong about the candidate SET.
+SELECT count(*) AS seq_rows_not_matching
+  FROM ff JOIN ff_seq USING (id)
+ WHERE NOT (ff.body @@@ 'alpha | zeta'::wquery);
+ seq_rows_not_matching 
+-----------------------
+                     0
+(1 row)
+
+DROP TABLE ff_idx;
+DROP TABLE ff_seq;
+DROP TABLE ff;
+RESET max_parallel_workers_per_gather;
