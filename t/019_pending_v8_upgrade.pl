@@ -1,30 +1,34 @@
 # Copyright (c) 2024-2026, PostgreSQL Global Development Group
 
-# 019_pending_v8_upgrade.pl -- read a v8-layout PENDING page with v9 code.
+# 019_pending_v8_upgrade.pl -- read a v8-layout PENDING page with current code.
 #
 # WHY THIS EXISTS.  Task V7's second half (doc/GAPS.md G23) made a pending item
 # carry the inserted row's vector, which GREW the item header from 12 bytes to 16
-# and changed the item stride.  The two layouts are told apart by page kind
-# (WEAVE_PK_PENDING vs WEAVE_PK_PENDING_V9), and weave_pending_iter_next() in
+# and changed the item stride; Z8's second half (G35) grew it again to 20 for the
+# raw gram_ops text.  The three layouts are told apart by page kind
+# (WEAVE_PK_PENDING vs _V9 vs _V10), and weave_pending_iter_next() in
 # include/weave/am.h has a branch for each.  An index upgraded with un-flushed
-# pending documents reaches the OLD branch on its very next scan -- so it is not a
+# pending documents reaches an OLD branch on its very next scan -- so it is not a
 # theoretical path, and before this file nothing executed it.  This codebase has
 # closed two gaps (G24, G26) whose entire content was "unreachable, therefore
 # untested", and a compatibility branch that is claimed in a comment and run by
 # nothing is the same bet.
 #
 # HOW.  The same manufacture-the-old-image method as t/010_format_v6_upgrade.pl,
-# and legitimate for the same reason: the v9 -> v8 pending delta is precisely
-# known and small.  An item is
+# and legitimate for the same reason: the delta down to v8 is precisely known and
+# small.  An item is
 #
+#     v10: tid[6] pad[2] doclen[4] veclen[4] gramlen[4]
+#            | wdoc[doclen] ... | wvec[veclen] ... | gram[gramlen] ...
+#          stride = MAXALIGN(20 + doclen) + MAXALIGN(veclen) + MAXALIGN(gramlen)
 #     v9:  tid[6] pad[2] doclen[4] veclen[4] | wdoc[doclen] ... | wvec[veclen] ...
 #          stride = MAXALIGN(16 + doclen) + MAXALIGN(veclen)
 #     v8:  tid[6] pad[2] doclen[4]           | wdoc[doclen] ...
 #          stride = MAXALIGN(12 + doclen)
 #
-# so the downgrade repacks each item four bytes earlier, drops the vector, and
-# rewrites pd_lower and the page's kind bits.  A v8 writer produced exactly these
-# bytes.
+# so the downgrade repacks each item eight bytes earlier, drops the vector and the
+# gram text, and rewrites pd_lower and the page's kind bits.  A v8 writer produced
+# exactly these bytes.
 #
 # WHAT IT ASSERTS, in order of what would go unnoticed without it:
 #   1. The pending documents still answer lexically, byte-identically -- i.e. the
@@ -51,16 +55,16 @@ use constant {
 	OPAQUE_SIZE           => 8,		# MAXALIGN(sizeof(WeavePageOpaqueData))
 	WEAVE_PENDING_BIT     => 1 << 3,	# the legacy one-hot kind bit
 	WEAVE_PAGE_KIND_EXT   => 1 << 15,
-	WEAVE_PK_PENDING_V9   => 29,
-	V9_HDR                => 16,
+	WEAVE_PK_PENDING_V10  => 33,
+	V10_HDR               => 20,
 	V8_HDR                => 12,
 };
 
 sub maxalign { my ($n) = @_; return ($n + 7) & ~7; }
 
-# Rewrite every v9-layout pending page in `path` into the v8 layout, dropping the
-# vectors.  Server MUST be down.  Returns the number of pages rewritten and the
-# number of items repacked.
+# Rewrite every current-layout pending page in `path` into the v8 layout, dropping
+# the vectors and the gram text.  Server MUST be down.  Returns the number of pages
+# rewritten and the number of items repacked.
 #
 # Blocks are SCANNED rather than walked from meta.pendinghead: the walk would
 # duplicate the metapage arithmetic t/010 already owns, and a scan cannot miss a
@@ -84,13 +88,13 @@ sub downgrade_pending_pages
 		my $opoff = BLCKSZ - OPAQUE_SIZE;
 		my ($flags, $kind) = unpack('vv', substr($page, $opoff, 4));
 		next unless ($flags & WEAVE_PAGE_KIND_EXT)
-			&& $kind == WEAVE_PK_PENDING_V9;
+			&& $kind == WEAVE_PK_PENDING_V10;
 
 		my $lower = unpack('v', substr($page, PD_LOWER_OFF, 2));
 		die "pd_lower $lower out of range on block $blk"
 		  if $lower < CONTENT_START || $lower > $opoff;
 
-		# repack the items, four bytes earlier each, vector dropped
+		# repack the items, eight bytes earlier each, vector and gram text dropped
 		# 'vvv xx V' is the ItemPointerData + padding shape: bi_hi, bi_lo, ip_posid
 		# are three uint16s, and doclen is a uint32 at offset 8, so the two padding
 		# bytes have to be spelled out -- Perl's pack inserts no alignment of its
@@ -98,31 +102,33 @@ sub downgrade_pending_pages
 		my $out = '';
 		my $p = CONTENT_START;
 		my $onpage = 0;
-		while ($p + V9_HDR <= $lower)
+		while ($p + V10_HDR <= $lower)
 		{
-			my ($b_hi, $b_lo, $posid, $doclen, $veclen) =
-			  unpack('vvvxxVV', substr($page, $p, V9_HDR));
-			my $stride = maxalign(V9_HDR + $doclen) + maxalign($veclen);
+			my ($b_hi, $b_lo, $posid, $doclen, $veclen, $gramlen) =
+			  unpack('vvvxxVVV', substr($page, $p, V10_HDR));
+			my $stride = maxalign(V10_HDR + $doclen) + maxalign($veclen)
+			  + maxalign($gramlen);
 			last if $p + $stride > $lower;
 
-			my $doc = substr($page, $p + V9_HDR, $doclen);
+			my $doc = substr($page, $p + V10_HDR, $doclen);
 			my $item = pack('vvvxxV', $b_hi, $b_lo, $posid, $doclen) . $doc;
 			$item .= "\0" x (maxalign(V8_HDR + $doclen) - length($item));
 			$out .= $item;
 			$onpage++;
 			$p += $stride;
 		}
-		die "block $blk: repacked 0 items from a v9 pending page" unless $onpage;
+		die "block $blk: repacked 0 items from a current-layout pending page"
+		  unless $onpage;
 		$nitems += $onpage;
 
 		# The tail between the new pd_lower and the opaque must be zeroed: it was
-		# never written by a v8 producer, and leaving v9 bytes there would let a
+		# never written by a v8 producer, and leaving v10 bytes there would let a
 		# reader that mis-computes pd_lower appear to work.
 		my $newlower = CONTENT_START + length($out);
 		substr($page, CONTENT_START, $opoff - CONTENT_START,
 			   $out . ("\0" x ($opoff - $newlower)));
 		substr($page, PD_LOWER_OFF, 2, pack('v', $newlower));
-		# ...and the kind LAST, so an interrupted surgery leaves a v9 page whose
+		# ...and the kind LAST, so an interrupted surgery leaves a v10 page whose
 		# items are v8 -- unparseable, which is louder than silently wrong.
 		substr($page, $opoff, 4,
 			   pack('vv', ($flags & ~WEAVE_PAGE_KIND_EXT) | WEAVE_PENDING_BIT, 0));
@@ -192,9 +198,10 @@ sub kind_pages
 		  WHERE kind = '$kind'");
 }
 
-my $before = pending_answers('v9 pending (as inserted)');
+my $before = pending_answers('current-layout pending (as inserted)');
 is($before->[0], '3', 'the three pending documents are searchable before surgery');
-cmp_ok(kind_pages('pending'), '>', 0, 'and they are on a v9-layout pending page');
+cmp_ok(kind_pages('pending'), '>', 0,
+	'and they are on a current-layout pending page');
 is(kind_pages('pending_v8'), '0', 'with no legacy pending page yet');
 
 my $relpath = $node->safe_psql('postgres',
@@ -213,9 +220,9 @@ $node->start;
 # --- 1. THE COMPATIBILITY GATE --------------------------------------------
 my $after = pending_answers('v8 pending (manufactured legacy image)');
 is_deeply($after, $before,
-	'a v8-layout pending page returns byte-identical answers under v9 code');
+	'a v8-layout pending page returns byte-identical answers under current code');
 cmp_ok(kind_pages('pending_v8'), '>', 0, 'and it now reads as the legacy kind');
-is(kind_pages('pending'), '0', 'with no v9 page left');
+is(kind_pages('pending'), '0', 'with no current-layout page left');
 
 # --- 2. a new INSERT must not append to the v8 tail ------------------------
 $node->safe_psql('postgres', q{
@@ -224,7 +231,7 @@ $node->safe_psql('postgres', q{
               '[904,904,904,904]');
 });
 cmp_ok(kind_pages('pending'), '>', 0,
-	'the new item started a v9 page instead of appending to the v8 one');
+	'the new item started a current-layout page instead of appending to the v8 one');
 cmp_ok(kind_pages('pending_v8'), '>', 0, 'and the v8 page is still there');
 is($node->safe_psql('postgres',
 		q{SET enable_seqscan=off;
