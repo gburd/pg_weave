@@ -223,7 +223,13 @@ L14 + L17), common-band ranked (1.86× / 1.61×), and **index size 3.5× / 3.0×
 than the fork** (L8/L12/L17/L18). **Inherited, as exact ties at both scales:** `count(*)`
 pushdown and prefix `count(*)` — so the 133–144× `count(*)` margin over GIN is pg_fts's
 custom scan renamed, and `doc/ARCHITECTURE.md` §9's four claims correctly exclude it.
-**One loss to upstream, visible only at scale:** build, 1.08× slower at 4M. Details and
+**One loss to upstream, visible only at scale:** build, 1.08× slower at 4M. **And one bug
+found in both forks and fixed only here**, the same day: `count(*)`'s visibility gate was
+O(heap pages) and selectivity-independent, making it up to **40× slower than the ordinary
+path** below ~df 9,000 — `doc/GAPS.md` G38, now closed, measured at 0.003–0.005 ms flat
+where it had been 0.278–0.291 ms. pg_fts has the identical loop at
+`pg_fts_am_scan.c:4402`, so **an upstream bug report is owed** (the third: pg_fts's gate
+premise and harness artifact, pg_tre's `uleven.c` OOB read, and now this). Details and
 two acknowledged confounds in `bench/RESULTS_LEXICAL.md`; new gap **G38** is a 2.2×
 `count(*)` slowdown since 2026-09-07 that the fork reproduces to 0.01 ms, which is how
 it is known not to come from pg_weave's divergence.

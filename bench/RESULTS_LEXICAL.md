@@ -115,7 +115,7 @@ at 1M and 578.09 → 809.33 ms at 4M, and the bare `ORDER BY` form goes to **2,3
 | mid-band ranked latency | **EARNED** (L17, L14) | 7.0× at 1M, 5.0× at 4M, same corpus, same host, same analyzer |
 | common-band ranked latency | **EARNED** | 1.86× at 1M, 1.61× at 4M |
 | index size | **EARNED** (L8, L12, L17, L18) | 3.5× / 3.0× smaller than the fork it came from |
-| `count(*)` pushdown | **INHERITED** | 0.95 vs 0.94 at 1M, 3.81 vs 3.81 at 4M. The 133–144× win over GIN is pg_fts's `FtsCount` custom scan, renamed |
+| `count(*)` pushdown | **INHERITED** (the mechanism) / **EARNED** (its cost, as of the G38 fix, same day) | 0.95 vs 0.94 at 1M and 3.81 vs 3.81 at 4M — identical, because both forks had the same O(heap-pages) visibility gate (`pg_fts_am_scan.c:4402`). The 133–144× win over GIN is pg_fts's `FtsCount` custom scan renamed. The **fix** to that gate exists only here and is unmeasured against pg_fts on a shared table |
 | prefix `count(*)` | **INHERITED** | 40.73 vs 41.12 and 134.98 vs 136.73 — tie at both scales |
 | rare-band ranked latency | **NEITHER** | 0.04 vs 0.05 and 0.05 vs 0.06 — one or two ticks of the 0.01 ms reporting resolution |
 | build time | **a LOSS at 4M** | 56.8 s against 52.7 s |
@@ -200,13 +200,36 @@ lower bounds:
 | build | 29.2 s | **10.9 s** | ≥ 2.7× better (L12) |
 | index size as built | 46 MB | 48 MB | flat, on a differently-drawn corpus |
 
-One figure moved the **wrong** way and is not explained: **`count(*)` common was 0.43 ms
-and is now 0.95 ms**, on a corpus with *fewer* matching documents (179,772 against
-197,552), which should have made it faster. The useful datum is that **pg_fts measures
-0.94 ms on the same table** — the two forks agree to 0.01 ms — so whatever changed is
-not in the code pg_weave diverged on. It is left as an open question rather than
-attributed; a candidate is the wider heap, but `WeaveCount` is supposed to answer from
-the index alone, and "supposed to" is not a measurement.
+One figure moved the **wrong** way, and chasing it the same day found a real defect.
+**`count(*)` common was 0.43 ms and measured 0.95 ms here**, on a corpus with *fewer*
+matching documents — and pg_fts measured 0.94 ms on the same table, so the two forks
+agreed to 0.01 ms and nothing in pg_weave's divergence could explain it.
+
+**Answered, and it was not a regression: `count(*)`'s fast path is O(heap pages), not
+O(matching documents)** (`doc/GAPS.md` G38). It proved whole-heap visibility with one
+`VM_ALL_VISIBLE()` call per heap block, so all three published figures are three heap
+sizes on one line — 0.43 ms at 1,076 MB, 0.95 at 2,357, 3.81 at 9,238 — and a term
+matching *nothing* cost the same as one matching 196,785 documents. Below roughly
+df 9,000 the fast path was up to **40× slower than the ordinary path it exists to
+avoid**.
+
+**The two forks agreeing to 0.01 ms is now explained rather than merely observed:**
+pg_fts has the identical gate, `bm25_count_dictdf_fastpath()` with the same per-block
+loop at `pg_fts_am_scan.c:4402`. So the *defect* is inherited, and **the fix is not** —
+it exists only here, and it is owed to upstream as a bug report.
+
+**Fixed 2026-09-21** (zero-df early-out plus `visibilitymap_count()`), measured at
+**0.003–0.005 ms flat across every df** on an 87,486-page heap, a 69–93× improvement on
+that heap, with the old per-block scan retained as a `USE_ASSERT_CHECKING` cross-check.
+
+> **THE `count(*)` ROWS IN THE TABLES ABOVE ARE PRE-FIX.** 0.95 ms at 1M and 3.81 ms at
+> 4M were measured before G38 was found. They are left as measured rather than edited,
+> because a benchmark file records what was run — and the *comparisons* they support are
+> unaffected, since pg_fts has the same gate and both arms were measured on the same
+> table. **No post-fix ratio against GIN or pg_fts is stated here, because the fix was
+> measured on a different corpus and heap** (`/scratch/pg_weave/g38.sh`, 683 MB heap), and
+> dividing a number from one run by a number from another is what hard rule 11 forbids.
+> The next lexical run produces it.
 
 ## What this does not tell us
 
