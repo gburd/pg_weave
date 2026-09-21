@@ -42,6 +42,7 @@ OBJS = \
 	src/query/match.o \
 	src/query/gate.o \
 	src/query/edist.o \
+	src/query/lexshuttle.o \
 	src/vector/quantize.o \
 	src/vector/pack.o \
 	src/vector/vecpage.o \
@@ -404,6 +405,10 @@ check-standalone:
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/fuse test/hegel/test_fuse_props.c \
 		src/am/fuse.c -lm; \
 	$$tmp/fuse 60000 | tail -4; \
+	echo "== F6 lexical bound (C2): block_bound >= BM25 contribution, attained at (max_tf, min |D|) =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/lexb test/hegel/test_lexbound.c -lm; \
+	$$tmp/lexb > $$tmp/lexb.log || { cat $$tmp/lexb.log; exit 1; }; \
+	tail -3 $$tmp/lexb.log; \
 	echo "== Z9 edist shuttle (C1)+(C2): the bound never exceeds a true Levenshtein distance =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/edist test/hegel/test_edist.c -lm; \
 	$$tmp/edist | tail -2; \

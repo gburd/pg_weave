@@ -81,6 +81,9 @@ sources = files(
   'src/query/gate.c',
   # Z9: the <@> edit-distance shuttle (include/weave/edist.h).  In OBJS too.
   'src/query/edist.c',
+  # F6: the BM25 lexical shuttle, one per query term (include/weave/bm25bound.h,
+  # and the weave_wand_cursor_* seam in include/weave/am.h).  In OBJS too.
+  'src/query/lexshuttle.c',
   # Fuzzy/regex/prefix channel, imported from pg_tre (doc/specs/IMPORT_pg_tre.md)
   # and wired into the build by tasks Z1/Z2.  Compiled and linked but not yet
   # reachable from the access method or the planner (Z3 onward).
