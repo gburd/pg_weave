@@ -44,6 +44,9 @@
 									 * and its per-block (C2) bound; this file used
 									 * to carry a transcription of both */
 #include "weave/vector.h"			/* F7: the shared vector top-k the <-> / <#> ordering scan drives */
+#include "weave/channel.h"			/* F2.2: the shuttle contract the fused pass drives */
+#include "weave/fuse.h"				/* F2.2: the fused-threshold top-k core */
+#include "weave/gate.h"				/* F2.2: the boolean gate shuttle a WHERE qual becomes */
 #include <math.h>
 #include "access/genam.h"
 #include "access/generic_xlog.h"
@@ -267,6 +270,41 @@ typedef struct WeaveScanOpaqueData
 								 * that fail the ignored clause -- a wrong answer, and
 								 * one the planner is entitled to produce because
 								 * amcanmulticol is true. */
+
+	/*
+	 * THE FUSED MULTI-CHANNEL ORDERING SCAN (task F2.2), which is a FOURTH
+	 * order-by shape over the same ordered[]/cand[] machinery.  It is recognized
+	 * by a transport key -- strategy WEAVE_STRAT_FUSE_WEIGHTS, `<~>`, whose right
+	 * operand is the float4[] of per-channel weights -- standing beside two or
+	 * more scored order-by keys.  src/am/fusepath.c builds that shape and
+	 * doc/specs/FUSED_TOPK.md sect. 7a records why the weights travel on an ORDER
+	 * BY key rather than a qual.
+	 *
+	 * The ladder is over a CANDIDATE WIDTH, the lexical/vector shape rather than
+	 * the `<@>` threshold shape, because a width is what the fused core takes as
+	 * its parameter and what its three prunes measure against: a wider k is a
+	 * lower theta, so it prunes less and finds more.
+	 *
+	 * `fuseDone` is the ladder's EXACT stop, and the proof is the one `candfull`
+	 * rests on: a pass whose top-k heap never filled kept theta at -INFINITY for
+	 * its whole run, and every one of the three prunes in src/am/fuse.c compares
+	 * against theta (`ub <= theta`, `s + csuffix <= theta`, and the partition's
+	 * `suffix[split-1] <= theta`).  Nothing was skipped, so that pass scored every
+	 * candidate the channels can generate.  It is an AND over the segments,
+	 * because the pass is run per bolt and one bolt proving completeness says
+	 * nothing about another.
+	 *
+	 * `fuseQ` and `fuseW` are COPIED into the scan's context.  sk_argument belongs
+	 * to the executor's ScanKey and every rung of the ladder re-reads both --
+	 * arbitrarily later than the rescan that installed them -- which is the same
+	 * reason the vector path copies its query vector.
+	 */
+	bool		fuseScan;
+	WeaveQuery *fuseQ;			/* nfuse queries, in scored-key order */
+	float4	   *fuseW;			/* nfuse weights, same order, from the transport */
+	int			nfuse;
+	int			fusek;			/* candidate width of the current fused pass */
+	bool		fuseDone;
 } WeaveScanOpaqueData;
 
 typedef WeaveScanOpaqueData *WeaveScanOpaque;
@@ -290,6 +328,13 @@ static bool weave_edist_grow(Relation index, WeaveScanOpaque so);
 /* the <=> vector ordering ladder (F7); defined next to the lexical one */
 static void weave_vec_pass(Relation index, WeaveScanOpaque so);
 static bool weave_vec_grow(Relation index, WeaveScanOpaque so);
+
+/* the fused multi-channel ordering ladder (F2.2); defined next to the others.
+ * weave_fuse_rescan() is up in weave_rescan() because that is where scan keys
+ * arrive, and it is the only one of the three that reads a ScanKey. */
+static bool weave_fuse_rescan(IndexScanDesc scan, WeaveScanOpaque so);
+static void weave_fuse_pass(Relation index, WeaveScanOpaque so);
+static bool weave_fuse_grow(Relation index, WeaveScanOpaque so);
 
 static int
 cmp_tid(const void *a, const void *b)
@@ -2256,6 +2301,12 @@ weave_beginscan(Relation r, int nkeys, int norderbys)
 	so->cgramPatLen = 0;
 	so->cgramCI = false;
 	so->cgramLossy = false;
+	so->fuseScan = false;
+	so->fuseQ = NULL;
+	so->fuseW = NULL;
+	so->nfuse = 0;
+	so->fusek = 0;
+	so->fuseDone = false;
 	scan->opaque = so;
 	/* the AM owns allocation of the order-by result arrays */
 	if (norderbys > 0)
@@ -2396,6 +2447,19 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->veck = 0;
 	so->vecLanes = 0;
 	so->vecDone = false;
+	/*
+	 * F2.2's per-rescan state, reset HERE with all the rest and for the reason the
+	 * paragraph above gives: a nested loop whose inner scan kept the previous
+	 * outer row's queries or the previous rung's width returns plausible rows on
+	 * every arm of the join.  sql/fuse_pushdown.sql drives a correlated subquery
+	 * for exactly this.
+	 */
+	so->fuseScan = false;
+	so->fuseQ = NULL;
+	so->fuseW = NULL;
+	so->nfuse = 0;
+	so->fusek = 0;
+	so->fuseDone = false;
 	if (scan->numberOfOrderBys >= 1)
 	{
 		/*
@@ -2426,7 +2490,25 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		 * returns nothing, and an ordering path over a channel this index does not
 		 * carry is a legitimate plan over an empty channel.
 		 */
-		if (scan->orderByData[0].sk_strategy == WEAVE_STRAT_VEC_L2 ||
+		if (weave_fuse_rescan(scan, so))
+		{
+			/*
+			 * A FUSED scan (task F2.2), recognized by the weights transport key
+			 * standing beside two or more scored keys.  Tested FIRST because the
+			 * dispatch below reads orderByData[0] ALONE, and in a fused shape that
+			 * key is one channel of several: honouring it and discarding the rest
+			 * would answer a fused ordering with a single-channel one -- plausible
+			 * rows in a ranking nobody asked for, which is the failure class this
+			 * project treats as worse than an error.
+			 *
+			 * weave_fuse_rescan() returns false when no transport key is present,
+			 * and RAISES when there is one it cannot honour.  A raise here is a bug
+			 * report about src/am/fusepath.c rather than anything a user did: that
+			 * file's hard invariant is that it never offers a path this function
+			 * refuses, and doc/GAPS.md G39 is what breaking it looks like.
+			 */
+		}
+		else if (scan->orderByData[0].sk_strategy == WEAVE_STRAT_VEC_L2 ||
 			scan->orderByData[0].sk_strategy == WEAVE_STRAT_VEC_IP)
 		{
 			bool		wantip = (scan->orderByData[0].sk_strategy ==
@@ -2625,7 +2707,19 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 				 errdetail("The scan has neither a @@@ restriction nor an ORDER BY <=> ordering clause."),
 				 errhint("Add \"WHERE col @@@ query\" or \"ORDER BY col <=> query\".")));
 
-	if (so->vecScan)
+	if (so->fuseScan)
+	{
+		/*
+		 * F2.2: the fused path has SEVERAL queries and no single so->query, so
+		 * every test below would reject it.  Tested before the other three
+		 * because a fused scan may also carry a `@@@` restriction key, which set
+		 * queryValid, and may carry order-by keys whose strategies the three
+		 * below recognize.
+		 */
+		if (so->fuseQ == NULL || so->nfuse < 2)
+			return false;
+	}
+	else if (so->vecScan)
 	{
 		/*
 		 * F7: the `<=>` vector path has a query VECTOR instead of a wquery, so
@@ -2696,7 +2790,44 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 	if (!so->orderInit)
 	{
-		if (so->vecScan)
+		if (so->fuseScan)
+		{
+			/*
+			 * Task F2.2.  The ladder's rungs are CANDIDATE WIDTHS, the lexical and
+			 * vector shape, and it exists for the reason both of those state:
+			 * PostgreSQL gives an access method no way to learn the query's LIMIT,
+			 * so CORRECTNESS MUST NOT DEPEND ON THE PLANNER'S LIMIT ESTIMATE.  The
+			 * first rung is the same weave_ord_width() over-fetch of
+			 * pg_weave.wand_initial_k the other two use -- one knob for "how wide is
+			 * the first rung of an ordering pass", because two knobs drift -- and
+			 * weave_fuse_grow() widens x4 whenever the executor drains what is
+			 * materialized.
+			 *
+			 * maxhits is the union bound over the fused queries: each query's
+			 * provable match ceiling, summed, is a ceiling on the set of documents
+			 * ANY of them reaches, which is the fused candidate set
+			 * (include/weave/fuse.h: the union of the scored channels' positions,
+			 * intersected with the required ones').  Summing over-counts documents
+			 * several queries match, which is the safe direction -- it can only
+			 * make the cheap early stop fire later.
+			 */
+			double		N;
+			WeaveMetaPageData m0;
+			int			qi;
+
+			pgstat_count_index_scan(scan->indexRelation);
+			weave_read_meta(scan->indexRelation, &m0);
+			N = m0.ndocs < 1.0 ? 1.0 : m0.ndocs;
+			so->maxhits = 0.0;
+			for (qi = 0; qi < so->nfuse; qi++)
+				so->maxhits += weave_query_maxhits(scan->indexRelation,
+												   so->fuseQ[qi], N);
+			so->fusek = weave_ord_width(pg_weave_wand_initial_k);
+			weave_fuse_pass(scan->indexRelation, so);
+			so->ordpos = 0;
+			so->orderInit = true;
+		}
+		else if (so->vecScan)
 		{
 			/*
 			 * Task F7.  The vector ladder's rungs are CANDIDATE WIDTHS, the same
@@ -2817,7 +2948,8 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 				break;
 		}
 		/* candidates exhausted: widen the pass, or the scan is complete */
-		if (!(so->vecScan ? weave_vec_grow(scan->indexRelation, so)
+		if (!(so->fuseScan ? weave_fuse_grow(scan->indexRelation, so)
+			  : so->vecScan ? weave_vec_grow(scan->indexRelation, so)
 			  : so->edistScan ? weave_edist_grow(scan->indexRelation, so)
 			  : weave_ord_grow(scan->indexRelation, so)))
 			return false;
@@ -2833,6 +2965,19 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 		 * which for a fuzzy/regex/NOT query is the OVER-generating set (the same
 		 * one amgetbitmap reports recheck for), so say so and let the executor
 		 * re-run the original qual against the heap tuple.
+		 */
+		scan->xs_recheck = so->plainRecheck;
+	if (so->fuseScan && scan->numberOfKeys > 0)
+		/*
+		 * `WHERE d @@@ q ORDER BY fuse(...)` pushed the @@@ key down, and unlike
+		 * the vector case below the fused pass DID honour it -- as a REQUIRED gate
+		 * channel inside the scan, which is the conjunctive-gate path and the whole
+		 * point of fusing a predicate with a ranking (include/weave/fuse.h note 2).
+		 * So recheck carries only what the gate's own key set carries: the set came
+		 * from weave_collect_matches(), which OVER-generates for a fuzzy, regex or
+		 * phrase query (the same set amgetbitmap reports recheck for), and an Index
+		 * Scan does not re-evaluate a pushed-down qual unless the AM asks.  Exactly
+		 * the `<@>` arrangement, deliberately: one flag, set by one collector.
 		 */
 		scan->xs_recheck = so->plainRecheck;
 	if (so->vecScan && scan->numberOfKeys > 0)
@@ -2851,12 +2996,36 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 	weave_set_itup(scan, so);
 	if (scan->numberOfOrderBys > 0)
 	{
-		IndexOrderByDistance dist;
-		Oid			typ = FLOAT8OID;
+		/*
+		 * ONE ENTRY PER ORDER-BY KEY, AND IT MUST BE EXACTLY THAT MANY.
+		 * index_store_float8_orderby_distances() loops over
+		 * scan->numberOfOrderBys and reads distances[i] for each one, so the
+		 * single-element array this used to pass is only correct while every
+		 * ordering shape has exactly one key.  A FUSED scan (task F2.2) has one
+		 * key per channel PLUS the weights transport key, so that array would be
+		 * read off the end -- an out-of-bounds stack read whose symptom is a
+		 * plausible float, which is the class doc/CONVENTIONS.md rule 2 refuses.
+		 *
+		 * The fused value belongs to the ordering AS A WHOLE and not to any one
+		 * key, so it goes in slot 0 and the rest are NULL.  Nothing reads them:
+		 * xs_recheckorderby is false on every path here, and the only consumer of
+		 * these values is the executor's reorder queue, which exists only for a
+		 * recheck.  INDEX_MAX_KEYS bounds numberOfOrderBys, so the arrays are
+		 * stack-sized without an allocation.
+		 */
+		IndexOrderByDistance dist[INDEX_MAX_KEYS];
+		Oid			typ[INDEX_MAX_KEYS];
+		int			k;
 
-		dist.value = so->ordered[so->ordpos].score;
-		dist.isnull = false;
-		index_store_float8_orderby_distances(scan, &typ, &dist, false);
+		for (k = 0; k < scan->numberOfOrderBys; k++)
+		{
+			typ[k] = FLOAT8OID;
+			dist[k].value = 0.0;
+			dist[k].isnull = (k > 0);
+		}
+		dist[0].value = so->ordered[so->ordpos].score;
+		dist[0].isnull = false;
+		index_store_float8_orderby_distances(scan, typ, dist, false);
 	}
 	so->ordpos++;
 	return true;
@@ -6310,8 +6479,13 @@ weave_ord_probe(Relation index, WeaveScanOpaque so, int want)
 		 * carried through unchanged.  Inverting it here would have produced a
 		 * plausible monotone value and a wrong xs_orderbyvals.  The `<=>` vector
 		 * path (F7) is the same case: weave_vec_pass() has already turned the
-		 * channel's higher-is-better score into an ascending distance. */
-		so->ordered[so->nordered].score = (so->edistScan || so->vecScan) ? c->score
+		 * channel's higher-is-better score into an ascending distance.  So is the
+		 * fused path (F2.2): weave_fuse_pass() stores -S, which is fuse()'s own
+		 * value and is what the ORDER BY pathkey the planner matched sorts on --
+		 * inverting it here would hand the executor a monotone but DIFFERENT
+		 * number than the expression it elided the Sort for. */
+		so->ordered[so->nordered].score = (so->edistScan || so->vecScan ||
+										   so->fuseScan) ? c->score
 			: 1.0 / (1.0 + c->score);
 		so->nordered++;
 	}
@@ -6970,6 +7144,719 @@ weave_edist_grow(Relation index, WeaveScanOpaque so)
 		so->edistNext = so->edistThr + 1;
 	so->edistThr = so->edistNext;
 	weave_edist_pass(index, so);
+	return true;
+}
+
+/* -------------------------------------------------------------------------
+ * The fused multi-channel ordering pass -- task F2.2
+ *
+ * One pass is the fused top-k (src/am/fuse.c, doc/specs/FUSED_TOPK.md sect. 3) at
+ * width so->fusek, run ONCE PER BOLT and merged.  What this file adds to the core
+ * is everything the core deliberately does not know about: which shuttles to
+ * build, where the weights go, TID resolution, MVCC, and the widening ladder.
+ *
+ * PER BOLT, AND THAT IS NOT AN OPTIMIZATION.  A fused run advances every one of
+ * its channels through ONE position space, and a channel's cursor is per segment:
+ * a WandCursor is a (term, segment) pair.  Running one fused loop over the whole
+ * index would mean several cursors of the same term standing at the same position
+ * and each contributing its own score, which double-counts.  So each bolt gets its
+ * own run, its own threshold and its own top-k, and the per-bolt results are merged
+ * afterwards -- which is sound for the same reason the lexical ladder's widening is
+ * sound: a bolt's exact top-W contains that bolt's entire contribution to the
+ * global top-W, so merging exact prefixes yields an exact prefix.
+ *
+ * THE POSITION SPACE IS THE DOCID SPACE, and choosing it is the decision
+ * include/weave/gate.h left to Phase F in as many words ("reconciling them is
+ * Phase F's decision, not this task's").  The lexical shuttle publishes
+ * weave_tid_to_docid() docids as its warp positions and so does a gate shuttle
+ * built from a TidSet, so those two channels already agree and need no
+ * translation.  The vector shuttle's warp is a segment-local dense LANE INDEX and
+ * the `<@>` shuttle's warp is a position in the DICTIONARY; neither is a docid, so
+ * neither can join a run in this space without an adapter that does not exist yet.
+ * src/am/fusepath.c therefore offers no path containing one, and
+ * doc/specs/FUSED_TOPK.md sect. 7b records the finding, the adapter design, and
+ * why refusing beats translating badly.
+ *
+ * LIVEDOCS ARE THE ONE PLACE THIS RUN DEVIATES FROM (C6), stated rather than
+ * quietly done.  channel.h's (C6) says tombstones are applied once, by the scorer,
+ * from a warp-indexed bitmap -- which presumes a DENSE warp.  A docid is sparse:
+ * a bitmap covering it would need one bit per (heap block x MaxHeapTuplesPerPage)
+ * slot, tens of megabytes on a large heap, to carry the same information the
+ * channels already hold.  So `live` is NULL and each channel applies its own:
+ * a WandCursor skips its OWN SEGMENT's tombstones (wand_skip_own_tombstoned, which
+ * is also the per-segment semantics a shared bitmap could not express -- a docid
+ * deleted in segment A must not suppress a live document that reused the heap slot
+ * in a newer segment), and a gate's key set is already tombstone-filtered by
+ * weave_collect_matches().  The MVCC check that decides what the user sees is the
+ * heap probe in weave_ord_probe() either way; this only decides what is scored.
+ *
+ * WHERE THE TIDs COME FROM, the paragraph AGENTS.md asks for because getting it
+ * wrong FAILS SILENTLY -- a physical (heap-only) TID resolves to no visible tuple,
+ * so the plan shows a row count and no error.  They are not manufactured from the
+ * heap: a fused hit's position IS a docid, weave_docid_to_tid() inverts
+ * weave_tid_to_docid(), and the docid came out of a posting list that was written
+ * from the TID the BUILD CALLBACK or weave_insert() was handed.  Both of those are
+ * already HOT-chain roots -- table_index_build_scan() reports the root for a
+ * HOT-updated tuple, and an aminsert TID is the root of a chain starting with it --
+ * so the mapping is root-preserving and no heap_get_root_tuples() pass is needed or
+ * wanted.  (Contrast weave_cgram_heapscan(), which reads the heap itself and
+ * therefore must call it; that is the site whose omission cost a debugging round.)
+ *
+ * THE VALUE HANDED TO THE EXECUTOR is -S, the negated weighted sum, which is
+ * exactly what fuse() returns (src/am/fusepath.c explains why negation and not
+ * 1/(1+S)).  It is ascending, best first, and it is the SAME number the pathkey the
+ * planner matched sorts on -- so the elided Sort is honest.  It is not
+ * bit-identical to the fallback's value and cannot be: sect. 7a (1) records that
+ * weave_distance() outside an index has no corpus, and sect. 3a records that float
+ * addition is not associative, so the fused sum's order (required first, then
+ * scored by descending weighted ceiling) differs from the fallback's left-to-right.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * The scored keys and the transport key.  Returns false when this is not a fused
+ * scan, which is every scan with no WEAVE_STRAT_FUSE_WEIGHTS key.
+ *
+ * EVERY REFUSAL HERE IS AN ERROR AND NOT A FALL-BACK, which is the opposite of the
+ * rule in src/am/fusepath.c and for the same reason: by the time a key reaches
+ * amrescan the planner has already chosen this plan, so the honest failure is loud.
+ * None of these is reachable from SQL through the path that file builds; each is a
+ * check on that file.
+ */
+static bool
+weave_fuse_rescan(IndexScanDesc scan, WeaveScanOpaque so)
+{
+	MemoryContext old;
+	ArrayType  *arr;
+	float4	   *w;
+	int			nw;
+	int			transport = -1;
+	int			nsc = 0;
+	int			i;
+	int			j;
+
+	for (i = 0; i < scan->numberOfOrderBys; i++)
+		if (scan->orderByData[i].sk_strategy == WEAVE_STRAT_FUSE_WEIGHTS)
+			transport = i;
+	if (transport < 0)
+		return false;
+
+	if (scan->orderByData[transport].sk_flags & SK_ISNULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("a fused weave index scan was given no weights")));
+
+	arr = DatumGetArrayTypeP(scan->orderByData[transport].sk_argument);
+	if (ARR_NDIM(arr) > 1 || ARR_HASNULL(arr))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("fused weave scan weights must be a one-dimensional array without NULLs")));
+	nw = (ARR_NDIM(arr) == 0) ? 0 : ARR_DIMS(arr)[0];
+	w = (float4 *) ARR_DATA_PTR(arr);
+
+	/*
+	 * WEAVE_STRAT_DISTANCE IS THE ONLY SCORED CHANNEL A FUSED RUN CAN DRIVE
+	 * TODAY, and an order-by key of any other strategy beside a transport key is
+	 * therefore a bug in src/am/fusepath.c rather than a query to serve in some
+	 * reduced form.  Serving it reduced would silently answer a two-channel
+	 * ordering with a one-channel one.
+	 */
+	for (i = 0; i < scan->numberOfOrderBys; i++)
+	{
+		if (i == transport)
+			continue;
+		if (scan->orderByData[i].sk_strategy != WEAVE_STRAT_DISTANCE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("a fused weave index scan cannot serve ORDER BY strategy %d",
+							(int) scan->orderByData[i].sk_strategy),
+					 errdetail("Only the lexical <=> channel can be fused today; see doc/specs/FUSED_TOPK.md sect. 7b.")));
+		if (scan->orderByData[i].sk_flags & SK_ISNULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("a fused weave index scan channel was given a NULL query")));
+		nsc++;
+	}
+
+	if (nsc < 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a fused weave index scan needs at least two scored channels, got %d",
+						nsc)));
+	if (nsc != nw)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a fused weave index scan has %d channel(s) but %d weight(s)",
+						nsc, nw)));
+
+	/*
+	 * COPIED into the scan's own context, both of them.  sk_argument belongs to
+	 * the executor's ScanKey and every rung of the widening ladder re-reads the
+	 * queries -- arbitrarily later than this call -- which is the same reason the
+	 * vector path copies its query vector.
+	 */
+	old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+	so->fuseQ = (WeaveQuery *) palloc(nsc * sizeof(WeaveQuery));	/* alloc-ok: one per fuse() score argument, at most WEAVE_FUSE_MAX_CHAN */
+	so->fuseW = (float4 *) palloc(nsc * sizeof(float4));	/* alloc-ok: as above */
+	j = 0;
+	for (i = 0; i < scan->numberOfOrderBys; i++)
+	{
+		WeaveQuery	q;
+
+		if (i == transport)
+			continue;
+		q = DatumGetWQuery(scan->orderByData[i].sk_argument);
+		so->fuseQ[j] = (WeaveQuery) palloc(VARSIZE_ANY(q));	/* alloc-ok: one query, bounded by the query text */
+		memcpy(so->fuseQ[j], q, VARSIZE_ANY(q));
+
+		/*
+		 * The weight is validated here, before the core can see it, because
+		 * include/weave/fuse.h note 3 is about silent damage rather than taste: a
+		 * zero weight on a gate's +INF ceiling is 0 * INF = NaN, a NaN threshold
+		 * comparison is false, and every prune then quietly switches itself off
+		 * while the answers stay plausible.  src/am/fusepath.c validates a Const
+		 * array at plan time through the same rules; this is the second line of
+		 * the same defence, because a weights array can also arrive from a
+		 * catalog this backend did not plan against.
+		 */
+		if (!isfinite(w[j]) || w[j] <= 0.0f)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("fused weave scan weight %d is %g: weights must be finite and greater than zero",
+							j + 1, (double) w[j])));
+		so->fuseW[j] = w[j];
+		j++;
+	}
+	so->nfuse = nsc;
+	so->fuseScan = true;
+	MemoryContextSwitchTo(old);
+	return true;
+}
+
+/*
+ * One fused key's term list and the corpus-global IDF of each term.  IDF is
+ * global because segments share one corpus (weave_topk_candidates_range() makes
+ * the same choice for the same reason): a per-segment IDF would score the same
+ * document differently depending on which bolt it landed in.
+ *
+ * idf < 0 is the "absent from every segment" sentinel.  A term with df 0 anywhere
+ * has no posting cursor to build, and log() of its would-be IDF is not a number
+ * worth computing.
+ */
+typedef struct FuseKeyTerms
+{
+	const char **terms;
+	int		   *lens;
+	int			nterms;
+	double	   *idf;
+} FuseKeyTerms;
+
+/* (ascending distance, ascending TID): the fused candidate list's total order.
+ * The TID tie-break is not cosmetic, it is what makes a LIMIT that cuts inside a
+ * run of equal fused scores cut at the same place every time -- the argument
+ * cmp_edist_dist() makes, and ties are reachable here too (two documents matching
+ * the same terms with the same tf and length). */
+static int
+cmp_fuse_cand(const void *a, const void *b)
+{
+	const ScoredTid *x = (const ScoredTid *) a;
+	const ScoredTid *y = (const ScoredTid *) b;
+
+	if (x->score != y->score)
+		return x->score < y->score ? -1 : 1;
+	return ItemPointerCompare((ItemPointer) &x->tid, (ItemPointer) &y->tid);
+}
+
+static void
+weave_fuse_pass(Relation index, WeaveScanOpaque so)
+{
+	MemoryContext socxt = GetMemoryChunkContext(so);
+	MemoryContext passctx;
+	ScoredTid  *acc = NULL;
+	int			nacc = 0;
+	int			capacc = 0;
+	bool		complete = true;
+	bool		stable = false;
+	int			attempt;
+	int			i;
+	int			j;
+
+	/*
+	 * The @@@ restriction, collected ONCE and cached in the (otherwise unused on
+	 * this path) plain-scan slots, because the widening ladder calls this function
+	 * repeatedly -- weave_edist_pass()'s arrangement verbatim.  What differs is
+	 * what the set is used FOR: there it is intersected with the pass's output
+	 * afterwards, here it becomes a REQUIRED gate channel inside the run, so the
+	 * predicate drives pivot selection and a selective one makes the scan SKIP
+	 * instead of discarding rows it has already scored.  That is claim 3 of
+	 * doc/ARCHITECTURE.md sect. 9 and include/weave/fuse.h note 2's payoff.
+	 */
+	if (!so->plainInit && so->queryValid && so->query != NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(socxt);
+		TidSet		m;
+
+		weave_collect_matches(index, so->query, &m, &so->plainRecheck);
+		so->plainTids = m.tids;
+		so->nplain = m.n;
+		so->plainInit = true;
+		MemoryContextSwitchTo(old);
+	}
+
+	/*
+	 * THE PREDICATE ADMITS NOTHING, ANYWHERE.  A required channel is conjunctive,
+	 * so an empty gate set makes the whole fused answer empty whatever the scored
+	 * channels find.  Answered here, once, rather than per bolt, so that the bolt
+	 * loop below has no channel-less special case to get wrong -- and `fuseDone`
+	 * is set, because widening a pass cannot make an empty intersection non-empty.
+	 */
+	if (so->plainInit && so->nplain == 0)
+	{
+		if (so->cand)
+			pfree(so->cand);
+		so->cand = NULL;
+		so->ncand = 0;
+		so->candpos = 0;
+		so->candfull = false;
+		so->fuseDone = true;
+		return;
+	}
+
+	passctx = AllocSetContextCreate(CurrentMemoryContext,
+									"weave fused pass",
+									ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * The A1 race, bracketed exactly as weave_edist_pass() and
+	 * weave_topk_candidates_guarded() do: the bolt loop reads dictionary and
+	 * posting pages under per-page SHARE locks off a metapage snapshot, so a
+	 * concurrent merge or vacuum can free and recycle them mid-pass.  Re-read the
+	 * directory generation and redo from a fresh snapshot if it moved, bounded at
+	 * 10 attempts.
+	 */
+	for (attempt = 0; attempt < 10; attempt++)
+	{
+		WeaveMetaPageData meta;
+		WeaveTombstones tombs;
+		WeaveDoclenDirCache *doclendir;
+		WeaveDoclenResident *doclenres = NULL;
+		FuseKeyTerms *kt;
+		MemoryContext old;
+		uint32		gen0;
+		uint32		s;
+		double		N;
+		double		avgdl;
+		int			qi;
+		int			t;
+		WandCursor *cursors;
+		WeaveShuttle **ss;
+		WeaveFuseChan *chans;
+		WeaveFuseChan **cp;
+		WeaveFuseHit *heap;
+		MemoryContext segctx;
+
+		MemoryContextReset(passctx);
+		old = MemoryContextSwitchTo(passctx);
+
+		nacc = 0;
+		complete = true;
+		gen0 = weave_read_meta_generation(index);
+		weave_read_meta(index, &meta);
+		N = meta.ndocs < 1.0 ? 1.0 : meta.ndocs;
+		avgdl = meta.ndocs > 0 ? meta.sumdoclen / meta.ndocs : 1.0;
+
+		/* the relcache page directory over the v4 doclen sidecars, and one shared
+		 * resident block per segment so a multi-term run does not decode the same
+		 * block once per term -- both borrowed by the cursors below */
+		doclendir = weave_doclendir_cache(index, &meta);
+		if (doclendir != NULL)
+			doclenres = (WeaveDoclenResident *)
+				palloc0(sizeof(WeaveDoclenResident) *
+						Max((int) meta.nsegments, 1));
+		weave_tombstones_load(index, &meta, &tombs);
+
+		kt = (FuseKeyTerms *) palloc0(so->nfuse * sizeof(FuseKeyTerms));	/* alloc-ok: one per fuse() score argument, at most WEAVE_FUSE_MAX_CHAN */
+		for (qi = 0; qi < so->nfuse; qi++)
+		{
+			kt[qi].nterms = weave_query_terms(so->fuseQ[qi], &kt[qi].terms,
+											  &kt[qi].lens);
+			kt[qi].idf = (double *)
+				palloc(Max(kt[qi].nterms, 1) * sizeof(double));	/* alloc-ok: one per query term */
+			for (t = 0; t < kt[qi].nterms; t++)
+			{
+				uint64		gdf = 0;
+
+				for (s = 0; s < meta.nsegments; s++)
+				{
+					uint32		df;
+					uint32		max_tf;
+					BlockNumber firstblk;
+					uint32		firstoff;
+
+					if (weave_lookup_dict(index, &meta.segs[s], kt[qi].terms[t],
+										  kt[qi].lens[t], &df, &max_tf,
+										  &firstblk, &firstoff))
+						gdf += df;
+				}
+				kt[qi].idf[t] = (gdf == 0) ? -1.0
+					: log(1.0 + (N - (double) gdf + 0.5) / ((double) gdf + 0.5));
+			}
+		}
+
+		/*
+		 * PER-BOLT SCRATCH, ALLOCATED ONCE PER ATTEMPT.  The cursor array, the
+		 * shuttle array and the top-k heap are sized by the core's channel cap and
+		 * by the pass width, never by the bolt count, so allocating them inside the
+		 * bolt loop would hold nsegments copies of all three alive until the pass
+		 * ended -- up to 128 x fusek heap entries at the top of the ladder.  What
+		 * actually has to be recycled per bolt is `segctx`: the shuttles, their own
+		 * contexts, and the posting block buffers wand_load_block() pallocs while a
+		 * cursor walks.
+		 */
+		cursors = (WandCursor *)
+			palloc(WEAVE_FUSE_MAX_CHAN * sizeof(WandCursor));	/* alloc-ok: fixed at the core's channel cap */
+		ss = (WeaveShuttle **)
+			palloc(WEAVE_FUSE_MAX_CHAN * sizeof(WeaveShuttle *));	/* alloc-ok: as above */
+		chans = (WeaveFuseChan *)
+			palloc(WEAVE_FUSE_MAX_CHAN * sizeof(WeaveFuseChan));	/* alloc-ok: as above */
+		cp = (WeaveFuseChan **)
+			palloc(WEAVE_FUSE_MAX_CHAN * sizeof(WeaveFuseChan *));	/* alloc-ok: as above */
+
+		/* One heap entry per requested candidate.  fusek climbs the x4 ladder to
+		 * WEAVE_ORD_WIDTH_MAX, so this is a corpus-scale allocation and takes the
+		 * huge-safe variant (make check-alloc). */
+		heap = (WeaveFuseHit *)
+			WEAVE_ALLOC_MAYBE_HUGE((Size) so->fusek * sizeof(WeaveFuseHit));
+
+		segctx = AllocSetContextCreate(passctx, "weave fused bolt",
+									   ALLOCSET_DEFAULT_SIZES);
+
+		for (s = 0; s < meta.nsegments; s++)
+		{
+			const WeaveSegMeta *sg = &meta.segs[s];
+			MemoryContext segold;
+			WeaveFuseState st;
+			WeaveFuseError err;
+			int			nch = 0;
+			int			nscored = 0;
+			int			nh;
+
+			if (sg->dictstart == InvalidBlockNumber)
+				continue;
+
+			MemoryContextReset(segctx);
+			segold = MemoryContextSwitchTo(segctx);
+
+			/*
+			 * ONE SHUTTLE PER QUERY TERM, which is the whole reason the lexical
+			 * channel has a shuttle at all (src/query/lexshuttle.c): a single
+			 * shuttle wrapping the whole WAND would put a second top-k and a second
+			 * threshold inside the fused loop's threshold, which IS the
+			 * over-fetch-and-reconcile shape fuse.h exists to replace.  So a
+			 * three-term query is three scored channels that the one fused
+			 * threshold prunes against, alongside any gate.
+			 */
+			for (qi = 0; qi < so->nfuse; qi++)
+			{
+				for (t = 0; t < kt[qi].nterms; t++)
+				{
+					uint32		df;
+					uint32		max_tf;
+					BlockNumber firstblk;
+					uint32		firstoff;
+					WandCursor *c;
+					WeaveShuttle *sh;
+					sm_cursor_t ini = SM_CURSOR_INIT;
+
+					if (kt[qi].idf[t] < 0.0)
+						continue;	/* absent from every segment */
+					if (!weave_lookup_dict(index, sg, kt[qi].terms[t],
+										   kt[qi].lens[t], &df, &max_tf,
+										   &firstblk, &firstoff))
+						continue;	/* absent from THIS segment */
+
+					/*
+					 * Unreachable through src/am/fusepath.c, which refuses a shape
+					 * whose plan-time term count plus one gate exceeds the cap.
+					 * Checked anyway, because the alternative to an error is
+					 * DROPPING a channel, and a dropped scored channel is a
+					 * different ranking returned without a word.  One slot is held
+					 * back for the gate for the same reason.
+					 */
+					if (nch >= WEAVE_FUSE_MAX_CHAN - 1)
+						ereport(ERROR,
+								(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+								 errmsg("a fused weave index scan needs more than %d channels",
+										WEAVE_FUSE_MAX_CHAN),
+								 errhint("Use fewer query terms, or move a term into a WHERE clause so it becomes a gate.")));
+
+					c = &cursors[nch];
+					c->index = index;
+					c->firstblk = firstblk;
+					c->firstoff = firstoff;
+					c->df = df;
+					c->termidx = t;
+					c->blkbuf = NULL;
+					c->blkcount = 0;
+					c->cur = 0;
+					c->docid = 0;
+					weave_bm25_factors_init(&c->bm, kt[qi].idf[t], 1.2, 0.75,
+											avgdl);
+					c->max_contrib = weave_bm25_term_bound(&c->bm,
+														   (double) max_tf);
+					c->tombs = &tombs;
+					c->segidx = s;
+					c->has_doclen_col =
+						(sg->doclenstart == InvalidBlockNumber);
+					weave_doclen_cursor_init(&c->doclenc, index,
+											 sg->doclenstart, doclendir,
+											 doclenres ? &doclenres[s] : NULL);
+					c->docid_lo = 0;
+					c->docid_hi = UINT64_MAX;
+					c->tombcursor = ini;
+					wand_prime(c);
+
+					sh = weave_lex_shuttle_begin(c, segctx);
+
+					/*
+					 * HERE IS WHERE A WEIGHT REACHES A CHANNEL, and it is the only
+					 * place: the transport array's j-th entry became so->fuseW[qi]
+					 * in weave_fuse_rescan(), and every term of that key carries it.
+					 * weave_fuse_wrap_shuttles() copies the field and the core does
+					 * the multiplying, exactly once, which is what makes (C2)
+					 * survive weighting (channel.h: w * bound >= w * score needs
+					 * only w > 0).  A shuttle that applied the weight itself would
+					 * double-count AND scale the bound, so (C2) would still hold
+					 * and the scores would simply be wrong -- the undetectable kind.
+					 */
+					sh->weight = so->fuseW[qi];
+					ss[nch++] = sh;
+					nscored++;
+				}
+			}
+
+			/*
+			 * nscored == 0 means no scored channel reaches this bolt, so this bolt
+			 * has no candidate at all: include/weave/fuse.h defines the candidate
+			 * set as the UNION of the scored channels' positions intersected with
+			 * the required ones', and a run with gates alone would pad the top-k
+			 * with documents containing none of the query.  `complete` is untouched
+			 * -- there was nothing here to prune.
+			 */
+			if (nscored > 0)
+			{
+				if (so->plainInit)
+				{
+					TidSet		gateset;
+
+					/*
+					 * `required` COMES FROM WHERE THE KEY ARRIVED, never from the
+					 * channel's kind: this set came from a WHERE clause, so it is a
+					 * predicate, and weave_gate_shuttle_from_tidset() sets
+					 * `required` on the shuttle it returns.  sect. 3a (2) and
+					 * channel.h's (C5) note both record the falsification --
+					 * src/query/edist.c labels a SCORED channel WEAVE_CH_FUZZY, so
+					 * a kind-based inference would apply a conjunctive veto to a
+					 * distance channel and silently drop every row it ranks.
+					 *
+					 * WEAVE_CH_DOCVALS is the kind, and it is a reporting choice
+					 * with one constraint: weave_gate_shuttle_begin() refuses a
+					 * SCORED kind outright (its counters would claim posting work
+					 * that did not happen) and WEAVE_CH_LEXICAL is scored.  What
+					 * this gate walks is a materialized set of document ids, which
+					 * is what a docvalues predicate is; the kind reaches nothing
+					 * but EXPLAIN and the per-channel counters.
+					 *
+					 * The empty-set case cannot arrive here: it is answered once,
+					 * before the bolt loop, so this loop has no channel-less
+					 * special case to get wrong.
+					 */
+					gateset.tids = so->plainTids;
+					gateset.n = so->nplain;
+					ss[nch++] = weave_gate_shuttle_from_tidset(WEAVE_CH_DOCVALS,
+															   &gateset,
+															   segctx);
+				}
+
+				weave_fuse_wrap_shuttles(chans, ss, nch);
+				for (i = 0; i < nch; i++)
+					cp[i] = &chans[i];
+
+				/*
+				 * nwarp is the END SENTINEL, not a document count, because the
+				 * position space is the SPARSE docid space (see this section's
+				 * header): there is no dense upper bound to give, the channels
+				 * themselves run out, and `live` is NULL so nwarp is not doing
+				 * double duty as a bitmap extent.
+				 */
+				err = weave_fuse_init(&st, cp, nch, heap, so->fusek, NULL,
+									  WEAVE_FUSE_END);
+				if (err != WEAVE_FUSE_OK)
+					weave_fuse_error(&st, err);
+#ifdef USE_ASSERT_CHECKING
+				/* Turn every score() into a checked (C2) assertion under cassert,
+				 * the same choice already made for the score()-returns-distance
+				 * convention elsewhere in this file.  Set AFTER init, which zeroes
+				 * it. */
+				st.check_bounds = 1;
+#endif
+				err = weave_fuse_run(&st);
+				if (err != WEAVE_FUSE_OK)
+					weave_fuse_error(&st, err);
+				nh = weave_fuse_drain(&st, heap);
+
+				/*
+				 * THE COMPLETENESS SIGNAL, and it is a proof rather than an
+				 * estimate.  A run whose heap never filled kept theta at -INFINITY
+				 * for its whole length, and all three prunes in src/am/fuse.c
+				 * compare against theta -- the block bound (`ub <= theta`),
+				 * incremental abandonment (`s + csuffix <= theta`) and the
+				 * essential/non-essential partition (`suffix[split-1] <= theta`,
+				 * which cannot move while theta is -INF).  So nothing was skipped
+				 * and this run scored every candidate its channels can generate.
+				 * It is an AND over the bolts: one bolt proving completeness says
+				 * nothing about another.
+				 */
+				if (nh >= so->fusek)
+					complete = false;
+
+				if (nh > 0)
+				{
+					MemoryContext accold = MemoryContextSwitchTo(socxt);
+
+					if (nacc + nh > capacc)
+					{
+						int			newcap = Max(capacc * 2,
+												 Max(nacc + nh, 64));
+
+						/* One entry per merged candidate: bolts x the pass width,
+						 * so corpus-scale at the top of the ladder (make
+						 * check-alloc). */
+						acc = (acc == NULL)
+							? (ScoredTid *) WEAVE_ALLOC_MAYBE_HUGE((Size) newcap * sizeof(ScoredTid))
+							: (ScoredTid *) WEAVE_REALLOC_MAYBE_HUGE(acc, (Size) newcap * sizeof(ScoredTid));
+						capacc = newcap;
+					}
+					MemoryContextSwitchTo(accold);
+
+					for (i = 0; i < nh; i++)
+					{
+						/*
+						 * A fused hit's position IS a docid, so the TID is the
+						 * inverse of the mapping the build callback applied to a
+						 * HOT-CHAIN ROOT -- see this section's header for why that
+						 * matters and why no heap_get_root_tuples() pass belongs
+						 * here.  The score is fuse()'s own value, -S, ascending.
+						 */
+						weave_docid_to_tid((uint64) heap[i].warp,
+										   &acc[nacc].tid);
+						acc[nacc].score = -(double) heap[i].score;
+						nacc++;
+					}
+				}
+
+				for (i = 0; i < nch; i++)
+					ss[i]->ops->end(ss[i]);
+			}
+
+			MemoryContextSwitchTo(segold);
+		}
+
+		weave_tombstones_free(&tombs);
+		MemoryContextSwitchTo(old);
+
+		if (weave_read_meta_generation(index) == gen0)
+		{
+			stable = true;
+			break;
+		}
+	}
+
+	MemoryContextDelete(passctx);
+
+	/*
+	 * EVERY ATTEMPT RACED A MERGE.  Then the last attempt's hits may have come off
+	 * recycled pages, so they are DISCARDED rather than returned -- the outcome
+	 * weave_topk_candidates_guarded() and weave_vec_pass() both specify, and the
+	 * one weave_edist_pass() does not (it keeps the last attempt; that is a
+	 * pre-existing divergence, noted here rather than changed by this task).  The
+	 * ladder stops, because widening would only race again.
+	 */
+	if (!stable)
+	{
+		nacc = 0;
+		complete = true;
+	}
+
+	if (nacc > 1)
+		qsort(acc, nacc, sizeof(ScoredTid), cmp_fuse_cand);
+
+	/*
+	 * Truncate to the pass width only when the pass PRUNED.  Merging exact
+	 * per-bolt top-fusek lists gives an exact global top-fusek, so cutting there
+	 * loses nothing the ladder cannot recover by widening; when every bolt proved
+	 * completeness the merged list is the whole match set and cutting it would
+	 * drop rows the ladder is about to declare there are none of.
+	 */
+	if (!complete && nacc > so->fusek)
+		nacc = so->fusek;
+
+	/*
+	 * Rows an earlier, narrower pass already materialized are removed by TID, so a
+	 * widening EXTENDS the scan instead of repeating its output -- the argument
+	 * weave_ord_pass() makes, and it holds here for the same reason: a pass at
+	 * width W1 is the exact top-W1 of the fused score (the bounds are sound by
+	 * (C2), which is what the property test asserts), so a document in it has
+	 * fewer than W1 <= W2 documents scoring above it and nothing a wider pass
+	 * newly finds can outrank a row already handed out.  A document merged into
+	 * the index between two passes could; a ranked scan is not order-stable under
+	 * concurrent modification, here or on any other channel.
+	 */
+	if (nacc > 0 && so->nordered > 0)
+	{
+		ItemPointerData *seen = (ItemPointerData *)
+			WEAVE_ALLOC_MAYBE_HUGE((Size) so->nordered * sizeof(ItemPointerData));
+
+		for (i = 0; i < so->nordered; i++)
+			seen[i] = so->ordered[i].tid;
+		qsort(seen, so->nordered, sizeof(ItemPointerData), cmp_tid);
+		for (i = 0, j = 0; i < nacc; i++)
+			if (bsearch(&acc[i].tid, seen, so->nordered,
+						sizeof(ItemPointerData), cmp_tid) == NULL)
+				acc[j++] = acc[i];
+		nacc = j;
+		pfree(seen);
+	}
+
+	if (so->cand)
+		pfree(so->cand);
+	so->cand = acc;
+	so->ncand = nacc;
+	so->candpos = 0;
+	so->candfull = !complete;
+	so->fuseDone = complete;
+}
+
+/*
+ * Widen the fused pass x4 because the executor wants more rows than the current
+ * one can supply.  Returns false only when a pass PROVED there is nothing
+ * further, which is the standard weave_ord_grow(), weave_edist_grow() and
+ * weave_vec_grow() all hold themselves to: an amcanorderbyop scan must be able to
+ * return EVERY matching tuple in order, so a ceiling of the access method's own
+ * silently truncates a query that asks for more.
+ */
+static bool
+weave_fuse_grow(Relation index, WeaveScanOpaque so)
+{
+	if (so->fuseDone)
+		return false;			/* every bolt scored its whole candidate set */
+	if ((double) so->fusek >= so->maxhits)
+		return false;			/* already as wide as every possible match */
+	if (so->fusek >= WEAVE_ORD_WIDTH_MAX)
+		return false;			/* cannot widen further */
+
+	so->fusek = (so->fusek > WEAVE_ORD_WIDTH_MAX / 4)
+		? WEAVE_ORD_WIDTH_MAX : so->fusek * 4;
+	weave_fuse_pass(index, so);
 	return true;
 }
 
