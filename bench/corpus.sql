@@ -16,6 +16,16 @@
 DROP TABLE IF EXISTS docs CASCADE;
 CREATE TABLE docs (id bigint PRIMARY KEY, body text);
 
+-- SEEDED, since 2026-09-21.  Without this the corpus is drawn fresh on every run,
+-- and the df bands move with it: the 2026-09-07 run had mid = 2,503 and common =
+-- 197,552 where the 2026-09-21 run at the same NDOCS/VOCAB had 2,499 and 179,772.
+-- Between-arm comparisons inside one run were never affected -- every arm sees the
+-- same table -- but comparing pg_weave against its OWN earlier number was
+-- confounded, while the file said "Reproduce: NDOCS=... bench/aws/run.sh ...",
+-- which is a reproducibility claim the harness could not keep.  setseed makes the
+-- corpus a function of (ndocs, vocab) alone.
+SELECT setseed(0.42);
+
 -- Sampling weight ~ 1/rank via floor(vocab * u^3): word_00001 is common,
 -- word_:vocab is rare.  8..15 words per document.
 -- NOTE: no underscore in the token.  pg_weave's analyzer splits on non-word
