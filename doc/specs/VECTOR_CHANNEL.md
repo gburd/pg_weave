@@ -1314,6 +1314,27 @@ segment so a reader never has to guess"*. That is precisely what
 `WeaveVecMeta.metric` is for. Default `l2`, because every weft already on disk
 says `l2` and format v8 shipped two days ago.
 
+**UPDATE, task F7 (2026-09-21): the ORDER BY path exists and the per-metric family
+split still does not.** F7 added `<=>` on `(wvec, wvec)` to `wvec_weave_ops` as an
+ORDER BY member (strategy 1; see `include/weave/am.h`, `WEAVE_STRAT_VEC_DISTANCE`),
+because until it did, a vector query could not reach `amrescan` at all and
+`ORDER BY embedding <=> $1 LIMIT 10` was answered by a Seq Scan and a top-N Sort —
+task L7's 7,000× cliff with a different column type. That leaves a **named
+divergence** rather than a clean story, and it is stated here rather than only in the
+code: the operator is spelled for **cosine** distance, and the ordering the index
+produces is the weft's **`metric`** (`l2` by default). For unit-normalized vectors —
+what the embedding models this channel targets emit — cosine, `l2` and inner product
+induce the same ordering and the two agree; for unnormalized vectors they do not.
+`sql/vecorderby.sql` therefore **records** the number of positions on which the index
+ordering differs from an exact float `<=>` ordering, with an `EXPLAIN` over each arm,
+instead of asserting agreement — the quantized codes are the second, independent
+source of the same divergence, and neither is a defect. The eventual fix is still the
+family-per-metric split above (`wvec_l2_ops`, `wvec_ip_ops`), which needs a second
+opclass, a second `weave_opfamily_kinds[]` row and a migration for existing indexes,
+and is therefore a task rather than a line. `xs_recheckorderby` stays **false**: a
+reorder queue would require the index's distance to be a proven *lower bound* on the
+operator's, and a quantized score is not one.
+
 ### Warp → docid needs no random access, because the scan is monotone
 
 The dense warp→docid map on the `WEAVE_PK_VWARP` chain has only a sequential
