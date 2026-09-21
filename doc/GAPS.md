@@ -1277,7 +1277,9 @@ scorers that disagree get written. Held for F, recorded here, and asserted in
 rather than as nothing.
 
 **Now visible through a plan, not only through an SRF (task F7, 2026-09-21).** F7 gave
-the vector channel an `ORDER BY` operator, so the gap is reachable from ordinary SQL:
+the vector channel its `ORDER BY` members — `<->` (metric `l2`) and `<#>` (metric `ip`),
+one per metric the scan core serves, and deliberately not `<=>` — so the gap is
+reachable from ordinary SQL:
 `sql/vecorderby.sql` section (7) asserts `vec_rows_before_flush` = table rows − 1 and
 `pending_row_in_vec_answer_before_flush` = 0, with an `EXPLAIN` proving the count came
 from the index scan rather than from a Seq Scan (the count is the discriminator, so a
@@ -1581,3 +1583,31 @@ seeded corpus with and without the extra analyzed columns and compare `EXPLAIN (
 BUFFERS)` heap-block counts. If `shared hit` is proportional to the table width, the
 custom scan reads the heap. That is a 10-minute experiment and it should precede any
 optimization, per hard rule 9.
+
+### G39 — a query-less scan of an indexed table fails on PostgreSQL 18 when the seq scan is disabled — **OPEN 2026-09-21, found by F7's test file, and pre-existing**
+
+`SELECT count(*) FROM t` where `t` carries a weave index, under `SET enable_seqscan =
+off`, fails on PostgreSQL 18 with *"a weave index scan requires a query"*. It succeeds on
+17. Nothing about it is new: the guard and its reasoning predate F7
+(`weave_costestimate`, `src/am/am.c`), and F7's regression file is simply the first test
+that asked for the shape.
+
+**The mechanism, in three facts that are each individually correct.** (1) The AM cannot
+serve a scan with no restriction and no ordering clause: `weave_build_callback` and
+`weave_insert` skip NULLs, so a row whose indexed column is NULL has no entry and a full
+scan would **undercount** — a wrong answer, not a slow one. (2) `amoptionalkey` must stay
+true, because that is what lets the keyless *ordering* path exist at all (task L7, the
+3,705x-at-1M win), and it also lets the planner consider an Index Only Scan for an
+unqualified aggregate, since `count(*)` needs no columns and `check_index_only()`
+therefore succeeds regardless of `amcanreturn`. (3) So the path is priced at 1e12 and
+refused at runtime as a backstop. **PostgreSQL 18 turns the backstop into a user-visible
+failure**: it compares disabled-node counts *before* costs, so a disabled seq scan loses
+to a path costed at 1e12.
+
+**Nothing here is fixable by tuning the cost**, which is the useful part: on 18 the price
+is not what decides. The candidates are (a) serve the scan by falling back to a heap pass
+when the AM knows it cannot enumerate — a whole mechanism for a query nobody should send
+to this index, (b) get per-path veto from core, which does not exist, or (c) leave it and
+document, which is what this row does. The practical cost is confined to sessions that
+disable the seq scan, which is a debugging setting; the regression files that need it keep
+`enable_seqscan = on` around their query-less counts and say why at the call site.

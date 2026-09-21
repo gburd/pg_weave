@@ -43,7 +43,7 @@
 #include "weave/bm25bound.h"		/* F6: the single copy of the BM25 contribution
 									 * and its per-block (C2) bound; this file used
 									 * to carry a transcription of both */
-#include "weave/vector.h"			/* F7: the shared vector top-k the <=> ordering scan drives */
+#include "weave/vector.h"			/* F7: the shared vector top-k the <-> / <#> ordering scan drives */
 #include <math.h>
 #include "access/genam.h"
 #include "access/generic_xlog.h"
@@ -2403,15 +2403,16 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		 * reading it wrong is not a type error -- DatumGetWQuery() on a text
 		 * datum would interpret a varlena header as a WeaveQuery and walk
 		 * garbage.  So dispatch on sk_strategy, and treat an unknown strategy as
-		 * an error rather than as <=>.
+		 * an error rather than as one of the known ones.
 		 *
-		 * The vector member is tested FIRST because its number is the one shared
-		 * with another family's member.  WEAVE_STRAT_VEC_DISTANCE is 1, which
+		 * The vector members are tested FIRST because one of their numbers is the
+		 * one shared with another family's member.  WEAVE_STRAT_VEC_L2 is 1, which
 		 * wdoc_lex_ops spends on `@@@`; `@@@` is a restriction operator and so can
-		 * never arrive in orderByData, which is exactly why 1 was chosen for the
-		 * vector member (include/weave/am.h).  The strategy is therefore
-		 * unambiguous here, and reading a wvec datum as a wvec is safe because the
-		 * operator's left argument type is what put the key on this column.
+		 * never arrive in orderByData, which is exactly why 1 was chosen for a
+		 * vector member (include/weave/am.h).  WEAVE_STRAT_VEC_IP is 4 and is
+		 * shared with nothing.  The strategy is therefore unambiguous here, and
+		 * reading a wvec datum as a wvec is safe because the operator's left
+		 * argument type is what put the key on this column.
 		 *
 		 * WHICH COLUMN it names is answered one level down instead of here, and
 		 * that is a deliberate choice rather than an omission: sk_attno is carried
@@ -2425,10 +2426,73 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		 * returns nothing, and an ordering path over a channel this index does not
 		 * carry is a legitimate plan over an empty channel.
 		 */
-		if (scan->orderByData[0].sk_strategy == WEAVE_STRAT_VEC_DISTANCE)
+		if (scan->orderByData[0].sk_strategy == WEAVE_STRAT_VEC_L2 ||
+			scan->orderByData[0].sk_strategy == WEAVE_STRAT_VEC_IP)
 		{
-			MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
-			WVec	   *q = DatumGetWVec(scan->orderByData[0].sk_argument);
+			bool		wantip = (scan->orderByData[0].sk_strategy ==
+								  WEAVE_STRAT_VEC_IP);
+			int			want = wantip ? WEAVE_METRIC_IP : WEAVE_METRIC_L2;
+			int			have = weave_index_vec_metric(scan->indexRelation);
+			MemoryContext old;
+			WVec	   *q;
+
+			/*
+			 * THE OPERATOR NAMES A METRIC, THE WEFT IS SCORED IN EXACTLY ONE, AND A
+			 * MISMATCH IS REFUSED RATHER THAN ANSWERED.  Serving an l2 ordering
+			 * under `<#>` (or an ip one under `<->`) is a WRONG ANSWER, not an
+			 * approximation like the quantizer's reordering is: every row comes back
+			 * in a ranking the query did not ask for, plausibly, with no error.
+			 * That is the defect F7 shipped -- it made `<=>` the member while the
+			 * weft ordered by `metric` -- so the refusal is the correction.
+			 *
+			 * WHY THIS IS A RUNTIME ERROR AND NOT A PLANNER DECISION.  The planner
+			 * matches a pathkey against an operator FAMILY, and the metric is not in
+			 * the family -- it is a reloption, which path generation never looks at.
+			 * So there is no point at which the planner could decline to build this
+			 * path, and the last place that can still refuse is the scan.  The fix
+			 * that turns this into a planner decision is the one
+			 * doc/specs/VECTOR_CHANNEL.md sect. 8b names: ONE OPERATOR FAMILY PER
+			 * METRIC (wvec_l2_ops, wvec_ip_ops), so an `ip` index simply has no
+			 * `<->` member and no path is generated at all.  The metric belongs in
+			 * the opclass, the way pgvector does it, and not in a reloption the
+			 * planner cannot see.
+			 *
+			 * THIS CHECK ONLY EVER SEPARATES l2 FROM ip.  A cosine or l1 index
+			 * cannot exist: weave_index_vec_metric() refuses both at CREATE INDEX
+			 * (expected/vecscan.out lines 303 and 307), because neither has a sound
+			 * compressed-domain bound.  The scan core serves IP and L2 and refuses
+			 * the rest (include/weave/vecscan.h), which is also why `<=>` is not a
+			 * member of any family on wvec.
+			 *
+			 * WHERE THE METRIC IS READ FROM, and it is the weaker of the two
+			 * available authorities because it is the only one reachable here: the
+			 * `metric` RELOPTION.  The scoring authority is WeaveVecMeta.metric,
+			 * recorded per weft, and no weft is open at rescan time -- bolts are
+			 * visited by weave_vec_topk_run() off a metapage snapshot, one level
+			 * down and once per pass.  The two can legitimately DISAGREE: `metric`
+			 * carries AccessExclusiveLock, so `ALTER INDEX ... SET (metric = ...)`
+			 * is accepted WITHOUT a REINDEX and rewrites nothing, leaving every
+			 * existing weft scored in the old metric.  That is a second, independent
+			 * reason the reloption is the wrong home for this, and it is why the
+			 * per-family split above is the fix rather than a deeper check here: a
+			 * check against each weft's own metric could only turn the same
+			 * disagreement into a per-bolt error, mid-scan.
+			 */
+			if (have != want)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("operator %s cannot order a weave index whose metric is %s",
+								wantip ? "<#>" : "<->",
+								have == WEAVE_METRIC_IP ? "ip" : "l2"),
+						 errdetail("The vector weft is scored in one metric only, so an ordering by %s would be returned in %s order.",
+								   wantip ? "<#>" : "<->",
+								   have == WEAVE_METRIC_IP ? "ip" : "l2"),
+						 errhint("Order by %s instead, or build the index WITH (metric = '%s').",
+								 have == WEAVE_METRIC_IP ? "<#>" : "<->",
+								 wantip ? "ip" : "l2")));
+
+			old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+			q = DatumGetWVec(scan->orderByData[0].sk_argument);
 
 			/*
 			 * COPIED, not aliased.  DatumGetWVec() hands back the datum itself
@@ -2443,7 +2507,7 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 			/*
 			 * The vector IS the query on this path; so->query stays NULL and
 			 * queryValid keeps its existing meaning ("a WHERE clause supplied a
-			 * wquery"), which for a bare `ORDER BY v <=> c` it did not.
+			 * wquery"), which for a bare `ORDER BY v <-> c` it did not.
 			 */
 			MemoryContextSwitchTo(old);
 		}
@@ -6343,17 +6407,19 @@ weave_ord_grow(Relation index, WeaveScanOpaque so)
  * WHAT THE DISTANCE IS.  The channel scores in the metric's domain, higher is
  * better (-||q-v||^2 for l2, the inner product for ip), so the ordering distance
  * handed to the executor is the NEGATED score: monotone, ascending, and for l2
- * exactly ||q-v||^2.  It is NOT the value `<=>` would compute on the heap, for two
- * independent reasons that are recorded rather than papered over -- the index scores
- * QUANTIZED reconstructions, and the weft's metric is the `metric` reloption (l2 by
- * default) while `<=>` is named for cosine.  xs_recheckorderby therefore stays
- * false: setting it would ask the executor to re-sort within a reorder queue, which
- * requires the AM's value to be a proven LOWER BOUND on the operator's, and a
- * quantized score is not one.  This is an approximate (ANN) ordering, which is what
- * an ANN index is; sql/vecorderby.sql RECORDS the divergence from an exact float
- * ordering instead of asserting it away, and doc/specs/VECTOR_CHANNEL.md sect. 8b
- * holds the eventual per-metric opclass split (wvec_l2_ops, wvec_ip_ops) that makes
- * the operator's name true.
+ * exactly ||q-v||^2 -- the square of what `<->` computes on the heap, which is the
+ * same ordering, and for ip exactly what `<#>` computes.  It is still not the
+ * operator's own value, because the index scores QUANTIZED reconstructions, and
+ * that one divergence is recorded rather than papered over.  xs_recheckorderby
+ * therefore stays false: setting it would ask the executor to re-sort within a
+ * reorder queue, which requires the AM's value to be a proven LOWER BOUND on the
+ * operator's, and a quantized score is not one.  This is an approximate (ANN)
+ * ordering, which is what an ANN index is; sql/vecorderby.sql RECORDS the
+ * divergence from an exact float ordering instead of asserting it away.  (A
+ * mismatch between the operator's metric and the index's is a different matter
+ * entirely and is refused in weave_rescan() -- see the comment there, and
+ * doc/specs/VECTOR_CHANNEL.md sect. 8b for the per-metric opclass split that would
+ * make it a planner decision.)
  * ------------------------------------------------------------------------- */
 
 /*

@@ -203,16 +203,26 @@ when the scope was read as "BM25 + vector", then back when it was restated as al
 six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
 hard rule was weakened on an inference about scope rather than a question about it.*
 
-**39 of 72 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
+**41 of 72 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
 Z5, Z8, Z9) and 6 withdrawn (L2, L21, V9, V10, V13, **F4**). By phase: X 4/4, L 16/20,
-Z 7/9, V 9/17, P 2/4, **F 2/7**, M 0/6, R 0/5. **Phase F grew by two rows on 2026-09-21**
-and both were found by reading the code before writing any: **F6**, a BM25 term shuttle
-(the lexical channel has none — ranked lexical is a WAND over `WandCursor`, and the fused
-core consumes only shuttles), and **F7**, an `ORDER BY` operator for the vector channel
-(`wvec_weave_ops` is `STORAGE` only, so a vector query cannot reach `amrescan`). Until both
-land, the fused scan the project's headline rests on has **nothing to fuse** — the two
-channels `FUSED_TOPK.md` §7's own example names are both unreachable as ORDER BY operands.
-That is recorded in §7a with the line references.
+Z 7/9, V 9/17, P 2/4, **F 4/7**, M 0/6, R 0/5. **Phase F grew by two rows on 2026-09-21,
+both found by reading the code before writing any, and both are now DONE the same day:**
+**F6**, a BM25 term shuttle (the lexical channel had none — ranked lexical is a WAND over
+`WandCursor`, and the fused core consumes only shuttles), and **F7**, an `ORDER BY`
+operator for the vector channel (`wvec_weave_ops` was `STORAGE` only, so a vector query
+could not reach `amrescan` at all). So the fused scan now has two channels to fuse, which
+it did not when the session started, and F2.2 is what connects them.
+
+**F7's first cut was a wrong answer and the corrected test measures how wrong.** It
+registered `<=>`, which is cosine, while the scan core serves only IP and L2 and refuses
+cosine (`include/weave/vecscan.h:53`) — so the index answered an **l2 ordering under a
+cosine operator**, and the file's own "quantizer divergence" section was measuring that:
+24 of 25 positions differing, overlap 19 of 25. With `<->` and `<#>` registered instead
+— the operators whose semantics the weft actually computes — the same section measures
+**4 of 25 and overlap 25 of 25**. An `ORDER BY` operator an index serves has to be the
+ordering the index computes; the remaining debt is one operator family per metric
+(`VECTOR_CHANNEL.md` §8b), because a `metric` reloption is invisible to the planner and
+can drift from the weft under `ALTER INDEX ... SET`.
 
 **The lexical channel was re-measured on 2026-09-21 at two scales with a pg_fts arm for
 the first time, and it changes what this project may claim.** Against tsvector + GIN,

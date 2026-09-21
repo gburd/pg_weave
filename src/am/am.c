@@ -4025,7 +4025,14 @@ weave_handler(PG_FUNCTION_ARGS)
 {
 	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
-	amroutine->amstrategies = 3;
+	/*
+	 * 4, and the fourth member is WEAVE_STRAT_VEC_IP (`<#>` on wvec, task F7):
+	 * ALTER OPERATOR FAMILY validates a member number against this value, so a
+	 * second vector ORDER BY member -- one per metric the scan core serves -- is
+	 * unregisterable while this says 3.  1..3 are `@@@`/`@~` (restriction),
+	 * WEAVE_STRAT_DISTANCE and WEAVE_STRAT_EDIST; see include/weave/am.h.
+	 */
+	amroutine->amstrategies = 4;
 	amroutine->amsupport = 0;
 	amroutine->amoptsprocnum = 0;
 	amroutine->amcanorder = false;

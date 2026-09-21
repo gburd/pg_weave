@@ -1,71 +1,87 @@
 /* pg_weave 0.14.0 -> 0.15.0 */
 
--- F7: `ORDER BY vcol <=> $1 LIMIT k` -- the vector channel's ORDER BY operator.
+-- F7: `ORDER BY vcol <-> $1 LIMIT k` -- the vector channel's ORDER BY operators.
 --
 -- WHAT WAS MISSING, and it was the whole surface rather than a refinement.
 -- 0.7.0--0.8.0 created wvec_weave_ops as `STORAGE wvec` and NOTHING ELSE, on the
 -- stated grounds that V7 was the storage half and the scan came later: "an opclass
--- that advertised <=> before the access method could execute a vector ordering
--- would make the planner build index paths that fail at run time -- on the query
--- shape every pgvector user writes first."  The scan arrived in V8, reachable only
--- through the weave_vec_scan() SRF, and src/am/fusepath.c (F2.1) recorded that no
--- channel fuse() names is an ORDER BY operand yet and pointed at this task.  Until
--- now a vector query could not reach amrescan AT ALL: with no member in the family,
--- the planner has no ordering operator to match a pathkey against, so
--- `ORDER BY embedding <=> $1 LIMIT 10` was answered by a Seq Scan and a top-N Sort
--- computing the exact distance for every row.  That is task L7's recorded 7,000x
--- cliff (doc/GAPS.md G1) with a different column type.
+-- that advertised an ordering operator before the access method could execute a
+-- vector ordering would make the planner build index paths that fail at run time --
+-- on the query shape every pgvector user writes first."  The scan arrived in V8,
+-- reachable only through the weave_vec_scan() SRF, and src/am/fusepath.c (F2.1)
+-- recorded that no channel fuse() names is an ORDER BY operand yet and pointed at
+-- this task.  Until now a vector query could not reach amrescan AT ALL: with no
+-- member in the family, the planner has no ordering operator to match a pathkey
+-- against, so `ORDER BY embedding <-> $1 LIMIT 10` was answered by a Seq Scan and a
+-- top-N Sort computing the exact distance for every row.  That is task L7's recorded
+-- 7,000x cliff (doc/GAPS.md G1) with a different column type.
 --
--- STRATEGY 1, AND THE NUMBER IS A DECISION.  Strategy numbers are scoped to an
--- operator FAMILY, not to the access method: sk_strategy is resolved against the
--- family of the index column the key matched, so wdoc_lex_ops's 1 (`@@@`) and
--- gram_ops's 1 (`@~`) are already different operators with the same number.  Inside
--- wvec_weave_ops every number in 1..3 is free, because the family has no members at
--- all.  1 is chosen because it is the only one of the three that is not already an
--- ORDER BY member SOMEWHERE in this access method -- wdoc_lex_ops spends 2 on `<=>`
--- (BM25 distance) and 3 on `<@>` (edit distance) -- and src/am/amscan.c's
--- weave_rescan() dispatches ORDER BY keys on sk_strategy.  Reusing 2 or 3 would make
--- one number name two order-by operators over two argument types, and a misread
--- there is not a type error: it hands a WeaveQuery reader a wvec datum and walks
--- garbage.  `@@@` can never appear in orderByData because it is a restriction
--- operator, so 1 is unambiguous.  The constant is WEAVE_STRAT_VEC_DISTANCE in
--- include/weave/am.h; the number has to be within amstrategies (3), which ALTER
--- OPERATOR FAMILY validates, so choosing 11 to dodge the question is not available.
+-- TWO MEMBERS, ONE PER METRIC THE SCAN CORE CAN SERVE.  include/weave/vecscan.h
+-- serves WEAVE_METRIC_IP and WEAVE_METRIC_L2 and refuses everything else, and the
+-- weft's metric is recorded per segment (WeaveVecMeta.metric).  So the family
+-- advertises exactly those two orderings:
 --
--- WHAT THE INDEX ORDERING IS, AND WHERE IT DIVERGES FROM THE OPERATOR.  The scan
--- returns the vector channel's top-k by the weft's own metric over QUANTIZED codes,
--- and that differs from an exact `<=>` evaluated on the heap for two independent
--- reasons, both recorded rather than hidden:
+--   OPERATOR 1  `<->`  wvec_l2_distance: sqrt(sum of squares), non-negative, and
+--               ascending is nearest-first.  The weft scores l2 as -||q-v||^2
+--               (higher is better), so the index's ordering value is -score.
+--   OPERATOR 4  `<#>`  wvec_negative_inner_product: -sum(a_i b_i), which is
+--               pgvector's convention (declared as such in
+--               sql/pg_weave--0.1.0--0.2.0.sql) precisely so that ascending order
+--               returns the LARGEST inner product first.  The weft's ip score
+--               domain is higher-is-better too, so again -score ascending.
 --
---   1. The codes are quantized (4 bits per dimension by default), so near-ties
---      reorder freely.  This is what an ANN index is; sql/vecorderby.sql RECORDS the
---      number of positions that differ instead of asserting they do not.
---   2. `<=>` is named for cosine distance -- src/am/fusepath.c recovers cosine
---      similarity from it as 1 - d -- while the weft's metric is the `metric`
---      reloption, default l2, because include/weave/vecscan.h REFUSES cosine: a
---      sound compressed-domain bound for it has to switch on the sign of the
---      numerator and no maximum true norm is stored, and a channel with an unsound
---      bound violates contract (C2) silently.  For unit-normalized vectors -- what
---      every embedding model this is aimed at produces -- cosine, l2 and inner
---      product induce the SAME ordering, so the two agree; for unnormalized ones
---      they do not.  doc/specs/VECTOR_CHANNEL.md sect. 8b holds the eventual fix,
---      which is one operator family per metric (wvec_l2_ops, wvec_ip_ops), and that
---      is a task rather than a line: it needs a second opclass, a second registry
---      row, and a migration for existing indexes.  Shipping the operator every
---      pgvector user writes, with the divergence written down here and measured in
---      the regression suite, is the smaller honest step.
+-- `<=>` IS DELIBERATELY NOT A MEMBER, and this is the correction to F7 as first
+-- written (2026-09-21), which registered it.  `<=>` is cosine distance; the scan
+-- core refuses cosine (no maximum true norm is stored, so a sound compressed-domain
+-- bound would have to switch on the sign of the numerator, and an unsound bound
+-- violates contract (C2) silently), and an index WITH (metric = 'cosine') cannot be
+-- built at all -- src/am/am.c's weave_index_vec_metric() throws at CREATE INDEX.
+-- A cosine member could therefore only ever be served in l2 or ip order, which is a
+-- WRONG ANSWER rather than an approximation: as shipped, the index answered an l2
+-- ordering under a cosine operator, and sql/vecorderby.sql's "divergence" section
+-- was measuring exactly that while attributing it to quantization.  With no member,
+-- `ORDER BY v <=> q` gets no index path and is answered by a Sort, which is honest;
+-- sql/vecorderby.sql now asserts that plan.
 --
--- The scan therefore leaves xs_recheckorderby FALSE: asking the executor to reorder
--- within a queue would require the index's value to be a proven LOWER BOUND on the
--- operator's, and a quantized score is not one.
+-- THE NUMBERS ARE DECISIONS.  Strategy numbers are scoped to an operator FAMILY,
+-- not to the access method: sk_strategy is resolved against the family of the index
+-- column the key matched, so wdoc_lex_ops's 1 (`@@@`) and gram_ops's 1 (`@~`) are
+-- already different operators with the same number.  1 is chosen for `<->` because
+-- it is the only number with no ORDER BY meaning anywhere in this access method --
+-- wdoc_lex_ops spends 2 on `<=>` (BM25 distance) and 3 on `<@>` (edit distance),
+-- both ORDER BY members, while its 1 is the restriction operator `@@@`, which can
+-- never appear in orderByData.  src/am/amscan.c's weave_rescan() dispatches ORDER BY
+-- keys on sk_strategy ALONE, so the second vector member needs a number of its own
+-- rather than sharing 1: two members that differ only in the metric they name are
+-- distinguishable only by the number.  Hence 4 -- which is why
+-- amroutine->amstrategies was raised from 3 to 4 (src/am/am.c, weave_handler): ALTER
+-- OPERATOR FAMILY validates a member number against amstrategies, so the bump is a
+-- precondition of `<#>` existing.  The constants are WEAVE_STRAT_VEC_L2 and
+-- WEAVE_STRAT_VEC_IP in include/weave/am.h.
 --
--- NO NEW FUNCTION AND NO NEW OPERATOR.  `<=>` on (wvec, wvec) has existed since
--- 0.1.0--0.2.0 (wvec_cosine_distance), it is already IMMUTABLE and PARALLEL SAFE,
--- and it is already the operator fuse() recognizes.  All F7 adds is its membership
--- in the family, which is what turns it from a function the executor evaluates
--- per row into an ordering the index can serve.
+-- A MISMATCH IS REFUSED, NOT ANSWERED.  The metric is a reloption, which the
+-- planner cannot see, so nothing stops it from matching `<->` to an `ip` index.
+-- weave_rescan() compares the two and throws, naming the operator and the index's
+-- metric.  doc/specs/VECTOR_CHANNEL.md sect. 8b holds the fix that makes it a
+-- planner decision instead: one operator family per metric (wvec_l2_ops,
+-- wvec_ip_ops), which needs a second opclass, a second registry row and a migration
+-- for existing indexes, and is therefore a task rather than a line.
+--
+-- WHAT STILL DIVERGES FROM AN EXACT ORDERING, now that the metric does not: the
+-- codes are QUANTIZED (4 bits per dimension by default), so near-ties reorder
+-- freely.  That is what an ANN index is, and sql/vecorderby.sql RECORDS the number
+-- of positions that differ instead of asserting they do not.  The scan therefore
+-- leaves xs_recheckorderby FALSE: asking the executor to reorder within a queue
+-- would require the index's value to be a proven LOWER BOUND on the operator's, and
+-- a quantized score is not one.
+--
+-- NO NEW FUNCTION AND NO NEW OPERATOR.  `<->` and `<#>` on (wvec, wvec) have
+-- existed since 0.1.0--0.2.0, both IMMUTABLE and PARALLEL SAFE.  All F7 adds is
+-- their membership in the family, which is what turns a function the executor
+-- evaluates per row into an ordering the index can serve.
 ALTER OPERATOR FAMILY wvec_weave_ops USING weave ADD
-    OPERATOR 1 <=> (wvec, wvec) FOR ORDER BY pg_catalog.float_ops;
+    OPERATOR 1 <-> (wvec, wvec) FOR ORDER BY pg_catalog.float_ops,
+    OPERATOR 4 <#> (wvec, wvec) FOR ORDER BY pg_catalog.float_ops;
 
 COMMENT ON OPERATOR CLASS wvec_weave_ops USING weave IS
-    'index a wvec column as the vector channel of a weave index; ORDER BY col <=> query drives an index ordering scan';
+    'index a wvec column as the vector channel of a weave index; ORDER BY col <-> query (metric l2) or col <#> query (metric ip) drives an index ordering scan';

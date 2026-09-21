@@ -28,9 +28,10 @@
 -- test/hegel/test_kernels.c, pinning removes the host from the expected output --
 -- which is what lets the divergence COUNTS below be numbers instead of ranges.
 CREATE EXTENSION IF NOT EXISTS pg_weave;
+NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
+NOTICE:  version "0.15.0" of extension "pg_weave" is already installed
 SET pg_weave.vec_kernel = 'scalar';
-
 -- enable_seqscan=off is how we test PATH GENERATION rather than cost (see
 -- sql/orderby.sql): if the AM can produce an ordering path the planner takes it, and
 -- if it cannot the planner falls back to Seq Scan even at disable_cost.  So a Seq
@@ -38,7 +39,6 @@ SET pg_weave.vec_kernel = 'scalar';
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = on;
-
 -- 300 documents, 8 dimensions, one bolt.  The vectors are a deterministic spread
 -- rather than random so every number in this file is reproducible.  `band` gives a
 -- lexical token that selects 30 rows and `tag<g>` one that selects exactly one, both
@@ -52,10 +52,13 @@ INSERT INTO vo(d, v)
     FROM generate_series(1, 300) g;
 CREATE INDEX vo_weave ON vo USING weave (d, v);
 ANALYZE vo;
-
 -- One bolt, 300 lanes, metric l2 (WEAVE_METRIC_L2 == 1, the reloption default).
 SELECT count(*) AS wefts, sum(nvec) AS lanes, min(metric) AS metric
   FROM weave_vec_meta('vo_weave');
+ wefts | lanes | metric 
+-------+-------+--------
+     1 |   300 |      1
+(1 row)
 
 -- ROW <-> DOCID, so a plan's rows can be compared with the scan SRF's output.
 --
@@ -84,13 +87,23 @@ CREATE TEMP TABLE vomap AS
     JOIN (SELECT docid, row_number() OVER (ORDER BY docid) AS rn
             FROM weave_vec_lanes('vo_weave')) l USING (rn);
 SELECT count(*) = (SELECT count(*) FROM vo) AS map_covers_every_row FROM vomap;
-SET enable_seqscan = off;
+ map_covers_every_row 
+----------------------
+ t
+(1 row)
 
+SET enable_seqscan = off;
 -- ============================================================================
 -- (1) THE PLAN.  Index Scan with an Order By, no Sort.
 -- ============================================================================
 EXPLAIN (COSTS OFF)
 SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 5;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Limit
+   ->  Index Scan using vo_weave on vo
+         Order By: (v <-> '[7,7,7,7,7,7,7,7]'::wvec)
+(3 rows)
 
 -- The LIMIT-LESS form too, because that is what the lexical channel supports: task
 -- L7's sql/orderby.sql drains `ORDER BY d <=> q` with no LIMIT and with a cursor,
@@ -100,10 +113,21 @@ SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 5;
 -- query's LIMIT, so correctness cannot depend on the planner's estimate of one.
 EXPLAIN (COSTS OFF)
 SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Index Scan using vo_weave on vo
+   Order By: (v <-> '[7,7,7,7,7,7,7,7]'::wvec)
+(2 rows)
 
 -- ...and a second query point, so the plan is not an artefact of one constant.
 EXPLAIN (COSTS OFF)
 SELECT id FROM vo ORDER BY v <-> '[90,80,70,60,50,40,30,20]'::wvec LIMIT 10;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Limit
+   ->  Index Scan using vo_weave on vo
+         Order By: (v <-> '[90,80,70,60,50,40,30,20]'::wvec)
+(3 rows)
 
 -- ============================================================================
 -- (2) THE ROWS EQUAL weave_vec_scan() AT THE SAME k.
@@ -121,7 +145,6 @@ SELECT id FROM vo ORDER BY v <-> '[90,80,70,60,50,40,30,20]'::wvec LIMIT 10;
 -- which is exactly (segno, warp).
 -- ============================================================================
 CREATE TEMP TABLE voarm (arm text, ids int[]);
-
 INSERT INTO voarm
   SELECT 'idx1', array_agg(id)
     FROM (SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 1) i;
@@ -129,7 +152,6 @@ INSERT INTO voarm
   SELECT 'srf1', array_agg(m.id ORDER BY s.score DESC, s.segno, s.warp)
     FROM weave_vec_scan('vo_weave', '[7,7,7,7,7,7,7,7]'::wvec, 1) s
     JOIN vomap m USING (docid);
-
 INSERT INTO voarm
   SELECT 'idx5', array_agg(id)
     FROM (SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 5) i;
@@ -137,7 +159,6 @@ INSERT INTO voarm
   SELECT 'srf5', array_agg(m.id ORDER BY s.score DESC, s.segno, s.warp)
     FROM weave_vec_scan('vo_weave', '[7,7,7,7,7,7,7,7]'::wvec, 5) s
     JOIN vomap m USING (docid);
-
 -- k = 100 is past the first rung of the ladder: the initial width is
 -- weave_ord_width(pg_weave.wand_initial_k), which floors at 64, so serving 100 rows
 -- REQUIRES a widening and the concatenation of two passes must equal one wide pass.
@@ -148,7 +169,6 @@ INSERT INTO voarm
   SELECT 'srf100', array_agg(m.id ORDER BY s.score DESC, s.segno, s.warp)
     FROM weave_vec_scan('vo_weave', '[7,7,7,7,7,7,7,7]'::wvec, 100) s
     JOIN vomap m USING (docid);
-
 -- k LARGER THAN THE TABLE.  Both arms must terminate and return every row exactly
 -- once -- the ladder's stop has to be a PROOF (the pass returned fewer hits than it
 -- asked for, or it was as wide as the lane count), not a ceiling of the access
@@ -160,12 +180,10 @@ INSERT INTO voarm
   SELECT 'srf1000', array_agg(m.id ORDER BY s.score DESC, s.segno, s.warp)
     FROM weave_vec_scan('vo_weave', '[7,7,7,7,7,7,7,7]'::wvec, 1000) s
     JOIN vomap m USING (docid);
-
 -- The bare LIMIT-less form has to agree with LIMIT 1000 row for row as well.
 INSERT INTO voarm
   SELECT 'idxall', array_agg(id)
     FROM (SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec) i;
-
 SELECT (SELECT ids FROM voarm WHERE arm = 'idx1')
          = (SELECT ids FROM voarm WHERE arm = 'srf1')    AS k1_index_equals_srf,
        (SELECT ids FROM voarm WHERE arm = 'idx5')
@@ -176,15 +194,35 @@ SELECT (SELECT ids FROM voarm WHERE arm = 'idx1')
          = (SELECT ids FROM voarm WHERE arm = 'srf1000') AS k1000_index_equals_srf,
        (SELECT ids FROM voarm WHERE arm = 'idxall')
          = (SELECT ids FROM voarm WHERE arm = 'idx1000') AS limitless_equals_limit1000;
+ k1_index_equals_srf | k5_index_equals_srf | k100_index_equals_srf | k1000_index_equals_srf | limitless_equals_limit1000 
+---------------------+---------------------+-----------------------+------------------------+----------------------------
+ t                   | t                   | t                     | t                      | t
+(1 row)
 
 -- Lengths, so an "equal" above that compared two NULLs would still fail here.
 SELECT arm, coalesce(array_length(ids, 1), 0) AS n FROM voarm ORDER BY arm;
+   arm   |  n  
+---------+-----
+ idx1    |   1
+ idx100  | 100
+ idx1000 | 300
+ idx5    |   5
+ idxall  | 300
+ srf1    |   1
+ srf100  | 100
+ srf1000 | 300
+ srf5    |   5
+(9 rows)
 
 -- A narrow prefix is the prefix of a wide answer.  A widening EXTENDS the scan:
 -- ordered[] survives, the rows already handed out are not re-probed and not
 -- re-emitted, and nothing a wider pass newly finds may outrank them.
 SELECT (SELECT ids FROM voarm WHERE arm = 'idx5')
          = (SELECT ids[1:5] FROM voarm WHERE arm = 'idx1000') AS top5_is_the_prefix_of_all;
+ top5_is_the_prefix_of_all 
+---------------------------
+ t
+(1 row)
 
 -- ============================================================================
 -- (3) THE QUANTIZER'S DIVERGENCE FROM AN EXACT FLOAT ORDERING, RECORDED AND NOT
@@ -214,7 +252,6 @@ SELECT (SELECT ids FROM voarm WHERE arm = 'idx5')
 -- worthless if one of them did not run the plan it claims: an "exact" arm answered
 -- by the index would record 0 and prove nothing.
 -- ============================================================================
-
 -- The EXACT arm: no index path at all, so the executor evaluates <-> per row.
 -- enable_seqscan goes back ON for this arm rather than leaving the Seq Scan
 -- disabled, because PostgreSQL 18 reports disabled nodes in EXPLAIN and 17 does
@@ -223,25 +260,42 @@ SET enable_seqscan = on;
 SET enable_indexscan = off;
 EXPLAIN (COSTS OFF)
 SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 25;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: ((v <-> '[7,7,7,7,7,7,7,7]'::wvec))
+         ->  Seq Scan on vo
+(4 rows)
+
 INSERT INTO voarm
   SELECT 'exact25', array_agg(id)
     FROM (SELECT id FROM vo
            ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec, id LIMIT 25) e;
-
 -- The INDEX arm, same query, same k.
 SET enable_seqscan = off;
 SET enable_indexscan = on;
 EXPLAIN (COSTS OFF)
 SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 25;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Limit
+   ->  Index Scan using vo_weave on vo
+         Order By: (v <-> '[7,7,7,7,7,7,7,7]'::wvec)
+(3 rows)
+
 INSERT INTO voarm
   SELECT 'index25', array_agg(id)
     FROM (SELECT id FROM vo
            ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 25) i;
-
 SELECT count(*) AS positions_differing_index_vs_exact
   FROM voarm a, voarm b, generate_series(1, 25) g
  WHERE a.arm = 'index25' AND b.arm = 'exact25'
    AND a.ids[g] IS DISTINCT FROM b.ids[g];
+ positions_differing_index_vs_exact 
+------------------------------------
+                                  4
+(1 row)
 
 -- The set overlap, as a number rather than a bound: positions may shuffle freely
 -- while the candidate set stays right, and a rerank window (task V10) consumes
@@ -251,6 +305,10 @@ SELECT count(*) AS overlap_of_index_top25_with_exact_top25
   FROM (SELECT unnest(ids) AS id FROM voarm WHERE arm = 'index25'
         INTERSECT
         SELECT unnest(ids) AS id FROM voarm WHERE arm = 'exact25') x;
+ overlap_of_index_top25_with_exact_top25 
+-----------------------------------------
+                                      25
+(1 row)
 
 -- ============================================================================
 -- (4) A RESTRICTION CLAUSE ALONGSIDE THE VECTOR ORDER BY.
@@ -271,17 +329,32 @@ SELECT count(*) AS overlap_of_index_top25_with_exact_top25
 EXPLAIN (COSTS OFF)
 SELECT id FROM vo WHERE d @@@ 'tag17'::wquery
  ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 5;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Limit
+   ->  Index Scan using vo_weave on vo
+         Index Cond: (d @@@ '''tag17'''::wquery)
+         Order By: (v <-> '[7,7,7,7,7,7,7,7]'::wvec)
+(4 rows)
 
 SELECT count(*) AS restricted_rows,
        bool_and(d @@@ 'tag17'::wquery) AS every_row_satisfies_the_qual
   FROM (SELECT id, d FROM vo WHERE d @@@ 'tag17'::wquery
          ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 5) s;
+ restricted_rows | every_row_satisfies_the_qual 
+-----------------+------------------------------
+               1 | t
+(1 row)
 
 -- 30 rows through the same path, and the same two properties.
 SELECT count(*) AS band3_rows,
        bool_and(d @@@ 'band3'::wquery) AS every_band3_row_satisfies_the_qual
   FROM (SELECT id, d FROM vo WHERE d @@@ 'band3'::wquery
          ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec) s;
+ band3_rows | every_band3_row_satisfies_the_qual 
+------------+------------------------------------
+         30 | t
+(1 row)
 
 -- ============================================================================
 -- (5) RESCAN.  Every field weave_rescan() adds is reset there, and this is what
@@ -298,7 +371,6 @@ INSERT INTO voq VALUES
   (2, '[90,80,70,60,50,40,30,20]'),
   (3, '[1,2,3,4,5,6,7,8]'),
   (4, '[0,0,0,0,0,0,0,0]');
-
 -- A correlated subquery: the ordering operand is an outer reference, so the index
 -- path is parameterized and is re-established per outer row.
 --
@@ -311,6 +383,16 @@ SET enable_seqscan = on;
 EXPLAIN (COSTS OFF)
 SELECT qid, (SELECT id FROM vo ORDER BY vo.v <-> voq.q LIMIT 1) AS nn
   FROM voq ORDER BY qid;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Sort
+   Sort Key: voq.qid
+   ->  Seq Scan on voq
+         SubPlan 1
+           ->  Limit
+                 ->  Index Scan using vo_weave on vo
+                       Order By: (v <-> voq.q)
+(7 rows)
 
 SELECT count(*) AS correlated_rescan_disagreements
   FROM voq
@@ -318,6 +400,10 @@ SELECT count(*) AS correlated_rescan_disagreements
        IS DISTINCT FROM
        (SELECT m.id FROM weave_vec_scan('vo_weave', voq.q, 1) s
           JOIN vomap m USING (docid));
+ correlated_rescan_disagreements 
+---------------------------------
+                               0
+(1 row)
 
 -- ... and a genuine nested loop over LATERAL, at k = 3 so the inner scan returns
 -- several rows per rescan and an ordpos that was not reset would show up as a
@@ -325,12 +411,24 @@ SELECT count(*) AS correlated_rescan_disagreements
 EXPLAIN (COSTS OFF)
 SELECT q.qid, n.id FROM voq q,
   LATERAL (SELECT id FROM vo ORDER BY vo.v <-> q.q LIMIT 3) n;
+                 QUERY PLAN                  
+---------------------------------------------
+ Nested Loop
+   ->  Seq Scan on voq q
+   ->  Limit
+         ->  Index Scan using vo_weave on vo
+               Order By: (v <-> q.q)
+(5 rows)
 
 SET enable_seqscan = off;
 SELECT count(*) AS lateral_rows,
        count(DISTINCT (qid, id)) AS lateral_distinct_pairs
   FROM (SELECT q.qid, n.id FROM voq q,
           LATERAL (SELECT id FROM vo ORDER BY vo.v <-> q.q LIMIT 3) n) t;
+ lateral_rows | lateral_distinct_pairs 
+--------------+------------------------
+           12 |                     12
+(1 row)
 
 SELECT count(*) AS lateral_rescan_disagreements
   FROM voq q
@@ -339,6 +437,10 @@ SELECT count(*) AS lateral_rescan_disagreements
        IS DISTINCT FROM
        (SELECT array_agg(m.id ORDER BY s.score DESC, s.segno, s.warp)
           FROM weave_vec_scan('vo_weave', q.q, 3) s JOIN vomap m USING (docid));
+ lateral_rescan_disagreements 
+------------------------------
+                            0
+(1 row)
 
 -- ============================================================================
 -- (6) SEVERAL BOLTS, MERGED INTO ONE ORDERING.
@@ -353,8 +455,11 @@ INSERT INTO vo(d, v)
   SELECT to_wdoc(string_agg('oversized' || g, ' ')),
          '[800,800,800,800,800,800,800,800]'
     FROM generate_series(1, 3000) g;
-
 SELECT count(*) AS wefts, sum(nvec) AS lanes FROM weave_vec_meta('vo_weave');
+ wefts | lanes 
+-------+-------
+     2 |   301
+(1 row)
 
 DROP TABLE vomap;
 SET enable_seqscan = on;    -- the query-less count again; see the first vomap block
@@ -364,12 +469,20 @@ CREATE TEMP TABLE vomap AS
     JOIN (SELECT docid, row_number() OVER (ORDER BY docid) AS rn
             FROM weave_vec_lanes('vo_weave')) l USING (rn);
 SELECT count(*) = (SELECT count(*) FROM vo) AS map_covers_every_row_2 FROM vomap;
-SET enable_seqscan = off;
+ map_covers_every_row_2 
+------------------------
+ t
+(1 row)
 
+SET enable_seqscan = off;
 -- Every lane of both bolts, in one ordering, each row once.
 SELECT count(*) AS rows_over_two_bolts,
        count(DISTINCT id) AS distinct_rows_over_two_bolts
   FROM (SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec) s;
+ rows_over_two_bolts | distinct_rows_over_two_bolts 
+---------------------+------------------------------
+                 301 |                          301
+(1 row)
 
 -- ... and it is the same ordering the SRF produces over the same two bolts.
 SELECT (SELECT array_agg(id)
@@ -379,6 +492,10 @@ SELECT (SELECT array_agg(id)
           FROM weave_vec_scan('vo_weave', '[7,7,7,7,7,7,7,7]'::wvec, 10) s
           JOIN vomap m USING (docid))
        AS two_bolt_top10_index_equals_srf;
+ two_bolt_top10_index_equals_srf 
+---------------------------------
+ t
+(1 row)
 
 -- The oversized row is an exact match for its own vector and lives in the SECOND
 -- bolt, so a query at that point must reach it -- an ordering that scanned only
@@ -386,6 +503,10 @@ SELECT (SELECT array_agg(id)
 SELECT (SELECT id FROM vo ORDER BY v <-> '[800,800,800,800,800,800,800,800]'::wvec
          LIMIT 1) = (SELECT max(id) FROM vo)
        AS second_bolt_row_is_reachable;
+ second_bolt_row_is_reachable 
+------------------------------
+ t
+(1 row)
 
 -- ============================================================================
 -- (7) AN INSERT THAT LANDS IN THE PENDING BUFFER.  doc/GAPS.md G29.
@@ -407,19 +528,31 @@ SELECT (SELECT id FROM vo ORDER BY v <-> '[800,800,800,800,800,800,800,800]'::wv
 -- ============================================================================
 INSERT INTO vo(d, v)
   VALUES (to_wdoc('order pendingtoken'), '[7,7,7,7,7,7,7,7]');
-
 -- seqscan back ON for this count: it is a query-less scan of an indexed table, which
 -- this AM prices out and refuses, and PG18 picks the refused path anyway when the seq
 -- scan is disabled.  See the first vomap block.
 SET enable_seqscan = on;
 SELECT count(*) AS table_rows FROM vo;
+ table_rows 
+------------
+        302
+(1 row)
+
 SET enable_seqscan = off;
 SELECT sum(nvec) AS lanes_before_flush FROM weave_vec_meta('vo_weave');
+ lanes_before_flush 
+--------------------
+                301
+(1 row)
 
 -- The lexical channel sees it immediately: weave_collect_matches() walks the
 -- pending page itself.  This asymmetry is the whole of G29.
 SELECT count(*) AS lexical_sees_the_pending_row
   FROM vo WHERE d @@@ 'pendingtoken'::wquery;
+ lexical_sees_the_pending_row 
+------------------------------
+                            1
+(1 row)
 
 -- The vector ordering scan does not: one fewer row than the table has, and the
 -- inserted row is not among them even though its vector IS the query.  The EXPLAIN
@@ -428,21 +561,55 @@ SELECT count(*) AS lexical_sees_the_pending_row
 -- opposite of what it claims.
 EXPLAIN (COSTS OFF)
 SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Index Scan using vo_weave on vo
+   Order By: (v <-> '[7,7,7,7,7,7,7,7]'::wvec)
+(2 rows)
+
 SELECT count(*) AS vec_rows_before_flush
   FROM (SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec) s;
+ vec_rows_before_flush 
+-----------------------
+                   301
+(1 row)
+
 SELECT count(*) AS pending_row_in_vec_answer_before_flush
   FROM (SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec) s
  WHERE s.id = (SELECT max(id) FROM vo);
+ pending_row_in_vec_answer_before_flush 
+----------------------------------------
+                                      0
+(1 row)
 
 -- After a flush the row is in a real weft (G23 is closed at the segment) and the
 -- ordering covers it.
 SELECT weave_merge('vo_weave');
+ weave_merge 
+-------------
+ t
+(1 row)
+
 SELECT sum(nvec) AS lanes_after_flush FROM weave_vec_meta('vo_weave');
+ lanes_after_flush 
+-------------------
+               302
+(1 row)
+
 SELECT count(*) AS vec_rows_after_flush
   FROM (SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec) s;
+ vec_rows_after_flush 
+----------------------
+                  302
+(1 row)
+
 SELECT count(*) AS pending_row_in_vec_answer_after_flush
   FROM (SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec) s
  WHERE s.id = (SELECT max(id) FROM vo);
+ pending_row_in_vec_answer_after_flush 
+---------------------------------------
+                                     1
+(1 row)
 
 -- ============================================================================
 -- (8) VISIBILITY, AND WHERE THE TIDs COME FROM.
@@ -480,25 +647,58 @@ CREATE INDEX voh_weave ON voh USING weave (d, v);
 ANALYZE voh;
 SET enable_seqscan = on;    -- query-less count; see the first vomap block
 SELECT count(*) AS hot_visible_rows FROM voh;
+ hot_visible_rows 
+------------------
+               40
+(1 row)
+
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF)
 SELECT id FROM voh ORDER BY v <-> '[5,5,5,5,5,5,5,5]'::wvec;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Index Scan using voh_weave on voh
+   Order By: (v <-> '[5,5,5,5,5,5,5,5]'::wvec)
+(2 rows)
+
 SELECT count(*) AS vec_rows_over_hot_chains
   FROM (SELECT id FROM voh ORDER BY v <-> '[5,5,5,5,5,5,5,5]'::wvec) s;
-DROP TABLE voh;
+ vec_rows_over_hot_chains 
+--------------------------
+                       40
+(1 row)
 
+DROP TABLE voh;
 -- A DELETE that is not yet vacuumed: the docid is still in the weft and the heap
 -- probe is what must drop it.  The count is the whole assertion -- a scan that
 -- skipped the probe would return the dead rows too.
 DELETE FROM vo WHERE id IN (SELECT id FROM vo ORDER BY id LIMIT 10);
 SET enable_seqscan = on;    -- query-less count; see the first vomap block
 SELECT count(*) AS visible_rows_after_delete FROM vo;
+ visible_rows_after_delete 
+---------------------------
+                       292
+(1 row)
+
 SET enable_seqscan = off;
 SELECT sum(nvec) AS lanes_still_in_the_weft FROM weave_vec_meta('vo_weave');
+ lanes_still_in_the_weft 
+-------------------------
+                     302
+(1 row)
+
 SELECT count(*) AS vec_rows_after_delete
   FROM (SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec) s;
+ vec_rows_after_delete 
+-----------------------
+                   292
+(1 row)
 
 SELECT bool_and(ok) AS all_invariants_hold FROM weave_check('vo_weave');
+ all_invariants_hold 
+---------------------
+ t
+(1 row)
 
 -- ============================================================================
 -- (9) AN INDEX WITH NO VECTOR CHANNEL falls through cleanly.  The operator is on
@@ -514,10 +714,26 @@ CREATE INDEX voe_weave ON voe USING weave (d, v);
 SELECT count(*) AS wefts, sum(nvec) AS lanes,
        (SELECT count(*) FILTER (WHERE live) FROM weave_vec_lanes('voe_weave')) AS live_lanes
   FROM weave_vec_meta('voe_weave');
+ wefts | lanes | live_lanes 
+-------+-------+------------
+     0 |       |          0
+(1 row)
+
 EXPLAIN (COSTS OFF)
 SELECT id FROM voe ORDER BY v <-> '[1,1,1,1,1,1,1,1]'::wvec LIMIT 5;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Limit
+   ->  Index Scan using voe_weave on voe
+         Order By: (v <-> '[1,1,1,1,1,1,1,1]'::wvec)
+(3 rows)
+
 SELECT count(*) AS rows_from_an_all_null_vector_column
   FROM (SELECT id FROM voe ORDER BY v <-> '[1,1,1,1,1,1,1,1]'::wvec LIMIT 5) s;
+ rows_from_an_all_null_vector_column 
+-------------------------------------
+                                   0
+(1 row)
 
 -- And an index with NO wvec column at all: the operator cannot be matched to any of
 -- its columns, so there is no index path and the planner sorts.  That is the
@@ -533,10 +749,22 @@ INSERT INTO vol(d, v) SELECT to_wdoc('lexonly tag' || g),
 CREATE INDEX vol_weave ON vol USING weave (d);
 EXPLAIN (COSTS OFF)
 SELECT id FROM vol ORDER BY v <-> '[1,1,1,1,1,1,1,1]'::wvec LIMIT 3;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: ((v <-> '[1,1,1,1,1,1,1,1]'::wvec))
+         ->  Seq Scan on vol
+(4 rows)
+
 SELECT count(*) AS rows_without_a_vector_channel
   FROM (SELECT id FROM vol ORDER BY v <-> '[1,1,1,1,1,1,1,1]'::wvec LIMIT 3) s;
-SET enable_seqscan = off;
+ rows_without_a_vector_channel 
+-------------------------------
+                             3
+(1 row)
 
+SET enable_seqscan = off;
 -- ============================================================================
 -- (10) A METRIC MISMATCH IS REFUSED, NOT ANSWERED.
 --
@@ -565,22 +793,48 @@ INSERT INTO voip(d, v)
     FROM generate_series(1, 20) g;
 CREATE INDEX voip_weave ON voip USING weave (d, v) WITH (metric = 'ip');
 ANALYZE voip;
-
 EXPLAIN (COSTS OFF)
 SELECT id FROM voip ORDER BY v <-> '[1,1,1,1,1,1,1,1]'::wvec LIMIT 3;
-SELECT id FROM voip ORDER BY v <-> '[1,1,1,1,1,1,1,1]'::wvec LIMIT 3;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Limit
+   ->  Index Scan using voip_weave on voip
+         Order By: (v <-> '[1,1,1,1,1,1,1,1]'::wvec)
+(3 rows)
 
+SELECT id FROM voip ORDER BY v <-> '[1,1,1,1,1,1,1,1]'::wvec LIMIT 3;
+ERROR:  operator <-> cannot order a weave index whose metric is ip
+DETAIL:  The vector weft is scored in one metric only, so an ordering by <-> would be returned in ip order.
+HINT:  Order by <#> instead, or build the index WITH (metric = 'l2').
 -- ... and the mirror image, on the default (l2) index of the main table.
 EXPLAIN (COSTS OFF)
 SELECT id FROM vo ORDER BY v <#> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 3;
-SELECT id FROM vo ORDER BY v <#> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 3;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Limit
+   ->  Index Scan using vo_weave on vo
+         Order By: (v <#> '[7,7,7,7,7,7,7,7]'::wvec)
+(3 rows)
 
+SELECT id FROM vo ORDER BY v <#> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 3;
+ERROR:  operator <#> cannot order a weave index whose metric is l2
+DETAIL:  The vector weft is scored in one metric only, so an ordering by <#> would be returned in l2 order.
+HINT:  Order by <-> instead, or build the index WITH (metric = 'ip').
 -- Each index serves its OWN operator, which is what makes the two refusals above a
 -- statement about the MISMATCH rather than about either member being unusable.
 SELECT count(*) AS ip_index_serves_ip
   FROM (SELECT id FROM voip ORDER BY v <#> '[1,1,1,1,1,1,1,1]'::wvec LIMIT 3) s;
+ ip_index_serves_ip 
+--------------------
+                  3
+(1 row)
+
 SELECT count(*) AS l2_index_serves_l2
   FROM (SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 3) s;
+ l2_index_serves_l2 
+--------------------
+                  3
+(1 row)
 
 -- ============================================================================
 -- (11) `<=>` IS NOT A MEMBER, AND THE PLAN SAYS SO.
@@ -599,10 +853,22 @@ SELECT count(*) AS l2_index_serves_l2
 SET enable_seqscan = on;
 EXPLAIN (COSTS OFF)
 SELECT id FROM vo ORDER BY v <=> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 5;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: ((v <=> '[7,7,7,7,7,7,7,7]'::wvec))
+         ->  Seq Scan on vo
+(4 rows)
+
 SELECT count(*) AS rows_from_the_cosine_sort
   FROM (SELECT id FROM vo ORDER BY v <=> '[7,7,7,7,7,7,7,7]'::wvec LIMIT 5) s;
-SET enable_seqscan = off;
+ rows_from_the_cosine_sort 
+---------------------------
+                         5
+(1 row)
 
+SET enable_seqscan = off;
 DROP TABLE voip;
 DROP TABLE vol;
 DROP TABLE voe;
