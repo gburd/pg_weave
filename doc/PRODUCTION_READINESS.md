@@ -203,9 +203,16 @@ when the scope was read as "BM25 + vector", then back when it was restated as al
 six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
 hard rule was weakened on an inference about scope rather than a question about it.*
 
-**39 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
+**39 of 72 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
 Z5, Z8, Z9) and 6 withdrawn (L2, L21, V9, V10, V13, **F4**). By phase: X 4/4, L 16/20,
-Z 7/9, V 9/17, P 2/4, **F 2/5**, M 0/6, R 0/5.
+Z 7/9, V 9/17, P 2/4, **F 2/7**, M 0/6, R 0/5. **Phase F grew by two rows on 2026-09-21**
+and both were found by reading the code before writing any: **F6**, a BM25 term shuttle
+(the lexical channel has none — ranked lexical is a WAND over `WandCursor`, and the fused
+core consumes only shuttles), and **F7**, an `ORDER BY` operator for the vector channel
+(`wvec_weave_ops` is `STORAGE` only, so a vector query cannot reach `amrescan`). Until both
+land, the fused scan the project's headline rests on has **nothing to fuse** — the two
+channels `FUSED_TOPK.md` §7's own example names are both unreachable as ORDER BY operands.
+That is recorded in §7a with the line references.
 
 **The lexical channel was re-measured on 2026-09-21 at two scales with a pg_fts arm for
 the first time, and it changes what this project may claim.** Against tsvector + GIN,
