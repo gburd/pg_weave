@@ -372,11 +372,53 @@ run_smoke() {
 		> "$OUT/tap.log" 2>/dev/null || true
 }
 
+# Ship and install the UPSTREAM fork, pg_fts, so bench/lexical.sh gets its third
+# arm.  Optional by design and never fatal: a host without it produces a two-arm
+# table with a banner, which is the honest degradation.  Returns non-zero when the
+# arm will not run, and the caller records that.
+#
+# Source comes from `git archive HEAD` of a local checkout, the same rule the
+# pg_weave upload follows and for the same reason -- only committed state is
+# measured, so a number can always be tied to a commit in BOTH projects.  Nothing
+# is cloned on the host: that would need credentials there, and the sibling
+# repository is not public.
+upload_pgfts() {
+	local root=${PGFTS_ROOT:-$HOME/ws/pg_fts}
+
+	if [ ! -d "$root/.git" ]; then
+		say "no pg_fts checkout at $root -- the fork-vs-fork arm will be SKIPPED"
+		return 1
+	fi
+	say "uploading pg_fts from $root"
+	git -C "$root" archive --format=tar --prefix=pg_fts/ HEAD \
+		| $SSH 'cat > /tmp/fts.tar && rm -rf ~/pg_fts && tar -xf /tmp/fts.tar -C ~' \
+		|| { say "pg_fts upload failed -- arm SKIPPED"; return 1; }
+	git -C "$root" rev-parse HEAD > "$OUT/pgfts_commit.txt"
+	git -C "$root" describe --tags --always > "$OUT/pgfts_version.txt" 2>/dev/null || true
+	say "pg_fts $(cat "$OUT/pgfts_version.txt" 2>/dev/null) $(cat "$OUT/pgfts_commit.txt")"
+
+	# The build is checked by its OWN exit status and by the artifact, in that
+	# order.  AGENTS.md's ninth verification-error member is a stale .so making a
+	# failed build look like a pass, so the tree is cleaned first.
+	$SSH 'cd pg_fts && make -s clean >/dev/null 2>&1; \
+		  make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/tmp/fts.build.log 2>&1 \
+		  && test -f pg_fts.so \
+		  && sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >>/tmp/fts.build.log 2>&1 \
+		  && echo PGFTS_INSTALL_OK || { echo PGFTS_INSTALL_FAILED; tail -20 /tmp/fts.build.log; }' \
+		2>&1 | tee "$OUT/pgfts_build.log" | grep -q PGFTS_INSTALL_OK \
+		|| { say "pg_fts build/install FAILED (see $OUT/pgfts_build.log) -- arm SKIPPED"; return 1; }
+	say "pg_fts installed"
+	return 0
+}
+
 run_lexical() {
 	# The comparison that decides adoption: pg_weave against the tsvector+GIN
 	# baseline every PostgreSQL user already has, on the same host and the same
-	# stored analyzed column.  Correctness is gated before any timing.
-	say "lexical benchmark vs tsvector+GIN"
+	# stored analyzed column -- plus, since 2026-09-21, against pg_fts, the
+	# project pg_weave was forked from, which is the only arm that separates an
+	# inherited number from an earned one.  Correctness is gated before any timing.
+	upload_pgfts || say "continuing with two arms; the results file must say so"
+	say "lexical benchmark vs tsvector+GIN and pg_fts"
 	$SSH "cd pg_weave && sudo -u postgres createuser -s ubuntu 2>/dev/null; \
 		  export PATH=/usr/lib/postgresql/17/bin:\$PATH PGDATABASE=weavebench; \
 		  bash bench/lexical.sh ${NDOCS:-1000000} ${VOCAB:-200000} 7" \

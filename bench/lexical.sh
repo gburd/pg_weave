@@ -1,11 +1,29 @@
 #!/usr/bin/env bash
 #
-# bench/lexical.sh -- pg_weave vs tsvector+GIN on the same corpus, same host.
+# bench/lexical.sh -- pg_weave vs tsvector+GIN vs pg_fts, same corpus, same host.
 #
 # tsvector + GIN is the baseline every PostgreSQL user already has, so beating it
 # is the minimum bar for anyone to install anything.  It is also the only
 # competitor guaranteed installable without third-party packages, which makes it
 # the one comparison that is always reproducible.
+#
+# THE pg_fts ARM, added 2026-09-21 (task P3).  pg_weave is a FORK of pg_fts and
+# had never been measured against it -- only against GIN -- so the one comparison
+# that isolates what this project's own changes are worth did not exist.  Every
+# lexical claim in doc/PHASES.md Phase L is a claim about code inherited from
+# pg_fts plus L7/L8/L12/L13/L14/L15/L17/L18 on top, and without this arm there was
+# no way to tell an inherited number from an earned one.
+#
+# The two forks present the same surface -- `to_ftsdoc(text)` / `ftsdoc @@@
+# ftsquery` / `ftsdoc <=> ftsquery` against `to_wdoc(text)` / `wdoc @@@ wquery` /
+# `wdoc <=> wquery` -- and different AM and type names (`fts`/`ftsdoc` against
+# `weave`/`wdoc`), so both extensions coexist in one database over one corpus and
+# the arms differ in nothing but the index.
+#
+# The arm is OPTIONAL and its absence is LOUD: if `CREATE EXTENSION pg_fts` fails
+# the run continues with two arms and prints a banner, and every pg_fts cell reads
+# `-`.  A silently missing arm in a results table is indistinguishable from an arm
+# that tied.
 #
 # Methodology, per .agent/skills/weave-bench:
 #	 - warm, median of N with the first run dropped
@@ -33,6 +51,25 @@ createdb "$DB" 2>/dev/null || true
 $PSQL -c "CREATE EXTENSION IF NOT EXISTS pg_weave;" >/dev/null
 $PSQL -c "ALTER EXTENSION pg_weave UPDATE;" >/dev/null 2>&1 || true
 
+# The optional third arm.  Recorded, not assumed: the version that answered is
+# printed, so a results file can never claim an arm it did not run.
+HAVE_FTS=0
+if $PSQL -c "CREATE EXTENSION IF NOT EXISTS pg_fts;" >/dev/null 2>&1; then
+    HAVE_FTS=1
+    $PSQL -c "ALTER EXTENSION pg_fts UPDATE;" >/dev/null 2>&1 || true
+fi
+say "provenance"
+$PSQL -c "SELECT extname, extversion FROM pg_extension
+           WHERE extname IN ('pg_weave','pg_fts') ORDER BY extname"
+$PSQL -t -A -c "SHOW default_text_search_config"
+if [ "$HAVE_FTS" = 0 ]; then
+    printf '\033[1;31m'
+    printf '!! pg_fts is NOT INSTALLED on this host: the fork-vs-fork arm is SKIPPED.\n'
+    printf '!! Every pg_fts cell below reads "-".  A results file written from this\n'
+    printf '!! run must say the arm did not run, not omit it.\n'
+    printf '\033[0m'
+fi
+
 say "corpus: $NDOCS docs, $VOCAB vocabulary"
 $PSQL -v ndocs="$NDOCS" -v vocab="$VOCAB" -f "$(dirname "$0")/corpus.sql"
 
@@ -55,8 +92,20 @@ $PSQL <<'SQL'
 ALTER TABLE docs ADD COLUMN d wdoc;
 ALTER TABLE docs ADD COLUMN tsv tsvector;
 UPDATE docs SET d = to_wdoc(body), tsv = to_tsvector('simple', body);
-VACUUM (ANALYZE) docs;
 SQL
+
+# The fork's column, built with the SAME one-argument analyzer entry point, so both
+# forks resolve `default_text_search_config` identically and the arms differ in the
+# index rather than in the tokenizer.  GIN's `'simple'` is the pre-existing choice
+# and is left alone; the corpus is synthetic `wordNNNNNN` tokens, so no stemmer or
+# stopword list can separate the three -- and the correctness gate below PROVES
+# that operationally rather than asserting it, by requiring all arms to return the
+# same match counts as a seq scan.
+if [ "$HAVE_FTS" = 1 ]; then
+    $PSQL -c "ALTER TABLE docs ADD COLUMN f ftsdoc" >/dev/null
+    $PSQL -c "UPDATE docs SET f = to_ftsdoc(body)" >/dev/null
+fi
+$PSQL -c "VACUUM (ANALYZE) docs" >/dev/null
 
 build() {
     local name=$1 ddl=$2
@@ -74,11 +123,16 @@ BUILD_WEAVE=$(build weave "CREATE INDEX weave_idx ON docs USING weave (d)")
 # from CREATE INDEX, and measuring only the compacted size hid gap G6 for four
 # benchmark runs.  Compaction is measured explicitly further down.
 BUILD_GIN=$(build gin "CREATE INDEX gin_idx ON docs USING gin (tsv)")
+BUILD_FTS='fts\t-\t-'
+if [ "$HAVE_FTS" = 1 ]; then
+    BUILD_FTS=$(build fts "CREATE INDEX fts_idx ON docs USING fts (f)")
+fi
 
 say "prewarming"
 $PSQL -c "SELECT count(*) FROM docs" >/dev/null
 $PSQL -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm" >/dev/null 2>&1 || true
 $PSQL -c "SELECT pg_prewarm('weave_idx'); SELECT pg_prewarm('gin_idx');" >/dev/null 2>&1 || true
+[ "$HAVE_FTS" = 1 ] && { $PSQL -c "SELECT pg_prewarm('fts_idx')" >/dev/null 2>&1 || true; }
 
 # ---------------------------------------------------------------------------
 # Correctness gate, before any timing.
@@ -90,11 +144,15 @@ for t in "$RARE" "$MID" "$COMMON" zzqrare; do
                           SELECT count(*) FROM docs WHERE body ~ ('\\m' || '$t' || '\\M')")
     wv=$($PSQL -t -A -c "SELECT count(*) FROM docs WHERE d @@@ '$t'::wquery")
     gn=$($PSQL -t -A -c "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$t')")
-    if [ "$ref" != "$wv" ] || [ "$ref" != "$gn" ]; then
-        printf '  MISMATCH %-12s seqscan=%s weave=%s gin=%s\n' "$t" "$ref" "$wv" "$gn"
+    ft='-'
+    [ "$HAVE_FTS" = 1 ] && ft=$($PSQL -t -A -c "SELECT count(*) FROM docs WHERE f @@@ '$t'::ftsquery")
+    if [ "$ref" != "$wv" ] || [ "$ref" != "$gn" ] ||
+       { [ "$HAVE_FTS" = 1 ] && [ "$ref" != "$ft" ]; }; then
+        printf '  MISMATCH %-12s seqscan=%s weave=%s gin=%s fts=%s\n' \
+            "$t" "$ref" "$wv" "$gn" "$ft"
         FAIL=1
     else
-        printf '  ok %-12s %s rows (all three agree)\n' "$t" "$ref"
+        printf '  ok %-12s %s rows (every arm agrees; fts=%s)\n' "$t" "$ref" "$ft"
     fi
 done
 [ "$FAIL" = 0 ] || { echo "ABORT: correctness failed; latency numbers would be meaningless" >&2; exit 1; }
@@ -185,11 +243,29 @@ planshape() {                   # planshape <sql>
       | cut -c1-38
 }
 
-row() {                         # row <label> <weave-sql> <gin-sql>
-    plan "$1 / weave" "$2"
-    plan "$1 / gin" "$3"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$1" \
-        "$(coldq "$2")" "$(warmq "$2")" "$(coldq "$3")" "$(warmq "$3")"
+# row <label> <weave-sql> <gin-sql> [fts-sql]
+#
+# The pg_fts columns are always PRINTED, as `-` when the arm did not run, so the
+# column count is fixed and the table stays parseable -- and so that a missing arm
+# reads as missing rather than as absent-because-irrelevant.
+row() {
+    local label=$1 wsql=$2 gsql=$3 fsql=${4:-}
+    # A real tab, not the two characters backslash-t: printf's %s does not
+    # interpret escapes in an ARGUMENT, so 'x\ty' would land in the table as the
+    # literal text and silently shift every column after it.
+    local fcold='-' fwarm=$'-\t-'
+
+    plan "$label / weave" "$wsql"
+    plan "$label / gin" "$gsql"
+    if [ "$HAVE_FTS" = 1 ] && [ -n "$fsql" ]; then
+        plan "$label / fts" "$fsql"
+        fcold=$(coldq "$fsql")
+        fwarm=$(warmq "$fsql")
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$label" \
+        "$(coldq "$wsql")" "$(warmq "$wsql")" \
+        "$(coldq "$gsql")" "$(warmq "$gsql")" \
+        "$fcold" "$fwarm"
 }
 
 # ---------------------------------------------------------------------------
@@ -212,7 +288,7 @@ say "==== max_parallel_workers_per_gather = $PAR ===="
 
 say "latency (ms): cold = first scan in a fresh backend; warm = p50/p99 in-session"
 {
-printf 'query\tweave_cold\tweave_p50\tweave_p99\tgin_cold\tgin_p50\tgin_p99\n'
+printf 'query\tweave_cold\tweave_p50\tweave_p99\tgin_cold\tgin_p50\tgin_p99\tfts_cold\tfts_p50\tfts_p99\n'
 for band in rare mid common; do
     case $band in rare) T=$RARE;; mid) T=$MID;; common) T=$COMMON;; esac
     for k in 10 100; do
@@ -224,7 +300,9 @@ for band in rare mid common; do
             "SELECT id FROM docs WHERE d @@@ '$T'::wquery
                ORDER BY d <=> '$T'::wquery LIMIT $k" \
             "SELECT id, ts_rank(tsv, to_tsquery('simple','$T')) r FROM docs
-               WHERE tsv @@ to_tsquery('simple','$T') ORDER BY r DESC LIMIT $k"
+               WHERE tsv @@ to_tsquery('simple','$T') ORDER BY r DESC LIMIT $k" \
+            "SELECT id FROM docs WHERE f @@@ '$T'::ftsquery
+               ORDER BY f <=> '$T'::ftsquery LIMIT $k"
     done
 done
 
@@ -245,38 +323,51 @@ for band in rare common; do
     row "bare_orderby_${band}" \
         "SELECT id FROM docs ORDER BY d <=> '$T'::wquery LIMIT 10" \
         "SELECT id, ts_rank(tsv, to_tsquery('simple','$T')) r FROM docs
-           ORDER BY r DESC LIMIT 10"
+           ORDER BY r DESC LIMIT 10" \
+        "SELECT id FROM docs ORDER BY f <=> '$T'::ftsquery LIMIT 10"
 done
 row count_common \
     "SELECT count(*) FROM docs WHERE d @@@ '$COMMON'::wquery" \
-    "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$COMMON')"
+    "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$COMMON')" \
+    "SELECT count(*) FROM docs WHERE f @@@ '$COMMON'::ftsquery"
 row count_AND \
     "SELECT count(*) FROM docs WHERE d @@@ '$RARE & $MID'::wquery" \
-    "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$RARE & $MID')"
+    "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$RARE & $MID')" \
+    "SELECT count(*) FROM docs WHERE f @@@ '$RARE & $MID'::ftsquery"
 row count_prefix \
     "SELECT count(*) FROM docs WHERE d @@@ 'word0001*'::wquery" \
-    "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','word0001:*')"
+    "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','word0001:*')" \
+    "SELECT count(*) FROM docs WHERE f @@@ 'word0001*'::ftsquery"
 } | column -t
 
 say "plan shapes (a [NO-INDEX] here explains a flat latency curve)"
 {
-printf 'query\tweave_plan\tgin_plan\n'
+ftsshape() {                    # ftsshape <sql>; '-' when the arm did not run
+    [ "$HAVE_FTS" = 1 ] || { printf -- '-'; return; }
+    planshape "$1"
+}
+printf 'query\tweave_plan\tgin_plan\tfts_plan\n'
 for band in rare common; do
     case $band in rare) T=$RARE;; common) T=$COMMON;; esac
-    printf 'ranked_%s\t%s\t%s\n' "$band" \
+    printf 'ranked_%s\t%s\t%s\t%s\n' "$band" \
       "$(planshape "SELECT id FROM docs WHERE d @@@ '$T'::wquery
                       ORDER BY d <=> '$T'::wquery LIMIT 10")" \
       "$(planshape "SELECT id, ts_rank(tsv, to_tsquery('simple','$T')) r FROM docs
-                      WHERE tsv @@ to_tsquery('simple','$T') ORDER BY r DESC LIMIT 10")"
+                      WHERE tsv @@ to_tsquery('simple','$T') ORDER BY r DESC LIMIT 10")" \
+      "$(ftsshape "SELECT id FROM docs WHERE f @@@ '$T'::ftsquery
+                      ORDER BY f <=> '$T'::ftsquery LIMIT 10")"
 done
-printf 'count_common\t%s\t%s\n' \
+printf 'count_common\t%s\t%s\t%s\n' \
   "$(planshape "SELECT count(*) FROM docs WHERE d @@@ '$COMMON'::wquery")" \
-  "$(planshape "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$COMMON')")"
-printf 'count_AND\t%s\t%s\n' \
+  "$(planshape "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$COMMON')")" \
+  "$(ftsshape "SELECT count(*) FROM docs WHERE f @@@ '$COMMON'::ftsquery")"
+printf 'count_AND\t%s\t%s\t%s\n' \
   "$(planshape "SELECT count(*) FROM docs WHERE d @@@ '$RARE & $MID'::wquery")" \
-  "$(planshape "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$RARE & $MID')")"
-printf 'bare_orderby\t%s\t-\n' \
-  "$(planshape "SELECT id FROM docs ORDER BY d <=> '$RARE'::wquery LIMIT 10")"
+  "$(planshape "SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('simple','$RARE & $MID')")" \
+  "$(ftsshape "SELECT count(*) FROM docs WHERE f @@@ '$RARE & $MID'::ftsquery")"
+printf 'bare_orderby\t%s\t-\t%s\n' \
+  "$(planshape "SELECT id FROM docs ORDER BY d <=> '$RARE'::wquery LIMIT 10")" \
+  "$(ftsshape "SELECT id FROM docs ORDER BY f <=> '$RARE'::ftsquery LIMIT 10")"
 } | column -t
 
 say "full plans"
@@ -341,7 +432,19 @@ done
 } | column -t
 
 say "build time (s) and index size AS BUILT"
-printf 'engine\tbuild_s\tsize\n%s\n%s\n' "$BUILD_WEAVE" "$BUILD_GIN" | column -t
+printf 'engine\tbuild_s\tsize\n%s\n%s\n%b\n' \
+    "$BUILD_WEAVE" "$BUILD_GIN" "$BUILD_FTS" | column -t
+
+# The fork's own size and segment count, for the one comparison where pg_weave's
+# format changes (L8, L12, L17, L18) should show up as bytes rather than as
+# milliseconds.  Its as-built size is the number to compare against pg_weave's
+# AS BUILT figure above, not against the compacted one.
+if [ "$HAVE_FTS" = 1 ]; then
+    say "pg_fts index size and segments AS BUILT"
+    $PSQL -t -A -c "SELECT 'fts as-built: ' || pg_size_pretty(pg_relation_size('fts_idx'))"
+    $PSQL -t -A -c "SELECT 'fts segments: ' || fts_index_nsegments('fts_idx')" 2>/dev/null \
+        || echo "fts segments: (no fts_index_nsegments in this version)"
+fi
 
 say "heap"
 $PSQL -t -A -c "SELECT pg_size_pretty(pg_total_relation_size('docs'))"
