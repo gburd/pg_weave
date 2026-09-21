@@ -1263,6 +1263,8 @@ weave_page_kind_name(WeavePageKind kind)
 		case WEAVE_PK_PENDING:
 			return "pending_v8";
 		case WEAVE_PK_PENDING_V9:
+			return "pending_v9";
+		case WEAVE_PK_PENDING_V10:
 			return "pending";
 		case WEAVE_PK_TRGM:
 			return "trigram_dir";

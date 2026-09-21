@@ -159,6 +159,18 @@ source file only.
    the way it merges the lexical weft. Until that exists, a cgram index does not
    compact. **This benchmark did not exercise it** (one bolt, no flush), so the
    cost of never merging is **unmeasured**.
+
+   **SUPERSEDED 2026-09-21 (`doc/GAPS.md` G34).** The structural claim above is
+   wrong in its second half and the error is worth keeping visible: a merge does
+   not need the column's TEXT, it needs the PAIRS, and an input bolt's cgram weft
+   already holds them. `weave_cgram_merge_append()` reads them back and feeds the
+   ordinary writer, so a group in which EVERY bolt carries a weft now merges. A
+   group in which only some do is still refused — the output weft has to cover
+   every document of the merged bolt or it is a false negative. What the fix does
+   not fix: the re-accumulation is not streaming (16 bytes per pair of the whole
+   group, ~930 B/document at the measured 58.1 pairs), bounded only by
+   `WEAVE_CGRAM_MAX_PAIRS`, past which the weft is omitted. Still **unmeasured**
+   at scale.
 2. **A post-build `INSERT` is correct but not accelerated.** A `WeavePendingItem`
    carries the analyzed `wdoc` and the row's `wvec`, not the raw text, so a bolt
    written by `weave_flush_pending()` has no cgram weft. The route then contributes
@@ -166,6 +178,14 @@ source file only.
    filters it exactly, so the row is found — the same shape as `doc/GAPS.md` G23
    before V7's second half closed it, with the same remedy (widen the item).
    `sql/cgram.sql` asserts the correctness half; the latency cost is unmeasured.
+
+   **SUPERSEDED 2026-09-21 (`doc/GAPS.md` G35).** The item now carries the raw
+   text and the flush runs the ordinary producer, so a flushed bolt has a real
+   weft. One number in the description above was also understated: because
+   `weave_cgram_collect()` uses no bolt's weft unless EVERY live bolt has one, the
+   cost was not "this row is not accelerated" but "no `@~` query in this index is
+   accelerated until the next REINDEX". `sql/cgram.sql`'s `served_after_flush`
+   reads 0 before the fix and 1 after. Still **unmeasured** as a latency.
 3. **Byte trigrams, not character trigrams.** `weave_trigrams()` hashes three
    consecutive BYTES of the server-encoded value, and a trigram may straddle two
    multi-byte characters. Sound as a candidate filter because both sides are hashed

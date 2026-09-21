@@ -197,6 +197,12 @@ static void weave_cgram_accum_reset(WeaveCgramAccum *acc);
 static void weave_cgram_accum_add(WeaveCgramAccum *acc, ItemPointer tid,
 								  Datum value, bool isnull);
 
+/* Defined down with the merge rules, declared here because
+ * weave_merge_group_to_seg() sits ABOVE them and has to apply the same rule the
+ * selectors do -- see the chokepoint comment there. */
+static bool weave_segs_cgram_agree(Relation index, const WeaveSegMeta *segs,
+								   uint32 nsegs, uint32 *nwith_out);
+
 typedef struct WeaveBuildState
 {
 	MemoryContext ctx;
@@ -236,23 +242,25 @@ typedef struct WeaveBuildState
 								 * reasoning as lexattno above. */
 	AttrNumber	cgramattno;		/* 1-based index attnum of the gram_ops text
 								 * column, or 0.  Same reasoning again. */
-	WeaveCgramAccum cgram;		/* Z8: this state's (trigram, docid) pairs.
-								 * INACTIVE on every path with no raw text to
-								 * read -- the merge (which has no heap tuple and
-								 * cannot reconstruct the column; see
-								 * weave_seg_mergeable) and the pending flush (a
-								 * WeavePendingItem carries the wdoc and the
-								 * wvec, not the text).  Both of those are why a
-								 * bolt may legitimately have no cgram weft. */
+	WeaveCgramAccum cgram;		/* Z8: this state's (trigram, docid) pairs.  Fed
+								 * from the RAW TEXT on the two paths that have a
+								 * heap tuple (the build callback and the oversized
+								 * insert), from the stored pending text on the
+								 * flush (doc/GAPS.md G35), and from the INPUT
+								 * BOLTS' OWN WEFTS on the merge (G34,
+								 * weave_cgram_merge_append) -- so the one thing
+								 * that still leaves it inactive is an index with
+								 * no gram_ops column, plus the merge of a group
+								 * in which only some bolts carry a weft. */
 	WeaveVecAccum vec;			/* producer 1: one lane per document this state
 								 * accumulated, in warp order.  INACTIVE on every
 								 * path that has no vector to accumulate -- the
-								 * merge (which skips vector-bearing bolts until
-								 * the merge producer lands, sect. 7.3) and the
-								 * pending flush (a WeavePendingItem carries the
-								 * wdoc and nothing else, so an inserted row's
-								 * vector is not available at flush time; see
-								 * doc/GAPS.md G23). */
+								 * merge of a group whose wefts disagree on a
+								 * geometry (sect. 7.3) and an index with no
+								 * vector column.  A pending item carries the
+								 * inserted row's vector since doc/GAPS.md G23
+								 * closed, so the flush is no longer one of
+								 * them. */
 } WeaveBuildState;
 
 /*
@@ -290,12 +298,13 @@ weave_build_vecattno(Relation index)
 /*
  * Which values[] slot holds the gram_ops text column, or 0 when the index has no
  * cgram column.  A third one-line wrapper rather than a combined call, for the
- * reason weave_build_vecattno() gives: the seven WeaveBuildState initializers do
- * not all want a cgram producer.  Only the two that scan the HEAP can have one --
- * the merge has no heap tuple and a pending item stores the wdoc and the wvec but
- * NOT the raw text, so neither can reconstruct a trigram.  A helper that returned
- * all three would make it easy to wire an accumulator into a path with nothing to
- * put in it.
+ * reason weave_build_vecattno() gives: the WeaveBuildState initializers do not
+ * all want a cgram producer.  The MERGE must not have one -- it has no heap tuple,
+ * and its pairs come from its inputs' wefts instead
+ * (weave_cgram_merge_append) -- so a helper that returned all three would make it
+ * easy to wire an accumulator into a path with nothing to put in it.  The pending
+ * FLUSH does want one: since doc/GAPS.md G35 closed, a pending item carries the
+ * raw text, so the flush reads this and runs the ordinary producer.
  */
 static AttrNumber
 weave_build_cgramattno(Relation index)
@@ -2244,6 +2253,46 @@ weave_cgram_accum_reset(WeaveCgramAccum *acc)
 }
 
 /*
+ * Append one (trigram, docid) pair.  Returns false once the per-segment cap is
+ * reached, having set `toobig` so the weft is OMITTED rather than truncated (see
+ * WEAVE_CGRAM_MAX_PAIRS for why absent is safe here and incomplete is not).
+ *
+ * THE CALLER MUST ALREADY BE IN acc->ctx: the array has to be seen by
+ * MemoryContextMemAllocated(bs->ctx), which is what bounds a build's peak by
+ * maintenance_work_mem instead of by the corpus.  Kept as a separate function
+ * because there are two producers -- a heap tuple's text (below) and another
+ * bolt's already-extracted postings (the merge, weave_cgram_merge_append) -- and
+ * the growth policy existing twice is how two callers start disagreeing about the
+ * cap that exists to stop a crash.
+ */
+static bool
+weave_cgram_accum_pair(WeaveCgramAccum *acc, uint32 trgm, uint64 docid)
+{
+	if (acc->npairs >= acc->cap)
+	{
+		Size		want = acc->cap ? acc->cap * 2 : 4096;
+
+		if (want > WEAVE_CGRAM_MAX_PAIRS)
+			want = WEAVE_CGRAM_MAX_PAIRS;
+		if (acc->npairs >= want)
+		{
+			acc->toobig = true;
+			return false;
+		}
+		/* corpus-scale: 58 pairs per document at 1M documents is 58M pairs */
+		acc->pairs = acc->pairs
+			? WEAVE_REALLOC_MAYBE_HUGE(acc->pairs, want * sizeof(WeaveCgramPair))
+			: WEAVE_ALLOC_MAYBE_HUGE(want * sizeof(WeaveCgramPair));
+		acc->cap = want;
+	}
+	acc->pairs[acc->npairs].docid = docid;
+	acc->pairs[acc->npairs].trgm = trgm;
+	acc->pairs[acc->npairs].pad = 0;
+	acc->npairs++;
+	return true;
+}
+
+/*
  * PRODUCER: this document's (trigram, docid) pairs.
  *
  * A value shorter than 3 bytes contributes NOTHING, and that is sound rather
@@ -2296,27 +2345,8 @@ weave_cgram_accum_add(WeaveCgramAccum *acc, ItemPointer tid, Datum value,
 	docid = weave_tid_to_docid(tid);
 	for (i = 0; i + 3 <= len; i++)
 	{
-		if (acc->npairs >= acc->cap)
-		{
-			Size		want = acc->cap ? acc->cap * 2 : 4096;
-
-			if (want > WEAVE_CGRAM_MAX_PAIRS)
-				want = WEAVE_CGRAM_MAX_PAIRS;
-			if (acc->npairs >= want)
-			{
-				acc->toobig = true;
-				break;
-			}
-			/* corpus-scale: 58 pairs per document at 1M documents is 58M pairs */
-			acc->pairs = acc->pairs
-				? WEAVE_REALLOC_MAYBE_HUGE(acc->pairs, want * sizeof(WeaveCgramPair))
-				: WEAVE_ALLOC_MAYBE_HUGE(want * sizeof(WeaveCgramPair));
-			acc->cap = want;
-		}
-		acc->pairs[acc->npairs].docid = docid;
-		acc->pairs[acc->npairs].trgm = weave_cgram_hash3(acc->fold + i);
-		acc->pairs[acc->npairs].pad = 0;
-		acc->npairs++;
+		if (!weave_cgram_accum_pair(acc, weave_cgram_hash3(acc->fold + i), docid))
+			break;
 	}
 
 	MemoryContextSwitchTo(old);
@@ -2517,6 +2547,166 @@ weave_build_cgram_weft(Relation index, WeaveCgramAccum *acc)
 	pfree(doclens);
 	return root;
 }
+/*
+ * PRODUCER 3 ON THE MERGE PATH (doc/GAPS.md G34): re-accumulate one input bolt's
+ * cgram weft as (trigram, docid) pairs, dropping tombstoned docids.
+ *
+ * WHY THIS AND NOT A K-WAY MERGE OF THE WEFTS.  The obvious construction, and the
+ * one G34 proposed, is a second MergeSource sweep: parameterize the dictionary
+ * cursor on (dictstart, dictindexstart), take the smallest key across sources and
+ * concatenate its posting lists.  It would be bounded to one key's postings at a
+ * time, which this is not -- but it also needs a SECOND writer for a weft whose
+ * one writer (weave_build_cgram_weft) already exists, and "one function writes a
+ * weft" is the rule doc/specs/VECTOR_CHANNEL.md sect. 7.3 states and that producer
+ * 2 obeys.  Two writers for one format is how a merged weft starts disagreeing
+ * with a built one in a way only a benchmark or a dropped row would show.
+ *
+ * WHAT IT COSTS, stated rather than discovered later: the pair array is 16 bytes
+ * per (trigram, docid) pair of the whole merged group, i.e. ~930 B per document at
+ * the 58.1 pairs/document measured in doc/specs/FUZZY_CHANNEL.md sect. 6 -- so
+ * compacting a 1M-document index wants ~930 MB, and this runs on VACUUM's cleanup
+ * path.  It is bounded, and the bound DEGRADES SAFELY: at WEAVE_CGRAM_MAX_PAIRS
+ * the accumulator sets `toobig`, weave_build_cgram_weft() omits the weft with a
+ * WARNING, and the merged bolt simply has none -- which is exactly the state every
+ * merged bolt was in before this change.  A streaming producer is the follow-up;
+ * it is an optimization, not a correctness fix, which is why it is not this
+ * commit.  doc/GAPS.md G34 records both.
+ *
+ * Returns false with *why set when the weft cannot be read.  The caller must then
+ * ABANDON the merge, and may only do so before its first page is written -- which
+ * is why this runs where producer 2 does.
+ */
+static bool
+weave_cgram_merge_append(Relation index, const WeaveSegMeta *seg,
+						 WeaveCgramAccum *acc,
+						 const uint8 *tombdense, uint64 tombdense_n,
+						 const char **why)
+{
+	WeaveCgramWeft w;
+	BlockNumber root = weave_cgram_weft_root(index, seg);
+	BlockNumber blk;
+	CgramDictEnt *ents = NULL;
+	Size		entcap = 0;
+	MemoryContext old;
+
+	if (root == InvalidBlockNumber)
+	{
+		*why = "the bolt carries no cgram weft";
+		return false;
+	}
+	if (!weave_cgram_weft_open(index, root, &w, why))
+		return false;
+
+	old = MemoryContextSwitchTo(acc->ctx);
+
+	blk = w.dictstart;
+	while (blk != InvalidBlockNumber)
+	{
+		Buffer		buffer;
+		Page		page;
+		char	   *ptr;
+		char	   *end;
+		BlockNumber next;
+		Size		n = 0;
+		Size		i;
+
+		CHECK_FOR_INTERRUPTS();	/* between pages, no lock held across yields */
+		buffer = ReadBuffer(index, blk);
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buffer);
+		if (!WeavePageHasKind(page, WEAVE_PK_CGRAM_DICT))
+		{
+			UnlockReleaseBuffer(buffer);
+			MemoryContextSwitchTo(old);
+			*why = "a page on the cgram dictionary chain is not a cgram dictionary page";
+			return false;
+		}
+		ptr = (char *) PageGetContents(page);
+		end = weave_page_entry_end(page);
+		next = WeavePageGetOpaque(page)->nextblk;
+
+		/*
+		 * Copy this page's entries out and RELEASE THE PAGE before decoding any
+		 * postings: the decode reads other buffers, and holding a content lock
+		 * across that is how a buffer-lock cycle gets built.  Same reason, same
+		 * shape as merge_source_load_page().
+		 */
+		while (ptr < end)
+		{
+			WeaveDictEntry *de = (WeaveDictEntry *) ptr;
+			const unsigned char *k;
+
+			if (!weave_dict_entry_fits(de, end))
+				break;			/* recycled/corrupt page: stop this page's walk */
+			if (de->termlen != WEAVE_CGRAM_KEYLEN)
+			{
+				UnlockReleaseBuffer(buffer);
+				MemoryContextSwitchTo(old);
+				*why = "a cgram dictionary entry's key is not four bytes";
+				return false;
+			}
+			if (n >= entcap)
+			{
+				entcap = entcap ? entcap * 2 : 512;
+				ents = ents
+					? repalloc(ents, entcap * sizeof(CgramDictEnt))	/* alloc-ok: bounded by one 8kB page -- the entry walk above is bounds-guarded, so n cannot exceed what a page holds */
+					: palloc(entcap * sizeof(CgramDictEnt));	/* alloc-ok: bounded by one 8kB page -- the entry walk above is bounds-guarded, so n cannot exceed what a page holds */
+			}
+			k = (const unsigned char *) de->term;
+			ents[n].trgm = ((uint32) k[0] << 24) | ((uint32) k[1] << 16) |
+				((uint32) k[2] << 8) | (uint32) k[3];
+			ents[n].df = de->df;
+			ents[n].firstposting = de->firstposting;
+			ents[n].firstoffset = de->firstoffset;
+			n++;
+			ptr += MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+		}
+		UnlockReleaseBuffer(buffer);
+
+		for (i = 0; i < n; i++)
+		{
+			WeavePosting *post;
+			uint32	   *posarena = NULL;
+			int			np;
+			int			p;
+
+			CHECK_FOR_INTERRUPTS();	/* per key */
+			/* docids_only: a cgram posting's tf is 1 and its doclen 0 by
+			 * construction, so the two columns are decoded by nobody.
+			 * has_doclen_col is a constant true -- the cgram writer keeps the
+			 * inline column precisely so this argument cannot be got wrong. */
+			np = weave_decode_term(index, ents[i].firstposting,
+								   ents[i].firstoffset, ents[i].df, &post,
+								   NULL, false, &posarena, true, true);
+			for (p = 0; p < np; p++)
+			{
+				uint64		dv = weave_tid_to_docid(&post[p].tid);
+
+				if (dv < tombdense_n &&
+					(tombdense[dv >> 3] & (uint8) (1u << (dv & 7))) != 0)
+					continue;	/* tombstoned: physically drop, as the lexical
+								 * merge does with the same bitmap */
+				if (!weave_cgram_accum_pair(acc, ents[i].trgm, dv))
+					break;		/* cap reached; the weft will be omitted */
+			}
+			pfree(post);
+			if (posarena)
+				pfree(posarena);
+			if (acc->toobig)
+				break;
+		}
+
+		if (acc->toobig)
+			break;				/* no point reading the rest: the weft is off */
+		blk = next;
+	}
+
+	if (ents)
+		pfree(ents);
+	MemoryContextSwitchTo(old);
+	return true;
+}
+
 /*
  * Write one immutable segment (dictionary + postings + trigram index) from a
  * populated build state, filling *seg.  The build state's terms must already
@@ -3122,6 +3312,7 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	WeaveVocab	voc;
 	BlockNumber surfroot;
 	BlockNumber vecroot;
+	BlockNumber cgramroot;
 	uint32		nout = 0;
 	uint32		i;
 	MemoryContext old = MemoryContextSwitchTo(bs->ctx);
@@ -3159,6 +3350,41 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 									   merge_src_dropped, &srcv[i], &why))
 				continue;
 			elog(DEBUG1, "pg_weave merge: index \"%s\": abandoning the merge, an input vector weft is unreadable (%s)",
+				 RelationGetRelationName(index),
+				 why != NULL ? why : "unknown");
+			{
+				uint32		j;
+
+				for (j = 0; j < nsel; j++)
+					weave_doclens_free(&srcv[j].doclens);
+			}
+			MemoryContextSwitchTo(old);
+			return false;
+		}
+	}
+
+	/*
+	 * PRODUCER 3 (doc/GAPS.md G34), and HERE for producer 2's reason: this is the
+	 * last point at which the merge can be abandoned for free, and an input weft
+	 * that turns out to be unreadable must cost a skipped merge rather than a leak.
+	 *
+	 * bs->cgram.active is true only when EVERY input carries a cgram weft -- the
+	 * callers establish that (weave_merge_selected, weave_merge_group_to_seg) and
+	 * it is what makes the output weft COMPLETE.  A weft covering only some of its
+	 * bolt's documents is a false negative, which is why a mixed group is refused
+	 * rather than merged with a partial weft.
+	 */
+	if (bs->cgram.active)
+	{
+		for (i = 0; i < nsel; i++)
+		{
+			const char *why = NULL;
+
+			if (weave_cgram_merge_append(index, &chosen[i], &bs->cgram,
+										 srcv[i].tombdense,
+										 srcv[i].tombdense_n, &why))
+				continue;
+			elog(DEBUG1, "pg_weave merge: index \"%s\": abandoning the merge, an input cgram weft is unreadable (%s)",
 				 RelationGetRelationName(index),
 				 why != NULL ? why : "unknown");
 			{
@@ -3233,9 +3459,10 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 		tbs.want_positions = bs->want_positions;
 		tbs.lexattno = bs->lexattno;
 		tbs.vecattno = 0;
-		/* No cgram producer either, and for a stronger reason than the vector
-		 * one: this path has no heap tuple at all, so the raw text a trigram
-		 * comes from does not exist here.  See weave_seg_mergeable(). */
+		/* No cgram producer on the PER-TERM state: the merge's cgram pairs are
+		 * gathered once for the whole group into bs->cgram before this loop starts
+		 * (producer 3), not per lexical term.  This state exists only to hold one
+		 * output term's postings. */
 		tbs.cgramattno = 0;
 		weave_cgram_accum_init(&tbs.cgram, termctx, false);
 		/* Inactive (active = false), so no weft is written and this width is
@@ -3437,9 +3664,18 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	 * tombstoned away, in which case the merged bolt costs zero vector bytes.
 	 */
 	vecroot = weave_vec_write_weft(index, &bs->vec);
-	/* No cgram root: a merge cannot produce one (weave_seg_mergeable refuses a
-	 * group containing a cgram-bearing bolt, so every input here has none). */
-	weave_attach_chandesc(index, seg, surfroot, vecroot, InvalidBlockNumber);
+	/*
+	 * Z8 cgram weft, from producer 3's accumulator -- the SAME writer the build and
+	 * the flush use, for the reason weave_cgram_merge_append() gives.
+	 * InvalidBlockNumber when no input carried a weft (the accumulator is
+	 * inactive), when every posting was tombstoned away, or when the pair cap was
+	 * reached -- and in all three cases the merged bolt carries no CGRAM descriptor
+	 * and costs zero cgram bytes.  Absent is safe on this channel; incomplete is
+	 * not, and nothing here can produce incomplete (see the producer-3 block
+	 * above).
+	 */
+	cgramroot = weave_build_cgram_weft(index, &bs->cgram);
+	weave_attach_chandesc(index, seg, surfroot, vecroot, cgramroot);
 
 	for (i = 0; i < nsel; i++)
 		weave_doclens_free(&srcv[i].doclens);
@@ -3536,6 +3772,7 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 	WeaveBuildState bs;
 	WeaveVecMeta vgeom;
 	uint32		nvecbolts = 0;
+	uint32		ncgrambolts = 0;
 
 	/*
 	 * The residual vector rule, at this second chokepoint.  The leader already
@@ -3551,6 +3788,14 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 		return false;
 	}
 
+	/* And the cgram rule, same chokepoint, same "should always pass" reasoning. */
+	if (!weave_segs_cgram_agree(index, group, ngroup, &ncgrambolts))
+	{
+		elog(DEBUG1, "pg_weave merge: index \"%s\": worker group mixes cgram-bearing and cgram-less bolts; group left alone",
+			 RelationGetRelationName(index));
+		return false;
+	}
+
 	bs.ctx = AllocSetContextCreate(CurrentMemoryContext, "weave merge group",
 								   ALLOCSET_DEFAULT_SIZES);
 	bs.want_positions = weave_index_wants_positions(index);
@@ -3560,10 +3805,11 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 	/* No producer 1 here: no heap tuple, no Datum.  Producer 2 is active exactly
 	 * when an input carries a weft (see weave_merge_selected for both halves). */
 	bs.vecattno = 0;
-	/* And no cgram producer: Z8 has no merge producer at all, so this path is
-	 * only ever reached for groups with no cgram weft (weave_seg_mergeable). */
+	/* PRODUCER 3, at this second chokepoint: a worker group in which only SOME
+	 * bolts carry a cgram weft is refused above for the same reason the leader
+	 * refuses one -- the merged weft would not cover every document of the bolt. */
 	bs.cgramattno = 0;
-	weave_cgram_accum_init(&bs.cgram, bs.ctx, false);
+	weave_cgram_accum_init(&bs.cgram, bs.ctx, ncgrambolts > 0);
 	weave_vec_accum_init(&bs.vec, bs.ctx, nvecbolts > 0, (int) vgeom.bits,
 						 (WeaveMetric) vgeom.metric);
 	if (nvecbolts > 0 &&
@@ -3634,42 +3880,73 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
  * doing now; this one decides whether it may happen at all.
  */
 static bool
-weave_seg_mergeable(Relation index, const WeaveSegMeta *seg, bool vecok)
+weave_seg_mergeable(Relation index, const WeaveSegMeta *seg, bool vecok,
+					bool cgramok)
 {
 	/*
-	 * Z8: A BOLT CARRYING A CGRAM WEFT IS NOT MERGEABLE, and this is the same
-	 * interim rule the vector weft had before its merge producer landed --
-	 * quoted above as "a merge SKIPS any group containing a vector-bearing
-	 * bolt".  The reason is sharper here, and it is worth stating because it
-	 * looks at first like an oversight:
+	 * Z8: A BOLT CARRYING A CGRAM WEFT IS MERGEABLE ONLY WHEN THE WHOLE DIRECTORY
+	 * AGREES, which is the vector rule's shape (`vecok`) and not an accident: what
+	 * a merge can produce is a property of the SET of inputs, not of one bolt.
 	 *
-	 *	 THE CGRAM WEFT CANNOT BE REBUILT FROM THE INDEX BY THE PATH THE MERGE
-	 *	 TAKES.  A merge streams DICTIONARY TERMS out of its input bolts; the
-	 *	 cgram weft's input is the RAW TEXT of the column, which a weave index
-	 *	 does not store.  So "rebuild it on merge" is not available at all
-	 *	 without re-reading the heap, which weave_merge_segments_streaming()
-	 *	 never does and must not start doing on VACUUM's cleanup path.
+	 * WHAT CHANGED AND WHY (doc/GAPS.md G34, closed).  This used to refuse every
+	 * cgram-bearing bolt unconditionally, on the grounds that the weft's input is
+	 * the raw column TEXT, which the index does not store, so a merge could not
+	 * reconstruct the output bolt's trigram vocabulary.  The second half of that is
+	 * simply false, and noticing it is the whole fix: the merge does not need the
+	 * TEXT, it needs the PAIRS, and the pairs are exactly what an input bolt's
+	 * cgram weft already contains.  weave_cgram_merge_append() reads them back and
+	 * feeds the ordinary writer.
 	 *
-	 *	 What IS available is a k-way merge of the cgram wefts themselves: they
-	 *	 are dictionary + postings in exactly the lexical shape, so MergeSource
-	 *	 parameterized on (dictstart, dictindexstart) would merge them the way it
-	 *	 merges the lexical weft.  That is the follow-up this rule exists to make
-	 *	 unnecessary for correctness, not an impossibility.
+	 * WHY THE REFUSAL COULD NOT SIMPLY STAY, once doc/GAPS.md G35 was closed.  With
+	 * the pending flush producing cgram-bearing bolts, "unmergeable" stopped being
+	 * a bounded cost: every flush would add a bolt no compaction could ever
+	 * consume, so the segment directory would climb to WEAVE_MAX_SEGMENTS and
+	 * weave_add_segment_with_room() would then ERROR -- turning a latency gap into
+	 * a FAILED INSERT.  The two gaps had to close together.
 	 *
-	 * DROPPING the weft on merge was the alternative, and it is rejected on the
-	 * grounds the comment above already sets out for the vector case: absent IS
-	 * safe on this channel (the scan route contributes the whole bolt's live
-	 * docid set when a bolt has no cgram weft, and the mandatory recheck keeps
-	 * the answer exact), so dropping would not be WRONG -- it would be a silent
-	 * and permanent performance cliff that only a benchmark could see, on the
-	 * one channel whose entire justification is a latency number.  A skipped
-	 * merge is visible in weave_segment_stats(); a silently de-accelerated index
-	 * is not.
+	 * MIXED DIRECTORIES KEEP THE OLD BEHAVIOUR (cgramok false): the cgram-bearing
+	 * bolts are excluded from candidate lists and the rest still compact.  The
+	 * output weft must cover EVERY document of the merged bolt or a pattern's AND
+	 * excludes a document that matches -- a dropped row, AGENTS.md hard rule 1 --
+	 * and a group containing a weft-less input cannot produce that.  A mixed
+	 * directory is already unaccelerated (weave_cgram_collect() uses no weft unless
+	 * every live bolt has one), so excluding those bolts costs nothing a query can
+	 * see, and REINDEX is the path back.
 	 */
-	if (weave_cgram_weft_root(index, seg) != InvalidBlockNumber)
+	if (weave_cgram_weft_root(index, seg) != InvalidBlockNumber && !cgramok)
 		return false;
 
 	return vecok || weave_vec_weft_root(index, seg) == InvalidBlockNumber;
+}
+
+/*
+ * Do the live bolts of this directory AGREE about carrying a cgram weft -- i.e.
+ * do all of them, or none?  One call, because like weave_segs_vec_agree() the
+ * answer is a property of the SET while the selectors below ask per candidate.
+ *
+ * "None" answers true because then no candidate is cgram-bearing and the rule
+ * above never consults this; keeping the two cases in one boolean means a
+ * selector cannot forget one of them.
+ */
+static bool
+weave_segs_cgram_agree(Relation index, const WeaveSegMeta *segs, uint32 nsegs,
+					   uint32 *nwith_out)
+{
+	uint32		nlive = 0;
+	uint32		nwith = 0;
+	uint32		i;
+
+	for (i = 0; i < nsegs && i < WEAVE_MAX_SEGMENTS; i++)
+	{
+		if (segs[i].dictstart == InvalidBlockNumber)
+			continue;			/* consumed slot */
+		nlive++;
+		if (weave_cgram_weft_root(index, &segs[i]) != InvalidBlockNumber)
+			nwith++;
+	}
+	if (nwith_out != NULL)
+		*nwith_out = nwith;
+	return nwith == 0 || nwith == nlive;
 }
 
 /* weave_vec_merge_geom() over every live bolt of the directory: do all the vector
@@ -3693,6 +3970,7 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	WeaveSegMeta chosen[WEAVE_MAX_SEGMENTS];
 	WeaveVecMeta vgeom;
 	uint32		nvecbolts = 0;
+	uint32		ncgrambolts = 0;
 	uint32		i;
 	double		indocs = 0;
 	instr_time	t0;
@@ -3736,20 +4014,14 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	 * their candidate lists, but weave_merge_selected() is reachable directly
 	 * from SQL (weave_merge_segments(regclass, int[])), so a rule enforced only
 	 * in the selectors is a rule an explicit merge request walks straight past --
-	 * dropping every cgram weft in the group.
+	 * and what it would walk past is no longer a dropped weft but an INCOMPLETE
+	 * one, i.e. a dropped row.
 	 */
+	if (!weave_segs_cgram_agree(index, chosen, nsel, &ncgrambolts))
 	{
-		uint32		ci;
-
-		for (ci = 0; ci < nsel; ci++)
-		{
-			if (weave_cgram_weft_root(index, &chosen[ci]) != InvalidBlockNumber)
-			{
-				elog(DEBUG1, "pg_weave merge: index \"%s\": skipping a group containing a cgram-bearing bolt (Z8 has no cgram merge producer)",
-					 RelationGetRelationName(index));
-				return false;
-			}
-		}
+		elog(DEBUG1, "pg_weave merge: index \"%s\": skipping a group in which only some bolts carry a cgram weft (the merged weft would not cover every document)",
+			 RelationGetRelationName(index));
+		return false;
 	}
 
 	elog(DEBUG1, "pg_weave merge: index \"%s\": merging %u of %u segments (%.0f live docs) into one",
@@ -3764,10 +4036,12 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	/* No PRODUCER 1 on a merge path: there is no heap tuple and no Datum here.
 	 * vecattno stays 0 so nothing looks for one (see weave_merge_group_to_seg). */
 	bs.vecattno = 0;
-	/* Same for the cgram weft, and see weave_seg_mergeable() for why a group
-	 * containing one never reaches here in the first place. */
+	/* PRODUCER 3: active exactly when EVERY input carries a cgram weft, which the
+	 * check above has just established.  cgramattno stays 0 because there is no
+	 * heap tuple to read a text from -- the pairs come from the inputs' own wefts
+	 * (weave_cgram_merge_append). */
 	bs.cgramattno = 0;
-	weave_cgram_accum_init(&bs.cgram, bs.ctx, false);
+	weave_cgram_accum_init(&bs.cgram, bs.ctx, ncgrambolts > 0);
 	/* PRODUCER 2: active exactly when an input carries a weft, and made ready for
 	 * pre-encoded lanes at the geometry the inputs agreed on -- not at the current
 	 * `bits` reloption, which may have changed since they were written. */
@@ -4055,10 +4329,12 @@ weave_merge_all_parallel(Relation index, int request)
 	nsrc = 0;
 	{
 		bool		vecok = weave_segs_vec_agree(index, &meta);
+		bool		cgramok = weave_segs_cgram_agree(index, meta.segs,
+													 meta.nsegments, NULL);
 
 		for (i = 0; i < (int) meta.nsegments; i++)
 			if (meta.segs[i].dictstart != InvalidBlockNumber &&
-				weave_seg_mergeable(index, &meta.segs[i], vecok))
+				weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok))
 				ms->src[nsrc++] = meta.segs[i];
 	}
 	ms->nsrc = nsrc;
@@ -4292,6 +4568,7 @@ weave_merge_all(Relation index, bool try_parallel)
 		uint32		ncand = 0;
 		uint32		i;
 		bool		vecok;
+		bool		cgramok;
 
 		{
 			Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
@@ -4314,9 +4591,10 @@ weave_merge_all(Relation index, bool try_parallel)
 		 * step per pass) and still reach a single segment.
 		 */
 		vecok = weave_segs_vec_agree(index, &meta);
+		cgramok = weave_segs_cgram_agree(index, meta.segs, meta.nsegments, NULL);
 		for (i = 0; i < meta.nsegments; i++)
 			if (meta.segs[i].dictstart != InvalidBlockNumber &&
-				weave_seg_mergeable(index, &meta.segs[i], vecok))
+				weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok))
 			{
 				cand[ncand].idx = i;
 				cand[ncand].size = meta.segs[i].ndocs - meta.segs[i].ndeleted;
@@ -4507,6 +4785,7 @@ weave_merge_segments(Relation index)
 		int			target = -1;
 		uint32		i;
 		bool		vecok;
+		bool		cgramok;
 
 		{
 			Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
@@ -4520,6 +4799,7 @@ weave_merge_segments(Relation index)
 
 		/* count runs per level */
 		vecok = weave_segs_vec_agree(index, &meta);
+		cgramok = weave_segs_cgram_agree(index, meta.segs, meta.nsegments, NULL);
 		memset(lvlcount, 0, sizeof(lvlcount));
 		for (i = 0; i < meta.nsegments; i++)
 		{
@@ -4529,7 +4809,7 @@ weave_merge_segments(Relation index)
 			 * candidate, so it must not count toward a level's occupancy either --
 			 * counting it would select a level whose runs cannot be merged and spin
 			 * the loop until the guard stopped it. */
-			if (!weave_seg_mergeable(index, &meta.segs[i], vecok))
+			if (!weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok))
 				continue;
 			lvlcount[weave_seg_level(meta.segs[i].ndocs - meta.segs[i].ndeleted)]++;
 		}
@@ -4572,8 +4852,8 @@ weave_merge_segments(Relation index)
 
 				if (meta.segs[i].dictstart == InvalidBlockNumber)
 					continue;
-				if (!weave_seg_mergeable(index, &meta.segs[i], vecok))
-					continue;	/* sect. 7.3 */
+				if (!weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok))
+					continue;	/* sect. 7.3, and the cgram rule */
 				sz = meta.segs[i].ndocs - meta.segs[i].ndeleted;
 				if (weave_seg_level(sz) != target)
 					continue;
@@ -5212,7 +5492,8 @@ weave_small_runs_worth_merging(Relation index)
 
 static void
 weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
-								 Datum vecval, bool vecisnull)
+								 Datum vecval, bool vecisnull,
+								 Datum gramval, bool gramisnull)
 {
 	WeaveBuildState bs;
 	WeaveTermEntry *entries = WEAVE_DOC_ENTRIES(doc);
@@ -5229,15 +5510,20 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 	 * it (doc/GAPS.md G23, closed).  A NULL vector still occupies its lane. */
 	bs.vecattno = weave_build_vecattno(index);
 	/*
-	 * NO CGRAM PRODUCER, and it is the same unclosed gap G23 was for vectors:
-	 * weave_insert() is handed the analyzed wdoc and the wvec, not the raw text
-	 * of the gram_ops column, so an oversized INSERT writes a bolt with no cgram
-	 * weft.  Absent is safe -- the route contributes that bolt's whole live docid
-	 * set and the mandatory recheck filters it -- so the row is FOUND, just not
-	 * accelerated.  Recorded rather than hidden: see bench/RESULTS_CGRAM.md.
+	 * THE CGRAM PRODUCER IS ACTIVE HERE (doc/GAPS.md G35, closed).  This path
+	 * writes a whole bolt inside the inserting statement, so it has the raw Datum
+	 * and needs nothing carried: it runs the same producer a build does.  Fixed in
+	 * the same change as the pending buffer and asserted separately in
+	 * sql/cgram.sql, because a fix to the buffer alone would look correct
+	 * everywhere else -- which is exactly what sql/pendingvec.sql says about the
+	 * vector half of this path.
+	 *
+	 * It matters more here than it looks: a bolt with no cgram weft makes
+	 * weave_cgram_collect() refuse to use ANY bolt's weft, so one oversized INSERT
+	 * would de-accelerate the whole index.
 	 */
-	bs.cgramattno = 0;
-	weave_cgram_accum_init(&bs.cgram, bs.ctx, false);
+	bs.cgramattno = weave_build_cgramattno(index);
+	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
 	weave_vec_accum_init(&bs.vec, bs.ctx, bs.vecattno != 0,
 						 weave_index_vec_bits(index),
 						 (WeaveMetric) (bs.vecattno != 0 ?
@@ -5259,6 +5545,12 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 		 * callback: the lane and the postings must agree on the warp position. */
 		if (bs.vecattno != 0)
 			weave_vec_accum_add(&bs.vec, index, tid, vecval, vecisnull);
+
+		/* PRODUCER 3.  Order is irrelevant here (a cgram posting is keyed by
+		 * docid, not by warp position -- see the build callback), but it is kept
+		 * next to producer 1 so the three producers read in one place. */
+		if (bs.cgramattno != 0)
+			weave_cgram_accum_add(&bs.cgram, tid, gramval, gramisnull);
 
 		for (j = 0; j < doc->nterms; j++)
 		{
@@ -5345,7 +5637,7 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
  * Write one pending item into a page's item area.  Shared by both append paths
  * so the layout exists in ONE place; see WeavePendingItem in weave/am.h.
  *
- * The two alignment gaps are zeroed EXPLICITLY.  They would in fact be zero
+ * The alignment gaps are zeroed EXPLICITLY.  They would in fact be zero
  * anyway -- weave_init_page() calls PageInit(), which memsets the page, and no
  * other writer touches these bytes -- but this page image goes into a WAL
  * record, and a page image that depends on "nothing else happened to have
@@ -5354,14 +5646,17 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 static void
 weave_pending_item_write(WeavePendingItem *pi, ItemPointer tid,
 						 WeaveDoc doc, uint32 doclen,
-						 const void *vec, uint32 veclen)
+						 const void *vec, uint32 veclen,
+						 const void *gram, uint32 gramlen)
 {
 	Size		docend = sizeof(WeavePendingItem) + doclen;
 	Size		vecoff = MAXALIGN(docend);
+	Size		gramoff = vecoff + MAXALIGN(veclen);
 
 	pi->tid = *tid;
 	pi->doclen = doclen;
 	pi->veclen = veclen;
+	pi->gramlen = gramlen;
 	memcpy((char *) pi + sizeof(WeavePendingItem), doc, doclen);
 	if (vecoff > docend)
 		MemSet((char *) pi + docend, 0, vecoff - docend);
@@ -5370,6 +5665,13 @@ weave_pending_item_write(WeavePendingItem *pi, ItemPointer tid,
 		memcpy((char *) pi + vecoff, vec, veclen);
 		if (MAXALIGN(veclen) > veclen)
 			MemSet((char *) pi + vecoff + veclen, 0, MAXALIGN(veclen) - veclen);
+	}
+	if (gramlen > 0)
+	{
+		memcpy((char *) pi + gramoff, gram, gramlen);
+		if (MAXALIGN(gramlen) > gramlen)
+			MemSet((char *) pi + gramoff + gramlen, 0,
+				   MAXALIGN(gramlen) - gramlen);
 	}
 }
 
@@ -5404,6 +5706,8 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	int			lexidx;
 	const void *vec = NULL;
 	uint32		veclen = 0;
+	const void *gram = NULL;
+	uint32		gramlen = 0;
 	WeavePageKind wantkind;
 
 	/*
@@ -5447,30 +5751,61 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	}
 
 	/*
-	 * ...and the page kind is the v9 layout either way, including for an index
-	 * with no vector column, whose items just carry veclen == 0.  The kind names
-	 * the ITEM LAYOUT; see WEAVE_PK_PENDING_V9 in weave/pagekind.h for what
-	 * happened when it named the payload instead.
+	 * THE CGRAM PRODUCER'S INPUT, CARRIED FORWARD THE SAME WAY (doc/GAPS.md G35).
+	 * The flush that folds this document into a bolt cannot reconstruct the raw
+	 * text of the gram_ops column from the analyzed wdoc -- analysis is lossy and
+	 * a trigram is a property of the BYTES -- so a text that is not written down
+	 * here is gone, and the bolt the flush writes carries no cgram weft.  That is
+	 * not merely "this row is not accelerated": weave_cgram_collect() requires
+	 * EVERY live bolt to carry a weft before it will use any of them, so one
+	 * weft-less bolt de-accelerates the WHOLE index until the next REINDEX.
+	 *
+	 * THE TEXT AND NOT THE TRIGRAMS, and see WeavePendingItem in weave/am.h for
+	 * the argument: the pairs are ~16 bytes per byte of text, and they depend on
+	 * the extractor, which belongs to the weft being written rather than to the
+	 * insert.
 	 */
-	wantkind = WEAVE_PK_PENDING_V9;
+	if (layout.cgramattno != 0)
+	{
+		int			gramidx = layout.cgramattno - 1;
 
-	need = weave_pending_item_size(doclen, veclen);
+		if (!isnull[gramidx])
+		{
+			gram = (const void *) PG_DETOAST_DATUM(values[gramidx]);
+			gramlen = VARSIZE_ANY(gram);
+		}
+	}
+
+	/*
+	 * ...and the page kind is the v10 layout either way, including for an index
+	 * with neither a vector nor a gram_ops column, whose items just carry
+	 * veclen == gramlen == 0.  The kind names the ITEM LAYOUT; see
+	 * WEAVE_PK_PENDING_V10 in weave/pagekind.h for what happened when it named
+	 * the payload instead.
+	 */
+	wantkind = WEAVE_PK_PENDING_V10;
+
+	need = weave_pending_item_size(doclen, veclen, gramlen);
 
 	if (need > BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(WeavePageOpaqueData)))
 	{
 		/* Too large for the verbatim pending buffer: index it directly as its
 		 * own one-document segment (no per-doc size limit there).
 		 *
-		 * The vector is part of `need`, so a vector column makes this path more
-		 * likely and, above WVEC_MAX_DIM/2 or so, unavoidable: a 16,384-d wvec is
-		 * 65,544 bytes and can never share a page with anything.  That is why the
-		 * oversized path also has to carry the vector -- routing around the
-		 * pending buffer must not route around the vector weft. */
+		 * The vector and the gram text are part of `need`, so either column makes
+		 * this path more likely and, for a large value, unavoidable: a 16,384-d
+		 * wvec is 65,544 bytes and can never share a page with anything.  That is
+		 * why the oversized path also has to carry both -- routing around the
+		 * pending buffer must not route around a weft. */
 		weave_insert_oversized_as_segment(index, doc, ht_ctid,
 										 layout.vecattno != 0 ?
 										 values[layout.vecattno - 1] : (Datum) 0,
 										 layout.vecattno == 0 ||
-										 isnull[layout.vecattno - 1]);
+										 isnull[layout.vecattno - 1],
+										 layout.cgramattno != 0 ?
+										 values[layout.cgramattno - 1] : (Datum) 0,
+										 layout.cgramattno == 0 ||
+										 isnull[layout.cgramattno - 1]);
 		return true;
 	}
 
@@ -5491,11 +5826,11 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 		tailpage = BufferGetPage(tailbuf);
 		/*
 		 * The KIND check is not defensive: an index upgraded across
-		 * WEAVE_VERSION_PENDING_VEC can have a tail page of v8 items, whose stride
-		 * is MAXALIGN(12 + doclen) rather than this item's.  Mixing the two on one
-		 * page makes the page unparseable by either reader, so start a fresh page
-		 * instead -- the old page stays valid and the flush reads it with the v8
-		 * parser.
+		 * WEAVE_VERSION_PENDING_VEC or WEAVE_VERSION_PENDING_CGRAM can have a tail
+		 * page of v8 or v9 items, whose strides are shorter than this item's.
+		 * Mixing layouts on one page makes the page unparseable by every reader,
+		 * so start a fresh page instead -- the old page stays valid and the flush
+		 * reads it with the parser its own kind selects.
 		 */
 		if (WeavePageHasKind(tailpage, wantkind) &&
 			weave_page_entry_end(tailpage) + need <=
@@ -5506,7 +5841,8 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			state = GenericXLogStart(index);
 			tailpage = GenericXLogRegisterBuffer(state, tailbuf, 0);
 			pi = (WeavePendingItem *) weave_page_entry_end(tailpage);
-			weave_pending_item_write(pi, ht_ctid, doc, doclen, vec, veclen);
+			weave_pending_item_write(pi, ht_ctid, doc, doclen, vec, veclen,
+									 gram, gramlen);
 			((PageHeader) tailpage)->pd_lower += need;
 			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
 			meta = WeavePageGetMeta(metapage);
@@ -5545,7 +5881,8 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 
 			weave_init_page(np, wantkind);
 			pi = (WeavePendingItem *) weave_page_entry_end(np);
-			weave_pending_item_write(pi, ht_ctid, doc, doclen, vec, veclen);
+			weave_pending_item_write(pi, ht_ctid, doc, doclen, vec, veclen,
+									 gram, gramlen);
 			((PageHeader) np)->pd_lower += need;
 		}
 
@@ -5604,6 +5941,7 @@ weave_flush_pending(Relation index)
 	WeaveBuildState bs;
 	WeaveSegMeta seg;
 	BlockNumber blk;
+	bool		gramcomplete = true;
 
 	{
 		Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
@@ -5641,19 +5979,21 @@ weave_flush_pending(Relation index)
 										weave_index_vec_metric(index) :
 										WEAVE_METRIC_L2));
 	/*
-	 * NO CGRAM PRODUCER on the pending-flush path, and this is the ONE gap in
-	 * Z8's coverage worth reading twice: a WeavePendingItem carries the analyzed
-	 * wdoc and the wvec, NOT the raw text of the gram_ops column, so a bolt built
-	 * from the pending buffer has no cgram weft.  It is exactly the shape of
-	 * doc/GAPS.md G23 before V7's second half closed it, and it has the same
-	 * remedy (widen the item) and the same interim consequence: absent is safe,
-	 * so post-build INSERTs are FOUND by a `@~` query -- the route contributes
-	 * that bolt's whole live docid set and the mandatory recheck filters it
-	 * exactly -- they are simply not accelerated until a REINDEX.  sql/cgram.sql
-	 * asserts the correctness half of that with an INSERT after the build.
+	 * PRODUCER 3 over the pending buffer (doc/GAPS.md G35, closed).  A pending
+	 * item now carries the raw text of the gram_ops column, so this bolt gets a
+	 * real cgram weft instead of none -- which matters beyond the inserted row
+	 * itself: weave_cgram_collect() uses no bolt's weft unless EVERY live bolt has
+	 * one, so before this change a single post-build INSERT turned every `@~`
+	 * query in the index into a sequential heap pass until the next REINDEX.
+	 *
+	 * THE TRIGRAMS ARE COMPUTED HERE AND NOT AT INSERT TIME, which is the same
+	 * decision V7 made for the vector and for a stronger reason; the argument is
+	 * on WeavePendingItem in weave/am.h.  The consequence for this function is the
+	 * one that matters: the extractor that runs is the one this bolt is being
+	 * written by, so the weft's keys cannot mix two vocabularies.
 	 */
-	bs.cgramattno = 0;
-	weave_cgram_accum_init(&bs.cgram, bs.ctx, false);
+	bs.cgramattno = weave_build_cgramattno(index);
+	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -5752,6 +6092,22 @@ weave_flush_pending(Relation index)
 									dead);
 			}
 
+			/*
+			 * PRODUCER 3.  rec.gram is NULL for three different reasons and all
+			 * three mean "this document contributes no trigram", so they need no
+			 * distinguishing: the row's text was NULL, the index has no gram_ops
+			 * column, or the item is an older layout (v8/v9) written before this
+			 * version and still un-flushed.  The third is the one worth naming --
+			 * such a bolt then has an INCOMPLETE weft rather than none, which is a
+			 * false negative, so the accumulator is switched off for the whole
+			 * flush if ANY item cannot supply its text.  See the gramok pass below.
+			 */
+			if (bs.cgramattno != 0 && !rec.hasgram)
+				gramcomplete = false;
+			else if (bs.cgramattno != 0 && rec.gram != NULL)
+				weave_cgram_accum_add(&bs.cgram, rec.tid,
+									  PointerGetDatum(rec.gram), false);
+
 			entries = WEAVE_DOC_ENTRIES(rec.doc);
 
 			for (j = 0; j < rec.doc->nterms; j++)
@@ -5768,6 +6124,24 @@ weave_flush_pending(Relation index)
 		UnlockReleaseBuffer(buffer);
 		MemoryContextSwitchTo(old);
 		blk = next;
+	}
+
+	/*
+	 * ONE PRE-v10 PENDING ITEM MEANS NO WEFT FOR THE WHOLE BOLT.  An index
+	 * upgraded across WEAVE_VERSION_PENDING_CGRAM with un-flushed pending pages
+	 * holds items whose gram text was never stored, and the bolt this flush writes
+	 * covers those documents too.  A weft over only the recoverable subset would
+	 * be INCOMPLETE, and incomplete means a pattern's AND excludes a document that
+	 * matches -- a dropped row no fixed-output test can see (AGENTS.md hard rule
+	 * 1).  ABSENT IS SAFE and incomplete is not, which is the same stance
+	 * weave_build_cgram_weft() takes on its own overflow, so the producer is
+	 * switched off wholesale.  Reached only once per upgraded index.
+	 */
+	if (!gramcomplete)
+	{
+		elog(DEBUG1, "pg_weave flush: index \"%s\": pending items predate the gram-text item layout, so this bolt gets no cgram weft",
+			 RelationGetRelationName(index));
+		weave_cgram_accum_init(&bs.cgram, bs.ctx, false);
 	}
 
 	if (bs.nterms > 1)

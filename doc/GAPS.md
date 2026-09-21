@@ -1425,7 +1425,7 @@ all, which would mean `<@>` stops being a shuttle in the (C1)-(C6) sense and bec
 with a cutoff.
 
 
-### G34 — a cgram-bearing bolt cannot be merged — **OPEN 2026-09-20, by construction, refused in code**
+### G34 — a cgram-bearing bolt cannot be merged — **FOUND AND CLOSED 2026-09-21; the diagnosis below was half wrong, which is the interesting part**
 
 A merge reads its inputs' dictionaries and streams terms out of them. The cgram weft's input
 is the raw column **text**, which the index does not store, so a merge cannot reconstruct the
@@ -1446,7 +1446,58 @@ sort by `memcmp` exactly as terms do. It was left undone deliberately: Z8's gate
 size, and a merge path written without a test that can see a mis-merged trigram posting list is
 how a silent wrong answer gets shipped.
 
-### G35 — a post-build INSERT is not indexed by the cgram channel — **OPEN 2026-09-20**
+**WHAT WAS ACTUALLY WRONG WITH THAT DIAGNOSIS.** "A merge cannot reconstruct the trigram
+vocabulary" is false, and the sentence right after it says why without noticing: a merge does
+not need the column's TEXT, it needs the (trigram, docid) PAIRS, and an input bolt's cgram weft
+is *precisely a container of those pairs*. The premise that made the refusal look structural
+was the assumption that a weft must be rebuilt from its original input. So the fix is not the
+k-way merge proposed above; it is 150 lines that read the pairs back
+(`weave_cgram_merge_append()` in `src/am/ambuild.c`), drop the tombstoned docids using the same
+dense bitmap the lexical merge uses, and hand them to `weave_build_cgram_weft()` — **the same
+writer** the build and the flush use, which is the rule `VECTOR_CHANNEL.md` §7.3 states as "one
+function writes a weft". A second writer for one format is how a merged weft starts disagreeing
+with a built one.
+
+**And it had to close with `G35`, not after it.** `G35`'s fix makes every pending flush produce
+a cgram-bearing bolt. With the refusal still in place those bolts would be unmergeable
+*forever*, so the segment directory would grow by one per flush until
+`weave_add_segment_with_room()` ran out of retries and raised — converting a latency gap into a
+**failed INSERT**. The mitigation this gap's own text relied on ("bolts created by later inserts
+carry no cgram weft and merge among themselves") was `G35` being open.
+
+**The rules that replaced the refusal**, all in `src/am/ambuild.c`:
+
+- `weave_seg_mergeable()` takes a `cgramok` flag with the same meaning `vecok` has: what a merge
+  can produce is a property of the SET of inputs. `weave_segs_cgram_agree()` computes it — every
+  live bolt carries a weft, or none does.
+- A **mixed** directory keeps exactly the old behaviour: the cgram-bearing bolts are excluded
+  from candidate lists and everything else still compacts. An output weft covering only some of
+  its bolt's documents is a false negative, so a mixed group is refused rather than merged with a
+  partial weft. A mixed directory is already unaccelerated (`weave_cgram_collect()` uses no weft
+  unless every live bolt has one), so the exclusion costs nothing a query can see.
+- Both chokepoints (`weave_merge_selected()`, `weave_merge_group_to_seg()`) re-check, because the
+  parallel merge's worker groups are formed elsewhere and "should always pass" is what G24 was
+  made of.
+
+**What is NOT fixed, and is the follow-up.** The re-accumulation is **not streaming**: the pair
+array is 16 bytes per pair of the whole merged group, ~930 B per document at the 58.1
+pairs/document measured in `FUZZY_CHANNEL.md` §6, so compacting a 1M-document index wants
+~930 MB on VACUUM's cleanup path. It is bounded by `WEAVE_CGRAM_MAX_PAIRS` and **degrades
+safely** — past the cap the accumulator sets `toobig`, the writer omits the weft with a WARNING,
+and the merged bolt simply has none, which is the state every merged bolt was in before this
+change. The streaming version is the k-way merge the original text proposed, and it is an
+optimization; doing it *instead* of this would have meant a second writer for the format, which
+is the trade that was rejected. **Unmeasured at scale** — `bench/RESULTS_CGRAM.md` §5 item 1
+carries the same note.
+
+**What can see a mis-merged posting list**, which is the objection the refusal existed to
+answer: `sql/cgram.sql`'s parity sweeps, which now run against a *merged* weft. A merge that
+loses a (trigram, docid) posting makes the pattern's AND exclude a document `LIKE` keeps, and
+the symmetric difference then names the ids. Duplication is absorbed by `tidset_sort_uniq()` and
+is harmless. The file also asserts `segments_after_merge`, which reads **2** before this change
+and **1** after.
+
+### G35 — a post-build INSERT is not indexed by the cgram channel — **FOUND AND CLOSED 2026-09-21**
 
 `WeavePendingItem` carries the row's `wdoc` and (since `G23`) its `wvec`. It does not carry the
 raw text of a `gram_ops` column, so an inserted row contributes no trigrams and is found only by
@@ -1455,6 +1506,53 @@ same two options apply: carry the text on the pending item (bytes, and the text 
 heap), or teach the flush to re-read the heap tuple. `sql/cgram.sql` asserts the correct answer
 across INSERT, DELETE and VACUUM so that closing this shows up as a latency change and not as a
 correctness change.
+
+**THE COST WAS UNDERSTATED ABOVE, and the correction is the reason this was worth doing before
+anything else in the channel.** It is not "that row is not accelerated". `weave_cgram_collect()`
+requires **every live bolt** to carry a weft before it will use *any* of them — it must, or the
+narrowed candidate set is not a superset of the answer — so ONE weft-less bolt makes every `@~`
+and `@~*` query in the index fall back to a sequential heap pass. A single post-build INSERT
+therefore de-accelerated the whole channel until the next REINDEX. It was never a wrong answer
+(the fallback is exact, which is why `sql/cgram.sql`'s row sets passed throughout), and it was
+never only one row either.
+
+**The fix, and where the contribution is computed.** `WeavePendingItem` gains a `gramlen` word
+and the raw, detoasted text after the wvec; `weave_flush_pending()` then runs
+`weave_cgram_accum_add()` — the *same* producer the build callback runs — over that text. So the
+trigrams are computed **at flush time, from the stored bytes**, and not at insert time. Two
+reasons, the first `G23`'s and the second stronger than `G23`'s:
+
+- **Size.** A value contributes one 16-byte pair per byte of text, so storing the pairs would
+  make a pending item ~16× the size of the text it came from. The cheap thing to store is the
+  input.
+- **The pairs depend on the EXTRACTOR, which belongs to the weft and not to the insert** — the
+  ASCII fold, the gram width, the key encoding. `G23` stored the vector raw because a code baked
+  at insert time freezes the `bits` reloption that an `ALTER INDEX` can change between the insert
+  and the flush; the same argument here has a worse failure mode, because a weft whose dictionary
+  mixes keys from two extractors makes a pattern require a key the matching document was never
+  indexed under — a dropped row, not a refused merge.
+
+**The layout is discriminated by PAGE KIND** (`WEAVE_PK_PENDING_V10` = 33), exactly as v8 → v9
+was and for the identical reason: the strides are not distinguishable from the bytes, and
+`weave_insert()` does not upcast the metapage, so one index can hold all three layouts at once.
+`WEAVE_VERSION` is 10; an older `.so` refuses the index rather than parsing a v10 page with the
+v9 stride. `weave_pending_iter_next()` has a branch per layout, `t/019` exercises the v8 one by
+manufacturing the old image, and a pre-v10 item in the chain switches the producer off for the
+**whole** bolt (`gramcomplete`) — a weft over the recoverable subset would be incomplete, and
+absent is safe while incomplete is not.
+
+**The oversized-INSERT path needed the same fix and is asserted separately**, which is what
+`sql/pendingvec.sql` learned for the vector half: a document too large for a pending page becomes
+its own one-document bolt, and a fix to the buffer alone would have looked correct everywhere
+else while leaving that bolt weft-less — which, by the paragraph above, de-accelerates the entire
+index.
+
+**The number that discriminates**, because almost nothing else does: `sql/cgram.sql`'s
+`served_after_flush` (`cgram_scan` after `weave_merge()` has folded the pending buffer into a
+bolt) reads **0** before the fix and **1** after. What does *not* discriminate, and is asserted
+next to it so it cannot be mistaken for it: the row sets (identical either way — that is what
+"absent is safe" means) and `served_while_pending` (1 either way — a pending TID is a candidate
+unconditionally).
 
 ### G36 — the fused core is document-at-a-time: `score_block()` exists, is faster, and is unused — **OPEN 2026-09-20, deliberately**
 

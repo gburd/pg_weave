@@ -69,7 +69,25 @@ and extending `weave_check()` with an invariant for the new page type.
 | 23 | `WEAVE_PK_REGEX` | `kind` = 23 | fuzzy (compiled-pattern cache) | reserved |
 | 24 | `WEAVE_PK_FUZZY_SPARE` | `kind` = 24 | fuzzy | reserved |
 | 25 | `WEAVE_PK_DOCVALS` | `kind` = 25 | docvalues (scalar/facet forward store) | reserved |
-| 26 | `WEAVE_PK_CGRAM` | `kind` = 26 | opt-in corpus-level character trigrams | reserved |
+| 26 | `WEAVE_PK_CGRAM` | `kind` = 26 | corpus-level character trigrams (weft root) | **exists** |
+| 27 | `WEAVE_PK_VDIR` | `kind` = 27 | vector (per-block directory records) | **exists** |
+| 28 | `WEAVE_PK_VWARP` | `kind` = 28 | vector (warp → docid) | **exists** |
+| 29 | `WEAVE_PK_PENDING_V9` | `kind` = 29 | segment machinery (pending page, v9 item layout) | **read-only legacy** |
+| 30 | `WEAVE_PK_CGRAM_DICT` | `kind` = 30 | cgram (trigram → docid dictionary) | **exists** |
+| 31 | `WEAVE_PK_CGRAM_DICTINDEX` | `kind` = 31 | cgram (sparse block index) | **exists** |
+| 32 | `WEAVE_PK_CGRAM_POST` | `kind` = 32 | cgram (docid posting chain) | **exists** |
+| 33 | `WEAVE_PK_PENDING_V10` | `kind` = 33 | segment machinery (pending page, current item layout) | **v10, the only kind written** |
+
+**The pending chain is the one chain that legitimately mixes page kinds**, because
+the item HEADER has grown twice — 12 bytes (v8) → 16 (v9, a `veclen` for the
+inserted row's vector) → 20 (v10, a `gramlen` for the raw `gram_ops` text) — and
+the three strides are not distinguishable from the bytes. So the page declares its
+layout, `weave_insert()` starts a fresh page rather than appending an item of one
+layout to a page of another, and the discriminator is per PAGE and not the metapage
+version, because `weave_insert()` deliberately does not upcast the metapage. One
+index can therefore hold all three at once; `weave_pending_iter_next()` in
+`include/weave/am.h` is the only reader of any of them, and `t/019` manufactures a
+v8 image to keep the oldest branch executed rather than merely claimed.
 
 Ids 1–15 are **in-memory only**; the disk carries the one-hot bit. Ids ≥ 16 **are**
 the byte pattern stored in `kind`, so they are on-disk ABI: never renumber one,
@@ -334,9 +352,9 @@ typedef struct WeaveChannelDesc		/* 12 bytes */
 ```
 
 `WeaveWeftKind` is `{ LEXICAL=1, VECTOR=2, FUZZY=3, DOCVALS=4, CGRAM=5 }`.
-`LEXICAL` and — since v7 — `FUZZY` are written; the rest are reserved so the
-remaining channels cannot collide, which is the same reason the page-kind ids are
-allocated in one table (§2).
+`LEXICAL`, `FUZZY` (v7), `VECTOR` (v8) and `CGRAM` (Z8) are written; `DOCVALS` is
+reserved so the remaining channel cannot collide, which is the same reason the
+page-kind ids are allocated in one table (§2).
 
 Structural rules the decoder enforces, each of which exists for a reason:
 
@@ -466,7 +484,7 @@ keep growing and the trie does not.
 
 ## 8. Compatibility policy
 
-1. **Versions read: v3, v4, v5, v6, v7. Version written: v7.** `WEAVE_VERSION` is 7.
+1. **Versions read: v3 … v10. Version written: v10.** `WEAVE_VERSION` is 10.
    The range is one constant pair in `include/weave/am.h`
    (`WEAVE_VERSION_DOCLEN_INLINE` = 3 is the floor, `WEAVE_VERSION` the ceiling)
    and `weave_check_meta()` is the single gate; `weave_check()` reports the range
@@ -482,6 +500,16 @@ keep growing and the trie does not.
    | 5 | sidecar docid column is absolute offsets | per-**block** `WEAVE_DOCLEN_ABS` set |
    | 6 | per-bolt weft descriptors; extended page-kind space | per-**bolt** `segs[i].chandesc`; per-**page** `WEAVE_PAGE_KIND_EXT` |
    | 7 | the fuzzy weft (SuRF trie over the vocabulary) | per-**bolt**: a `WEAVE_WK_FUZZY` entry on the bolt's descriptor page |
+   | 8 | the vector weft (`WEAVE_PK_VMETA` + directory + code strips) | per-**bolt**: a `WEAVE_WK_VECTOR` entry on the descriptor page |
+   | 9 | a pending item carries the row's `wvec` | per-**page**: kind `WEAVE_PK_PENDING_V9` |
+   | 10 | a pending item carries the row's raw `gram_ops` text, and a merged bolt may carry a cgram weft | per-**page**: kind `WEAVE_PK_PENDING_V10` |
+
+   **v8, v9 and v10 changed no metapage struct either, and bumped anyway**, for
+   v7's reason and one more. v9 and v10 grew the pending ITEM, so an older `.so`
+   would parse the newer page with the shorter stride, hand
+   `weave_doc_is_valid()` garbage, and WARN-and-skip documents the metapage has
+   already counted into `ndocs` — a silent under-count, not an error. Refusing the
+   index is correct.
 
    **v7 changed no struct, and bumped the version anyway.** A v6 metapage and a v7
    metapage are byte-identical; a v6 `.so` would read a v7 bolt's descriptor page
