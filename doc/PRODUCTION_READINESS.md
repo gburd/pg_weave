@@ -203,9 +203,25 @@ when the scope was read as "BM25 + vector", then back when it was restated as al
 six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
 hard rule was weakened on an inference about scope rather than a question about it.*
 
-**41 of 72 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
+**42 of 77 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
 Z5, Z8, Z9) and 6 withdrawn (L2, L21, V9, V10, V13, **F4**). By phase: X 4/4, L 16/20,
-Z 7/9, V 9/17, P 2/4, **F 4/7**, M 0/6, R 0/5. **Phase F grew by two rows on 2026-09-21,
+Z 7/9, V 9/20, P 2/4, **F 5/9**, M 0/6, R 0/5. **Five rows were added on 2026-09-21
+and every one of them was created by work that ran, not by planning:** **F8** and **F9**,
+because F2.2's pushdown found that the channels do not share a position space (lexical and
+gate shuttles publish docids, the vector shuttle publishes segment-local lane indices, `<@>`
+publishes dictionary positions) so it decided the **docid space** and offers no path for the
+other two -- which means the flagship `fuse(body <=> q, emb <-> v)` query is still answered
+by the fallback; and **V16**, **V17**, **V18** from a read-only review of Alibaba's zvec
+(ideas only, hard rule 6). V16 is the one that matters soonest: cosine is refused today for
+want of a stored maximum true norm, and pg_weave already stores a per-lane `(scale, norm)`
+pair, so cosine may be a **storage** decision rather than an unsupportable metric. V17 is
+**claim 3's missing mechanism** -- switch plan strategy on predicate selectivity -- and claim
+3 has been unmeasured since F4's withdrawal.
+
+**Also closed 2026-09-21: G34 and G35**, the two cgram gaps, with the closure proved by a
+**pre-fix control run** rather than by a green suite (0/2/0 before, 1/1/1 after); format
+v10. Hard rule 12 debt is recorded: that work touches merge, so a run at scale is owed
+before it counts as durable. **Phase F grew by two rows on 2026-09-21,
 both found by reading the code before writing any, and both are now DONE the same day:**
 **F6**, a BM25 term shuttle (the lexical channel had none — ranked lexical is a WAND over
 `WandCursor`, and the fused core consumes only shuttles), and **F7**, an `ORDER BY`

@@ -1709,3 +1709,58 @@ to this index, (b) get per-path veto from core, which does not exist, or (c) lea
 document, which is what this row does. The practical cost is confined to sessions that
 disable the seq scan, which is a debugging setting; the regression files that need it keep
 `enable_seqscan = on` around their query-less counts and say why at the call site.
+
+### G34, G35 — **BOTH CLOSED 2026-09-21, and the closure was proved by a pre-fix control run**
+
+G35 (a post-build INSERT is not indexed by the cgram channel) and G34 (a cgram-bearing
+bolt cannot be merged) are closed together, because G35 alone would have been a P0: every
+flush would add an unmergeable bolt until `weave_add_segment_with_room()` ERRORs, i.e. a
+failed INSERT.
+
+`WeavePendingItem` carries the row's **raw gram text** (format **v10**, new page kind
+`WEAVE_PK_PENDING_V10`; v9 and v8 layouts kept with their own stride helpers, and an
+unrecognized kind now yields **nothing** rather than guessing the oldest stride). The
+trigrams are computed **at flush time**, through the same `weave_cgram_accum_add()` the
+build callback uses: pairs are ~16 bytes per byte of input text and they depend on the
+extractor (fold, gram width, key encoding), which belongs to the weft being written — the
+same argument V7 used for storing vectors raw, and here a frozen extractor would produce a
+weft mixing two key vocabularies, which is a false negative rather than a refused merge.
+A pre-v10 pending item switches the producer off for the whole bolt: absent is safe,
+incomplete is not. `weave_cgram_merge_append()` reads an input bolt's weft back as pairs,
+drops tombstoned docids with the lexical merge's dense bitmap, and feeds the existing
+writer; `weave_seg_mergeable()` gains a `cgramok` term, and a group where only some live
+bolts carry a weft keeps the old refusal.
+
+**The recorded diagnosis for G34 was wrong** and that is worth keeping: it said a merge
+cannot reconstruct the vocabulary. A merge needs the *pairs*, not the text, and the input
+weft holds them.
+
+**The proof, because "the test passes" is not it.** Every row-set assertion in
+`sql/cgram.sql` passes with both gaps open — that is what "absent is safe" means, since a
+weft-less bolt just falls back to a heap pass and returns the same rows more slowly. A
+**pre-fix control run** (build `5ed01e6`, the new `sql/cgram.sql` against the old code,
+PG17, EC2 dev host) measured `served_after_flush` **0**, `segments_after_merge` **2**, and
+`served_after_oversized` **0**, against **1**, **1**, **1** after. `served_while_pending`
+was *claimed* in the file not to discriminate and the control measured **0 -> 1** there
+too; the wrong claim is left in place at the call site, because "this number does not
+discriminate" is exactly the kind of assertion that has to be measured rather than
+reasoned, and it had been reasoned.
+
+**Two follow-ups, recorded rather than hidden.** (1) The cgram half of a merge is **not
+streaming**: ~930 B/document resident, bounded by `WEAVE_CGRAM_MAX_PAIRS`, past which the
+weft is omitted — the same shape as G25 for the vector half. (2) **Hard rule 12 debt:**
+this touches merge, so local green is not evidence; a run at scale through `bench/aws/` is
+owed before the closure is treated as durable.
+
+### G40 — no regression test exercises a post-build, un-VACUUMed, HOT-churned heap — **OPEN 2026-09-21, found by the pg_tre 4.0.x review**
+
+pg_tre 4.0.2 fixed `amgettuple` returning HOT-successor TIDs, and its post-mortem says the
+blind spot that hid the bug for three rounds was a test suite that churned the heap only
+*before* the index existed. pg_weave has the same blind spot: `sql/cgram.sql:80` runs its
+UPDATE churn **before** `CREATE INDEX` at `:81`, and `:97` sets only `enable_seqscan = off`
+with no arm that forces `amgettuple` specifically. pg_weave's own code is **not** defective
+here — the HOT-root fix is present at `src/am/amscan.c:4014-4054` and every other TID path
+inverts `weave_docid_to_tid()` from root TIDs recorded at build/insert time
+(`amscan.c:6395-6405`), so it is structurally immune — but the *coverage* that would catch a
+regression does not exist. What is owed: an arm that UPDATEs after the index is built,
+does not VACUUM, and reads through a plan that must use `amgettuple`.
