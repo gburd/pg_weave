@@ -27,7 +27,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.14.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.15.0" of extension "pg_weave" is already installed
 -- max_parallel_workers_per_gather = 0 only so the plans below are stable text;
 -- nothing here is about parallelism.
 SET max_parallel_workers_per_gather = 0;

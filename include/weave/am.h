@@ -1320,6 +1320,42 @@ extern int	weave_index_vec_bits(Relation index);
 extern int	weave_index_vec_metric(Relation index);
 
 /*
+ * THE VECTOR CHANNEL'S ORDER BY STRATEGY NUMBER (task F7).
+ *
+ * `<=>` on (wvec, wvec), added to the wvec_weave_ops family as an ORDER BY member
+ * by sql/pg_weave--0.14.0--0.15.0.sql.  1, and the number is a decision rather than
+ * the next free integer:
+ *
+ *	 - STRATEGY NUMBERS ARE SCOPED TO AN OPERATOR FAMILY, not to the access method.
+ *	   sk_strategy is resolved against the family of the index COLUMN the key was
+ *	   matched to, so gram_ops's `@~` and wdoc_lex_ops's `@@@` are both strategy 1
+ *	   and are different operators.  amscan.c's weave_rescan() carries the full
+ *	   argument for why that is a correctness hazard and not bookkeeping: the number
+ *	   is the only thing distinguishing a wquery argument from a text one, and
+ *	   DatumGetWQuery() on the wrong datum reads a varlena header as a WeaveQuery
+ *	   and walks garbage.
+ *	 - SO WHY NOT 2 OR 3, which are equally unused inside wvec_weave_ops (the family
+ *	   has no members at all -- 0.7.0--0.8.0 created it STORAGE-only).  Because
+ *	   wdoc_lex_ops already uses 2 for `<=>` (BM25 distance) and 3 for `<@>` (edit
+ *	   distance) as ORDER BY members, and weave_rescan() dispatches ORDER BY keys on
+ *	   sk_strategy.  Picking 2 or 3 would make one number mean two different
+ *	   order-by operators over two different argument types in one access method,
+ *	   and the dispatch would then depend entirely on getting the attribute check
+ *	   right in every branch forever.  1 is used by no ORDER BY member anywhere in
+ *	   this access method, so a vector ordering key is unambiguous on its strategy
+ *	   alone -- and weave_rescan() checks the attribute as well, belt and braces.
+ *	 - IT HAS TO BE IN 1..amstrategies (3).  ALTER OPERATOR FAMILY validates the
+ *	   number against the access method's amstrategies, so "use 11 and avoid the
+ *	   question" is not available; include/weave/cgram.h records the same constraint.
+ *
+ * The other two live in include/weave/edist.h with the `<@>` machinery they were
+ * added for.  This one is here because it belongs to no channel header: the thing
+ * that reads it is the AM's key dispatch, weave_index_layout() below is the other
+ * half of that dispatch, and weave/am.h must not depend on weave/vector.h.
+ */
+#define WEAVE_STRAT_VEC_DISTANCE	1
+
+/*
  * Which index column feeds which channel.
  *
  * Until task V7 the access method was single-attribute: every write and recheck

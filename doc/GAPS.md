@@ -1276,6 +1276,15 @@ scorers that disagree get written. Held for F, recorded here, and asserted in
 `sql/pendingvec.sql` (`lanes_before_flush`) so that closing it shows up as a diff
 rather than as nothing.
 
+**Now visible through a plan, not only through an SRF (task F7, 2026-09-21).** F7 gave
+the vector channel an `ORDER BY` operator, so the gap is reachable from ordinary SQL:
+`sql/vecorderby.sql` section (7) asserts `vec_rows_before_flush` = table rows − 1 and
+`pending_row_in_vec_answer_before_flush` = 0, with an `EXPLAIN` proving the count came
+from the index scan rather than from a Seq Scan (the count is the discriminator, so a
+sort would have reported the opposite and looked like a pass). That makes the window a
+user-visible missing ROW in a `LIMIT`-less vector query, which is a stronger statement
+of the same gap than a lane count was.
+
 **Note the asymmetry is not new to the vector channel.** Per-term `df` in the
 dictionary is also not updated until a merge, which is documented as matching GIN
 fastupdate's staleness. The difference is that stale `df` perturbs a *score* while
