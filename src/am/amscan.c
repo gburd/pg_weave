@@ -6558,8 +6558,6 @@ weave_count_dictdf_fastpath(Relation index, WeaveQuery q)
 	uint32		s;
 	Relation	heap;
 	BlockNumber nblocks;
-	BlockNumber blk;
-	Buffer		vmbuf = InvalidBuffer;
 	bool		all_visible = true;
 
 	/* Gate (1): exactly one plain positive term. */
@@ -6601,24 +6599,84 @@ weave_count_dictdf_fastpath(Relation index, WeaveQuery q)
 	}
 
 	/*
-	 * Gate (4): the whole heap must be all-visible to this snapshot.  Scan the
-	 * VM over every heap page; any page not marked all-visible aborts the fast
-	 * path.  (RelationGetNumberOfBlocks is the current physical length; a page
-	 * appended by a concurrent inserter is not all-visible, so it fails here or
-	 * is caught by the generation re-check below.)
+	 * A ZERO df NEEDS NO VISIBILITY PROOF.  Gate (3) has already established
+	 * npending == 0, so no document exists outside the segments; if no segment's
+	 * dictionary holds the term, nothing matches and the answer is 0 whatever the
+	 * visibility map says.  Returning here skips gate (4) entirely.
+	 *
+	 * This was measured, not assumed: before it, `count(*)` for a term that does
+	 * not exist in the corpus cost 0.280 ms on an 87,486-page heap -- the same as
+	 * a term matching 196,785 documents -- because the whole-heap VM walk below
+	 * ran anyway (doc/GAPS.md G38).
+	 */
+	if (sumdf == 0)
+		return 0;
+
+	/*
+	 * Gate (4): the whole heap must be all-visible to this snapshot.
+	 *
+	 * visibilitymap_count() reads the VM PAGES and counts set bits, which is
+	 * O(heap_pages / 32672) buffer reads and a popcount per word.  The first
+	 * version of this gate called VM_ALL_VISIBLE() once per HEAP BLOCK, and that
+	 * made the whole fast path O(heap pages) with a large constant: measured at
+	 * 0.278 ms on an 87,486-page heap, ~3.2 ns per block, all of it CPU -- the
+	 * plan reported `shared hit=8`, so it was never I/O, just 87,486 calls.
+	 *
+	 * That cost is INDEPENDENT OF SELECTIVITY, which is what made it a defect
+	 * rather than a trade: `count(*)` was flat at 0.278-0.291 ms from df 0 to df
+	 * 196,785, while the ordinary (non-fast) path answered df 25 in 0.072 ms.  So
+	 * below roughly df 6,500 on that heap the "fast" path was a 3.9x
+	 * PESSIMIZATION, and the crossover moved with heap size rather than with
+	 * anything the user could see.  doc/GAPS.md G38 has the measurements.
+	 *
+	 * THE ONE HAZARD THIS SWAP INTRODUCES, STATED RATHER THAN ARGUED AWAY.
+	 * visibilitymap_count() counts set bits over the WHOLE map, including any bit
+	 * belonging to a block past the current end of the relation.  A count that
+	 * merely EQUALS nblocks could therefore, in principle, be made up of
+	 * (nblocks - k) real all-visible pages plus k stale bits past EOF -- and the
+	 * cost of believing it would be a WRONG COUNT, not a slow one.  The per-block
+	 * loop it replaces could not be fooled that way.
+	 *
+	 * Why it is not reachable: visibilitymap_truncate() runs inside
+	 * RelationTruncate()'s critical section and the XLOG_SMGR_TRUNCATE record
+	 * covers heap, VM and FSM together, so a crash cannot leave the VM longer than
+	 * the heap; and TRUNCATE TABLE allocates a new relfilenode, which has no VM at
+	 * all.  But "not reachable through any supported path" is the kind of reasoning
+	 * doc/CONVENTIONS.md rule 2 exists to distrust, so it is CHECKED rather than
+	 * trusted: under USE_ASSERT_CHECKING the authoritative per-block scan runs and
+	 * must agree.  A cassert build therefore re-derives this gate over the whole
+	 * regression suite, which is the same arrangement already used for the
+	 * score()-returns-distance convention.  Production pays O(VM pages).
 	 */
 	heap = table_open(index->rd_index->indrelid, AccessShareLock);
 	nblocks = RelationGetNumberOfBlocks(heap);
-	for (blk = 0; blk < nblocks; blk++)
 	{
-		if (!VM_ALL_VISIBLE(heap, blk, &vmbuf))
+		BlockNumber nallvisible;
+		BlockNumber nallfrozen;
+
+		visibilitymap_count(heap, &nallvisible, &nallfrozen);
+		all_visible = (nblocks > 0 && nallvisible == nblocks);
+
+#ifdef USE_ASSERT_CHECKING
 		{
-			all_visible = false;
-			break;
+			Buffer		vmbuf = InvalidBuffer;
+			bool		exact = (nblocks > 0);
+			BlockNumber blk;
+
+			for (blk = 0; blk < nblocks; blk++)
+			{
+				if (!VM_ALL_VISIBLE(heap, blk, &vmbuf))
+				{
+					exact = false;
+					break;
+				}
+			}
+			if (vmbuf != InvalidBuffer)
+				ReleaseBuffer(vmbuf);
+			Assert(all_visible == exact);
 		}
+#endif
 	}
-	if (vmbuf != InvalidBuffer)
-		ReleaseBuffer(vmbuf);
 	table_close(heap, AccessShareLock);
 	if (!all_visible)
 		return -1;

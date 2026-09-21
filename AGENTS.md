@@ -166,6 +166,34 @@ physical TID resolves to no visible tuple, so the plan read `Bitmap Index Scan r
 Nothing about this is specific to that channel: any AM path that manufactures TIDs outside the
 build callback has the same hazard, and the symptom is a row count, not a message.
 
+**TENTH MEMBER, and it presents as a backend CRASH in a test that has nothing to do with
+your change.** On the 2026-09-21 dev image, PGXS's bitcode step runs `llvm-lto` from
+PostgreSQL 17's LLVM 19 over bitcode the image's **clang 21** produced, and it aborts:
+`sudo make install` exits 134 *after* having written some of
+`/usr/lib/postgresql/17/lib/bitcode/pg_weave/`. The `.so` is therefore never replaced, and
+PG17's JIT now finds mismatched bitcode to inline and **kills the backend** —
+`error: Unknown attribute kind (102) (Producer: 'LLVM21.1.8' Reader: 'LLVM 19.1.1')` in the
+server log, `server closed the connection unexpectedly` in the client, and the postmaster
+survives so later tests still run and still pass. The crash appeared in `sql/weave.sql` on
+the one query complex enough to exceed `jit_above_cost`, three hours after the install that
+caused it.
+
+Three things follow:
+
+- **Always `with_llvm=no` on this image.** `/scratch/pg_weave/gates.sh` already does, with
+  a comment saying why; a *manual* `sudo make install` without it is what poisoned the
+  host, and `with_llvm=no` on a later install does not remove what the earlier one left.
+- **`SET jit = off` is the one-line triage** that separates "my change broke this" from
+  "the toolchain did". It is not the fix and it is not proof of innocence — it only shows
+  JIT is necessary for the crash.
+- **`rm -rf $libdir/bitcode/pg_weave*`** is the repair. Check for it before believing any
+  crash on a host where a manual install has ever run.
+
+The generalization the other nine already make, arriving by a new route: the failure was
+reported by a test that was not near the change, on the major that was not first, hours
+after the cause. An install whose exit status is not checked is a landmine with a delay
+fuse.
+
 **A gate that reports FAIL and nothing else costs a round trip**, which on a remote
 build host is minutes. Print the compiler's own error lines on a build failure and the
 install log's tail on an install failure. Two round trips were burned on

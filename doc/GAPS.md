@@ -1486,7 +1486,62 @@ exist. **Unmeasured, and not attempted.** Recorded so that the current shape rea
 choice rather than an oversight, and so that anyone profiling a fused scan and finding seek
 cost dominant knows the lever exists.
 
-### G38 — `count(*)` on a common term measured 0.43 ms on 2026-09-07 and 0.95 ms on 2026-09-21, on a corpus with FEWER matches — **OPEN, unexplained, and provably not ours**
+### G38 — `count(*)`'s fast path cost O(heap pages) and was a 40× pessimization below ~df 9,000 — **FOUND AND CLOSED 2026-09-21, the same day it was opened**
+
+**It was never a regression.** G38 was opened on an unexplained 2.2× slowdown between two
+benchmark runs. The answer is that `weave_count_dictdf_fastpath()`'s gate (4) proved
+whole-heap visibility by calling `VM_ALL_VISIBLE()` once per **heap block**, so the path
+was O(heap pages) with a ~3.2 ns constant and **completely independent of selectivity**.
+The three figures that looked like a regression are three heap sizes on one straight line:
+0.43 ms at 1,076 MB, 0.95 ms at 2,357 MB, 3.81 ms at 9,238 MB.
+
+**Measured inside ONE run, where only the term changed** (1M docs, 87,486-page heap,
+c7i.2xlarge, `/scratch/pg_weave/g38.sh`, two passes agreeing to the last digit):
+
+| query | df | before | after | general path (fast path defeated) |
+|---|---:|---:|---:|---:|
+| `count(*)` rare | 25 | 0.278 ms | **0.004 ms** | 0.007 ms |
+| `count(*)` mid | 2,505 | 0.291 ms | **0.004 ms** | — |
+| `count(*)` common | 196,785 | 0.278 ms | **0.003 ms** | 6.0 ms |
+| `count(*)` no-match | 0 | 0.280 ms | **0.005 ms** | — |
+
+Flat from df 0 to df 196,785, with `EXPLAIN (ANALYZE, BUFFERS)` reporting `shared hit=8` —
+so the 0.278 ms was never I/O, it was 87,486 function calls. **A term that does not exist
+in the corpus cost the same as one matching 196,785 documents.**
+
+**Why that is a defect and not a trade.** The ordinary path answers df 25 in 0.007 ms, so
+below roughly **df 9,000** on that heap the "fast" path was up to **40× slower than the
+code it exists to avoid** — and the crossover moved with heap size rather than with
+anything a user could see or tune.
+
+**The fix, two parts, both in `src/am/amscan.c`:**
+
+1. **A zero df needs no visibility proof.** Gate (3) already establishes `npending == 0`,
+   so if no segment's dictionary holds the term the answer is 0 whatever the VM says.
+   Returns before gate (4) runs at all.
+2. **Gate (4) uses `visibilitymap_count()`**, which reads VM *pages* and popcounts, making
+   the gate O(heap_pages / 32672) buffer reads instead of O(heap_pages) calls.
+
+**The one hazard the swap introduces is checked, not argued away.**
+`visibilitymap_count()` counts bits over the whole map, including any belonging to blocks
+past the end of the relation, so a count that merely *equals* `nblocks` could in principle
+be real pages plus stale bits — and believing it produces a **wrong count**, not a slow
+one. It is unreachable (`visibilitymap_truncate()` runs inside `RelationTruncate()`'s
+critical section and `XLOG_SMGR_TRUNCATE` covers heap, VM and FSM together; `TRUNCATE
+TABLE` makes a new relfilenode with no VM), but `doc/CONVENTIONS.md` rule 2 exists to
+distrust exactly that reasoning — so **under `USE_ASSERT_CHECKING` the authoritative
+per-block scan runs and must `Assert` agreement**. A cassert build re-derives the gate
+across the whole regression suite. Same arrangement as the score()-returns-distance
+convention.
+
+**The `count(*)` rows in `bench/RESULTS_LEXICAL.md` are pre-fix** (0.95 ms at 1M, 3.81 ms
+at 4M) and will fall by two orders of magnitude on the next run. They are left as measured
+rather than edited, with a pointer: a benchmark file records what was run.
+
+*Original entry, kept because the hypothesis it reached was wrong in an instructive way —
+it blamed the environment and the harness, and the answer was in the code all along:*
+
+### G38 (original) — `count(*)` on a common term measured 0.43 ms on 2026-09-07 and 0.95 ms on 2026-09-21, on a corpus with FEWER matches
 
 `bench/RESULTS_LEXICAL.md`: the common-term `count(*)` pushdown was 0.43 ms at 1M docs
 with df 197,552 and is 0.95 ms at 1M docs with df 179,772 — 2.2× slower on 18 %
