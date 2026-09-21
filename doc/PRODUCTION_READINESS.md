@@ -207,17 +207,39 @@ hard rule was weakened on an inference about scope rather than a question about 
 Z5, Z8, Z9) and 6 withdrawn (L2, L21, V9, V10, V13, **F4**). By phase: X 4/4, L 16/20,
 Z 7/9, V 9/17, P 2/4, **F 2/5**, M 0/6, R 0/5.
 
+**The lexical channel was re-measured on 2026-09-21 at two scales with a pg_fts arm for
+the first time, and it changes what this project may claim.** Against tsvector + GIN,
+pg_weave is now ahead on everything except three rows that are behind by **10–30 µs**
+(ranked rare k=10/k=100 and `count(*)` AND) — including **index size, 1.73–1.79× ahead**,
+and **build time, 1.03–1.46× ahead**, the two dimensions Phase L used to fail on
+outright. The Phase L gate is still not met, because it is phrased "zero measured
+losses" and three losses of 10–30 µs are still losses; closing it needs the gate
+restated in absolute terms, which is a maintainer decision.
+
+**The arm that matters more is pg_fts, because pg_weave is a fork of it and the two had
+never been compared.** Earned: the bare `ORDER BY` index path (L7 — upstream v1.8.3 still
+seq-scans it; **3,705× at 1M, 11,853× at 4M**), mid-band ranked latency (7.0× / 5.0×,
+L14 + L17), common-band ranked (1.86× / 1.61×), and **index size 3.5× / 3.0× smaller
+than the fork** (L8/L12/L17/L18). **Inherited, as exact ties at both scales:** `count(*)`
+pushdown and prefix `count(*)` — so the 133–144× `count(*)` margin over GIN is pg_fts's
+custom scan renamed, and `doc/ARCHITECTURE.md` §9's four claims correctly exclude it.
+**One loss to upstream, visible only at scale:** build, 1.08× slower at 4M. Details and
+two acknowledged confounds in `bench/RESULTS_LEXICAL.md`; new gap **G38** is a 2.2×
+`count(*)` slowdown since 2026-09-07 that the fork reproduces to 0.01 ms, which is how
+it is known not to come from pg_weave's divergence.
+
 **Phase F started on 2026-09-20 under a SCOPED WAIVER of hard rule 7, and the waiver's
-terms are part of the status.** None of the L, Z or V gates passes — L's
-`bench/RESULTS_LEXICAL.md` is stale and records losses, Z's own gate artifact
-`bench/RESULTS_FUZZY.md` was never written, V8's GIST-960d latency gate is unrun — and
+terms are part of the status.** None of the L, Z or V gates passes — L is now current but
+still misses by those 10–30 µs, Z's own gate artifact `bench/RESULTS_FUZZY.md` was never
+written, V8's GIST-960d latency gate is unrun — and
 the waiver is recorded at `doc/PHASES.md` "Phase F" with what was checked and why
 bounded top-k is nonetheless the one lever every unmet Z/V latency gate needs. **F1 and
 F5 are done; F2 and F3 are closed by the waiver** (F3 projects a scan only F2's pushdown
 can start), **F4 is withdrawn** because the vector proximity graph it integrated was
-withdrawn in Phase V, and **no Phase F gate is claimable** until `bench/lexical.sh` is
-re-run, because `FUSED_TOPK.md` §8's control is RRF-with-over-fetch and its lexical arm
-is the stale number above.
+withdrawn in Phase V, and the §8 gate's blocker moved: `bench/lexical.sh` **has** been
+re-run, so its RRF control no longer has a stale lexical arm, and `bench/RESULTS_FUSE.md`
+is now blocked by F2 alone — plus the nDCG rows on two public datasets, which this
+project has never run at all.
 
 What F1 bought beyond code is five falsifications of the algorithm's own spec, all
 recorded in `FUSED_TOPK.md` §3a rather than quietly fixed, and one of them is a
