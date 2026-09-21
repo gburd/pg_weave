@@ -185,6 +185,13 @@ weave_gate_shuttle_begin(WeaveChannelKind kind, const uint64 *keys, int nkeys,
 	gs->sh.blkend = 0;
 	gs->sh.weight = 1.0f;
 	gs->sh.maxscore = nkeys > 0 ? WEAVE_SCORE_ALWAYS : WEAVE_SCORE_NEVER;
+
+	/* (C5): this IS the reference predicate channel, so it declares itself one.
+	 * The fused scorer reads this field and not `kind` -- src/query/edist.c builds
+	 * a SCORED shuttle under WEAVE_CH_FUZZY, so the kind cannot carry the
+	 * contract.  See the field's comment in include/weave/channel.h. */
+	gs->sh.required = true;
+
 	gs->sh.state = gs;
 	return &gs->sh;
 }

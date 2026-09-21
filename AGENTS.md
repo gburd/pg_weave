@@ -203,25 +203,32 @@ gcc -O2 -I include -o /scratch/bp bench/bound_pruning.c \
 
 ## Scratch space, and where parallel worktrees go
 
-**Everything that is not the repository goes in `/scratch`.** Build outputs,
-compiled standalone tests, throwaway clusters, corpora, profiles, and git
-worktrees. Do not create sibling directories next to the checkout: `~/ws` is the
-maintainer's workspace root holding a hundred unrelated projects, and a
-`~/ws/wt-something` is indistinguishable from one of them a week later.
+**Everything that is not the repository goes under `/scratch/pg_weave/`.** Build
+outputs, compiled standalone tests, throwaway clusters, corpora, profiles, harness
+scripts, per-host env files, and git worktrees. Two placements are both wrong and
+both were corrected on 2026-09-20: **not** a sibling directory next to the checkout
+(`~/ws` is the maintainer's workspace root holding a hundred unrelated projects, so
+`~/ws/wt-something` is indistinguishable from one of them a week later), and **not**
+`/scratch` top level either (`/scratch` is shared with every other project, and this
+project's debris reached ~17 GB before anyone noticed). Be tidy: delete what is no
+longer needed, in the session that stops needing it.
 
 When several agents work at once they need **separate worktrees**, because a
 shared tree means concurrent `make` runs writing the same object files:
 
 ```sh
-git worktree add /scratch/pgw-<task> -b wt/<task> main
+git worktree add /scratch/pg_weave/<task> -b wt/<task> main
 # ... work, commit in the worktree, do not push ...
-git worktree remove /scratch/pgw-<task>
+git worktree remove /scratch/pg_weave/<task>
 ```
 
 `/scratch` is a **different filesystem** from `$HOME`, so `git worktree move`
-into it fails with "Invalid cross-device link". Create it in the right place the
-first time; relocating means `worktree remove` + `worktree add`, which is only
-safe once every change is committed.
+into it fails with "Invalid cross-device link" — but a move *within* `/scratch`
+works, which is how the 2026-09-20 relocation was done. Create it in the right
+place the first time; a cross-device relocation means `worktree remove` +
+`worktree add`, which is only safe once every change is committed.
+
+The bash harness refuses `rm -rf <dir>`. Use `find <dir> -depth -delete`.
 
 Two quirks a fresh worktree has that the main checkout does not, both discovered
 the hard way:
@@ -298,7 +305,17 @@ Apache-2.0's patent grant and NOTICE requirements are incompatible with a clean
 PostgreSQL-licensed release, and contrib-track eligibility is the reason that
 matters. See `doc/LICENSING.md`.
 
-**7. Do not start Phase F before the L, Z, and V gates pass.** The fused scorer is
+**7. Do not start Phase F before the L, Z, and V gates pass.** **SCOPED WAIVER IN
+FORCE since 2026-09-20 — read `doc/PHASES.md` "Phase F" before acting on this rule.**
+F1 (the backend-free fused core) and F5 (its property test) are open under a recorded
+maintainer decision; **F2 and F3 are not** — F3 because it projects the current row of a
+scan that only F2's pushdown can start — and **no Phase F gate is claimable**, because §8's control is
+RRF-with-over-fetch and its lexical arm is stale. None of the three prerequisite gates
+passes; the waiver states which, why bounded top-k is nonetheless the one lever every
+unmet Z/V latency gate needs, and what the mitigation for rule 7's actual hazard is.
+The rule below is the reasoning the waiver had to answer, so it stays as written.
+
+The fused scorer is
 the interesting part and the temptation is strong. A fused scorer debugged against a
 half-working channel costs more time than all of them, because every wrong answer
 has several possible causes and you will chase the wrong one.

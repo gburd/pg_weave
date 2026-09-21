@@ -141,6 +141,72 @@ Three prunes, in increasing strength: the essential/non-essential partition
 whole 32- or 128-document ranges; incremental abandonment removes the remaining
 per-document score calls.
 
+### 3a. Five corrections to the pseudocode above — TASK F1, 2026-09-20
+
+The loop was implemented (`include/weave/fuse.h`, `src/am/fuse.c`) and the
+pseudocode above is **left as written** because four of these five are not typos,
+they are places where a reasonable reading produces a silently wrong answer. The
+header of `fuse.h` carries each one at length next to the code that avoids it;
+this is the index.
+
+1. **Pivot selection as written performs a backward seek.** `min over ESSENTIAL i
+   of shuttle_i.seek(p)`: if channel A answers 50 and B answers 10, the pivot is
+   10 and the next round calls `A->seek(11)` — below what A already returned.
+   `channel.h` entitles a channel to **refuse** that, and both implemented
+   shuttles do. The scorer must remember each channel's last returned position
+   and seek only those standing below the target. Not an optimization: the literal
+   loop errors out on the second iteration of any unaligned multi-channel query.
+
+2. **A boolean channel is conjunctive, and (C5)'s "no special case" was false.**
+   The loop sums only the *contributing* channels, so a gate that has advanced
+   past the pivot contributes nothing rather than -INF and **the predicate is
+   silently not applied**. Channels split into REQUIRED (intersect; excluded from
+   the partition and from `ub`, because a gate's +INF bound would make `ub`
+   infinite and kill the block prune) and SCORED (sum). (C5) in `channel.h` is
+   corrected in place, and a channel now declares `required` on its shuttle —
+   `kind` cannot carry it, since Z9's `<@>` distance channel is scored and labels
+   itself `WEAVE_CH_FUZZY`.
+
+3. **Non-essential channels must still be advanced to the pivot.** The
+   contributing test `cur <= p <= blkend` reads like a filter over channels that
+   happen to be nearby, but a non-essential channel is never seeked by pivot
+   selection, so it sits at position 0 and the test excludes it for every `p > 0`
+   — dropping its contribution from every score. What MaxScore saves is that a
+   non-essential channel generates no *candidates* and can be abandoned before
+   `score()`; it does not save the seek. Found by the property test at 40,574
+   disagreements in 303,073 comparisons.
+
+4. **`remaining` by subtraction, and the three NaN traps.** `remaining <- ub` then
+   subtracting each bound is `INF - INF` with two contributing gates; `0 * INF` is
+   a zero weight on a gate's ceiling; `-INF + INF` is the abandonment test with a
+   vetoed document and an unscored gate. Each evaluates false against θ, so each
+   *silently disables a prune* while the answers stay plausible. `remaining` is a
+   suffix sum, weights must be `> 0` and finite (not merely non-negative as §7
+   says), and a -INF running sum is discarded before it meets anything.
+
+5. **§3 never defines the candidate set, and the definition is not free.** A
+   position no scored channel reaches is **not** a result: it matches nothing, its
+   fused score is 0, and padding the top-k with such rows answers "the ten best
+   documents" with documents containing none of the query. The candidate set is
+   the **union** of the scored channels' positions intersected with the required
+   channels'; with no scored channel, the required intersection alone. Pivot
+   selection gives the fast path exactly this, so §4's proof reaches the right
+   answer — but *not by the argument it gives*: the pivot-skip case argues
+   `S(d) <= Σ non-essential ≤ θ`, and at the start of a scan every channel is
+   essential, so that sum is 0 while θ is -INF. The skip is right; this definition
+   is why.
+
+And one property that is not a correction but must be stated, because it decides
+whether two plans agree: **float32 addition is not associative, so a fused score
+is only well defined once the summation order is.** The order is required
+channels first, then scored channels by descending weighted ceiling. Summing in
+the caller's order instead produced last-ULP differences on 771 of 812,179
+comparisons — the same rows, differing in the seventh digit — as soon as the
+property test was given a fine-grained score lattice. Nothing was wrong with
+either sum; there were two definitions of one number. The order must therefore
+come from the channel set, which is stable, and never from the plan or from which
+channels happened to be pruned. This is a constraint on F2 and F3.
+
 ## 4. Correctness
 
 **Claim.** The algorithm returns exactly the top `k` documents by `S(d)`,
@@ -187,13 +253,60 @@ descending-`B_i` array with a running suffix sum, and the split point only ever
 moves in one direction as θ grows. `src/am/fuse.c` should implement it as a
 single `int split` index into that array.
 
-Heuristic worth measuring, not assuming: for a *vector graph* channel, being
+~~Heuristic worth measuring, not assuming: for a *vector graph* channel, being
 non-essential is much more valuable than for a lexical channel, because a graph
 shuttle that is never used for pivot selection can skip its traversal entirely
 and degrade to a pure verifier. Consider biasing the sort to put graph channels
-last. `bench/fuse_partition.sql` should A/B this.
+last. `bench/fuse_partition.sql` should A/B this.~~
+
+**SUPERSEDED 2026-09-20, with §6 and task F4: there is no graph channel.** The
+heuristic's whole value was that a graph shuttle demoted out of pivot selection can
+skip its *traversal*; no other channel kind has a traversal to skip, so the bias has
+nothing to bias. Descending `B_i` is the plain MaxScore order and stands unmodified,
+and `bench/fuse_partition.sql` is not owed. What survives the withdrawal is the
+observation underneath it, which is about cost asymmetry rather than graphs: when two
+channels have comparable `B_i` but very different `score()` costs, the expensive one
+is worth demoting first, because the partition's benefit is measured in avoided work
+and not in avoided positions. The code scan's `score_block()` (32 lanes in a few SIMD
+instructions) versus a posting-list decode is the live instance. **Unmeasured**, and
+deliberately not implemented on that reasoning alone — descending `B_i` is what §4's
+proof is written against, and any reordering has to preserve the invariant
+`Σ_{non-essential} B_i ≤ θ` rather than merely look plausible.
 
 ## 6. Interaction with the vector graph channel
+
+**SUPERSEDED 2026-09-20 — THIS SECTION HAS NO SUBJECT. The vector proximity graph
+was withdrawn in Phase V, so nothing described below is built, and task F4, which
+existed to build it, is withdrawn with it.** The section is left in place per hard
+rule 13 rather than deleted, because the design is sound and would be the right
+answer if a graph channel is ever re-justified.
+
+What happened, so the withdrawal is checkable and not just asserted. pg_turbovec
+deprecated its graph kind in v2.5.0 having measured that at R@10 ≥ 0.98 on
+GIST-10M/960-d, IVF reached 28.4 ms while the graph could not reach 0.98 at **any**
+latency (ceiling 0.873 at 181 ms) and built 57–90× slower. V9's IVF is separately
+demoted. The ratified Phase V shape (2026-09-13) is a flat 32-lane code scan plus an
+exact float32 top-25 rerank read from the heap — recall@10 0.9920 at n=1M on
+GIST-960d. So `WEAVE_CH_VECTOR_GRAPH` has no implementation and no planned one, and
+`set_visit_filter` in `channel.h` is an optional vtable slot that no channel fills.
+
+Three consequences that matter to the scorer, all of them simplifications:
+
+1. **Every shuttle's `seek` is monotone by construction.** Non-monotonicity was the
+   graph's alone (best-first traversal order is not warp order), and it is the reason
+   this section had to exist. (C1) is now a contract every implemented channel
+   satisfies naturally rather than one that needed a preparation step to rescue.
+2. **The fused loop's cursor is always the exhaustive code scan**, which is what
+   `recall=exact` already meant. The approximate arm is gone, not disabled.
+3. **§8's `recall ≥ 0.99 with graph on` row is struck**, because recall against an
+   exhaustive fused scan is 1.000 by construction when no channel is approximate.
+   Claim 3 in `doc/ARCHITECTURE.md` §9 — that queries get *faster* as predicates get
+   more selective — loses the mechanism this section gave it (filter-steered
+   traversal) and must rest on the other two: the boolean gate narrowing pivot
+   selection, and the block bound skipping whole intersected block ranges. Both are
+   §3 mechanisms, neither needs a graph, and neither is measured yet.
+
+Superseded design follows.
 
 The graph channel is the one shuttle whose `seek` is not naturally monotone —
 Vamana traversal visits nodes in best-first order, not warp order. Two options,
@@ -263,7 +376,7 @@ control. `bench/fuse.sql` and `bench/RESULTS_FUSE.md`.
 | p50 latency, k=10 | RRF `k'=100` | ≤ 0.5× RRF |
 | p99 latency, k=10 | RRF `k'=100` | ≤ 0.7× RRF |
 | channel score() calls | RRF `k'=100` | ≤ 0.2× RRF (this is the mechanism; if it is not much lower, the bounds are too loose and §2 is wrong) |
-| recall vs exhaustive fused scan | — | ≥ 0.99 with graph on; **1.000** with `recall=exact` |
+| recall vs exhaustive fused scan | — | ~~≥ 0.99 with graph on;~~ **1.000**, and it is 1.000 *by construction* now that the graph channel is withdrawn (§6) — every implemented channel is exact, so this row tests the scorer's pruning, not an approximation. A single miss is a (C2) violation, which makes it the most valuable row in the table rather than the weakest |
 
 If the `score()` call ratio is not dramatically lower, stop and fix the bounds
 before optimizing anything else — a loose bound makes the entire design pointless

@@ -1405,3 +1405,49 @@ same two options apply: carry the text on the pending item (bytes, and the text 
 heap), or teach the flush to re-read the heap tuple. `sql/cgram.sql` asserts the correct answer
 across INSERT, DELETE and VACUUM so that closing this shows up as a latency change and not as a
 correctness change.
+
+### G36 — the fused core is document-at-a-time: `score_block()` exists, is faster, and is unused — **OPEN 2026-09-20, deliberately**
+
+`include/weave/channel.h` defines an optional `score_block()` slot for channels that can
+produce a whole block's worth of candidates more cheaply than one `seek()` per position —
+"the vector code scan does 32 lanes in a few SIMD instructions" — and says **"When present,
+the scorer prefers it."** As of task F1 the scorer does not. `src/am/fuse.c` is
+document-at-a-time only, so V8's `score_block()` is implemented, verified, and called by
+nothing.
+
+Why it was left: using it turns the loop inside out. The block becomes the unit of work,
+the pivot has to be recomputed against a range rather than a position, and the
+essential/non-essential partition has to be evaluated per range. Doing that before the
+document-at-a-time loop was proven against brute force would have meant debugging two
+algorithms at once, with the wrong-answer modes of each available to explain any
+disagreement. That is the trade AGENTS.md hard rule 7 is about, made inside one task
+instead of across a phase.
+
+**The cost is unmeasured and must not be guessed.** The honest statement of what is known:
+V8's kernels score 32 lanes per call, and the fused loop currently calls `score()` once per
+surviving position. Whether that matters depends on how many positions survive the block
+prune, which at 10^6 synthetic trials is 32.2 M block skips against 79.4 M pivots — a
+synthetic ratio that says nothing about a real corpus. Measure it when F2 makes a real
+query reachable; do not quote a factor before then.
+
+Related and smaller: `channel.h` also documents the `nwarp`/`allow` bitmap-extent
+obligation that `score_block()` carries, and no caller exercises it, so that contract is
+asserted in V8's own property test and nowhere else.
+
+### G37 — MaxScore's *seek* saving is not taken: every scored channel is advanced at every pivot — **OPEN 2026-09-20**
+
+`src/am/fuse.c` advances **every** scored channel to the pivot, essential or not. That is
+required for correctness — a non-essential channel that is not advanced silently drops its
+contribution from every score, which is `FUSED_TOPK.md` §3a correction 3 and cost a
+debugging round when F5 found it — but it is more work than a textbook MaxScore does. What
+is preserved is the saving that matters for *candidates*: a non-essential channel never
+generates a pivot, so the scan never visits a document only it matches, and incremental
+abandonment can stop before its `score()` runs. What is given up is the seek itself.
+
+A lazier variant is possible: defer a non-essential channel's seek until the abandonment
+loop actually reaches it, and take its bound from its ceiling rather than its block until
+then. That is strictly looser, so it prunes less, so it is a trade and not an improvement —
+and the number that decides it (seeks avoided against blocks no longer skipped) does not
+exist. **Unmeasured, and not attempted.** Recorded so that the current shape reads as a
+choice rather than an oversight, and so that anyone profiling a fused scan and finding seek
+cost dominant knows the lever exists.

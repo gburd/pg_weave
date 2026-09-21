@@ -203,9 +203,33 @@ when the scope was read as "BM25 + vector", then back when it was restated as al
 six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
 hard rule was weakened on an inference about scope rather than a question about it.*
 
-**37 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
-Z5, Z8, Z9) and 5 withdrawn (L2, L21, V9, V10, V13). By phase: X 4/4, L 16/20, Z 7/9,
-V 9/17, P 2/4, F 0/5, M 0/6, R 0/5. **ALL NINE PHASE-Z TASKS NOW HAVE AN IMPLEMENTATION as of 2026-09-20**, and two of them are
+**39 of 70 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
+Z5, Z8, Z9) and 6 withdrawn (L2, L21, V9, V10, V13, **F4**). By phase: X 4/4, L 16/20,
+Z 7/9, V 9/17, P 2/4, **F 2/5**, M 0/6, R 0/5.
+
+**Phase F started on 2026-09-20 under a SCOPED WAIVER of hard rule 7, and the waiver's
+terms are part of the status.** None of the L, Z or V gates passes — L's
+`bench/RESULTS_LEXICAL.md` is stale and records losses, Z's own gate artifact
+`bench/RESULTS_FUZZY.md` was never written, V8's GIST-960d latency gate is unrun — and
+the waiver is recorded at `doc/PHASES.md` "Phase F" with what was checked and why
+bounded top-k is nonetheless the one lever every unmet Z/V latency gate needs. **F1 and
+F5 are done; F2 and F3 are closed by the waiver** (F3 projects a scan only F2's pushdown
+can start), **F4 is withdrawn** because the vector proximity graph it integrated was
+withdrawn in Phase V, and **no Phase F gate is claimable** until `bench/lexical.sh` is
+re-run, because `FUSED_TOPK.md` §8's control is RRF-with-over-fetch and its lexical arm
+is the stale number above.
+
+What F1 bought beyond code is five falsifications of the algorithm's own spec, all
+recorded in `FUSED_TOPK.md` §3a rather than quietly fixed, and one of them is a
+correction to a **correctness contract**: (C5)'s promise that a boolean channel needs
+"no special case" is false — a gate past the pivot is not in the contributing set, so
+its -INF is never summed and the predicate is silently not applied. Boolean channels are
+conjunctive, `channel.h` says so now, and a channel declares `required` on its shuttle
+rather than having it inferred from `kind` — because Z9's `<@>` channel is **scored** and
+labels itself `WEAVE_CH_FUZZY`, so the inference would have vetoed every row it ranks.
+F5's gate is met at 1,140,000 trials and 37,765,994 checks with 11 of 13 mutants killed,
+and its positive control measures how silent a loose bound is: a bound 1 % too low
+changes the answer in **1.30 %** of trials, one 10 % too low in **13.08 %**. **ALL NINE PHASE-Z TASKS NOW HAVE AN IMPLEMENTATION as of 2026-09-20**, and two of them are
 PARTIAL for reasons that are measurements rather than missing code: Z8's `cgram` channel is
 2.0-2.4x slower than `pg_trgm` and 1.67x its size (`bench/RESULTS_CGRAM.md`), with a
 cgram-bearing bolt not yet mergeable (`G34`) and post-build inserts unaccelerated (`G35`);
@@ -229,10 +253,11 @@ row stays PARTIAL until `bench/aws/run.sh` says so for the record -- while `G32`
 negative the old literal-run extractor produced for `\d`, is closed by deleting it. **Four of the six retrieval kinds are CHANNELS** -- BM25 lexical, quantized-vector ANN
 (V8, 2026-09-18), and as of Z7 on 2026-09-20 fuzzy and regex -- in the sense defined above:
 a shuttle with a real bound (for a predicate, +/-INF is exactly tight; `include/weave/gate.h`).
-The gate shuttle is key-space agnostic and is not yet driven by any query, because there is
-no fused scorer to drive it (hard rule 7); prefix returns correct rows through the dictionary
-range walk and could use the same shuttle the day a route hands it a key set; n-gram (`cgram`,
-Z8) has neither a route nor a shuttle.
+The gate shuttle is key-space agnostic and is not yet driven by any query: **as of F1 a fused
+scorer exists to drive it, but nothing builds one, because that is F2's planner pushdown and
+the waiver keeps F2 closed.** Prefix returns correct rows through the dictionary range walk
+and could use the same shuttle the day a route hands it a key set; n-gram (`cgram`, Z8) has
+neither a route nor a shuttle.
 
 *Z4 is PARTIAL as of 2026-09-19, and the interesting part is why.* Its stated shape --
 route prefix through SuRF instead of the dictionary walk -- is a strict superset of the
