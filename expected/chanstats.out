@@ -16,7 +16,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.14.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.15.0" of extension "pg_weave" is already installed
 SET enable_seqscan = off;
 SET max_parallel_workers_per_gather = 0;
 CREATE TABLE cs (id serial, body text, d wdoc, v wvec(4));

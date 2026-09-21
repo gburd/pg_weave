@@ -40,6 +40,7 @@
 #include "weave/am.h"
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
 #include "weave/edist.h"			/* Z9: the <@> edit-distance shuttle */
+#include "weave/vector.h"			/* F7: the shared vector top-k the <=> ordering scan drives */
 #include <math.h>
 #include "access/genam.h"
 #include "access/generic_xlog.h"
@@ -208,6 +209,37 @@ typedef struct WeaveScanOpaqueData
 	bool		edistDone;
 
 	/*
+	 * `<=>` vector ordering scan over a wvec column (task F7).  A THIRD order-by
+	 * operator over the same ordered[]/cand[] machinery, and the shape is the
+	 * lexical one rather than the `<@>` one: the ladder is over a CANDIDATE WIDTH,
+	 * because that is what the vector channel's top-k takes as its parameter and
+	 * what its block bound prunes against (a wider k is a lower top-k floor, so it
+	 * prunes less and finds more).
+	 *
+	 * `vecQuery` is the query vector, DETOASTED AND COPIED into the scan's own
+	 * context, because sk_argument is only guaranteed for the duration of the
+	 * rescan and every pass of the ladder re-reads it.
+	 *
+	 * `vecAttno` is the index attribute the order-by key named, and it is carried
+	 * rather than re-derived so that the pass scores the weft recorded against THAT
+	 * column: an index may carry more than one wvec column, and scoring the wrong
+	 * weft is a wrong answer with a correct row count (include/weave/vector.h).
+	 *
+	 * `vecDone` is the ladder's exact stop: a pass that returned fewer hits than it
+	 * asked for never filled its top-k heap, so its floor stayed -INFINITY, so no
+	 * block could be skipped on the bound and no lane was passed over -- the pass
+	 * IS the complete set of live lanes.  Same argument as `candfull` on the lexical
+	 * side, and `vecLanes` (total lanes in every bolt scanned) is the cheap early
+	 * stop that `maxhits` is there.
+	 */
+	bool		vecScan;
+	WVec	   *vecQuery;
+	AttrNumber	vecAttno;
+	int			veck;			/* candidate width of the current vector pass */
+	uint64		vecLanes;		/* lanes the last pass saw, live or not */
+	bool		vecDone;
+
+	/*
 	 * `@~` / `@~*` corpus-trigram restriction (task Z8).  A RESTRICTION key, not
 	 * an ordering one, and its argument is a raw LIKE PATTERN rather than a
 	 * wquery -- which is why weave_rescan() must decide WHICH KIND OF KEY it has
@@ -251,6 +283,10 @@ static void weave_ord_probe(Relation index, WeaveScanOpaque so, int want);
 static bool weave_ord_grow(Relation index, WeaveScanOpaque so);
 static void weave_edist_pass(Relation index, WeaveScanOpaque so);
 static bool weave_edist_grow(Relation index, WeaveScanOpaque so);
+
+/* the <=> vector ordering ladder (F7); defined next to the lexical one */
+static void weave_vec_pass(Relation index, WeaveScanOpaque so);
+static bool weave_vec_grow(Relation index, WeaveScanOpaque so);
 
 static int
 cmp_tid(const void *a, const void *b)
@@ -2206,6 +2242,12 @@ weave_beginscan(Relation r, int nkeys, int norderbys)
 	so->edistThr = 0;
 	so->edistNext = INT_MAX;
 	so->edistDone = false;
+	so->vecScan = false;
+	so->vecQuery = NULL;
+	so->vecAttno = 0;
+	so->veck = 0;
+	so->vecLanes = 0;
+	so->vecDone = false;
 	so->cgramScan = false;
 	so->cgramPat = NULL;
 	so->cgramPatLen = 0;
@@ -2337,6 +2379,20 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->edistThr = 0;
 	so->edistNext = INT_MAX;
 	so->edistDone = false;
+	/*
+	 * F7's per-rescan state, reset HERE with all the rest and not lazily on first
+	 * use.  A rescan that leaks one field from the previous scan is a wrong answer
+	 * that appears only under a nested loop -- the outer row changes, the inner
+	 * scan keeps the previous query vector or the previous ladder width, and every
+	 * arm of the join returns plausible rows.  sql/vecorderby.sql drives a
+	 * correlated subquery for exactly this.
+	 */
+	so->vecScan = false;
+	so->vecQuery = NULL;
+	so->vecAttno = 0;
+	so->veck = 0;
+	so->vecLanes = 0;
+	so->vecDone = false;
 	if (scan->numberOfOrderBys >= 1)
 	{
 		/*
@@ -2345,8 +2401,50 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		 * datum would interpret a varlena header as a WeaveQuery and walk
 		 * garbage.  So dispatch on sk_strategy, and treat an unknown strategy as
 		 * an error rather than as <=>.
+		 *
+		 * The vector member is tested FIRST because its number is the one shared
+		 * with another family's member.  WEAVE_STRAT_VEC_DISTANCE is 1, which
+		 * wdoc_lex_ops spends on `@@@`; `@@@` is a restriction operator and so can
+		 * never arrive in orderByData, which is exactly why 1 was chosen for the
+		 * vector member (include/weave/am.h).  The strategy is therefore
+		 * unambiguous here, and reading a wvec datum as a wvec is safe because the
+		 * operator's left argument type is what put the key on this column.
+		 *
+		 * WHICH COLUMN it names is answered one level down instead of here, and
+		 * that is a deliberate choice rather than an omission: sk_attno is carried
+		 * into so->vecAttno and weave_vec_topk_run() scores only a weft whose
+		 * channel DESCRIPTOR records that attribute.  The descriptor's attnum is
+		 * the stronger check -- it catches a weft WRITTEN against the wrong column,
+		 * which is the mutation include/weave/vector.h says the field exists to
+		 * catch, and which a catalog-derived comparison here would miss -- and it
+		 * is also what makes the no-vector-channel and no-vector-weft cases FALL
+		 * THROUGH to zero rows rather than to an error: no bolt matches, the pass
+		 * returns nothing, and an ordering path over a channel this index does not
+		 * carry is a legitimate plan over an empty channel.
 		 */
-		if (scan->orderByData[0].sk_strategy == WEAVE_STRAT_EDIST)
+		if (scan->orderByData[0].sk_strategy == WEAVE_STRAT_VEC_DISTANCE)
+		{
+			MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+			WVec	   *q = DatumGetWVec(scan->orderByData[0].sk_argument);
+
+			/*
+			 * COPIED, not aliased.  DatumGetWVec() hands back the datum itself
+			 * when it is not toasted, sk_argument belongs to the executor's
+			 * ScanKey, and every rung of the widening ladder re-reads the vector
+			 * from weave_gettuple() -- arbitrarily later than this call.
+			 */
+			so->vecQuery = (WVec *) palloc(VARSIZE_ANY(q));	/* alloc-ok: one query vector, bounded by WVEC_MAX_DIM */
+			memcpy(so->vecQuery, q, VARSIZE_ANY(q));
+			so->vecAttno = scan->orderByData[0].sk_attno;
+			so->vecScan = true;
+			/*
+			 * The vector IS the query on this path; so->query stays NULL and
+			 * queryValid keeps its existing meaning ("a WHERE clause supplied a
+			 * wquery"), which for a bare `ORDER BY v <=> c` it did not.
+			 */
+			MemoryContextSwitchTo(old);
+		}
+		else if (scan->orderByData[0].sk_strategy == WEAVE_STRAT_EDIST)
 		{
 			MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
 			text	   *pat = DatumGetTextPP(scan->orderByData[0].sk_argument);
@@ -2426,8 +2524,9 @@ weave_set_itup(IndexScanDesc scan, WeaveScanOpaque so)
 }
 
 /*
- * weave_gettuple: ordering scan for ORDER BY (wdoc <=> wquery) LIMIT k.
- * On the first call it computes the block-max WAND top-k (visibility-filtered)
+ * weave_gettuple: ordering scan for ORDER BY (wdoc <=> wquery) LIMIT k, and since
+ * tasks Z9 and F7 also for (wdoc <@> text) and (wvec <=> wvec).
+ * On the first call it computes the channel's top-k (visibility-filtered)
  * into scan state, then returns tuples one per call in ascending distance
  * (descending relevance), setting xs_orderbyvals so the executor can honor the
  * ORDER BY without a sort.  Only forward scans are supported.
@@ -2459,7 +2558,18 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 				 errdetail("The scan has neither a @@@ restriction nor an ORDER BY <=> ordering clause."),
 				 errhint("Add \"WHERE col @@@ query\" or \"ORDER BY col <=> query\".")));
 
-	if (so->edistScan)
+	if (so->vecScan)
+	{
+		/*
+		 * F7: the `<=>` vector path has a query VECTOR instead of a wquery, so
+		 * everything below that tests so->query would reject it.  Tested before
+		 * the other two because a vector ordering scan may also carry a `@@@`
+		 * restriction key, which would have set queryValid.
+		 */
+		if (so->vecQuery == NULL)
+			return false;
+	}
+	else if (so->edistScan)
 	{
 		/*
 		 * The <@> path has a pattern instead of a wquery; everything below that
@@ -2519,7 +2629,34 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 	if (!so->orderInit)
 	{
-		if (so->edistScan)
+		if (so->vecScan)
+		{
+			/*
+			 * Task F7.  The vector ladder's rungs are CANDIDATE WIDTHS, the same
+			 * shape as the lexical one and for the same reason: PostgreSQL gives an
+			 * access method no way to learn the query's LIMIT, so
+			 * CORRECTNESS MUST NOT DEPEND ON THE PLANNER'S LIMIT ESTIMATE.  The
+			 * scan starts at a width chosen for the first page an interactive
+			 * `ORDER BY v <=> $1 LIMIT 10` asks for, and weave_vec_grow() widens x4
+			 * whenever the executor drains what is materialized -- a cursor, a
+			 * LIMIT-less query, or a LIMIT the planner under-estimated all reach the
+			 * same code, and an amcanorderbyop scan that stopped at a ceiling of its
+			 * own would silently truncate the result (see weave_ord_grow).
+			 *
+			 * The initial width is pg_weave.wand_initial_k through the same
+			 * weave_ord_width() over-fetch the lexical pass uses, rather than a
+			 * constant or a second GUC.  One knob for "how wide is the first rung of
+			 * an ordering pass" is a knob a benchmark can sweep; two are a pair that
+			 * drifts, and the x4 over-fetch is there for the same reason in both
+			 * channels -- MVCC filtering, which discards candidates after scoring.
+			 */
+			pgstat_count_index_scan(scan->indexRelation);
+			so->veck = weave_ord_width(pg_weave_wand_initial_k);
+			weave_vec_pass(scan->indexRelation, so);
+			so->ordpos = 0;
+			so->orderInit = true;
+		}
+		else if (so->edistScan)
 		{
 			/*
 			 * Task Z9.  The narrowest useful threshold is 0 -- documents holding
@@ -2588,7 +2725,8 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 	 *
 	 *  1. already materialized in ordered[] -- free;
 	 *  2. the current pass's remaining candidates -- one heap probe each;
-	 *  3. a wider pass (weave_ord_grow) -- a full WAND recompute.
+	 *  3. a wider pass (weave_ord_grow / weave_edist_grow / weave_vec_grow) -- a
+	 *     full recompute of the channel's top-k.
 	 *
 	 * (3) EXTENDS the scan rather than repeating it: ordered[] survives, so the
 	 * rows already handed out are neither re-probed nor re-emitted.
@@ -2612,7 +2750,8 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 				break;
 		}
 		/* candidates exhausted: widen the pass, or the scan is complete */
-		if (!(so->edistScan ? weave_edist_grow(scan->indexRelation, so)
+		if (!(so->vecScan ? weave_vec_grow(scan->indexRelation, so)
+			  : so->edistScan ? weave_edist_grow(scan->indexRelation, so)
 			  : weave_ord_grow(scan->indexRelation, so)))
 			return false;
 	}
@@ -2629,6 +2768,19 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 		 * re-run the original qual against the heap tuple.
 		 */
 		scan->xs_recheck = so->plainRecheck;
+	if (so->vecScan && scan->numberOfKeys > 0)
+		/*
+		 * `WHERE d @@@ q ORDER BY v <=> $1` pushed the @@@ key down and the vector
+		 * pass DID NOT HONOUR IT: fusing a lexical restriction into the vector
+		 * channel's top-k is the fused scorer, i.e. Phase F, and building a second
+		 * one here is what AGENTS.md hard rule 7 forbids.  So the returned set is an
+		 * admitted SUPERSET of the answer and recheck goes out as true, which makes
+		 * the executor re-evaluate the original qual against the heap tuple.  The
+		 * result is still COMPLETE rather than merely correct, because the executor
+		 * discarding rows drives the ladder on: weave_vec_grow() widens until it can
+		 * prove there is nothing further, not until it has produced k rows.
+		 */
+		scan->xs_recheck = true;
 	weave_set_itup(scan, so);
 	if (scan->numberOfOrderBys > 0)
 	{
@@ -6004,8 +6156,10 @@ weave_ord_probe(Relation index, WeaveScanOpaque so, int want)
 		 * On the <@> path (Z9) cand[].score is ALREADY the edit distance -- a
 		 * distance, ascending, in the units the operator returns -- so it is
 		 * carried through unchanged.  Inverting it here would have produced a
-		 * plausible monotone value and a wrong xs_orderbyvals. */
-		so->ordered[so->nordered].score = so->edistScan ? c->score
+		 * plausible monotone value and a wrong xs_orderbyvals.  The `<=>` vector
+		 * path (F7) is the same case: weave_vec_pass() has already turned the
+		 * channel's higher-is-better score into an ascending distance. */
+		so->ordered[so->nordered].score = (so->edistScan || so->vecScan) ? c->score
 			: 1.0 / (1.0 + c->score);
 		so->nordered++;
 	}
@@ -6051,6 +6205,212 @@ weave_ord_grow(Relation index, WeaveScanOpaque so)
 	so->curk = (so->curk > WEAVE_ORD_WIDTH_MAX / 4)
 		? WEAVE_ORD_WIDTH_MAX : so->curk * 4;
 	weave_ord_pass(index, so);
+	return true;
+}
+
+/* -------------------------------------------------------------------------
+ * The `<=>` vector ordering pass -- task F7
+ *
+ * One pass is the vector channel's top-k at width so->veck, computed by
+ * weave_vec_topk_run() -- the SAME loop the weave_vec_scan() SRF drives, shared
+ * rather than copied so that a drift between the operator and its own oracle is
+ * impossible (include/weave/vector.h).  This file adds only what a scan needs and
+ * an SRF does not: TID resolution, MVCC, and the widening ladder.
+ *
+ * THE LADDER IS OVER A CANDIDATE WIDTH, and it exists because
+ * CORRECTNESS MUST NOT DEPEND ON THE PLANNER'S LIMIT ESTIMATE.  PostgreSQL gives
+ * an access method no way to learn a query's LIMIT, and an amcanorderbyop scan must
+ * be able to return EVERY matching tuple in order -- a ceiling of the access
+ * method's own silently truncates a query that asks for more, which on the lexical
+ * side was a real reported bug ("orderby distance scan undercounts", see
+ * weave_ord_grow).  So the scan starts narrow, and when the executor drains what is
+ * materialized -- via a LIMIT larger than the first pass, via a cursor, via a
+ * LIMIT-less query, or via rows the executor's own recheck discarded --
+ * weave_vec_grow() runs a wider pass.
+ *
+ * THE STOP IS A PROOF, not an estimate, and there are two of them:
+ *
+ *	 1. nhit < veck.  The pass's top-k heap never filled, so its floor stayed at
+ *	    -INFINITY for the whole scan; WEAVE_VSCAN_SKIP_BOUND is only reachable when
+ *	    a block's bound is <= that floor, and no allowlist is in play so
+ *	    WEAVE_VSCAN_SKIP_MASK is not either.  Nothing was skipped, so the pass IS
+ *	    every live lane in the index.  Exact, and the analogue of `candfull`.
+ *	 2. veck >= nlane.  The pass was at least as wide as the total lane count of
+ *	    every bolt it scanned, so no wider pass can find more.  The analogue of
+ *	    `curk >= maxhits`, and unlike that one it is a count rather than a bound, so
+ *	    it is also what keeps the hit array from growing past the relation.
+ *
+ * WHERE THE TIDs COME FROM, and it is the paragraph AGENTS.md asks for because
+ * getting it wrong FAILS SILENTLY -- a physical (heap-only) TID resolves to no
+ * visible tuple, so the plan shows a row count and no error.  These TIDs are NOT
+ * manufactured from the heap: weave_docid_to_tid() inverts weave_tid_to_docid(),
+ * and the docid it inverts came out of the weft's warp map, which was written from
+ * the TID the BUILD CALLBACK or weave_insert() was handed.  Those are already
+ * HOT-chain roots -- table_index_build_scan() reports the root for a HOT-updated
+ * tuple, and an aminsert TID is the root of a chain that starts with it -- so the
+ * mapping is root-preserving and no heap_get_root_tuples() pass is needed or
+ * wanted.  (Contrast weave_cgram_heapscan(), which reads the heap itself and
+ * therefore must call it; that is the site whose omission cost a debugging round.)
+ *
+ * WHAT THE DISTANCE IS.  The channel scores in the metric's domain, higher is
+ * better (-||q-v||^2 for l2, the inner product for ip), so the ordering distance
+ * handed to the executor is the NEGATED score: monotone, ascending, and for l2
+ * exactly ||q-v||^2.  It is NOT the value `<=>` would compute on the heap, for two
+ * independent reasons that are recorded rather than papered over -- the index scores
+ * QUANTIZED reconstructions, and the weft's metric is the `metric` reloption (l2 by
+ * default) while `<=>` is named for cosine.  xs_recheckorderby therefore stays
+ * false: setting it would ask the executor to re-sort within a reorder queue, which
+ * requires the AM's value to be a proven LOWER BOUND on the operator's, and a
+ * quantized score is not one.  This is an approximate (ANN) ordering, which is what
+ * an ANN index is; sql/vecorderby.sql RECORDS the divergence from an exact float
+ * ordering instead of asserting it away, and doc/specs/VECTOR_CHANNEL.md sect. 8b
+ * holds the eventual per-metric opclass split (wvec_l2_ops, wvec_ip_ops) that makes
+ * the operator's name true.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * One pass, bracketed against the A1 race.
+ *
+ * The bolt loop reads VDIR/VCODES/VWARP pages under per-page SHARE locks off a
+ * metapage snapshot, so a concurrent merge or vacuum can free and recycle those
+ * pages mid-pass and the scan would score bytes that are no longer the weft.
+ * Re-read the directory generation afterwards and redo from a fresh snapshot if it
+ * moved, bounded at 10 attempts -- exactly weave_topk_candidates_guarded()'s
+ * contract, including its outcome on total failure: no candidates rather than a
+ * nonzero count over an array that may be garbage.  (The weave_vec_scan() SRF does
+ * NOT do this and never has; it is a diagnostic that reads what is there.)
+ */
+static WeaveVecTopK *
+weave_vec_topk_guarded(Relation index, WeaveScanOpaque so)
+{
+	int			gen_retries = 0;
+
+	do
+	{
+		WeaveMetaPageData meta;
+		uint32		gen0 = weave_read_meta_generation(index);
+		WeaveVecTopK *r;
+
+		weave_read_meta(index, &meta);
+		r = weave_vec_topk_run(index, &meta, so->vecQuery, so->veck,
+							   (uint16) so->vecAttno, NULL, 0, false);
+		if (weave_read_meta_generation(index) == gen0)
+			return r;
+		pfree(r->hit);
+		pfree(r->ctr);
+		pfree(r);
+	} while (gen_retries++ < 10);
+
+	return NULL;
+}
+
+static void
+weave_vec_pass(Relation index, WeaveScanOpaque so)
+{
+	WeaveVecTopK *r = weave_vec_topk_guarded(index, so);
+	ScoredTid  *cand;
+	int			ncand;
+	int			i;
+
+	if (r == NULL)
+	{
+		/* every attempt raced a merge: no candidates, and the ladder stops */
+		if (so->cand)
+			pfree(so->cand);
+		so->cand = NULL;
+		so->ncand = 0;
+		so->candpos = 0;
+		so->candfull = false;
+		so->vecLanes = 0;
+		so->vecDone = true;
+		return;
+	}
+
+	so->vecLanes = r->nlane;
+	so->vecDone = (r->nhit < so->veck ||
+				   (uint64) so->veck >= r->nlane);
+	ncand = r->nhit;
+
+	cand = (ScoredTid *) WEAVE_ALLOC_MAYBE_HUGE((Size) Max(ncand, 1) *
+												sizeof(ScoredTid));
+	for (i = 0; i < ncand; i++)
+	{
+		weave_docid_to_tid(r->hit[i].docid, &cand[i].tid);
+		cand[i].score = -(double) r->hit[i].score;
+	}
+	pfree(r->hit);
+	pfree(r->ctr);
+	pfree(r);
+
+	/*
+	 * Rows an earlier, narrower pass already materialized are removed by TID, so a
+	 * widening EXTENDS the scan instead of repeating its output -- the same
+	 * argument weave_ord_pass() makes.  Ordering across the boundary is safe for
+	 * the same reason too: a pass at width W1 is the EXACT top-W1 of the channel's
+	 * (quantized) score function, because the block bound is sound by contract
+	 * (C2), so a document in it has fewer than W1 <= W2 documents scoring above it
+	 * and nothing a wider pass newly finds can outrank a row already handed out.
+	 * A document merged into the index between two passes could; a ranked scan is
+	 * not order-stable under concurrent modification, here or on the lexical side.
+	 */
+	if (ncand > 0 && so->nordered > 0)
+	{
+		ItemPointerData *seen;
+		int			j = 0;
+
+		seen = (ItemPointerData *)
+			WEAVE_ALLOC_MAYBE_HUGE((Size) so->nordered * sizeof(ItemPointerData));
+		for (i = 0; i < so->nordered; i++)
+			seen[i] = so->ordered[i].tid;
+		qsort(seen, so->nordered, sizeof(ItemPointerData), cmp_tid);
+		for (i = 0; i < ncand; i++)
+			if (bsearch(&cand[i].tid, seen, so->nordered,
+						sizeof(ItemPointerData), cmp_tid) == NULL)
+				cand[j++] = cand[i];
+		ncand = j;
+		pfree(seen);
+	}
+
+	if (so->cand)
+		pfree(so->cand);
+	so->cand = cand;
+	so->ncand = ncand;
+	so->candpos = 0;
+	so->candfull = false;		/* the <=> vector ladder stops on vecDone */
+}
+
+/*
+ * Widen the vector pass x4 because the executor wants more rows than the current
+ * one can supply.  Returns false only when a pass PROVED there is nothing further,
+ * which is the standard weave_ord_grow() and weave_edist_grow() hold themselves to.
+ */
+static bool
+weave_vec_grow(Relation index, WeaveScanOpaque so)
+{
+	int64		next;
+
+	if (so->vecDone)
+		return false;			/* the pass returned every live lane */
+	if (so->veck >= WEAVE_ORD_WIDTH_MAX)
+		return false;			/* cannot widen further */
+
+	next = (int64) so->veck * 4;
+	if (next > (int64) WEAVE_ORD_WIDTH_MAX)
+		next = WEAVE_ORD_WIDTH_MAX;
+	/*
+	 * Clamp to the lane count the last pass reported.  Without this a x4 step past
+	 * the end of the index asks weave_vec_topk_run() for a hit array wider than the
+	 * relation -- pure waste, and at relation scale a large one.  vecLanes is 0
+	 * only when no bolt carried a matching weft, in which case vecDone is already
+	 * set and this line is unreachable.
+	 */
+	if (so->vecLanes > 0 && (uint64) next > so->vecLanes)
+		next = (int64) so->vecLanes;
+	if (next <= (int64) so->veck)
+		return false;			/* progress is not optional: no wider pass exists */
+
+	so->veck = (int) next;
+	weave_vec_pass(index, so);
 	return true;
 }
 

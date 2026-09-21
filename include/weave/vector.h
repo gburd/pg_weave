@@ -833,6 +833,93 @@ extern uint64 weave_vec_shuttle_docid(WeaveShuttle *s, WeaveWarp warp);
  */
 extern const WeaveVecScanState *weave_vec_shuttle_stats(WeaveShuttle *s);
 
+/* ---------------------------------------------------------------------------
+ * The whole-index top-k, ONE implementation with two callers (task F7)
+ *
+ * These three structs and weave_vec_topk_run() were file-static inside
+ * src/vector/vecshuttle.c, reached only by the weave_vec_scan() SRF, until F7 gave
+ * the vector channel an ORDER BY operator and therefore a second driver -- the
+ * access method's own amgettuple (src/am/amscan.c, weave_vec_pass()).
+ *
+ * THEY ARE PUBLIC SO THAT THERE IS ONLY ONE SCORING LOOP, and that is the point
+ * rather than a convenience.  Two loops over the same bolts, one reached from SQL
+ * and one reached from the planner, would be two answers to "what is the top-k of
+ * this index" that agree until one of them is edited.  The SRF is
+ * sql/vecscan.sql's oracle and sql/vecorderby.sql compares the index scan against
+ * it, so a drift between them would present as a regression diff in a file that
+ * looks like it is testing the operator.  Sharing the loop makes that comparison
+ * meaningful instead of circular: it still pins the scan path -- TID resolution,
+ * visibility, the widening ladder -- which is all F7 added.
+ *
+ * MVCC IS NOT APPLIED HERE, per (C6): dead LANES are excluded by the shuttle
+ * (score WEAVE_SCORE_NEVER), but a docid is an index-resident document id, not a
+ * proof that a visible row exists.  The amgettuple driver probes the heap; the SRF
+ * deliberately does not.
+ * ------------------------------------------------------------------------- */
+
+typedef struct WeaveVecTopKHit
+{
+	int32		segno;
+	uint32		warp;
+	uint64		docid;
+	float4		score;			/* the metric's domain, higher is better */
+} WeaveVecTopKHit;
+
+typedef struct WeaveVecTopKCtr
+{
+	int32		segno;
+	float4		maxscore;
+	int64		nblk_seen;
+	int64		nblk_mask;
+	int64		nblk_bound;
+	int64		nblk_score;
+	int64		nlane_score;
+} WeaveVecTopKCtr;
+
+typedef struct WeaveVecTopK
+{
+	WeaveVecTopKHit *hit;		/* best first; nhit of k slots used */
+	int			nhit;
+	int			k;
+	WeaveVecTopKCtr *ctr;
+	int			nctr;
+
+	/*
+	 * Total lanes across every bolt this run visited, live or not.  It is the
+	 * provable ceiling on how many rows any wider pass could ever return, which is
+	 * what lets the amgettuple driver's widening ladder stop for a reason instead
+	 * of at a limit of its own -- the role weave_query_maxhits() plays for the
+	 * lexical ladder.  Counted here because it is a byproduct of the bolt loop and
+	 * a second walk to obtain it would be a second answer.
+	 */
+	uint64		nlane;
+} WeaveVecTopK;
+
+/*
+ * Run the top-k over every bolt of an ALREADY-OPEN index.
+ *
+ * `attnum` is the index attribute the caller wants scored, or 0 for "whichever
+ * vector weft the bolt carries".  A bolt whose weft is recorded against a
+ * different attribute is SKIPPED, not scored: the attnum in the channel
+ * descriptor exists precisely so a scan can route by it (see
+ * weave_vec_weft_locate above), and scoring the wrong column is a wrong answer
+ * that counts correctly.  The 0 case preserves the SRF's behaviour, which names
+ * no attribute.
+ *
+ * `want` is a SORTED docid allowlist of `nwant` entries; `filtered` distinguishes
+ * an EMPTY allowlist (admits nothing) from the ABSENCE of one (admits everything),
+ * which a NULL pointer alone cannot.
+ *
+ * An index with no vector weft in any bolt returns nhit == 0 and nlane == 0 -- not
+ * an error.  A query that reaches the operator against such an index is a
+ * legitimate plan over an empty channel, and the caller turns it into zero rows.
+ */
+extern WeaveVecTopK *weave_vec_topk_run(Relation index,
+										const WeaveMetaPageData *meta,
+										const WVec *query, int k, uint16 attnum,
+										const uint64 *want, int nwant,
+										bool filtered);
+
 /*
  * The scan SRFs (src/vector/vecshuttle.c).  They exist because a mutation in scan
  * code reachable only through the planner can be answered by a bitmap heap scan's
