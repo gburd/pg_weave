@@ -135,11 +135,41 @@ losses** against tsvector + GIN on latency, p99, and index size — the six gaps
 G1–G6 in `doc/GAPS.md` all closed. Then the same against pg_search,
 pg_textsearch, and VectorChord (task P3).
 
-**Status 2026-09-06:** measured for the first time (`bench/RESULTS_LEXICAL.md`).
-Winning by 8.2–19× on common-term ranked, 595× on `count(*)`, and 3.8–7.7× on
-prefix. Losing by 1.7× on rare and mid ranked, 1.7–1.9× on index size, 1.2× on
-build time, and carrying one silent 7,000× cliff (L7). L1–L6 unstarted; L7 is now
-the highest priority in the project.
+**Status 2026-09-21 — RE-MEASURED AT TWO SCALES, WITH A pg_fts ARM FOR THE FIRST
+TIME, AND THE GATE IS STILL NOT MET BY 10–30 µs** (`bench/RESULTS_LEXICAL.md`,
+`r6id.4xlarge`, 1M and 4M docs, pg_fts v1.8.3 in the same database over the same
+table). Against tsvector + GIN: **ahead** 3.7–4.5× on mid ranked, 20–29× on common
+ranked, 133–144× on `count(*)`, 4.9–7.1× on prefix, 3,376–11,030× on the bare
+`ORDER BY` form, **1.73–1.79× on index size**, and **1.03–1.46× on build time** —
+the last two being the dimensions this gate used to fail on outright. **Behind** on
+exactly three rows, all of them 10–30 µs on queries that complete in under 0.1 ms:
+ranked rare k=10 and k=100, and `count(*)` AND. They reproduce in the same
+direction at both scales, so they are not noise; they are also below anything that
+could matter. **A gate phrased "zero measured losses" cannot be closed by a
+measurement this size — it can only be closed by restating the gate in absolute
+terms, which is a maintainer decision and not a benchmark result.** Left open.
+
+**The pg_fts arm is the more important result, because it separates earned from
+inherited.** pg_weave is a fork of pg_fts and the two had never been measured
+against each other, so every published lexical number measured the fork *plus its
+inheritance* against a PostgreSQL built-in. Earned: the bare `ORDER BY` index path
+(**L7** — pg_fts v1.8.3 still plans `Limit[NO-INDEX]` and still pays the seq scan;
+**3,705× at 1M and 11,853× at 4M**, the largest earned number in the project),
+mid-band ranked latency (**7.0× / 5.0×**, L14 and L17), common-band ranked
+(1.86× / 1.61×), and index size (**3.5× / 3.0× smaller than the fork**, L8/L12/
+L17/L18). **Inherited, and exact ties with upstream at both scales:** `count(*)`
+pushdown (0.95 vs 0.94; 3.81 vs 3.81) and prefix `count(*)` (40.73 vs 41.12;
+134.98 vs 136.73). So the 133–144× `count(*)` margin over GIN is pg_fts's custom
+scan renamed, and presenting it as pg_weave's achievement would be
+misattribution — `doc/ARCHITECTURE.md` §9's four claims deliberately exclude it.
+**One loss against upstream, and it only appears at scale:** build is a tie at 1M
+(10.9 s each) and **1.08× slower at 4M** (56.8 s against 52.7 s).
+
+*Superseded status, 2026-09-06:* measured for the first time. Winning by 8.2–19×
+on common-term ranked, 595× on `count(*)`, and 3.8–7.7× on prefix. Losing by 1.7×
+on rare and mid ranked, 1.7–1.9× on index size, 1.2× on build time, and carrying
+one silent 7,000× cliff (L7). The mid-band loss and both size/build losses are
+gone; the rare-band loss is what remains, at 10–30 µs.
 
 ---
 
@@ -597,7 +627,7 @@ it:
 
 | gate | required | state on 2026-09-20 |
 |---|---|---|
-| L | `bench/lexical.sh` re-run with **zero measured losses** vs tsvector + GIN on latency, p99 and size; G1–G6 closed | **NOT MET.** `bench/RESULTS_LEXICAL.md` is stale (2026-09-07) and records 1.7× behind on rare/mid ranked and 1.7–1.9× on index size. **L2** (common band, the 4.75× worst ratio), **L5**, **L6**, **L20** open |
+| L | `bench/lexical.sh` re-run with **zero measured losses** vs tsvector + GIN on latency, p99 and size; G1–G6 closed | **STILL NOT MET, but no longer stale — RE-MEASURED 2026-09-21 at 1M and 4M with a pg_fts arm.** Size and build flipped to wins (1.73–1.79× and 1.03–1.46× ahead) and mid-band ranked went from 1.7× behind to 3.7–4.5× ahead. Three rows remain behind by **10–30 µs**: ranked rare k=10/k=100 and `count(*)` AND. The stale-control problem this waiver was written around is **discharged**. **L2**, **L5**, **L6**, **L20** open |
 | Z | beat pg_tre on **every row** of `pg_tre/doc/perf.md` at 1M rows, and within 3× pg_trgm index size with `cgram` off, **recorded in `bench/RESULTS_FUZZY.md`** | **NOT MET.** That file does not exist. The pg_tre comparison on record (`bench/RESULTS_FUZZY_REGEX.md`) is against pg_tre's *published* numbers, never a measured head-to-head on the same host. The size half is satisfied by `bench/RESULTS_CGRAM.md` (39 MB vs pg_trgm's 72 MB with `cgram` off = 0.54×) but is not written in the named artifact. **Z3** (SuRF pure core, unwired), **Z5**, **Z8**, **Z9** are PARTIAL |
 | V | the restated gate below (recall, latency, storage) | **NOT MET.** V8's GIST-960d **latency** gate is unrun; **V6** kernels PARTIAL; V9 demoted-not-withdrawn; V11–V15 open |
 
@@ -620,10 +650,13 @@ taken as *the fix for the Z and V latency debt*, and the debt keeps its own rows
 
 What the waiver does **not** license, and these are the teeth in it:
 
-1. **No Phase F gate may be claimed.** `doc/specs/FUSED_TOPK.md` §8 compares against
-   RRF-with-over-fetch on the same corpus, and the lexical arm of that control is the
-   stale number above. A §8 row measured against a stale control is not evidence.
-   `bench/RESULTS_FUSE.md` is not written until L's numbers are current (task P3).
+1. ~~**No Phase F gate may be claimed**, because §8's RRF control has a stale lexical
+   arm.~~ **DISCHARGED 2026-09-21.** `bench/lexical.sh` was re-run at two scales with a
+   pg_fts arm (`bench/RESULTS_LEXICAL.md`), so the control's lexical arm is current and
+   `bench/RESULTS_FUSE.md` is blocked by F2 alone. Two things the §8 gate still has no
+   run behind, so that "blocked by F2" is not read as "ready": **nDCG on ≥ 2 public
+   datasets** (BEIR subset + MS MARCO), which this project has never produced at all,
+   and an RRF control implementation to measure against.
 2. **F2 stays closed, and F3 turns out to be behind it.** Planner pushdown is the step
    that makes `fuse()` reachable from a user's query; exposing a scorer whose gate
    cannot be evaluated is how a half-working channel becomes a published claim. F3

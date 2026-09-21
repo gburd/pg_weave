@@ -110,10 +110,30 @@ query should not be 35 % larger than the same index after manual maintenance.
 component. Publishing a size number that swings 35 % on operator behaviour is
 worse than publishing the larger number.
 
-### G3, G4 — rare and mid ranked latency
+### G3, G4 — rare and mid ranked latency — **G4 (mid) CLOSED BY MEASUREMENT 2026-09-21; G3 (rare) OPEN AND NOW BOUNDED AT 10–30 µs**
 
-**Absolute magnitudes are small** — 0.02 ms and 1.5 ms — but they are losses, and
-they are the queries a search application runs most.
+**G4 is closed.** The mid band is no longer a loss: at 1M it is **0.50 ms against
+GIN's 2.27 ms** and at 4M **1.02 against 3.96** — a 3.7–4.5× *win*, from a 1.7× loss
+(`bench/RESULTS_LEXICAL.md`, 2026-09-21, two scales). Nothing in this gap's own
+"candidate fixes" list did it; L14 (incremental WAND growth) and L17 (the doclen
+sidecar's absolute-offset docid column) did, and the fork-vs-fork arm attributes it:
+pg_fts v1.8.3 measures 3.49 ms and 5.07 ms on the same table, so the win is earned
+rather than inherited.
+
+**G3 is open, and the useful change is that it is now bounded.** Ranked rare k=10 is
+0.04 ms against GIN's 0.03 at 1M and 0.05 against 0.03 at 4M: a loss of **10–30 µs**,
+reproducing in the same direction at both scales, with p50 equal to p99 for both arms
+and a reporting resolution of 0.01 ms. `count(*)` AND behaves the same way (0.04 vs
+0.02). So the loss is real and it is also smaller than anything that could matter,
+which is a genuinely awkward place for a gate phrased as "zero measured losses" — see
+the Phase L status in `doc/PHASES.md`. **The hypothesis below (fixed per-scan setup)
+is no longer supported by its own evidence**: it rested on the df 25 vs df 2,503 ratio
+being 70× for a 100× document ratio, and that ratio is now 0.04 → 0.50 ms, i.e. 12.5×
+for 100× — which says the per-document work got much cheaper while the fixed cost did
+not move. Anything spent on G3 from here is spent on 20 µs.
+
+*Original text follows.* **Absolute magnitudes are small** — 0.02 ms and 1.5 ms — but
+they are losses, and they are the queries a search application runs most.
 
 **Likely root cause, not yet confirmed.** pg_weave does strictly more work per
 matching document than GIN: it decodes tf, looks up a quantized doclen, and
@@ -135,7 +155,21 @@ per-segment dictionary lookup across scans in the relcache the way the doclen
 page directory already is; and skip livedocs deserialization when a segment has
 zero tombstones.
 
-### G5 — build time
+### G5 — build time — **REFRAMED 2026-09-21: the GIN loss is gone, a pg_fts loss appeared at scale**
+
+Against GIN, build is now a **win**: 10.9 s against 11.2 s at 1M and 56.8 s against
+82.8 s at 4M (`bench/RESULTS_LEXICAL.md`). The 1.2×-then-2.5× loss this gap was opened
+for is closed by L12.
+
+Against **pg_fts**, measured for the first time on 2026-09-21, build is a **tie at 1M
+(10.9 s each) and 1.08× slower at 4M (56.8 s against 52.7 s)**. Small, and it only
+shows at scale, which is the interesting part: a constant-factor difference would show
+at both. The mechanism is not established, and L8's vacate+pack pass is the obvious
+suspect precisely because it is the thing pg_weave added and L12 made cheap rather than
+free. Not chased; recorded so the direction is on the record per hard rule 8.
+
+The paragraph below is about a different corpus (`synth-2m-long`) and a different
+comparator (pg_textsearch) and still stands as the profile attribution.
 
 After L12 and L15, 192.5 s against pg_textsearch's 49.2 s and GIN's 202.7 s on
 `synth-2m-long`. What remains is not a hash: the post-L15 profile's top three are
@@ -1451,3 +1485,30 @@ and the number that decides it (seeks avoided against blocks no longer skipped) 
 exist. **Unmeasured, and not attempted.** Recorded so that the current shape reads as a
 choice rather than an oversight, and so that anyone profiling a fused scan and finding seek
 cost dominant knows the lever exists.
+
+### G38 — `count(*)` on a common term measured 0.43 ms on 2026-09-07 and 0.95 ms on 2026-09-21, on a corpus with FEWER matches — **OPEN, unexplained, and provably not ours**
+
+`bench/RESULTS_LEXICAL.md`: the common-term `count(*)` pushdown was 0.43 ms at 1M docs
+with df 197,552 and is 0.95 ms at 1M docs with df 179,772 — 2.2× slower on 18 %
+*fewer* matching documents, same instance type, same CPU model (Xeon 8375C @ 2.90 GHz),
+same PostgreSQL major.
+
+**What rules a cause in or out.** `pg_fts v1.8.3` measures **0.94 ms on the same table
+in the same run**, and the two forks agree to 0.01 ms at both scales (3.81 vs 3.81 at
+4M). pg_fts does not have L14, L17 or L18, so if any of those had regressed the count
+path, pg_weave would be the slower of the two. It is not. Whatever moved is either in
+the code both forks still share, or it is the environment.
+
+**The candidate, and why it is not yet an answer.** The table is 2.2× wider than in the
+2026-09-07 run — it now carries an `ftsdoc` column alongside `wdoc` and `tsvector` — so
+a heap-touching plan would pay more per row. But `WeaveCount` is a custom scan that is
+supposed to answer from the index alone, and "supposed to" is not a measurement. Either
+it touches the heap, in which case the custom scan is not doing what its own
+documentation says, or it does not, in which case the 2.2× is unexplained and the
+number to distrust is one of the two.
+
+**Cheapest next step**, and it needs no new corpus: run `count(*)` common on the same
+seeded corpus with and without the extra analyzed columns and compare `EXPLAIN (ANALYZE,
+BUFFERS)` heap-block counts. If `shared hit` is proportional to the table width, the
+custom scan reads the heap. That is a 10-minute experiment and it should precede any
+optimization, per hard rule 9.
