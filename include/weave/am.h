@@ -1430,4 +1430,79 @@ extern bool weave_trgm_candidates(Relation index, BlockNumber trgmstart,
  * the candidate set it returns. */
 extern void tidset_sort_uniq(TidSet *s);
 
+/* ---------------------------------------------------------------------------
+ * F6: the lexical channel's shuttle, over one query TERM's posting cursor
+ *
+ * WHY THESE DECLARATIONS ARE HERE, which AGENTS.md hard rule 5 requires an
+ * answer to.  Ranked lexical retrieval is a Broder/BlockMax-WAND over
+ * WandCursor -- src/am/amscan.c's private per-(term, segment) cursor -- while the
+ * fused core (src/am/fuse.c) consumes only WeaveShuttles.  That mismatch is the
+ * scope discovery in doc/specs/FUSED_TOPK.md sect. 7a (3), and the fix is glue:
+ * the cursor already carries the current docid, the decoded block (so blkend is
+ * its last docid), the per-block bound inputs and the term-wide ceiling, so no
+ * on-disk field changes.
+ *
+ * The glue lives in src/query/lexshuttle.c, beside src/query/gate.c and
+ * src/query/edist.c, because it is a channel face rather than scan machinery.
+ * It therefore has to reach a cursor it must NOT be able to take apart, so
+ * WandCursor stays an incomplete type everywhere except amscan.c and the five
+ * calls a shuttle needs are declared here, in the file that owns the seam,
+ * instead of as externs at the top of a .c file.  Nothing else in the tree may
+ * use them; a second traversal over a posting cursor is a second thing to keep
+ * in step with the format.
+ *
+ * One shuttle per TERM, not per query: include/weave/channel.h says a channel
+ * "with many concurrent shuttles (one per query term, typically)" shares one
+ * vtable, and one shuttle per term is what lets a multi-term BM25 query become
+ * several scored channels under a single fused threshold instead of a sub-scan
+ * with its own.
+ *
+ * WeaveShuttle is spelled `struct WeaveShuttle` below rather than through its
+ * typedef because include/weave/channel.h includes THIS header, so this one
+ * cannot include channel.h, and repeating channel.h's typedef would be a
+ * duplicate typedef (legal only from C11).  The tag is the same type.
+ * ------------------------------------------------------------------------- */
+typedef struct WandCursor WandCursor;
+
+/* The cursor's current docid and the last docid of its decoded block, without
+ * moving it: what the shuttle publishes as (cur, blkend) at begin() time.  The
+ * cursor must already be primed. */
+extern uint64 weave_wand_cursor_tell(WandCursor *c, uint64 *blkend);
+
+/* (C1) Advance to the first posting with docid >= target, reporting the new
+ * position and the new block end together, because a seek that does not
+ * republish blkend leaves the bound describing the previous block.  Returns
+ * UINT64_MAX when the cursor is exhausted.  Does NOT itself refuse a backward
+ * target -- the WAND tolerates one; the shuttle refuses it, per channel.h's
+ * "NOT IDEMPOTENT" note. */
+extern uint64 weave_wand_cursor_seek(WandCursor *c, uint64 target,
+									 uint64 *blkend);
+
+/* (C2)+(C3) The block bound from the block header values the cursor already
+ * holds: arithmetic only, no buffer read. */
+extern double weave_wand_cursor_block_max(WandCursor *c);
+
+/* (C4) The exact contribution at the current posting.  May read a buffer: on a
+ * v4 segment the doclen comes from the cursor's own doclen-sidecar cursor. */
+extern double weave_wand_cursor_contrib(WandCursor *c);
+
+/* The term-wide ceiling, i.e. WeaveShuttle.maxscore.  Static per cursor. */
+extern double weave_wand_cursor_max_contrib(WandCursor *c);
+
+/*
+ * Wrap one PRIMED cursor as a scored WeaveShuttle.  The cursor is BORROWED: the
+ * shuttle never frees its block buffer, its doclen cursor or its tombstone map,
+ * because the ranked scan that built the cursor array already owns all three and
+ * two owners is how a double pfree() happens.  end() drops only the shuttle's
+ * own context.
+ *
+ * `kind` is not a parameter: a posting cursor is always WEAVE_CH_LEXICAL.
+ * `required` is false -- this is a SCORED channel, and per (C5) and
+ * FUSED_TOPK.md sect. 7a it is a field the channel sets rather than something
+ * inferred from the kind.
+ */
+extern struct WeaveShuttle *weave_lex_shuttle_begin(WandCursor *c,
+													MemoryContext cxt);
+extern void weave_lex_shuttle_end(struct WeaveShuttle *s);
+
 #endif							/* WEAVE_AM_H */

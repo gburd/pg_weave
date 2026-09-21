@@ -40,6 +40,9 @@
 #include "weave/am.h"
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
 #include "weave/edist.h"			/* Z9: the <@> edit-distance shuttle */
+#include "weave/bm25bound.h"		/* F6: the single copy of the BM25 contribution
+									 * and its per-block (C2) bound; this file used
+									 * to carry a transcription of both */
 #include <math.h>
 #include "access/genam.h"
 #include "access/generic_xlog.h"
@@ -4357,8 +4360,13 @@ cmp_scored_desc(const void *a, const void *b)
  * A per-term cursor for the WAND merge.  posts is the term's docid-sorted
  * posting list; cursors load posting pages lazily from the index and skip
  * whole pages via the page block-max when they cannot beat the threshold.
+ *
+ * The TYPEDEF is in include/weave/am.h, which leaves the struct INCOMPLETE:
+ * src/query/lexshuttle.c (F6) dresses a cursor as a WeaveShuttle and must not be
+ * able to take one apart.  Defining the struct here and naming it there is what
+ * keeps the posting cursor's internals inside the scan.
  */
-typedef struct WandCursor
+struct WandCursor
 {
 	Relation	index;
 	BlockNumber curblk;			/* page holding the current block */
@@ -4391,11 +4399,12 @@ typedef struct WandCursor
 	int			cur;			/* index within the current block */
 	uint64		docid;			/* current docid (UINT64_MAX = exhausted) */
 
-	double		idf;
-	double		avgdl;
-	double		k1b_inv_avgdl;	/* precomputed k1*b/avgdl (norm hot path) */
-	double		k1_1mb;			/* precomputed k1*(1-b) */
-	double		idf_k1p1;		/* precomputed idf*(k1+1) */
+	/* The saturation function's per-(term, segment) constants -- idf, k1, b,
+	 * avgdl and the three products the norm is precomputed into.  These were
+	 * five fields of this struct until F6 moved the arithmetic that reads them
+	 * into include/weave/bm25bound.h, so that the property test and the scan
+	 * share one formula instead of two transcriptions of it. */
+	WeaveBm25Factors bm;
 	double		max_contrib;	/* term-wide upper bound (shortest-doc norm) */
 	WeaveTombstones *tombs;		/* loaded per-segment tombstones (or NULL) */
 	uint32		segidx;			/* which segment this cursor's postings belong to */
@@ -4420,7 +4429,7 @@ typedef struct WandCursor
 	 */
 	uint64		docid_lo;
 	uint64		docid_hi;
-}			WandCursor;
+};
 
 static inline void wand_skip_own_tombstoned(WandCursor *c);
 static void wand_seek(WandCursor *c, uint64 target);
@@ -4605,14 +4614,16 @@ wand_prime(WandCursor *c)
 static inline double
 wand_block_max_contrib(WandCursor *c)
 {
-	double		k1 = 1.2;
 	double		mtf = (double) c->blk_max_tf;
 	uint32		mindl_raw = c->blk_min_dl;
 	double		mindl = (double) (c->has_doclen_col
 									 ? mindl_raw			/* v3: exact inline doclen */
 									 : weave_byte_to_doclen(weave_doclen_to_byte(mindl_raw)));
 
-	return c->idf * mtf * (k1 + 1.0) / (mtf + c->k1_1mb + c->k1b_inv_avgdl * mindl);
+	/* The quantized-floor adjustment above stays HERE, not in bm25bound.h: it is
+	 * a property of what the v4 sidecar can hand the scorer, not of BM25, and the
+	 * bound's inputs must be the extremes scoring can actually produce. */
+	return weave_bm25_block_bound(&c->bm, mtf, mindl);
 }
 
 /* True if the cursor's CURRENT docid is tombstoned in the cursor's OWN
@@ -4678,9 +4689,8 @@ wand_contrib_cur(WandCursor *c)
 	double		dl = c->has_doclen_col
 		? (double) weave_for_get(c->blkbuf + c->dloff, c->cur)	/* v3: inline */
 		: (double) weave_doclen_cursor_lookup(&c->doclenc, c->docid);	/* v4: sidecar */
-	double		norm = tf + c->k1_1mb + c->k1b_inv_avgdl * dl;
 
-	return c->idf_k1p1 * tf / norm;
+	return weave_bm25_contrib(&c->bm, tf, dl);
 }
 
 /*
@@ -4807,6 +4817,88 @@ wand_seek(WandCursor *c, uint64 target)
 		}
 		/* target beyond this block; loop to load/skip the next */
 	}
+}
+
+/* ---------------------------------------------------------------------------
+ * F6: the five calls the lexical shuttle needs from a posting cursor
+ *
+ * src/query/lexshuttle.c dresses ONE WandCursor as a WeaveShuttle so the fused
+ * core can consume ranked lexical (doc/specs/FUSED_TOPK.md sect. 7a (3)).  It
+ * sees the cursor as an incomplete type, so everything it needs comes through
+ * these five functions; they are declared in include/weave/am.h with the reason
+ * (AGENTS.md hard rule 5).  Each is a two-line skin over the static primitives
+ * above -- no new traversal logic lives here, because a second traversal is the
+ * thing that would drift from the one the regression suite exercises.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * The last warp position the CURRENT block covers, which a shuttle must publish
+ * as blkend after every seek: block_max() bounds the closed interval
+ * [cur, blkend], and the header values it reads (blk_max_tf, blk_min_dl) are
+ * exactly this block's.  The cursor does not store it -- it stores the decoded
+ * docids -- so it is the last of those.
+ *
+ * Max()'d against the current docid so blkend >= cur holds even if a corrupt
+ * block decoded a non-ascending docid run, since a blkend below cur would make
+ * the shuttle's bound cover an empty interval and (C2) vacuous.
+ */
+static inline uint64
+wand_cur_blkend(WandCursor *c)
+{
+	uint64		last;
+
+	if (c->docid == UINT64_MAX)
+		return UINT64_MAX;
+	if (c->blkcount <= 0)
+		return c->docid;
+	last = c->docids[c->blkcount - 1];
+	return last > c->docid ? last : c->docid;
+}
+
+/* The cursor's current docid and block end without moving it: what the shuttle
+ * publishes at begin() time, since the cursor arrives already primed. */
+uint64
+weave_wand_cursor_tell(WandCursor *c, uint64 *blkend)
+{
+	*blkend = wand_cur_blkend(c);
+	return c->docid;
+}
+
+/* (C1) forward to the first posting with docid >= target, reporting the new
+ * position and the new block end together -- one call, because a shuttle that
+ * seeks without republishing blkend is a shuttle whose bound describes the
+ * block it used to be on. */
+uint64
+weave_wand_cursor_seek(WandCursor *c, uint64 target, uint64 *blkend)
+{
+	wand_seek(c, target);
+	*blkend = wand_cur_blkend(c);
+	return c->docid;
+}
+
+/* (C2)+(C3): the block bound, from the block header values the cursor already
+ * holds.  No buffer is read; wand_block_max_contrib() is arithmetic only. */
+double
+weave_wand_cursor_block_max(WandCursor *c)
+{
+	return wand_block_max_contrib(c);
+}
+
+/* (C4): the exact contribution at the current posting.  May read a buffer -- on
+ * a v4 segment the doclen comes from the sidecar cursor, which is the cursor's
+ * own resident-block cache and not a second lookup path. */
+double
+weave_wand_cursor_contrib(WandCursor *c)
+{
+	return wand_contrib_cur(c);
+}
+
+/* The term-wide ceiling, i.e. WeaveShuttle.maxscore.  Static for the cursor's
+ * life; the shuttle reads it once. */
+double
+weave_wand_cursor_max_contrib(WandCursor *c)
+{
+	return c->max_contrib;
 }
 
 /*
@@ -5678,13 +5770,9 @@ weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
 			cursors[nactive].blkcount = 0;
 			cursors[nactive].cur = 0;
 			cursors[nactive].docid = 0;
-			cursors[nactive].idf = idf;
-			cursors[nactive].avgdl = avgdl;
-			cursors[nactive].k1b_inv_avgdl = k1 * b / avgdl;
-			cursors[nactive].k1_1mb = k1 * (1.0 - b);
-			cursors[nactive].idf_k1p1 = idf * (k1 + 1.0);
+			weave_bm25_factors_init(&cursors[nactive].bm, idf, k1, b, avgdl);
 			cursors[nactive].max_contrib =
-				idf * mtf * (k1 + 1.0) / (mtf + k1 * (1.0 - b));
+				weave_bm25_term_bound(&cursors[nactive].bm, mtf);
 			cursors[nactive].tombs = &tombs;
 			cursors[nactive].segidx = s;
 			cursors[nactive].has_doclen_col =
