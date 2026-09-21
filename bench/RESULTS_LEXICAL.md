@@ -127,10 +127,10 @@ or claim that presents the 133× `count(*)` margin as pg_weave's achievement is
 misattributing it, and `doc/ARCHITECTURE.md` §9's four claims deliberately do not
 include it.
 
-## Phase L gate: NOT MET, and the remaining loss is 10–30 µs
+## Phase L gate: MET on its GIN half under the gate as RESTATED 2026-09-21; the 10–30 µs losses stand
 
-The gate (`doc/PHASES.md`) is *"`bench/lexical.sh` re-run and recorded with **zero
-measured losses** against tsvector + GIN on latency, p99, and index size"*.
+The gate as it read when this run was made was *"`bench/lexical.sh` re-run and recorded
+with **zero measured losses** against tsvector + GIN on latency, p99, and index size"*.
 
 Losses remaining against GIN, at both scales:
 
@@ -145,14 +145,20 @@ outright — **index size is now 1.73–1.79× ahead** where it was recorded as 
 behind, and **build is 1.03–1.46× ahead** where it was 1.2× behind and then 2.5× behind
 after L8.
 
-So the gate is **not met**, and the honest reading of *why* cuts both ways. The
-remaining differences are real and reproduce at both scales in the same direction, so
-they are not noise. They are also 10–30 µs on queries that complete in under 0.1 ms,
-where p50 equals p99 for both arms and the reported precision is 0.01 ms — so nothing
-here supports a claim that the loss matters, either. **A gate written as "zero measured
-losses" cannot be closed by a measurement this size; it can only be closed by restating
-the gate in absolute terms, and that is a maintainer decision, not a benchmark result.**
-It is left open rather than quietly reinterpreted.
+The honest reading of the three rows cuts both ways. They are real and reproduce at both
+scales in the same direction, so they are not noise. They are also 10–30 µs on queries
+that complete in under 0.1 ms, where p50 equals p99 for both arms and the reported
+precision is 0.01 ms — so nothing here supports a claim that the loss matters, either.
+
+**RESOLUTION, 2026-09-21, and it is a decision and not a measurement.** The maintainer
+restated the gate in absolute terms: no latency or p99 row behind by more than **0.05 ms**,
+no row behind at all where either arm's p50 exceeds **0.10 ms**, size and build not behind
+(`doc/PHASES.md`, Phase L gate). The largest gap above is 0.03 ms, so the **GIN half of
+the gate is MET**. Nothing in this file got faster when that happened: the three rows are
+still losses, they stay in the table above and in `doc/GAPS.md` G3 under hard rule 8, and
+the absolute threshold is fixed rather than being a sliding tolerance. **The gate's
+third-party half — pg_search, pg_textsearch, VectorChord (task P3) — is still owed;** the
+pg_fts arm below was never part of the gate's text and does not substitute for it.
 
 `doc/GAPS.md` G3 and G4 are the rare-band rows. The mid-band half of those gaps is
 **closed by measurement**: the 1.7× loss they describe is now a 3.7–4.5× win.

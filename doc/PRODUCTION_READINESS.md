@@ -212,9 +212,13 @@ the first time, and it changes what this project may claim.** Against tsvector +
 pg_weave is now ahead on everything except three rows that are behind by **10–30 µs**
 (ranked rare k=10/k=100 and `count(*)` AND) — including **index size, 1.73–1.79× ahead**,
 and **build time, 1.03–1.46× ahead**, the two dimensions Phase L used to fail on
-outright. The Phase L gate is still not met, because it is phrased "zero measured
-losses" and three losses of 10–30 µs are still losses; closing it needs the gate
-restated in absolute terms, which is a maintainer decision.
+outright. **The Phase L gate was RESTATED IN ABSOLUTE TERMS on 2026-09-21 (maintainer
+decision) and its GIN half is now MET:** no row behind by more than 0.05 ms, none behind
+at all where either arm exceeds 0.10 ms, size and build not behind. The old phrasing was
+"zero measured losses", which a 10 µs difference cannot satisfy and a 0.01 ms reporting
+resolution cannot measure. **The three rows are still losses and are still recorded as
+such** (G3, hard rule 8) — the gate changed, the code did not. **The third-party half of
+the gate (P3: pg_search, pg_textsearch, VectorChord) is still owed.**
 
 **The arm that matters more is pg_fts, because pg_weave is a fork of it and the two had
 never been compared.** Earned: the bare `ORDER BY` index path (L7 — upstream v1.8.3 still
@@ -235,13 +239,15 @@ two acknowledged confounds in `bench/RESULTS_LEXICAL.md`; new gap **G38** is a 2
 it is known not to come from pg_weave's divergence.
 
 **Phase F started on 2026-09-20 under a SCOPED WAIVER of hard rule 7, and the waiver's
-terms are part of the status.** None of the L, Z or V gates passes — L is now current but
-still misses by those 10–30 µs, Z's own gate artifact `bench/RESULTS_FUZZY.md` was never
-written, V8's GIST-960d latency gate is unrun — and
+terms are part of the status. The waiver was WIDENED TO F2 AND F3 on 2026-09-21.** L's
+GIN half now passes under the restated absolute gate; **Z and V still do not pass** — Z's
+own gate artifact `bench/RESULTS_FUZZY.md` was never written, V8's GIST-960d latency gate
+is unrun — and
 the waiver is recorded at `doc/PHASES.md` "Phase F" with what was checked and why
 bounded top-k is nonetheless the one lever every unmet Z/V latency gate needs. **F1 and
-F5 are done; F2 and F3 are closed by the waiver** (F3 projects a scan only F2's pushdown
-can start), **F4 is withdrawn** because the vector proximity graph it integrated was
+F5 are done; F2 is in progress and F3 is sequenced behind it** (F3 projects a scan only
+F2's pushdown can start, which is a structural dependency and not a waiver term),
+**F4 is withdrawn** because the vector proximity graph it integrated was
 withdrawn in Phase V, and the §8 gate's blocker moved: `bench/lexical.sh` **has** been
 re-run, so its RRF control no longer has a stale lexical arm, and `bench/RESULTS_FUSE.md`
 is now blocked by F2 alone — plus the nDCG rows on two public datasets, which this

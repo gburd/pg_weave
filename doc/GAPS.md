@@ -36,7 +36,7 @@ From `bench/RESULTS_LEXICAL.md`, 1M documents, r6id.4xlarge, PostgreSQL 17.
 | ~~**G12**~~ | ~~boolean NOT~~ | **CLOSED.** `count(*) WHERE 'common & !rare'` 7008 ms → **14.05 ms** (499×) by building the NOT universe lazily. Now **beats GIN's 141 ms by 10×**. | done, and a win |
 | ~~**G1**~~ | ~~bare `ORDER BY <=> LIMIT` does not use the index~~ | **CLOSED by L7.** 83 ms → **0.05 ms** (1,662× par4, 7,248× serial). Now beats GIN by 1,615×/7,080× on the same form. | done |
 | ~~**G2**~~ | ~~index size~~ | **CLOSED by L8/L10.** The loss was a measurement artifact: 70.7% of the file was freed pages. Live content is **46 MB vs GIN's 81 MB — 1.76× smaller.** | done, and a win |
-| **G3** | ranked latency on rare terms (df 25) | 0.05 ms vs 0.03 ms — **1.7×** | ≤ GIN |
+| ~~**G3**~~ | ~~ranked latency on rare terms (df 25)~~ | **CLOSED 2026-09-21 BY THE RESTATED PHASE L GATE, NOT BY A FIX — the loss is accepted, not repaired.** 0.04 ms vs 0.03 (1M) and 0.05 vs 0.03 (4M): still **behind**, by 10–30 µs, reproducing in the same direction at both scales. The gate now reads "no row behind by more than 0.05 ms, none behind above 0.10 ms" (`doc/PHASES.md`, maintainer decision), which this clears. The loss stays written here and in `bench/RESULTS_LEXICAL.md` under hard rule 8; `count(*)` AND (0.04 vs 0.02) is the same shape and the same verdict | accepted at ≤ 0.05 ms |
 | **G4** | ranked latency on mid terms (df 2.5k) | 3.54 ms vs 2.06 ms — **1.7×** | ≤ GIN |
 | **G5** | build time | **NARROWED AGAIN by L15: 328.0 s → 192.5 s (1.70×; 1.82× under identical `DO_PROFILE` conditions).** Now **3.91×** behind pg_textsearch (49.2 s) and **0.95×** of GIN (202.7 s) — a tie-to-win on GIN pending a reproducing run, since GIN itself swung 15% between runs on unchanged code. Index size unchanged at 625 MB, ranked latency within ±4% both directions. The profile's "37.5% dynahash" was right about the symbol and wrong about the cause twice: hashing/`memcmp` of the 64-byte key was worth 3.9%; the merge's per-term hash (probed once per posting into a one-entry table) was worth 19.5%; and the largest single cost was a hash the profile never named — the doclen sidecar collector, a `uint64`-keyed dynahash `HASH_ENTER`'d once per posting (~240M) in both the writer and the merge. Replaced by a per-heap-block radix map. No hash remains on the per-posting path. `bench/RESULTS_L15.md` | ≤ GIN — **met in one run, not yet reproduced** |
 | ~~**G6**~~ | ~~index size is non-deterministic~~ | **CLOSED by L8.** as-built 46 MB, compacted 46 MB, swing **0.0%**; `weave_merge`/`weave_vacuum` both return false on a fresh build. | done |
@@ -110,7 +110,7 @@ query should not be 35 % larger than the same index after manual maintenance.
 component. Publishing a size number that swings 35 % on operator behaviour is
 worse than publishing the larger number.
 
-### G3, G4 — rare and mid ranked latency — **G4 (mid) CLOSED BY MEASUREMENT 2026-09-21; G3 (rare) OPEN AND NOW BOUNDED AT 10–30 µs**
+### G3, G4 — rare and mid ranked latency — **G4 (mid) CLOSED BY MEASUREMENT 2026-09-21; G3 (rare) CLOSED 2026-09-21 BY THE RESTATED GATE AT 10–30 µs, WHICH IS NOT THE SAME THING**
 
 **G4 is closed.** The mid band is no longer a loss: at 1M it is **0.50 ms against
 GIN's 2.27 ms** and at 4M **1.02 against 3.96** — a 3.7–4.5× *win*, from a 1.7× loss
@@ -120,17 +120,22 @@ sidecar's absolute-offset docid column) did, and the fork-vs-fork arm attributes
 pg_fts v1.8.3 measures 3.49 ms and 5.07 ms on the same table, so the win is earned
 rather than inherited.
 
-**G3 is open, and the useful change is that it is now bounded.** Ranked rare k=10 is
-0.04 ms against GIN's 0.03 at 1M and 0.05 against 0.03 at 4M: a loss of **10–30 µs**,
-reproducing in the same direction at both scales, with p50 equal to p99 for both arms
-and a reporting resolution of 0.01 ms. `count(*)` AND behaves the same way (0.04 vs
-0.02). So the loss is real and it is also smaller than anything that could matter,
-which is a genuinely awkward place for a gate phrased as "zero measured losses" — see
-the Phase L status in `doc/PHASES.md`. **The hypothesis below (fixed per-scan setup)
-is no longer supported by its own evidence**: it rested on the df 25 vs df 2,503 ratio
-being 70× for a 100× document ratio, and that ratio is now 0.04 → 0.50 ms, i.e. 12.5×
-for 100× — which says the per-document work got much cheaper while the fixed cost did
-not move. Anything spent on G3 from here is spent on 20 µs.
+**G3 is closed by decision, not by a fix, and the distinction is the whole content of
+this update.** Ranked rare k=10 is 0.04 ms against GIN's 0.03 at 1M and 0.05 against
+0.03 at 4M: a loss of **10–30 µs**, reproducing in the same direction at both scales,
+with p50 equal to p99 for both arms and a reporting resolution of 0.01 ms.
+`count(*)` AND behaves the same way (0.04 vs 0.02). The loss is real. What changed on
+2026-09-21 is the **gate**: it was phrased "zero measured losses", which a 10 µs
+difference can never satisfy and which a 0.01 ms reporting resolution cannot even
+measure, so it was restated in absolute terms — no row behind by more than 0.05 ms, no
+row behind at all above 0.10 ms (maintainer decision, `doc/PHASES.md`). Under that gate
+these rows pass; under any honest reading pg_weave is still slower on them, and hard
+rule 8 keeps them written down here and in `bench/RESULTS_LEXICAL.md`. **The hypothesis
+below (fixed per-scan setup) is no longer supported by its own evidence**: it rested on
+the df 25 vs df 2,503 ratio being 70× for a 100× document ratio, and that ratio is now
+0.04 → 0.50 ms, i.e. 12.5× for 100× — which says the per-document work got much cheaper
+while the fixed cost did not move. Anything spent on G3 from here is spent on 20 µs,
+which is why nothing more will be.
 
 *Original text follows.* **Absolute magnitudes are small** — 0.02 ms and 1.5 ms — but
 they are losses, and they are the queries a search application runs most.

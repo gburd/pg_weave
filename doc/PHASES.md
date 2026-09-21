@@ -130,13 +130,31 @@ cheapest wins available anywhere in this project.
 | ~~**L19**~~ | **DONE 2026-09-14, after refuting both mechanisms the task was written around.** Task text said: under `ShareUpdateExclusiveLock` the recycle gate blocks reuse, phase 2 cannot reuse phase 1's freed pages, so the rewrite extends. **Measured: `lowfree_defer = 0`, `fsm_defer = 0`, `extend = 2`** — the gate rejected nothing because it was never consulted, because `weave_vacuumcleanup()`'s trigger (free pages > 25%) is itself tombstone-blind and the rewrite never ran. The task described what would happen *after* fixing the trigger as if it were the current state. **The second claim was worse:** "autovacuum cannot reclaim tombstoned space; a delete-heavy deployment needs a scheduled `weave_vacuum()`" shipped in `PRODUCTION_READINESS.md` and was **measured on a cluster with `autovacuum = off` and no other activity, so nothing advanced the xid horizon** — and every page's recyclability is gated on that horizon moving. With it advancing, plain `VACUUM` reclaims **1093 → 94 pages** and holds 94. **The real defect was narrower and pre-existing (G18):** with a stalled horizon and the free-page trigger firing (a bulk ingest guarantees it — tiered merges free their inputs), the relocation reuses nothing, extends, and its own freed pages re-satisfy the trigger — **+73 pages every cycle, forever** (1022 → 1166 → 1239 → 1312 → 1385 → 1458). Attributed by measurement, not assumed: identical with L18's term disabled. **Fixed** by probing, when not holding `AccessExclusiveLock`, whether any free page is currently recyclable, and skipping the pass if none is — a pass that cannot pack can only extend. Stalled horizon now flat (1022 → 1093 → 1093 ×4); advancing horizon reclaims 11.6× and is stable. Guarded against the skip-forever degradation that bit pg_fts (18 → 22 MB) by probing **recyclability** (which advances on its own) rather than free space, and by requiring a shrink in `t/015`. | `t/015_alloc_outcomes.pl` (13 assertions), `doc/GAPS.md` G18/G19 | **MET** — no ratchet in all three arms (L18 off, L18 on, horizon advancing), AND a shrink on the advancing arm, AND that shrink comes from page *reuse* not truncation alone |
 | **L20** | **NEW 2026-09-14, created by L18. Sweep `pg_weave.vacuum_tombstone_frac`.** L18 shipped it at **0.2, which is a convention and not a measurement** — labelled as a guess in both the GUC description and `src/am/am.c`, so it cannot be mistaken for a tuned default. It trades rewrite cost (a rewrite streams the whole segment through the buffer pool twice) against space held by invisible postings, so the frontier certainly depends on segment size and probably on the delete pattern (uniform vs. clustered by docid — clustered deletes should free whole pages and want a *lower* threshold). Sweep it the way L13 swept `wand_initial_k`: several corpus sizes, several delete fractions, record reclaimed bytes and rewrite seconds, set the default from the frontier. | `bench/RESULTS_TOMBSTONE_FRAC.md` | a default set from a recorded frontier rather than a convention, with the losing region stated |
 | ~~**L21**~~ | **WITHDRAWN 2026-09-14, the same day it was created — the evidence was retracted upstream.** The task said `weave_free_page()`'s one-WAL-record-per-page costs real time, citing an upstream 3.8 GB / ~489k-page index whose vacuum ran 113+ minutes. **Upstream retracted that number hours later:** re-measured at 8,686,917 pages freed in 46 s = **0.005 ms/page, ~2,800× cheaper** than published, confirmed by a second run. Their figure came from a stack sample on an index already damaged by a separate allocation bug — `gdb` showed *where* the backend was and that became *why* it was slow. **A stack sample gives a location, not a rate.** The second-order error is ours: this task was created on inherited evidence we never measured against our own code. If the free path ever looks slow here, the first step is pages per second. `doc/GAPS.md` G17. | `doc/GAPS.md` ~~G17~~ | **WITHDRAWN** — no measurement supports the task existing |
-**Phase L gate:** `bench/lexical.sh` re-run and recorded with **zero measured
-losses** against tsvector + GIN on latency, p99, and index size — the six gaps
-G1–G6 in `doc/GAPS.md` all closed. Then the same against pg_search,
+**Phase L gate — RESTATED IN ABSOLUTE TERMS 2026-09-21, MAINTAINER DECISION.** The
+gate is now: `bench/lexical.sh` re-run and recorded **at two scales** against
+tsvector + GIN with
+
+1. **no latency or p99 row behind by more than 0.05 ms in absolute terms**, and
+2. **no row behind at all where either arm's p50 exceeds 0.10 ms**, and
+3. index size and build time **not** behind,
+
+the gaps G1–G6 in `doc/GAPS.md` all closed. Then the same against pg_search,
 pg_textsearch, and VectorChord (task P3).
 
-**Status 2026-09-21 — RE-MEASURED AT TWO SCALES, WITH A pg_fts ARM FOR THE FIRST
-TIME, AND THE GATE IS STILL NOT MET BY 10–30 µs** (`bench/RESULTS_LEXICAL.md`,
+**Why the phrasing changed, stated plainly because it was changed after seeing the
+data.** The previous phrasing was **zero measured losses**, and it missed by 10–30 µs
+on three rows that complete in under 0.1 ms. A ratio computed at two to five ticks of
+the harness's 0.01 ms reporting resolution is not a measurement of anything, and
+0.05 ms is below the parse-plan-and-round-trip floor of any real query, so no
+application can observe a difference under it. That makes this a decision about what
+the gate should have said, **not** evidence that the rows got faster: the three losses
+stay on the record in `bench/RESULTS_LEXICAL.md` and in G3, and hard rule 8 still
+applies to them. The absolute threshold is fixed at 0.05 ms / 0.10 ms and is not to be
+widened again to admit a future miss — a second widening is how a gate becomes a
+formality.
+
+**Status 2026-09-21 — the GIN half of the restated gate is MET; the third-party half
+(P3: pg_search, pg_textsearch, VectorChord) is still owed** (`bench/RESULTS_LEXICAL.md`,
 `r6id.4xlarge`, 1M and 4M docs, pg_fts v1.8.3 in the same database over the same
 table). Against tsvector + GIN: **ahead** 3.7–4.5× on mid ranked, 20–29× on common
 ranked, 133–144× on `count(*)`, 4.9–7.1× on prefix, 3,376–11,030× on the bare
@@ -144,10 +162,9 @@ ranked, 133–144× on `count(*)`, 4.9–7.1× on prefix, 3,376–11,030× on th
 the last two being the dimensions this gate used to fail on outright. **Behind** on
 exactly three rows, all of them 10–30 µs on queries that complete in under 0.1 ms:
 ranked rare k=10 and k=100, and `count(*)` AND. They reproduce in the same
-direction at both scales, so they are not noise; they are also below anything that
-could matter. **A gate phrased "zero measured losses" cannot be closed by a
-measurement this size — it can only be closed by restating the gate in absolute
-terms, which is a maintainer decision and not a benchmark result.** Left open.
+direction at both scales, so they are not noise; the largest is 0.03 ms, which clears
+both clauses of the restated gate. A pg_fts arm was not in the gate's text and is now
+the more informative control; it is recorded below rather than folded into the gate.
 
 **The pg_fts arm is the more important result, because it separates earned from
 inherited.** pg_weave is a fork of pg_fts and the two had never been measured
@@ -618,16 +635,23 @@ say exactly that.
 
 Spec: `doc/specs/FUSED_TOPK.md`. ~~Do not start until L, Z, V gates pass.~~
 
-**SCOPED WAIVER OF HARD RULE 7 — MAINTAINER DECISION 2026-09-20.** F1 and F5 start
-now; F2, F3 and F4 do not. None of the three prerequisite gates passes, and the
-waiver is recorded here rather than inferred from progress, because rule 7 was once
-weakened on an inference about scope and that is the mistake the rule's own history
-warns about. What was actually checked, so a later reader does not have to re-derive
-it:
+**SCOPED WAIVER OF HARD RULE 7 — MAINTAINER DECISION 2026-09-20, WIDENED TO F2 AND F3
+ON 2026-09-21.** F1 and F5 started under the original waiver and are done; **F2 and F3
+are now licensed as well**, on two grounds recorded at the time of the decision rather
+than inferred later: (a) the **L gate is MET on its GIN half** under the absolute
+restatement above, so the lexical arm of §8's RRF control is current and the reason F2
+was held — "exposing a scorer whose gate cannot be evaluated" — is discharged; (b) F3
+is behind F2 by construction and unblocks the moment F2's pushdown exists. **F4 stays
+withdrawn** (its channel does not exist). The Z and V gates still do not pass and this
+waiver does not pretend otherwise; the argument for proceeding anyway is unchanged and
+is the one about fanout below. Both widenings are recorded here rather than inferred
+from progress, because rule 7 was once weakened on an inference about scope and that is
+the mistake the rule's own history warns about. What was actually checked, so a later
+reader does not have to re-derive it:
 
-| gate | required | state on 2026-09-20 |
+| gate | required | state on 2026-09-21 |
 |---|---|---|
-| L | `bench/lexical.sh` re-run with **zero measured losses** vs tsvector + GIN on latency, p99 and size; G1–G6 closed | **STILL NOT MET, but no longer stale — RE-MEASURED 2026-09-21 at 1M and 4M with a pg_fts arm.** Size and build flipped to wins (1.73–1.79× and 1.03–1.46× ahead) and mid-band ranked went from 1.7× behind to 3.7–4.5× ahead. Three rows remain behind by **10–30 µs**: ranked rare k=10/k=100 and `count(*)` AND. The stale-control problem this waiver was written around is **discharged**. **L2**, **L5**, **L6**, **L20** open |
+| L | restated in **absolute** terms above: no row behind by more than 0.05 ms, none behind where either arm exceeds 0.10 ms, size and build not behind; G1–G6 closed | **GIN HALF MET** — re-measured 2026-09-21 at 1M and 4M with a pg_fts arm. Size and build flipped to wins (1.73–1.79× and 1.03–1.46× ahead) and mid-band ranked went from 1.7× behind to 3.7–4.5× ahead. Three rows stay behind by **10–30 µs** and are still recorded as losses (G3, hard rule 8); the largest is 0.03 ms, which clears both clauses. **The third-party half (P3: pg_search, pg_textsearch, VectorChord) is still owed.** The stale-control problem this waiver was written around is **discharged**. **L2**, **L5**, **L6**, **L20** open |
 | Z | beat pg_tre on **every row** of `pg_tre/doc/perf.md` at 1M rows, and within 3× pg_trgm index size with `cgram` off, **recorded in `bench/RESULTS_FUZZY.md`** | **NOT MET.** That file does not exist. The pg_tre comparison on record (`bench/RESULTS_FUZZY_REGEX.md`) is against pg_tre's *published* numbers, never a measured head-to-head on the same host. The size half is satisfied by `bench/RESULTS_CGRAM.md` (39 MB vs pg_trgm's 72 MB with `cgram` off = 0.54×) but is not written in the named artifact. **Z3** (SuRF pure core, unwired), **Z5**, **Z8**, **Z9** are PARTIAL |
 | V | the restated gate below (recall, latency, storage) | **NOT MET.** V8's GIST-960d **latency** gate is unrun; **V6** kernels PARTIAL; V9 demoted-not-withdrawn; V11–V15 open |
 
@@ -657,20 +681,21 @@ What the waiver does **not** license, and these are the teeth in it:
    run behind, so that "blocked by F2" is not read as "ready": **nDCG on ≥ 2 public
    datasets** (BEIR subset + MS MARCO), which this project has never produced at all,
    and an RRF control implementation to measure against.
-2. **F2 stays closed, and F3 turns out to be behind it.** Planner pushdown is the step
-   that makes `fuse()` reachable from a user's query; exposing a scorer whose gate
-   cannot be evaluated is how a half-working channel becomes a published claim. F3
-   was initially scoped into this waiver and then removed on inspection: `score()`
-   and `score_parts()` project the *current row's* per-channel contributions, so they
-   need a fused scan to have run in a query, which needs F2. There is nothing to
-   build for F3 that is not either F2's planner work or a stub.
-   **The same dependency demotes F1's own stated gate.** `sql/fuse_degenerate.sql`
-   requires "byte-identical to the single-channel paths", which means invoking the
-   fused scorer from SQL against real channels — F2's surface, and the very
-   live-channel debugging the waiver's mitigation avoids. So F1's gate for now is
-   **F5**, whose synthetic shuttles express three of the five degenerate shapes
-   directly (single scored channel, all-boolean, `k=1`) as properties rather than as
-   expected output. The SQL file is owed when F2 lands and is not silently dropped.
+2. ~~**F2 stays closed, and F3 turns out to be behind it.**~~ **F2 AND F3 LICENSED
+   2026-09-21 (the widening above).** The original text: planner pushdown is the step
+   that makes `fuse()` reachable from a user's query, and exposing a scorer whose gate
+   cannot be evaluated is how a half-working channel becomes a published claim. That
+   condition is what changed — the L gate's control is current, so the §8 gate can be
+   evaluated once F2 exists. **F3's dependency on F2 is a fact and not a waiver term:**
+   `score()` and `score_parts()` project the *current row's* per-channel contributions,
+   so they need a fused scan to have run inside a query. F3 is therefore *sequenced*
+   after F2, not blocked by rule 7.
+   **F1's own stated gate is still owed and is now F2's to pay.**
+   `sql/fuse_degenerate.sql` requires "byte-identical to the single-channel paths",
+   which means invoking the fused scorer from SQL against real channels — F2's surface.
+   F5's synthetic shuttles express three of the five degenerate shapes (single scored
+   channel, all-boolean, `k=1`) as properties, which is what stood in for it; the SQL
+   file lands with F2 and is not silently dropped.
 3. **The rule-7 hazard is accepted explicitly.** Rule 7's actual argument is that a
    wrong answer in a fused scan has several possible causes and you chase the wrong
    one. The mitigation is that F1 is built as a **backend-free core** (the
@@ -687,16 +712,20 @@ from two different channel families, one scored and one boolean.
 | id | task | gate |
 |---|---|---|
 | ~~**F1**~~ | **DONE 2026-09-20, and the useful part is that implementing §3 falsified five things about it.** `include/weave/fuse.h` + `src/am/fuse.c` (the backend-free core: pivot selection, the required/scored split, the partition, the block prune, incremental abandonment, the top-k heap and its tie-break) + `src/am/fuseshuttle.c` (the `WeaveShuttle` skin, no policy, no caller until F2 — the `gate.c` arrangement). **The five corrections are written into `FUSED_TOPK.md` §3a and `fuse.h`'s header rather than quietly fixed**, because four of them are readings of the spec that return plausible wrong answers: (1) §3's pivot selection performs a **backward seek**, which both implemented shuttles refuse — the literal loop errors out on the second iteration of any unaligned multi-channel query; (2) **(C5)'s promise that a gate needs "no special case" is false** — the loop sums only *contributing* channels, so a gate past the pivot never contributes its -INF and **the predicate is silently not applied**, which makes boolean channels conjunctive and is corrected in `channel.h` in place; (3) **non-essential channels must still be advanced to the pivot** — the `cur <= p <= blkend` test excludes a channel that pivot selection never seeks, dropping its contribution from every score (found by F5 at 40,574 disagreements in 303,073 comparisons); (4) **three NaN traps** (`INF - INF` from maintaining `remaining` by subtraction, `0 * INF` from a zero weight on a gate's ceiling, `-INF + INF` in the abandonment test), each of which evaluates false against θ and so *silently disables a prune* while the answers stay plausible; (5) **§3 never defines the candidate set** — a position no scored channel reaches is not a result, and §4's proof reaches that conclusion by an argument that does not hold at θ = -INF. Also recorded: a fused score is only well defined once the **summation order** is, since float32 addition is not associative — 771 of 812,179 comparisons differed in the last ULP until the oracle summed in the scorer's order. **Two design facts for the record:** `score_block()` is deliberately unused (document-at-a-time first; `G36`), and `required` is a field on the shuttle rather than an inference from `kind`, because Z9's `<@>` channel is **scored** and labels itself `WEAVE_CH_FUZZY` — a kind-based inference would have vetoed every row it ranks. | ~~degenerate cases in `sql/fuse_degenerate.sql` byte-identical to the single-channel paths~~ **DEFERRED to F2** (it needs SQL surface to invoke the scorer). **MET via F5**, which expresses three of the five degenerate shapes as generator modes |
-| F2 | **BLOCKED by the waiver above — do not start.** `fuse()` planner support: recognize it, push it into the index `ORDER BY`, and provide an executable fallback so the query never fails. **Also owes `sql/fuse_degenerate.sql`, inherited from F1.** | `sql/fuse_fallback.sql` |
-| F3 | **BLOCKED by F2, discovered 2026-09-20.** `score()` / `score_parts()` projection. Both project the current row's per-channel contributions, which requires a fused scan to have run inside a query — that is F2's pushdown. Nothing implementable remains that is not F2's work or a stub. | values match a reference recomputation |
+| F2 | **IN PROGRESS 2026-09-21, unblocked by the widened waiver above.** `fuse()` planner support: recognize it, push it into the index `ORDER BY`, and provide an executable fallback so the query never fails. **Also owes `sql/fuse_degenerate.sql`, inherited from F1.** | `sql/fuse_fallback.sql` |
+| F3 | **SEQUENCED AFTER F2** (not blocked by rule 7 any more; the dependency is structural, found 2026-09-20). `score()` / `score_parts()` projection. Both project the current row's per-channel contributions, which requires a fused scan to have run inside a query — that is F2's pushdown. | values match a reference recomputation |
 | ~~F4~~ | **WITHDRAWN 2026-09-20 — the channel it integrates does not exist.** The row read "two-phase graph integration per FUSED_TOPK §6", and the vector **proximity graph** was withdrawn in Phase V: the graph kind was dropped after pg_turbovec deprecated theirs (at R@10 ≥ 0.98 on GIST-10M/960-d, IVF reached 28.4 ms while the graph could not reach 0.98 at **any** latency — ceiling 0.873 at 181 ms — and built 57–90× slower), V9's IVF is demoted, and the ratified Phase V shape is a flat 32-lane code scan plus an exact float32 top-25 rerank. There is no non-monotone shuttle left for the two-phase arrangement to confine, `WEAVE_CH_VECTOR_GRAPH` has no implementation and no planned one, and `set_visit_filter` is consequently an optional vtable slot no channel fills. **Consequences, all discharged in the spec rather than left implied:** §6 is marked superseded in place, §5's "bias the graph channels last" heuristic loses its subject, and §8's `recall ≥ 0.99 with graph on` row is struck — with no graph the fused loop's cursor is the exhaustive code scan, so recall against an exhaustive fused scan is **1.000 by construction** and the row was measuring the absent approximation. This is also why the withdrawal is written out at length: F4 was one session away from being implemented from a stale sentence, which is what hard rule 9 and the "do not re-derive scope from one sentence" rule exist to prevent. **If a graph channel is ever re-justified, this row comes back with it** — the design in §6 is sound, it just has no subject. | ~~filter pushdown demonstrably steers traversal: recall with a 1%-selective predicate ≥ recall without it~~ |
 | ~~**F5**~~ | **DONE 2026-09-20. GATE MET: 1,140,000 trials, 37,765,994 checks, 0 failures in 82 s** (dev host c7i.2xlarge, `gcc -O2 -Wall -Wextra -Werror`, also wired into `make check-standalone` at 60k trials). `test/hegel/test_fuse_props.c` compares the core against `weave_fuse_reference()` — a brute-force oracle in the same TU that uses only `seek()` and `score()` and **never asks for a bound**, so a (C2) violation cannot move it. Eight properties: fused == brute force including the tie-break; **no backward seek**, asserted by the synthetic channel itself; `score()` only at `cur`; `score()` calls ≤ the reference's; no tombstoned row returned; **gates applied conjunctively**; the (C2) check and every init refusal; and **P8, a positive control that answers "can this test see the failure mode hard rule 1 is about"** — with the check off and one channel's bound scaled below the truth, **0.99 changes the answer in 1.30 % of trials and 0.90 in 13.08 %**, and the run FAILS if either rate is zero. That 1.3 % is the finding, not the pass: it is the measurement of *how silent* a 1 %-too-low bound is, and why no fixed-expected-output test can catch one. **Coverage is asserted, not hoped for** — the run fails if any prune path stayed at zero, and at 10^6 trials it reports pivot 79.4 M, block skips 32.2 M, required-intersection skips 20.0 M, vetoes 4.8 M, abandonments 10.0 M, tombstone drops 14.7 M, and 471,794 trials that demoted a channel to non-essential. **Mutation: 11 of 13 legs killed** (`/scratch/pg_weave/f1-mut.sh`, with a baseline leg that must pass first and a per-leg timeout, both added after a killed ssh session left a mutation in the working copy and cost an hour). The two survivors are declared with mechanisms: `suffix[0] <= θ + 0.001f` is unsound but reachable only when the k-th best score sits within 0.001 of the sum of every channel's ceiling (the `+ 1.0f` leg IS killed, so the check is exercised), and `s > θ` → `s >= θ` at the heap push is unreachable because the abandonment test already discards a score equal to θ and the global-termination check breaks a pure-boolean scan first — so that comparison is defensive redundancy, and the load-bearing tie-break is `fuse_worse()` plus those two earlier discards. **One mutant HUNG rather than failed**, which found a real defect: `rend < p` sent the scan backwards and it cycled forever, so the invariant is now refused by name instead of assumed. | ~~passes 10^6 generated cases~~ **MET** |
 
 **Phase F gate:** every row of the table in `doc/specs/FUSED_TOPK.md` §8,
 including the `score()`-call ratio. If the call ratio is not ≤ 0.2× RRF, the
 bounds are too loose — fix them before anything else, and record the negative
-result. **Not claimable under the 2026-09-20 waiver** until `bench/lexical.sh` is
-re-run, because RRF-with-over-fetch is the control and its lexical arm is stale.
+result. ~~**Not claimable under the 2026-09-20 waiver** until `bench/lexical.sh` is
+re-run, because RRF-with-over-fetch is the control and its lexical arm is stale.~~
+**That blocker is discharged (2026-09-21): the control's lexical arm is current.** Two
+things the gate still has no run behind, and neither is F2's: **nDCG on ≥ 2 public
+datasets** (BEIR subset + MS MARCO), which this project has never produced, and an **RRF
+control implementation** to measure against.
 
 ---
 
