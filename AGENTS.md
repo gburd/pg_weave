@@ -334,12 +334,11 @@ PostgreSQL-licensed release, and contrib-track eligibility is the reason that
 matters. See `doc/LICENSING.md`.
 
 **7. Do not start Phase F before the L, Z, and V gates pass.** **SCOPED WAIVER IN
-FORCE since 2026-09-20 — read `doc/PHASES.md` "Phase F" before acting on this rule.**
-F1 (the backend-free fused core) and F5 (its property test) are open under a recorded
-maintainer decision; **F2 and F3 are not** — F3 because it projects the current row of a
-scan that only F2's pushdown can start — and **no Phase F gate is claimable**, because §8's control is
-RRF-with-over-fetch and its lexical arm is stale. None of the three prerequisite gates
-passes; the waiver states which, why bounded top-k is nonetheless the one lever every
+FORCE since 2026-09-20, WIDENED 2026-09-21 — read `doc/PHASES.md` "Phase F" before acting
+on this rule.** F1 and F5 are done; **F2 and F3 are now licensed too**, because the L gate
+was restated in absolute terms and its GIN half passes, which discharges the "a gate that
+cannot be evaluated" objection F2 was held on. **F4 is withdrawn.** Z and V still do not
+pass; the waiver states which, why bounded top-k is nonetheless the one lever every
 unmet Z/V latency gate needs, and what the mitigation for rule 7's actual hazard is.
 The rule below is the reasoning the waiver had to answer, so it stays as written.
 
