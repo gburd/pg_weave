@@ -409,6 +409,19 @@ weighted sum of calibrated per-channel scores", where larger is better. Decision
   ascending, which is exactly the map `<=>` already uses and for the reason stated
   there. §7's `LIMIT 10` example then works verbatim, and the *score* — the number that
   "means something" — stays retrievable through F3's `score()`.
+
+  **SUPERSEDED 2026-09-21 by F2.1, which implemented it: `fuse()` returns the NEGATED
+  weighted sum, `−Σ wᵢ·sᵢ`, and ascending order is still best-first.** `1/(1+S)` is
+  total and monotone only because BM25 is `≥ 0`. A *fused* sum is not: cosine
+  similarity lives in `[−1, 1]`, so a score recovered from `wvec <=> wvec` is negative
+  whenever the vectors point apart, and a weighted sum containing it can reach the pole
+  at `S = −1`, on either side of which the map is not monotone. The failure that
+  produces is a **wrong order**, not an error — the class this project treats as worse
+  than a refusal. Negation is total, exactly order-reversing, and needs no domain
+  argument; the cost is only that the value is not in `(0,1]` like a `<=>` distance,
+  which costs nothing for an `ORDER BY` expression. The reasoning also lives next to
+  the arithmetic, in `src/am/fusepath.c`'s header comment, and in
+  `sql/pg_weave--0.13.0--0.14.0.sql`.
 - **The spelling `fuse(col <=> q, ...)` is planner-rewritten, not evaluated as written.**
   The planner sees each argument's operator, therefore knows each argument's channel,
   therefore knows the inverse of that channel's distance map (lexical `<=>`:
