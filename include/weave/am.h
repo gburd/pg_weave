@@ -1320,11 +1320,33 @@ extern int	weave_index_vec_bits(Relation index);
 extern int	weave_index_vec_metric(Relation index);
 
 /*
- * THE VECTOR CHANNEL'S ORDER BY STRATEGY NUMBER (task F7).
+ * THE VECTOR CHANNEL'S ORDER BY STRATEGY NUMBERS (task F7).
  *
- * `<=>` on (wvec, wvec), added to the wvec_weave_ops family as an ORDER BY member
- * by sql/pg_weave--0.14.0--0.15.0.sql.  1, and the number is a decision rather than
- * the next free integer:
+ * ONE MEMBER PER METRIC THE SCAN CORE CAN SERVE, and that is the whole shape of
+ * this: include/weave/vecscan.h serves WEAVE_METRIC_IP and WEAVE_METRIC_L2 and
+ * refuses everything else, so the family advertises exactly those two orderings
+ * and nothing that would have to be answered in some other metric.
+ *
+ *	 - WEAVE_STRAT_VEC_L2 is `<->`, wvec_l2_distance (src/vector/wvec.c).  It
+ *	   returns sqrt(sum of squares), so it is non-negative and ascending is
+ *	   nearest-first.  The weft scores L2 as -||q-v||^2, higher-is-better
+ *	   (include/weave/vecscan.h), so the index's ordering value is -score
+ *	   ascending.
+ *	 - WEAVE_STRAT_VEC_IP is `<#>`, wvec_negative_inner_product, which returns
+ *	   -sum(a_i b_i) -- pgvector's sign convention, declared as such in
+ *	   sql/pg_weave--0.1.0--0.2.0.sql -- so ascending returns the LARGEST inner
+ *	   product first.  The weft's IP score domain is higher-is-better too, so the
+ *	   index's ordering value is again -score ascending.  One convention, both
+ *	   members, and the negation lives in exactly one place (weave_vec_pass()).
+ *
+ * `<=>` (cosine distance) is DELIBERATELY NOT A MEMBER.  An index cannot be built
+ * with metric = 'cosine' at all -- weave_index_vec_metric() below refuses it at
+ * CREATE INDEX because no sound compressed-domain bound exists for it -- so a
+ * cosine member could only ever be served in some other metric, which is a wrong
+ * answer rather than an approximation.  `ORDER BY v <=> q` therefore gets no index
+ * path and is answered by a Sort, which is the honest plan.
+ *
+ * WHY 1 AND 4, AND THE NUMBERS ARE DECISIONS RATHER THAN THE NEXT FREE INTEGERS:
  *
  *	 - STRATEGY NUMBERS ARE SCOPED TO AN OPERATOR FAMILY, not to the access method.
  *	   sk_strategy is resolved against the family of the index COLUMN the key was
@@ -1334,26 +1356,29 @@ extern int	weave_index_vec_metric(Relation index);
  *	   is the only thing distinguishing a wquery argument from a text one, and
  *	   DatumGetWQuery() on the wrong datum reads a varlena header as a WeaveQuery
  *	   and walks garbage.
- *	 - SO WHY NOT 2 OR 3, which are equally unused inside wvec_weave_ops (the family
- *	   has no members at all -- 0.7.0--0.8.0 created it STORAGE-only).  Because
- *	   wdoc_lex_ops already uses 2 for `<=>` (BM25 distance) and 3 for `<@>` (edit
- *	   distance) as ORDER BY members, and weave_rescan() dispatches ORDER BY keys on
- *	   sk_strategy.  Picking 2 or 3 would make one number mean two different
- *	   order-by operators over two different argument types in one access method,
- *	   and the dispatch would then depend entirely on getting the attribute check
- *	   right in every branch forever.  1 is used by no ORDER BY member anywhere in
- *	   this access method, so a vector ordering key is unambiguous on its strategy
- *	   alone -- and weave_rescan() checks the attribute as well, belt and braces.
- *	 - IT HAS TO BE IN 1..amstrategies (3).  ALTER OPERATOR FAMILY validates the
- *	   number against the access method's amstrategies, so "use 11 and avoid the
- *	   question" is not available; include/weave/cgram.h records the same constraint.
+ *	 - 1 IS FREE OF ANY ORDER BY MEANING in this access method: wdoc_lex_ops spends
+ *	   it on `@@@`, a restriction operator, which can never arrive in orderByData.
+ *	   2 and 3 are not free -- they are WEAVE_STRAT_DISTANCE (`<=>` on wdoc, BM25
+ *	   distance) and WEAVE_STRAT_EDIST (`<@>`) in include/weave/edist.h, both ORDER
+ *	   BY members -- and weave_rescan() dispatches order-by keys on sk_strategy
+ *	   ALONE.  Reusing either would make one number name two order-by operators over
+ *	   two argument types.
+ *	 - SO THE SECOND VECTOR MEMBER NEEDS A FRESH NUMBER, 4, rather than sharing 1
+ *	   with the first: the two differ only in the metric they name, the dispatch
+ *	   reads the number, and a shared number would leave weave_rescan() unable to
+ *	   tell an l2 ordering request from an ip one.
+ *	 - 4 IS WHY amstrategies IS 4 (src/am/am.c, weave_handler).  ALTER OPERATOR
+ *	   FAMILY validates a member number against the access method's amstrategies,
+ *	   so the bump is a precondition of this member existing and not a tidy-up;
+ *	   include/weave/cgram.h records the same constraint.
  *
  * The other two live in include/weave/edist.h with the `<@>` machinery they were
- * added for.  This one is here because it belongs to no channel header: the thing
- * that reads it is the AM's key dispatch, weave_index_layout() below is the other
+ * added for.  These are here because they belong to no channel header: the thing
+ * that reads them is the AM's key dispatch, weave_index_layout() below is the other
  * half of that dispatch, and weave/am.h must not depend on weave/vector.h.
  */
-#define WEAVE_STRAT_VEC_DISTANCE	1
+#define WEAVE_STRAT_VEC_L2		1
+#define WEAVE_STRAT_VEC_IP		4
 
 /*
  * Which index column feeds which channel.

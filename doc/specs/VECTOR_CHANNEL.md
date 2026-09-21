@@ -1314,7 +1314,9 @@ segment so a reader never has to guess"*. That is precisely what
 `WeaveVecMeta.metric` is for. Default `l2`, because every weft already on disk
 says `l2` and format v8 shipped two days ago.
 
-**UPDATE, task F7 (2026-09-21): the ORDER BY path exists and the per-metric family
+**UPDATE, task F7 (2026-09-21) — SUPERSEDED THE SAME DAY. Read the correction that
+follows before relying on any sentence in this paragraph; what it calls a "named
+divergence" is a wrong answer. The ORDER BY path exists and the per-metric family
 split still does not.** F7 added `<=>` on `(wvec, wvec)` to `wvec_weave_ops` as an
 ORDER BY member (strategy 1; see `include/weave/am.h`, `WEAVE_STRAT_VEC_DISTANCE`),
 because until it did, a vector query could not reach `amrescan` at all and
@@ -1334,6 +1336,49 @@ opclass, a second `weave_opfamily_kinds[]` row and a migration for existing inde
 and is therefore a task rather than a line. `xs_recheckorderby` stays **false**: a
 reorder queue would require the index's distance to be a proven *lower bound* on the
 operator's, and a quantized score is not one.
+
+**CORRECTION, task F7 (2026-09-21): `<=>` was withdrawn as a member, replaced by one
+member per metric the scan core can serve.** The mechanism the paragraph above got
+wrong: `include/weave/vecscan.h:53` says the scan core serves **IP and L2 and refuses
+everything else**, and the weft's metric is `WeaveVecMeta.metric` (from the `metric`
+reloption, default `l2`). Registering `<=>` therefore did not produce an
+approximation of cosine — it produced an **`l2` ordering under a cosine operator**,
+for every row, silently. And `sql/vecorderby.sql`'s "divergence" section was
+measuring that mismatch (24 of 25 positions differing, overlap 19 of 25) while
+attributing the number to quantization. What landed instead:
+
+- **Two ORDER BY members.** `<->` = `wvec_l2_distance`, strategy **1**
+  (`WEAVE_STRAT_VEC_L2`); `<#>` = `wvec_negative_inner_product`, strategy **4**
+  (`WEAVE_STRAT_VEC_IP`). Both are ascending-is-nearest in pgvector's convention —
+  `<#>` returns *−*Σaᵢbᵢ for exactly that reason — and the weft's score domain is
+  higher-is-better in both metrics, so the index's ordering value is `-score`
+  ascending in both. Strategy 4 is why `amroutine->amstrategies` was raised from 3 to
+  4: `ALTER OPERATOR FAMILY` validates a member number against it, and 2 and 3 are
+  already `WEAVE_STRAT_DISTANCE` and `WEAVE_STRAT_EDIST` while `weave_rescan()`
+  dispatches order-by keys on `sk_strategy` alone.
+- **`<=>` is deliberately not a member of any weave family on `wvec`.** Cosine has no
+  sound compressed-domain bound here (no maximum true norm is stored), so the core
+  refuses it and `CREATE INDEX ... WITH (metric = 'cosine')` is refused outright. A
+  cosine member could only ever be served in some other metric. With no member,
+  `ORDER BY v <=> q` gets no index path and is answered by a Sort over a Seq Scan —
+  the honest plan, and `sql/vecorderby.sql` now asserts it.
+- **A metric mismatch is refused, not answered.** `weave_rescan()` compares the
+  metric the strategy names against the index's and `ereport(ERROR)`s, naming the
+  operator and the metric, with a hint to use the other operator or rebuild. It is a
+  *run-time* error because the metric is a reloption and path generation never looks
+  at one; the scan is the last place that can refuse.
+- **The only divergence from the operator that remains is the quantizer**, which is
+  what an ANN index is, and `sql/vecorderby.sql` records it. `xs_recheckorderby`
+  stays **false** for the reason given above.
+
+**The family-per-metric split is still the fix**, for two reasons the refusal makes
+visible rather than removes. First, it moves the decision into the planner: an `ip`
+index would have no `<->` member, so no path is generated and no error is needed.
+Second, the `metric` reloption carries `AccessExclusiveLock` and can be changed by
+`ALTER INDEX ... SET (metric = ...)` **without** a `REINDEX`, which rewrites no weft
+— so the reloption and `WeaveVecMeta.metric`, which is the scoring authority, can
+disagree. A reloption is the wrong home for something the planner must see and a
+reader must trust; an opclass, the way pgvector does it, is the right one.
 
 ### Warp → docid needs no random access, because the scan is monotone
 
