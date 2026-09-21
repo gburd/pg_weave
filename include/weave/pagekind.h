@@ -257,6 +257,33 @@ typedef enum WeavePageKind
 	WEAVE_PK_CGRAM_DICTINDEX = 31,	/* cgram: sparse index over those pages */
 	WEAVE_PK_CGRAM_POST = 32,	/* cgram: the shared docid posting chain */
 
+	/*
+	 * Allocated by task Z8's second half (doc/GAPS.md G35), which made a pending
+	 * item carry the inserted row's RAW gram_ops TEXT so that a post-build
+	 * INSERT does not de-accelerate the whole cgram channel until the next
+	 * REINDEX.
+	 *
+	 * A NEW KIND FOR THE SAME REASON WEAVE_PK_PENDING_V9 IS ONE, and the reason
+	 * is worth re-reading rather than re-deriving: the item HEADER grew again
+	 * (WeavePendingItem gained a gramlen word), which moved the wvec from byte 16
+	 * to byte 20 and lengthened the stride by MAXALIGN(gramlen).  Those strides
+	 * are not distinguishable from the bytes, so the page must DECLARE which
+	 * layout its items use, weave_insert() must never append a new item to a page
+	 * of older ones, and the discriminator has to be per PAGE because
+	 * weave_insert() deliberately does not upcast the metapage -- so one index
+	 * can hold all three layouts at once.
+	 *
+	 * EVERY pending page this version writes is this kind, including in an index
+	 * with neither a vector nor a gram_ops column, where every item simply has
+	 * veclen == gramlen == 0.  The kind names the LAYOUT, not the payload: that
+	 * distinction is what the first attempt at the v8 -> v9 change got wrong (it
+	 * kept the old kind for indexes with no vector column and wrote new-layout
+	 * items onto it, so the reader parsed them with the old stride and the
+	 * regression suite filled up with "skipping malformed pending document").
+	 * WEAVE_PK_PENDING_V9 joins WEAVE_PK_PENDING as a read-only legacy format.
+	 */
+	WEAVE_PK_PENDING_V10 = 33,	/* pending page in the v10 item layout */
+
 	WEAVE_PK_NKINDS				/* first unassigned id; not a kind */
 } WeavePageKind;
 

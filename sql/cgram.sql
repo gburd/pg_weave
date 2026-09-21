@@ -238,13 +238,13 @@ ORDER BY n;
 -- ---------------------------------------------------------------------------
 -- A row inserted AFTER the build.
 --
--- It lands in the pending buffer, which carries the analyzed wdoc but not the raw
--- text, so its bolt has no cgram weft (see weave_flush_pending in
--- src/am/ambuild.c).  ABSENT IS SAFE: the route adds every pending TID to the
--- candidates unconditionally and the mandatory recheck decides, so the row is
--- FOUND -- it is simply not accelerated.  Asserted because "absent is safe" is a
--- claim, and an unasserted claim about a dropped row is the failure mode this
--- whole file exists for.
+-- It lands in the pending buffer, which carries the analyzed wdoc, the wvec and
+-- -- since doc/GAPS.md G35 closed -- the RAW TEXT of the gram_ops column, so the
+-- bolt a flush writes from it carries a real cgram weft.  While the row is still
+-- pending it is in no bolt at all: the route adds every pending TID to the
+-- candidates unconditionally and the mandatory recheck decides, so it is FOUND
+-- either way.  Asserted because "found either way" is a claim, and an unasserted
+-- claim about a dropped row is the failure mode this whole file exists for.
 -- ---------------------------------------------------------------------------
 INSERT INTO cg(id, body, d)
 VALUES (9100, 'pending insertion refused later',
@@ -256,6 +256,62 @@ FROM cgpat p, cg_diff(p.pat) d
 ORDER BY p.n, d.arm, d.id;
 
 SELECT id FROM cg WHERE body @~ '%tion refused l%' ORDER BY id;
+
+-- ---------------------------------------------------------------------------
+-- THE FLUSH, AND THE TWO NUMBERS THAT DISCRIMINATE (doc/GAPS.md G35 and G34).
+--
+-- Read this before changing anything below it, because most of the obvious
+-- assertions here pass whether the gaps are closed or not:
+--
+--   * THE ROW SET DOES NOT DISCRIMINATE.  Every parity assertion in this file
+--     passes with both gaps open -- that is what "absent is safe" means: a bolt
+--     with no cgram weft makes the route fall back to a sequential heap pass,
+--     which returns the SAME rows, slower.  So the symmetric differences below
+--     are a guard against the fix, not a test of it.
+--   * NEITHER DOES THE COUNTER WHILE THE ROW IS STILL PENDING.  A pending
+--     document is in no bolt, its TID is added as a candidate unconditionally,
+--     and the route still serves the scan: `served_while_pending` is 1 before the
+--     fix and 1 after.  It is asserted precisely so that the next number cannot
+--     be mistaken for it.
+--
+-- What DOES discriminate is the counter AFTER the pending buffer is folded into a
+-- bolt, and the segment count after a compaction:
+--
+--   served_after_flush     G35.  weave_cgram_collect() uses no bolt's weft unless
+--                          EVERY live bolt has one, so the flushed bolt's missing
+--                          weft de-accelerated the WHOLE index, not just the new
+--                          row.  BEFORE the fix this is 0 (the route falls back to
+--                          weave_cgram_heapscan and the counter deliberately does
+--                          not move); AFTER it is 1.
+--   segments_after_merge   G34.  weave_merge() flushes and then compacts.  BEFORE
+--                          the fix a cgram-bearing bolt was refused by
+--                          weave_seg_mergeable(), so the two bolts stayed two: 2.
+--                          AFTER, the merge re-derives the output weft from its
+--                          inputs' wefts and the index compacts to 1.
+--
+-- The 0 -> 1 and 2 -> 1 pair is also why the two gaps had to close together:
+-- G35 alone would have made every flush add a bolt that no compaction could ever
+-- consume, and a segment directory that only grows ends at WEAVE_MAX_SEGMENTS
+-- with a FAILED INSERT (weave_add_segment_with_room).
+--
+-- WHAT CATCHES A MIS-MERGED POSTING LIST, which is the risk G34's refusal existed
+-- to avoid: the sweeps further down, which now run against a MERGED cgram weft.
+-- A merge that loses a (trigram, docid) posting makes the pattern's AND exclude a
+-- document that LIKE keeps, and the symmetric difference is then non-empty and
+-- names the ids.  No extra sweep is added here -- the ones after the DELETE and
+-- after the VACUUM are those assertions, moved onto a merged weft by this block.
+-- ---------------------------------------------------------------------------
+SELECT cg_served('%tion refused l%') AS served_while_pending;
+SELECT weave_merge('cg_idx');
+SELECT cg_served('%tion refused l%') AS served_after_flush;
+SELECT weave_index_nsegments('cg_idx') AS segments_after_merge;
+SELECT id FROM cg WHERE body @~ '%tion refused l%' ORDER BY id;
+
+-- The merged bolt's weft is visible in the size report, and the report still sums
+-- to the relation: a merge that wrote cgram pages the report cannot attribute
+-- would show up here rather than as a mystery in bench/RESULTS_CGRAM.md.
+SELECT sum(bytes) = pg_relation_size('cg_idx') AS sums_to_relation_after_merge
+FROM weave_index_size_detail('cg_idx');
 
 -- ---------------------------------------------------------------------------
 -- A DELETE, so the tombstone filter on this route is exercised.  A deleted row
@@ -292,13 +348,31 @@ SELECT p.n, p.why, d.arm, d.id
 FROM cgpat p, cg_diff(p.pat) d
 ORDER BY p.n, d.arm, d.id;
 
--- A REINDEX rebuilds the weft from the heap, which is the only path that can
--- (the merge cannot: see weave_seg_mergeable).  After it, the post-build INSERT
--- is accelerated rather than merely correct -- so the counter says 1 for a
--- pattern that only that row matches.
+-- A REINDEX rebuilds the weft from the heap.  Before doc/GAPS.md G35 closed it was
+-- the ONLY path that could, which is what made a post-build INSERT de-accelerate
+-- the whole index until someone ran one; the flush and the merge can both produce
+-- a weft now, so this asserts a property rather than a workaround: a rebuild from
+-- the heap and a weft carried through a flush and a merge agree about the row.
 REINDEX INDEX cg_idx;
 SELECT cg_served('%tion refused l%') AS served_after_reindex;
 SELECT id FROM cg WHERE body @~ '%tion refused l%' ORDER BY id;
+
+-- An oversized INSERT bypasses the pending buffer entirely and becomes its own
+-- one-document bolt.  That path had to grow a cgram producer in the same change
+-- for the same reason (doc/GAPS.md G35) -- and here the consequence of missing it
+-- is larger than one row: a bolt with no weft de-accelerates every `@~` query in
+-- the index, so this number is 0 with the pending-buffer half fixed alone and 1
+-- with both.  sql/pendingvec.sql asserts the vector half of the same path for the
+-- same reason.
+INSERT INTO cg(id, body, d)
+SELECT 9200, b, to_wdoc('simple', b)
+FROM (SELECT 'oversized ' || string_agg('refutation' || g, ' ') AS b
+        FROM generate_series(1, 3000) g) s;
+INSERT INTO cgref(id, body)
+SELECT 9200, 'oversized ' || string_agg('refutation' || g, ' ')
+FROM generate_series(1, 3000) g;
+SELECT cg_served('%tion refuta%') AS served_after_oversized;
+SELECT count(*) AS oversized_row_found FROM cg WHERE body @~ '%refutation7 refutation8%';
 
 -- An index with a gram_ops column and nothing else must be refused, and the
 -- error must say why: the docid space comes from the lexical build.

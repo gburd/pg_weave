@@ -34,7 +34,22 @@
 #include "weave/weave.h"
 
 #define WEAVE_MAGIC			0x42324635	/* "B2F5" */
-#define WEAVE_VERSION		9		/* v9: a PENDING page carries each inserted
+#define WEAVE_VERSION		10		/* v10: a PENDING page carries each inserted
+										 * row's RAW gram_ops TEXT as well, on a
+										 * WEAVE_PK_PENDING_V10 page whose item
+										 * layout differs from v9's (task Z8's
+										 * second half, doc/GAPS.md G35), and a
+										 * MERGED bolt may carry a cgram weft
+										 * (G34).  The metapage is again
+										 * BYTE-IDENTICAL, and the bump is again
+										 * about REFUSAL and FREEING: a v9 .so
+										 * does not know page kind 33, so it
+										 * would parse such a page with the v9
+										 * item stride and WARN-and-skip
+										 * documents the metapage has already
+										 * counted into ndocs -- exactly the v8
+										 * -> v9 failure below, one field over.
+										 * v9: a PENDING page carries each inserted
 										 * row's vector, on a WEAVE_PK_PENDING_V9 page
 										 * whose item layout differs from v8's (task
 										 * V7, doc/GAPS.md G23).  The metapage is
@@ -104,6 +119,10 @@
 #define WEAVE_VERSION_SURF		7	/* first version writing the fuzzy (SuRF) weft */
 #define WEAVE_VERSION_VECTOR	8	/* first version writing the vector weft */
 #define WEAVE_VERSION_PENDING_VEC 9	/* first version whose pending items carry a wvec */
+#define WEAVE_VERSION_PENDING_CGRAM 10	/* first version whose pending items carry the
+										 * raw gram_ops text, and therefore the first
+										 * whose pending flush and whose merge can
+										 * produce a cgram weft */
 
 /*
  * Set in WeaveDoclenBlockHdr.count to mark a sidecar block whose docid column is
@@ -365,9 +384,10 @@ typedef struct WeaveBlockHdr
 /*
  * A pending record: a not-yet-merged document stored verbatim on a pending
  * page.  The wdoc varlena follows the header inline (doclen bytes), then the
- * row's wvec (veclen bytes) if the index has a vector column.  Pending
- * documents are searched directly at scan time and folded into a new segment by
- * a flush -- triggered by weave_merge() or automatically during VACUUM cleanup.
+ * row's wvec (veclen bytes) if the index has a vector column, then the raw text
+ * of its gram_ops column (gramlen bytes) if it has one.  Pending documents are
+ * searched directly at scan time and folded into a new segment by a flush --
+ * triggered by weave_merge() or automatically during VACUUM cleanup.
  *
  * WHY THE VECTOR IS STORED RAW AND NOT PRE-QUANTIZED.  A code is ~8x smaller
  * (480 B against 3,848 B at 960-d/4-bit), which is a real cost paid on every
@@ -379,6 +399,21 @@ typedef struct WeaveBlockHdr
  * (scale, norm) pair from a reconstruction, the one thing doc/specs/
  * VECTOR_CHANNEL.md forbids.  Storing the vector verbatim means a flush runs
  * PRODUCER 1 exactly as a build does: one quantization path, not two.
+ *
+ * WHY THE GRAM TEXT IS STORED RAW AND NOT AS PRE-COMPUTED TRIGRAM PAIRS -- the
+ * same argument arriving at a much wider margin (doc/GAPS.md G35).  The pairs a
+ * value contributes are 16 bytes EACH and there is one per byte of text
+ * (weave_cgram_accum_add), so baking them here would make a pending item ~16x
+ * the size of the text it came from: the cheap thing to store is the input, not
+ * the output.  And the correctness half is sharper than the vector's: the pairs
+ * depend on the EXTRACTOR (the ASCII fold, the gram width, the key encoding),
+ * which is a property of the WEFT being written and not of the insert.  A weft
+ * whose dictionary mixed keys produced by two extractors would make a pattern
+ * require a key the matching document was never indexed under -- a FALSE
+ * NEGATIVE, i.e. a silently dropped row (AGENTS.md hard rule 1), where the
+ * vector's equivalent is merely a refused merge.  Storing the text means the
+ * flush runs THE SAME PRODUCER a build does, at the geometry of the bolt it is
+ * writing: one extractor, not two.
  */
 typedef struct WeavePendingItem
 {
@@ -389,15 +424,40 @@ typedef struct WeavePendingItem
 								 * column.  The two need no distinguishing: both
 								 * leave the lane dead, and producer 1 is
 								 * inactive in the second case anyway. */
-	/* char wdoc[doclen], then at MAXALIGN(sizeof(hdr) + doclen): char wvec[veclen] */
+	uint32		gramlen;		/* byte length of the gram_ops column's raw text
+								 * (a full varlena, detoasted) after the wvec; 0
+								 * for a NULL value AND for an index with no
+								 * gram_ops column.  Again no distinguishing is
+								 * needed: a NULL text contributes no trigram
+								 * (NULL LIKE anything is NULL), which is exactly
+								 * what an absent column contributes. */
+	/*
+	 * char wdoc[doclen],
+	 * then at MAXALIGN(sizeof(hdr) + doclen):                 char wvec[veclen],
+	 * then at MAXALIGN(sizeof(hdr) + doclen) + MAXALIGN(veclen): char gram[gramlen]
+	 */
 } WeavePendingItem;
+
+/*
+ * The v9 layout, still on disk in any index that was written by a build before
+ * WEAVE_VERSION_PENDING_CGRAM and has un-flushed pending documents: the same
+ * item without the gramlen word, so its wvec sits four bytes earlier and its
+ * stride is shorter.  Kept as a struct for the reason the v8 one is.
+ */
+typedef struct WeavePendingItemV9
+{
+	ItemPointerData tid;
+	uint32		doclen;
+	uint32		veclen;
+	/* char wdoc[doclen], then at MAXALIGN(sizeof(hdr) + doclen): char wvec[veclen] */
+} WeavePendingItemV9;
 
 /*
  * The v8 layout, still on disk in any index that was written by a build before
  * WEAVE_VERSION_PENDING_VEC and has un-flushed pending documents.  Declared as a
  * struct rather than a bare `12` so the old stride is checked by the compiler
  * and readable by a human; see WEAVE_PK_PENDING_V9 in weave/pagekind.h for why
- * the two layouts are told apart by PAGE KIND and not by a version word.
+ * the layouts are told apart by PAGE KIND and not by a version word.
  */
 typedef struct WeavePendingItemV8
 {
@@ -408,19 +468,28 @@ typedef struct WeavePendingItemV8
 
 StaticAssertDecl(sizeof(WeavePendingItemV8) == 12,
 				 "the v8 pending item header is on-disk ABI");
-StaticAssertDecl(sizeof(WeavePendingItem) == 16,
+StaticAssertDecl(sizeof(WeavePendingItemV9) == 16,
+				 "the v9 pending item header is on-disk ABI");
+StaticAssertDecl(sizeof(WeavePendingItem) == 20,
 				 "the pending item header is on-disk ABI");
 
 /*
- * Bytes one pending item occupies, both layouts.  MAXALIGN(veclen) is ADDED to
- * an already-aligned offset rather than folded into one MAXALIGN of the total,
- * so that the vector itself starts aligned and veclen == 0 reduces to exactly
- * the doc-only stride.
+ * Bytes one pending item occupies, all three layouts.  Each payload's
+ * MAXALIGN is ADDED to an already-aligned offset rather than folded into one
+ * MAXALIGN of the total, so that every payload starts aligned and a zero length
+ * reduces to exactly the stride of the shorter item.
  */
 static inline Size
-weave_pending_item_size(uint32 doclen, uint32 veclen)
+weave_pending_item_size(uint32 doclen, uint32 veclen, uint32 gramlen)
 {
-	return MAXALIGN(sizeof(WeavePendingItem) + doclen) + MAXALIGN(veclen);
+	return MAXALIGN(sizeof(WeavePendingItem) + doclen) + MAXALIGN(veclen) +
+		MAXALIGN(gramlen);
+}
+
+static inline Size
+weave_pending_item_size_v9(uint32 doclen, uint32 veclen)
+{
+	return MAXALIGN(sizeof(WeavePendingItemV9) + doclen) + MAXALIGN(veclen);
 }
 
 static inline Size
@@ -595,22 +664,29 @@ weave_page_entry_end(Page page)
 }
 
 /*
- * A forward cursor over one pending page's items, in EITHER layout.
+ * A forward cursor over one pending page's items, in ANY of the three layouts.
  *
- * The two layouts live here and nowhere else.  A WEAVE_PK_PENDING_V9 page's
- * items have a 16-byte header with a veclen word and may carry a vector after
- * the document; a legacy WEAVE_PK_PENDING page's have a 12-byte header and never
- * do.  One index can hold both (see WEAVE_PK_PENDING_V9 in weave/pagekind.h).
- * It is in this header rather than in a .c file because there are TWO readers --
- * weave_flush_pending() folds pending items into a segment and the bitmap scan
- * matches them live -- and this arithmetic existing in both files independently
- * is exactly the shape of bug the consolidation prevents.
+ * The layouts live here and nowhere else.  A WEAVE_PK_PENDING_V10 page's items
+ * have a 20-byte header with doclen/veclen/gramlen and may carry a vector and the
+ * raw gram text after the document; a WEAVE_PK_PENDING_V9 page's have a 16-byte
+ * header and never carry gram text; a legacy WEAVE_PK_PENDING page's have a
+ * 12-byte header and carry neither.  One index can hold all three (see
+ * WEAVE_PK_PENDING_V10 in weave/pagekind.h).  It is in this header rather than in
+ * a .c file because there are TWO readers -- weave_flush_pending() folds pending
+ * items into a segment and the bitmap scan matches them live -- and this
+ * arithmetic existing in both files independently is exactly the shape of bug the
+ * consolidation prevents.
+ *
+ * `layout` is the ITEM-HEADER SIZE and not an enum, because that is the only
+ * thing the three cases differ by that the arithmetic below needs; a reader that
+ * asks "is this the newest layout" asks about a payload it wants (gram != NULL),
+ * which is the question WEAVE_PK_PENDING_V9's history says to ask.
  */
 typedef struct WeavePendingIter
 {
 	char	   *ptr;
 	char	   *end;
-	bool		v9layout;			/* page kind is WEAVE_PK_PENDING_V9 */
+	Size		hdrsz;			/* sizeof the item header on THIS page */
 } WeavePendingIter;
 
 typedef struct WeavePendingRec
@@ -620,25 +696,61 @@ typedef struct WeavePendingRec
 	uint32		doclen;
 	const void *vec;			/* NULL unless the item carries one */
 	uint32		veclen;
+	const void *gram;			/* the gram_ops column's raw text (a varlena), or
+								 * NULL unless the item carries one */
+	uint32		gramlen;
+	bool		hasgram;		/* does this item's LAYOUT have a gram field at
+								 * all?  Distinct from gram != NULL, and the
+								 * distinction is load-bearing: a NULL text means
+								 * "contributes no trigram", while an older layout
+								 * means "this document's trigrams are NOT
+								 * RECOVERABLE", and a weft written over the second
+								 * case would be incomplete -- i.e. a false
+								 * negative (weave_flush_pending). */
 } WeavePendingRec;
 
 static inline void
 weave_pending_iter_init(WeavePendingIter *it, Page page)
 {
+	WeavePageKind pk = WeavePageGetKind(page);	/* decoded ONCE: three
+												 * WeavePageHasKind() tests would
+												 * decode the opaque words three
+												 * times per page walked */
+
 	it->ptr = (char *) PageGetContents(page);
 	it->end = weave_page_entry_end(page);
-	it->v9layout = WeavePageHasKind(page, WEAVE_PK_PENDING_V9);
+	if (pk == WEAVE_PK_PENDING_V10)
+		it->hdrsz = sizeof(WeavePendingItem);
+	else if (pk == WEAVE_PK_PENDING_V9)
+		it->hdrsz = sizeof(WeavePendingItemV9);
+	else if (pk == WEAVE_PK_PENDING)
+		it->hdrsz = sizeof(WeavePendingItemV8);
+	else
+	{
+		/*
+		 * A kind this build does not recognize as a pending layout: yield NOTHING
+		 * rather than guess a stride.  Unreachable through the ordinary paths --
+		 * weave_check_meta() refuses an index whose format version exceeds
+		 * WEAVE_VERSION before any page is read, and the chain is built by one
+		 * writer -- but "assume the oldest layout" is a best-effort read of bytes
+		 * we do not understand, which doc/CONVENTIONS.md decision 3 rules out, and
+		 * on a torn or recycled page it would hand weave_doc_is_valid() garbage
+		 * once per item instead of stopping.
+		 */
+		it->ptr = it->end;
+		it->hdrsz = sizeof(WeavePendingItem);
+	}
 }
 
 /*
  * Next item, or false at the end of the item area -- and also false for the
  * first item whose own lengths do not fit inside that area, which is how a torn
- * or recycled page with a garbage doclen/veclen is stopped rather than followed
- * off the page.  Both callers read pending pages under only BUFFER_LOCK_SHARE
- * while a concurrent flush can free and an insert can recycle them, so this is
- * load-bearing and not belt-and-braces: without it the pointer advance runs off
- * the page (observed as a wild multi-gigabyte allocation under concurrent merge
- * plus ingestion).
+ * or recycled page with a garbage doclen/veclen/gramlen is stopped rather than
+ * followed off the page.  Both callers read pending pages under only
+ * BUFFER_LOCK_SHARE while a concurrent flush can free and an insert can recycle
+ * them, so this is load-bearing and not belt-and-braces: without it the pointer
+ * advance runs off the page (observed as a wild multi-gigabyte allocation under
+ * concurrent merge plus ingestion).
  *
  * A record returned here is BOUNDED, not VALIDATED: the bytes are still
  * untrusted, and the caller runs weave_doc_is_valid() and weave_wvec_is_valid()
@@ -648,30 +760,51 @@ weave_pending_iter_init(WeavePendingIter *it, Page page)
 static inline bool
 weave_pending_iter_next(WeavePendingIter *it, WeavePendingRec *rec)
 {
-	Size		hdrsz = it->v9layout ? sizeof(WeavePendingItem)
-		: sizeof(WeavePendingItemV8);
 	Size		stride;
 
-	if (it->ptr + hdrsz > it->end)
+	if (it->ptr + it->hdrsz > it->end)
 		return false;
 
 	rec->vec = NULL;
 	rec->veclen = 0;
+	rec->gram = NULL;
+	rec->gramlen = 0;
+	rec->hasgram = (it->hdrsz == sizeof(WeavePendingItem));
 
-	if (it->v9layout)
+	if (it->hdrsz == sizeof(WeavePendingItem))
 	{
 		WeavePendingItem *pi = (WeavePendingItem *) it->ptr;
 
 		rec->tid = &pi->tid;
 		rec->doclen = pi->doclen;
 		rec->veclen = pi->veclen;
-		stride = weave_pending_item_size(pi->doclen, pi->veclen);
+		rec->gramlen = pi->gramlen;
+		stride = weave_pending_item_size(pi->doclen, pi->veclen, pi->gramlen);
 		if (it->ptr + stride > it->end)
 			return false;
 		rec->doc = (WeaveDoc) (it->ptr + sizeof(WeavePendingItem));
 		if (pi->veclen > 0)
 			rec->vec = it->ptr +
 				MAXALIGN(sizeof(WeavePendingItem) + (Size) pi->doclen);
+		if (pi->gramlen > 0)
+			rec->gram = it->ptr +
+				MAXALIGN(sizeof(WeavePendingItem) + (Size) pi->doclen) +
+				MAXALIGN((Size) pi->veclen);
+	}
+	else if (it->hdrsz == sizeof(WeavePendingItemV9))
+	{
+		WeavePendingItemV9 *pi = (WeavePendingItemV9 *) it->ptr;
+
+		rec->tid = &pi->tid;
+		rec->doclen = pi->doclen;
+		rec->veclen = pi->veclen;
+		stride = weave_pending_item_size_v9(pi->doclen, pi->veclen);
+		if (it->ptr + stride > it->end)
+			return false;
+		rec->doc = (WeaveDoc) (it->ptr + sizeof(WeavePendingItemV9));
+		if (pi->veclen > 0)
+			rec->vec = it->ptr +
+				MAXALIGN(sizeof(WeavePendingItemV9) + (Size) pi->doclen);
 	}
 	else
 	{
