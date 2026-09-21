@@ -987,15 +987,20 @@ weave_vec_shuttle_stats(WeaveShuttle *s)
 /* ---------------------------------------------------------------------------
  * weave_vec_scan() and weave_vec_scan_stats(): the direct entry point
  *
- * WHY A SQL FUNCTION EXISTS AT ALL, since V8 wires no operator and no ORDER BY.
- * On 2026-09-16 a mutation that reintroduced a known scan-side bug passed the
+ * WHY A SQL FUNCTION EXISTS AT ALL, which when this was written was because V8
+ * wired no operator and no ORDER BY.  Task F7 wired both, and the answer did not
+ * change -- it got sharper.  On 2026-09-16 a mutation that reintroduced a known
+ * scan-side bug passed the
  * whole regression suite twice, the second time because the planner answered the
  * query with a bitmap heap scan whose executor recheck re-evaluated the operator
  * itself -- the right answer by a path that never entered the mutated code
  * (AGENTS.md).  Only weave_count() and weave_search() reach the lexical scan
  * machinery directly, and that is the only reason mutations in it are catchable.
  * The vector scan needs the same door, and it needs it in the commit that adds
- * the scan rather than in a later one.
+ * the scan rather than in a later one.  Now that a plan CAN reach the channel, this
+ * function is also the oracle sql/vecorderby.sql compares that plan against, which
+ * is why F7 factored the bolt loop into weave_vec_topk_run() instead of writing a
+ * second one: an oracle that drifts from the thing it checks is worse than none.
  *
  * TWO FUNCTIONS, NOT ONE WITH EXTRA COLUMNS, and the reason is the case the
  * counters matter most in: an allowlist that admits nothing returns ZERO ROWS,
@@ -1012,33 +1017,13 @@ weave_vec_shuttle_stats(WeaveShuttle *s)
  * document id, not a proof that a visible row exists.
  * ------------------------------------------------------------------------- */
 
-typedef struct VecScanHit
-{
-	int32		segno;
-	uint32		warp;
-	uint64		docid;
-	float4		score;
-} VecScanHit;
-
-typedef struct VecScanCtr
-{
-	int32		segno;
-	float4		maxscore;
-	int64		nblk_seen;
-	int64		nblk_mask;
-	int64		nblk_bound;
-	int64		nblk_score;
-	int64		nlane_score;
-} VecScanCtr;
-
-typedef struct VecScanRun
-{
-	VecScanHit *hit;			/* best first; nhit of k slots used */
-	int			nhit;
-	int			k;
-	VecScanCtr *ctr;
-	int			nctr;
-} VecScanRun;
+/*
+ * WeaveVecTopKHit / WeaveVecTopKCtr / WeaveVecTopK were declared here, file-static,
+ * while this SRF was the only driver of the per-bolt top-k.  Task F7 added a second
+ * driver -- the access method's ORDER BY path -- so they moved to
+ * include/weave/vector.h, where the reason they are shared rather than copied is
+ * written next to them.  Nothing else about them changed.
+ */
 
 static int
 vec_cmp_u64(const void *a, const void *b)
@@ -1125,7 +1110,7 @@ vec_allow_from_docids(const WeaveVecWeft *w, int segno, const uint64 *sorted,
  * the shuttle is the k-th best score itself.
  */
 static float4
-vec_topk_theta(const VecScanRun *r)
+vec_topk_theta(const WeaveVecTopK *r)
 {
 	if (r->nhit < r->k)
 		return -get_float4_infinity();
@@ -1133,13 +1118,13 @@ vec_topk_theta(const VecScanRun *r)
 }
 
 static bool
-vec_topk_rejects(const VecScanRun *r, float4 s)
+vec_topk_rejects(const WeaveVecTopK *r, float4 s)
 {
 	return r->nhit == r->k && !(s > r->hit[r->k - 1].score);
 }
 
 static void
-vec_topk_admit(VecScanRun *r, int32 segno, uint32 warp, uint64 docid, float4 s)
+vec_topk_admit(WeaveVecTopK *r, int32 segno, uint32 warp, uint64 docid, float4 s)
 {
 	int			i;
 	int			j;
@@ -1161,13 +1146,13 @@ vec_topk_admit(VecScanRun *r, int32 segno, uint32 warp, uint64 docid, float4 s)
 
 /* Drive one bolt's shuttle to exhaustion, folding its lanes into the top-k. */
 static void
-vec_scan_bolt(VecScanRun *r, const WeaveVecWeft *w, int segno, const WVec *query,
+vec_scan_bolt(WeaveVecTopK *r, const WeaveVecWeft *w, int segno, const WVec *query,
 			  const uint64 *allow)
 {
 	WeaveShuttle *sh = weave_vec_shuttle_begin(w, segno, query->x, (int) query->dim,
 											   allow, (WeaveWarp) w->meta.nvec,
 											   1.0f);
-	VecScanCtr *ctr = &r->ctr[r->nctr];
+	WeaveVecTopKCtr *ctr = &r->ctr[r->nctr];
 	const WeaveVecScanState *st;
 	WeaveWarp	warp;
 
@@ -1231,19 +1216,93 @@ vec_scan_bolt(VecScanRun *r, const WeaveVecWeft *w, int segno, const WVec *query
 }
 
 /*
- * Run the scan over every bolt of one index.  Shared by both SRFs so that the
- * counters one reports describe the work the other did.
+ * Run the top-k over every bolt of an already-open index.  The contract, and why
+ * this is not static, is on the declaration in include/weave/vector.h.
  */
-static VecScanRun *
+WeaveVecTopK *
+weave_vec_topk_run(Relation index, const WeaveMetaPageData *meta,
+				   const WVec *query, int k, uint16 attnum,
+				   const uint64 *want, int nwant, bool filtered)
+{
+	WeaveVecTopK *r;
+	uint32		s;
+
+	if (k < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("k must be at least 1")));
+
+	r = (WeaveVecTopK *) palloc0(sizeof(WeaveVecTopK));
+	r->k = k;
+	/*
+	 * HUGE-SAFE since F7, and the reason is that `k`'s provenance changed.  It used
+	 * to be an SRF argument a human typed; the ORDER BY driver's widening ladder now
+	 * raises it geometrically until it can prove completeness, so at the top of that
+	 * ladder it is the index's lane count -- relation scale.  Not zeroed, unlike the
+	 * palloc0 this replaced: every reader of hit[] (vec_topk_theta, vec_topk_admit,
+	 * both SRFs, weave_vec_pass) is bounded by nhit, and memset-ing a
+	 * relation-scale array for slots nothing reads is the cost this allocation is
+	 * trying to avoid.
+	 */
+	r->hit = (WeaveVecTopKHit *) WEAVE_ALLOC_MAYBE_HUGE((Size) k * sizeof(WeaveVecTopKHit));
+	r->ctr = (WeaveVecTopKCtr *) palloc0((Size) WEAVE_MAX_SEGMENTS * sizeof(WeaveVecTopKCtr));
+
+	for (s = 0; s < meta->nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		WeaveVecWeft w;
+		BlockNumber root;
+		const char *why = NULL;
+		uint64	   *allow = NULL;
+		uint16		wattnum = 0;
+
+		if (meta->segs[s].dictstart == InvalidBlockNumber)
+			continue;			/* consumed slot */
+		root = weave_vec_weft_locate(index, &meta->segs[s], &wattnum);
+		if (root == InvalidBlockNumber)
+			continue;			/* this bolt carries no vector weft */
+
+		/*
+		 * ROUTE BY ATTRIBUTE when the caller named one.  A weft records the index
+		 * attribute it was built from, and a driver that scores a weft belonging to
+		 * a different column produces a wrong answer with a correct row count --
+		 * which is the exact failure include/weave/vector.h says this field exists
+		 * to prevent.  attnum 0 is "any", which is what the SRF asks for.
+		 */
+		if (attnum != 0 && wattnum != attnum)
+			continue;
+
+		if (!weave_vec_weft_open(index, root, &w, &why))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("bolt %u of index \"%s\" has an unreadable vector weft at block %u",
+							s, RelationGetRelationName(index), root),
+					 errdetail("%s.", why != NULL ? why : "unknown reason")));
+
+		r->nlane += (uint64) w.meta.nvec;
+		if (filtered)
+			allow = vec_allow_from_docids(&w, (int) s, want, nwant);
+		vec_scan_bolt(r, &w, (int) s, query, allow);
+		if (allow != NULL)
+			pfree(allow);
+	}
+
+	return r;
+}
+
+/*
+ * The SRFs' entry: turn the SQL arguments into the shared runner's arguments.
+ * Shared by both SRFs so that the counters one reports describe the work the other
+ * did.
+ */
+static WeaveVecTopK *
 vec_scan_run(Oid indexoid, const WVec *query, int k, ArrayType *arr)
 {
 	WeaveMetaPageData meta;
 	Relation	index;
-	VecScanRun *r;
+	WeaveVecTopK *r;
 	uint64	   *want = NULL;
 	int			nwant = 0;
 	bool		filtered = false;
-	uint32		s;
 
 	if (k < 1)
 		ereport(ERROR,
@@ -1298,36 +1357,13 @@ vec_scan_run(Oid indexoid, const WVec *query, int k, ArrayType *arr)
 	index = weave_vec_introspect_open(indexoid, &meta);
 	pgstat_count_index_scan(index);
 
-	r = (VecScanRun *) palloc0(sizeof(VecScanRun));
-	r->k = k;
-	r->hit = (VecScanHit *) palloc0((Size) k * sizeof(VecScanHit));
-	r->ctr = (VecScanCtr *) palloc0((Size) WEAVE_MAX_SEGMENTS * sizeof(VecScanCtr));
-
-	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
-	{
-		WeaveVecWeft w;
-		BlockNumber root;
-		const char *why = NULL;
-		uint64	   *allow = NULL;
-
-		if (meta.segs[s].dictstart == InvalidBlockNumber)
-			continue;			/* consumed slot */
-		root = weave_vec_weft_locate(index, &meta.segs[s], NULL);
-		if (root == InvalidBlockNumber)
-			continue;			/* this bolt carries no vector weft */
-		if (!weave_vec_weft_open(index, root, &w, &why))
-			ereport(ERROR,
-					(errcode(ERRCODE_INDEX_CORRUPTED),
-					 errmsg("bolt %u of index \"%s\" has an unreadable vector weft at block %u",
-							s, RelationGetRelationName(index), root),
-					 errdetail("%s.", why != NULL ? why : "unknown reason")));
-
-		if (filtered)
-			allow = vec_allow_from_docids(&w, (int) s, want, nwant);
-		vec_scan_bolt(r, &w, (int) s, query, allow);
-		if (allow != NULL)
-			pfree(allow);
-	}
+	/*
+	 * attnum 0: this function names no column, so it scores whatever vector weft a
+	 * bolt carries.  That is what every existing caller (sql/vecscan.sql) asserts
+	 * against and it is the behaviour of this function before F7 split the loop
+	 * out of it.  The ORDER BY driver passes the attribute the scan key named.
+	 */
+	r = weave_vec_topk_run(index, &meta, query, k, 0, want, nwant, filtered);
 
 	pgstat_count_index_tuples(index, r->nhit);
 	index_close(index, AccessShareLock);
@@ -1343,7 +1379,7 @@ vec_scan_run(Oid indexoid, const WVec *query, int k, ArrayType *arr)
  * difference.  Strictness in the other three is emulated -- a NULL index, query
  * or k returns no rows, which is what STRICT would have done.
  */
-static VecScanRun *
+static WeaveVecTopK *
 vec_scan_from_args(FunctionCallInfo fcinfo)
 {
 	ArrayType  *arr = NULL;
@@ -1361,7 +1397,7 @@ Datum
 weave_vec_scan(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
-	VecScanRun *r;
+	WeaveVecTopK *r;
 
 	if (SRF_IS_FIRSTCALL())
 	{
@@ -1382,11 +1418,11 @@ weave_vec_scan(PG_FUNCTION_ARGS)
 	}
 
 	funcctx = SRF_PERCALL_SETUP();
-	r = (VecScanRun *) funcctx->user_fctx;
+	r = (WeaveVecTopK *) funcctx->user_fctx;
 
 	if (funcctx->call_cntr < funcctx->max_calls)
 	{
-		const VecScanHit *h = &r->hit[funcctx->call_cntr];
+		const WeaveVecTopKHit *h = &r->hit[funcctx->call_cntr];
 		Datum		values[4];
 		bool		nulls[4];
 		HeapTuple	tuple;
@@ -1406,7 +1442,7 @@ Datum
 weave_vec_scan_stats(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
-	VecScanRun *r;
+	WeaveVecTopK *r;
 
 	if (SRF_IS_FIRSTCALL())
 	{
@@ -1427,11 +1463,11 @@ weave_vec_scan_stats(PG_FUNCTION_ARGS)
 	}
 
 	funcctx = SRF_PERCALL_SETUP();
-	r = (VecScanRun *) funcctx->user_fctx;
+	r = (WeaveVecTopK *) funcctx->user_fctx;
 
 	if (funcctx->call_cntr < funcctx->max_calls)
 	{
-		const VecScanCtr *c = &r->ctr[funcctx->call_cntr];
+		const WeaveVecTopKCtr *c = &r->ctr[funcctx->call_cntr];
 		Datum		values[7];
 		bool		nulls[7];
 		HeapTuple	tuple;

@@ -467,12 +467,18 @@ weave_edist_block_lower(const WeaveEdistCursor *c)
 #include "weave/channel.h"
 
 /*
- * The operator family's ORDER BY strategy numbers.  1 is `@@@` (the boolean
- * search operator), 2 is `<=>` (BM25 distance), and 3 is `<@>`.  amrescan is
- * handed ScanKeyData whose sk_strategy is the only thing distinguishing a
- * wquery argument from a text one, and DatumGetWQuery() on a text datum is a
- * silent misread, so the number is named here rather than written as a literal
- * at the one place that reads it.
+ * WDOC_LEX_OPS's strategy numbers.  1 is `@@@` (the boolean search operator), 2 is
+ * `<=>` (BM25 distance), and 3 is `<@>`.  amrescan is handed ScanKeyData whose
+ * sk_strategy is the only thing distinguishing a wquery argument from a text one,
+ * and DatumGetWQuery() on a text datum is a silent misread, so the number is named
+ * here rather than written as a literal at the one place that reads it.
+ *
+ * THESE ARE NOT THE ONLY TWO.  Strategy numbers are scoped to an operator FAMILY,
+ * so the same three integers are reused by gram_ops (include/weave/cgram.h) and by
+ * wvec_weave_ops (WEAVE_STRAT_VEC_DISTANCE in include/weave/am.h, which is why that
+ * one is 1 and not the next free number).  Adding a member to any family means
+ * re-reading all three lists, because weave_rescan() dispatches order-by keys on
+ * sk_strategy and only the attribute tells two families' numbers apart.
  */
 #define WEAVE_STRAT_DISTANCE	2
 #define WEAVE_STRAT_EDIST		3
