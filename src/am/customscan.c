@@ -535,4 +535,14 @@ _PG_init(void)
 
 	prev_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook = weave_create_upper_paths;
+
+	/*
+	 * F2.2's fused-ORDER-BY pushdown, installed the same way and for the same
+	 * reason: this is the module's single documented entry point, so a second
+	 * place that chained a planner hook would be a second answer to "what does
+	 * loading this library do".  The installer lives with the hook it installs
+	 * (src/am/fusepath.c) because everything it needs -- the recognized operator
+	 * OIDs, the refusal rules -- is private to that file; only the call is here.
+	 */
+	weave_fuse_install_pathlist_hook();
 }
