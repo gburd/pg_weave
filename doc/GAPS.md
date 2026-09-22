@@ -1864,6 +1864,17 @@ it is that the gate's green was uninformative for every release in between.**
 exits 1. Under the old pattern the identical binary produced a pass. A gate fix whose
 only evidence is that the gate now passes is the failure this gap is about.
 
+**A SECOND suite was also failing, and only CI could show it.** The first push with the
+fixed gate went red on the `standalone` leg: `run_tre_bump.sh backref` dies with
+`fatal: invalid object name 'aae7a35'`. That leg rebuilds the vendored TRE library from a
+fixed historical commit to prove the backref fix changes behaviour on our own copy, and
+`actions/checkout` clones at depth 1, so the object is not there. It had been failing on
+**every CI run since the leg was added** and nothing said so. Locally it passes, because a
+developer checkout has the history — so the two suites this gap was hiding fail in
+opposite environments, and neither the local run nor the CI run alone would have found
+both. The fix is `fetch-depth: 0` on that job, with a comment on it saying why, since a
+shallow clone is exactly the sort of thing someone optimizes back in.
+
 **Why it belongs in the record rather than in a quiet commit.** AGENTS.md already carries
 this exact family — members eight and nine are `psql -f t.sql | head -90` killing the
 process under test, and `make 2>&1 | grep error; test -f pg_weave.so && echo OK` reporting
