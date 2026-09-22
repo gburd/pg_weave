@@ -497,7 +497,12 @@ printf 'attempted\tcompared\tmismatched_vs_oracle\tskipped_tied_oracle\tfallback
 printf '%s\t%s\t%s\t%s\t%s\n' "$CHECKN" "$CHECKED" "$BAD" "$TIED" "$FBDIFF"
 
 printf '\n### fuse_quality\n'
-printf 'label\tnqueries_scored\tndcg@10\trecall@100\tmrr@10\texcluded_no_positive\tmissing_from_run\n'
+# Five columns, matching what bench/ndcg.py's data line actually emits.  The
+# header used to promise excluded_no_positive and missing_from_run as well, but
+# ndcg.py writes those to STDERR as `#` comments (they are diagnostics about the
+# qrels, not per-arm measurements), so the table advertised two columns it never
+# filled -- which reads, in a results file, as two zeros nobody measured.
+printf 'label\tnqueries_scored\tndcg@10\trecall@100\tmrr@10\n'
 printf '%s\n%s\n' "$Q_FUSED" "$Q_RRF"
 
 printf '\n### fuse_latency\n'
