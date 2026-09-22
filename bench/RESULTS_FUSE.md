@@ -120,11 +120,37 @@ pre-scan ceiling leaves a median **1.37×** relative misweighting between the tw
 — L2-normalized vectors under ip — so every bit of that distortion is the lexical
 ceiling's assumption that all terms hit max tf in the shortest document at once.
 
-The opening this leaves: `include/weave/fuse.h` note 3 requires a weight to be **positive
-and finite**, nothing more, so **a normalizer need not be an upper bound**. It may be a
-statistical estimate of the realized max (for the lexical key, the contribution at max tf
-and *average* doclen), which is much closer and still known before the scan. Details and
-the next measurement in `doc/GAPS.md` G44.
+**And the one-pass scheme was then measured too, with `bench/normsweep.sh`: it beats RRF
+on 3 of 3.** Dividing each key by its pre-scan ceiling corresponds to an effective
+lexical:vector ratio of **0.73** — *below* 1, because the lexical ceiling is the looser of
+the two (2.07× vs 1.52×), so dividing by it shrinks the lexical side more. (`1/1.37`, not
+`1.37`; taking that direction the wrong way makes fiqa read as a loss and would have
+rejected the implementable scheme on an arithmetic slip.)
+
+| dataset | RRF | raw sum (shipping) | **ceiling-normalized (r=0.73)** | vs RRF |
+|---|---|---|---|---|
+| scifact | 0.6846 | 0.6720 | **0.7133** | **1.042×** |
+| nfcorpus | 0.3422 | 0.3161 | **0.3489** | **1.020×** |
+| fiqa | 0.3482 | 0.2393 | **0.3763** | **1.081×** |
+
+So the nDCG row is fixable **without a second pass, without new statistics and without new
+on-disk state** — by dividing each key by a constant the scan already computes for its
+MaxScore partition. On nfcorpus that ratio is the best point in the entire sweep; on fiqa it
+beats even the realized-max scheme.
+
+Two things kept honest about it. **The ceiling's helpful direction is empirical, not
+derived** — it happens to push toward more vector weight, and more vector weight is what all
+three of these corpora want (best points at 0.25, 0.50, 0.73, every one below equal); a
+corpus wanting more lexical weight would be pushed the wrong way. And **the third dataset
+overturned the second's conclusion**: scifact swings 3.0 % across the whole ratio range and
+nfcorpus 6.9 %, which after two datasets supported "nDCG is flat, the weights knob is
+forgiving" — while **fiqa swings 43.4 %**, falls monotonically across the range, and drops
+below RRF at ratio 1.37. That is hard rule 11 in person, and the conclusion two datasets
+supported was wrong. fiqa's optimum is also at or below the lowest ratio swept and still
+falling, so the sweep does not contain it.
+
+Full numbers, the per-key-not-per-channel constraint, and the implementation spec in
+`doc/GAPS.md` G44.
 
 ## Latency: a real win, and the A/A leg says so
 

@@ -2245,9 +2245,72 @@ Two facts make this tractable rather than a dead end:
      makes a one-pass fix plausible, and it was not obvious: every other constant in this
      design is a bound, so the reflex is to reach for one here too.
 
-**Next step, and it is a measurement, not a patch:** add the ceiling-normalized and
-avgdl-normalized schemes as study arms and score them the same way. Implement in C only
-the scheme that is shown to hold parity with `maxn`.
+**MEASURED, and the cheap one-pass scheme is the ANSWER — it beats RRF on 3 of 3 and
+beats the realized-max scheme on 2 of 3.** `bench/normsweep.sh` sweeps the key-vs-key
+weight ratio after max-normalization, evaluating every ratio from ONE materialized pair of
+exhaustive scans per query (7 ratios for the cost of 1; on fiqa the naive shape would have
+taken three hours). nDCG@10:
+
+| lex:vec ratio | scifact | nfcorpus | fiqa |
+|---|---|---|---|
+| 0.25 | 0.6986 | 0.3333 | **0.4026** |
+| 0.50 | **0.7194** | 0.3449 | 0.3965 |
+| **0.73 — the ceiling proxy** | **0.7133** | **0.3489** | **0.3763** |
+| 1.00 — `maxn` | 0.7182 | 0.3444 | 0.3556 |
+| 1.37 | 0.7190 | 0.3431 | 0.3347 |
+| 2.00 | 0.7118 | 0.3368 | 0.3160 |
+| 4.00 | 0.6998 | 0.3264 | 0.2807 |
+| *RRF control* | *0.6846* | *0.3422* | *0.3482* |
+
+**THE CEILING PROXY IS RATIO 0.73, NOT 1.37, AND GETTING THAT DIRECTION WRONG INVERTS THE
+CONCLUSION.** The lexical ceiling is looser than the vector ceiling (2.07× vs 1.52×), so
+dividing each key by its own ceiling shrinks the *lexical* side more, and the effective
+ratio moves **below** 1: `1/(2.07/1.52) = 0.73`. The first reading of this table took the
+proxy to be 1.37 — where fiqa scores 0.961× RRF, i.e. a loss — and would have rejected the
+implementable scheme on the strength of an arithmetic slip. A looseness ratio is a
+divisor, not a multiplier.
+
+At ratio 0.73 — what dividing each key by its pre-scan ceiling actually does:
+
+| dataset | RRF | raw sum (today) | **ceiling-normalized** | vs RRF |
+|---|---|---|---|---|
+| scifact | 0.6846 | 0.6720 | **0.7133** | **1.042×** |
+| nfcorpus | 0.3422 | 0.3161 | **0.3489** | **1.020×** |
+| fiqa | 0.3482 | 0.2393 | **0.3763** | **1.081×** |
+
+So the fix needs **no second pass, no new statistics and no new on-disk state**: it divides
+each key by a constant the scan *already computes* for the MaxScore partition. On nfcorpus
+0.73 is the best point in the whole sweep, and on fiqa it beats `maxn` outright.
+
+**Why that is luck as much as design, and it must not be written up as though it were
+not.** The ceiling's looseness happens to push the ratio toward *more vector weight*, and
+more vector weight is what all three of these corpora want (their best points are at 0.25,
+0.50 and 0.73 — every one below equal). On a corpus that wanted more *lexical* weight the
+same looseness would push the wrong way. The scheme is validated **empirically on three
+datasets**, not derived.
+
+**AND THE THIRD DATASET OVERTURNED THE SECOND'S CONCLUSION, which is hard rule 11 arriving
+in person.** scifact swings 3.0 % across the whole 16× ratio range and nfcorpus 6.9 %, so
+after two datasets the honest-looking summary was "nDCG is flat, the `weights` knob is
+forgiving, any reasonable ratio beats RRF". **fiqa swings 43.4 %**, is monotone decreasing
+across the entire range, and drops below RRF at ratio 1.37. That conclusion would have been
+published off two datasets and been wrong. *The knob is forgiving on some corpora and sharp
+on others, and which one you have is not knowable from the ranking alone.*
+
+**Still unmeasured, and stated rather than glossed:** fiqa's optimum is at or below the
+lowest ratio swept (0.25, at 1.156× RRF) and the curve is *still falling* at that edge, so
+the sweep does not contain fiqa's best point. Extending the range would say how much is
+being left on the table by an equal-weight default, and would probably say the default
+should not be equal. That is a tuning question, and tuning is dataset-specific; what
+matters for the gate is that the equal-weight, ceiling-normalized default beats RRF
+everywhere measured.
+
+**Implementation, now fully specified by measurement.** Per `fuse()` KEY (not per channel),
+divide by the sum of that key's channels' `maxscore`. Each channel's effective weight
+becomes `w_key / N_key`, a positive finite constant, so (C2), the suffix sums and the
+partition are untouched — and each key's ceiling then equals exactly its weight, which
+makes `suffix[0] = Σ w_key` and the weights directly interpretable as relative influence
+for the first time.
 
 **Latent because every prior test used one channel or a fixture.** A single-channel
 ranking has no scale to mismatch, and `sql/fuse_pushdown.sql`'s fixtures assert the
