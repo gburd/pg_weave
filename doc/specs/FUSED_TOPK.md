@@ -710,6 +710,25 @@ and no amount of SIMD recovers it. Record the negative result in
 `pg_turbovec/docs/PARITY_GAPS.md` are the house style for that, and the retracted
 "we win 2.3×" claim in the latter is exactly the mistake to avoid.
 
+### 8b. STATUS: this section is BLOCKED, and by a wrong answer rather than a harness
+
+`bench/fuse.sh` and `bench/prepdata.py` exist, run end to end on BEIR scifact, and
+their first real dataset found **`doc/GAPS.md` G43**: the fused path returns a
+different top-10 than two non-fused vector paths that agree with each other, admitting
+a lower-scoring document and dropping a higher one. Block pruning is provably not
+involved (`blkskip = 0`, every document a pivot); the leading hypothesis is that the
+vector channel's ceiling is not a true upper bound, made reachable by F8 because the
+fused scorer's abandonment prune *acts* on a bound the single-channel path computes and
+ignores.
+
+So no row of the table above has been measured on a real corpus, deliberately: hard
+rule 8 says verify correctness before recording a latency. The harness's correctness
+gate is red and that is the harness working. What the attempt did produce, beyond G43,
+is the two instruments below and one correction to this document's own method — the
+`fuse()` fallback is not an oracle at scale, for the reason §7a (1) gives, so the gate
+compares against an exhaustive per-channel oracle built from `weave_search()` and
+`weave_vec_scan()` instead.
+
 ### 8a. The instrument, added 2026-09-22, and the two things it already says
 
 The `score()`-call row above was unmeasurable for as long as it has existed, and not

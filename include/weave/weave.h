@@ -454,4 +454,68 @@ extern uint64 weave_fuse_veto;	/* documents a predicate channel rejected */
 extern uint64 weave_fuse_abandon;	/* documents abandoned mid-sum once the
 									 * remaining ceiling could not reach theta */
 
+/*
+ * THE SPLIT OF `weave_fuse_scores` BY CHANNEL KIND, and it exists because a total is
+ * not comparable against an RRF control.  A hybrid fused query's `scores` is lexical
+ * BM25 contributions PLUS vector lane-asks PLUS one probe per required gate per
+ * pivot, and the control arm's two scans are counted in two different units by two
+ * different counters.  Comparing a sum of three things against either one of them is
+ * the mistake; these two make the lexical part derivable exactly as
+ * `scores - vec_scores - gate_scores`, rather than by an assumption about which
+ * channels a query had.  Attributed in src/am/amscan.c from the vector-slot list and
+ * from WeaveFuseChan.required -- never from a channel KIND, for the reason (C5)'s
+ * note gives.
+ */
+extern uint64 weave_fuse_vec_scores;	/* of `scores`, the vector adapters' share */
+extern uint64 weave_fuse_gate_scores;	/* of `scores`, the required gates' share */
+
+/*
+ * CHANNEL WORK COUNTERS (read from SQL via weave_work_stats()).  Backend-local,
+ * always compiled in, same caveats as every block above.
+ *
+ * WHY A SECOND FUNCTION AND NOT MORE COLUMNS ON weave_fuse_stats().  That one
+ * measures THE FUSED SCORER'S LOOP.  These measure what a CHANNEL did, on whatever
+ * path asked it -- fused, single-channel `ORDER BY`, or a diagnostic SQL function --
+ * and the entire point of them is to be comparable ACROSS those paths.  FUSED_TOPK.md
+ * sect. 8's gate is a ratio against an RRF control, and a ratio needs both arms
+ * counted in one unit by one piece of code.  Putting the control's denominator inside
+ * a function called "fuse" would be the wrong name on the right number.
+ *
+ * `weave_lex_contribs` COUNTS THE SINGLE-CHANNEL WAND PATH ONLY, and that is a
+ * deliberate asymmetry with a reason.  The fused lexical channel scores through
+ * src/query/lexshuttle.c, which calls weave_wand_cursor_contrib() -- the same
+ * wand_contrib_cur() the WAND loops use.  An increment inside wand_contrib_cur()
+ * would therefore count the FUSED arm here as well as in weave_fuse_scores, and a
+ * quantity counted twice in one arm of a ratio is a made-up ratio in whichever
+ * direction happens to flatter. So the increments sit at the three WAND call sites
+ * (weave_search_bmw and weave_search_maxscore) and nowhere else.  Units match across
+ * the two: one count is one (term, document) BM25 contribution on both arms.
+ *
+ * THE VECTOR COUNTERS ARE PATH-INDEPENDENT, from one site: vec_shuttle_end() in
+ * src/vector/vecshuttle.c, which every vector shuttle passes through -- the fused
+ * pass ends its shuttles at src/am/amscan.c, the ORDER BY pass at
+ * weave_vec_bolt_pass(), and weave_vec_scan_stats() at its own call.  The per-scan
+ * counters it harvests already existed in WeaveVecScanState and were being pfree'd
+ * unread on the ORDER BY path.
+ *
+ * AND `vec_lanes` IS THE UNIT THAT MATTERS FOR A VECTOR CHANNEL, not score() calls.
+ * The code-scan kernel scores a 32-lane BLOCK at a time, so a fused scan asking for
+ * one lane and a top-k scan asking for a whole block can register the same number of
+ * score() calls having done 32x different work.  Quoting a vector channel's score()
+ * count as its cost would be the kind of number hard rule 11 says to interrogate
+ * before publishing.  Lanes are what the kernel actually touched.
+ */
+extern uint64 weave_lex_contribs;	/* (term, doc) BM25 contributions computed by the
+									 * SINGLE-CHANNEL WAND path; see above for why
+									 * the fused path is excluded here */
+extern uint64 weave_vecwork_lanes;	/* lanes the code-scan kernel scored, every path */
+extern uint64 weave_vecwork_blocks; /* blocks it scored, every path */
+extern uint64 weave_vecwork_blk_bound;	/* blocks the (C2) block bound pruned, every
+									 * path -- the vector half of the pruning claim,
+									 * and the counter that would have made
+									 * bench/RESULTS_BOUND_PRUNING.md's 0.0 % visible
+									 * from SQL rather than from a C harness */
+extern uint64 weave_vecwork_shuttles;	/* vector shuttles ended: the denominator that
+									 * says how many bolts the above is spread over */
+
 #endif							/* WEAVE_H */

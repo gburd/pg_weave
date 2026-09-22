@@ -613,6 +613,59 @@ SELECT g.pivots <= u.pivots AS a_gate_does_not_widen_the_candidate_set,
 
 DROP TABLE p_stats_ungated, p_stats_gated;
 
+-- ---------------------------------------------------------------------------
+-- (7b) THE CONTROL ARM'S COUNTERS (0.19.0), which are what make section 8's ratio a
+-- ratio rather than one measured number over one assumed one.
+--
+-- weave_work_stats() counts what a CHANNEL did on whatever path asked it, so the
+-- fused arm and a single-channel arm are counted by one piece of code in one unit.
+-- Two relations are worth pinning and neither is a number:
+--
+--   * `lex_contribs` moves for a SINGLE-CHANNEL lexical query and does NOT move for a
+--     fused one.  That asymmetry is deliberate and is the whole correctness content
+--     of the counter: the fused lexical channel calls the same wand_contrib_cur(), so
+--     an increment inside that function would count the fused arm twice -- once here
+--     and once in weave_fuse_stats().scores -- and a quantity double-counted in one
+--     arm of a ratio is a made-up ratio.
+--   * `vec_lanes` moves on BOTH paths, because it is harvested at vec_shuttle_end(),
+--     the one site every vector shuttle passes through.  A zero on either path would
+--     mean the harvest site is not on that path after all.
+-- ---------------------------------------------------------------------------
+SET enable_seqscan = off;
+
+SELECT weave_work_stats_reset();
+
+SELECT count(*) AS lexical_only_rows
+  FROM (SELECT id FROM fp ORDER BY body <=> 'alpha'::wquery LIMIT 5) t;
+
+SELECT lex_contribs > 0 AS the_wand_path_counted_contributions,
+       vec_lanes = 0 AS a_lexical_query_scored_no_lanes
+  FROM weave_work_stats();
+
+SELECT weave_work_stats_reset();
+
+SELECT count(*) AS vector_only_rows
+  FROM (SELECT id FROM fp ORDER BY emb <-> '[1,0,0,1]'::wvec LIMIT 5) t;
+
+SELECT vec_lanes > 0 AS the_orderby_path_harvested_lanes,
+       vec_shuttles > 0 AS a_shuttle_was_ended,
+       lex_contribs = 0 AS a_vector_query_scored_no_terms
+  FROM weave_work_stats();
+
+SELECT weave_work_stats_reset();
+
+SELECT count(*) AS fused_rows
+  FROM (SELECT id FROM fp
+         ORDER BY fuse(body <=> 'alpha'::wquery,
+                       emb <-> '[1,0,0,1]'::wvec,
+                       weights => '{0.5,0.5}') LIMIT 5) t;
+
+SELECT vec_lanes > 0 AS the_fused_path_harvested_lanes_too,
+       lex_contribs = 0 AS the_fused_lexical_channel_is_not_counted_here
+  FROM weave_work_stats();
+
+RESET enable_seqscan;
+
 DROP TABLE p_pushdown, p_fallback, p_oracle_scores, p_oracle, p_gated, p_ungated, p_lat, p_solo;
 DROP TABLE fpmap, pv_pushdown, pv_oracle_scores, pv_oracle;
 DROP TABLE fp_nb;

@@ -785,6 +785,28 @@ vec_shuttle_end(WeaveShuttle *s)
 {
 	VecShuttle *vs = (VecShuttle *) s->state;
 
+	/*
+	 * HARVEST THE PER-SCAN COUNTERS HERE, because this is the one place every
+	 * vector shuttle passes through: the fused pass ends its shuttles in
+	 * src/am/amscan.c, weave_vec_bolt_pass() ends its own a few hundred lines
+	 * below, and weave_vec_scan_stats() ends the one it opened.  One site means the
+	 * fused arm and the single-channel arm are counted by the same code in the same
+	 * unit, which is the only way FUSED_TOPK.md sect. 8's ratio is a measurement
+	 * rather than two measurements.  Until now the ORDER BY path pfree'd these
+	 * unread.
+	 *
+	 * LANES, not score() calls: the kernel scores a 32-lane block at a time.  See
+	 * include/weave/weave.h.
+	 *
+	 * An ERROR between begin() and end() skips this, so the counters undercount a
+	 * failed query -- the same "a zero is not evidence unless the query ran" caveat
+	 * every counter in this project carries, and the safe direction.
+	 */
+	weave_vecwork_shuttles++;
+	weave_vecwork_lanes += (uint64) vs->core.nlane_score;
+	weave_vecwork_blocks += (uint64) vs->core.nblk_score;
+	weave_vecwork_blk_bound += (uint64) vs->core.nblk_bound;
+
 	MemoryContextDelete(vs->ctx);
 }
 
@@ -1014,7 +1036,7 @@ weave_vec_shuttle_stats(WeaveShuttle *s)
  *
  * MVCC AND TOMBSTONES ARE NOT APPLIED, deliberately and per (C6): livedocs are
  * the fused scorer's job, this is a view of what the weft contains, and
- * weave_vec_lanes() reports the same way.  A docid here is an index-resident
+ * weave_vecwork_lanes() reports the same way.  A docid here is an index-resident
  * document id, not a proof that a visible row exists.
  * ------------------------------------------------------------------------- */
 
@@ -1064,7 +1086,7 @@ vec_docid_member(const uint64 *sorted, int n, uint64 d)
  * SEGMENT-LOCAL (doc/ARCHITECTURE.md sect. 3), so warp 7 names a different
  * document in every bolt and an array of warps is ambiguous the moment an index
  * has two.  A docid is the bolt-independent name, it is what
- * weave_vec_lanes() reports so a test can obtain one, and it is what a real
+ * weave_vecwork_lanes() reports so a test can obtain one, and it is what a real
  * filter would arrive as -- the fused scorer's allowlist comes from another
  * channel over the shared docid space.  The conversion is one pass of the warp
  * map per bolt, which the scan walks anyway.

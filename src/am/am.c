@@ -878,6 +878,19 @@ uint64		weave_fuse_rqskip = 0;
 uint64		weave_fuse_livedrop = 0;
 uint64		weave_fuse_veto = 0;
 uint64		weave_fuse_abandon = 0;
+uint64		weave_fuse_vec_scores = 0;
+uint64		weave_fuse_gate_scores = 0;
+
+/*
+ * CHANNEL WORK COUNTERS.  Contract, the reason they are a separate function, and
+ * the reason the lexical one deliberately excludes the fused path are all on the
+ * extern declarations in include/weave/weave.h.
+ */
+uint64		weave_lex_contribs = 0;
+uint64		weave_vecwork_lanes = 0;
+uint64		weave_vecwork_blocks = 0;
+uint64		weave_vecwork_blk_bound = 0;
+uint64		weave_vecwork_shuttles = 0;
 
 Buffer
 weave_new_buffer(Relation index)
@@ -1192,8 +1205,8 @@ Datum
 weave_fuse_stats(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[12];
-	bool		nulls[12];
+	Datum		values[14];
+	bool		nulls[14];
 	HeapTuple	tuple;
 	int			i;
 
@@ -1201,7 +1214,7 @@ weave_fuse_stats(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 	tupdesc = BlessTupleDesc(tupdesc);
 
-	for (i = 0; i < 12; i++)
+	for (i = 0; i < 14; i++)
 		nulls[i] = false;
 
 	values[0] = Int64GetDatum((int64) weave_fuse_passes);
@@ -1216,6 +1229,8 @@ weave_fuse_stats(PG_FUNCTION_ARGS)
 	values[9] = Int64GetDatum((int64) weave_fuse_livedrop);
 	values[10] = Int64GetDatum((int64) weave_fuse_veto);
 	values[11] = Int64GetDatum((int64) weave_fuse_abandon);
+	values[12] = Int64GetDatum((int64) weave_fuse_vec_scores);
+	values[13] = Int64GetDatum((int64) weave_fuse_gate_scores);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
@@ -1239,6 +1254,61 @@ weave_fuse_stats_reset(PG_FUNCTION_ARGS)
 	weave_fuse_livedrop = 0;
 	weave_fuse_veto = 0;
 	weave_fuse_abandon = 0;
+	weave_fuse_vec_scores = 0;
+	weave_fuse_gate_scores = 0;
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(weave_work_stats);
+PG_FUNCTION_INFO_V1(weave_work_stats_reset);
+
+/*
+ * weave_work_stats() -> record : what the CHANNELS did, on whatever path asked them.
+ *
+ * The contract is on the extern declarations in include/weave/weave.h, and two parts
+ * of it decide whether a number taken from here means anything: `lex_contribs` counts
+ * the single-channel WAND path ONLY (the fused path's lexical work is
+ * weave_fuse_stats().scores minus its vec_scores and gate_scores), and `vec_lanes`
+ * rather than a score() count is the vector channel's unit, because the kernel scores
+ * a 32-lane block at a time.
+ *
+ * PARALLEL RESTRICTED for the reason every other counter function here is.
+ */
+Datum
+weave_work_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[5];
+	bool		nulls[5];
+	HeapTuple	tuple;
+	int			i;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	for (i = 0; i < 5; i++)
+		nulls[i] = false;
+
+	values[0] = Int64GetDatum((int64) weave_lex_contribs);
+	values[1] = Int64GetDatum((int64) weave_vecwork_lanes);
+	values[2] = Int64GetDatum((int64) weave_vecwork_blocks);
+	values[3] = Int64GetDatum((int64) weave_vecwork_blk_bound);
+	values[4] = Int64GetDatum((int64) weave_vecwork_shuttles);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/* Zero this backend's channel work counters. */
+Datum
+weave_work_stats_reset(PG_FUNCTION_ARGS)
+{
+	weave_lex_contribs = 0;
+	weave_vecwork_lanes = 0;
+	weave_vecwork_blocks = 0;
+	weave_vecwork_blk_bound = 0;
+	weave_vecwork_shuttles = 0;
 	PG_RETURN_VOID();
 }
 

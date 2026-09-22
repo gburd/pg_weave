@@ -5686,7 +5686,15 @@ weave_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filt
 			score = 0.0;
 			for (i = 0; i < nterms; i++)
 				if (cursors[i].docid == pivot_docid)
+				{
+					/* The control arm's denominator, in the same unit the fused
+					 * arm counts: one (term, document) BM25 contribution.  Counted
+					 * at the WAND call sites and NOT inside wand_contrib_cur(),
+					 * because the fused lexical channel calls that too and would
+					 * then be counted in both places -- include/weave/weave.h. */
+					weave_lex_contribs++;
 					score += wand_contrib_cur(&cursors[i]);
+				}
 
 			/* push into the top-k min-heap -- but only if the docid is admitted
 			 * by the boolean match-set gate.  Two equivalent gates:
@@ -5839,7 +5847,10 @@ weave_search_maxscore(WandCursor *cursors, int nterms, int k,
 		score = 0.0;
 		for (i = first_essential; i < nterms; i++)
 			if (cursors[i].docid == cand)
+			{
+				weave_lex_contribs++;	/* see weave_search_bmw() */
 				score += wand_contrib_cur(&cursors[i]);
+			}
 
 		/* early-exit check: essential score + all non-essential max <= threshold
 		 * => cand cannot make the top-k, skip the non-essential lookups */
@@ -5850,7 +5861,10 @@ weave_search_maxscore(WandCursor *cursors, int nterms, int k,
 			{
 				wand_seek(&cursors[i], cand);
 				if (cursors[i].docid == cand)
+				{
+					weave_lex_contribs++;	/* see weave_search_bmw() */
 					score += wand_contrib_cur(&cursors[i]);
+				}
 			}
 
 			/* gate heap admission by the boolean match-set (DocidFilter for
@@ -8049,9 +8063,33 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 				weave_fuse_chans += (uint64) nch;
 				for (i = 0; i < nch; i++)
 				{
+					int			k;
+					int			isvec = 0;
+
 					weave_fuse_seeks += (uint64) cp[i]->nseek;
 					weave_fuse_scores += (uint64) cp[i]->nscore;
 					weave_fuse_bounds += (uint64) cp[i]->nbmax;
+
+					/*
+					 * SPLIT THE TOTAL BY KIND, from the vector-slot list and from
+					 * `required` -- never from a channel kind, for the reason
+					 * (C5)'s note in this file gives.  A hybrid query's `scores`
+					 * is BM25 contributions plus vector lane-asks plus one gate
+					 * probe per pivot, and comparing that sum against either arm
+					 * of an RRF control compares three things with one.
+					 */
+					for (k = 0; k < nvc; k++)
+					{
+						if (vc[k].slot == i)
+						{
+							isvec = 1;
+							break;
+						}
+					}
+					if (isvec)
+						weave_fuse_vec_scores += (uint64) cp[i]->nscore;
+					else if (cp[i]->required)
+						weave_fuse_gate_scores += (uint64) cp[i]->nscore;
 				}
 				weave_fuse_pivots += (uint64) st.npivot;
 				weave_fuse_blkskip += (uint64) st.nblkskip;
