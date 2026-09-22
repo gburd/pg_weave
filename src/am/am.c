@@ -861,6 +861,24 @@ uint64		weave_chan_surf_cache_misses = 0;
 uint64		weave_chan_surf_cache_evicts = 0;
 uint64		weave_chan_surf_cache_bytes = 0;
 
+/*
+ * FUSED-SCORER WORK COUNTERS.  Contract and the two ways to misread `scores` are
+ * on the extern declarations in include/weave/weave.h; the accumulation is in
+ * src/am/amscan.c, next to the pass that produces the numbers.
+ */
+uint64		weave_fuse_passes = 0;
+uint64		weave_fuse_runs = 0;
+uint64		weave_fuse_chans = 0;
+uint64		weave_fuse_seeks = 0;
+uint64		weave_fuse_scores = 0;
+uint64		weave_fuse_bounds = 0;
+uint64		weave_fuse_pivots = 0;
+uint64		weave_fuse_blkskip = 0;
+uint64		weave_fuse_rqskip = 0;
+uint64		weave_fuse_livedrop = 0;
+uint64		weave_fuse_veto = 0;
+uint64		weave_fuse_abandon = 0;
+
 Buffer
 weave_new_buffer(Relation index)
 {
@@ -1150,6 +1168,77 @@ weave_channel_stats_reset(PG_FUNCTION_ARGS)
 	/* surf_cache_bytes is NOT reset: it is a gauge of memory this backend is
 	 * still holding, and zeroing it here would report a false zero for as long as
 	 * the images stay resident.  weave.h says the same thing next to the counter. */
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(weave_fuse_stats);
+PG_FUNCTION_INFO_V1(weave_fuse_stats_reset);
+
+/*
+ * weave_fuse_stats() -> record : how much work the fused scorer did in this
+ * backend, and how much of it the bounds removed.
+ *
+ * The contract, and above all the two ways `scores` can be misread into a wrong
+ * ratio, are on the extern declarations in include/weave/weave.h.  Read them
+ * before quoting any number from here in doc/specs/FUSED_TOPK.md sect. 8: `passes`
+ * and `runs` are not decoration, they are the denominators that make `scores`
+ * mean something.
+ *
+ * PARALLEL RESTRICTED for the reason weave_alloc_stats() is: workers would count
+ * into their own copies and the leader would report only its own, which is a wrong
+ * answer rather than a slow one.
+ */
+Datum
+weave_fuse_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[12];
+	bool		nulls[12];
+	HeapTuple	tuple;
+	int			i;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	for (i = 0; i < 12; i++)
+		nulls[i] = false;
+
+	values[0] = Int64GetDatum((int64) weave_fuse_passes);
+	values[1] = Int64GetDatum((int64) weave_fuse_runs);
+	values[2] = Int64GetDatum((int64) weave_fuse_chans);
+	values[3] = Int64GetDatum((int64) weave_fuse_seeks);
+	values[4] = Int64GetDatum((int64) weave_fuse_scores);
+	values[5] = Int64GetDatum((int64) weave_fuse_bounds);
+	values[6] = Int64GetDatum((int64) weave_fuse_pivots);
+	values[7] = Int64GetDatum((int64) weave_fuse_blkskip);
+	values[8] = Int64GetDatum((int64) weave_fuse_rqskip);
+	values[9] = Int64GetDatum((int64) weave_fuse_livedrop);
+	values[10] = Int64GetDatum((int64) weave_fuse_veto);
+	values[11] = Int64GetDatum((int64) weave_fuse_abandon);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/* Zero this backend's fused-scorer counters, so a measurement can bracket one
+ * query.  Every column here is a cumulative count rather than a gauge, so unlike
+ * weave_channel_stats_reset() this one has nothing it must leave alone. */
+Datum
+weave_fuse_stats_reset(PG_FUNCTION_ARGS)
+{
+	weave_fuse_passes = 0;
+	weave_fuse_runs = 0;
+	weave_fuse_chans = 0;
+	weave_fuse_seeks = 0;
+	weave_fuse_scores = 0;
+	weave_fuse_bounds = 0;
+	weave_fuse_pivots = 0;
+	weave_fuse_blkskip = 0;
+	weave_fuse_rqskip = 0;
+	weave_fuse_livedrop = 0;
+	weave_fuse_veto = 0;
+	weave_fuse_abandon = 0;
 	PG_RETURN_VOID();
 }
 

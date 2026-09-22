@@ -1828,3 +1828,48 @@ elements are transformed and others are not is a shape whose bug is invisible in
 review, because the untransformed ones look like a deliberate exception. Wherever this
 project maps a set of operators through a table, the test has to be that the set is
 COMPLETE, not that each member it contains is right.
+
+### G42 — `make check-standalone` could not fail: sixteen of eighteen property suites were invoked through a pipe, and one of them had been aborting for releases — **FOUND AND FIXED 2026-09-22**
+
+Found while running the local gates for the fused-scorer counters (0.18.0). `make
+check-standalone` printed `== ALL STANDALONE CHECKS PASSED ==` and exited 0 while
+`test_pagekind` aborted on an assertion, with the abort message plainly visible in the
+output three lines above the success banner.
+
+**The mechanism is one character.** The recipe ran each suite as
+
+```
+$$tmp/pk | tail -1;
+```
+
+and a pipeline's exit status is the LAST command's. `tail` always succeeds, so `set -e`
+had nothing to see. Sixteen of the eighteen suites were invoked that way; only
+`test_kernels` and `test_lexbound` redirected to a log and checked their own status,
+which is now what all eighteen do. The two spellings had sat side by side in the same
+recipe for months.
+
+**What it was hiding.** `test_pagekind`'s check 7 asserts
+`all_kinds[NKINDS - 1] == WEAVE_PK_NKINDS - 1` — the one thing that notices when a page
+kind is allocated and not added to the test's enumeration. Five had been:
+`WEAVE_PK_PENDING_V9` (29), `WEAVE_PK_CGRAM_DICT` (30), `WEAVE_PK_CGRAM_DICTINDEX` (31),
+`WEAVE_PK_CGRAM_POST` (32) and `WEAVE_PK_PENDING_V10` (33). So the assertion designed to
+catch exactly this was *working*, and was silenced by the harness. With the five added,
+the suite passes 852,112 exhaustive checks over all 2^16 flag words. The on-disk
+consequence was nil — the encode/decode bijection holds for those ids, they simply went
+unchecked — and that is the point: **the cost of this gap is not a bug it let through,
+it is that the gate's green was uninformative for every release in between.**
+
+**The fix is verified by a positive control, not by the suite passing.** The stale
+`test_pagekind` was compiled from `git show HEAD:` and run through the new pattern: it
+exits 1. Under the old pattern the identical binary produced a pass. A gate fix whose
+only evidence is that the gate now passes is the failure this gap is about.
+
+**Why it belongs in the record rather than in a quiet commit.** AGENTS.md already carries
+this exact family — members eight and nine are `psql -f t.sql | head -90` killing the
+process under test, and `make 2>&1 | grep error; test -f pg_weave.so && echo OK` reporting
+on a stale artifact. This is the same mistake in the gate that fronts **every property
+test in the project**, i.e. the gate behind hard rule 1. Every "N million checks, 0
+failures" figure this project has published came through it. Those figures are not
+retracted — the suites print their own totals and a suite that ran and reported is still
+evidence — but a suite that ABORTED would have been reported identically, and nothing
+distinguished the two until now.

@@ -194,6 +194,32 @@ reported by a test that was not near the change, on the major that was not first
 after the cause. An install whose exit status is not checked is a landmine with a delay
 fuse.
 
+**ELEVENTH MEMBER, and it is in the gate that fronts every property test in the
+project.** `make check-standalone` invoked sixteen of its eighteen suites as
+`$tmp/pk | tail -1`. A pipeline's exit status is the LAST command's, so `set -e` saw
+`tail` succeed no matter what the test did — and on 2026-09-22 `test_pagekind` was found
+to have been **aborting on an assertion** while the target printed
+`== ALL STANDALONE CHECKS PASSED ==` and exited 0, with the abort message visible three
+lines above the banner. Two suites in the same recipe (`test_kernels`, `test_lexbound`)
+had always redirected to a log and checked their own status; all eighteen do now.
+
+What it hid is instructive on its own: the assertion that fired is the one designed to
+notice a page kind added to the enum and not to the test's list, and **five had been**
+(`WEAVE_PK_PENDING_V9`, the three `WEAVE_PK_CGRAM_*` kinds, `WEAVE_PK_PENDING_V10`). The
+guard worked; the harness silenced it. `doc/GAPS.md` **G42**.
+
+Two rules follow, and the second is the one that generalizes:
+
+- **A gate fix needs a positive control, not a passing gate.** "The suite passes now" is
+  compatible with the gate still being unable to fail. The stale `test_pagekind` was
+  recompiled from `git show HEAD:` and run through the new pattern to show it exits 1.
+- **Every "N million checks, 0 failures" figure this project publishes came through that
+  target.** Those are not retracted — a suite that ran and printed its own total is still
+  evidence — but a suite that *aborted* would have been reported identically, and until
+  now nothing distinguished the two. When a harness reports on something other than the
+  thing under test, the damage is not the bugs it let through; it is that every green it
+  ever printed becomes uninformative in retrospect.
+
 **A gate that reports FAIL and nothing else costs a round trip**, which on a remote
 build host is minutes. Print the compiler's own error lines on a build failure and the
 install log's tail on an install failure. Two round trips were burned on

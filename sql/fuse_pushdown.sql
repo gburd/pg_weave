@@ -508,6 +508,111 @@ SELECT (SELECT array_agg(id ORDER BY id) FROM p_lat)
 -- ---------------------------------------------------------------------------
 SELECT body <~> '{1,1}'::float4[] FROM fp LIMIT 1;
 
+-- ---------------------------------------------------------------------------
+-- (7) THE COUNTERS THE SECT. 8 GATE IS MEASURED WITH, asserted as RELATIONS.
+--
+-- weave_fuse_stats() carries the core's per-channel and per-state counters out of
+-- the scan; FUSED_TOPK.md sect. 8 makes the score() call ratio the row that decides
+-- whether the bounds are tight enough for the design to mean anything.  Nothing
+-- here pins a NUMBER -- every count depends on the corpus, the segment layout and
+-- the ladder, and a pinned count would be rewritten by anyone who changed the
+-- corpus, which is how a gate becomes a formality.  What is pinned is every
+-- relation that must hold whatever the numbers are.
+--
+-- THE ONE WITH TEETH IS `scores <= nchan * pivots`.  Each pivot scores each channel
+-- at most once, so a query with two scored channels cannot exceed 2 x pivots.  The
+-- way to break it is to count a channel twice, and there is a specific place that
+-- almost happens: for a vector slot the accumulation in src/am/amscan.c must sum
+-- cp[] (the F8 adapter, which is what the core asked) and NOT also chans[] (the
+-- shuttle channel the adapter drives, which sees one call per forwarded call).  The
+-- vector arm below is that discriminator: double-counting would push a two-channel
+-- query to 3 x pivots and fail here.
+-- ---------------------------------------------------------------------------
+SET enable_seqscan = off;
+
+SELECT weave_fuse_stats_reset();
+
+SELECT count(*) AS lexical_rows
+  FROM (SELECT id FROM fp
+         ORDER BY fuse(body <=> 'alpha'::wquery,
+                       body <=> 'zeta'::wquery,
+                       weights => '{1,1}') LIMIT 5) t;
+
+SELECT passes > 0 AS ran_a_pass,
+       runs >= passes AS a_bolt_per_pass,
+       chans >= runs AS a_channel_per_run,
+       scores > 0 AS scored_something,
+       bounds > 0 AS bounded_something,
+       pivots > 0 AS considered_candidates,
+       seeks > 0 AS sought_something,
+       scores <= 2 * pivots AS scores_within_two_channels_per_pivot
+  FROM weave_fuse_stats();
+
+-- The reset is part of the instrument: a benchmark brackets one query with it, so a
+-- reset that missed a column would attribute the previous query's work to the next.
+SELECT weave_fuse_stats_reset();
+
+SELECT passes + runs + chans + seeks + scores + bounds + pivots + blkskip
+       + rqskip + livedrop + veto + abandon = 0 AS reset_zeroed_every_column
+  FROM weave_fuse_stats();
+
+-- THE VECTOR ARM.  Two scored channels, one of them reaching the core through the
+-- F8 adapter; see the note above on why 2 x pivots is the interesting bound.
+SELECT count(*) AS vector_rows
+  FROM (SELECT id FROM fp
+         ORDER BY fuse(body <=> 'alpha'::wquery,
+                       emb <-> '[1,0,0,1]'::wvec,
+                       weights => '{0.5,0.5}') LIMIT 10) t;
+
+SELECT scores > 0 AS vector_arm_scored,
+       scores <= 2 * pivots AS vector_arm_not_double_counted
+  FROM weave_fuse_stats();
+
+-- CLAIM 3's MECHANISM, on `pivots` and deliberately not on `scores`.
+--
+-- ARCHITECTURE.md sect. 9 claim 3 is that a query gets FASTER as its predicates get
+-- more selective, and the mechanism is that a required channel's intersection jumps
+-- the scorer over ranges nothing can match -- which is counted as `rqskip` and shows
+-- up as fewer `pivots`.  It does NOT show up as fewer `scores`, because a required
+-- channel is itself scored once per pivot to obtain its veto (src/am/fuse.c, the
+-- required loop), so adding a gate adds a score() call per surviving candidate.
+-- Asserting the claim on `scores` would therefore be asserting something false, and
+-- the reason to write that down here is that `scores` is the number sect. 8 quotes:
+-- it is TOTAL work, which is the right quantity against RRF and the wrong one for
+-- claim 3.
+SET enable_bitmapscan = off;
+
+SELECT weave_fuse_stats_reset();
+
+SELECT count(*) AS ungated_rows
+  FROM (SELECT id FROM fp
+         ORDER BY fuse(body <=> 'alpha'::wquery,
+                       body <=> 'zeta'::wquery,
+                       weights => '{1,1}') LIMIT 5) t;
+
+CREATE TEMP TABLE p_stats_ungated AS SELECT * FROM weave_fuse_stats();
+
+SELECT weave_fuse_stats_reset();
+
+SELECT count(*) AS gated_rows
+  FROM (SELECT id FROM fp
+         WHERE body @@@ 'zeta'::wquery
+         ORDER BY fuse(body <=> 'alpha'::wquery,
+                       body <=> 'zeta'::wquery,
+                       weights => '{1,1}') LIMIT 5) t;
+
+CREATE TEMP TABLE p_stats_gated AS SELECT * FROM weave_fuse_stats();
+
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+
+SELECT g.pivots <= u.pivots AS a_gate_does_not_widen_the_candidate_set,
+       g.pivots < u.pivots AS a_gate_narrowed_it_here,
+       g.rqskip > 0 AS the_intersection_did_the_skipping
+  FROM p_stats_gated g, p_stats_ungated u;
+
+DROP TABLE p_stats_ungated, p_stats_gated;
+
 DROP TABLE p_pushdown, p_fallback, p_oracle_scores, p_oracle, p_gated, p_ungated, p_lat, p_solo;
 DROP TABLE fpmap, pv_pushdown, pv_oracle_scores, pv_oracle;
 DROP TABLE fp_nb;

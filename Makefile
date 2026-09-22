@@ -118,7 +118,7 @@ TRE_CPPFLAGS = \
 	-I$(srcdir)/vendor/tre/local_includes
 
 EXTENSION = pg_weave
-DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql sql/pg_weave--0.4.0--0.5.0.sql sql/pg_weave--0.5.0--0.6.0.sql sql/pg_weave--0.6.0--0.7.0.sql sql/pg_weave--0.7.0--0.8.0.sql sql/pg_weave--0.8.0--0.9.0.sql sql/pg_weave--0.9.0--0.10.0.sql sql/pg_weave--0.10.0--0.11.0.sql sql/pg_weave--0.11.0--0.12.0.sql sql/pg_weave--0.12.0--0.13.0.sql sql/pg_weave--0.13.0--0.14.0.sql sql/pg_weave--0.14.0--0.15.0.sql sql/pg_weave--0.15.0--0.16.0.sql sql/pg_weave--0.16.0--0.17.0.sql
+DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql sql/pg_weave--0.4.0--0.5.0.sql sql/pg_weave--0.5.0--0.6.0.sql sql/pg_weave--0.6.0--0.7.0.sql sql/pg_weave--0.7.0--0.8.0.sql sql/pg_weave--0.8.0--0.9.0.sql sql/pg_weave--0.9.0--0.10.0.sql sql/pg_weave--0.10.0--0.11.0.sql sql/pg_weave--0.11.0--0.12.0.sql sql/pg_weave--0.12.0--0.13.0.sql sql/pg_weave--0.13.0--0.14.0.sql sql/pg_weave--0.14.0--0.15.0.sql sql/pg_weave--0.15.0--0.16.0.sql sql/pg_weave--0.16.0--0.17.0.sql sql/pg_weave--0.17.0--0.18.0.sql
 PGFILEDESC = "pg_weave - unified lexical + vector + fuzzy retrieval in one index"
 
 # sql/ and expected/ are already at the top level (PGXS's built-in default
@@ -338,6 +338,18 @@ check-rename:
 # test_lev.c) is deliberately NOT here: it needs two external libraries, so it
 # cannot gate a build, which is why dependency-free equivalents are being written
 # one at a time.
+#
+# EVERY TEST IS RUN TO A LOG AND ITS OWN EXIT STATUS IS CHECKED, and the reason is
+# that the obvious spelling -- `$$tmp/pk | tail -1` -- reports on `tail`.  A
+# pipeline's status is the LAST command's, so `set -e` sees tail succeed no matter
+# what the test did: sixteen of these eighteen suites were invoked that way, which
+# means `make check-standalone` printed "ALL STANDALONE CHECKS PASSED" over an
+# aborting test for as long as the target has existed.  It was found on 2026-09-22
+# when test_pagekind started failing an assertion and the gate stayed green; see
+# doc/GAPS.md G42.  This is the eighth and ninth member of the AGENTS.md family of
+# "a result needs evidence that the specific thing you meant to run, ran" -- the
+# same `| tail` / `| head` / `test -f` mistake, this time in the gate that fronts
+# every property test in the project.
 CHECK_CC ?= cc
 STANDALONE_CFLAGS = -O2 -Wall -Wextra -Wno-unused-parameter -I include
 
@@ -347,11 +359,13 @@ check-standalone:
 	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	echo "== FOR codec: fast extractor vs the bit-by-bit implementation it replaced =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/for test/hegel/test_for_get.c -lm; \
-	$$tmp/for | tail -1; \
+	$$tmp/for > $$tmp/for.log 2>&1 || { cat $$tmp/for.log; exit 1; }; \
+	tail -1 $$tmp/for.log; \
 	echo "== vector quantizer: rotation, codebook, encode, packing, block bound (C2) =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/q test/hegel/test_quantize.c \
 		src/vector/quantize.c src/vector/pack.c -lm; \
-	$$tmp/q | tail -1; \
+	$$tmp/q > $$tmp/q.log 2>&1 || { cat $$tmp/q.log; exit 1; }; \
+	tail -1 $$tmp/q.log; \
 	echo "== vector kernels: every available ISA path == the scalar oracle, bit for bit =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/k test/hegel/test_kernels.c \
 		src/vector/kernels.c src/vector/quantize.c src/vector/pack.c -lm; \
@@ -359,53 +373,66 @@ check-standalone:
 	sed -n '1p;$$p' $$tmp/k.log; \
 	echo "== v5 doclen sidecar: random access over absolute offsets == gap decode =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/dlb test/hegel/test_doclen_block.c -lm; \
-	$$tmp/dlb | tail -1; \
+	$$tmp/dlb > $$tmp/dlb.log 2>&1 || { cat $$tmp/dlb.log; exit 1; }; \
+	tail -1 $$tmp/dlb.log; \
 	echo "== v6 page-kind space: encode/decode bijection + fail-closed vs a v5 reader =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/pk test/hegel/test_pagekind.c; \
-	$$tmp/pk | tail -1; \
+	$$tmp/pk > $$tmp/pk.log 2>&1 || { cat $$tmp/pk.log; exit 1; }; \
+	tail -1 $$tmp/pk.log; \
 	echo "== v6 channel descriptor: pure validator on well-formed and corrupt images =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/cd test/fuzz/fuzz_chandesc.c; \
-	$$tmp/cd | tail -1; \
+	$$tmp/cd > $$tmp/cd.log 2>&1 || { cat $$tmp/cd.log; exit 1; }; \
+	tail -1 $$tmp/cd.log; \
 	echo "== page-bound guard (G22): end offset in range, avail never underflows =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/pb test/fuzz/fuzz_pagebound.c; \
-	$$tmp/pb | tail -1; \
+	$$tmp/pb > $$tmp/pb.log 2>&1 || { cat $$tmp/pb.log; exit 1; }; \
+	tail -1 $$tmp/pb.log; \
 	echo "== V5 32-lane packing: round-trip, lane isolation, move_lane/zero_lane, bounds =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/pack test/hegel/test_pack.c src/vector/pack.c; \
-	$$tmp/pack | tail -1; \
+	$$tmp/pack > $$tmp/pack.log 2>&1 || { cat $$tmp/pack.log; exit 1; }; \
+	tail -1 $$tmp/pack.log; \
 	echo "== V7 code strips: coordinate slicing, page-image determinism, refusals =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecpage test/hegel/test_vecpage.c \
 		src/vector/vecpage.c src/vector/pack.c; \
-	$$tmp/vecpage | tail -1; \
+	$$tmp/vecpage > $$tmp/vecpage.log 2>&1 || { cat $$tmp/vecpage.log; exit 1; }; \
+	tail -1 $$tmp/vecpage.log; \
 	echo "== V7 vector weft: partition, round trip, statistics recompute, the merge MOVE =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecweft test/hegel/test_vecweft.c \
 		src/vector/vecweft.c src/vector/vecpage.c src/vector/vecstats.c \
 		src/vector/quantize.c src/vector/pack.c -lm; \
-	$$tmp/vecweft | tail -1; \
+	$$tmp/vecweft > $$tmp/vecweft.log 2>&1 || { cat $$tmp/vecweft.log; exit 1; }; \
+	tail -1 $$tmp/vecweft.log; \
 	echo "== V7/V8 contract (C2): the block bound is an upper bound on every lane =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecbound test/hegel/test_vecbound.c \
 		src/vector/vecstats.c src/vector/quantize.c src/vector/pack.c \
 		src/vector/kernels.c -lm; \
-	$$tmp/vecbound | tail -1; \
+	$$tmp/vecbound > $$tmp/vecbound.log 2>&1 || { cat $$tmp/vecbound.log; exit 1; }; \
+	tail -1 $$tmp/vecbound.log; \
 	echo "== V8 code-scan core: (C1) ascent, (C2) in the METRIC'S domain, mask skips =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecscan test/hegel/test_vecscan.c \
 		src/vector/vecscan.c src/vector/vecweft.c src/vector/vecpage.c \
 		src/vector/vecstats.c src/vector/kernels.c src/vector/quantize.c \
 		src/vector/pack.c -lm; \
-	$$tmp/vecscan | tail -2; \
+	$$tmp/vecscan > $$tmp/vecscan.log 2>&1 || { cat $$tmp/vecscan.log; exit 1; }; \
+	tail -2 $$tmp/vecscan.log; \
 	echo "== Z3 surf trie: trie membership == dictionary membership, prefix enumeration =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/surf test/hegel/test_surf.c \
 		src/query/surftrie.c; \
-	$$tmp/surf | tail -1; \
+	$$tmp/surf > $$tmp/surf.log 2>&1 || { cat $$tmp/surf.log; exit 1; }; \
+	tail -1 $$tmp/surf.log; \
 	echo "== Z5 uleven: exact vocabulary neighbourhood, skip soundness, char units =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/ul test/hegel/test_uleven.c -lm; \
-	$$tmp/ul | tail -1; \
+	$$tmp/ul > $$tmp/ul.log 2>&1 || { cat $$tmp/ul.log; exit 1; }; \
+	tail -1 $$tmp/ul.log; \
 	echo "== Z7 gate shuttle (C1)+(C2)+(C5): monotone seek == linear oracle, +/-INF, backward refused =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/bounds test/hegel/test_bounds.c; \
-	$$tmp/bounds | tail -1; \
+	$$tmp/bounds > $$tmp/bounds.log 2>&1 || { cat $$tmp/bounds.log; exit 1; }; \
+	tail -1 $$tmp/bounds.log; \
 	echo "== F1/F5 fused top-k: fused == brute force, conjunctive gates, no backward seek =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/fuse test/hegel/test_fuse_props.c \
 		src/am/fuse.c -lm; \
-	$$tmp/fuse 60000 | tail -4; \
+	$$tmp/fuse 60000 > $$tmp/fuse.log 2>&1 || { cat $$tmp/fuse.log; exit 1; }; \
+	tail -4 $$tmp/fuse.log; \
 	echo "== F6 lexical bound (C2): block_bound >= BM25 contribution, attained at (max_tf, min |D|) =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/lexb test/hegel/test_lexbound.c -lm; \
 	$$tmp/lexb > $$tmp/lexb.log || { cat $$tmp/lexb.log; exit 1; }; \
@@ -417,13 +444,16 @@ check-standalone:
 	tail -12 $$tmp/vecdocmap.log; \
 	echo "== Z9 edist shuttle (C1)+(C2): the bound never exceeds a true Levenshtein distance =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/edist test/hegel/test_edist.c -lm; \
-	$$tmp/edist | tail -2; \
+	$$tmp/edist > $$tmp/edist.log 2>&1 || { cat $$tmp/edist.log; exit 1; }; \
+	tail -2 $$tmp/edist.log; \
 	echo "== TRE d0e0c997 -> f864ed0 (pg_tre 1521662): backref wrong-answer fix =="; \
-	bash test/hegel/run_tre_bump.sh backref | tail -1; \
+	bash test/hegel/run_tre_bump.sh backref > $$tmp/tre.log 2>&1 || { cat $$tmp/tre.log; exit 1; }; \
+	tail -1 $$tmp/tre.log; \
 	echo "== pg_tre 2be8dbf (v3.2.5): literal '-' first/last in a bracket expression =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -I test/hegel/pgshim_regex -I src/query \
 		-o $$tmp/rxdash test/hegel/test_regex_dash.c src/query/regex_tokens.c; \
-	$$tmp/rxdash | tail -1; \
+	$$tmp/rxdash > $$tmp/rxdash.log 2>&1 || { cat $$tmp/rxdash.log; exit 1; }; \
+	tail -1 $$tmp/rxdash.log; \
 	echo "== ALL STANDALONE CHECKS PASSED =="
 
 # The INT_MAX crash fix (pg_tre 1521662 / upstream ad26b6d) needs an actual

@@ -734,6 +734,16 @@ things the gate still has no run behind, and neither is F2's: **nDCG on ≥ 2 pu
 datasets** (BEIR subset + MS MARCO), which this project has never produced, and an **RRF
 control implementation** to measure against.
 
+**A third blocker existed and was invisible until someone tried to write the harness
+(2026-09-22): there was no way to read the `score()` count from SQL.** The core has
+counted since F1 and the counters died with the scan's memory context, so the row the
+whole phase gate turns on could not be measured by any query. `weave_fuse_stats()` in
+extension **0.18.0** fixes that, adds a `block_max()` call count so the ratio cannot be
+passed by trading score calls for bound calls, and is asserted by `sql/fuse_pushdown.sql`
+§7 — which also pins the thing that would silently break it, the F8 adapter being counted
+twice. See `doc/specs/FUSED_TOPK.md` §8a, including the synthetic 0.231 ratio the property
+test now reports and why that is **not** this gate.
+
 ---
 
 ## Phase M — migration and compatibility
