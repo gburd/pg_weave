@@ -755,10 +755,13 @@ still has no run behind, and neither is F2's: **nDCG on ≥ 2 public datasets** 
 + MS MARCO) and an **RRF control implementation** to measure against — the harness now has
 both arms, so this is a run, not a build.
 
-**The property-test hole G43 named is still open and is independent of G43's cause:**
-`test/hegel/test_vecbound.c` covers neither metric explicitly while the bound has separate
-ip and l2 forms (`include/weave/quantize.h:535,551`). Hard rule 1's subtler case — a test
-that covers a channel but not a *configuration* of it — and it stays owed.
+**~~The property-test hole G43 named is still open~~ RETRACTED: it does not exist.**
+`test/hegel/test_vecbound.c` asserts both bound forms by name — B1 against
+`weave_block_bound_ip()` and B3 against `weave_block_bound_l2()`, each versus an
+independently computed exact score over every live lane. The original finding came from
+grepping the file for "metric", a word it never uses because it names the two *functions*
+instead. Absence of a vocabulary is not absence of coverage. What IS owed from this work
+is a positive control for the new abandonment audit, which has never fired.
 
 **A third blocker existed and was invisible until someone tried to write the harness
 (2026-09-22): there was no way to read the `score()` count from SQL.** The core has

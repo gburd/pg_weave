@@ -1950,10 +1950,11 @@ dropped; the first three fixtures tried reproduced nothing. Positive control: wi
 guard reverted the assertion reports 128 of 130 documents, missing exactly the two
 postings in the skipped final block.
 
-**Still owed, and not closed by this fix:** `test/hegel/test_vecbound.c` over both
-metrics (see below — that gap is real and independent of this bug's cause), and the
-abandonment audit added here has not yet fired on anything, so it has no positive
-control.
+**Still owed, and not closed by this fix:** the abandonment audit added here
+(`WEAVE_FUSE_C2_ABANDON` / `fuse_audit_abandon()`) has not fired on anything, so it has
+no positive control and its silence means nothing — the twelfth-member lesson applied to
+this commit's own instrument. The `test_vecbound.c` item recorded below turned out not to
+exist; it is retracted in place.
 
 ---
 
@@ -2031,6 +2032,22 @@ reachable.** Any bound this project computes but does not act on is in the same
 position.
 
 **And the property test has a hole that hard rule 1 names exactly.**
+— **RETRACTED 2026-09-22. There is no hole; this was a grep artifact.**
+`test/hegel/test_vecbound.c` tests **both** bound functions explicitly and by name:
+assertion **B1** compares `weave_block_bound_ip()` against an independently computed
+exact reconstructed inner product, and **B3** compares `weave_block_bound_l2()` against
+an independently computed exact L2 similarity, in that sign convention, over every live
+lane of every generated block. The file contains **zero** occurrences of the word
+"metric" and never mentions `WeaveMetric` — which is what was searched for, and which is
+why a file with full coverage read as a file with none.
+
+**The lesson is the same one already learned about limited greps, from the other
+direction: absence of a VOCABULARY is not absence of COVERAGE.** A test names the
+functions it calls, not the concept the caller uses to choose between them. Grep for the
+symbol under test, and when the answer is "no coverage at all", read the file before
+believing it — especially when the conclusion creates work.
+
+*What the original paragraph said, and it was wrong:*
 `test/hegel/test_vecbound.c` is the (C2) test for this bound and **contains no mention
 of a metric anywhere**, while `include/weave/quantize.h` has two bound functions —
 `weave_block_bound_ip()` (line 535) and `weave_block_bound_l2()` (551, which is built
