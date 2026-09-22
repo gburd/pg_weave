@@ -255,6 +255,13 @@ extern int pg_weave_build_mem_ceiling_mb;
 extern double pg_weave_vacuum_tombstone_frac;
 extern int pg_weave_surf_cache_mb;
 
+/* (C2) CHECKING INSIDE THE FUSED SCORER, reachable from SQL rather than only from a
+ * cassert build.  The reason it had to become a GUC is doc/GAPS.md G43: a wrong answer
+ * that reproduces on a RELEASE cluster, whose cause this check would name, and which
+ * was therefore unreachable exactly where it was needed.  See the long comment at the
+ * DefineCustomBoolVariable in src/am/customscan.c. */
+extern bool pg_weave_fuse_check_bounds;
+
 /* Allocator outcome counters (src/am/am.c).  Backend-local; read from SQL via
  * weave_alloc_stats().  See the block comment above weave_new_buffer() for why
  * they are always compiled in and why they are read from SQL rather than logged. */
