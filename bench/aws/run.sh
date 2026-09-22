@@ -45,6 +45,12 @@
 #					  hnswbase   the pgvector HNSW baseline: bytes/vector,
 #							     recall@10 vs ef, warm+cold p50. SEPARATE HOST
 #							     from rerankcold -- one engine per host.
+#					  fuse	   the fused-retrieval benchmark (doc/specs/FUSED_TOPK.md):
+#							     CPU-embeds each dataset with sentence-transformers
+#							     (bench/prepdata.py), then bench/fuse.sh over it.
+#							     Wants a BIGGER instance than the default -- pass
+#							     it as this script's first positional argument,
+#							     e.g. `bench/aws/run.sh c7i.8xlarge fuse`.
 #
 #	 NDOCS / VOCAB environment variables size the lexical corpus (default 1M /
 #	 200k).  A 1M-document run takes a few minutes to generate.  NDOCS / REPS size
@@ -81,6 +87,12 @@ case "$JOB" in
 	# without the load failing halfway through a two-hour run.
 	winsweep|rerankcold|hnswbase) VOLGB=${VOLGB_OVERRIDE:-400} ;;
 	codescan|csrecall|csdim) VOLGB=${VOLGB_OVERRIDE:-250} ;;
+	# fuse CPU-embeds a corpus with sentence-transformers.  The small BEIR sets
+	# (scifact/nfcorpus/fiqa) it defaults to are tiny, but FUSE_DATASETS can be
+	# pointed at MS MARCO, whose collection is ~3 GB compressed, plus the
+	# sentence-transformer model cache at ~500 MB -- 250 leaves headroom instead
+	# of prepdata.py dying partway through a download.
+	fuse) VOLGB=${VOLGB_OVERRIDE:-250} ;;
 esac
 REGION=$(aws configure get region --profile "$PROFILE")
 RUN=pgweave-$(date -u +%Y%m%d-%H%M%S)
@@ -423,6 +435,56 @@ run_lexical() {
 		  export PATH=/usr/lib/postgresql/17/bin:\$PATH PGDATABASE=weavebench; \
 		  bash bench/lexical.sh ${NDOCS:-1000000} ${VOCAB:-200000} 7" \
 		2>&1 | tee "$OUT/lexical.log"
+}
+
+run_fuse() {
+	# The fused-retrieval benchmark (doc/specs/FUSED_TOPK.md): each dataset gets
+	# CPU-embedded with a sentence-transformer (bench/prepdata.py), then scored
+	# through bench/fuse.sh.  Neither file is fatal to expect missing here --
+	# both are written by a parallel task -- but the job itself is real.
+	#
+	# The embedder needs sentence-transformers, which is not on the base image
+	# and pulls torch CPU with it.  That install is installed ONCE, before any
+	# dataset, not per-dataset: pip3 already no-ops on a second install, and
+	# running it inside the per-dataset loop would just make the "is this
+	# hung?" moment happen three times instead of once.
+	say "installing sentence-transformers (pulls torch CPU -- several minutes with NO output; this is EXPECTED, not a hang)"
+	$SSH 'pip3 install --quiet sentence-transformers' \
+		2>&1 | tee "$OUT/fuse-pip-install.log" \
+		|| die "sentence-transformers install FAILED -- tail of $OUT/fuse-pip-install.log:
+$(tail -30 "$OUT/fuse-pip-install.log")"
+	say "sentence-transformers installed"
+
+	local datasets=${FUSE_DATASETS:-"scifact nfcorpus fiqa"}
+	local limit=${FUSE_LIMIT:-0}
+
+	for D in $datasets; do
+		say "fuse: preparing $D (embed=minilm, limit=$limit)"
+		$SSH "cd pg_weave && mkdir -p /mnt/data/bench && \
+			  python3 bench/prepdata.py --dataset $D --out /mnt/data/bench --embed minilm --limit \"$limit\"" \
+			2>&1 | tee "$OUT/fuse-$D-prep.log" \
+			|| die "prepdata.py failed for $D (see $OUT/fuse-$D-prep.log)"
+
+		say "fuse: running $D (${REPS:-7} reps)"
+		$SSH "cd pg_weave && bash bench/fuse.sh /mnt/data/bench $D \"${REPS:-7}\"" \
+			2>&1 | tee "$OUT/fuse-$D.log" \
+			|| die "fuse.sh failed for $D (see $OUT/fuse-$D.log)"
+
+		# Pulled back HERE, per dataset, not once at the end.  AGENTS.md hard
+		# rule 14: pull artefacts incrementally, never in one final scp -- a
+		# burner expiring mid-run has already cost a sibling project an
+		# instance and every byte of its data.  find, not a hardcoded filename,
+		# because prepdata.py/fuse.sh are still being written by another agent
+		# and their exact layout under /mnt/data/bench/$D is not yet ours to
+		# assume.
+		say "fuse: pulling back $D artifacts"
+		mkdir -p "$OUT/fuse-$D"
+		for f in $($SSH "find /mnt/data/bench/$D -maxdepth 2 \
+				\( -name manifest.json -o -name '*.tsv' \) 2>/dev/null"); do
+			$SSH "cat '$f'" > "$OUT/fuse-$D/$(basename "$f")" \
+				|| say "fuse: could not pull back $f for $D -- continuing, host may still be terminated on schedule"
+		done
+	done
 }
 
 run_fuzzy() {
@@ -1045,6 +1107,7 @@ case "$JOB" in
 	csdim)      run_csdim ;;
 	rerankcold) run_winsweep; run_rerankcold ;;
 	hnswbase)   run_hnswbase ;;
+	fuse)       run_fuse ;;
 	all)     run_smoke; run_bound; run_lexical ;;
 	*)     die "unknown job: $JOB" ;;
 esac

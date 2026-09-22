@@ -1884,3 +1884,85 @@ failures" figure this project has published came through it. Those figures are n
 retracted — the suites print their own totals and a suite that ran and reported is still
 evidence — but a suite that ABORTED would have been reported identically, and nothing
 distinguished the two until now.
+
+### G43 — the F8 fused vector path returns a different top-k than two non-fused paths that agree with each other, on a real corpus — **OPEN 2026-09-22, found by the section 8 benchmark harness on its first real dataset**
+
+Found while smoke-testing `bench/fuse.sh` against BEIR scifact (5,183 documents, 384-d
+vectors, `metric = 'ip'`, PG17.11, extension 0.19.0). This is the first time any
+pg_weave index has been built over a real text+vector corpus at more than 24,000 rows,
+and it took one afternoon to find something 18,899,792 property checks did not.
+
+**The observation.** For one query, three arms over the same index and the same query
+vector, top-10:
+
+```
+weave_vec_scan() SRF        : 238 1478 1554 2730 2983 3217 3284 3401 3751 4956
+ORDER BY emb <#> v          : 238 1478 1554 2730 2983 3217 3284 3401 3751 4956
+fuse(body<=>q, emb<#>v)     : 238  880 1478 2730 2983 3217 3284 3401 3751 4956
+```
+
+Two independent non-fused paths agree exactly. The fused path substitutes **880**
+(lane 894, score 0.22096) for **1554** (lane 1568, score 0.22553) — it admits a
+lower-scoring document and drops a higher one. Stable across `LIMIT 10`, `20` and
+`50`, so it is not the widening ladder truncating.
+
+**What has been ruled OUT, each by measurement:**
+
+- *The score-recovery plumbing.* `emb <#> v` returns −0.10451, `weave_ipscore()`
+  recovers +0.10451, and `weave_vec_scan()` reports 0.10300 for the same document —
+  the quantizer's 1.4 % error and nothing else. Not a second G41.
+- *The lexical side.* The single-channel `ORDER BY body <=> q` top-10 is **identical**
+  to an exhaustive `weave_search()` oracle on both probed queries.
+- *Block pruning.* `weave_fuse_stats()` on the failing query: `blkskip = 0`,
+  `pivots = 5183` (every document considered), and `weave_work_stats()` reports
+  `vec_blocks_bound_skipped = 0`. No block was skipped by any bound.
+- *The ladder and the merge-race retry.* `passes = 1`, `runs = 1`.
+- *Tombstones.* `livedrop = 0` on a freshly built index.
+- *A float32 tie at the cut.* The two documents' oracle scores are 5.42375 and
+  5.37364 — a 0.9 % gap, not a rounding artifact.
+
+**What is left, and it is the leading hypothesis rather than a diagnosis.** The only
+prune that fired is **incremental abandonment**: 4,564 of 5,183 documents were
+abandoned mid-sum on `s + csuffix[j+1] <= theta`. That test is sound only if each
+`csuffix` entry is a true upper bound on the remaining channels' scores at that
+document. And **in every disagreement observed, the DROPPED document had the HIGHER
+vector score** — 0.103 vs 0.026 in the balanced-weight case, 0.22553 vs 0.22096 in the
+vector-dominated one. A vector ceiling that is too low produces exactly that: the
+document whose realized vector score would have saved it is abandoned before the
+vector channel is ever scored.
+
+**Why this could stay latent until F8, which is the part worth generalizing.** The
+vector block bound **prunes 0.0 % of blocks** on the single-channel path — that is
+`bench/RESULTS_BOUND_PRUNING.md`'s headline finding, reproduced here as
+`vec_blocks_bound_skipped = 0`. A bound that never prunes is a bound whose soundness is
+never load-bearing, so a too-low one is unobservable. The fused scorer uses the same
+bound *differently* — as a ceiling inside a suffix sum that decides abandonment — and
+that use IS load-bearing. **F8 did not introduce the defect; it made a latent one
+reachable.** Any bound this project computes but does not act on is in the same
+position.
+
+**And the property test has a hole that hard rule 1 names exactly.**
+`test/hegel/test_vecbound.c` is the (C2) test for this bound and **contains no mention
+of a metric anywhere**, while `include/weave/quantize.h` has two bound functions —
+`weave_block_bound_ip()` (line 535) and `weave_block_bound_l2()` (551, which is built
+on top of the ip one). So one metric is tested implicitly and the other is not tested
+at all, on a code path where l2's correctness does not imply ip's. Rule 1 says a
+channel without a (C1)+(C2) property test is not merged; this is the subtler version,
+a test that covers a channel but not a *configuration* of it.
+
+**The decisive next step, not yet run.** `src/am/amscan.c` sets
+`st.check_bounds = 1` under `USE_ASSERT_CHECKING`, which turns every `score()` into a
+checked (C2) assertion and would raise `WEAVE_FUSE_C2_VIOLATION` naming the offending
+channel. The cluster this was found on is a release build. Build with `cassert` and run
+the reproducer: either it raises and the hypothesis is confirmed with the channel
+named, or it does not and the defect is in the mapping rather than the bound. Then
+extend `test_vecbound.c` over both metrics before touching anything.
+
+**Consequence for the benchmark, recorded because it is the reason this was found.**
+`bench/RESULTS_FUSE.md` is **not** being produced from this state. Hard rule 8: verify
+correctness before recording a latency, and a benchmark of a broken fast path is worse
+than no benchmark. The harness stays, its correctness gate stays red, and no EC2 run
+was spent. The gate that caught this is `bench/fuse.sh`'s per-query comparison against
+an exhaustive per-channel oracle — which is only an oracle because
+`sql/fuse_pushdown.sql` section 2b had already worked out that the `fuse()` fallback is
+not one (`FUSED_TOPK.md` section 7a (1)).

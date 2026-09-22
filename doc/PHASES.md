@@ -734,6 +734,15 @@ things the gate still has no run behind, and neither is F2's: **nDCG on ≥ 2 pu
 datasets** (BEIR subset + MS MARCO), which this project has never produced, and an **RRF
 control implementation** to measure against.
 
+**AND THE GATE IS NOW BLOCKED ON A WRONG ANSWER, not on a missing harness
+(2026-09-22).** `bench/fuse.sh` runs end to end and its first real dataset found
+`doc/GAPS.md` **G43**: the fused path disagrees with two non-fused vector paths that
+agree with each other. No row of §8's table has been measured and no EC2 run was
+spent, per hard rule 8. G43 names the decisive next step (a `cassert` build, whose
+`check_bounds` assertion would name the offending channel) and the property-test hole
+it depends on (`test/hegel/test_vecbound.c` covers neither metric explicitly, while
+the bound has separate ip and l2 forms).
+
 **A third blocker existed and was invisible until someone tried to write the harness
 (2026-09-22): there was no way to read the `score()` count from SQL.** The core has
 counted since F1 and the counters died with the scan's memory context, so the row the
