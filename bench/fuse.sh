@@ -398,11 +398,26 @@ W_RRF=$(work_of rrf_sql)
 # ---------------------------------------------------------------------------
 # LATENCY.  A/B ALTERNATED per query: fused, rrf, fused, rrf ... so drift over the
 # pass cannot land on one arm (weave-bench, and the AWS skill's A/B rule).
+#
+# AND AN A/A LEG, which is AGENTS.md hard rule 10 and is not optional: the fused
+# arm is measured TWICE per query, in the first and third slots, and the gap
+# between those two measurements is the WITHIN-ARM SPREAD.  A between-arm delta
+# smaller than that spread is not a result.  The sibling project's retracted
+# 8.5 % "win" was a single baseline outlier, and the only thing that would have
+# caught it is this leg.
+#
+# The second fused measurement sits AFTER the rrf one deliberately, rather than
+# back-to-back with the first.  Back-to-back would measure the best case -- same
+# cache, same everything -- and understate the spread.  Third slot means it
+# carries whatever the rrf run did to the cache and to the clock, which is the
+# conservative estimate and the one that can actually bound a claim.
 # ---------------------------------------------------------------------------
-say "$DS: latency, $LATN queries x $REPS reps, arms alternated"
-LAT_F=$(mktemp); LAT_R=$(mktemp)
+say "$DS: latency, $LATN queries x $REPS reps, arms alternated, with an A/A leg"
+LAT_F=$(mktemp); LAT_R=$(mktemp); LAT_F2=$(mktemp)
 while IFS=$'\t' read -r qid wq qv; do
-    for gen in fused_sql rrf_sql; do
+    for leg in "fused_sql:$LAT_F" "rrf_sql:$LAT_R" "fused_sql:$LAT_F2"; do
+        gen=${leg%%:*}
+        dest=${leg#*:}
         {
             echo "$SETUP"
             for _ in $(seq 1 "$REPS"); do
@@ -411,7 +426,7 @@ while IFS=$'\t' read -r qid wq qv; do
         } | psql -X -q -d "$DB" -t -A \
           | sed -n 's/^Execution Time: \([0-9.]*\) ms$/\1/p' \
           | tail -n +2 \
-          >> "$([ "$gen" = fused_sql ] && echo "$LAT_F" || echo "$LAT_R")"
+          >> "$dest"
     done
 done < <(head -n "$LATN" "$QLIT")
 
@@ -423,7 +438,8 @@ pctl() {                        # pctl <file> -- p50 TAB p99
 }
 P_FUSED=$(pctl "$LAT_F")
 P_RRF=$(pctl "$LAT_R")
-rm -f "$LAT_F" "$LAT_R"
+P_FUSED2=$(pctl "$LAT_F2")
+rm -f "$LAT_F" "$LAT_R" "$LAT_F2"
 
 # ---------------------------------------------------------------------------
 # SCORE.  bench/ndcg.py excludes queries with no positive judgment and PENALIZES
@@ -452,6 +468,11 @@ printf '\n### fuse_latency\n'
 printf 'arm\tp50_ms\tp99_ms\tqueries\treps\n'
 printf 'fused\t%s\t%s\t%s\n' "$P_FUSED" "$LATN" "$REPS"
 printf 'rrf\t%s\t%s\t%s\n' "$P_RRF" "$LATN" "$REPS"
+# The A/A leg (hard rule 10).  `fused_aa` is the SAME arm measured again in the
+# third slot; the fused-vs-fused_aa gap is the noise floor any fused-vs-rrf claim
+# has to clear.  Reported as a row rather than folded into the fused numbers so
+# that nobody can average the two and lose the only estimate of spread there is.
+printf 'fused_aa\t%s\t%s\t%s\n' "$P_FUSED2" "$LATN" "$REPS"
 
 printf '\n### fuse_work\n'
 printf 'arm\tlex_contribs_fused_side\tlex_contribs_wand\tvec_lanes\tvec_blocks\tvec_blocks_bound_skipped\tfuse_scores_total\tpivots\tblkskip\trqskip\tpasses\truns\n'

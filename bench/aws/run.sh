@@ -466,7 +466,15 @@ $(tail -30 "$OUT/fuse-pip-install.log")"
 			|| die "prepdata.py failed for $D (see $OUT/fuse-$D-prep.log)"
 
 		say "fuse: running $D (${REPS:-7} reps)"
-		$SSH "cd pg_weave && bash bench/fuse.sh /mnt/data/bench $D \"${REPS:-7}\"" \
+		# LATN and CHECKN are forwarded rather than left to fuse.sh's defaults.
+		# CHECKN is the RECALL-VS-EXHAUSTIVE row of FUSED_TOPK.md sect. 8, which
+		# that table calls the most valuable row in it -- a single miss is a (C2)
+		# violation -- so it should cover as many queries as the clock allows,
+		# not the 10 a smoke run wants.  Each one costs two exhaustive per-channel
+		# scans, so it is linear in queries x documents and worth watching on the
+		# larger sets.
+		$SSH "cd pg_weave && LATN=\"${LATN:-50}\" CHECKN=\"${CHECKN:-100}\" \
+			  bash bench/fuse.sh /mnt/data/bench $D \"${REPS:-7}\"" \
 			2>&1 | tee "$OUT/fuse-$D.log" \
 			|| die "fuse.sh failed for $D (see $OUT/fuse-$D.log)"
 
@@ -1107,7 +1115,14 @@ case "$JOB" in
 	csdim)      run_csdim ;;
 	rerankcold) run_winsweep; run_rerankcold ;;
 	hnswbase)   run_hnswbase ;;
-	fuse)       run_fuse ;;
+	# run_smoke FIRST, exactly as the lexical and fuzzy jobs do, and it is not
+	# optional: run_smoke is where `sudo make install` happens, so without it
+	# `CREATE EXTENSION pg_weave` fails on the instance and the whole run dies
+	# after paying for the launch, the torch install and the corpus download.
+	# It also means the host has passed regression + isolation + TAP before any
+	# number is taken off it, which is this project's own rule about correctness
+	# preceding latency applied to the machine rather than to the code.
+	fuse)       run_smoke; run_fuse ;;
 	all)     run_smoke; run_bound; run_lexical ;;
 	*)     die "unknown job: $JOB" ;;
 esac
