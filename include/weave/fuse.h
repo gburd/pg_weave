@@ -204,6 +204,29 @@ typedef int64 weave_ft_int64;
  * have been a bitmap AND. */
 #define WEAVE_FUSE_MAX_CHAN		64
 
+/*
+ * The four ways the pivot loop can end, recorded in WeaveFuseState.stop.  Only
+ * EXHAUSTED and CEILING are ordinary; the other two are the same conditions seen
+ * from inside a step, and telling them apart is what turns "the answer is wrong"
+ * into "the loop ended at document N for reason R".
+ */
+#define WEAVE_FUSE_STOP_NONE		0	/* the run has not ended */
+#define WEAVE_FUSE_STOP_EXHAUSTED	1	/* no channel can produce another
+										 * candidate: the pivot reached the end
+										 * sentinel or nwarp */
+#define WEAVE_FUSE_STOP_CEILING		2	/* the heap is full and the sum of every
+										 * scored channel's ceiling cannot beat
+										 * theta.  SOUND ONLY IF EVERY maxscore IS
+										 * A TRUE GLOBAL BOUND -- one that is too
+										 * low ends the scan over a docid PREFIX
+										 * and returns a plausible wrong top-k */
+#define WEAVE_FUSE_STOP_REQUIRED	3	/* a required channel's intersection ran
+										 * off the end */
+#define WEAVE_FUSE_STOP_NOCAND		4	/* every scored channel went non-essential
+										 * and there is no required channel to
+										 * pin a candidate; the CEILING case seen
+										 * from the partition instead of the test */
+
 typedef enum WeaveFuseError
 {
 	WEAVE_FUSE_OK = 0,
@@ -214,6 +237,15 @@ typedef enum WeaveFuseError
 	WEAVE_FUSE_C1_VIOLATION,	/* a channel's seek went backwards */
 	WEAVE_FUSE_C2_VIOLATION,	/* score() exceeded block_max(); checked only
 								 * when check_bounds is set */
+	WEAVE_FUSE_C2_ABANDON,		/* incremental abandonment discarded a document
+								 * that the channels' ACTUAL scores say should
+								 * have been kept -- i.e. an unscored channel's
+								 * bound was below its score.  Checked only when
+								 * check_bounds is set, and it is the only check
+								 * that can see this class at all: the per-score
+								 * C2_VIOLATION above audits scored channels,
+								 * and abandonment's whole point is not scoring
+								 * the rest.  See G43. */
 	WEAVE_FUSE_NAN_SCORE		/* a channel returned NaN; see note 4 */
 } WeaveFuseError;
 
@@ -380,6 +412,14 @@ typedef struct WeaveFuseState
 	weave_ft_int64 nlivedrop;
 	weave_ft_int64 nveto;
 	weave_ft_int64 nabandon;
+
+	/* WHY THE PIVOT LOOP STOPPED, one of WEAVE_FUSE_STOP_*.  A wrong answer from
+	 * this core is nearly always a loop that ended sooner than the document set
+	 * did, and the four exits are indistinguishable from the outside -- the
+	 * counters look the same whether the channels ran out or a ceiling cut the
+	 * scan off early.  G43 cost hours to the difference.  Set at every break, so
+	 * a caller that finds it zero after a run has found a fifth exit. */
+	int			stop;
 
 	/* Set when the run stopped on an error: the offending channel, as a pointer
 	 * rather than an index, since the two arrays are separately indexed. */

@@ -5175,9 +5175,34 @@ wand_skip_blocks(WandCursor *c, uint64 target)
 				break;
 			}
 			nextp = (char *) MAXALIGN((char *) (bh + 1) + bh->bytelen + bh->posbytelen);
-			/* can we prove this whole block is < target? need the next block's
-			 * first_docid (on this page) to be <= target. */
-			if (nextp + sizeof(WeaveBlockHdr) <= pend)
+			/*
+			 * Can we prove this whole block is < target?  The test is the NEXT
+			 * block's first_docid <= target, and it is sound only because the
+			 * next block on this page is the SAME TERM'S next block, so every
+			 * docid here is below its first one.
+			 *
+			 * WHICH FAILS FOR THE TERM'S LAST BLOCK, and that was G43.  Posting
+			 * lists share pages, so the header after a term's final block
+			 * belongs to ANOTHER TERM and its first_docid is an unrelated
+			 * number -- typically a small one, since a new term's list starts
+			 * near docid 0.  Reading it as this term's continuation "proves"
+			 * the final block is below target for almost any target, so the
+			 * block is skipped, `nread` reaches `df`, and the cursor reports
+			 * EXHAUSTED with its last block never decoded.  Observed on BEIR
+			 * scifact: term with df = 211 in blocks of 128 + 83, target 184499,
+			 * foreign first_docid 1167 -- 83 postings silently dropped, and the
+			 * fused top-k that came back was a correct top-k of the 128 that
+			 * survived.  So: a block containing the term's last posting is
+			 * never prove-skipped; it is decoded, which costs one block decode
+			 * per exhausting seek and is the only way to know where the list
+			 * really ends.
+			 *
+			 * The count test has to be `<` rather than `<=`: nread + count == df
+			 * means this block HOLDS the last posting, which is exactly the case
+			 * with no trustworthy header behind it.
+			 */
+			if (nextp + sizeof(WeaveBlockHdr) <= pend &&
+				c->nread + (int) bh->count < (int) c->df)
 			{
 				WeaveBlockHdr *nb = (WeaveBlockHdr *) nextp;
 				uint64		nbfirst = ((uint64) nb->first_docid_hi << 32) | nb->first_docid_lo;
@@ -8053,6 +8078,41 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 				err = weave_fuse_run(&st);
 				if (err != WEAVE_FUSE_OK)
 					weave_fuse_error(&st, err);
+
+				/*
+				 * WHY THE LOOP ENDED, reported under the same GUC as the bound
+				 * checks and for the same reason: the counters cannot distinguish
+				 * "the channels ran out" from "a ceiling ended the scan over a
+				 * docid prefix", and those two have identical signatures from
+				 * SQL -- one is the answer, the other is G43.  A NOTICE rather
+				 * than a counter column so it needs no SQL version bump and so it
+				 * arrives per bolt, which is the granularity the stop has.
+				 */
+				if (st.check_bounds)
+				{
+					int			ci;
+
+					elog(NOTICE, "weave fused bolt %u: stop=%d pivots=" INT64_FORMAT " k=%d nheap=%d nsc=%d split=%d theta=%g ceiling=%g",
+						 s, st.stop, (int64) st.npivot, st.k, st.nheap,
+						 st.nsc, st.split,
+						 (double) st.theta, (double) st.suffix[0]);
+
+					/*
+					 * PER CHANNEL, because "the answer is wrong" is not
+					 * actionable and "channel 0 stopped seeking at position N
+					 * having scored 128 of its 211 postings" is.  cur is where
+					 * the channel ENDED, so a channel that froze mid-list is
+					 * visible here and nowhere else.
+					 */
+					for (ci = 0; ci < nch; ci++)
+						elog(NOTICE, "  chan %d kind=%s cur=%u blkend=%u nseek=" INT64_FORMAT " nscore=" INT64_FORMAT " nbmax=" INT64_FORMAT " maxscore=%g w=%g",
+							 ci, weave_channel_kind_name(ss[ci]->kind),
+							 (unsigned) cp[ci]->cur, (unsigned) cp[ci]->blkend,
+							 (int64) cp[ci]->nseek, (int64) cp[ci]->nscore,
+							 (int64) cp[ci]->nbmax,
+							 (double) cp[ci]->maxscore,
+							 (double) cp[ci]->weight);
+				}
 				nh = weave_fuse_drain(&st, heap);
 
 				/*

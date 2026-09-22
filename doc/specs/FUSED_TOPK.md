@@ -710,24 +710,64 @@ and no amount of SIMD recovers it. Record the negative result in
 `pg_turbovec/docs/PARITY_GAPS.md` are the house style for that, and the retracted
 "we win 2.3×" claim in the latter is exactly the mistake to avoid.
 
-### 8b. STATUS: this section is BLOCKED, and by a wrong answer rather than a harness
+### 8b. STATUS: unblocked 2026-09-22. The gate went red on first contact with a real corpus, and is now green.
 
-`bench/fuse.sh` and `bench/prepdata.py` exist, run end to end on BEIR scifact, and
-their first real dataset found **`doc/GAPS.md` G43**: the fused path returns a
-different top-10 than two non-fused vector paths that agree with each other, admitting
-a lower-scoring document and dropping a higher one. Block pruning is provably not
-involved (`blkskip = 0`, every document a pivot); the leading hypothesis is that the
-vector channel's ceiling is not a true upper bound, made reachable by F8 because the
-fused scorer's abandonment prune *acts* on a bound the single-channel path computes and
-ignores.
+`bench/fuse.sh` and `bench/prepdata.py` run end to end on BEIR scifact, and their first
+real dataset found **`doc/GAPS.md` G43**: the fused path returned a plausible,
+correctly-ordered top-10 that was wrong in six of ten rows. The cause was neither the
+vector channel nor any bound — it was `wand_skip_blocks()` declaring a posting cursor
+exhausted one block early, by reading the block header that follows a term's final block
+as though it belonged to that term. Fixed; `sql/orderby.sql`'s last section is the
+regression, with a positive control.
 
-So no row of the table above has been measured on a real corpus, deliberately: hard
-rule 8 says verify correctness before recording a latency. The harness's correctness
-gate is red and that is the harness working. What the attempt did produce, beyond G43,
-is the two instruments below and one correction to this document's own method — the
-`fuse()` fallback is not an oracle at scale, for the reason §7a (1) gives, so the gate
-compares against an exhaustive per-channel oracle built from `weave_search()` and
-`weave_vec_scan()` instead.
+**Two things about the diagnosis belong in this document rather than only in GAPS.**
+
+First, the defect was **unreachable before F2/F8 and is not in the fused core.** The
+plain ranked path never reaches that header inference at all — instrumented, zero times
+on the same corpus and queries — because it advances with `wand_next()` and only a
+second channel driving the pivot produces a seek that jumps past a block boundary while
+postings remain. The fused scan is therefore the first consumer of the posting cursor's
+seek contract at full generality, and it should be assumed to be the first consumer of
+every other channel's too. **A channel that passes its single-channel tests has been
+tested against one caller.**
+
+Second, the first three hypotheses were all wrong and all *explained the symptom*: a
+too-low vector ceiling, OR-accumulation, and early termination each predicted "admits a
+lower document, drops a higher one". What discriminated was not analysis but the
+experiment that REMOVES a component — weighting the vector channel down to `1e-6` and
+finding the wrong answer bit-for-bit unchanged. That took two minutes and should have
+been first.
+
+Correctness gate as of the fix: **25 of 25 judged scifact queries, 0 mismatches** against
+the exhaustive per-channel oracle. No row of the table above is filled in yet, because the
+numbers must come from EC2 and not from a shared workstation — but the reason is now cost
+and validity, not correctness. What the blocked period also produced is the two
+instruments below, the loop-exit reporting described in §8c, and one correction to this
+document's own method: the `fuse()` fallback is not an oracle at scale, for the reason
+§7a (1) gives, so the gate compares against an exhaustive per-channel oracle built from
+`weave_search()` and `weave_vec_scan()` instead.
+
+### 8c. Why the loop stopped, reported per bolt
+
+`weave_fuse_run()` has four exits and they were indistinguishable from outside the core:
+the counters look identical whether the channels ran out of candidates or a ceiling
+ended the scan early, and a wrong answer from a top-k loop is nearly always a loop that
+ended before the document set did. G43 cost hours to exactly that ambiguity — the
+returned rows were a correct top-k of a docid *prefix*, which is the signature of the
+ceiling test firing on an under-reported `maxscore`, and the ceiling test had never
+fired.
+
+`WeaveFuseState.stop` now records one of `WEAVE_FUSE_STOP_EXHAUSTED`, `_CEILING`,
+`_REQUIRED` or `_NOCAND`, set at every break, so zero after a run means a fifth exit
+exists. `src/am/amscan.c` reports it per bolt under `pg_weave.fuse_check_bounds`
+alongside `theta`, the total ceiling, `k`, `nheap` and the partition split, and then one
+line per channel with its final position, seek count, score count and `maxscore`. That
+per-channel line is what turned G43 from a mystery into a two-minute diagnosis:
+`chan 0 kind=lexical cur=4294967295 nseek=129 nscore=128` against a term with 211
+postings.
+
+A NOTICE rather than a counter column, deliberately: it needs no SQL version bump, and
+it arrives per bolt, which is the granularity a stop actually has.
 
 ### 8a. The instrument, added 2026-09-22, and the two things it already says
 

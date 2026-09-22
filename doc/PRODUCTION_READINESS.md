@@ -203,6 +203,34 @@ when the scope was read as "BM25 + vector", then back when it was restated as al
 six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
 hard rule was weakened on an inference about scope rather than a question about it.*
 
+**Also closed 2026-09-22, and it is the most consequential correctness finding this project
+has recorded: `doc/GAPS.md` G43.** The fused path returned a **plausible, correctly-ordered,
+wrong** top-k on BEIR scifact — six of ten rows wrong, every row defensible in isolation,
+found the first time a pg_weave index was built over a real text+vector corpus. The cause was
+not in the fused core, not in the vector channel, and not in any bound: `wand_skip_blocks()`
+in the lexical posting cursor decides a block lies below the seek target by reading **the next
+block's header**, which for a term's FINAL block belongs to another term, so the cursor
+declared itself exhausted with its last block never decoded. A term with df 211 in blocks of
+128 + 83 silently lost 83 postings.
+
+Four things follow, and they are readiness statements rather than a bug report:
+
+1. **The fused scan is the first caller that exercises the posting cursor's seek contract at
+   full generality.** Instrumented, the plain ranked path reaches that inference **zero**
+   times on the same corpus and queries. So passing single-channel tests means a channel has
+   been tested against one caller, and every other channel should be assumed to be in the
+   same position until a fused scan has driven it.
+2. **No fixed-expected-output test can catch this class**, and none did — hard rule 1's
+   argument arriving from page layout rather than from a bound's arithmetic. What caught it
+   was a benchmark harness with a correctness gate in front of it, against an exhaustive
+   per-channel oracle. That gate is now the cheapest real-corpus assurance this project has.
+3. **Two claims were retracted in place** (hard rule 13): the vector-ceiling hypothesis, and
+   "the (C2) check ran and did not fire" — the latter because the GUC had been defined inside
+   `#ifdef WEAVE_TEST_HOOKS` and did not exist in any shipped build, while `SHOW` echoed back
+   `on` from a placeholder. An absent GUC is indistinguishable from one that is off.
+4. **The §8 benchmark table is now blocked only on EC2 time**, not on correctness. Gate:
+   25 of 25 judged scifact queries, 0 mismatches.
+
 **43 of 77 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
 Z5, Z8, Z9) and 6 withdrawn (L2, L21, V9, V10, V13, **F4**). By phase: X 4/4, L 16/20,
 Z 7/9, V 9/20, P 2/4, **F 6/9**, M 0/6, R 0/5. **Five rows were added on 2026-09-21

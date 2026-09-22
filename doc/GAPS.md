@@ -1885,7 +1885,83 @@ retracted — the suites print their own totals and a suite that ran and reporte
 evidence — but a suite that ABORTED would have been reported identically, and nothing
 distinguished the two until now.
 
-### G43 — the F8 fused vector path returns a different top-k than two non-fused paths that agree with each other, on a real corpus — **OPEN 2026-09-22, found by the section 8 benchmark harness on its first real dataset**
+### G43 — a fused scan returns a plausible wrong top-k on a real corpus, because a posting cursor reports itself exhausted one block early — **FIXED 2026-09-22 (same day). The vector channel was innocent; two hypotheses recorded below are RETRACTED in place.**
+
+**ROOT CAUSE, found by measurement and not by the reasoning further down.**
+`wand_skip_blocks()` in `src/am/amscan.c` advances a posting cursor over whole
+128-posting blocks reading block HEADERS only, and concludes a block lies entirely
+below the seek target when **the next block's `first_docid <= target`**. That inference
+holds only while the next block belongs to the same term. Posting lists share pages, so
+the header after a term's **final** block belongs to another term and its `first_docid`
+is an unrelated — typically small — number. Read as this term's continuation it
+"proves" the final block is below almost any target, so the block is skipped, `nread`
+reaches `df`, and the cursor reports **EXHAUSTED with its last block never decoded**.
+
+The fix is one condition: a block that holds the term's last posting is never
+prove-skipped, it is decoded. `nread + count < df` — strictly less, because
+`nread + count == df` is exactly the case with no trustworthy header behind it.
+
+**The evidence, in the order it actually arrived**, because every step of it was
+measurement and the three intermediate hypotheses were all wrong:
+
+1. Weighting the vector channel down to `1e-6` left the wrong answer **unchanged**,
+   which exonerated the vector channel completely and killed the abandonment
+   hypothesis below.
+2. Single-term queries were wrong too, so it was not OR accumulation. The terms that
+   were wrong (`properties` df 211, `show` df 1012) were the ones with more than one
+   posting block; the terms that were right (`dimensional` 72, `inductive` 2,
+   `biomaterials` 1) all fit in one.
+3. The returned top-10 was exactly the exhaustive top-10 **restricted to a docid
+   prefix**, which looked like early termination — and was not. New instrumentation
+   (`WeaveFuseState.stop`, reported per bolt under `pg_weave.fuse_check_bounds`) said
+   `stop = EXHAUSTED` with `ceiling = 6.64 > theta = 2.28`: the global ceiling test had
+   never fired. The four loop exits are indistinguishable from the outside, and hours
+   went into that difference; they are now named and reported.
+4. Per-channel reporting then made it trivial: `chan 0 kind=lexical cur=4294967295
+   nseek=129 nscore=128` — the lexical channel had scored 128 of its 211 postings and
+   parked on the end sentinel. Varying `k` over 128/512/2048 held `nscore` at exactly
+   128 every time, so the 128 was the **posting block size**, not the heap.
+5. A probe at the skip site printed the mechanism verbatim:
+   `blk count=83 nread=128 df=211 nbfirst=1167 target=184499 islast=1 skip=1`.
+   A foreign `first_docid` of 1167 "proving" that postings at docid 194098+ were below
+   target 184499.
+
+**Severity, stated precisely.** Every row returned was plausible and correctly ordered;
+the answer was a correct top-k of the subset that survived. Six of ten rows were wrong
+on the probed scifact query. **No fixed-expected-output test can catch this** and none
+did — which is hard rule 1's whole argument, arriving from the direction of a page
+layout rather than an arithmetic bound.
+
+**Why it needed a FUSED scan to surface, which is the reachability lesson.** The skip
+requires a seek target that jumps past the end of the cursor's current block while
+postings remain, and only a second channel driving the pivot produces one. Instrumented,
+the plain ranked path reached the header inference **zero** times on the same corpus and
+the same queries, while the fused path hit it on the first query. So the defect predates
+F8 and was unreachable before it — the same shape as the latency note below, and the
+reason the single-channel oracle stayed trustworthy throughout (it is what proved the
+fix).
+
+**Regression coverage** is `sql/orderby.sql`'s final section, and it needs four
+conditions at once — a term spanning more than one block, sorting early enough in the
+dictionary that another term's blocks follow its last one, sparse relative to a second
+dense term so that term's pivots land beyond its block boundaries, and varying document
+lengths so a top-k oracle is well defined at all. Each was observed to hide the bug when
+dropped; the first three fixtures tried reproduced nothing. Positive control: with the
+guard reverted the assertion reports 128 of 130 documents, missing exactly the two
+postings in the skipped final block.
+
+**Still owed, and not closed by this fix:** `test/hegel/test_vecbound.c` over both
+metrics (see below — that gap is real and independent of this bug's cause), and the
+abandonment audit added here has not yet fired on anything, so it has no positive
+control.
+
+---
+
+*Original entry, kept per hard rule 13. Its diagnosis was wrong; the measurements it
+records were all correct and are what the eventual root cause had to be consistent
+with.*
+
+### G43 (original) — the F8 fused vector path returns a different top-k than two non-fused paths that agree with each other, on a real corpus — **was OPEN 2026-09-22, found by the section 8 benchmark harness on its first real dataset**
 
 Found while smoke-testing `bench/fuse.sh` against BEIR scifact (5,183 documents, 384-d
 vectors, `metric = 'ip'`, PG17.11, extension 0.19.0). This is the first time any
@@ -1921,7 +1997,20 @@ lower-scoring document and drops a higher one. Stable across `LIMIT 10`, `20` an
 - *A float32 tie at the cut.* The two documents' oracle scores are 5.42375 and
   5.37364 — a 0.9 % gap, not a rounding artifact.
 
-**What is left, and it is the leading hypothesis rather than a diagnosis.** The only
+**What is left, and it is the leading hypothesis rather than a diagnosis.**
+— **RETRACTED 2026-09-22. The vector channel was not involved at all.** Weighting it
+down to `1e-6` left the wrong answer bit-for-bit unchanged, which no vector-ceiling
+defect can survive. The correlation recorded in this paragraph is real and was a
+coincidence of this corpus: the dropped documents lived in a posting block the LEXICAL
+cursor had skipped, and their vector scores happened to be the higher ones. **A
+correlation observed in "every disagreement" when there are two disagreements is one
+observation, not a pattern** — and it pointed at the channel that was working. What
+made it seductive is that it explained the *direction* of the error; what should have
+killed it in ten minutes is the weight sweep, which is the cheapest possible test of
+"is this channel involved at all". Reach for the experiment that REMOVES a component
+before the one that explains the symptom.
+
+The only
 prune that fired is **incremental abandonment**: 4,564 of 5,183 documents were
 abandoned mid-sum on `s + csuffix[j+1] <= theta`. That test is sound only if each
 `csuffix` entry is a true upper bound on the remaining channels' scores at that
@@ -1951,7 +2040,22 @@ channel without a (C1)+(C2) property test is not merged; this is the subtler ver
 a test that covers a channel but not a *configuration* of it.
 
 **The (C2) check was made reachable and RAN, and the result is a refinement rather than
-an answer.** `st.check_bounds` was wired to `USE_ASSERT_CHECKING` alone, so the check
+an answer.** — **RETRACTED 2026-09-22: IT NEVER RAN.** The
+`DefineCustomBoolVariable("pg_weave.fuse_check_bounds", ...)` call was placed inside the
+`#ifdef WEAVE_TEST_HOOKS` block in `src/am/customscan.c`, and nothing in the Makefile,
+meson or flake defines that macro — so the GUC **did not exist in any build anyone
+runs**. `SET pg_weave.fuse_check_bounds = on` was then accepted as a *placeholder*
+custom GUC and `SHOW` echoed back `on`, so the check read as enabled while
+`st.check_bounds` stayed 0 for the whole run. The reasoning below about what the check
+is blind to is still correct and the audit it asks for was built; what is retracted is
+the evidence, because there was none. **An absent GUC is indistinguishable from a GUC
+that is off** unless you look in `pg_settings` — where a placeholder has no
+`short_desc`, and where the library must be LOADED in that session or the view is empty
+either way and tells you nothing. This is the same family as G42 one day earlier: a
+diagnostic needs a positive control exactly as much as a gate does, because until it has
+fired once, its silence is not evidence of anything.
+
+*What the original paragraph said:* `st.check_bounds` was wired to `USE_ASSERT_CHECKING` alone, so the check
 that names the offending channel sat behind a PostgreSQL rebuild on the one machine
 where the bug was in hand. It is now also a GUC — `pg_weave.fuse_check_bounds`, off by
 default, `PGC_USERSET` — because a correctness check reachable only by recompiling the
@@ -1983,6 +2087,13 @@ only catch scorer bugs, never bound bugs.
 Then extend `test_vecbound.c` over both metrics before touching anything.
 
 **Consequence for the benchmark, recorded because it is the reason this was found.**
+— **SUPERSEDED 2026-09-22: the gate is now GREEN and `bench/RESULTS_FUSE.md` is
+unblocked.** `bench/fuse.sh`'s correctness gate passes 25 of 25 judged scifact queries
+against the exhaustive per-channel oracle, with 0 mismatches, and the harness now runs
+end to end through its plan assertion, quality pass, work counters and latency pass. No
+EC2 run had been spent on the broken state, which is the outcome hard rule 8 exists to
+produce. The paragraph below stands as written for the period it described.
+
 `bench/RESULTS_FUSE.md` is **not** being produced from this state. Hard rule 8: verify
 correctness before recording a latency, and a benchmark of a broken fast path is worse
 than no benchmark. The harness stays, its correctness gate stays red, and no EC2 run

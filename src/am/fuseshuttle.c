@@ -173,6 +173,21 @@ weave_fuse_error(const WeaveFuseState *st, WeaveFuseError err)
 							 "A bound that is too low silently drops rows.")));
 			break;
 
+		case WEAVE_FUSE_C2_ABANDON:
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("weave fused scan abandoned a document it should have kept"),
+					 errdetail("Incremental abandonment discarded a document on a "
+							   "sum of bounds, but the actual scores put it above "
+							   "the threshold; channel kind %s scored furthest "
+							   "above the bound it reported.", kind),
+					 errhint("This is contract (C2) in include/weave/channel.h, "
+							 "seen through the one prune the per-score check "
+							 "cannot audit. A bound that is too low silently "
+							 "drops rows. Only reachable with "
+							 "pg_weave.fuse_check_bounds on.")));
+			break;
+
 		case WEAVE_FUSE_NAN_SCORE:
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),

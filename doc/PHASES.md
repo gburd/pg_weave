@@ -734,14 +734,31 @@ things the gate still has no run behind, and neither is F2's: **nDCG on ≥ 2 pu
 datasets** (BEIR subset + MS MARCO), which this project has never produced, and an **RRF
 control implementation** to measure against.
 
-**AND THE GATE IS NOW BLOCKED ON A WRONG ANSWER, not on a missing harness
-(2026-09-22).** `bench/fuse.sh` runs end to end and its first real dataset found
-`doc/GAPS.md` **G43**: the fused path disagrees with two non-fused vector paths that
-agree with each other. No row of §8's table has been measured and no EC2 run was
-spent, per hard rule 8. G43 names the decisive next step (a `cassert` build, whose
-`check_bounds` assertion would name the offending channel) and the property-test hole
-it depends on (`test/hegel/test_vecbound.c` covers neither metric explicitly, while
-the bound has separate ip and l2 forms).
+**~~AND THE GATE IS NOW BLOCKED ON A WRONG ANSWER, not on a missing harness
+(2026-09-22).~~ UNBLOCKED THE SAME DAY.** `bench/fuse.sh` runs end to end and its first
+real dataset found `doc/GAPS.md` **G43**: the fused path disagreed with two non-fused
+vector paths that agreed with each other. No row of §8's table had been measured and no
+EC2 run was spent, per hard rule 8 — which is the outcome that rule exists to produce.
+
+**G43 is FIXED**, and by nothing this paragraph originally predicted: the vector channel
+was innocent, no bound was too low, and the decisive next step named here (a `cassert`
+build) would not have found it. The cause was `wand_skip_blocks()` in the LEXICAL posting
+cursor treating the block header that follows a term's final block as that term's own,
+declaring the cursor exhausted with its last block never decoded. The fused scan is
+simply the first caller whose seek pattern reaches that inference — instrumented, the
+plain ranked path reaches it zero times. Correctness gate now: **25 of 25 judged scifact
+queries, 0 mismatches** against the exhaustive per-channel oracle. Regression coverage is
+`sql/orderby.sql`'s final section, with a positive control.
+
+So §8's table is blocked only on **EC2 time** now, not on correctness. Two things the gate
+still has no run behind, and neither is F2's: **nDCG on ≥ 2 public datasets** (BEIR subset
++ MS MARCO) and an **RRF control implementation** to measure against — the harness now has
+both arms, so this is a run, not a build.
+
+**The property-test hole G43 named is still open and is independent of G43's cause:**
+`test/hegel/test_vecbound.c` covers neither metric explicitly while the bound has separate
+ip and l2 forms (`include/weave/quantize.h:535,551`). Hard rule 1's subtler case — a test
+that covers a channel but not a *configuration* of it — and it stays owed.
 
 **A third blocker existed and was invisible until someone tried to write the harness
 (2026-09-22): there was no way to read the `score()` count from SQL.** The core has

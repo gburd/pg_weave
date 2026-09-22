@@ -516,7 +516,6 @@ _PG_init(void)
 							 0.2, 0.0, 1.0,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 
-#ifdef WEAVE_TEST_HOOKS
 	/*
 	 * THE (C2) CHECK, AVAILABLE IN A RELEASE BUILD, and it is diagnostics rather
 	 * than a test hook.
@@ -535,6 +534,18 @@ _PG_init(void)
 	 * hot path.  PGC_USERSET so it can bracket one query.  It can only ever turn a
 	 * silent wrong answer into an ERROR naming the channel, which is the safe
 	 * direction for a correctness check.
+	 *
+	 * IT MUST STAY OUTSIDE THE WEAVE_TEST_HOOKS BLOCK BELOW, and it spent its first
+	 * day inside it: nothing in the Makefile, meson or flake defines that macro, so
+	 * the GUC did not exist in any build anyone runs.  `SET pg_weave.fuse_check_bounds
+	 * = on` was then accepted as a PLACEHOLDER custom GUC and `SHOW` echoed back
+	 * `on`, so the check read as enabled, ran nothing, and was recorded as having
+	 * cleared a bound it never examined.  Two lessons, the second general: a GUC that
+	 * is ABSENT is indistinguishable from one that is OFF unless you look in
+	 * pg_settings (a placeholder has no short_desc -- and the library must be LOADED
+	 * in that session or the view is empty either way); and a diagnostic needs a
+	 * positive control exactly as much as a gate does, because until it has fired
+	 * once its silence is not evidence of anything.
 	 */
 	DefineCustomBoolVariable("pg_weave.fuse_check_bounds",
 							 "Raise an error if a fused channel's score() exceeds its block_max() (C2).",
@@ -546,6 +557,7 @@ _PG_init(void)
 							 false,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 
+#ifdef WEAVE_TEST_HOOKS
 	/*
 	 * TEST-ONLY build.  This GUC only exists when compiled with
 	 * -DWEAVE_TEST_HOOKS (never in a release build recipe -- Makefile, meson,

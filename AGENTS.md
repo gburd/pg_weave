@@ -220,6 +220,35 @@ Two rules follow, and the second is the one that generalizes:
   thing under test, the damage is not the bugs it let through; it is that every green it
   ever printed becomes uninformative in retrospect.
 
+**TWELFTH MEMBER, one day after the eleventh, and it is the same shape wearing a
+GUC.** A diagnostic GUC added specifically to investigate `doc/GAPS.md` G43 —
+`pg_weave.fuse_check_bounds`, whose own comment says "AVAILABLE IN A RELEASE BUILD, and
+it is diagnostics rather than a test hook" — was placed **inside the
+`#ifdef WEAVE_TEST_HOOKS` block**, which nothing in the Makefile, meson or flake defines.
+So the GUC did not exist in any build anyone runs. `SET pg_weave.fuse_check_bounds = on`
+was then accepted as a **placeholder** custom GUC, `SHOW` echoed back `on`, the check
+never executed, and "the check ran and did not fire" was recorded in the gap entry and in
+project memory as evidence that a bound was sound. It had examined nothing.
+
+- **An absent GUC is indistinguishable from a GUC that is OFF.** `SHOW` cannot tell you;
+  it happily reports placeholder values. `pg_settings` can — a placeholder has no
+  `short_desc` — but **only in a session where the library is actually LOADED**, and a
+  fresh `psql -c "select ... from pg_settings"` loads nothing, so the view is empty and
+  answers a question you did not ask. Touch an index first, then look.
+- **A diagnostic needs a positive control exactly as much as a gate does.** Until it has
+  fired once, its silence is not evidence of anything. The eleventh member said this
+  about a test target; it is equally true of an assertion, a GUC, a counter and a
+  `WARNING`. When the abandonment audit built for G43 also stayed silent, that silence
+  was correctly treated as uninformative — and the instrument that did find the bug was
+  a per-channel `elog` proven to fire before it was trusted.
+
+*And the diagnostic sequence that eventually worked is worth copying,* because three
+plausible hypotheses each explained the symptom and all three were wrong. What
+discriminated was never analysis; it was **the experiment that REMOVES a component
+rather than the one that explains the behaviour**. Weighting the suspected channel down
+to `1e-6` and finding the wrong answer bit-for-bit unchanged took two minutes and
+exonerated it completely. Reach for the ablation first.
+
 **A gate that reports FAIL and nothing else costs a round trip**, which on a remote
 build host is minutes. Print the compiler's own error lines on a build failure and the
 install log's tail on an install failure. Two round trips were burned on
