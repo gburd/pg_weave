@@ -378,4 +378,80 @@ extern uint64 weave_chan_surf_cache_misses; /* consults that had to load */
 extern uint64 weave_chan_surf_cache_evicts; /* images dropped to stay in budget */
 extern uint64 weave_chan_surf_cache_bytes;	/* resident image bytes RIGHT NOW */
 
+/*
+ * FUSED-SCORER WORK COUNTERS (accumulated in src/am/amscan.c, read from SQL via
+ * weave_fuse_stats()).  Backend-local, always compiled in, same discipline and
+ * the same "a zero is not evidence unless the query ran in this session" caveat
+ * as the two blocks above.
+ *
+ * WHY THESE ARE A SEPARATE FUNCTION rather than more columns on
+ * weave_channel_stats().  That one answers "which mechanism served a leaf" and
+ * counts once per leaf or per segment; these count the scorer's inner loop and
+ * run to millions.  Mixing a routing flag and a work total in one record invites
+ * exactly one mistake -- dividing one by the other -- and the reset cadences
+ * differ too: a benchmark brackets a single query with these.
+ *
+ * WHAT THEY ARE FOR, and it is not diagnostics.  doc/specs/FUSED_TOPK.md sect. 8
+ * makes the `score()`-call ratio against RRF the row that decides whether this
+ * whole design means anything: "if the score() call ratio is not dramatically
+ * lower, stop and fix the bounds before optimizing anything else".  That row was
+ * unmeasurable until these existed -- the core has counted into WeaveFuseChan and
+ * WeaveFuseState since F1, and nothing carried the numbers out of the scan.
+ *
+ * TWO WAYS TO MISREAD `scores`, both of which would manufacture a wrong ratio, and
+ * both of which is why `passes` and `runs` are reported beside it rather than left
+ * for someone to reconstruct:
+ *
+ * 1. THE WIDENING LADDER RE-RUNS THE WHOLE FUSED PASS.  One SQL query climbs
+ *	  candidate widths k, 4k, 16k ... and each rung scores from scratch, so `scores`
+ *	  is the total over every rung and is NOT "the score() calls this query's answer
+ *	  cost".  A ratio is only honest when it is taken over the same quantity on both
+ *	  arms -- total work per query -- or when `passes` is 1 on both.  The merge-race
+ *	  retry inside a single rung widens nothing and still re-runs; it increments
+ *	  `passes` too, for the same reason.
+ * 2. THE FUSED PASS RUNS ONCE PER BOLT.  `runs` is bolts summed over passes, so
+ *	  `scores / runs` is per-bolt and `scores / passes` is per-query-pass.  Neither
+ *	  is per document.
+ *
+ * `bounds` exists so the gate row cannot be passed dishonestly: halving score()
+ * calls by asking block_max() twice as often moves work rather than removing it,
+ * and on the vector channel block_max() reads the block's stored bound.  See the
+ * comment on WeaveFuseChan.nbmax in include/weave/fuse.h.
+ *
+ * A VECTOR CHANNEL IS COUNTED ONCE, at the core's view of it.  Task F8 interposes
+ * include/weave/vecdocmap.h between the core and the vector shuttle, and that
+ * adapter forwards one score() per core score(); the forwarding calls are
+ * deliberately not counted, because counting both would double every vector score
+ * and the gate's quantity is what the CORE asked for.
+ */
+extern uint64 weave_fuse_passes;	/* fused passes started (ladder rungs plus
+									 * merge-race retries); see misreading 1 */
+extern uint64 weave_fuse_runs;	/* weave_fuse_run() calls: bolts x passes */
+extern uint64 weave_fuse_chans; /* channels summed over runs, so a mean channel
+								 * count is derivable and a one-channel "fused"
+								 * query cannot masquerade as a fused one */
+extern uint64 weave_fuse_seeks; /* channel seek() calls */
+extern uint64 weave_fuse_scores;	/* channel score() calls -- THE sect. 8 row.
+									 * INCLUDES the probe of every REQUIRED channel,
+									 * which src/am/fuse.c scores once per pivot to
+									 * obtain its veto.  So adding a selective gate
+									 * can RAISE this while making the query faster,
+									 * and claim 3 must be argued on `pivots`, not
+									 * here.  Total work is the right quantity
+									 * against RRF, which also evaluates the filter,
+									 * and the wrong one for claim 3 --
+									 * sql/fuse_pushdown.sql section 7 pins both
+									 * halves of that. */
+extern uint64 weave_fuse_bounds;	/* channel block_max() calls */
+extern uint64 weave_fuse_pivots;	/* candidate positions the core considered */
+extern uint64 weave_fuse_blkskip;	/* blocks skipped: bound could not beat theta */
+extern uint64 weave_fuse_rqskip;	/* ranges a required channel's intersection
+									 * jumped over */
+extern uint64 weave_fuse_livedrop;	/* positions dropped as tombstoned, kept apart
+									 * from pruning so a vacuum-heavy corpus cannot
+									 * flatter the prune rate */
+extern uint64 weave_fuse_veto;	/* documents a predicate channel rejected */
+extern uint64 weave_fuse_abandon;	/* documents abandoned mid-sum once the
+									 * remaining ceiling could not reach theta */
+
 #endif							/* WEAVE_H */

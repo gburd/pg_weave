@@ -710,6 +710,52 @@ and no amount of SIMD recovers it. Record the negative result in
 `pg_turbovec/docs/PARITY_GAPS.md` are the house style for that, and the retracted
 "we win 2.3×" claim in the latter is exactly the mistake to avoid.
 
+### 8a. The instrument, added 2026-09-22, and the two things it already says
+
+The `score()`-call row above was unmeasurable for as long as it has existed, and not
+for the reason the roadmap said. The core has counted since F1 — `WeaveFuseChan`
+carries `nseek` and `nscore`, `WeaveFuseState` carries `npivot`, `nblkskip`,
+`nrqskip`, `nlivedrop`, `nveto` and `nabandon`, and `src/am/fuse.c` increments all of
+them — but those structs are per-bolt scratch that dies with the scan's memory
+context, so **no query could read a single one of them.** The gate was not blocked on
+a benchmark harness; it was blocked on a counter with no way out. `weave_fuse_stats()`
+and `weave_fuse_stats_reset()` (extension 0.18.0) are that way out, and
+`include/weave/weave.h` states the contract, including the two ways `scores` can be
+misread into a wrong ratio: the widening ladder re-runs the whole pass per rung, and
+the pass runs once per bolt, so `passes` and `runs` are reported beside it.
+
+**A row this table is missing, and the instrument added a counter for it:**
+`block_max()` calls (`WeaveFuseChan.nbmax`). A change that halves `score()` calls by
+asking `block_max()` twice as often has moved work, not removed it, and on the vector
+channel `block_max()` reads the block's stored bound rather than returning a
+constant. There is no honest RRF control for it — RRF computes no bounds — so it is
+not a gated row here; it is a constraint on how the `score()` row may be read, and
+`bench/RESULTS_FUSE.md` must print both or neither.
+
+**What the property test already measured, for free and with no corpus.**
+`test/hegel/test_fuse_props.c` P4 asserted `fused ≤ reference` and now reports the
+ratio too, over 1,140,000 trials and 39,765,994 checks:
+
+| quantity | fused | exhaustive reference | ratio |
+|---|---|---|---|
+| `score()` calls | 55,809,045 | 242,068,130 | **0.231** |
+| `seek()` calls | 200,282,067 | 263,264,311 | 0.761 |
+| `block_max()` calls | 95,158,668 | — (the reference computes no bounds) | — |
+
+941,991 of 1,140,000 trials pruned at least one `score()` call, and the run now FAILS
+if that count is ever zero — a scorer whose prunes remove no scoring work on any input
+is this section's stop-everything signal, and finding that out should not require EC2.
+
+**This is not the gate and must never be quoted as it.** The control is an exhaustive
+scan of the same channels, not RRF over two indexes; the channels are synthetic; and
+synthetic score distributions are exactly what makes a bound look tight. What the
+0.231 establishes is narrower and still worth having: **the mechanism exists.** The
+prunes remove roughly three quarters of the scoring work on random input, which is the
+precondition for the real ratio being worth measuring. It also shows the cost side
+plainly — the fused scan calls `block_max()` **1.7× more often than it calls
+`score()`** — and that number has no counterpart in the table above, which is why the
+paragraph on `nbmax` is there.
+
 ## 9. Prior art to cite, and to not reinvent
 
 - Broder et al. 2003, **WAND** — the pivot/threshold idea.

@@ -970,13 +970,6 @@ weave_lookup_prefix(Relation index, const WeaveSegMeta *seg,
 {
 	BlockNumber blk = weave_dict_seek(index, seg, prefix, prefixlen);
 
-	/*
-	 * THE MECHANISM, counted where it is chosen rather than where it is
-	 * described.  One increment per (leaf, bolt) pair: a prefix leaf is
-	 * resolved once per bolt, and per-bolt is the unit any later comparison
-	 * against a trie route would have to be in.  doc/PHASES.md Z4.
-	 */
-	weave_chan_prefix_dict++;
 	int			cap = 32;
 	int			n = 0;
 	/* sized by the number of matching tuples, which is corpus-scale (a
@@ -984,6 +977,14 @@ weave_lookup_prefix(Relation index, const WeaveSegMeta *seg,
 	 * query rather than a vacuum */
 	ItemPointerData *tids = WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(ItemPointerData));
 	bool		done = false;
+
+	/*
+	 * THE MECHANISM, counted where it is chosen rather than where it is
+	 * described.  One increment per (leaf, bolt) pair: a prefix leaf is
+	 * resolved once per bolt, and per-bolt is the unit any later comparison
+	 * against a trie route would have to be in.  doc/PHASES.md Z4.
+	 */
+	weave_chan_prefix_dict++;
 
 	while (blk != InvalidBlockNumber && !done)
 	{
@@ -7656,6 +7657,15 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		complete = true;
 		gen0 = weave_read_meta_generation(index);
 		weave_read_meta(index, &meta);
+
+		/*
+		 * ONE PASS STARTED.  This counts ladder rungs AND merge-race retries, and
+		 * it is counted here rather than at the caller for that reason: both re-do
+		 * the whole bolt loop, so both multiply every other counter in
+		 * weave_fuse_stats(), and a `scores` total read without it is not the cost
+		 * of answering the query (include/weave/weave.h, misreading 1).
+		 */
+		weave_fuse_passes++;
 		N = meta.ndocs < 1.0 ? 1.0 : meta.ndocs;
 		avgdl = meta.ndocs > 0 ? meta.sumdoclen / meta.ndocs : 1.0;
 
@@ -8019,6 +8029,36 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 				if (err != WEAVE_FUSE_OK)
 					weave_fuse_error(&st, err);
 				nh = weave_fuse_drain(&st, heap);
+
+				/*
+				 * CARRY THE CORE'S COUNTERS OUT, because the channels and the state
+				 * die with segctx and the numbers are the only evidence
+				 * FUSED_TOPK.md sect. 8's gate row has.  After drain rather than
+				 * after run: drain touches neither, and an error path that never
+				 * reaches here then contributes nothing rather than contributing
+				 * half a run.
+				 *
+				 * OVER cp[], NOT chans[], and that is the whole correctness content
+				 * of this loop.  For a vector slot cp[] holds the F8 adapter while
+				 * chans[] holds the shuttle channel the adapter drives; the adapter
+				 * forwards one call per call, so summing both would double every
+				 * vector score and seek.  cp[] is what the CORE asked for, which is
+				 * the quantity the gate is about.
+				 */
+				weave_fuse_runs++;
+				weave_fuse_chans += (uint64) nch;
+				for (i = 0; i < nch; i++)
+				{
+					weave_fuse_seeks += (uint64) cp[i]->nseek;
+					weave_fuse_scores += (uint64) cp[i]->nscore;
+					weave_fuse_bounds += (uint64) cp[i]->nbmax;
+				}
+				weave_fuse_pivots += (uint64) st.npivot;
+				weave_fuse_blkskip += (uint64) st.nblkskip;
+				weave_fuse_rqskip += (uint64) st.nrqskip;
+				weave_fuse_livedrop += (uint64) st.nlivedrop;
+				weave_fuse_veto += (uint64) st.nveto;
+				weave_fuse_abandon += (uint64) st.nabandon;
 
 				/*
 				 * THE COMPLETENESS SIGNAL, and it is a proof rather than an

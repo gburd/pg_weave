@@ -286,9 +286,18 @@ struct WeaveFuseChan
 
 	/* Per-channel counters.  nscore is not bookkeeping: the ratio of score()
 	 * calls to RRF's is the row in FUSED_TOPK.md sect. 8 that decides whether
-	 * the bounds are tight enough for the design to mean anything. */
+	 * the bounds are tight enough for the design to mean anything.
+	 *
+	 * nbmax is here so that row cannot be read dishonestly.  A design that
+	 * halves score() calls by asking block_max() twice as often has moved work
+	 * rather than removed it, and on the vector channel block_max() is not free --
+	 * it reads the block's stored bound.  Reporting scores without bounds would
+	 * let a loose-bound regression look like a win, which is the exact failure
+	 * mode hard rule 8 was written for.  All three are read from SQL via
+	 * weave_fuse_stats(); the backend-side accumulation is in src/am/amscan.c. */
 	weave_ft_int64 nseek;
 	weave_ft_int64 nscore;
+	weave_ft_int64 nbmax;
 };
 
 /* One heap entry, and the scorer's output row. */

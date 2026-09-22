@@ -242,6 +242,7 @@ weave_fuse_init(WeaveFuseState *st, WeaveFuseChan **chan, int nchan,
 		c->blkend = 0;
 		c->nseek = 0;
 		c->nscore = 0;
+		c->nbmax = 0;
 
 		if (!fuse_finite(c->weight) || c->weight <= 0.0f)
 		{
@@ -516,6 +517,7 @@ weave_fuse_run(WeaveFuseState *st)
 			{
 				float		b = c->weight * c->ops->block_max(c);
 
+				c->nbmax++;
 				if (fuse_isnan(b))
 				{
 					st->badchan = c;

@@ -38,7 +38,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.17.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.18.0" of extension "pg_weave" is already installed
 -- Plan text stability only; nothing here is about parallelism.
 SET max_parallel_workers_per_gather = 0;
 -- A corpus with distinct BM25 scores per document for 'alpha', and a rare term

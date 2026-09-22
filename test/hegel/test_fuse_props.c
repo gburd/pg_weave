@@ -439,6 +439,25 @@ static long long agg_abandon = 0;
 static long long agg_livedrop = 0;
 static long long agg_split = 0;
 
+/*
+ * P4's MEASUREMENT, not just its assertion.  FUSED_TOPK.md sect. 8 makes the ratio
+ * of score() calls against the control the row that decides whether the design
+ * means anything -- "if the score() call ratio is not dramatically lower, stop and
+ * fix the bounds".  The control there is RRF on a real corpus and this is neither,
+ * so the number below is NOT that gate and must never be quoted as it.  What it is
+ * worth: a ratio of 1.000 here would mean the prunes remove no scoring work at all
+ * on ANY input, which sect. 8 says is the stop-everything signal, and finding that
+ * out costs nothing and needs no corpus.  agg_bmax is beside it because a design
+ * that trades score() calls for block_max() calls has moved work rather than
+ * removed it (include/weave/fuse.h, WeaveFuseChan.nbmax).
+ */
+static long long agg_fscore = 0;
+static long long agg_rscore = 0;
+static long long agg_fseek = 0;
+static long long agg_rseek = 0;
+static long long agg_fbmax = 0;
+static long long agg_score_win = 0;
+
 static void
 one_trial(TrialMode mode, int sabotage)
 {
@@ -596,12 +615,38 @@ one_trial(TrialMode mode, int sabotage)
 		long		fs = 0;
 		long		rs = 0;
 
+		long		fb = 0;
+
 		for (i = 0; i < nchan; i++)
 		{
 			fs += (long) fast[i].ch.nscore;
 			rs += (long) ref[i].ch.nscore;
+			fb += (long) fast[i].ch.nbmax;
+			agg_fseek += (long long) fast[i].ch.nseek;
+			agg_rseek += (long long) ref[i].ch.nseek;
 		}
 		CHECK(4, fs <= rs, "fused made %ld score() calls, reference %ld", fs, rs);
+
+		/*
+		 * AND THE COUNTERS THEMSELVES ARE CHECKED, because they are about to be
+		 * carried out to SQL and quoted.  Every score() and every block_max() the
+		 * core makes happens at a position it counted as a pivot, and at most once
+		 * per channel there, so npivot * nchan bounds both.  An extra increment --
+		 * the obvious way to get a flattering ratio by accident -- breaks this
+		 * before it reaches a results table.
+		 */
+		CHECK(4, fs <= (long) st.npivot * nchan,
+			  "%ld score() calls over %lld pivots x %d channels",
+			  fs, (long long) st.npivot, nchan);
+		CHECK(4, fb <= (long) st.npivot * nchan,
+			  "%ld block_max() calls over %lld pivots x %d channels",
+			  fb, (long long) st.npivot, nchan);
+
+		agg_fscore += (long long) fs;
+		agg_rscore += (long long) rs;
+		agg_fbmax += (long long) fb;
+		if (fs < rs)
+			agg_score_win++;
 	}
 
 	/* P5, P6 */
@@ -814,8 +859,28 @@ main(int argc, char **argv)
 		   agg_pivot, agg_blkskip, agg_rqskip, agg_veto, agg_abandon,
 		   agg_livedrop, agg_split);
 
+	/* SYNTHETIC, and labelled so in the output itself: this is not sect. 8's row.
+	 * See the comment on agg_fscore. */
+	printf("P4 work vs reference (SYNTHETIC, not the sect. 8 gate): "
+		   "score %lld/%lld = %.3f, seek %lld/%lld = %.3f, "
+		   "fused block_max %lld; %lld of %ld trials pruned a score() call\n",
+		   agg_fscore, agg_rscore,
+		   agg_rscore ? (double) agg_fscore / (double) agg_rscore : 0.0,
+		   agg_fseek, agg_rseek,
+		   agg_rseek ? (double) agg_fseek / (double) agg_rseek : 0.0,
+		   agg_fbmax, agg_score_win, trials);
+
 	/* Every prune must have fired.  A zero here means the generator stopped
 	 * reaching a path, not that the path is correct. */
+	if (agg_score_win == 0)
+	{
+		printf("P4 FAIL: the fused scan never once made fewer score() calls than "
+			   "the exhaustive reference, so the prunes remove no scoring work on "
+			   "any input this generator can produce -- FUSED_TOPK.md sect. 8's "
+			   "stop-everything signal\n");
+		failures++;
+	}
+
 	if (agg_blkskip == 0 || agg_rqskip == 0 || agg_veto == 0 ||
 		agg_abandon == 0 || agg_livedrop == 0 || agg_split == 0)
 	{

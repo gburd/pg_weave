@@ -32,7 +32,18 @@
 
 #include "weave/pagekind.h"
 
-/* Every id that is a real kind, in enum order. */
+/*
+ * Every id that is a real kind, in enum order.
+ *
+ * KEEP THIS LIST IN STEP WITH THE ENUM.  Check 7 below asserts that the last entry
+ * is WEAVE_PK_NKINDS - 1, which is the only thing that notices when a kind is
+ * allocated and not enumerated here -- and on 2026-09-22 it turned out FIVE were
+ * missing (PENDING_V9, the three CGRAM kinds, and PENDING_V10), so the assertion
+ * had been firing and aborting this test for several releases.  Nothing reported
+ * it, because `make check-standalone` invoked the binary as `$tmp/pk | tail -1` and
+ * a pipeline's exit status is tail's.  doc/GAPS.md G42; the Makefile now runs every
+ * standalone suite to a log and checks its own status.
+ */
 static const WeavePageKind all_kinds[] = {
 	WEAVE_PK_META, WEAVE_PK_DICT, WEAVE_PK_POSTING, WEAVE_PK_PENDING,
 	WEAVE_PK_TRGM, WEAVE_PK_TRGM_DATA, WEAVE_PK_LIVEDOCS, WEAVE_PK_DICTINDEX,
@@ -40,7 +51,9 @@ static const WeavePageKind all_kinds[] = {
 	WEAVE_PK_CHANDESC, WEAVE_PK_VMETA, WEAVE_PK_VCODES, WEAVE_PK_VGRAPH,
 	WEAVE_PK_VRERANK, WEAVE_PK_SURF, WEAVE_PK_ULEV, WEAVE_PK_REGEX,
 	WEAVE_PK_FUZZY_SPARE, WEAVE_PK_DOCVALS, WEAVE_PK_CGRAM,
-	WEAVE_PK_VDIR, WEAVE_PK_VWARP
+	WEAVE_PK_VDIR, WEAVE_PK_VWARP, WEAVE_PK_PENDING_V9,
+	WEAVE_PK_CGRAM_DICT, WEAVE_PK_CGRAM_DICTINDEX, WEAVE_PK_CGRAM_POST,
+	WEAVE_PK_PENDING_V10
 };
 
 #define NKINDS ((int) (sizeof(all_kinds) / sizeof(all_kinds[0])))

@@ -290,6 +290,18 @@ re-run, so its RRF control no longer has a stale lexical arm, and `bench/RESULTS
 is now blocked by F2 alone — plus the nDCG rows on two public datasets, which this
 project has never run at all.
 
+**And one blocker nobody had counted, found on 2026-09-22 by starting the harness:** the
+§8 gate's decisive row is the `score()`-call ratio, and **no query could read that number**
+— the core has counted since F1 into structs that die with the scan's memory context.
+`weave_fuse_stats()` (extension **0.18.0**) carries them out, with a `block_max()` count
+beside them so the ratio cannot be passed by trading score calls for bound calls. It is
+worth recording as a pattern rather than a fix: this is the third time a gate on this
+project turned out to be blocked on an instrument rather than on the feature it names
+(the allocator counters in 0.8.0 and the channel-mechanism counters in 0.9.0 were the
+other two), and each time the instrument settled something the same afternoon. Here it
+was that the fused scan calls `block_max()` 1.7× more often than `score()` — a cost the
+§8 table has no row for. `doc/specs/FUSED_TOPK.md` §8a.
+
 What F1 bought beyond code is five falsifications of the algorithm's own spec, all
 recorded in `FUSED_TOPK.md` §3a rather than quietly fixed, and one of them is a
 correction to a **correctness contract**: (C5)'s promise that a boolean channel needs
