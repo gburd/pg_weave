@@ -557,6 +557,27 @@ _PG_init(void)
 							 false,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 
+	/*
+	 * THE FUSED OBJECTIVE, and it is a ranking knob rather than a diagnostic: with
+	 * it on, every channel of a fuse() key is divided by that key's pre-scan
+	 * ceiling, so the weights mean relative influence instead of "whatever scale
+	 * this channel happens to emit".  Off is the raw weighted sum that shipped
+	 * before 2026-09-22, kept because it is the arm every recorded number in
+	 * bench/RESULTS_FUSE.md was measured on -- an A/B that cannot reproduce the
+	 * baseline is not an A/B (hard rule 10).
+	 *
+	 * PGC_USERSET, because it changes a ranking and nothing on disk.
+	 */
+	DefineCustomBoolVariable("pg_weave.fuse_normalize",
+							 "Divide each fuse() key by its own score ceiling before summing.",
+							 "On by default.  A raw sum adds a BM25 score reaching "
+							 "10-20 to a quantized inner product in [-1, 1], so equal "
+							 "weights are effectively lexical-only; see doc/GAPS.md "
+							 "G44.  Off restores the raw weighted sum.",
+							 &pg_weave_fuse_normalize,
+							 true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
 #ifdef WEAVE_TEST_HOOKS
 	/*
 	 * TEST-ONLY build.  This GUC only exists when compiled with

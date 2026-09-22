@@ -387,6 +387,34 @@ Four things, and it should claim exactly four things:
    bound** — note 3 asks only for a positive finite weight — so it may be a
    statistical estimate rather than a ceiling, which is a larger design space than
    "make the bound tighter".
+
+   **STATUS REVISED 2026-09-22 (later the same day; the UNSUPPORTED note above stays
+   as history, dated 2026-09-22, because it was correct when written). The RANKING
+   half of this claim is now SUPPORTED on three public datasets; the WORK-REDUCTION
+   half is not, and that is the part to keep quiet about.** The pre-scan normalizer
+   shipped — per `fuse()` **key**, each key divided by its own ceiling, query-global
+   rather than per bolt, behind `pg_weave.fuse_normalize` (default on) — and was
+   measured in the product rather than offline (`bench/normprod.sh`, three arms that
+   are the same statement differing only in the GUC, plus the RRF control):
+   nDCG@10 **0.7212 / 0.3455 / 0.3878** against RRF's 0.6846 / 0.3422 / 0.3482, i.e.
+   **1.053× / 1.010× / 1.114×**, with recall@100 up as well (scifact 0.8892 → 0.9683,
+   fiqa 0.5141 → 0.7079) so it is not a top-10 reshuffle. **The caveat travels with
+   the claim: on nfcorpus the normalized arm loses recall@100 (0.3206 vs 0.3251) and
+   MRR@10 (0.5441 vs 0.5514) to RRF** while winning nDCG@10 by 1.0 %. nfcorpus is a
+   gate-row win, not a clean one.
+
+   So what may now be said is exactly this: *the fused-threshold top-k is exact, and
+   its objective ranks at least as well as RRF on three BEIR corpora with one corpus
+   winning only the headline metric.* What may **not** be said is that it gets there
+   by doing less work. §8's `score()`-call row still fails at 0.648× / 0.903× /
+   0.541× against a 0.20× gate, because the vector block bound prunes nothing
+   (`vec_blocks_bound_skipped = 0` on all three datasets) and the vector channel sets
+   **71–87 %** of all fused `score()` calls; p50 is 0.582× / 0.795× / 0.578× against
+   ≤ 0.50×. **And the latency figures that used to back the "no over-fetch is also
+   cheaper" reading are STALE**: they were taken before the normalizer, which adds an
+   unmeasured pre-scan pass, so an EC2 re-run is owed before any p50 or p99 is quoted
+   for the shipping scorer (`bench/RESULTS_FUSE.md`, marked in place). `doc/GAPS.md`
+   **G44**, `doc/specs/FUSED_TOPK.md` **sect. 8d**.
 3. Queries that get **faster** as predicates get more selective, because the
    predicate is pushed into the SIMD block mask instead of collapsing recall.
    (The "graph traversal" half of this sentence is stale — the Vamana plan was

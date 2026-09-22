@@ -262,6 +262,14 @@ extern int pg_weave_surf_cache_mb;
  * DefineCustomBoolVariable in src/am/customscan.c. */
 extern bool pg_weave_fuse_check_bounds;
 
+/* THE FUSED OBJECTIVE'S PER-KEY NORMALIZER, on by default.  Off restores the raw
+ * weighted sum of channel scores, which is what shipped before 2026-09-22 and which
+ * loses to an RRF control on every corpus measured because BM25 and a quantized inner
+ * product differ by ~33x in scale (doc/GAPS.md G44, doc/specs/FUSED_TOPK.md sect. 8d).
+ * It exists so the two objectives can be A/B'd in the product rather than in a study,
+ * and so a corpus that the ceiling's looseness pushes the wrong way has a way out. */
+extern bool pg_weave_fuse_normalize;
+
 /* Allocator outcome counters (src/am/am.c).  Backend-local; read from SQL via
  * weave_alloc_stats().  See the block comment above weave_new_buffer() for why
  * they are always compiled in and why they are read from SQL rather than logged. */

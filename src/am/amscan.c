@@ -7674,6 +7674,8 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		WeaveDoclenDirCache *doclendir;
 		WeaveDoclenResident *doclenres = NULL;
 		FuseKeyTerms *kt;
+		double	   *keynorm;
+		float4	   *fw;
 		MemoryContext old;
 		uint32		gen0;
 		uint32		s;
@@ -7719,8 +7721,12 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		weave_tombstones_load(index, &meta, &tombs);
 
 		kt = (FuseKeyTerms *) palloc0(so->nfuse * sizeof(FuseKeyTerms));	/* alloc-ok: one per fuse() score argument, at most WEAVE_FUSE_MAX_CHAN */
+		keynorm = (double *) palloc0(so->nfuse * sizeof(double));	/* alloc-ok: as above */
+		fw = (float4 *) palloc(so->nfuse * sizeof(float4));	/* alloc-ok: as above */
 		for (qi = 0; qi < so->nfuse; qi++)
 		{
+			uint32	   *mtf;
+
 			/* A vector key has no terms and no IDF: its channel is one shuttle per
 			 * bolt, built below.  palloc0 above already left nterms zero, and every
 			 * loop over kt[qi] is bounded by it, so the vector keys simply fall
@@ -7733,6 +7739,8 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 											  &kt[qi].lens);
 			kt[qi].idf = (double *)
 				palloc(Max(kt[qi].nterms, 1) * sizeof(double));	/* alloc-ok: one per query term */
+			mtf = (uint32 *)
+				palloc0(Max(kt[qi].nterms, 1) * sizeof(uint32));	/* alloc-ok: one per query term */
 			for (t = 0; t < kt[qi].nterms; t++)
 			{
 				uint64		gdf = 0;
@@ -7747,11 +7755,127 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 					if (weave_lookup_dict(index, &meta.segs[s], kt[qi].terms[t],
 										  kt[qi].lens[t], &df, &max_tf,
 										  &firstblk, &firstoff))
+					{
 						gdf += df;
+
+						/*
+						 * THE LARGEST max tf ANYWHERE, not this bolt's, and that is
+						 * the whole reason this is collected in the loop that
+						 * already reads every bolt's dictionary entry rather than
+						 * in the bolt loop below: the per-key normalizer it feeds
+						 * must be one constant for the query (sect. 8d), because
+						 * the pass merges per-bolt top-k lists by score.  Free
+						 * here -- these lookups happen anyway, for the global df.
+						 */
+						if (max_tf > mtf[t])
+							mtf[t] = max_tf;
+					}
 				}
 				kt[qi].idf[t] = (gdf == 0) ? -1.0
 					: log(1.0 + (N - (double) gdf + 0.5) / ((double) gdf + 0.5));
 			}
+
+			/*
+			 * THE KEY'S CEILING: the sum over its terms of the term-wide bound, at
+			 * the same (idf, k1, b, avgdl) the cursors below will use.  PER KEY, and
+			 * not per channel, which is the one part of this that is easy to get
+			 * wrong and hard to notice: a lexical key expands to one channel PER
+			 * TERM, so dividing each channel by its own ceiling would rescale the
+			 * query's terms against each other and partially undo idf -- the thing
+			 * BM25 is for.  The algebra survives either way, so nothing would
+			 * complain; only the ranking would be worse.  doc/GAPS.md G44.
+			 *
+			 * A term absent from the whole index (idf < 0) contributes no channel,
+			 * so it contributes nothing here either.
+			 */
+			for (t = 0; t < kt[qi].nterms; t++)
+			{
+				WeaveBm25Factors bm;
+
+				if (kt[qi].idf[t] < 0.0)
+					continue;
+				weave_bm25_factors_init(&bm, kt[qi].idf[t], 1.2, 0.75, avgdl);
+				keynorm[qi] += weave_bm25_term_bound(&bm, (double) mtf[t]);
+			}
+			pfree(mtf);
+		}
+
+		/*
+		 * AND THE VECTOR KEYS' CEILINGS, over every bolt, before any bolt is
+		 * scanned -- for the reason include/weave/vector.h gives above
+		 * weave_vec_weft_maxscore().  The skip conditions are the bolt loop's,
+		 * verbatim and in the same order: a bolt this pass will not score must not
+		 * enter the maximum, or a weft belonging to another column would set the
+		 * scale for a key that never reads it.
+		 */
+		for (qi = 0; qi < so->nfuse; qi++)
+		{
+			if (so->fuseStrat[qi] == WEAVE_STRAT_DISTANCE)
+				continue;
+
+			for (s = 0; s < meta.nsegments; s++)
+			{
+				WeaveVecWeft w;
+				BlockNumber root;
+				const char *why = NULL;
+				uint16		wattnum = 0;
+				float		ms = 0.0f;
+
+				if (meta.segs[s].dictstart == InvalidBlockNumber)
+					continue;
+				root = weave_vec_weft_locate(index, &meta.segs[s], &wattnum);
+				if (root == InvalidBlockNumber)
+					continue;
+				if (wattnum != 0 && so->fuseA[qi] != 0 &&
+					wattnum != (uint16) so->fuseA[qi])
+					continue;
+				if (!weave_vec_weft_open(index, root, &w, &why))
+					continue;	/* the bolt loop raises; see vector.h */
+				if (w.meta.nvec == 0)
+					continue;
+
+				if (weave_vec_weft_maxscore(&w, so->fuseV[qi]->x,
+											(int) so->fuseV[qi]->dim,
+											&ms, &why) &&
+					(double) ms > keynorm[qi])
+					keynorm[qi] = (double) ms;
+			}
+		}
+
+		/*
+		 * THE EFFECTIVE WEIGHT EACH CHANNEL OF A KEY CARRIES, w_key / N_key.
+		 *
+		 * This is the whole of G44's fix and it is arithmetic, not machinery: the
+		 * raw sum of a BM25 score reaching 10-20 and a quantized inner product in
+		 * [-1, 1] is a 33x scale mismatch, so equal weights are lexical-only and the
+		 * fused ranking loses to an RRF control that never sees units.  Dividing
+		 * each key by its own pre-scan ceiling put the fused objective ABOVE RRF on
+		 * all three corpora measured (doc/GAPS.md G44), at the cost of no extra pass
+		 * and no new on-disk state.
+		 *
+		 * w/N is positive and finite, which is all include/weave/fuse.h note 3 asks,
+		 * so (C2), the suffix sums and the MaxScore partition are untouched.  One
+		 * property does improve: each key's weighted ceiling is now exactly its
+		 * weight, so suffix[0] = sum of the weights and a weights array finally
+		 * means relative influence.
+		 *
+		 * A NON-POSITIVE OR NON-FINITE NORMALIZER LEAVES THE WEIGHT ALONE rather
+		 * than dividing: a zero would make weave_fuse_init() refuse the scan
+		 * (WEAVE_FUSE_BAD_WEIGHT) and an infinity would silently zero the channel.
+		 * It is reachable -- a key whose every term is absent from the index has
+		 * ceiling 0, and so does a bolt-less vector key -- and in both cases the
+		 * channel has nothing to contribute anyway.
+		 */
+		for (qi = 0; qi < so->nfuse; qi++)
+		{
+			double		eff = (double) so->fuseW[qi];
+
+			if (pg_weave_fuse_normalize && keynorm[qi] > 0.0 &&
+				!isinf(keynorm[qi]) && !isnan(keynorm[qi]))
+				eff = (double) so->fuseW[qi] / keynorm[qi];
+			fw[qi] = (float4) eff;
+			if (!(fw[qi] > 0.0f) || isinf(fw[qi]))
+				fw[qi] = so->fuseW[qi];
 		}
 
 		/*
@@ -7883,7 +8007,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 					 * double-count AND scale the bound, so (C2) would still hold
 					 * and the scores would simply be wrong -- the undetectable kind.
 					 */
-					sh->weight = so->fuseW[qi];
+					sh->weight = fw[qi];
 					ss[nch++] = sh;
 					nscored++;
 				}
@@ -7964,8 +8088,8 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 				sh = weave_vec_shuttle_begin(&w, (int) s, so->fuseV[qi]->x,
 											 (int) so->fuseV[qi]->dim,
 											 allow, (WeaveWarp) w.meta.nvec,
-											 so->fuseW[qi]);
-				sh->weight = so->fuseW[qi];
+											 fw[qi]);
+				sh->weight = fw[qi];
 
 				vc[nvc].slot = nch;
 				vc[nvc].docid = dmap;

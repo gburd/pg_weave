@@ -747,6 +747,43 @@ Two of five rows fail:
 | nDCG@10 | ≥ RRF | 0.982× | 0.924× | 0.687× | **FAIL** |
 | `score()` calls | ≤ 0.20× | 0.648× | 0.903× | 0.541× | **FAIL** |
 
+**UPDATE 2026-09-22 (later the same day): the nDCG row is MET, so the gate is 3 of 5
+passing and 2 of 5 failing.** The fix is G44's per-key ceiling normalizer, now implemented
+and measured **in the product** — `bench/normprod.sh`, three arms that are the same fused
+statement differing only in the new GUC `pg_weave.fuse_normalize` (default on; `off`
+restores the raw sum), plus the RRF control, all through `bench/ndcg.py`. **No EC2 and no
+cost**: nDCG is deterministic and host-independent.
+
+| row | gate | scifact | nfcorpus | fiqa | |
+|---|---|---|---|---|---|
+| nDCG@10, normalized ÷ RRF | ≥ 1.000× | 1.053× | 1.010× | 1.114× | **MET** |
+
+Absolute nDCG@10 0.7212 / 0.3455 / 0.3878 against RRF's 0.6846 / 0.3422 / 0.3482, with the
+`raw` arm reproducing the EC2 figures above to four decimals as the positive control, and
+recall@100 improving too (scifact 0.8892 → 0.9683, fiqa 0.5141 → 0.7079), so it is not a
+top-10 reshuffle. **The loss in the same run, recorded with the win:** on nfcorpus the
+normalized arm loses recall@100 (0.3206 vs 0.3251) and MRR@10 (0.5441 vs 0.5514) to RRF
+while winning the gate row by 1.0 %. nfcorpus is met, not clean.
+
+**The latency and work-counter halves of the gate are NOT met and this work did not touch
+them.** p50 is still 0.582× / 0.795× / 0.578× against ≤ 0.50×, and the `score()`-call ratio
+is still 0.648× / 0.903× / 0.541× against ≤ 0.20× — the latter because
+`vec_blocks_bound_skipped = 0` on all three datasets and the vector channel is 71–87 % of
+all fused `score()` calls. **And the p50/p99 rows in the table above are now STALE:** the
+normalizer adds a pre-scan pass (one LUT build and one directory fold per bolt per vector
+key) whose cost is **unmeasured**, so those rows measure a scorer that no longer ships. They
+are marked stale in place in `bench/RESULTS_FUSE.md` rather than retracted, and an **EC2
+re-run of `bench/fuse.sh` under the existing P2 harness** is what settles them; no new task
+id is invented for it, because it is a run of a harness that exists against a gate that
+already has a row.
+
+**Nor is a new task invented for the vector bound**, which is the `score()` row's whole
+cause and is already measured and owned: `bench/RESULTS_BOUND_PRUNING.md` (0.00 % of blocks
+pruned) and `bench/RESULTS_CODE_SCAN.md`, with the generalization in `doc/GAPS.md` G43 and
+the candidate-reduction rows in Phase V — **V13** (warp ordering by cluster, justification
+gone), **V14** (per-block centroid + radius), **V15** (two-stage prefix scan) and **V18**
+(bit-plane progressive refinement). Whichever of those lands is what moves this row.
+
 **Phase F is therefore NOT claimable**, and the two failures have different characters:
 
 - **nDCG (`doc/GAPS.md` G44)** is the objective, not the scan. The fused top-k is exact
@@ -763,6 +800,16 @@ Two of five rows fail:
   *pre-scan* normalizer holds that parity — the ceiling substitute leaves a median
   1.37× key-vs-key misweighting against the raw sum's 33×. G44 has the numbers and the
   next measurement. **Implement in C only the scheme shown to hold parity.**
+  **IMPLEMENTED AND MEASURED IN THE PRODUCT 2026-09-22 (the update above):** the pre-scan
+  ceiling scheme ships behind `pg_weave.fuse_normalize` (default on), per fuse() **key**
+  rather than per channel, with the normalizer taken **query-global** because
+  `weave_fuse_pass()` merges per-bolt top-k lists by score and a per-bolt normalizer would
+  make the answer depend on segment layout — `sql/fuse_degenerate.sql` (6) asserts
+  bolt-count independence with a positive control from a mutated build. nDCG@10 beats RRF
+  1.053× / 1.010× / 1.114×, so **this row is MET**. `ARCHITECTURE.md` §9 claim 2 is
+  correspondingly revised: its **ranking** half is supported on three public datasets (with
+  the nfcorpus caveat), its **work-reduction** half is still UNSUPPORTED. Spec
+  `doc/specs/FUSED_TOPK.md` sect. 8d.
 - **`score()` calls** is the **vector block bound**, and it was predictable from data
   already on disk: the lexical side clears the gate on fiqa by itself (0.149×), while the
   vector side is 0.956–0.991× of the control with `vec_blocks_bound_skipped = 0`

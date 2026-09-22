@@ -257,10 +257,139 @@ SELECT (SELECT array_agg(id ORDER BY id) FROM d_zeta_heavy) = ARRAY[7, 19]
        AS weights_change_the_answer;
  zeta_weight_promotes_the_two_zeta_docs | weights_change_the_answer 
 ----------------------------------------+---------------------------
- t                                      | f
+ t                                      | t
+(1 row)
+
+-- ---------------------------------------------------------------------------
+-- (5a) THE SAME PAIR OF QUERIES WITH THE NORMALIZER OFF, and this section is
+-- here because `weights_change_the_answer` was recorded as **f** from the day
+-- this file was written until 2026-09-22.  The comment above says what the
+-- author expected -- 0.99/0.01 and 0.01/0.99 must not return the same two
+-- documents -- and the expected output recorded the opposite, without anyone
+-- noticing that the file's own control had failed.
+--
+-- THE MECHANISM, measured: the raw sum adds 'zeta's BM25 contribution (two
+-- documents out of forty, so a large idf) to 'alpha's, and zeta's term is large
+-- enough that 0.01 x zeta still dominates 0.99 x alpha.  The weights were being
+-- applied correctly and could not reach the ranking.  With the per-key
+-- normalizer each key is divided by its own ceiling, so 0.99/0.01 now returns
+-- {34, 38} -- the two highest-tf 'alpha' documents -- and the control passes.
+-- doc/GAPS.md G44, doc/specs/FUSED_TOPK.md sect. 8d.
+--
+-- So this pair pins BOTH objectives: the assertion above is the normalized one,
+-- and this one is the raw sum, which is the arm every figure in
+-- bench/RESULTS_FUSE.md was measured on.
+-- ---------------------------------------------------------------------------
+SET pg_weave.fuse_normalize = off;
+SET enable_seqscan = off;
+CREATE TEMP TABLE d_zeta_raw AS
+SELECT id FROM fd
+ ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'zeta'::wquery,
+               weights => '{0.01,0.99}') LIMIT 2;
+CREATE TEMP TABLE d_alpha_raw AS
+SELECT id FROM fd
+ ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'zeta'::wquery,
+               weights => '{0.99,0.01}') LIMIT 2;
+RESET enable_seqscan;
+RESET pg_weave.fuse_normalize;
+SELECT (SELECT array_agg(id ORDER BY id) FROM d_zeta_raw)
+       IS NOT DISTINCT FROM
+       (SELECT array_agg(id ORDER BY id) FROM d_alpha_raw)
+       AS raw_sum_cannot_see_these_weights;
+ raw_sum_cannot_see_these_weights 
+----------------------------------
+ t
 (1 row)
 
 DROP TABLE d_fused, d_plain, d_k1, d_k8, d_empty,
-           d_default_w, d_unit_w, d_zeta_heavy, d_alpha_heavy;
+           d_default_w, d_unit_w, d_zeta_heavy, d_alpha_heavy,
+           d_zeta_raw, d_alpha_raw;
 DROP TABLE fd;
+-- ---------------------------------------------------------------------------
+-- (6) THE NORMALIZER IS ONE CONSTANT PER QUERY, NOT ONE PER BOLT -- i.e. the
+-- fused top-k does not depend on how many segments the index happens to have.
+--
+-- WHY THIS IS A CORRECTNESS TEST AND NOT A TIDINESS ONE.  weave_fuse_pass()
+-- runs one bounded top-k PER BOLT and then merges the per-bolt lists BY SCORE.
+-- That merge is only exact while every bolt scored against the SAME objective,
+-- so a normalizer derived from the bolt's own ceilings -- the obvious
+-- implementation, since WeaveShuttle.maxscore is per bolt -- silently makes the
+-- answer a function of the segment layout: it would change after an INSERT,
+-- after VACUUM and after a merge, with no error anywhere.  The maximum over
+-- bolts is therefore taken BEFORE the first bolt is scanned (see
+-- weave_vec_weft_maxscore in include/weave/vector.h and the max-over-segments
+-- max tf in src/am/amscan.c).
+--
+-- HOW THE FIXTURE HAD TO BE BUILT, because the first three could not fail and
+-- the fourth is the only one that can.  A per-bolt normalizer is invisible when
+-- the bolts' ceilings are close, and BM25's tf saturation keeps them close: the
+-- term bound at tf=1 and at tf=8 differs by ~25 %, not 8x.  What separates the
+-- two implementations is a QUERY TERM PRESENT IN ONE BOLT AND ABSENT FROM
+-- ANOTHER -- then the key's ceiling is a sum over a different number of terms in
+-- each bolt, and the scale moves by a factor rather than a percent.  Here
+-- 'beta' is in the first bolt only, and 'alpha' is in every document so its idf
+-- is near zero, which makes the first key's ceiling essentially beta's.
+--
+-- POSITIVE CONTROL (2026-09-22, and the reason this section is trusted): a build
+-- whose normalizer used each bolt's own ceilings returns {1,...,9,308} before
+-- the merge and {1,...,9,11} after it, so `bolt_independent` reads f.  The three
+-- earlier fixtures -- a two-key query over an 80-document index, a 4,000-row
+-- index built under maintenance_work_mem = '1MB', and a three-bolt index whose
+-- bolts differed in max tf -- all read t under that same mutant.  Two of them
+-- turned out to have ONE bolt, which the nseg assertion below now makes
+-- impossible to miss.
+-- ---------------------------------------------------------------------------
+CREATE TABLE fb (id serial, d wdoc);
+-- The first bolt: 'alpha' at a tf unique per document, 'beta' in all of them.
+INSERT INTO fb(d)
+SELECT to_wdoc(repeat('alpha ', g) || repeat('beta ', 6) || 'gamma wa' || g)
+FROM generate_series(1, 300) g;
+CREATE INDEX fb_weave ON fb USING weave (d);
+-- The second bolt: the same 'alpha' ladder, no 'beta' at all.  A VACUUM-flushed
+-- batch is how weave.sql's parallel-merge fixture makes a second segment; a run
+-- of two is below the tiered auto-merge threshold, so both persist.
+INSERT INTO fb(d)
+SELECT to_wdoc(repeat('alpha ', g) || 'gamma wb' || g)
+FROM generate_series(1, 300) g;
+VACUUM fb;
+ANALYZE fb;
+-- Asserted, not assumed: with one bolt this whole section is vacuous.
+SELECT weave_index_nsegments('fb_weave') > 1 AS more_than_one_bolt;
+ more_than_one_bolt 
+--------------------
+ t
+(1 row)
+
+SET enable_seqscan = off;
+CREATE TEMP TABLE b_multi AS
+SELECT id FROM fb
+ ORDER BY fuse(d <=> 'alpha beta'::wquery, d <=> 'gamma'::wquery,
+               weights => '{1,1}') LIMIT 10;
+SELECT weave_merge('fb_weave') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT weave_index_nsegments('fb_weave') = 1 AS one_bolt_after_merge;
+ one_bolt_after_merge 
+----------------------
+ t
+(1 row)
+
+CREATE TEMP TABLE b_one AS
+SELECT id FROM fb
+ ORDER BY fuse(d <=> 'alpha beta'::wquery, d <=> 'gamma'::wquery,
+               weights => '{1,1}') LIMIT 10;
+RESET enable_seqscan;
+SELECT (SELECT array_agg(id ORDER BY id) FROM b_multi)
+       = (SELECT array_agg(id ORDER BY id) FROM b_one)
+       AS bolt_independent;
+ bolt_independent 
+------------------
+ t
+(1 row)
+
+DROP TABLE b_multi, b_one;
+DROP TABLE fb;
 RESET max_parallel_workers_per_gather;

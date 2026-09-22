@@ -688,6 +688,10 @@ int			pg_weave_surf_cache_mb = 32;
  * exists at all is on the extern in include/weave/weave.h -- doc/GAPS.md G43. */
 bool		pg_weave_fuse_check_bounds = false;
 
+/* ON by default: it is the ranking the project measured against RRF and beat
+ * (doc/GAPS.md G44).  include/weave/weave.h says what off means. */
+bool		pg_weave_fuse_normalize = true;
+
 static int
 cmp_blocknumber(const void *a, const void *b)
 {
