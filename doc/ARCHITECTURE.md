@@ -423,11 +423,14 @@ Four things, and it should claim exactly four things:
    0.541× against a 0.20× gate, because the vector block bound prunes nothing on this
    data and the vector channel sets
    **71–87 %** of all fused `score()` calls; p50 is 0.582× / 0.795× / 0.578× against
-   ≤ 0.50×. **And the latency figures that used to back the "no over-fetch is also
+   ≤ 0.50×.    **And the latency figures that used to back the "no over-fetch is also
    cheaper" reading are STALE**: they were taken before the normalizer, which adds an
    unmeasured pre-scan pass, so an EC2 re-run is owed before any p50 or p99 is quoted
    for the shipping scorer (`bench/RESULTS_FUSE.md`, marked in place). `doc/GAPS.md`
    **G44**, `doc/specs/FUSED_TOPK.md` **sect. 8d**.
+   **[RE-RUN DONE 2026-09-22 (night) — see the dated block below: the figures were not
+   merely stale, the shipping scorer's p99 FAILS and fiqa is slower than the control, and
+   the "unmeasured pre-scan pass" was the wrong suspect.]**
 
    **THE WORK-REDUCTION HALF IS STILL UNSUPPORTED, AND AS OF 2026-09-22 (evening) THE
    REASON HAS CHANGED. The notes above stay visible as history; they were correct about
@@ -471,6 +474,38 @@ Four things, and it should claim exactly four things:
    claim's docid adapter are not independent**, which nothing in the tree had recorded before
    today. Full numbers in `bench/RESULTS_FUSE.md` (third measurement); `doc/GAPS.md` **G46**,
    `doc/specs/FUSED_TOPK.md` **sect. 8d**.
+
+   **AND THE LATENCY BACKING IS NOW MEASURED, AND IT IS NEGATIVE ON THE LARGEST CORPUS
+   (2026-09-22, night; run `pgweave-20260922-224507`, `bench/RESULTS_FUSE.md` fourth
+   measurement). Everything above stays as history.** The EC2 re-run the "STALE" note in the
+   previous block asked for has happened, for the shipping `pg_weave.fuse_normalize = on`
+   scorer, with an RRF control over the same index and an A/A leg:
+
+   - **p99 is 0.710× / 0.612× / 1.000× against a ≤ 0.70× gate — FAIL on two of three, where
+     the raw sum PASSED at 0.609× / 0.560× / 0.633×.** The two arms are the same statement one
+     GUC apart, so this is a regression caused by the normalizer that fixed the ranking half of
+     this claim, not a number that went stale.
+   - **p50 is 0.710× / 0.827× / 1.172× against ≤ 0.50×, and on fiqa the fused arm is SLOWER
+     than the RRF control it is offered as a replacement for.** The normalizer's own p50 cost
+     is **+19 % / +3 % / +104 %**; fiqa's doubled.
+   - The cause is the **pivot walk**, not the pre-scan pass the earlier notes guessed: fiqa's
+     pivots rise 5.3× (7,081,750 → 37,306,460) and `fuse_scores_total` 5.6× while the vector
+     channel's lane count moves 4.6 %. Same ceiling mechanism as the work half, one step on.
+   - Hard rule 10 is satisfied: |fused − fused_aa| p50 = 0.014 / 0.003 / 0.035 ms against
+     between-arm deltas 30×–320× larger.
+
+   **So the sentence this claim is allowed to make gets narrower again, and the narrowing is
+   the point: "no over-fetch" may be claimed, "better ranking than RRF" may be claimed on three
+   BEIR corpora with the nfcorpus caveat, and "NO OVER-FETCH IS ALSO CHEAPER" MAY NOT BE STATED
+   AT ALL** — not as measured, not as expected, not hedged. It is measured, and on the largest
+   corpus in the set it is false. The §8 gate is **2 of 5** (recall, nDCG) and was **2 of 5**
+   before the normalizer (recall, p99): **the change traded p99 for nDCG.** A maintainer
+   decision is open on whether `pg_weave.fuse_normalize` should stay on by default — on, the
+   ranking wins and the scan is slower than RRF on fiqa; off, the scan is fast and the ranking
+   loses on all three, which is the state that made this claim unsupported in the first place —
+   and the third route, a smaller vector candidate set, is now the **single blocker for three of
+   the five rows**. The GUC is `PGC_USERSET`, so a user can already choose per query.
+   `doc/GAPS.md` **G44** and **G46**, `doc/specs/FUSED_TOPK.md` **sect. 8b** and **8d**.
 3. Queries that get **faster** as predicates get more selective, because the
    predicate is pushed into the SIMD block mask instead of collapsing recall.
    (The "graph traversal" half of this sentence is stale — the Vamana plan was
