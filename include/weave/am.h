@@ -1453,6 +1453,22 @@ extern int	weave_index_vec_bits(Relation index);
 extern int	weave_index_vec_metric(Relation index);
 
 /*
+ * The same reloption, WITHOUT the refusal: the value as stored, mapped to
+ * WEAVE_METRIC_L2 only when it is absent or unrecognized.
+ *
+ * WHY A SECOND ACCESSOR EXISTS (task F8).  src/am/fusepath.c reads the metric at
+ * PLAN time, to decide whether a fused path may carry a `<->` or `<#>` channel at
+ * all -- which is how the fused path refuses a metric mismatch before offering a
+ * plan, instead of raising at rescan the way the single-channel ordering path has
+ * to (doc/GAPS.md G39).  A planner hook may not throw on a catalog state it merely
+ * inspected: `ALTER INDEX ... SET (metric = 'cosine')` is accepted without a
+ * rewrite, so the throwing accessor above would turn such an index into a relation
+ * whose queries cannot be PLANNED, including queries that never touch its vector
+ * column.  This one reports and lets the caller decline.
+ */
+extern int	weave_index_vec_metric_raw(Relation index);
+
+/*
  * THE VECTOR CHANNEL'S ORDER BY STRATEGY NUMBERS (task F7).
  *
  * ONE MEMBER PER METRIC THE SCAN CORE CAN SERVE, and that is the whole shape of

@@ -76,6 +76,8 @@
 
 #include <math.h>
 
+#include "access/genam.h"		/* index_open: the metric is a reloption, so a
+								 * plan-time metric test has to open the index */
 #include "access/stratnum.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
@@ -100,6 +102,7 @@
 #include "weave/am.h"			/* WEAVE_STRAT_*, weave_fuse_install_pathlist_hook */
 #include "weave/edist.h"		/* WEAVE_STRAT_DISTANCE, WEAVE_STRAT_EDIST */
 #include "weave/fuse.h"			/* WEAVE_FUSE_MAX_CHAN */
+#include "weave/quantize.h"		/* WEAVE_METRIC_L2, WEAVE_METRIC_IP (F8) */
 #include "weave/weave.h"		/* WeaveQuery */
 
 /*
@@ -126,13 +129,27 @@ typedef struct WeaveFuseOids
 	Oid			lex_op;			/* <=> (wdoc, wquery) */
 	Oid			lex_commop;		/* <=> (wquery, wdoc), the commutator form */
 	Oid			vec_op;			/* <=> (wvec, wvec), cosine distance */
+	Oid			vec_l2_op;		/* <-> (wvec, wvec), Euclidean distance */
+	Oid			vec_ip_op;		/* <#> (wvec, wvec), negated inner product */
+	Oid			edist_op;		/* <@> (wdoc, text), Levenshtein distance */
 	Oid			lexscore_fn;	/* weave_lexscore(float8) */
 	Oid			cosscore_fn;	/* weave_cosscore(float8) */
+	Oid			l2score_fn;		/* weave_l2score(float8) */
+	Oid			ipscore_fn;		/* weave_ipscore(float8) */
+	Oid			edistscore_fn;	/* weave_edistscore(float8) */
+
+	/* Whether the objects 0.17.0 added all exist.  NOT folded into
+	 * the all-or-nothing test at the end of weave_fuse_resolve_oids(), and the
+	 * reason is a real upgrade window rather than caution: the library is replaced
+	 * before `ALTER EXTENSION pg_weave UPDATE` runs, so a 0.17.0 binary routinely
+	 * plans queries against 0.16.0's catalog for a few seconds or a few days.  If a
+	 * missing weave_l2score() failed the whole resolve, the LEXICAL rewrite would
+	 * silently stop firing in that window -- turning a missing feature into a
+	 * changed ranking on queries that have nothing to do with vectors. */
+	bool		have_distscore;
 } WeaveFuseOids;
 
-static WeaveFuseOids weave_fuse_oids = {InvalidOid, InvalidOid, InvalidOid,
-	InvalidOid, InvalidOid, InvalidOid
-};
+static WeaveFuseOids weave_fuse_oids = {InvalidOid};
 
 /*
  * Resolve, or confirm, every OID above.  Returns false if anything is missing,
@@ -192,17 +209,40 @@ weave_fuse_resolve_oids(void)
 	n.vec_op = OpernameGetOprid(list_make2(makeString(nspname),
 										   makeString("<=>")),
 								wvec, wvec);
+	n.vec_l2_op = OpernameGetOprid(list_make2(makeString(nspname),
+											  makeString("<->")),
+								   wvec, wvec);
+	n.vec_ip_op = OpernameGetOprid(list_make2(makeString(nspname),
+											  makeString("<#>")),
+								   wvec, wvec);
 	n.lexscore_fn = LookupFuncName(list_make2(makeString(nspname),
 											  makeString("weave_lexscore")),
 								   1, argtypes, true);
 	n.cosscore_fn = LookupFuncName(list_make2(makeString(nspname),
 											  makeString("weave_cosscore")),
 								   1, argtypes, true);
+	n.edist_op = OpernameGetOprid(list_make2(makeString(nspname),
+											 makeString("<@>")),
+								  wdoc, TEXTOID);
+	n.l2score_fn = LookupFuncName(list_make2(makeString(nspname),
+											 makeString("weave_l2score")),
+								  1, argtypes, true);
+	n.ipscore_fn = LookupFuncName(list_make2(makeString(nspname),
+											 makeString("weave_ipscore")),
+								  1, argtypes, true);
+	n.edistscore_fn = LookupFuncName(list_make2(makeString(nspname),
+												makeString("weave_edistscore")),
+									 1, argtypes, true);
 
 	if (!OidIsValid(n.lex_op) || !OidIsValid(n.lex_commop) ||
 		!OidIsValid(n.vec_op) || !OidIsValid(n.lexscore_fn) ||
 		!OidIsValid(n.cosscore_fn))
 		return false;
+
+	n.have_distscore = (OidIsValid(n.vec_l2_op) && OidIsValid(n.vec_ip_op) &&
+						OidIsValid(n.edist_op) && OidIsValid(n.l2score_fn) &&
+						OidIsValid(n.ipscore_fn) &&
+						OidIsValid(n.edistscore_fn));
 
 	n.extoid = extoid;
 	weave_fuse_oids = n;
@@ -363,6 +403,84 @@ weave_cosscore(PG_FUNCTION_ARGS)
 }
 
 /*
+ * weave_l2score(float8) -> float8 and weave_ipscore(float8) -> float8, task F8:
+ * recover the vector channel's score from what `<->` and `<#>` compute.
+ *
+ * WHY THESE HAD TO EXIST BEFORE THE VECTOR CHANNEL COULD BE FUSED AT ALL, and it
+ * is not a missing convenience -- 0.16.0 answered `fuse(body <=> q, emb <-> v)`
+ * WITH THE VECTOR CHANNEL INVERTED.  fuse() sums SCORES, higher being better, and
+ * negates once at the end; `<->` is a DISTANCE, so passing it through unrecovered
+ * made a far vector rank ahead of a near one, silently, in a query shape the
+ * documentation invites.  doc/GAPS.md G41 records it as found-and-closed and
+ * doc/specs/FUSED_TOPK.md sect. 7c has the reasoning; the reason nothing caught it
+ * is that both arms -- fallback and (refused) pushdown -- were wrong the same way,
+ * so no comparison between them could see it.
+ *
+ * THE DOMAIN IS THE CHANNEL'S, NOT THE OPERATOR'S.  The weave vector channel
+ * scores in the metric's domain with higher better: -||q - v||^2 for l2 and the
+ * inner product for ip (include/weave/vecscan.h "THE DOMAIN RULE").  So:
+ *
+ *	 l2: `<->` computes ||q - v||, hence the score is -d * d.  NOT -d, which is
+ *		 monotone in the same direction and would still rank a single channel
+ *		 correctly -- but a fused sum is not a ranking, it is arithmetic, and mixing
+ *		 -d with the index's -d^2 would weight the vector channel differently in the
+ *		 two arms at every distance except 1.
+ *	 ip: `<#>` computes the NEGATED inner product (pgvector's convention, which
+ *		 wvec follows so that smaller is nearer), hence the score is -d exactly.
+ *
+ * Total on every float, like their two siblings: reachable from hand-written SQL,
+ * and raising inside a sort key would turn a user's arithmetic mistake into a
+ * failed query.  -d * d overflows to -INF for |d| > ~1.3e154, which is the honest
+ * limit of "as far away as possible"; a NaN propagates.
+ */
+PG_FUNCTION_INFO_V1(weave_l2score);
+
+Datum
+weave_l2score(PG_FUNCTION_ARGS)
+{
+	double		d = PG_GETARG_FLOAT8(0);
+
+	PG_RETURN_FLOAT8(-(d * d));
+}
+
+PG_FUNCTION_INFO_V1(weave_ipscore);
+
+Datum
+weave_ipscore(PG_FUNCTION_ARGS)
+{
+	double		d = PG_GETARG_FLOAT8(0);
+
+	PG_RETURN_FLOAT8(-d);
+}
+
+/*
+ * weave_edistscore(float8) -> float8: recover a score from the `<@>` edit distance.
+ *
+ * SHIPPED WITH THE TWO ABOVE EVEN THOUGH `<@>` CANNOT BE FUSED YET (task F9), and
+ * the reason is that the two halves of doc/GAPS.md G41 are independent.  The
+ * pushdown needs a shuttle in the document space, which F9 owns; the FALLBACK's
+ * arithmetic needs only this function, and without it `fuse(body <=> q, body <@> p)`
+ * -- a shape sql/fuse_pushdown.sql has run since F2.2 -- sums a distance as a score
+ * and ranks the WORST spelling match first.  Fixing two of three channels and
+ * leaving the third inverted would be an arbitrary place to stop.
+ *
+ * A Levenshtein distance is a non-negative integer and smaller is better, so the
+ * score is -d.  Nothing subtler is available or wanted: any monotone decreasing map
+ * would rank one channel identically, and -d is the one that keeps a UNIT of
+ * distance worth a unit of score, which is what a weighted sum needs to be
+ * interpretable.
+ */
+PG_FUNCTION_INFO_V1(weave_edistscore);
+
+Datum
+weave_edistscore(PG_FUNCTION_ARGS)
+{
+	double		d = PG_GETARG_FLOAT8(0);
+
+	PG_RETURN_FLOAT8(-d);
+}
+
+/*
  * If `arg` is an OpExpr of a channel distance operator we recognize, return a
  * FuncExpr that recovers that channel's score from it, with the OpExpr itself as
  * the single argument.  Otherwise NULL, meaning "leave this argument alone".
@@ -384,6 +502,15 @@ weave_fuse_recover(Expr *arg)
 		recover = weave_fuse_oids.lexscore_fn;
 	else if (op->opno == weave_fuse_oids.vec_op)
 		recover = weave_fuse_oids.cosscore_fn;
+	else if (weave_fuse_oids.have_distscore &&
+			 op->opno == weave_fuse_oids.vec_l2_op)
+		recover = weave_fuse_oids.l2score_fn;
+	else if (weave_fuse_oids.have_distscore &&
+			 op->opno == weave_fuse_oids.vec_ip_op)
+		recover = weave_fuse_oids.ipscore_fn;
+	else if (weave_fuse_oids.have_distscore &&
+			 op->opno == weave_fuse_oids.edist_op)
+		recover = weave_fuse_oids.edistscore_fn;
 	else
 		return NULL;
 
@@ -711,27 +838,79 @@ weave_fuse_rhs_ok(PlannerInfo *root, RelOptInfo *rel, Expr *rhs)
  * drive inside a fused scan yet; the caller then refuses the whole shape, because
  * a partially fused ordering is a different ordering, not a weaker one.
  *
- * WHY THERE IS A `servable` FLAG AT ALL, AND IT IS THE ONE THING F2.2 DID NOT
- * FINISH.  The fused core drives every channel in ONE warp space, and this index's
- * channels do not yet share one:
+ * WHY THERE IS A `servable` FLAG AT ALL.  The fused core drives every channel in
+ * ONE warp space, and this index's channels do not all share one:
  *
  *	 - The lexical shuttle publishes weave_tid_to_docid() DOCIDS as its warp
  *	   positions (src/query/lexshuttle.c), and so does a gate shuttle built from a
- *	   TidSet (include/weave/gate.h).  Those two agree, which is why the shapes
- *	   this file does offer are lexical channels plus gates.
+ *	   TidSet (include/weave/gate.h).  Those two agree, which is why they were the
+ *	   first shapes offered.
  *	 - The vector shuttle's warp is a SEGMENT-LOCAL DENSE LANE INDEX
- *	   (src/vector/vecshuttle.c), related to a docid only through the weft's
- *	   warp map -- a forward-only page chain.
+ *	   (src/vector/vecshuttle.c), related to a docid only through the weft's warp
+ *	   map.  **F8 closed this**: include/weave/vecdocmap.h relabels that channel
+ *	   into the docid space through the map, which is monotone because the writer
+ *	   emits lanes in docid order, so (C1) and (C2) both survive.  `<->` and `<#>`
+ *	   are therefore servable now, subject to the metric test below.
  *	 - The `<@>` shuttle's warp is a position in the DICTIONARY, not in any
- *	   document space at all (src/query/edist.c; see weave_edist_pass()).
+ *	   document space at all (src/query/edist.c; see weave_edist_pass()).  No
+ *	   relabelling exists, because a document's `<@>` distance is a MINIMUM over
+ *	   its terms; that needs a document-space shuttle, which is task F9.
  *
  * include/weave/gate.h states this as "reconciling them is Phase F's decision,
- * not this task's".  F2.2 decides the docid space and serves what already lives
- * in it; doc/specs/FUSED_TOPK.md sect. 7b records the decision, the translation
- * design for the vector channel, and why a `<@>` channel needs a different
- * shuttle rather than an adapter.  Offering a path for either today would be
- * exactly the G39 defect this file's header refuses.
+ * not this task's".  F2.2 decided the docid space and served what already lived
+ * in it; doc/specs/FUSED_TOPK.md sect. 7b records the decision and sect. 7c what
+ * F8 found carrying it out.  Offering a path for `<@>` today would be exactly the
+ * G39 defect this file's header refuses.
  */
+
+/*
+ * Can a fused scan of `index` serve a vector channel scored in `want`?
+ *
+ * TWO CONDITIONS, AND BOTH ARE PLAN-TIME ON PURPOSE.
+ *
+ * 1. THE METRIC MUST MATCH, and this is the first place in the project that can
+ *    check it before a plan exists.  A weave vector weft is scored in one metric,
+ *    so answering `<->` out of an `ip` weft returns every row in an ordering the
+ *    query did not ask for -- a wrong answer, not an approximation.  The plain
+ *    `ORDER BY v <-> q` path can only refuse that at RUN time (see the long
+ *    comment in weave_rescan(), and doc/specs/VECTOR_CHANNEL.md sect. 8b for the
+ *    per-metric opclass split that would remove the need), because core matches a
+ *    pathkey against an operator FAMILY and the metric is a reloption.  This path
+ *    is our own code, so it can do better: DECLINING here means the fused plan is
+ *    never offered and the Sort over the fallback stands, instead of an access
+ *    method that advertises a plan and raises on the first tuple (doc/GAPS.md
+ *    G39).  The reloption is read WITHOUT THROWING -- weave_index_vec_metric()
+ *    raises on cosine and l1, and `ALTER INDEX ... SET (metric = 'cosine')` is
+ *    accepted without a rewrite, so the throwing accessor would turn such an index
+ *    into a query that cannot be PLANNED, never mind scanned.
+ *
+ * 2. THE SCORE-RECOVERY FUNCTIONS MUST EXIST.  Without weave_l2score(), the
+ *    fallback sums a raw DISTANCE where the index sums a score, so the two arms
+ *    would not merely differ in rounding, they would rank the vector channel in
+ *    OPPOSITE directions -- and the pathkey this path claims to satisfy is the
+ *    fallback's expression.  A binary newer than the catalog is an ordinary
+ *    upgrade state (see WeaveFuseOids.have_vecscore), so this is reachable, and
+ *    the honest answer in that window is no fused path.
+ *
+ * Opening the index relation is what plancat.c itself does downstream, and NoLock
+ * is correct: get_relation_info() has already taken and retained a lock on every
+ * index of this relation for the life of the transaction.
+ */
+static bool
+weave_fuse_vec_servable(IndexOptInfo *index, int want)
+{
+	Relation	irel;
+	int			have;
+
+	if (!weave_fuse_oids.have_distscore)
+		return false;
+
+	irel = index_open(index->indexoid, NoLock);
+	have = weave_index_vec_metric_raw(irel);
+	index_close(irel, NoLock);
+
+	return have == want;
+}
 static bool
 weave_fuse_attribute(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *index,
 					 Expr *arg, WeaveFuseChanReq *req)
@@ -748,7 +927,10 @@ weave_fuse_attribute(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *index,
 		FuncExpr   *f = (FuncExpr *) arg;
 
 		if ((f->funcid == weave_fuse_oids.lexscore_fn ||
-			 f->funcid == weave_fuse_oids.cosscore_fn) &&
+			 f->funcid == weave_fuse_oids.cosscore_fn ||
+			 f->funcid == weave_fuse_oids.l2score_fn ||
+			 f->funcid == weave_fuse_oids.ipscore_fn ||
+			 f->funcid == weave_fuse_oids.edistscore_fn) &&
 			list_length(f->args) == 1)
 			arg = (Expr *) linitial(f->args);
 	}
@@ -797,13 +979,13 @@ weave_fuse_attribute(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *index,
 	{
 		req->strategy = WEAVE_STRAT_VEC_L2;
 		wantfamily = weave_fuse_path_oids.vec_family;
-		req->servable = false;	/* lane-space warp; see above */
+		req->servable = weave_fuse_vec_servable(index, WEAVE_METRIC_L2);
 	}
 	else if (op->opno == weave_fuse_path_oids.vec_ip_op)
 	{
 		req->strategy = WEAVE_STRAT_VEC_IP;
 		wantfamily = weave_fuse_path_oids.vec_family;
-		req->servable = false;	/* lane-space warp; see above */
+		req->servable = weave_fuse_vec_servable(index, WEAVE_METRIC_IP);
 	}
 	else
 		return false;			/* not one of this AM's channel operators */

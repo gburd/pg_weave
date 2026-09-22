@@ -1764,3 +1764,67 @@ inverts `weave_docid_to_tid()` from root TIDs recorded at build/insert time
 (`amscan.c:6395-6405`), so it is structurally immune — but the *coverage* that would catch a
 regression does not exist. What is owed: an arm that UPDATEs after the index is built,
 does not VACUUM, and reads through a plan that must use `amgettuple`.
+
+### G41 — `fuse()` ranked every DISTANCE-spelled channel BACKWARDS, and the defect was printed in a checked-in expected file — **FOUND AND CLOSED 2026-09-22 by F8**
+
+`fuse()` sums **scores**, higher better, and negates once at the end so that ascending
+is best-first (`FUSED_TOPK.md` §7a). A channel argument spelled as a **distance** has
+to be recovered into a score first, which is what the planner support function does by
+wrapping each recognized `OpExpr` in a recovery call (`src/am/fusepath.c`,
+`weave_fuse_recover()`).
+
+0.14.0 shipped that recovery for two operators — the lexical `<=>` and the cosine
+`wvec <=> wvec` — and stopped, because at that point no vector or fuzzy channel could
+be fused and the point of the functions was the rewrite. The three operators left
+without one were `<->`, `<#>` and `<@>`. For each of them:
+
+    ORDER BY fuse(body <=> 'alpha', emb <-> '[1,0,0,1]')
+
+parsed, ran, and returned the **farthest** vectors first. Same for `<#>`, and same for
+`<@>`, which ranked the worst spelling match first.
+
+**Why no test caught it, and this is the part worth keeping.** Two independent reasons,
+each sufficient:
+
+1. **Both arms were wrong in the same direction.** The fallback computed the inverted
+   sum; the pushdown, once F8 built it, would have inverted it identically. Every
+   assertion this project writes about `fuse()` compares the two arms *against each
+   other* — `sql/fuse_fallback.sql` §5, `sql/fuse_pushdown.sql` §2 — so no amount of
+   that testing could see it. §7a had already arrived at the fix from another
+   direction: assert against an **oracle** built from the index's own per-channel
+   scores.
+2. **It was VISIBLE, in a file three reviews read.**
+   `expected/fuse_pushdown.out` contained, checked in:
+
+       Sort Key: (fuse(weave_lexscore((body <=> '''alpha'''::wquery)),
+                       (emb <-> '[1,0,0,1]'::wvec), '{1,1}'::real[]))
+
+   One argument wrapped in its recovery function and the other bare. That asymmetry
+   *is* the bug, on the page. A missing recovery function looks exactly like a
+   recovery function that is not needed.
+
+**The fix**, extension 0.17.0: `weave_l2score(d) = -d*d`, `weave_ipscore(d) = -d`,
+`weave_edistscore(d) = -d`, all STRICT and total on every float8 for the reason their
+two 0.14.0 siblings are. `-d*d` and not `-d` for l2 because the domain belongs to the
+**channel**, not the operator: the weft scores l2 as `-||q-v||^2`, so `-d` would rank a
+lone vector channel identically while weighting it differently from the index at every
+distance except 1 — and a fused sum is arithmetic, not a ranking.
+
+`weave_edistscore()` ships even though `<@>` cannot be fused until F9. The two halves
+of this gap are independent: the pushdown needs a document-space shuttle, the FALLBACK
+needs only the recovery function, and fixing two of three channels would be an
+arbitrary place to stop.
+
+**What the closure is asserted by:** `sql/fuse_pushdown.sql` §2b — the flagship
+two-channel query's rows equal an exact oracle built from `weave_search()` plus
+`weave_vec_scan()`, and a separate arm reports the *direction* on its own, because an
+oracle agreement could still hide it if the oracle were built the same wrong way. On
+the 40-row corpus the top 10 are ids 1..10 (the nearest vectors) where the lexical
+channel pulls the other way (tf of `alpha` is `g`, so large `g` scores higher) — so an
+inverted vector channel moves the answer.
+
+**The generalization, which is not about `fuse()`:** an argument list where some
+elements are transformed and others are not is a shape whose bug is invisible in
+review, because the untransformed ones look like a deliberate exception. Wherever this
+project maps a set of operators through a table, the test has to be that the set is
+COMPLETE, not that each member it contains is right.

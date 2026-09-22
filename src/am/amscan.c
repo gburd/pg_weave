@@ -46,6 +46,7 @@
 #include "weave/vector.h"			/* F7: the shared vector top-k the <-> / <#> ordering scan drives */
 #include "weave/channel.h"			/* F2.2: the shuttle contract the fused pass drives */
 #include "weave/fuse.h"				/* F2.2: the fused-threshold top-k core */
+#include "weave/vecdocmap.h"		/* F8: the vector channel's docid-space adapter */
 #include "weave/gate.h"				/* F2.2: the boolean gate shuttle a WHERE qual becomes */
 #include <math.h>
 #include "access/genam.h"
@@ -294,14 +295,34 @@ typedef struct WeaveScanOpaqueData
 	 * because the pass is run per bolt and one bolt proving completeness says
 	 * nothing about another.
 	 *
-	 * `fuseQ` and `fuseW` are COPIED into the scan's context.  sk_argument belongs
-	 * to the executor's ScanKey and every rung of the ladder re-reads both --
+	 * EVERY QUERY AND WEIGHT IS COPIED into the scan's context.  sk_argument belongs
+	 * to the executor's ScanKey and every rung of the ladder re-reads them all --
 	 * arbitrarily later than the rescan that installed them -- which is the same
-	 * reason the vector path copies its query vector.
+	 * reason the single-channel vector path copies its query vector.
 	 */
 	bool		fuseScan;
 	WeaveQuery *fuseQ;			/* nfuse queries, in scored-key order */
 	float4	   *fuseW;			/* nfuse weights, same order, from the transport */
+
+	/*
+	 * PER-CHANNEL KIND, and task F8 is why it exists.  Until F8 the only scored
+	 * channel a fused run could drive was the lexical one, so the kind was implicit
+	 * in `fuseQ` and weave_fuse_rescan() refused everything else.  A fused run can
+	 * now carry the vector channel too, and a vector key's query is a WVec rather
+	 * than a WeaveQuery -- so the arrays are parallel and exactly one of fuseQ[i]
+	 * and fuseV[i] is non-NULL, keyed by fuseStrat[i].  Keeping the kind EXPLICIT
+	 * rather than inferring it from which pointer is set is deliberate: the day a
+	 * third channel arrives with a text query, an inference would be silently wrong
+	 * where a switch is a compile-time reminder.
+	 *
+	 * fuseA[i] is the key's index ATTRIBUTE number, which the vector channel needs
+	 * and the lexical one does not: a weft records the column it was built from, and
+	 * scoring a weft belonging to a different column is a wrong answer with a
+	 * correct row count (include/weave/vector.h).
+	 */
+	int		   *fuseStrat;		/* nfuse sk_strategy values, same order */
+	WVec	  **fuseV;			/* nfuse query vectors; NULL for a lexical key */
+	AttrNumber *fuseA;			/* nfuse index attribute numbers */
 	int			nfuse;
 	int			fusek;			/* candidate width of the current fused pass */
 	bool		fuseDone;
@@ -2820,8 +2841,29 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 			N = m0.ndocs < 1.0 ? 1.0 : m0.ndocs;
 			so->maxhits = 0.0;
 			for (qi = 0; qi < so->nfuse; qi++)
-				so->maxhits += weave_query_maxhits(scan->indexRelation,
-												   so->fuseQ[qi], N);
+			{
+				/*
+				 * A VECTOR CHANNEL'S MATCH CEILING IS EVERY DOCUMENT, and it gets
+				 * `N` rather than a call to weave_query_maxhits() -- which takes a
+				 * WeaveQuery and would be handed NULL, since a vector key's query is
+				 * a WVec (task F8).  That NULL was a segfault in the first cut of
+				 * this loop, reached from the flagship two-channel query and from
+				 * nothing else: the lexical-only shapes F2.2 shipped never produce a
+				 * NULL here, so the whole regression suite passed over it.
+				 *
+				 * N is not a placeholder, it is the right number.  A vector shuttle
+				 * publishes a position for EVERY live lane of every bolt it reaches
+				 * -- there is no query-dependent posting list to bound it with -- so
+				 * "every document" is its provable ceiling, and this sum is a union
+				 * bound whose over-counting only makes the cheap early stop fire
+				 * later.
+				 */
+				if (so->fuseStrat[qi] == WEAVE_STRAT_DISTANCE)
+					so->maxhits += weave_query_maxhits(scan->indexRelation,
+													   so->fuseQ[qi], N);
+				else
+					so->maxhits += N;
+			}
 			so->fusek = weave_ord_width(pg_weave_wand_initial_k);
 			weave_fuse_pass(scan->indexRelation, so);
 			so->ordpos = 0;
@@ -7187,7 +7229,13 @@ weave_edist_grow(Relation index, WeaveScanOpaque so)
  * is also the per-segment semantics a shared bitmap could not express -- a docid
  * deleted in segment A must not suppress a live document that reused the heap slot
  * in a newer segment), and a gate's key set is already tombstone-filtered by
- * weave_collect_matches().  The MVCC check that decides what the user sees is the
+ * weave_collect_matches().  A VECTOR channel (task F8) had no tombstone logic at all
+ * -- the single-channel ORDER BY path leaves dead rows to the heap probe and refills
+ * through its widening ladder -- so weave_fuse_vec_warpmap() gives it an `allow`
+ * bitmap built on the warp-map pass it already makes.  Inside a fused run the heap
+ * probe is not enough: a dead docid the vector channel published would occupy one of
+ * the k heap slots and DISPLACE a live document, so the symptom is a missing row
+ * rather than a wrong one.  The MVCC check that decides what the user sees is the
  * heap probe in weave_ord_probe() either way; this only decides what is scored.
  *
  * WHERE THE TIDs COME FROM, the paragraph AGENTS.md asks for because getting it
@@ -7254,26 +7302,56 @@ weave_fuse_rescan(IndexScanDesc scan, WeaveScanOpaque so)
 	w = (float4 *) ARR_DATA_PTR(arr);
 
 	/*
-	 * WEAVE_STRAT_DISTANCE IS THE ONLY SCORED CHANNEL A FUSED RUN CAN DRIVE
-	 * TODAY, and an order-by key of any other strategy beside a transport key is
-	 * therefore a bug in src/am/fusepath.c rather than a query to serve in some
-	 * reduced form.  Serving it reduced would silently answer a two-channel
-	 * ordering with a one-channel one.
+	 * WHICH SCORED CHANNELS A FUSED RUN CAN DRIVE, and an order-by key of any other
+	 * strategy beside a transport key is a bug in src/am/fusepath.c rather than a
+	 * query to serve in some reduced form.  Serving it reduced would silently answer
+	 * a two-channel ordering with a one-channel one.
+	 *
+	 * Three since F8: the lexical `<=>` and the two vector orderings, whose lane
+	 * space is relabelled into this run's docid space by include/weave/vecdocmap.h.
+	 * `<@>` is still absent and is task F9 -- its positions are DICTIONARY entries,
+	 * for which no relabelling exists.
 	 */
 	for (i = 0; i < scan->numberOfOrderBys; i++)
 	{
+		int			strat;
+
 		if (i == transport)
 			continue;
-		if (scan->orderByData[i].sk_strategy != WEAVE_STRAT_DISTANCE)
+		strat = scan->orderByData[i].sk_strategy;
+		if (strat != WEAVE_STRAT_DISTANCE && strat != WEAVE_STRAT_VEC_L2 &&
+			strat != WEAVE_STRAT_VEC_IP)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("a fused weave index scan cannot serve ORDER BY strategy %d",
-							(int) scan->orderByData[i].sk_strategy),
-					 errdetail("Only the lexical <=> channel can be fused today; see doc/specs/FUSED_TOPK.md sect. 7b.")));
+							strat),
+					 errdetail("The lexical <=> channel and the vector <-> and <#> channels can be fused; see doc/specs/FUSED_TOPK.md sect. 7b and 7c.")));
 		if (scan->orderByData[i].sk_flags & SK_ISNULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 					 errmsg("a fused weave index scan channel was given a NULL query")));
+
+		/*
+		 * THE METRIC, CHECKED AGAIN.  src/am/fusepath.c reads the reloption at plan
+		 * time and declines to offer a fused path when it disagrees with the
+		 * operator, which is what keeps this out of doc/GAPS.md G39 -- so this is
+		 * unreachable from SQL and is a check on that file, like every other refusal
+		 * in this function.  It is worth its four lines because the failure it
+		 * catches is an ORDERING, not an error: a `<->` key answered out of an `ip`
+		 * weft returns every row, plausibly, in the wrong order.
+		 */
+		if (strat == WEAVE_STRAT_VEC_L2 || strat == WEAVE_STRAT_VEC_IP)
+		{
+			int			want = (strat == WEAVE_STRAT_VEC_IP) ?
+				WEAVE_METRIC_IP : WEAVE_METRIC_L2;
+
+			if (weave_index_vec_metric_raw(scan->indexRelation) != want)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("a fused weave index scan cannot order by %s on an index whose metric is not %s",
+								strat == WEAVE_STRAT_VEC_IP ? "<#>" : "<->",
+								strat == WEAVE_STRAT_VEC_IP ? "ip" : "l2")));
+		}
 		nsc++;
 	}
 
@@ -7289,25 +7367,45 @@ weave_fuse_rescan(IndexScanDesc scan, WeaveScanOpaque so)
 						nsc, nw)));
 
 	/*
-	 * COPIED into the scan's own context, both of them.  sk_argument belongs to
-	 * the executor's ScanKey and every rung of the widening ladder re-reads the
-	 * queries -- arbitrarily later than this call -- which is the same reason the
-	 * vector path copies its query vector.
+	 * COPIED into the scan's own context, all of them.  sk_argument belongs to the
+	 * executor's ScanKey and every rung of the widening ladder re-reads the queries
+	 * -- arbitrarily later than this call -- which is the same reason the
+	 * single-channel vector path copies its query vector.
 	 */
 	old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
-	so->fuseQ = (WeaveQuery *) palloc(nsc * sizeof(WeaveQuery));	/* alloc-ok: one per fuse() score argument, at most WEAVE_FUSE_MAX_CHAN */
+	so->fuseQ = (WeaveQuery *) palloc0(nsc * sizeof(WeaveQuery));	/* alloc-ok: one per fuse() score argument, at most WEAVE_FUSE_MAX_CHAN */
 	so->fuseW = (float4 *) palloc(nsc * sizeof(float4));	/* alloc-ok: as above */
+	so->fuseStrat = (int *) palloc(nsc * sizeof(int));	/* alloc-ok: as above */
+	so->fuseV = (WVec **) palloc0(nsc * sizeof(WVec *));	/* alloc-ok: as above */
+	so->fuseA = (AttrNumber *) palloc(nsc * sizeof(AttrNumber));	/* alloc-ok: as above */
 	j = 0;
 	for (i = 0; i < scan->numberOfOrderBys; i++)
 	{
-		WeaveQuery	q;
-
 		if (i == transport)
 			continue;
-		q = DatumGetWQuery(scan->orderByData[i].sk_argument);
-		so->fuseQ[j] = (WeaveQuery) palloc(VARSIZE_ANY(q));	/* alloc-ok: one query, bounded by the query text */
-		memcpy(so->fuseQ[j], q, VARSIZE_ANY(q));
 
+		so->fuseStrat[j] = scan->orderByData[i].sk_strategy;
+		so->fuseA[j] = scan->orderByData[i].sk_attno;
+
+		if (so->fuseStrat[j] == WEAVE_STRAT_DISTANCE)
+		{
+			WeaveQuery	q = DatumGetWQuery(scan->orderByData[i].sk_argument);
+
+			so->fuseQ[j] = (WeaveQuery) palloc(VARSIZE_ANY(q));	/* alloc-ok: one query, bounded by the query text */
+			memcpy(so->fuseQ[j], q, VARSIZE_ANY(q));
+		}
+		else
+		{
+			WVec	   *v = DatumGetWVec(scan->orderByData[i].sk_argument);
+
+			/* Copied for the reason the single-channel vector path copies it
+			 * (weave_rescan()): DatumGetWVec() hands back the datum itself when it
+			 * is not toasted, sk_argument belongs to the executor's ScanKey, and
+			 * every rung of the widening ladder re-reads the vector arbitrarily
+			 * later than this call. */
+			so->fuseV[j] = (WVec *) palloc(VARSIZE_ANY(v));	/* alloc-ok: one query vector, bounded by WVEC_MAX_DIM */
+			memcpy(so->fuseV[j], v, VARSIZE_ANY(v));
+		}
 		/*
 		 * The weight is validated here, before the core can see it, because
 		 * include/weave/fuse.h note 3 is about silent damage rather than taste: a
@@ -7349,6 +7447,102 @@ typedef struct FuseKeyTerms
 	int			nterms;
 	double	   *idf;
 } FuseKeyTerms;
+
+/*
+ * One VECTOR channel of one bolt (task F8).
+ *
+ * A lexical key becomes one shuttle per term and needs no per-bolt record; a
+ * vector key becomes exactly one shuttle per bolt plus the two arrays that
+ * relabel it into the docid space, which do need one.  `adapt` is storage, not a
+ * pointer: the core is handed &adapt.chan and must outlive nothing, so keeping it
+ * here rather than pallocing it separately means the whole per-bolt vector state
+ * is one array recycled with segctx.
+ */
+typedef struct FuseVecChan
+{
+	int			slot;			/* this channel's index in ss[] and chans[] */
+	uint64	   *docid;			/* the bolt's warp map: lane -> docid, ascending */
+	uint32		nlane;
+	WeaveVecDocChan adapt;
+} FuseVecChan;
+
+/*
+ * Materialize a bolt's warp map, and the allowlist that keeps the vector channel's
+ * tombstone semantics equal to the lexical channel's.
+ *
+ * ONE FORWARD PASS, which is all the warp map supports: it is a page chain with no
+ * index over its pages (which is exactly why the relabelling needs an array and
+ * not a lookup).  The same pass vec_allow_from_docids() makes for the filtered
+ * top-k, and the cost doc/specs/FUSED_TOPK.md sect. 7b priced at 8 bytes per lane
+ * per bolt per pass -- nine with the bitmap.
+ *
+ * WHY THE ALLOWLIST IS BUILT HERE AND NOT LEFT NULL.  sect. 7b records that (C6)
+ * is not applied by the scorer on the fused path -- `live` is NULL, because a
+ * bitmap over the SPARSE docid space would cost tens of megabytes to carry what the
+ * channels already hold -- so each channel filters its own segment's tombstones.
+ * The lexical channel does (wand_skip_own_tombstoned()).  If the vector channel did
+ * not, a docid deleted in this bolt would still be published by it, enter the
+ * candidate union, occupy one of the k heap slots, and displace a live document
+ * that the heap fetch would then never see.  No wrong row is RETURNED -- the
+ * visibility check drops it -- so the symptom would be a MISSING row, which is the
+ * failure mode hard rule 1 is about.  The mask is also the cheap kind of filter:
+ * weave_vec_scan_block() tests it before it is handed any code bytes.
+ *
+ * A forward-resume sm_cursor_t is used because the map is docid-ascending, so the
+ * tombstone probes arrive in non-decreasing order -- the same amortization
+ * wand_cur_own_tombstoned() relies on, and it matters for the same reason: a bolt
+ * can carry millions of tombstones.
+ *
+ * Returns the live lane count.  `*docid_out` and `*allow_out` are allocated in the
+ * current context.
+ */
+static uint32
+weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
+					   const WeaveTombstones *tombs, uint64 **docid_out,
+					   uint64 **allow_out)
+{
+	WeaveVecWarpCursor wc;
+	uint64	   *docid;
+	uint64	   *allow;
+	uint32		nlane = (uint32) w->meta.nvec;
+	uint32		nword = (nlane + 63) / 64;
+	uint32		nlive = 0;
+	uint32		i;
+	sm_cursor_t tombcursor = SM_CURSOR_INIT;
+	bool		havetombs = (tombs != NULL && tombs->hasany &&
+							 segidx < tombs->nseg && tombs->present[segidx]);
+
+	/* Relation-scale, one entry per document of this bolt: huge-safe, and the
+	 * ascending check in weave_vecdoc_chan_init() reads every entry, so nothing is
+	 * left uninitialized by not zeroing it. */
+	docid = (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) Max(nlane, 1) * sizeof(uint64));
+	allow = (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) Max(nword, 1) * sizeof(uint64));
+	memset(allow, 0, (Size) Max(nword, 1) * sizeof(uint64));
+
+	weave_vec_warp_begin(&wc, w);
+	for (i = 0; i < nlane; i++)
+	{
+		uint64		d;
+		const char *why = NULL;
+
+		if (!weave_vec_warp_next(&wc, &d, &why))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("bolt %d of index \"%s\" has an unreadable vector warp map",
+							segidx, RelationGetRelationName(index)),
+					 errdetail("%s.", why != NULL ? why : "unknown reason")));
+		docid[i] = d;
+		if (havetombs && sm_contains(&tombs->maps[segidx], d, &tombcursor))
+			continue;
+		allow[i / 64] |= UINT64CONST(1) << (i % 64);
+		nlive++;
+	}
+	weave_vec_warp_end(&wc);
+
+	*docid_out = docid;
+	*allow_out = allow;
+	return nlive;
+}
 
 /* (ascending distance, ascending TID): the fused candidate list's total order.
  * The TID tie-break is not cosmetic, it is what makes a LIMIT that cuts inside a
@@ -7451,6 +7645,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		WeaveShuttle **ss;
 		WeaveFuseChan *chans;
 		WeaveFuseChan **cp;
+		FuseVecChan *vc;
 		WeaveFuseHit *heap;
 		MemoryContext segctx;
 
@@ -7477,6 +7672,14 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		kt = (FuseKeyTerms *) palloc0(so->nfuse * sizeof(FuseKeyTerms));	/* alloc-ok: one per fuse() score argument, at most WEAVE_FUSE_MAX_CHAN */
 		for (qi = 0; qi < so->nfuse; qi++)
 		{
+			/* A vector key has no terms and no IDF: its channel is one shuttle per
+			 * bolt, built below.  palloc0 above already left nterms zero, and every
+			 * loop over kt[qi] is bounded by it, so the vector keys simply fall
+			 * through -- which is why this is a `continue` and not a parallel
+			 * structure. */
+			if (so->fuseStrat[qi] != WEAVE_STRAT_DISTANCE)
+				continue;
+
 			kt[qi].nterms = weave_query_terms(so->fuseQ[qi], &kt[qi].terms,
 											  &kt[qi].lens);
 			kt[qi].idf = (double *)
@@ -7520,6 +7723,8 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 			palloc(WEAVE_FUSE_MAX_CHAN * sizeof(WeaveFuseChan));	/* alloc-ok: as above */
 		cp = (WeaveFuseChan **)
 			palloc(WEAVE_FUSE_MAX_CHAN * sizeof(WeaveFuseChan *));	/* alloc-ok: as above */
+		vc = (FuseVecChan *)
+			palloc(WEAVE_FUSE_MAX_CHAN * sizeof(FuseVecChan));	/* alloc-ok: as above */
 
 		/* One heap entry per requested candidate.  fusek climbs the x4 ladder to
 		 * WEAVE_ORD_WIDTH_MAX, so this is a corpus-scale allocation and takes the
@@ -7538,6 +7743,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 			WeaveFuseError err;
 			int			nch = 0;
 			int			nscored = 0;
+			int			nvc = 0;
 			int			nh;
 
 			if (sg->dictstart == InvalidBlockNumber)
@@ -7635,6 +7841,93 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 			}
 
 			/*
+			 * ONE SHUTTLE PER VECTOR KEY (task F8), ADAPTED INTO THE DOCID SPACE.
+			 *
+			 * The asymmetry with the lexical loop above is the channels', not this
+			 * code's: a lexical key's positions come from one posting list per term,
+			 * so a term is a channel, whereas a vector key's come from the bolt's
+			 * whole code weft, so a KEY is a channel.  That is also why a vector key
+			 * contributes exactly 1 to the plan-time channel count in
+			 * src/am/fusepath.c while a lexical key contributes its term count.
+			 *
+			 * A BOLT WITHOUT A WEFT FOR THIS COLUMN IS SKIPPED, not an error, and it
+			 * is the same semantics as a query term absent from a segment: the
+			 * channel contributes nothing here.  It is reachable without corruption
+			 * -- a bolt written before the vector column existed, or one whose every
+			 * row had a NULL vector -- and the alternative, refusing the scan, would
+			 * make one such bolt break every fused query on the index.
+			 */
+			for (qi = 0; qi < so->nfuse; qi++)
+			{
+				WeaveVecWeft w;
+				BlockNumber root;
+				const char *why = NULL;
+				uint16		wattnum = 0;
+				uint64	   *dmap;
+				uint64	   *allow;
+				uint32		nlane;
+				WeaveShuttle *sh;
+
+				if (so->fuseStrat[qi] == WEAVE_STRAT_DISTANCE)
+					continue;
+
+				root = weave_vec_weft_locate(index, sg, &wattnum);
+				if (root == InvalidBlockNumber)
+					continue;	/* this bolt carries no vector weft */
+
+				/* ROUTE BY ATTRIBUTE.  An index may carry more than one wvec
+				 * column, and scoring the weft of a different column is a wrong
+				 * answer with a correct row count -- the failure
+				 * include/weave/vector.h says the recorded attnum exists to
+				 * prevent, and the reason so->fuseA[] is carried at all. */
+				if (wattnum != 0 && so->fuseA[qi] != 0 &&
+					wattnum != (uint16) so->fuseA[qi])
+					continue;
+
+				if (!weave_vec_weft_open(index, root, &w, &why))
+					ereport(ERROR,
+							(errcode(ERRCODE_INDEX_CORRUPTED),
+							 errmsg("bolt %u of index \"%s\" has an unreadable vector weft at block %u",
+									s, RelationGetRelationName(index), root),
+							 errdetail("%s.", why != NULL ? why : "unknown reason")));
+
+				if (w.meta.nvec == 0)
+					continue;	/* nothing to publish; see vecdocmap.h's refusals */
+
+				if (nch >= WEAVE_FUSE_MAX_CHAN - 1)
+					ereport(ERROR,
+							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("a fused weave index scan needs more than %d channels",
+									WEAVE_FUSE_MAX_CHAN),
+							 errhint("Use fewer query terms, or move a term into a WHERE clause so it becomes a gate.")));
+
+				nlane = weave_fuse_vec_warpmap(index, &w, (int) s, &tombs,
+											   &dmap, &allow);
+				if (nlane == 0)
+					continue;	/* every document of this bolt is tombstoned */
+
+				/*
+				 * The allowlist is the shuttle's, not the core's: `live` stays NULL
+				 * for the reason weave_fuse_vec_warpmap() gives.  nwarp is the LANE
+				 * count, because that is the space the bitmap indexes -- the
+				 * relabelling happens one level up, in the adapter.
+				 */
+				sh = weave_vec_shuttle_begin(&w, (int) s, so->fuseV[qi]->x,
+											 (int) so->fuseV[qi]->dim,
+											 allow, (WeaveWarp) w.meta.nvec,
+											 so->fuseW[qi]);
+				sh->weight = so->fuseW[qi];
+
+				vc[nvc].slot = nch;
+				vc[nvc].docid = dmap;
+				vc[nvc].nlane = (uint32) w.meta.nvec;
+				nvc++;
+
+				ss[nch++] = sh;
+				nscored++;
+			}
+
+			/*
 			 * nscored == 0 means no scored channel reaches this bolt, so this bolt
 			 * has no candidate at all: include/weave/fuse.h defines the candidate
 			 * set as the UNION of the scored channels' positions intersected with
@@ -7680,6 +7973,29 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 				weave_fuse_wrap_shuttles(chans, ss, nch);
 				for (i = 0; i < nch; i++)
 					cp[i] = &chans[i];
+
+				/*
+				 * AND THE VECTOR CHANNELS ARE HANDED TO THE CORE THROUGH THEIR
+				 * ADAPTERS (task F8), which is the one place this pass departs from
+				 * "wrap every shuttle and go".  The wrapped channel publishes
+				 * segment-local LANE indices; the core's positions are docids.
+				 * include/weave/vecdocmap.h relabels one into the other through the
+				 * bolt's warp map and argues why (C1) and (C2) both survive.
+				 */
+				for (i = 0; i < nvc; i++)
+				{
+					const char *why = NULL;
+
+					if (weave_vecdoc_chan_init(&vc[i].adapt, &chans[vc[i].slot],
+											   vc[i].docid, vc[i].nlane,
+											   &why) != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_INDEX_CORRUPTED),
+								 errmsg("bolt %u of index \"%s\" cannot drive a fused vector channel",
+										s, RelationGetRelationName(index)),
+								 errdetail("%s.", why != NULL ? why : "unknown reason")));
+					cp[vc[i].slot] = &vc[i].adapt.chan;
+				}
 
 				/*
 				 * nwarp is the END SENTINEL, not a document count, because the
