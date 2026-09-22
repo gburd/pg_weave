@@ -375,6 +375,18 @@ Four things, and it should claim exactly four things:
    score normalization lands and the nDCG row is at parity.** (C2) survives any
    monotone positive rescaling — `w·bound ≥ w·score` needs only `w > 0` — so there
    is room to fix it without touching §2's algebra.
+
+   **And that room was measured the same day, offline, before any code: normalizing
+   each key by its realized per-query maximum beats RRF on all three datasets**
+   (1.049×, 1.006×, 1.021×) where the raw sum loses on all three (0.982×, 0.924×,
+   0.687×). So the deficiency is the objective's *scaling* and nothing deeper, and
+   this claim is recoverable rather than wrong. It is still UNSUPPORTED, because a
+   single-pass threshold scan cannot know a realized maximum before it starts and the
+   pre-scan substitute is not yet shown to hold that parity (`doc/GAPS.md` G44). The
+   useful correction to this paragraph's own instinct: **the normalizer need not be a
+   bound** — note 3 asks only for a positive finite weight — so it may be a
+   statistical estimate rather than a ceiling, which is a larger design space than
+   "make the bound tighter".
 3. Queries that get **faster** as predicates get more selective, because the
    predicate is pushed into the SIMD block mask instead of collapsing recall.
    (The "graph traversal" half of this sentence is stale — the Vamana plan was

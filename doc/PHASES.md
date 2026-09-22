@@ -757,6 +757,12 @@ Two of five rows fail:
   *fused-threshold top-k instead of RRF*, and being faster at a worse objective does not
   support it. **Claim 2 is not retracted — its mechanism works — but it is UNSUPPORTED
   until the ranking is competitive. Do not quote it as measured.**
+  **MEASURED the same day and the direction is settled:** normalizing each key by its
+  realized per-query maximum beats RRF on all three datasets (1.049×, 1.006×, 1.021×)
+  where the raw sum loses on all three. The remaining question is only whether a
+  *pre-scan* normalizer holds that parity — the ceiling substitute leaves a median
+  1.37× key-vs-key misweighting against the raw sum's 33×. G44 has the numbers and the
+  next measurement. **Implement in C only the scheme shown to hold parity.**
 - **`score()` calls** is the **vector block bound**, and it was predictable from data
   already on disk: the lexical side clears the gate on fiqa by itself (0.149×), while the
   vector side is 0.956–0.991× of the control with `vec_blocks_bound_skipped = 0`

@@ -87,6 +87,45 @@ therefore predictable from a measurement already on disk; nobody connected the t
 the gate failed. Hard rule 9 says measure the thing the design rests on before building
 on it. The measurement existed. The *inference* did not.
 
+## Follow-up the same day: normalization overturns the nDCG result (G44)
+
+Before writing any scorer code — hard rule 9 — the candidate objectives were scored
+offline from the index's **own** exhaustive per-channel scores, through the same run-file
+and `bench/ndcg.py` path the two real arms use. `FUSE_NORMSTUDY=1` in `bench/fuse.sh`.
+
+| dataset | raw sum (shipping) | RRF (control) | **maxn** | mmn | maxn ÷ RRF |
+|---|---|---|---|---|---|
+| scifact | 0.6720 | 0.6846 | **0.7182** | 0.7189 | **1.049×** |
+| nfcorpus | 0.3161 | 0.3422 | **0.3444** | 0.3208 | **1.006×** |
+| fiqa | 0.2393 | 0.3482 | **0.3556** | 0.3348 | **1.021×** |
+
+`maxn` = each **key** divided by its realized per-query maximum. `mmn` = per-key min-max.
+**The shipping objective loses to RRF on 3 of 3 datasets; `maxn` beats it on 3 of 3.**
+
+**Positive control:** the `raw` and `rrf` arms reproduce the EC2 numbers above to four
+decimals on all three datasets. A study that cannot reproduce the thing it claims to
+improve is measuring something else — and this one needed no EC2, because nDCG is
+deterministic and host-independent. Only latency needs a quiet machine.
+
+**`mmn` is rejected on semantics, not on one dataset.** It wins on scifact and loses on
+the other two. Min-max shifts each channel's floor to the corpus minimum, which destroys
+BM25's "an absent term contributes exactly 0" and lifts every non-matching document off
+the floor. Dividing by the max keeps 0 at 0.
+
+**So the nDCG row is fixable, and the fix is not in the scan.** What is *not* yet
+established is that a **one-pass** normalizer reaches `maxn`: a threshold scan cannot know
+a realized maximum before it starts. Measured over 25 scifact queries, substituting the
+pre-scan ceiling leaves a median **1.37×** relative misweighting between the two keys
+(range 0.88–2.09×) against the raw sum's **33×**. The vector ceiling is a constant 1.0107
+— L2-normalized vectors under ip — so every bit of that distortion is the lexical
+ceiling's assumption that all terms hit max tf in the shortest document at once.
+
+The opening this leaves: `include/weave/fuse.h` note 3 requires a weight to be **positive
+and finite**, nothing more, so **a normalizer need not be an upper bound**. It may be a
+statistical estimate of the realized max (for the lexical key, the contribution at max tf
+and *average* doclen), which is much closer and still known before the scan. Details and
+the next measurement in `doc/GAPS.md` G44.
+
 ## Latency: a real win, and the A/A leg says so
 
 | dataset | p50 fused | p50 RRF | p99 fused | p99 RRF | p50 A/A repeat | noise floor | delta ÷ noise |

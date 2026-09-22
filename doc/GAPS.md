@@ -2171,6 +2171,84 @@ The first is the only one that preserves the design. **It is also the one that m
 V17's selectivity switch and claim 3 meaningful**, since neither matters if the ranking
 is not competitive.
 
+**MEASURED 2026-09-22, same day: NORMALIZATION IS THE ANSWER, and it overturns the
+result rather than merely closing it.** Before writing any C — hard rule 9 — the
+candidate objectives were scored offline from the index's **own** per-channel scores
+(`weave_search()` and `weave_vec_scan()`, exhaustive), through the same run-file and
+`bench/ndcg.py` path the real arms use, so no scheme can win here by being measured
+differently. nDCG@10:
+
+| dataset | raw sum (today) | RRF (control) | **maxn** | mmn | maxn ÷ RRF |
+|---|---|---|---|---|---|
+| scifact | 0.6720 | 0.6846 | **0.7182** | 0.7189 | **1.049×** |
+| nfcorpus | 0.3161 | 0.3422 | **0.3444** | 0.3208 | **1.006×** |
+| fiqa | 0.2393 | 0.3482 | **0.3556** | 0.3348 | **1.021×** |
+
+`maxn` divides each **key** by its realized per-query maximum; `mmn` is per-key min-max.
+**The raw sum loses to RRF on 3 of 3; `maxn` beats it on 3 of 3.** MRR@10 moves the same
+way and recall@100 is at parity, so the gain is concentrated where nDCG@10 measures it.
+
+**Positive control for the study itself:** the `raw` and `rrf` arms reproduce the recorded
+EC2 numbers to four decimals on all three datasets (0.6720/0.6846, 0.3161/0.3422,
+0.2393/0.3482). A study that could not reproduce the thing it claims to improve would be
+measuring something else. This also means the study needs no EC2: nDCG is deterministic
+and host-independent, and **only latency needs a quiet machine** — which is why this cost
+nothing.
+
+**`mmn` IS REJECTED, and the reason is a semantic one worth keeping.** It wins on scifact
+and loses on the other two (0.937×, 0.962×). Min-max shifts each channel's floor to the
+corpus minimum, which destroys BM25's "an absent term contributes exactly **0**" — every
+non-matching document gets lifted off the floor. Dividing by the max keeps 0 as 0. So the
+scheme that respects the channel's own semantics is the one that generalizes, and the
+textbook choice is the one that does not.
+
+**THE NORMALIZER IS PER KEY, NOT PER CHANNEL, and getting this wrong would damage BM25.**
+A lexical `fuse()` argument expands to **one channel per query term**. Normalizing each
+channel by its own ceiling would rescale terms relative to each other — i.e. it would
+partially undo idf weighting, which is the thing BM25 is for. All channels arising from
+one `fuse()` argument must therefore share one normalizer. The algebra survives either
+way (each channel's effective weight is still a positive constant, so (C2), the suffix
+sums and the MaxScore partition are untouched), which is exactly why this would have been
+easy to get wrong and hard to notice.
+
+**WHAT IS NOT YET ESTABLISHED, and it is the whole implementation risk.** `maxn` uses the
+**realized** maximum, which a single-pass threshold scan cannot know before it starts. The
+obvious pre-scan substitute is the key's **ceiling** (the sum of its channels' `maxscore`),
+and measured against the realized maximum over 25 scifact queries:
+
+| | median | range |
+|---|---|---|
+| lexical ceiling ÷ realized max | 2.07× | 1.34–4.55× |
+| vector ceiling ÷ realized max | 1.52× | 1.20–2.86× |
+| **ratio of the two** (what distorts the ranking) | **1.37×** | 0.88–2.09× |
+
+Equal looseness cancels — it is a common factor — so only the **ratio** matters. Ceiling
+normalization would therefore leave a median **1.37×** relative misweighting against the
+raw sum's **33×**: a 24× improvement, not an exact fix. Whether 1.37× costs nDCG is
+measurable and unmeasured.
+
+Two facts make this tractable rather than a dead end:
+
+  1. **The vector ceiling is a CONSTANT 1.0107** across all 25 queries, because the
+     vectors and the query are L2-normalized and the metric is ip, so the ceiling is ~1.0
+     while the realized max is the best cosine (0.35–0.85 here). All of the distortion is
+     the lexical ceiling, whose looseness comes from assuming every term hits its max tf
+     in the shortest document *simultaneously* — an assumption that gets worse as term
+     count grows, which is why fiqa's 8-term queries are the loose end of the range.
+  2. **The normalizer does NOT have to be an upper bound.** `include/weave/fuse.h` note 3
+     requires only that a weight be **positive and finite**; nothing in §2's algebra needs
+     a normalized score to be ≤ 1, and the ceiling still bounds the normalized score
+     correctly because it is divided by the same constant. So the normalizer may be a
+     *statistical* estimate of the realized max — for the lexical key, the contribution at
+     max tf and **average** doclen rather than at |D| → 0 — which is far closer to the
+     realized maximum and is still known before the scan. This is the design freedom that
+     makes a one-pass fix plausible, and it was not obvious: every other constant in this
+     design is a bound, so the reflex is to reach for one here too.
+
+**Next step, and it is a measurement, not a patch:** add the ceiling-normalized and
+avgdl-normalized schemes as study arms and score them the same way. Implement in C only
+the scheme that is shown to hold parity with `maxn`.
+
 **Latent because every prior test used one channel or a fixture.** A single-channel
 ranking has no scale to mismatch, and `sql/fuse_pushdown.sql`'s fixtures assert the
 scorer computes *what it says it computes*, which it does. No fixed-output test can see
