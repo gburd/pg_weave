@@ -2131,7 +2131,7 @@ an exhaustive per-channel oracle — which is only an oracle because
 `sql/fuse_pushdown.sql` section 2b had already worked out that the `fuse()` fallback is
 not one (`FUSED_TOPK.md` section 7a (1)).
 
-### G44 — the fused scorer's linear sum of RAW channel scores is a worse ranking function than RRF, and the gap grows with how much the dense channel matters — **FIXED 2026-09-22, the same day it was opened: the per-key ceiling normalizer is IN THE PRODUCT, on by default, and measured there. `FUSED_TOPK.md` §8b's nDCG@10 row is now MET; its p50 and `score()`-call rows are untouched by this work and still FAIL.** Found by the first real-corpus §8 run; the original measurement, the study that produced the fix and the two things that study got wrong are all left below, annotated in place.
+### G44 — the fused scorer's linear sum of RAW channel scores is a worse ranking function than RRF, and the gap grows with how much the dense channel matters — **FIXED 2026-09-22, the same day it was opened: the per-key ceiling normalizer is IN THE PRODUCT, on by default, and measured there. `FUSED_TOPK.md` §8b's nDCG@10 row is now MET — AND THE FIX HAS A MEASURED PRICE, RECORDED 2026-09-22 (night): it costs +19 % / +3 % / +104 % of p50, and §8b's p99 row goes from PASS to FAIL, so the gate is 2 of 5 either way and the change TRADED p99 FOR nDCG. Its p50 and `score()`-call rows also still FAIL.** Found by the first real-corpus §8 run; the original measurement, the study that produced the fix and the two things that study got wrong are all left below, annotated in place.
 
 `bench/RESULTS_FUSE.md`. nDCG@10, fused vs RRF `k'=100`, same index, same
 embeddings, nothing differing but the scorer:
@@ -2485,11 +2485,20 @@ upgraded.
     0.052×, and its vector side is exactly **1.000×** with `blkskip` collapsed. The row
     fails either way; with the normalizer on it fails for a *different* reason, which is
     the dense-channel ceiling property in `FUSED_TOPK.md` §8d.
+    — **RE-MEASURED ON EC2 2026-09-22 (night): the p50 figures in this bullet are the raw
+    arm's. The shipping arm is 0.710× / 0.827× / 1.172× — worse on every corpus, and on fiqa
+    slower than the control — and the p99 row, which passed here, now FAILS at 0.710× /
+    0.612× / 1.000×.** Dated block at the end of this entry.
   - **The normalizer's own cost is UNMEASURED.** One LUT build and one directory pass per
     bolt per vector key, ahead of the first bolt. Kilobytes of directory against megabytes
     of codes is a reason to expect it to be small, not a measurement; no latency figure has
     been taken since the change, so `FUSED_TOPK.md` §8's p50/p99 rows describe the
     pre-normalizer build and need an EC2 re-run before they are quoted for the default.
+    — **CLOSED BY MEASUREMENT 2026-09-22 (night), AND THE GUESS IN IT IS CORRECTED: the cost
+    is +19 % / +3 % / +104 % of p50, and it is NOT the pre-scan pass.** See the dated EC2 block
+    at the end of this entry. "Kilobytes against megabytes" was a sound argument about the
+    pass and an unsound one about the total, because the pass is not the component that got
+    slower — the **pivot walk** is.
   - **fiqa's optimum ratio is still at or below the lowest ratio swept**, so the
     equal-weight default is probably not optimal there even now. Unchanged by this work.
     — **CLOSED BY MEASUREMENT 2026-09-22, and OVERTURNED: in the product fiqa PEAKS at
@@ -2682,6 +2691,77 @@ changed.** Hard rule 11: this is one harness at one scale on three corpora, the 
 is real, and "tune the default to the mean of three BEIR sets" is fitting, which is honest
 only if reported as fitted. It is a maintainer decision, and the numbers are here so that it
 can be made from measurement rather than from taste.
+
+**MEASURED ON EC2 2026-09-22 (night): THE NORMALIZER'S COST IS +19 % / +3 % / +104 % OF p50,
+THE §8 p99 ROW GOES FROM PASS TO FAIL, AND ON fiqa THE FUSED ARM IS NOW SLOWER THAN THE RRF
+CONTROL IT EXISTS TO REPLACE. This entry's "FIXED" verdict stands on nDCG and is now paid for
+in latency.** Run `pgweave-20260922-224507`: `c7i.8xlarge` (32 vCPU), us-east-2, PostgreSQL 17,
+extension **0.19.0**, commit **b0bd1b7**, real `all-MiniLM-L6-v2` embeddings computed on the
+instance, the same three BEIR corpora, an RRF `k'=100`/`k=60` control over the **same** index,
+`LATN=50` × `REPS=7` with arms alternated per query and an A/A leg. Instance terminated and
+verified; no orphaned volumes, keys or security groups. This is the re-run the open item above
+was waiting for, and it is a **loss**.
+
+| row | gate | scifact | nfcorpus | fiqa | the same row on the raw sum | |
+|---|---|---|---|---|---|---|
+| p99 fused ÷ RRF | ≤ 0.70× | 0.710× | 0.612× | **1.000×** | 0.609× / 0.560× / 0.633× | **FAIL on two of three — was PASS** |
+| p50 fused ÷ RRF | ≤ 0.50× | 0.710× | 0.827× | **1.172×** | 0.582× / 0.795× / 0.578× | **FAIL**, and fiqa is **slower than the control** |
+
+Absolute p50 / p99 in ms — fused (normalizer on) | RRF | `fused_aa` | `fused_raw`:
+scifact 2.557 / 3.296 | 3.601 / 4.645 | 2.571 / 3.277 | 2.144 / 2.939;
+nfcorpus 1.575 / 1.843 | 1.905 / 3.012 | 1.578 / 1.875 | 1.533 / 1.691;
+fiqa 22.163 / 27.918 | 18.915 / 27.905 | 22.198 / 27.900 | 10.889 / 16.845.
+
+**The p99 movement is caused by this change, not by staleness.** The two arms are the same
+statement one GUC apart on one index in one run. **The differences are real** (hard rule 10):
+|fused − `fused_aa`| at p50 is **0.014 / 0.003 / 0.035 ms**, and the between-arm deltas are
+**30× to 320×** that within-arm spread.
+
+**THE CAUSE IS THE PIVOT WALK, NOT THE PRE-SCAN PASS — and the open item above guessed the
+pass.** fiqa work counters, normalizer on vs off: **pivots 37,306,460 vs 7,081,750 (5.3×)**,
+lexical contributions 2,065,310 vs 5,884,038 (down 2.8×), **vector lanes 37,324,800 vs
+35,670,912 (up 4.6 %)**, `blkskip` 6,732 vs 3,444,538, `fuse_scores_total` 39,365,038 vs
+7,011,737 (5.6×). The kernel barely moved; the loop did. The normalized scan visits every
+document because the dense channel's weighted ceiling sits above θ — the property this entry
+already records and `FUSED_TOPK.md` §8d states generally — and one pivot costs one `seek()`
+plus one `block_max()` **per contributing channel** whether or not it ends in a `score()`.
+**The generalizable mistake: the cost was attributed to the component the change ADDED rather
+than to the component whose INPUT the change altered.** Same shape as this entry's earlier
+counter correction, one level up: a plausible mechanism, never asked to predict a number.
+
+**A GATE-DESIGN FINDING, and it is the part that outlives this run: §8's work row and §8's
+latency row moved in OPPOSITE directions.** The work row counts `score()` calls by channel and
+says normalization made things **better** (0.648 → 0.571, 0.903 → 0.875, 0.541 → 0.513 of the
+control). The clock says fiqa got **2.0× slower**. A work-count gate that excludes the pivot
+walk cannot predict the latency row it stands in for. **Recommendation, recorded in
+`FUSED_TOPK.md` §8 as well: if the gate keeps a work row it should count PIVOTS alongside
+`score()` calls.**
+
+**What reproduced exactly, which is itself a cross-harness positive control.** nDCG@10
+fused / raw / RRF = 0.7212 / 0.6720 / 0.6846, 0.3455 / 0.3161 / 0.3422, 0.3878 / 0.2393 /
+0.3482; recall@100 = 0.9683 / 0.8892 / 0.9517, 0.3206 / 0.2908 / 0.3251, 0.7079 / 0.5141 /
+0.6932 — the local `bench/normprod.sh` figures to four decimals, on a different host through a
+different harness, nfcorpus's recall@100 loss included. Correctness gate (normalizer **off**,
+per **G46**): scifact 100 of 100 compared / 0 mismatched, nfcorpus 99 of 100 compared / 1
+skipped for a tied oracle / 0 mismatched, fiqa 100 of 100 compared / 0 mismatched; the `fuse()`
+fallback differed on 100 / 85 / 100 queries, which is `FUSED_TOPK.md` §7a's documented
+divergence and not a defect. Index build 6.6 MB / 0.8 s, 4.9 MB / 0.3 s, 45.4 MB / 6.2 s.
+
+**GATE STATE: 2 of 5.** recall **PASS** (raw objective — G46), nDCG@10 **MET**, p50 / p99 /
+`score()` **FAIL**. Before the normalizer it was also 2 of 5 (recall, p99). **THIS ENTRY'S FIX
+TRADED p99 FOR nDCG**, and that sentence is the honest summary of G44 as a whole.
+
+**THE DECISION IT FORCES, PRESENTED AND NOT TAKEN — AWAITING THE MAINTAINER: should
+`pg_weave.fuse_normalize` stay ON by default?** **On:** the fused ranking beats RRF on all
+three corpora and is slower than RRF on the largest one. **Off:** it is fast (p99 0.609× /
+0.560× / 0.633×, the row passes) and ranks worse than RRF on all three — the state that made
+`ARCHITECTURE.md` §9 claim 2 unsupported in the first place. **Neither:** make the vector
+channel's candidate set smaller, which `FUSED_TOPK.md` §8d shows needs a restated unit, a
+second vector-major copy of the codes, or a cluster-ordered weft — and which is now the
+**single blocker for three of the five rows** rather than one. Two facts that belong with the
+choice: the GUC is **`PGC_USERSET`**, so a user can already choose per query; and this is the
+**first knob in the project whose two settings each fail a different gate row**, which is why
+no default is being changed here. Full numbers: `bench/RESULTS_FUSE.md`, fourth measurement.
 
 ### G45 — `prepdata.py`'s MS MARCO source returns HTTP 404; the dataset §8 names by name cannot be fetched — **OPEN 2026-09-22**
 

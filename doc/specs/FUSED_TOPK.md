@@ -703,6 +703,19 @@ control. `bench/fuse.sql` and `bench/RESULTS_FUSE.md`.
 | channel score() calls | RRF `k'=100` | ≤ 0.2× RRF (this is the mechanism; if it is not much lower, the bounds are too loose and §2 is wrong) |
 | recall vs exhaustive fused scan | — | ~~≥ 0.99 with graph on;~~ **1.000**, and it is 1.000 *by construction* now that the graph channel is withdrawn (§6) — every implemented channel is exact, so this row tests the scorer's pruning, not an approximation. A single miss is a (C2) violation, which makes it the most valuable row in the table rather than the weakest |
 
+**AMENDED 2026-09-22 (night): if this table keeps a work row, the row should count PIVOTS as
+well as `score()` calls.** The EC2 re-run of the shipping scorer (`bench/RESULTS_FUSE.md`,
+fourth measurement) moved the two rows in **opposite directions**: the `score()`-call ratio
+*improved* on all three corpora (0.648 → 0.571, 0.903 → 0.875, 0.541 → 0.513 of the control)
+while fiqa's measured p50 got **2.0× slower**. The missing work is the pivot walk — one
+`seek()` plus one `block_max()` per contributing channel per pivot, and fiqa's pivot count
+rose **5.3×** (7,081,750 → 37,306,460) while its vector lane count moved 4.6 %. A work row
+that counts only `score()` calls cannot predict the latency row it stands in for, which is the
+whole reason it is in this table. The counter already exists (`weave_fuse_stats()`); what is
+missing is the gate's arithmetic. **No number is invented for the restated row here** — a gate
+is honest only if it is written down before it is measured against (§8d option (a) makes the
+same point about the unit).
+
 If the `score()` call ratio is not dramatically lower, stop and fix the bounds
 before optimizing anything else — a loose bound makes the entire design pointless
 and no amount of SIMD recovers it. Record the negative result in
@@ -710,19 +723,26 @@ and no amount of SIMD recovers it. Record the negative result in
 `pg_turbovec/docs/PARITY_GAPS.md` are the house style for that, and the retracted
 "we win 2.3×" claim in the latter is exactly the mistake to avoid.
 
-### 8b. STATUS: MEASURED 2026-09-22 on three BEIR corpora. The gate is NOT met: two rows fail. (A third, nDCG@10, failed on the same run and was FIXED the same day — §8d.)
+### 8b. STATUS: MEASURED 2026-09-22 on three BEIR corpora, RE-MEASURED FOR THE SHIPPING SCORER THE SAME NIGHT. The gate is NOT met: **three rows fail**, and p99 moved from PASS to FAIL because of the normalizer that fixed nDCG@10 (§8d).
 
-`bench/RESULTS_FUSE.md` has the run. Summary, because a spec that states a gate should
+`bench/RESULTS_FUSE.md` has both runs. Summary, because a spec that states a gate should
 state whether it was cleared:
 
 | row | gate | scifact | nfcorpus | fiqa | |
 |---|---|---|---|---|---|
-| recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | **PASS** |
-| p99 latency | ≤ 0.70× | 0.609× | 0.560× | 0.633× | **PASS** |
-| p50 latency | ≤ 0.50× | 0.582× | 0.795× | 0.578× | **FAIL** |
+| recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | **PASS**, and for the **raw** objective only — the oracle cannot express the normalized one (`doc/GAPS.md` G46) |
 | nDCG@10, normalizer **on** (the default since 2026-09-22) | ≥ RRF | 1.053× | 1.010× | 1.114× | **MET** |
+| p99 latency, normalizer **on** | ≤ 0.70× | 0.710× | 0.612× | **1.000×** | **FAIL on two of three — measured 2026-09-22 (night), run `pgweave-20260922-224507`** |
+| p50 latency, normalizer **on** | ≤ 0.50× | 0.710× | 0.827× | **1.172×** | **FAIL**, and on fiqa the fused arm is **slower than the RRF control it replaces** |
+| `score()` calls, normalizer **on** | ≤ 0.20× | 0.571× | 0.875× | 0.513× | **FAIL** |
+| ~~p99 latency, raw weighted sum~~ | ≤ 0.70× | 0.609× | 0.560× | 0.633× | **PASSED — left visible and dated (hard rule 13). SUPERSEDED 2026-09-22 (night): this is the `pg_weave.fuse_normalize = off` arm, and the re-run of the same statement one GUC away FAILS. The row moved because the change moved it, not because the number went stale** |
+| ~~p50 latency, raw weighted sum~~ | ≤ 0.50× | 0.582× | 0.795× | 0.578× | **FAILED then too; superseded 2026-09-22 (night) by 0.710× / 0.827× / 1.172×** |
 | ~~nDCG@10, raw weighted sum~~ | ≥ RRF | 0.982× | 0.924× | 0.687× | **FAILED — this is the `pg_weave.fuse_normalize = off` arm. SUPERSEDED 2026-09-22 by §8d, and left in the table because it is the baseline the fix is measured against** |
-| `score()` calls | ≤ 0.20× | 0.648× | 0.903× | 0.541× | **FAIL** |
+| ~~`score()` calls, raw weighted sum~~ | ≤ 0.20× | 0.648× | 0.903× | 0.541× | **FAILED; the shipping arm's figures are the row above** |
+
+**So the gate is 2 of 5** — recall and nDCG@10 — and it was **2 of 5** before the normalizer
+too: recall and p99. **The change traded p99 for nDCG@10.** Both halves of that trade are
+stated here because either one alone misdescribes the product.
 
 **THE nDCG ROW IS MET AS OF 2026-09-22, and it was met in the product rather than in a
 study.** `bench/normprod.sh` scores three arms that are the *same statement* differing
@@ -744,6 +764,32 @@ the first bolt, and **that cost is unmeasured**. So p50 (0.582× / 0.795× / 0.5
 the raw arm and need an EC2 re-run before any of them is quoted for the shipping default.
 The p99 **PASS** is in exactly that position too: a pass measured on a build that is no
 longer the default is not a pass for the default.
+
+**MEASURED 2026-09-22 (night) — the re-run happened, and the last sentence of that paragraph
+turned out to be the important one. Two things in it were wrong.** Run
+`pgweave-20260922-224507` (`c7i.8xlarge`, PG17, extension 0.19.0, commit b0bd1b7, the same
+three corpora and embeddings, RRF control over the same index, 50 queries × 7 reps alternated
+per query with an A/A leg):
+
+  - **"Normalization changes no mechanism either row depends on" is FALSE.** It changes θ and
+    the MaxScore partition, therefore the pivot count, therefore the latency: fiqa's p50 is
+    **+104 %** with the normalizer on (10.889 → 22.163 ms), scifact **+19 %**, nfcorpus **+3 %**,
+    measured as the same statement one GUC apart. The p99 row **fails** at 0.710× / 0.612× /
+    1.000× where the raw arm passed at 0.609× / 0.560× / 0.633×, and at p50 fiqa's fused arm is
+    **1.172× the control — slower than the thing it replaces**.
+  - **The cost is not in the pre-scan pass**, which is where this paragraph put it. fiqa's
+    pivot count rises **5.3×** (7,081,750 → 37,306,460) and `fuse_scores_total` **5.6×**
+    (7,011,737 → 39,365,038) while the vector lane count moves **4.6 %** (35,670,912 →
+    37,324,800) — the kernel barely notices, the pivot loop pays for everything. The
+    mechanism is §8d's dense-channel ceiling property, one step further along: every document
+    becomes a pivot, and a pivot costs one `seek()` plus one `block_max()` per contributing
+    channel whether or not it ends in a `score()`.
+
+The differences are admissible under hard rule 10: |fused − `fused_aa`| at p50 is
+**0.014 / 0.003 / 0.035 ms** against between-arm deltas 30×–320× larger. Quality and
+correctness reproduced the local measurement exactly (nDCG@10 0.7212 / 0.3455 / 0.3878;
+299 of 300 queries compared, 0 mismatched, 1 skipped for a tied oracle), which is a
+cross-harness control on both. Full numbers: `bench/RESULTS_FUSE.md`, fourth measurement.
 
 **SUPERSEDED 2026-09-22 by §8d, and left in place because the fix was derived from it.**
 Every sentence in the next paragraph still describes the `pg_weave.fuse_normalize = off`
@@ -905,6 +951,20 @@ lanes, so it is kilobytes against a code weft of megabytes, and the pass duplica
 `begin()` runs anyway — but that is an argument that it is small, not a measurement that
 it is, and §8b's p50/p99 rows therefore predate the change and need an EC2 re-run.
 
+**MEASURED 2026-09-22 (night), and the paragraph above is right about the pass and wrong
+about the total.** The re-run (`bench/RESULTS_FUSE.md`, fourth measurement; run
+`pgweave-20260922-224507`) puts the normalizer's p50 cost at **+19 % scifact, +3 % nfcorpus,
++104 % fiqa** — fiqa's p50 doubled, 10.889 → 22.163 ms, same statement one GUC apart. The
+pre-scan pass is not where that lives. **The pivot walk is.** fiqa's pivot count rises
+**5.3×** (7,081,750 → 37,306,460) and `fuse_scores_total` **5.6×** (7,011,737 → 39,365,038)
+while the vector channel's lane count moves **4.6 %** (35,670,912 → 37,324,800) and `blkskip`
+collapses (3,444,538 → 6,732). One pivot costs one `seek()` plus one `block_max()` per
+contributing channel; with every document a pivot — which is exactly what the ceiling property
+below forces — the loop, not the kernel, is the bill. Two consequences for this section:
+**the ceiling property is a LATENCY finding as well as a work finding**, and the smallest
+vector candidate set is now the single blocker for **three** §8 rows (p50, p99, `score()`)
+rather than one.
+
 **THE CONSTRAINT THAT IS NOT OBVIOUS, and it is the reason the previous paragraph cannot
 be simplified: the normalizer must be ONE CONSTANT FOR THE WHOLE QUERY, not one per
 bolt.** `weave_fuse_pass()` runs one bounded top-k **per bolt** and then merges the
@@ -1022,6 +1082,20 @@ chosen here** — the choice is the maintainer's:
     knob turned two ways. `doc/PHASES.md` **V13** (warp ordering by cluster, whose own
     justification is already recorded as gone) is exactly that ordering, so **V13 and F8
     are not independent** — a conflict nothing in the tree had recorded before 2026-09-22.
+
+**AND AS OF 2026-09-22 (night) THIS IS NO LONGER ONLY THE `score()` ROW'S PROBLEM.** The EC2
+re-run measured the same mechanism costing **latency**: p99 fails at 0.710× / 0.612× / 1.000×
+(it passed at 0.609× / 0.560× / 0.633× on the raw sum) and fiqa's p50 is **1.172× the RRF
+control**, i.e. slower than the arm the design proposes to replace. So options (a)–(c) above
+are the three routes out of **three** failing rows, not one, and (a) — restating the unit —
+cannot help p50 or p99 at all, because the clock does not care what unit the gate is written
+in. **A maintainer decision this forces, presented and not taken:** `pg_weave.fuse_normalize`
+is **`PGC_USERSET` and default on**; on, the ranking beats RRF on three corpora and the scan
+is slower than RRF on the largest; off, the scan is fast and the ranking loses to RRF on all
+three, which is the state that made `doc/ARCHITECTURE.md` §9 claim 2 unsupported to begin
+with. It is the first knob in this project whose two settings each fail a **different** gate
+row, and a user can already pick per statement. `bench/RESULTS_FUSE.md` (fourth measurement)
+has the table the decision should be made from.
 
 ### 8c. Why the loop stopped, reported per bolt
 

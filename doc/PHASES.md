@@ -739,6 +739,10 @@ MEASURED 2026-09-22, AND THE GATE IS NOT MET.** `bench/RESULTS_FUSE.md` has the 
 (EC2 `c7i.8xlarge`, real MiniLM embeddings, three BEIR corpora, 3,633 → 57,600 docs).
 Two of five rows fail:
 
+**[UPDATED TWICE SINCE, both dated below: nDCG became MET the same day, and the 2026-09-22
+(night) EC2 re-run of the SHIPPING scorer turned p99 from PASS to FAIL. For the scorer that
+ships, THREE of five rows fail and the gate is 2 of 5.]**
+
 | row | gate | scifact | nfcorpus | fiqa | |
 |---|---|---|---|---|---|
 | recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | PASS |
@@ -748,7 +752,9 @@ Two of five rows fail:
 | `score()` calls | ≤ 0.20× | 0.648× | 0.903× | 0.541× | **FAIL** |
 
 **UPDATE 2026-09-22 (later the same day): the nDCG row is MET, so the gate is 3 of 5
-passing and 2 of 5 failing.** The fix is G44's per-key ceiling normalizer, now implemented
+passing and 2 of 5 failing.** [**CORRECTED 2026-09-22 (night) by the EC2 re-run: it is 2 of 5
+— the p99 row FAILS for the shipping scorer. See the dated block below.**] The fix is G44's
+per-key ceiling normalizer, now implemented
 and measured **in the product** — `bench/normprod.sh`, three arms that are the same fused
 statement differing only in the new GUC `pg_weave.fuse_normalize` (default on; `off`
 restores the raw sum), plus the RRF control, all through `bench/ndcg.py`. **No EC2 and no
@@ -766,7 +772,9 @@ normalized arm loses recall@100 (0.3206 vs 0.3251) and MRR@10 (0.5441 vs 0.5514)
 while winning the gate row by 1.0 %. nfcorpus is met, not clean.
 
 **The latency and work-counter halves of the gate are NOT met and this work did not touch
-them.** p50 is still 0.582× / 0.795× / 0.578× against ≤ 0.50×, and the `score()`-call ratio
+them.** [**CORRECTED 2026-09-22 (night): "did not touch them" is wrong — the normalizer made
+the latency rows WORSE, p99 from PASS to FAIL. Dated block below.**] p50 is still 0.582× /
+0.795× / 0.578× against ≤ 0.50×, and the `score()`-call ratio
 is still 0.648× / 0.903× / 0.541× against ≤ 0.20× — the latter because the vector block
 bound prunes nothing on this data and the vector channel is 71–87 % of all fused `score()`
 calls. (**CORRECTION 2026-09-22, evening:** this sentence used to cite
@@ -832,7 +840,54 @@ ratio, and r = 0.5 (more vector) beats the shipping equal-weight default on 2 of
 0.7212). Changing a shipping default on three corpora is what **hard rule 11** exists for;
 maintainer decision, not a task.
 
+**MEASURED ON EC2 2026-09-22 (night), run `pgweave-20260922-224507`: THE OWED LATENCY RE-RUN
+HAPPENED AND IT IS A LOSS. The gate is 2 of 5, the p99 row went from PASS to FAIL, and on fiqa
+the fused arm is SLOWER than the RRF control it exists to replace.** `c7i.8xlarge` (32 vCPU),
+us-east-2, PG17, extension **0.19.0**, commit **b0bd1b7**, real `all-MiniLM-L6-v2` embeddings
+computed on the instance, the same three BEIR corpora, RRF `k'=100`/`k=60` control over the
+same index, `LATN=50` × `REPS=7` alternated per query with an A/A leg; instance terminated and
+verified, no orphaned volumes, keys or security groups.
+
+| row | gate | scifact | nfcorpus | fiqa | before the normalizer | |
+|---|---|---|---|---|---|---|
+| recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | — | **PASS** (raw objective only — G46) |
+| nDCG@10 | ≥ RRF | 1.053× | 1.010× | 1.114× | 0.982× / 0.924× / 0.687× | **MET** |
+| p99 latency | ≤ 0.70× | 0.710× | 0.612× | **1.000×** | 0.609× / 0.560× / 0.633× | **FAIL on two of three — WAS PASS** |
+| p50 latency | ≤ 0.50× | 0.710× | 0.827× | **1.172×** | 0.582× / 0.795× / 0.578× | **FAIL**, fiqa slower than the control |
+| `score()` calls | ≤ 0.20× | 0.571× | 0.875× | 0.513× | 0.648× / 0.903× / 0.541× | **FAIL** |
+
+**So the gate is 2 of 5 (recall, nDCG) and it was 2 of 5 before the normalizer (recall, p99):
+THE CHANGE TRADED p99 FOR nDCG.** The normalizer's own p50 cost, same statement one GUC apart,
+is **+19 % scifact, +3 % nfcorpus, +104 % fiqa** — fiqa's p50 doubled, 10.889 → 22.163 ms. The
+differences are real under hard rule 10: |fused − `fused_aa`| p50 = **0.014 / 0.003 /
+0.035 ms** against between-arm deltas 30×–320× larger. Quality and correctness reproduced the
+local measurement exactly (nDCG@10 0.7212 / 0.3455 / 0.3878; 299 of 300 compared, 0 mismatched,
+1 skipped for a tied oracle), which is a cross-harness control on both.
+
+**The cause is the PIVOT WALK, not the pre-scan pass the notes above guessed** — fiqa pivots
+7,081,750 → **37,306,460** (5.3×) and `fuse_scores_total` 7,011,737 → 39,365,038 (5.6×) while
+the vector channel's lane count moves 4.6 %; one pivot is a `seek()` plus a `block_max()` per
+contributing channel. **And the work row therefore cannot stand in for the latency row:** the
+`score()` ratio *improved* on all three corpora while fiqa's clock got 2.0× slower, so the two
+gate rows moved in opposite directions. `FUSED_TOPK.md` §8 now carries the recommendation that
+a work row count **pivots** as well as `score()` calls.
+
+**Two maintainer decisions are open, presented and not taken, and no task id is invented for
+either.** (1) **Should `pg_weave.fuse_normalize` stay ON by default?** On: the ranking beats RRF
+on three corpora and the scan is slower than RRF on the largest. Off: the scan is fast (p99
+passes) and the ranking loses to RRF on all three, which is the state that made
+`ARCHITECTURE.md` §9 claim 2 unsupported to begin with. The GUC is `PGC_USERSET`, so a user can
+already choose per query, and this is the first knob in the project whose two settings each fail
+a **different** gate row. (2) The (a)/(b)/(c) choice above — restated unit, vector-major copy, or
+cluster-ordered weft — which is now the **single blocker for three of the five rows** (p50, p99,
+`score()`) rather than one, and of which (a) cannot help p50 or p99 at all because the clock does
+not care what unit a gate is written in. `bench/RESULTS_FUSE.md` (fourth measurement),
+`doc/GAPS.md` **G44**, `doc/specs/FUSED_TOPK.md` **sect. 8b** and **8d**.
+
 **Phase F is therefore NOT claimable**, and the two failures have different characters:
+
+**RE-COUNTED 2026-09-22 (night): there are THREE failures, not two — p50, p99 and `score()`.
+The two-failure framing below is the 2026-09-22 daytime state and stays as history.**
 
 - **nDCG (`doc/GAPS.md` G44)** is the objective, not the scan. The fused top-k is exact
   (recall 1.000), but it sums **raw** BM25 against a **raw** quantized inner product — a
