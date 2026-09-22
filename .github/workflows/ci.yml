@@ -56,7 +56,18 @@ jobs:
   standalone:
     runs-on: ubuntu-latest
     steps:
+      # FULL HISTORY, and this job is the only one that needs it.
+      # test/hegel/run_tre_bump.sh rebuilds the vendored TRE library from a FIXED
+      # historical commit (`git show aae7a35:vendor/tre/lib/...`) to prove the
+      # backref fix changes behaviour on our own copy rather than just moving a pin.
+      # actions/checkout defaults to depth 1, so that object is absent and the leg
+      # dies with "fatal: invalid object name" -- which it had been doing on every CI
+      # run since the leg was added, unnoticed, because `make check-standalone`
+      # invoked each suite through `| tail -1` and a pipeline's exit status is tail's.
+      # doc/GAPS.md G42.  Do not "optimize" this back to a shallow clone.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install toolchain
         run: |
