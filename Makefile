@@ -29,6 +29,7 @@ OBJS = \
 	src/am/amscan.o \
 	src/am/fuse.o \
 	src/am/fuseshuttle.o \
+	src/am/vecdocmap.o \
 	src/am/fusepath.o \
 	src/am/customscan.o \
 	src/am/amaux.o \
@@ -117,7 +118,7 @@ TRE_CPPFLAGS = \
 	-I$(srcdir)/vendor/tre/local_includes
 
 EXTENSION = pg_weave
-DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql sql/pg_weave--0.4.0--0.5.0.sql sql/pg_weave--0.5.0--0.6.0.sql sql/pg_weave--0.6.0--0.7.0.sql sql/pg_weave--0.7.0--0.8.0.sql sql/pg_weave--0.8.0--0.9.0.sql sql/pg_weave--0.9.0--0.10.0.sql sql/pg_weave--0.10.0--0.11.0.sql sql/pg_weave--0.11.0--0.12.0.sql sql/pg_weave--0.12.0--0.13.0.sql sql/pg_weave--0.13.0--0.14.0.sql sql/pg_weave--0.14.0--0.15.0.sql sql/pg_weave--0.15.0--0.16.0.sql
+DATA = sql/pg_weave--0.1.0.sql sql/pg_weave--0.1.0--0.2.0.sql sql/pg_weave--0.2.0--0.3.0.sql sql/pg_weave--0.3.0--0.4.0.sql sql/pg_weave--0.4.0--0.5.0.sql sql/pg_weave--0.5.0--0.6.0.sql sql/pg_weave--0.6.0--0.7.0.sql sql/pg_weave--0.7.0--0.8.0.sql sql/pg_weave--0.8.0--0.9.0.sql sql/pg_weave--0.9.0--0.10.0.sql sql/pg_weave--0.10.0--0.11.0.sql sql/pg_weave--0.11.0--0.12.0.sql sql/pg_weave--0.12.0--0.13.0.sql sql/pg_weave--0.13.0--0.14.0.sql sql/pg_weave--0.14.0--0.15.0.sql sql/pg_weave--0.15.0--0.16.0.sql sql/pg_weave--0.16.0--0.17.0.sql
 PGFILEDESC = "pg_weave - unified lexical + vector + fuzzy retrieval in one index"
 
 # sql/ and expected/ are already at the top level (PGXS's built-in default
@@ -409,6 +410,11 @@ check-standalone:
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/lexb test/hegel/test_lexbound.c -lm; \
 	$$tmp/lexb > $$tmp/lexb.log || { cat $$tmp/lexb.log; exit 1; }; \
 	tail -3 $$tmp/lexb.log; \
+	echo "== F8 vecdocmap (C1)+(C2): lane-to-docid relabelling, unclamped-blkend and flipped-comparator controls =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecdocmap test/hegel/test_vecdocmap.c \
+		src/am/vecdocmap.c src/am/fuse.c -lm; \
+	$$tmp/vecdocmap 4000 > $$tmp/vecdocmap.log || { cat $$tmp/vecdocmap.log; exit 1; }; \
+	tail -12 $$tmp/vecdocmap.log; \
 	echo "== Z9 edist shuttle (C1)+(C2): the bound never exceeds a true Levenshtein distance =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/edist test/hegel/test_edist.c -lm; \
 	$$tmp/edist | tail -2; \

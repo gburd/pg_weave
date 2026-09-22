@@ -1380,6 +1380,30 @@ Second, the `metric` reloption carries `AccessExclusiveLock` and can be changed 
 disagree. A reloption is the wrong home for something the planner must see and a
 reader must trust; an opclass, the way pgvector does it, is the right one.
 
+**NARROWED 2026-09-22 by F8, and the correction is to the first of those two
+reasons.** "It moves the decision into the planner" was stated as though only an
+opclass split could — which is true of *core's* path generation, and false of ours.
+`src/am/fusepath.c` hand-builds the fused `IndexPath`, so it opens the index, reads
+the `metric` reloption through a **non-throwing** accessor (`weave_index_vec_metric_raw()`
+in `src/am/am.c`), and declines to offer the path when the operator and the metric
+disagree. So `ORDER BY fuse(body <=> q, emb <-> v)` on an `ip` index is a **Sort
+chosen at plan time**, not an error at rescan, while the single-channel
+`ORDER BY emb <-> v` on the same index still raises.
+
+Two things follow, and neither retires this section. The split is still the fix for
+**the single-channel path**, which is core's own index matching and cannot be reached
+this way. And the split is still the fix for the **second** reason above, which F8
+does not touch at all: a reloption that `ALTER INDEX` can change without a rewrite
+can disagree with `WeaveVecMeta.metric`, and reading it at plan time reads the same
+untrustworthy value one step earlier. What F8 removes is only the claim that no plan-time
+refusal was *possible*.
+
+A third, smaller thing F8 needed and is worth recording where the metric lives: the
+accessor a **planner** may call must not throw. `weave_index_vec_metric()` raises on
+cosine and l1, and `ALTER INDEX ... SET (metric = 'cosine')` is accepted, so calling
+it from a path hook would make such an index unplannable — for every query, including
+ones that never mention its vector column.
+
 ### Warp → docid needs no random access, because the scan is monotone
 
 The dense warp→docid map on the `WEAVE_PK_VWARP` chain has only a sequential

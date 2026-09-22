@@ -32,7 +32,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.16.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.17.0" of extension "pg_weave" is already installed
 -- Plan text stability only.
 SET max_parallel_workers_per_gather = 0;
 CREATE TABLE fp (id int, body wdoc, emb wvec(4));
@@ -188,6 +188,145 @@ SELECT (SELECT array_agg(id ORDER BY id) FROM p_pushdown)
 (1 row)
 
 -- ---------------------------------------------------------------------------
+-- (2b) THE FLAGSHIP SHAPE: one LEXICAL channel and one VECTOR channel, task F8.
+--
+-- This is the query doc/specs/FUSED_TOPK.md sect. 7 has advertised since the spec
+-- was written and which nothing could answer from an index until F8:
+--
+--     ORDER BY fuse(body <=> 'alpha', emb <-> '[...]')
+--
+-- WHAT MADE IT POSSIBLE, in one sentence each, because two separate things were
+-- missing and only one of them was the plumbing everyone expected:
+--
+--   * The vector shuttle publishes SEGMENT-LOCAL LANE INDICES and the fused core
+--     drives docids, so the channel had to be relabelled -- include/weave/vecdocmap.h
+--     does it through the bolt's docid-ascending warp map, and
+--     test/hegel/test_vecdocmap.c is the (C1)/(C2) property test for it.
+--   * fuse() sums SCORES, and `<->` is a DISTANCE.  0.16.0 had no recovery function
+--     for it, so the raw distance went into the sum as if it were a score and the
+--     final negation ranked the FARTHEST vector first -- silently, in this exact
+--     query shape (doc/GAPS.md G41).  weave_l2score() and weave_ipscore() close it.
+--
+-- The second one is why this section asserts against an oracle rather than against
+-- the fallback: both arms were wrong in the same direction before 0.17.0, so no
+-- comparison between them could have found it.
+-- ---------------------------------------------------------------------------
+-- ROW <-> DOCID, so the vector SRF's output can be joined to rows.  Derived by
+-- row_number() rather than from WEAVE_OFFSET_FACTOR, which keeps it independent of
+-- BLCKSZ: docids ascend with ctid (include/weave/am.h -- weave_tid_to_docid() is
+-- monotone in (block, offset)) and every row of `fp` has a non-NULL vector, so the
+-- n-th row in ctid order owns the n-th docid in ascending order.  Borrowed verbatim
+-- from sql/vecorderby.sql, including the count assertion that says the derivation
+-- held.  The column is `rowtid` and not `ctid`, because a table may not have a
+-- column of that name.
+SET enable_seqscan = on;
+CREATE TEMP TABLE fpmap AS
+  SELECT t.id, t.rowtid, l.docid
+    FROM (SELECT id, ctid AS rowtid, row_number() OVER (ORDER BY ctid) AS rn
+            FROM fp) t
+    JOIN (SELECT docid, row_number() OVER (ORDER BY docid) AS rn
+            FROM weave_vec_lanes('fp_weave')) l USING (rn);
+SELECT count(*) = (SELECT count(*) FROM fp) AS map_covers_every_row FROM fpmap;
+ map_covers_every_row 
+----------------------
+ t
+(1 row)
+
+SET enable_seqscan = off;
+-- THE PLAN.  Three `Order By` keys: the lexical channel, the vector channel, and the
+-- `<~>` transport key carrying the weights.  The transport key hangs off the LEXICAL
+-- column even though the second channel is on another one, which is deliberate --
+-- src/am/fusepath.c explains why it must, and this arm is what would notice if the
+-- per-key `indexorderbycols` and that choice ever disagreed.
+EXPLAIN (COSTS OFF)
+SELECT id FROM fp
+ ORDER BY fuse(body <=> 'alpha'::wquery,
+               emb <-> '[1,0,0,1]'::wvec,
+               weights => '{0.5,0.5}') LIMIT 10;
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using fp_weave on fp
+         Order By: ((body <=> '''alpha'''::wquery) AND (emb <-> '[1,0,0,1]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+(3 rows)
+
+CREATE TEMP TABLE pv_pushdown AS
+SELECT id FROM fp
+ ORDER BY fuse(body <=> 'alpha'::wquery,
+               emb <-> '[1,0,0,1]'::wvec,
+               weights => '{0.5,0.5}') LIMIT 10;
+RESET enable_seqscan;
+-- THE EXACT ORACLE, one call per channel at k = 40 (every document).  Each SRF
+-- enters the scan machinery directly and reports the INDEX's own per-channel score:
+-- exact BM25 from weave_search(), and the QUANTIZED metric-domain score from
+-- weave_vec_scan() -- which is the number the fused scan sums, not the exact
+-- -||q-v||^2 the heap operator would give.  Using the exact one here would be
+-- measuring the quantizer, not the scorer.
+CREATE TEMP TABLE pv_oracle_scores AS
+SELECT m.id,
+       0.5::float8 * COALESCE(a.score, 0::float8)
+       + 0.5::float8 * COALESCE(v.score::float8, 0::float8) AS score
+  FROM fpmap m
+  LEFT JOIN weave_search('fp_weave', 'alpha'::wquery, 40) a ON a.ctid = m.rowtid
+  LEFT JOIN weave_vec_scan('fp_weave', '[1,0,0,1]'::wvec, 40) v
+         ON v.docid = m.docid;
+-- Tie-freeness first, for the reason section (2) gives: a tie straddling rank 10
+-- makes "the" top-10 ambiguous however the scorer behaves.  It is a sharper question
+-- here than there, because the vector term is QUANTIZED and two documents can be
+-- assigned the same code-domain score even when their exact distances differ.
+SELECT count(*) = count(DISTINCT score) AS oracle_scores_are_tie_free
+  FROM pv_oracle_scores;
+ oracle_scores_are_tie_free 
+----------------------------
+ t
+(1 row)
+
+CREATE TEMP TABLE pv_oracle AS
+SELECT id FROM pv_oracle_scores ORDER BY score DESC LIMIT 10;
+SELECT (SELECT array_agg(id ORDER BY id) FROM pv_pushdown)
+       = (SELECT array_agg(id ORDER BY id) FROM pv_oracle)
+       AS fused_vector_pushdown_matches_the_exact_oracle;
+ fused_vector_pushdown_matches_the_exact_oracle 
+------------------------------------------------
+ t
+(1 row)
+
+-- AND THE DIRECTION, ON ITS OWN, because it is the half of G41 that an oracle
+-- agreement could still hide: if the vector channel were summed as a distance
+-- instead of a score, the top-10 would be the FARTHEST documents.  `emb` is
+-- [g, g%4, g%7, 1] for g = 1..40 and the query is [1,0,0,1], so the near documents
+-- are the small g -- and the lexical channel pulls the same way (tf of 'alpha' is g,
+-- so LARGE g scores higher), which is what makes this arm informative: the two
+-- channels disagree, and an inverted vector channel would move the answer.
+SELECT min(id) AS nearest_id, max(id) AS farthest_id,
+       (SELECT count(*) FROM pv_pushdown WHERE id <= 10) AS ids_in_the_near_third
+  FROM pv_pushdown;
+ nearest_id | farthest_id | ids_in_the_near_third 
+------------+-------------+-----------------------
+          1 |          10 |                    10
+(1 row)
+
+-- ip, on an index built for it, to show the second recovery function and the second
+-- metric are wired the same way.  fp_ip is also section (3d)'s mismatch subject.
+CREATE TABLE fp_ip (id int, body wdoc, emb wvec(4));
+INSERT INTO fp_ip SELECT id, body, emb FROM fp;
+CREATE INDEX fp_ip_weave ON fp_ip USING weave (body, emb) WITH (metric = 'ip');
+ANALYZE fp_ip;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM fp_ip
+ ORDER BY fuse(body <=> 'alpha'::wquery,
+               emb <#> '[1,0,0,1]'::wvec,
+               weights => '{0.5,0.5}') LIMIT 5;
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using fp_ip_weave on fp_ip
+         Order By: ((body <=> '''alpha'''::wquery) AND (emb <#> '[1,0,0,1]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+(3 rows)
+
+RESET enable_seqscan;
+-- ---------------------------------------------------------------------------
 -- (3) THE REFUSALS.  Each must be a Sort, and none may raise.
 --
 -- enable_seqscan stays ON through all of them, and the first version of this file
@@ -253,41 +392,66 @@ SELECT id FROM fp_nb
          ->  Seq Scan on fp_nb
 (4 rows)
 
--- (3d) A metric the index was not built with -- and the interesting part is that
--- the refusal does not depend on the metric at all.  fp_weave is l2 by default;
--- fp_ip is ip.  BOTH of these must be a Sort, because the vector channel is
--- refused OUTRIGHT by the fused path: its warp is a segment-local dense lane index
--- and the fused run advances everything through the docid space (sect. 7b).  So a
--- metric mismatch cannot reach the access method through a fused path, which is
--- how F2.2 discharges "refuse a metric the index was not built with" -- by
--- subsumption rather than by a check the planner could not make anyway (the metric
--- is a reloption, invisible to path generation; VECTOR_CHANNEL.md sect. 8b).
-CREATE TABLE fp_ip (id int, body wdoc, emb wvec(4));
-INSERT INTO fp_ip SELECT id, body, emb FROM fp;
-CREATE INDEX fp_ip_weave ON fp_ip USING weave (body, emb) WITH (metric = 'ip');
-ANALYZE fp_ip;
+-- (3d) A METRIC THE INDEX WAS NOT BUILT WITH -- and since F8 this is a REAL
+-- refusal rather than a refusal by subsumption.  `fp_weave` is l2 (the reloption
+-- default) and `fp_ip_weave` is ip; section (2b) has already shown that each serves
+-- ITS OWN operator.  The crossed pairs below must be a Sort.
+--
+-- WHY THE PLANNER CAN REFUSE THIS AND THE SINGLE-CHANNEL ORDER BY PATH CANNOT.  A
+-- weave vector weft is scored in one metric, so answering `<->` out of an ip weft
+-- returns every row in an ordering the query did not ask for -- a wrong answer, not
+-- an approximation.  Core matches a pathkey against an operator FAMILY and the
+-- metric is a reloption, invisible to path generation, so `ORDER BY emb <-> q` can
+-- only be refused at RUN time (weave_rescan(), and VECTOR_CHANNEL.md sect. 8b for
+-- the per-metric opclass split that would fix it properly).  The fused path is our
+-- own code: src/am/fusepath.c opens the index, reads the metric with the
+-- NON-THROWING accessor, and declines -- so the Sort below is chosen at plan time
+-- and no query fails.  That is the difference between this and doc/GAPS.md G39.
+CREATE TABLE fp_l2b (id int, body wdoc, emb wvec(4));
+INSERT INTO fp_l2b SELECT id, body, emb FROM fp;
+CREATE INDEX fp_l2b_weave ON fp_l2b USING weave (body, emb);
+ANALYZE fp_l2b;
+-- `<->` against the ip index: refused.
 EXPLAIN (COSTS OFF)
 SELECT id FROM fp_ip
  ORDER BY fuse(body <=> 'alpha'::wquery,
                emb <-> '[1,0,0,1]'::wvec, weights => '{1,1}') LIMIT 5;
-                                                       QUERY PLAN                                                       
-------------------------------------------------------------------------------------------------------------------------
+                                                              QUERY PLAN                                                               
+---------------------------------------------------------------------------------------------------------------------------------------
  Limit
    ->  Sort
-         Sort Key: (fuse(weave_lexscore((body <=> '''alpha'''::wquery)), (emb <-> '[1,0,0,1]'::wvec), '{1,1}'::real[]))
+         Sort Key: (fuse(weave_lexscore((body <=> '''alpha'''::wquery)), weave_l2score((emb <-> '[1,0,0,1]'::wvec)), '{1,1}'::real[]))
          ->  Seq Scan on fp_ip
 (4 rows)
 
+-- `<#>` against the l2 index: refused, the same test in the other direction.
 EXPLAIN (COSTS OFF)
-SELECT id FROM fp_ip
+SELECT id FROM fp_l2b
  ORDER BY fuse(body <=> 'alpha'::wquery,
                emb <#> '[1,0,0,1]'::wvec, weights => '{1,1}') LIMIT 5;
-                                                       QUERY PLAN                                                       
-------------------------------------------------------------------------------------------------------------------------
+                                                              QUERY PLAN                                                               
+---------------------------------------------------------------------------------------------------------------------------------------
  Limit
    ->  Sort
-         Sort Key: (fuse(weave_lexscore((body <=> '''alpha'''::wquery)), (emb <#> '[1,0,0,1]'::wvec), '{1,1}'::real[]))
-         ->  Seq Scan on fp_ip
+         Sort Key: (fuse(weave_lexscore((body <=> '''alpha'''::wquery)), weave_ipscore((emb <#> '[1,0,0,1]'::wvec)), '{1,1}'::real[]))
+         ->  Seq Scan on fp_l2b
+(4 rows)
+
+-- And `<=>` on a wvec -- COSINE -- which no weave index can carry at all
+-- (weave_index_vec_metric() refuses the reloption at CREATE INDEX, because a cosine
+-- bound must divide by a maximum true norm that is not stored).  It has a recovery
+-- function, so fuse() computes it correctly row by row; what it does not have is an
+-- opclass member, so there is no channel to attribute it to and no path to offer.
+EXPLAIN (COSTS OFF)
+SELECT id FROM fp
+ ORDER BY fuse(body <=> 'alpha'::wquery,
+               emb <=> '[1,0,0,1]'::wvec, weights => '{1,1}') LIMIT 5;
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: (fuse(weave_lexscore((body <=> '''alpha'''::wquery)), weave_cosscore((emb <=> '[1,0,0,1]'::wvec)), '{1,1}'::real[]))
+         ->  Seq Scan on fp
 (4 rows)
 
 -- And the `<@>` channel, refused for the third warp space: its shuttle walks the
@@ -296,11 +460,11 @@ EXPLAIN (COSTS OFF)
 SELECT id FROM fp
  ORDER BY fuse(body <=> 'alpha'::wquery,
                body <@> 'alpha', weights => '{1,1}') LIMIT 5;
-                                                     QUERY PLAN                                                      
----------------------------------------------------------------------------------------------------------------------
+                                                              QUERY PLAN                                                               
+---------------------------------------------------------------------------------------------------------------------------------------
  Limit
    ->  Sort
-         Sort Key: (fuse(weave_lexscore((body <=> '''alpha'''::wquery)), (body <@> 'alpha'::text), '{1,1}'::real[]))
+         Sort Key: (fuse(weave_lexscore((body <=> '''alpha'''::wquery)), weave_edistscore((body <@> 'alpha'::text)), '{1,1}'::real[]))
          ->  Seq Scan on fp
 (4 rows)
 
@@ -323,12 +487,24 @@ SELECT count(*) > 0 AS desc_arm_runs FROM (
  t
 (1 row)
 
-SELECT count(*) > 0 AS vector_arm_runs FROM (
+-- The refused metric-mismatch arm, and its SERVED counterpart beside it: since F8
+-- the vector channel is not refused as a class, so this pair is what says the
+-- refusal is about the metric and not about the channel.
+SELECT count(*) > 0 AS mismatched_vector_arm_runs FROM (
+  SELECT id FROM fp_ip
+   ORDER BY fuse(body <=> 'alpha'::wquery,
+                 emb <-> '[1,0,0,1]'::wvec, weights => '{1,1}') LIMIT 5) s;
+ mismatched_vector_arm_runs 
+----------------------------
+ t
+(1 row)
+
+SELECT count(*) > 0 AS matched_vector_arm_runs FROM (
   SELECT id FROM fp_ip
    ORDER BY fuse(body <=> 'alpha'::wquery,
                  emb <#> '[1,0,0,1]'::wvec, weights => '{1,1}') LIMIT 5) s;
- vector_arm_runs 
------------------
+ matched_vector_arm_runs 
+-------------------------
  t
 (1 row)
 
@@ -462,7 +638,9 @@ ERROR:  operator <~> cannot be evaluated outside a weave index scan
 DETAIL:  It exists only to carry fuse() weights into the index access method as an ORDER BY scan key.
 HINT:  Write "ORDER BY fuse(col <=> query, ..., weights => '{...}')" instead.
 DROP TABLE p_pushdown, p_fallback, p_oracle_scores, p_oracle, p_gated, p_ungated, p_lat, p_solo;
+DROP TABLE fpmap, pv_pushdown, pv_oracle_scores, pv_oracle;
 DROP TABLE fp_nb;
+DROP TABLE fp_l2b;
 DROP TABLE fp_ip;
 DROP TABLE fp;
 RESET max_parallel_workers_per_gather;

@@ -203,15 +203,19 @@ when the scope was read as "BM25 + vector", then back when it was restated as al
 six. Both are in `git log`. The lesson recorded in `AGENTS.md` hard rule 7 is that a
 hard rule was weakened on an inference about scope rather than a question about it.*
 
-**42 of 77 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
+**43 of 77 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
 Z5, Z8, Z9) and 6 withdrawn (L2, L21, V9, V10, V13, **F4**). By phase: X 4/4, L 16/20,
-Z 7/9, V 9/20, P 2/4, **F 5/9**, M 0/6, R 0/5. **Five rows were added on 2026-09-21
+Z 7/9, V 9/20, P 2/4, **F 6/9**, M 0/6, R 0/5. **Five rows were added on 2026-09-21
 and every one of them was created by work that ran, not by planning:** **F8** and **F9**,
 because F2.2's pushdown found that the channels do not share a position space (lexical and
 gate shuttles publish docids, the vector shuttle publishes segment-local lane indices, `<@>`
-publishes dictionary positions) so it decided the **docid space** and offers no path for the
-other two -- which means the flagship `fuse(body <=> q, emb <-> v)` query is still answered
-by the fallback; and **V16**, **V17**, **V18** from a read-only review of Alibaba's zvec
+publishes dictionary positions) so it decided the **docid space** and offered no path for the
+other two. **F8 is now DONE (2026-09-22) and the flagship `fuse(body <=> q, emb <-> v)`
+query is answered by the index** -- and it fixed a live wrong answer on the way (`doc/GAPS.md`
+**G41**: `fuse()` had no score-recovery function for `<->`, `<#>` or `<@>`, so a raw DISTANCE
+entered the sum as a score and the FARTHEST vector ranked first; the defect was printed in a
+checked-in expected file and reviewed three times, because both arms were wrong in the same
+direction and every assertion compared the two arms). Also **V16**, **V17**, **V18** from a read-only review of Alibaba's zvec
 (ideas only, hard rule 6). V16 is the one that matters soonest: cosine is refused today for
 want of a stored maximum true norm, and pg_weave already stores a per-lane `(scale, norm)`
 pair, so cosine may be a **storage** decision rather than an unsupportable metric. V17 is

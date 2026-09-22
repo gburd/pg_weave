@@ -560,6 +560,135 @@ channel design question, not a plumbing one.
    the safe direction). The price is that a **parameterized** `wquery` gets no fused
    path: the term count is unknowable until the scan runs.
 
+## 7c. What F8 found building the adapter (2026-09-22)
+
+§7b specified the vector adapter, priced it at "8 bytes per lane per bolt per pass",
+and called it cheap. The arithmetic was right and the estimate of the *work* was
+wrong in a way worth recording: **two of the four defects F8 fixed were not in the
+adapter at all**, and one of them was a live wrong answer that had been printed into
+a checked-in expected-output file and reviewed three times.
+
+### (1) The flagship query was ranking the vector channel BACKWARDS
+
+`doc/GAPS.md` G41. `fuse()` sums **scores**, higher better, and negates once at the
+end so ascending is best-first (§7a). A channel argument spelled as a **distance**
+therefore has to be recovered into a score first, which is what the support
+function's rewrite does. 0.14.0 shipped that recovery for the lexical `<=>` and for
+the cosine `wvec <=> wvec` and stopped there, because at that point no vector
+channel could be fused and the point of the functions was the rewrite.
+
+So `fuse(body <=> q, emb <-> v)` — the query this spec has advertised since §7 was
+written — passed the raw L2 **distance** into the sum as if it were a score, and the
+final negation put the **farthest** vector first. It parsed. It ran. It returned ten
+plausible rows.
+
+Two things about how it survived are the actual lesson:
+
+- **Both arms were wrong in the same direction.** The fallback computed the inverted
+  sum, and had the pushdown existed it would have inverted it identically. Every
+  assertion this project writes about `fuse()` compares the two arms against each
+  other, so no amount of that testing could have seen it. The fix is the discipline
+  §7a already arrived at from a different direction: assert against an **oracle**
+  built from the index's own per-channel scores, not against the other arm.
+- **It was visible in the expected output.** `expected/fuse_pushdown.out` contained
+  `Sort Key: (fuse(weave_lexscore((body <=> 'alpha')), (emb <-> '[...]'), ...))` —
+  one argument wrapped, the other bare. That asymmetry *is* the bug, printed, in a
+  file three reviews read. A recovery function being absent looks exactly like a
+  recovery function not being needed.
+
+0.17.0 adds `weave_l2score(d) = -d*d`, `weave_ipscore(d) = -d` and
+`weave_edistscore(d) = -d`. `-d*d` and not `-d` for l2 because the domain is the
+**channel's**, not the operator's: the weft scores l2 as `-||q-v||^2`, so `-d` would
+rank a lone vector channel identically while weighting it differently from the index
+at every distance except 1 — and a fused sum is arithmetic, not a ranking.
+`weave_edistscore()` ships even though `<@>` cannot be fused until F9, because the
+two halves of G41 are independent: the pushdown needs a shuttle, the fallback needs
+only the function, and fixing two of three channels would be an arbitrary place to
+stop.
+
+### (2) The metric mismatch became a PLAN-TIME refusal, which is new
+
+`VECTOR_CHANNEL.md` §8b and the long comment in `weave_rescan()` both state that a
+metric mismatch cannot be a planner decision, because core matches a pathkey against
+an operator **family** and the metric is a reloption. That is true of *core's* path
+generation. It is not true of ours: `src/am/fusepath.c` builds the fused IndexPath
+itself, so it can open the index, read the reloption, and simply not offer the path.
+
+So `fuse(body <=> q, emb <-> v)` on an `ip` index is a Sort, chosen at plan time, and
+no query fails — where the single-channel `ORDER BY emb <-> v` on the same index
+still raises at rescan. This does not retire §8b's per-metric opclass split; it
+narrows what that split is still needed for. It also required a second, **non-throwing**
+reloption accessor: `weave_index_vec_metric()` raises on cosine and l1, `ALTER INDEX
+... SET (metric = 'cosine')` is accepted without a rewrite, and a planner hook that
+raises on a catalog state it merely inspected would make such an index unplannable
+for queries that never touch its vector column.
+
+### (3) Duplicate docids are refused, and the first version's argument for accepting them was wrong twice
+
+The adapter originally accepted a non-strictly-ascending warp map, arguing that a
+duplicate docid "breaks nothing here, because both lanes lie inside any interval
+containing either". Writing the property test refuted it, and the error is worth
+naming because it is easy to make again: **it conflated the docid interval with the
+lane block the inner bound actually describes.**
+
+- (C2). With `docid = [10, 10, 10, 50]` and a block size of 1, `seek(0)` lands on
+  lane 0 and publishes `blkend = 10`. Lane 1 also has docid 10, so it is inside
+  `[cur, blkend]` — but the inner bound describes lane 0's block alone, and lane 1's
+  score may be arbitrarily larger. A bound too low drops rows silently.
+- (C4), which is worse and has no bound to blame. `score()` is defined at **one**
+  lane, so the other lanes sharing that docid contribute nothing however honest the
+  bound is. A document's score would depend on which of its lanes the search landed
+  on.
+
+Neither is fixable inside a relabelling: a docid with several lanes is not a
+relabelling, it is an **aggregation** (a max over the lanes), which is a different
+channel. So the map must be strictly ascending, which nothing legitimate violates.
+
+### (4) `WEAVE_FUSE_END` has to be LATCHED, and the symptom would have been an ERROR
+
+The core may ask an exhausted channel again — `fuse.h` note 1 promises only that
+targets increase. `lower_bound(target) < nlane` does **not** imply the inner channel
+can still be asked: the two spaces run out independently, because the inner stops
+when it has no contribution left, which can happen while plenty of lanes (and
+therefore plenty of docids ≥ the target) remain. Calling the inner after it has
+returned END hands it a target *below* the position it last returned, and every real
+shuttle refuses that — `src/vector/vecshuttle.c` raises "cannot resolve warp %u after
+warp %u". So this one is not a wrong answer, it is an **ERROR mid-scan on a perfectly
+good index**, and it was found by driving the adapter through the real core rather
+than by reading it.
+
+Worth stating alongside: the property that found it needed the *synthetic* inner
+channel to assert its own backward-seek refusal. A tolerant stand-in would have
+reported nothing.
+
+### (5) The vector channel filters its own tombstones, and had to be made to
+
+§7b's (C6) note says `live` is NULL on the fused path and each channel filters its
+own segment's tombstones. The lexical channel does. The vector channel did not — it
+has no tombstone logic at all, because the single-channel `ORDER BY` path relies on
+the heap visibility check to drop dead rows and on its widening ladder to refill.
+Inside a fused run that is not enough: a docid deleted in this bolt would still be
+published, enter the candidate union, occupy one of the `k` heap slots, and displace
+a live document. No wrong row is *returned* — the visibility check still drops it —
+so the symptom is a **missing** row.
+
+The fix is free where it lands, which is the only reason it is not a separate task:
+the adapter already makes one forward pass over the warp map, so the tombstone probe
+rides along (docid-ascending, so a forward-resume sparsemap cursor is O(1)
+amortized), and the result is the shuttle's own `allow` bitmap — which
+`weave_vec_scan_block()` tests *before* it is handed any code bytes.
+
+### What the property test cost, and what it bought
+
+`test/hegel/test_vecdocmap.c`: 18,899,792 checks, 0 failures, two positive controls
+firing at 32.4 % and 20.3 %. It found (3) and (4). It also produced three of its own
+false alarms, all in the harness, and they are the same class hard rule 11 names —
+a generator that makes a number up: adding to `WEAVE_FUSE_END` wrapped a uint32 into
+a backward target; `lane_bind()` drew a *random* weight and was called once per arm,
+so the two arms answered different questions; and a slack `block_max` needs the
+channel's `maxscore` to cover the slack, or the core's suffix arithmetic is unsound
+and the fused answer legitimately differs from the reference.
+
 ## 8. What must be benchmarked before this is called a win
 
 The claim being made is "no over-fetch, better quality, lower latency". All

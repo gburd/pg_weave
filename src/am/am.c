@@ -3810,7 +3810,6 @@ weave_index_vec_metric(Relation index)
 {
 	WeaveOptions *opts = (WeaveOptions *) index->rd_options;
 	int			metric = opts ? opts->metric : WEAVE_METRIC_L2;
-
 	if (metric == WEAVE_METRIC_COSINE)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3833,6 +3832,20 @@ weave_index_vec_metric(Relation index)
 	return metric;
 }
 
+/*
+ * The same value, reported rather than refused.  See the header comment on the
+ * declaration in weave/am.h for why the planner needs a non-throwing accessor,
+ * and note that this is NOT merely the function above minus two ereports: it maps
+ * an unserviceable metric to itself, so the caller can tell "l2" from "cosine,
+ * which no fused path may carry" instead of being handed a default.
+ */
+int
+weave_index_vec_metric_raw(Relation index)
+{
+	WeaveOptions *opts = (WeaveOptions *) index->rd_options;
+
+	return opts ? opts->metric : WEAVE_METRIC_L2;
+}
 /*
  * The operator-family -> weft-kind registry.  See WeaveIndexLayout in weave/am.h
  * for why the key is a family NAME rather than a type OID or an OID of any kind.
