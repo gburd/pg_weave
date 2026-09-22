@@ -767,9 +767,18 @@ while winning the gate row by 1.0 %. nfcorpus is met, not clean.
 
 **The latency and work-counter halves of the gate are NOT met and this work did not touch
 them.** p50 is still 0.582× / 0.795× / 0.578× against ≤ 0.50×, and the `score()`-call ratio
-is still 0.648× / 0.903× / 0.541× against ≤ 0.20× — the latter because
-`vec_blocks_bound_skipped = 0` on all three datasets and the vector channel is 71–87 % of
-all fused `score()` calls. **And the p50/p99 rows in the table above are now STALE:** the
+is still 0.648× / 0.903× / 0.541× against ≤ 0.20× — the latter because the vector block
+bound prunes nothing on this data and the vector channel is 71–87 % of all fused `score()`
+calls. (**CORRECTION 2026-09-22, evening:** this sentence used to cite
+`vec_blocks_bound_skipped = 0` as the evidence. That counter is **structurally zero in any
+fused scan** — it needs the vector shuttle's own floor, set only by
+`weave_vec_shuttle_set_threshold()` whose sole caller is the `weave_vec_scan()` SRF driver,
+so on the fused path the field keeps its `-INFINITY` init and cannot fire. The claim itself
+is unchanged and rests on `bench/RESULTS_CODE_SCAN.md` measuring 0.00–0.01 % of blocks
+pruned at an *oracle* θ plus B2 ≈ 1.0 by construction; `blkskip` is the informative counter
+but is a combined bound over all channels, so it cannot attribute a skip to the vector
+channel. Correction of reasoning, not of result — `bench/RESULTS_FUSE.md`, `doc/GAPS.md`
+**G46**.) **And the p50/p99 rows in the table above are now STALE:** the
 normalizer adds a pre-scan pass (one LUT build and one directory fold per bolt per vector
 key) whose cost is **unmeasured**, so those rows measure a scorer that no longer ships. They
 are marked stale in place in `bench/RESULTS_FUSE.md` rather than retracted, and an **EC2
@@ -783,6 +792,45 @@ pruned) and `bench/RESULTS_CODE_SCAN.md`, with the generalization in `doc/GAPS.m
 the candidate-reduction rows in Phase V — **V13** (warp ordering by cluster, justification
 gone), **V14** (per-block centroid + radius), **V15** (two-stage prefix scan) and **V18**
 (bit-plane progressive refinement). Whichever of those lands is what moves this row.
+
+**UPDATE 2026-09-22 (evening): the `score()` row's blocker is now CHARACTERIZED rather than
+merely measured, and the characterization says the row is not reachable by tuning.**
+Work counters for the shipping normalized scorer, local and deterministic through
+`bench/normprod.sh` with the `raw` arm reproducing the recorded EC2 numbers as its positive
+control (`bench/RESULTS_FUSE.md`, third measurement): the normalizer *improves* the gated
+row on all three corpora (0.648 → 0.571, 0.903 → 0.875, 0.541 → 0.513) and improves the
+lexical side a lot (fiqa 0.149× → 0.052×), while the **vector side becomes exactly 1.000×**
+and the fused core's range skipping collapses (fiqa `blkskip` 3,444,538 → 6,732). Observed
+mechanism, from a per-bolt diagnostic `NOTICE` rather than inference: with the normalizer on,
+each lexical channel carries w = 0.0110 against the vector channel's w = 0.4947, θ = 0.1106,
+the partition ceiling is exactly 1.0 and the scan visits **all 5,183** scifact documents; with
+it off, w = 0.5 everywhere, θ = 2.2824, ceiling 23.335, and the scan visits 1,450 (28 %). **A
+dense channel whose weighted ceiling sits above θ forces the pivot to visit every document**,
+and a real document scores ~0.11–0.35 of the 1.0 that would need both channels maxed at once,
+so θ never climbs past the vector channel's 0.49. The nDCG win and the work loss have the
+same cause.
+
+**The obvious fix was measured and fails.** Across seven lexical:vector ratios from 0.0625
+to 4 the vector column reads 1.000× at every point (0.997–0.999× at three) while nDCG falls
+away from its optimum; pushing the vector weight down 16× starts the core's range skipping
+dramatically (fiqa `blkskip` 0 → 4,096,432) and still does not reduce the vector channel's
+lane count, because in `WEAVE_PACK_LANE` reading one lane touches every byte of its block —
+scoring 1 lane costs the same memory traffic as scoring 32
+(`bench/RESULTS_CODE_SCAN.md:330,417`). So V13/V14/V15/V18 are no longer the only frame for
+this row. **Three options, named here and NOT chosen — this is a maintainer decision and no
+task id is invented for it:** (a) restate §8's row in the unit the layout has, **blocks or
+bytes** rather than lanes; (b) a second **vector-major** copy of the codes, forfeiting the
+storage gate; (c) **cluster-order the weft** so candidates are contiguous, which contradicts
+the strictly-ascending-docid requirement the fused vector channel depends on
+(`include/weave/vecdocmap.h:35,105,122`) — meaning **V13 and F8 are not independent**, a
+conflict nothing in the tree had recorded before today. `doc/GAPS.md` **G46**,
+`doc/specs/FUSED_TOPK.md` **sect. 8d**.
+
+**Recorded and not acted on, same run:** every corpus has an interior optimum in the weight
+ratio, and r = 0.5 (more vector) beats the shipping equal-weight default on 2 of 3 corpora
+(nfcorpus 0.3535 vs 0.3455, fiqa 0.4056 vs 0.3878) while losing scifact by 1 % (0.7138 vs
+0.7212). Changing a shipping default on three corpora is what **hard rule 11** exists for;
+maintainer decision, not a task.
 
 **Phase F is therefore NOT claimable**, and the two failures have different characters:
 
@@ -812,11 +860,18 @@ gone), **V14** (per-block centroid + radius), **V15** (two-stage prefix scan) an
   `doc/specs/FUSED_TOPK.md` sect. 8d.
 - **`score()` calls** is the **vector block bound**, and it was predictable from data
   already on disk: the lexical side clears the gate on fiqa by itself (0.149×), while the
-  vector side is 0.956–0.991× of the control with `vec_blocks_bound_skipped = 0`
-  everywhere, and it is 71–87 % of all calls. `bench/RESULTS_BOUND_PRUNING.md` measured
+  vector side is 0.956–0.991× of the control and it is 71–87 % of all calls.
+  `bench/RESULTS_BOUND_PRUNING.md` measured
   that bound pruning 0.0 % long ago; G43 wrote down the generalization. Hard rule 9 was
   satisfied in letter — the measurement was taken — and missed in spirit, because nobody
   drew the consequence until a gate failed.
+  **CORRECTION 2026-09-22 (evening):** this bullet cited
+  `vec_blocks_bound_skipped = 0 everywhere` as its evidence; that counter is structurally
+  zero in any fused scan and witnesses nothing (see the correction above and
+  `bench/RESULTS_FUSE.md`). The measured 0.956–0.991× stands, and so does the conclusion,
+  on the oracle-θ pruning figures and B2 ≈ 1.0. **And the cause is no longer only the
+  bound:** see the characterization above — a dense channel's weighted ceiling above θ plus
+  a pack layout in which a one-lane probe costs a whole block. `doc/GAPS.md` **G46**.
 
 **What DID clear.** The recall row — the one §8 calls its most valuable — is 1.000 on
 299 of 299 comparable queries against an exhaustive per-channel oracle. And the latency

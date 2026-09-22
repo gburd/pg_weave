@@ -255,13 +255,23 @@ claimable:**
   ranking, and right now the ranking is worse. Claim 2 must not be quoted as measured.
 - **The `score()`-call ratio fails (0.54–0.90× against a 0.20× gate), and the cause was
   already on disk.** The lexical side clears the gate unaided on the largest corpus
-  (0.149×); the vector side is 0.956–0.991× of the control with
-  `vec_blocks_bound_skipped = 0` on every dataset, and it is 71–87 % of all calls.
+  (0.149×); the vector side is 0.956–0.991× of the control, and it is 71–87 % of all calls.
   `bench/RESULTS_BOUND_PRUNING.md` measured that bound pruning 0.0 % long before this run
   and G43 wrote down the generalization — *a bound computed but not acted on is a latent
   defect*. Hard rule 9 was satisfied in letter and missed in spirit: the measurement
   existed, the inference did not. **This is the most reusable lesson of the week — taking
   a measurement is not the same as drawing its consequence.**
+  **CORRECTION 2026-09-22 (evening), reasoning not result:** this bullet cited
+  `vec_blocks_bound_skipped = 0 on every dataset` as the evidence. That counter is
+  **structurally zero in any fused scan** — it needs the vector shuttle's own threshold
+  floor, set only by `weave_vec_shuttle_set_threshold()`, whose sole caller is the
+  `weave_vec_scan()` SRF driver — so it could not have fired regardless of the bound's
+  quality, and the tree said so in a comment nobody propagated. The failing ratio is a
+  direct measurement and is unchanged; the bound's uselessness rests instead on 0.00–0.01 %
+  of blocks pruned at an **oracle** θ (`bench/RESULTS_CODE_SCAN.md`) and B2 ≈ 1.0 by
+  construction. `blkskip` is the informative counter but sums a combined bound over all
+  channels, so it cannot attribute a skip to the vector channel.
+  `bench/RESULTS_FUSE.md`, `doc/GAPS.md` **G46**.
 
 What cleared: the recall row (§8's most valuable), and a real latency win — p99
 0.56–0.63× of RRF, with an A/A leg putting the within-arm spread at 0.001–0.013 ms
@@ -313,6 +323,24 @@ any fused latency figure is quoted again.
 vector candidate reduction — `bench/RESULTS_BOUND_PRUNING.md`, Phase V V13/V14/V15/V18), and
 the unmeasured cost of the normalizer's pre-scan pass. Ranking quality is no longer on that
 list.
+
+**REVISED 2026-09-22 (evening): the `score()`-call row does not need a better bound, it
+needs a RESTATED UNIT or a LAYOUT CHANGE.** Work counters for the shipping scorer
+(`bench/normprod.sh`; `bench/RESULTS_FUSE.md`, third measurement, with the `raw` arm
+reproducing the EC2 figures as its positive control) show the normalizer *improving* the
+gated row on all three corpora (0.648 → 0.571, 0.903 → 0.875, 0.541 → 0.513) and the
+lexical side sharply (fiqa 0.149× → 0.052×), while the **vector side goes to exactly
+1.000×** and stays there across seven weight ratios from 0.0625 to 4. The observed cause is
+two-part: a dense channel whose weighted ceiling (0.4947 of a 1.0 partition ceiling) sits
+above θ (0.1106) forces the pivot to visit **every** document, and in `WEAVE_PACK_LANE`
+reading one lane touches every byte of its block, so scoring 1 lane costs the same memory
+traffic as scoring 32 (`bench/RESULTS_CODE_SCAN.md:330,417`). So the blocker list above is
+refined rather than replaced: **this row needs either (a) §8's row restated in blocks or
+bytes rather than lanes, or (b) a second vector-major copy of the codes — forfeiting the
+storage gate — or (c) a cluster-ordered weft, which contradicts the strictly-ascending-docid
+requirement the fused vector channel depends on** (`include/weave/vecdocmap.h:35,105,122`).
+All three are maintainer decisions, presented and not taken. `doc/GAPS.md` **G46**,
+`doc/specs/FUSED_TOPK.md` **sect. 8d**.
 
 **43 of 77 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
 Z5, Z8, Z9) and 6 withdrawn (L2, L21, V9, V10, V13, **F4**). By phase: X 4/4, L 16/20,
