@@ -443,51 +443,86 @@ run_fuse() {
 	# through bench/fuse.sh.  Neither file is fatal to expect missing here --
 	# both are written by a parallel task -- but the job itself is real.
 	#
-	# The embedder needs sentence-transformers, which is not on the base image
-	# and pulls torch CPU with it.  That install is installed ONCE, before any
-	# dataset, not per-dataset: pip3 already no-ops on a second install, and
-	# running it inside the per-dataset loop would just make the "is this
-	# hung?" moment happen three times instead of once.
-	say "installing sentence-transformers (pulls torch CPU -- several minutes with NO output; this is EXPECTED, not a hang)"
-	$SSH 'pip3 install --quiet sentence-transformers' \
+	# The embedder needs sentence-transformers, which is not on the base image.
+	#
+	# THREE THINGS THIS IMAGE MAKES NECESSARY, each of which killed a run:
+	#  1. `pip3` DOES NOT EXIST on Ubuntu 24.04's base image.  The first attempt
+	#     died on `pip3: command not found` after provisioning, building and
+	#     passing the whole test suite -- about twelve minutes of paid instance.
+	#  2. Even with pip installed, 24.04 marks the system Python
+	#     EXTERNALLY-MANAGED (PEP 668), so a system-wide `pip install` refuses.
+	#     Hence a venv, which is also cleaner: nothing this benchmark installs
+	#     can perturb the system Python the server tooling uses.
+	#  3. Plain `pip install sentence-transformers` resolves torch to the default
+	#     wheel, which carries the CUDA runtime -- gigabytes, on a CPU instance
+	#     that cannot use one.  torch comes from the explicit CPU index first, so
+	#     the dependency is already satisfied when sentence-transformers is
+	#     resolved.
+	#
+	# Installed ONCE, before any dataset, not per-dataset: pip no-ops on a second
+	# install, and running it inside the loop would just make the "is this hung?"
+	# moment happen four times instead of once.
+	say "installing sentence-transformers into a venv (pulls torch CPU -- several minutes with NO output; this is EXPECTED, not a hang)"
+	$SSH 'set -e
+		export DEBIAN_FRONTEND=noninteractive
+		sudo apt-get -qq install -y python3-venv >/dev/null
+		python3 -m venv /scratch/venv
+		/scratch/venv/bin/pip install --quiet --upgrade pip
+		/scratch/venv/bin/pip install --quiet torch \
+			--index-url https://download.pytorch.org/whl/cpu
+		/scratch/venv/bin/pip install --quiet sentence-transformers
+		/scratch/venv/bin/python3 -c "import sentence_transformers, torch; \
+print(\"EMBEDDER_OK st\", sentence_transformers.__version__, \"torch\", torch.__version__)"' \
 		2>&1 | tee "$OUT/fuse-pip-install.log" \
 		|| die "sentence-transformers install FAILED -- tail of $OUT/fuse-pip-install.log:
 $(tail -30 "$OUT/fuse-pip-install.log")"
-	say "sentence-transformers installed"
+	# Assert the IMPORT succeeded, not merely that pip exited 0: a resolver that
+	# installs a broken combination still exits 0, and the failure would then
+	# surface as prepdata.py dying after the corpus download.
+	grep -q EMBEDDER_OK "$OUT/fuse-pip-install.log" \
+		|| die "sentence-transformers installed but does not import (see $OUT/fuse-pip-install.log)"
+	say "embedder ready: $(grep EMBEDDER_OK "$OUT/fuse-pip-install.log")"
 
 	local datasets=${FUSE_DATASETS:-"scifact nfcorpus fiqa"}
 	local limit=${FUSE_LIMIT:-0}
+	# /scratch, not /mnt/data.  /mnt/data is not mounted and not writable on this
+	# image -- `mkdir -p /mnt/data/bench` fails for an unprivileged user -- while
+	# /scratch is created with the right ownership during provisioning and is what
+	# every other job in this file uses.
+	local bench=/scratch/bench
 
 	for D in $datasets; do
 		say "fuse: preparing $D (embed=minilm, limit=$limit)"
-		$SSH "cd pg_weave && mkdir -p /mnt/data/bench && \
-			  python3 bench/prepdata.py --dataset $D --out /mnt/data/bench --embed minilm --limit \"$limit\"" \
+		$SSH "cd pg_weave && mkdir -p $bench && \
+			  /scratch/venv/bin/python3 bench/prepdata.py --dataset $D \
+				--out $bench --embed minilm --limit \"$limit\"" \
 			2>&1 | tee "$OUT/fuse-$D-prep.log" \
 			|| die "prepdata.py failed for $D (see $OUT/fuse-$D-prep.log)"
 
 		say "fuse: running $D (${REPS:-7} reps)"
-		# LATN and CHECKN are forwarded rather than left to fuse.sh's defaults.
-		# CHECKN is the RECALL-VS-EXHAUSTIVE row of FUSED_TOPK.md sect. 8, which
-		# that table calls the most valuable row in it -- a single miss is a (C2)
-		# violation -- so it should cover as many queries as the clock allows,
-		# not the 10 a smoke run wants.  Each one costs two exhaustive per-channel
-		# scans, so it is linear in queries x documents and worth watching on the
-		# larger sets.
+		# LATN and CHECKN are forwarded rather than left to fuse.sh's
+		# smoke-sized defaults.  CHECKN drives the RECALL-VS-EXHAUSTIVE row of
+		# FUSED_TOPK.md sect. 8, which that table calls the most valuable row in
+		# it -- a single miss is a (C2) violation -- so it should cover as many
+		# queries as the clock allows, not the ten a smoke run wants.  Each one
+		# costs two exhaustive per-channel scans, so it is linear in
+		# queries x documents and worth watching on the larger sets.
+		#
+		# fuse.sh's own python is only bench/ndcg.py, which is stdlib-only, so
+		# the system python3 is correct there -- the venv is the EMBEDDER's, not
+		# the harness's.
 		$SSH "cd pg_weave && LATN=\"${LATN:-50}\" CHECKN=\"${CHECKN:-100}\" \
-			  bash bench/fuse.sh /mnt/data/bench $D \"${REPS:-7}\"" \
+			  bash bench/fuse.sh $bench $D \"${REPS:-7}\"" \
 			2>&1 | tee "$OUT/fuse-$D.log" \
 			|| die "fuse.sh failed for $D (see $OUT/fuse-$D.log)"
 
 		# Pulled back HERE, per dataset, not once at the end.  AGENTS.md hard
 		# rule 14: pull artefacts incrementally, never in one final scp -- a
 		# burner expiring mid-run has already cost a sibling project an
-		# instance and every byte of its data.  find, not a hardcoded filename,
-		# because prepdata.py/fuse.sh are still being written by another agent
-		# and their exact layout under /mnt/data/bench/$D is not yet ours to
-		# assume.
+		# instance and every byte of its data.
 		say "fuse: pulling back $D artifacts"
 		mkdir -p "$OUT/fuse-$D"
-		for f in $($SSH "find /mnt/data/bench/$D -maxdepth 2 \
+		for f in $($SSH "find $bench/$D -maxdepth 2 \
 				\( -name manifest.json -o -name '*.tsv' \) 2>/dev/null"); do
 			$SSH "cat '$f'" > "$OUT/fuse-$D/$(basename "$f")" \
 				|| say "fuse: could not pull back $f for $D -- continuing, host may still be terminated on schedule"
