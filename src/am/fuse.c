@@ -232,6 +232,7 @@ weave_fuse_init(WeaveFuseState *st, WeaveFuseChan **chan, int nchan,
 	st->nlivedrop = 0;
 	st->nveto = 0;
 	st->nabandon = 0;
+	st->stop = WEAVE_FUSE_STOP_NONE;
 	st->badchan = NULL;
 
 	for (i = 0; i < nchan; i++)
@@ -401,6 +402,74 @@ fuse_pivot(WeaveFuseState *st, weave_ft_uint32 p, int *ok)
 	return lo;
 }
 
+/*
+ * Audit an incremental abandonment (G43).
+ *
+ * Abandonment discards a document on `s + csuffix[j+1] <= theta`, where the
+ * suffix is a sum of BOUNDS for channels that are then never scored.  The
+ * per-score (C2) check in step 5 cannot see a bound that is too low HERE,
+ * because it only compares a bound against a score that was actually taken, and
+ * abandonment's entire purpose is not to take them.  A vector channel whose
+ * block bound reads below its true score therefore both causes the abandonment
+ * and escapes the assertion -- which is exactly the shape of G43.
+ *
+ * So: score the abandoned channels anyway and check the inequality against what
+ * they really return.  If `s + actual > theta`, the document beat the threshold
+ * and the prune dropped a row it had no right to drop.  A failure of the SUM
+ * implies at least one individual `score > bound` (if every term obeyed its
+ * bound, the actual sum could not exceed the bound sum), so the worst individual
+ * offender is named, not merely the fact of the loss.
+ *
+ * This defeats the prune it audits -- the work abandonment saves is precisely
+ * the work this does -- so it runs only under check_bounds, and the caller must
+ * not read a timing off a scan with it on.  It deliberately does NOT bump
+ * c->nscore: the audit must not move the instrument, so weave_fuse_stats()
+ * keeps reporting the work the PRODUCTION path would have done.
+ */
+static WeaveFuseError
+fuse_audit_abandon(WeaveFuseState *st, int j, float s)
+{
+	float		actual = 0.0f;
+	float		worst = 0.0f;
+	float		tol;
+	int			jj;
+
+	for (jj = j + 1; jj < st->ncontrib; jj++)
+	{
+		WeaveFuseChan *c = st->sc[st->contrib[jj]];
+		float		v = c->weight * c->ops->score(c);
+		float		over;
+
+		if (fuse_isnan(v))
+		{
+			st->badchan = c;
+			return WEAVE_FUSE_NAN_SCORE;
+		}
+
+		/*
+		 * A veto (-INFINITY) in an unscored channel means the document was
+		 * doomed regardless, so the abandonment was right about this document
+		 * even if a bound is loose.  -inf propagates through the sum and the
+		 * comparison below holds, which is the answer we want.
+		 */
+		actual += v;
+
+		over = v - st->cbound[jj];
+		if (over > worst)
+		{
+			worst = over;
+			st->badchan = c;
+		}
+	}
+
+	tol = FUSE_C2_RELTOL * (st->theta < 0.0f ? -st->theta : st->theta);
+	if (s + actual > st->theta + tol)
+		return WEAVE_FUSE_C2_ABANDON;
+
+	st->badchan = NULL;
+	return WEAVE_FUSE_OK;
+}
+
 WeaveFuseError
 weave_fuse_run(WeaveFuseState *st)
 {
@@ -416,7 +485,10 @@ weave_fuse_run(WeaveFuseState *st)
 		weave_ft_uint32 rend;
 
 		if (p == WEAVE_FUSE_END || p >= st->nwarp)
+		{
+			st->stop = WEAVE_FUSE_STOP_EXHAUSTED;
 			break;
+		}
 
 		/*
 		 * Global termination: once the heap is full and the sum of EVERY scored
@@ -424,7 +496,10 @@ weave_fuse_run(WeaveFuseState *st)
 		 * fuse.h explains which three cases this one test subsumes.
 		 */
 		if (st->nheap == st->k && st->suffix[0] <= st->theta)
+		{
+			st->stop = WEAVE_FUSE_STOP_CEILING;
 			break;
+		}
 
 		/* 1. The required channels intersect, and may move the pivot forward. */
 		if (st->nrq > 0)
@@ -432,7 +507,10 @@ weave_fuse_run(WeaveFuseState *st)
 			if (!fuse_intersect(st, &p))
 				return WEAVE_FUSE_C1_VIOLATION;
 			if (p == WEAVE_FUSE_END || p >= st->nwarp)
+			{
+				st->stop = WEAVE_FUSE_STOP_REQUIRED;
 				break;
+			}
 		}
 
 		/*
@@ -456,7 +534,10 @@ weave_fuse_run(WeaveFuseState *st)
 			}
 		}
 		else if (st->nrq == 0)
+		{
+			st->stop = WEAVE_FUSE_STOP_NOCAND;
 			break;				/* nothing left that can produce a candidate */
+		}
 
 		st->npivot++;
 
@@ -635,6 +716,13 @@ weave_fuse_run(WeaveFuseState *st)
 			if (s + st->csuffix[j + 1] <= st->theta)
 			{
 				st->nabandon++;
+				if (st->check_bounds)
+				{
+					WeaveFuseError aerr = fuse_audit_abandon(st, j, s);
+
+					if (aerr != WEAVE_FUSE_OK)
+						return aerr;
+				}
 				goto next;
 			}
 		}

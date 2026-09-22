@@ -367,3 +367,75 @@ SELECT to_wdoc(strip(to_tsvector('simple','quick brown')))
          @@@ 'quick:A'::wquery AS weave_zone_a_stripped;
 
 DROP TABLE ph;
+
+-- ---------------------------------------------------------------------------
+-- G43: a term's LAST posting block must not be prove-skipped from the header
+-- that follows it.
+--
+-- `wand_skip_blocks()` advances a cursor over whole 128-posting blocks by
+-- reading block HEADERS only, and decides a block lies entirely below the seek
+-- target when THE NEXT BLOCK'S first_docid <= target.  That inference is sound
+-- only while the next block belongs to the same term.  Posting lists share
+-- pages, so the header after a term's FINAL block belongs to another term, and
+-- its first_docid is an unrelated -- typically small -- number.  Read as this
+-- term's continuation it "proves" the final block is below almost any target,
+-- so the block is skipped, `nread` reaches `df`, and the cursor reports itself
+-- EXHAUSTED with its last block never decoded.
+--
+-- WHY IT NEEDS A FUSED SCAN TO SHOW UP, which is also why it survived to a real
+-- corpus: the seek has to jump PAST the end of the cursor's current block while
+-- postings remain, and only a second channel driving the pivot produces such a
+-- target.  The single-channel ranked path advances with wand_next() and never
+-- reaches the header inference at all.  Found on BEIR scifact (5,183 docs): a
+-- term with df = 211 in blocks of 128 + 83 lost 83 postings, and the fused
+-- top-10 that came back was a correct top-10 of the 128 that survived -- every
+-- row plausible, six of ten wrong.  doc/GAPS.md G43.
+--
+-- The fixture needs all four conditions, and dropping any one of them hides the
+-- bug (each was observed to):
+--   1. a term with MORE THAN ONE posting block (df > 128),
+--   2. which sorts EARLY in the dictionary, so another term's blocks follow its
+--      last one on the page -- the term written last has no header behind it,
+--   3. that is SPARSE relative to a second, DENSE term, so the dense term's
+--      pivots land beyond the sparse term's block boundaries,
+--   4. and varying document lengths, so BM25 scores are distinct and a top-k
+--      oracle is well defined.  With every score tied, any top-k is "correct".
+CREATE TABLE mblk (id serial, d wdoc);
+INSERT INTO mblk(d) SELECT to_wdoc(
+    CASE WHEN g % 10 = 1 THEN 'aaa bbb ' ELSE 'bbb ' END
+    || repeat('pad' || (g % 7) || ' ', 1 + (g % 13)))
+  FROM generate_series(1, 1300) g;
+CREATE INDEX mblk_weave ON mblk USING weave (d);
+ANALYZE mblk;
+
+-- 'aaa' is in 130 documents: two blocks, 128 + 2.
+SELECT count(*) AS aaa_df FROM mblk WHERE d @@@ 'aaa'::wquery;
+
+-- 'aaa' has by far the higher idf, so every document containing it outranks
+-- every document that does not.  The fused top-130 is therefore exactly the
+-- 'aaa' documents -- as a SET, which is what makes the assertion immune to the
+-- ordering among them.  Before the fix this returned 128 of 130, missing the two
+-- postings in the skipped final block.
+WITH f AS (SELECT id FROM mblk
+            ORDER BY fuse(d <=> 'aaa'::wquery, d <=> 'bbb'::wquery,
+                          weights => '{0.5,0.5}') LIMIT 130),
+     m AS (SELECT id FROM mblk WHERE d @@@ 'aaa'::wquery)
+SELECT (SELECT count(*) FROM m) = (SELECT count(*) FROM m JOIN f USING (id))
+         AS fused_scored_every_posting,
+       (SELECT count(*) FROM (SELECT id FROM m EXCEPT SELECT id FROM f) z)
+         AS postings_dropped;
+
+-- The same property stated on the counters rather than the ranking: the lexical
+-- channels are scored once per (term, document) the pivot reaches, so a channel
+-- that quits early shows up as a score count below its df.  'aaa' is essential
+-- here and the scan is exhaustive, so its channel must be scored at all 130 of
+-- its documents.
+SELECT weave_fuse_stats_reset();
+SET enable_seqscan = off;
+SELECT count(*) > 0 AS ran FROM
+  (SELECT id FROM mblk ORDER BY fuse(d <=> 'aaa'::wquery, d <=> 'bbb'::wquery,
+                                     weights => '{0.5,0.5}') LIMIT 130) t;
+SELECT scores - vec_scores - gate_scores >= 130 AS lexical_channels_not_truncated
+  FROM weave_fuse_stats();
+
+DROP TABLE mblk;

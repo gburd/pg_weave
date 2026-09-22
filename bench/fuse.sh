@@ -317,7 +317,12 @@ say "$DS: gate passed ($TIED of $CHECKN skipped for a tied oracle; the fuse() fa
 
 # The plan is asserted, not hoped for: if the pushdown was not chosen, every latency
 # number below is measuring the fallback and the comparison is meaningless.
-read -r qid1 wq1 qv1 < <(head -1 "$QLIT")
+# IFS=$'\t' IS LOAD-BEARING, exactly as in the gate loop above: a query literal
+# contains SPACES (multi-term queries are OR-joined, `a | b | c`), so a default-IFS
+# read splits one row into the wrong three fields and the EXPLAIN below is then
+# handed a malformed statement.  It fails as "the fused arm is NOT using the index",
+# which reads as a planner regression and is not one -- the statement never parsed.
+IFS=$'\t' read -r qid1 wq1 qv1 < <(head -1 "$QLIT")
 PLAN_FUSED=$( { echo "$SETUP"; printf 'EXPLAIN %s' "$(fused_sql "$wq1" "$qv1" 10)"; } \
               | psql -X -q -d "$DB" -t -A | tr '\n' ' ')
 case "$PLAN_FUSED" in
