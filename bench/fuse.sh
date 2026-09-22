@@ -297,10 +297,28 @@ WITH s AS (
       FROM fdmap m
       LEFT JOIN weave_search('fd_weave', $wq::wquery, $NDOCS) a ON a.ctid = m.rowtid
       LEFT JOIN weave_vec_scan('fd_weave', $qv::wvec, $NDOCS) v ON v.docid = m.docid
+), r AS (
+    SELECT id, score, row_number() OVER (ORDER BY score DESC, id) AS rn FROM s
 )
-SELECT (SELECT count(*) = count(DISTINCT score) FROM s),
-       (SELECT string_agg(id::text, ' ' ORDER BY id)
-          FROM (SELECT id FROM s ORDER BY score DESC LIMIT 10) k);
+-- TIE-FREE MEANS "THE TOP-10 SET IS UNIQUE", WHICH IS ONLY ABOUT RANKS 10 AND 11.
+--
+-- This used to be \`count(*) = count(DISTINCT score)\` over the WHOLE corpus, which
+-- demanded that no two documents anywhere share a score -- and a tie a thousand
+-- ranks down cannot affect a top-10 SET comparison.  On scifact (5,183 docs) that
+-- held for 98 of 100 queries and looked fine.  On nfcorpus (3,633) and fiqa
+-- (57,638) it held for ZERO of 100, so every query was skipped, \`BAD\` stayed 0,
+-- and the gate reported "passed" having compared NOTHING.  It is the recall row of
+-- FUSED_TOPK.md sect. 8 -- the one that table calls its most valuable -- and it was
+-- vacuous on two of three datasets while printing a pass.  Same family as G42:
+-- a gate that cannot fail.
+--
+-- Ties WITHIN the top 10 are harmless here because the comparison is a SET: if
+-- ranks 5 through 10 all share a score the set is still determined.  Only a tie
+-- across the CUT leaves two different, equally correct answers.  NOT EXISTS also
+-- gives the right answer when the corpus has fewer than 11 rows.
+SELECT NOT EXISTS (SELECT 1 FROM r x JOIN r y ON y.rn = 11
+                    WHERE x.rn = 10 AND x.score = y.score),
+       (SELECT string_agg(id::text, ' ' ORDER BY id) FROM r WHERE rn <= 10);
 SQL
 )
     if [ "$tiefree" != "t" ]; then
@@ -313,7 +331,22 @@ SQL
     fi
 done < <(head -n "$CHECKN" "$QLIT")
 [ "$BAD" -eq 0 ] || die "$BAD of $CHECKN queries disagree with the exhaustive per-channel oracle"
-say "$DS: gate passed ($TIED of $CHECKN skipped for a tied oracle; the fuse() fallback differed on $FBDIFF)"
+# A GATE THAT COMPARED NOTHING DID NOT PASS.  `BAD` is 0 both when every query
+# agreed and when every query was skipped, and those two states printed the same
+# line until nfcorpus and fiqa skipped 100 of 100 and still said "gate passed".
+# Refuse the run instead: an ambiguous oracle on EVERY query means the oracle is
+# wrong for this corpus, not that the scorer is right.
+CHECKED=$((CHECKN - TIED))
+[ "$CHECKED" -gt 0 ] || die "the correctness gate compared 0 of $CHECKN queries \
+(all skipped for a tied oracle) -- it has proved nothing; fix the oracle before \
+believing any number from this dataset"
+# And a mostly-skipped gate is weak evidence even when it is not vacuous, so the
+# threshold is loud rather than silent.
+if [ "$CHECKED" -lt $(( CHECKN / 2 )) ]; then
+    printf 'WARNING: the correctness gate compared only %s of %s queries (%s skipped for a tied oracle)\n' \
+        "$CHECKED" "$CHECKN" "$TIED" >&2
+fi
+say "$DS: gate passed ($CHECKED of $CHECKN queries COMPARED, $TIED skipped for a tied oracle; the fuse() fallback differed on $FBDIFF)"
 
 # The plan is asserted, not hoped for: if the pushdown was not chosen, every latency
 # number below is measuring the fallback and the comparison is meaningless.
@@ -457,8 +490,11 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
        "$DS" "$EMBED" "$DIM" "$NDOCS" "$NQ" "$NOWQ" "$TRUNC" "$IDXMB" "$BUILD_S" "$WEAVEVER" "$KP" "$RRFK"
 
 printf '\n### fuse_correctness\n'
-printf 'checked\tmismatched_vs_oracle\tskipped_tied_oracle\tfallback_differed\n'
-printf '%s\t%s\t%s\t%s\n' "$CHECKN" "$BAD" "$TIED" "$FBDIFF"
+# `compared` is the load-bearing column, not `attempted`: the recall row of sect. 8
+# is only as strong as the number of queries whose oracle was unambiguous, and
+# reporting only the attempt count is what let a 0-of-100 gate read as a pass.
+printf 'attempted\tcompared\tmismatched_vs_oracle\tskipped_tied_oracle\tfallback_differed\n'
+printf '%s\t%s\t%s\t%s\t%s\n' "$CHECKN" "$CHECKED" "$BAD" "$TIED" "$FBDIFF"
 
 printf '\n### fuse_quality\n'
 printf 'label\tnqueries_scored\tndcg@10\trecall@100\tmrr@10\texcluded_no_positive\tmissing_from_run\n'
