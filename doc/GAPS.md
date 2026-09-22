@@ -1993,6 +1993,13 @@ lower-scoring document and drops a higher one. Stable across `LIMIT 10`, `20` an
 - *Block pruning.* `weave_fuse_stats()` on the failing query: `blkskip = 0`,
   `pivots = 5183` (every document considered), and `weave_work_stats()` reports
   `vec_blocks_bound_skipped = 0`. No block was skipped by any bound.
+  — **HALF OF THAT CITATION IS A TAUTOLOGY; CORRECTED 2026-09-22, see "the counter six
+  documents cited" in G44 below.** `vec_blocks_bound_skipped` increments only on
+  `WEAVE_VSCAN_SKIP_BOUND` (`src/vector/vecscan.c:290-292`), which needs the vector
+  shuttle's own floor — set by `weave_vec_shuttle_set_threshold()`, whose sole caller is
+  the `weave_vec_scan()` SRF driver. In a fused scan the floor stays at its `-INFINITY`
+  init, so the counter is **structurally zero** and reports nothing about this query. The
+  ruling-out still holds, because `blkskip = 0` says it and that counter *can* move.
 - *The ladder and the merge-race retry.* `passes = 1`, `runs = 1`.
 - *Tombstones.* `livedrop = 0` on a freshly built index.
 - *A float32 tie at the cut.* The two documents' oracle scores are 5.42375 and
@@ -2023,8 +2030,13 @@ vector channel is ever scored.
 
 **Why this could stay latent until F8, which is the part worth generalizing.** The
 vector block bound **prunes 0.0 % of blocks** on the single-channel path — that is
-`bench/RESULTS_BOUND_PRUNING.md`'s headline finding, reproduced here as
-`vec_blocks_bound_skipped = 0`. A bound that never prunes is a bound whose soundness is
+`bench/RESULTS_BOUND_PRUNING.md`'s headline finding, ~~reproduced here as
+`vec_blocks_bound_skipped = 0`~~ **[NOT REPRODUCED — CORRECTED 2026-09-22. That counter
+cannot move in a fused scan (mechanism in G44 below), so the zero was structural rather
+than measured. The single-channel figure stands on `bench/RESULTS_BOUND_PRUNING.md` and
+`bench/RESULTS_CODE_SCAN.md:43-44` — 0.00–0.01 % even at oracle theta — and the fused
+scan's own equivalent is `blkskip`, which was also 0 on this query.]**. A bound that never
+prunes is a bound whose soundness is
 never load-bearing, so a too-low one is unobservable. The fused scorer uses the same
 bound *differently* — as a ceiling inside a suffix sum that decides abandonment — and
 that use IS load-bearing. **F8 did not introduce the defect; it made a latent one
@@ -2461,9 +2473,18 @@ upgraded.
   - **The p50 latency row still FAILS** (gate ≤ 0.50×; measured 0.582× / 0.795× / 0.578×)
     and **the `score()`-call row still FAILS** (gate ≤ 0.20×; measured 0.648× / 0.903× /
     0.541×). The mechanism is unchanged and is not the objective: the vector block bound
-    prunes nothing (`vec_blocks_bound_skipped = 0` on all three datasets) and 71–87 % of
+    prunes nothing (~~`vec_blocks_bound_skipped = 0` on all three datasets~~ **[CITATION
+    CORRECTED 2026-09-22: structurally zero in a fused scan; the evidence is
+    `bench/RESULTS_CODE_SCAN.md:43-44` and (B2) ≈ 1.0 by construction — see the dated
+    work-counter block below]**) and 71–87 % of
     all fused `score()` calls are the vector channel, so the vector side sets the ratio no
     matter how well the lexical side prunes. Nothing about normalization touches that.
+    — **AMENDED 2026-09-22 by the work counters below: "nothing about normalization touches
+    that" is wrong in both directions.** The normalized arm's totals are 0.571× / 0.875× /
+    0.513× (better on all three, still failed), its lexical side is 0.203× / 0.380× /
+    0.052×, and its vector side is exactly **1.000×** with `blkskip` collapsed. The row
+    fails either way; with the normalizer on it fails for a *different* reason, which is
+    the dense-channel ceiling property in `FUSED_TOPK.md` §8d.
   - **The normalizer's own cost is UNMEASURED.** One LUT build and one directory pass per
     bolt per vector key, ahead of the first bolt. Kilobytes of directory against megabytes
     of codes is a reason to expect it to be small, not a measurement; no latency figure has
@@ -2471,11 +2492,196 @@ upgraded.
     pre-normalizer build and need an EC2 re-run before they are quoted for the default.
   - **fiqa's optimum ratio is still at or below the lowest ratio swept**, so the
     equal-weight default is probably not optimal there even now. Unchanged by this work.
+    — **CLOSED BY MEASUREMENT 2026-09-22, and OVERTURNED: in the product fiqa PEAKS at
+    r = 0.5** (nDCG@10 0.4056) and falls off below it — 0.3968 at 0.25, 0.3817 at 0.125,
+    0.3766 at 0.0625. The original sentence stays because its axis was a different axis and
+    both readings are right on their own: the `bench/normsweep.sh` study table above applied
+    its ratio *after* realized-max normalization, the product divides by the **ceiling**, and
+    the ceiling proxy is 0.73 in study units — so product r = 0.5 is study r ≈ 0.37, and the
+    study's 0.4026 at study-r 0.25 sits between the product's 0.3968 at 0.25 and 0.4056 at
+    0.5. On that mapping the two agree and neither curve is still falling at its low end.
+    Sweep and reconciliation in the dated block below.
 
 **Local gates green on the change:** `installcheck` pg17 and pg18, `tap-pg17`,
 `make check-standalone`, and the four lint targets. Per hard rule 12 that is not evidence
 at scale — and the thing that needs scale here is exactly the thing not re-measured, which
 is latency.
+
+---
+
+**MEASURED 2026-09-22, LATER THE SAME DAY: THE WORK COUNTERS. Normalization improved the
+gated total on all three corpora and the `score()` row still FAILS by 2.6–4.4×, and the
+reason is now a property of the code page layout rather than a tuning question.**
+`bench/normprod.sh`, locally, no EC2: a count of `score()` calls is **deterministic**,
+which is the same argument that bought the nDCG arms their local run. Real MiniLM BEIR
+corpora (scifact 5,183 docs / 300 queries, nfcorpus 3,633 / 323, fiqa 57,600 / 648), fused
+arm over the RRF control, gate ≤ 0.20×:
+
+| dataset | arm | lexical | vector | total | fused `blkskip` |
+|---|---|---|---|---|---|
+| scifact | raw | 0.353× | 0.991× | 0.648× | 97,028 |
+| scifact | **norm** | **0.203×** | **1.000×** | **0.571×** | 0 |
+| nfcorpus | raw | 0.581× | 0.985× | 0.903× | 4,339 |
+| nfcorpus | **norm** | **0.380×** | **1.000×** | **0.875×** | 88 |
+| fiqa | raw | 0.149× | 0.956× | 0.541× | 3,444,538 |
+| fiqa | **norm** | **0.052×** | **1.000×** | **0.513×** | 6,732 |
+
+**Positive control:** the `raw` rows reproduce the recorded EC2 work numbers exactly on all
+three corpora (0.353 / 0.991 / 0.648, 0.581 / 0.985 / 0.903, 0.149 / 0.956 / 0.541), so the
+local harness is counting what the paid run counted.
+
+**The win and the loss, side by side because they are the same change.** The lexical side
+improved a lot — fiqa **0.149× → 0.052×**, one nineteenth of the WAND control's BM25
+contributions — and the gated total improved on all three. **The other two columns went the
+wrong way: the vector side became exactly 1.000×, and range skipping collapsed** (fiqa
+3,444,538 → 6,732 skipped ranges, scifact 97,028 → 0, nfcorpus 4,339 → 88). The gate is
+missed on all three: the vector channel is **74–87 %** of the fused total, so it sets the
+ratio no matter that the lexical half now clears the gate on fiqa by a factor of four.
+
+**THE COUNTER SIX DOCUMENTS CITED AS EVIDENCE IS A TAUTOLOGY IN A FUSED SCAN. This is a
+correction of REASONING, not a reversal of a result.** `vec_blocks_bound_skipped` increments
+only on `WEAVE_VSCAN_SKIP_BOUND` (`src/vector/vecscan.c:290-292`), which fires only when the
+vector shuttle's own floor is above a block's bound — and that floor is set by
+`weave_vec_shuttle_set_threshold()` (`src/vector/vecshuttle.c:1078`), whose **sole caller is
+the `weave_vec_scan()` SRF driver** (`vecshuttle.c:1336`). A fused scan never calls it, the
+field stays at its `-INFINITY` init (`vecshuttle.c:887`), and `bound <= threshold` is false
+for every finite bound. **The zero is structural; it says nothing about bound quality.**
+
+The counter that *can* move is the fused core's own `blkskip` (`weave_fuse_stats()`;
+`src/am/fuse.c:618`, `ub <= st->theta`, incremented at `:644`). It compares the **sum** of
+every contributing channel's weighted block bound (`ub += b` at `:611`) against theta, so it
+proves range skipping happens and **cannot attribute it to the vector channel**. Nothing in
+the tree can, today — which is why the table above prints `blkskip` and the tautology is
+gone from it.
+
+**The conclusion survives on evidence that was always the better evidence.** The vector
+block bound does not prune usefully: `bench/RESULTS_CODE_SCAN.md:43-44` measures
+**0.00–0.01 %** of blocks skipped even at *oracle* theta (`:55` confirms it at n = 200k), and
+(B2) = `max‖recon‖ · ‖q‖` is **≈ 1.0 by construction** on L2-normalized data with
+`metric = 'ip'` — it is the domain's own maximum, so it cannot get under a realized score.
+What changes is which line you cite.
+
+**And none of this needed measuring: `src/vector/vecshuttle.c:609-614` and `:44-46` already
+said it, in comments, before any of the six documents was written** — "`threshold` is
+-INFINITY unless a driver that owns a top-k sets it … so this only ever fires for the SRF
+below", and "a fused-loop driver passes -INFINITY as the threshold anyway". Nobody
+propagated it. A fact recorded where the code is and nowhere else is a fact the documents
+will contradict at their leisure; `doc/CONVENTIONS.md`'s deliberate three-place redundancy
+exists for exactly this, and was not applied here.
+
+**WHY THE VECTOR SIDE IS 1.000×, observed rather than argued.** One scifact query under the
+per-bolt diagnostic NOTICE (`FUSED_TOPK.md` §8c), five lexical channels and one vector
+channel:
+
+| | normalizer **on** | normalizer off |
+|---|---|---|
+| weights | `w_lex` = 0.0109506 each (0.5 / `N_lex` ≈ 45.7 over five terms), `w_vec` = 0.494712 (0.5 / 1.01069) | 0.5 everywhere |
+| partition ceiling | **1.0 exactly** — the sum of the weights | 23.3351 |
+| theta | 0.110627 | 2.28239 |
+| essential / non-essential split | 4 of 6 | — |
+| pivots | **5,183 — every document** | 1,450 (28 %) |
+| vector `nscore` | **5,183** | 1,052 |
+
+**The general property, and it is the durable half of the finding (`FUSED_TOPK.md` §8d): A
+DENSE CHANNEL WHOSE WEIGHTED CEILING SITS ABOVE THETA FORCES THE PIVOT TO VISIT EVERY
+DOCUMENT.** Normalization puts the vector key's weighted ceiling at 0.494712 and the whole
+partition's at 1.0, which only a document that maxes both keys *at once* could reach. Real
+documents score 0.11–0.35 of it, so theta settles at 0.110627, never climbs past 0.49, the
+vector channel is never non-essential, and MaxScore has nothing to exclude. With the
+normalizer off the 33× scale mismatch this entry opened on put theta at 2.28239 against a
+1.01069 vector ceiling: the vector channel went non-essential, 72 % of documents were never
+pivoted, and its `cur` ended at **300024** rather than the end sentinel — abandoned, unread.
+**That is the ranking defect and the cheap scan being the same state.** The nDCG win and the
+work loss are one mechanism, not two findings.
+
+**THE OBVIOUS FIX IS DEAD ON MEASUREMENT: the vector channel is 1.000× AT EVERY WEIGHT
+RATIO.** A seven-point lex:vec sweep (weights summing to 1, normalizer on), nDCG@10 and work
+reported together so a quality-for-work trade is visible rather than inferred. scifact:
+
+| lex:vec | nDCG@10 | lexical | total | `blkskip` |
+|---|---|---|---|---|
+| 0.0625 | 0.6679 | 0.153× | 0.544× | 0 |
+| 0.125 | 0.6815 | 0.157× | 0.546× | 0 |
+| 0.25 | 0.6976 | 0.164× | 0.550× | 0 |
+| 0.5 | 0.7138 | 0.178× | 0.558× | 0 |
+| 1 — the shipping default | **0.7212** | 0.203× | 0.571× | 0 |
+| 2 | 0.7207 | 0.238× | 0.590× | 4,114 |
+| 4 | 0.7112 | 0.269× | 0.607× | 4,114 |
+
+nfcorpus:
+
+| lex:vec | nDCG@10 | lexical | total | `blkskip` |
+|---|---|---|---|---|
+| 0.0625 | 0.3260 | 0.249× | 0.849× | 0 |
+| 0.125 | 0.3373 | 0.262× | 0.852× | 0 |
+| 0.25 | 0.3488 | 0.285× | 0.856× | 0 |
+| 0.5 | **0.3535** | 0.325× | 0.864× | 0 |
+| 1 — the shipping default | 0.3455 | 0.380× | 0.875× | 88 |
+| 2 | 0.3401 | 0.434× | 0.886× | 601 |
+| 4 | 0.3314 | 0.477× | 0.893× | 7,452 |
+
+fiqa:
+
+| lex:vec | nDCG@10 | lexical | total | `blkskip` |
+|---|---|---|---|---|
+| 0.0625 | 0.3766 | 0.026× | 0.499× | 0 |
+| 0.125 | 0.3817 | 0.028× | 0.500× | 0 |
+| 0.25 | 0.3968 | 0.031× | 0.502× | 0 |
+| 0.5 | **0.4056** | 0.038× | 0.505× | 0 |
+| 1 — the shipping default | 0.3878 | 0.052× | 0.513× | 6,732 |
+| 2 | 0.3474 | 0.073× | 0.523× | 332,823 |
+| 4 | 0.3085 | 0.095× | 0.533× | 4,096,432 |
+
+**The vector column is 1.000× at all 21 points** (0.997–0.999× at three of them) and is
+omitted from the tables for that reason. Weighting the vector key *down* is worse than
+useless: at r = 4 it carries 0.2 of the weight instead of 0.5, fiqa's range skipping goes
+6,732 → **4,096,432**, the vector channel's lane count does not move, and nDCG@10 falls on
+**every** corpus (0.7112 / 0.3314 / 0.3085). More range skips and identical vector work is
+the signature of skips the vector channel is not paying for.
+
+**The mechanism, and this project had already measured it for an unrelated reason**
+(`bench/RESULTS_CODE_SCAN.md:330,417`): in `WEAVE_PACK_LANE`, coordinate *j* of lane *s* is
+one nibble at byte `j*16 + s/2` (`include/weave/vecpage.h:18`), so **reading one lane touches
+every byte of the block** — scoring 1 lane costs the same memory traffic as scoring 32. A
+probe anywhere in a block scores the whole block; a non-essential channel is still probed at
+every candidate; candidates are scattered across docid space. The V15 verdict moved three
+times on this same fact, expressed as a harness bug.
+
+**CONSEQUENCE: `FUSED_TOPK.md` §8's `score()` row (≤ 0.20×) is NOT REACHABLE for the vector
+channel by tuning the objective or tightening the bound.** Three structural options, each
+with its cost, **none chosen here — this is a maintainer decision and no task id is invented
+for it** (the durable form, with the code anchors, is `FUSED_TOPK.md` §8d):
+
+  1. **Restate the row in the unit the layout has** — blocks or bytes of code read, not
+     lanes. No code. Honest only if the restated gate is written down *before* it is
+     measured against.
+  2. **A second, vector-major copy of the codes**, so one lane can be scored without its 31
+     neighbours. Forfeits the storage gate, and `include/weave/vecpage.h:24-26` refuses
+     `WEAVE_PACK_VECMAJOR` on the coordinate-split page layout, so it is a new on-disk shape.
+  3. **Cluster-order the weft** so candidates are contiguous. This **contradicts the
+     strictly-ascending-docid requirement the fused vector channel depends on** —
+     `include/weave/vecdocmap.h:35` derives (C2) from it, `:105` states it as the adapter's
+     invariant, `:122` is the (C1) lower-bound search that needs it, `:167` is the `init()`
+     refusal that enforces it. **V13 and F8 are therefore not independent**, a conflict
+     nothing in the tree had recorded before today.
+
+**THE SWEEP ALSO OVERTURNS AN OPEN ITEM OF THIS ENTRY — the last bullet of the open-items
+list above — and the axes are the reason it looked open.** The item said fiqa's optimum is at or below the lowest ratio swept
+and still falling. In the product fiqa **peaks at r = 0.5** (0.4056) and falls at 0.25
+(0.3968), 0.125 (0.3817) and 0.0625 (0.3766). The two measurements are not in conflict: the
+study swept its ratio *after* realized-max normalization, the product divides by the
+**ceiling**, and the ceiling proxy is 0.73 in study units — so **product r = 0.5 is study
+r ≈ 0.37**, and the study's 0.4026 at study-r 0.25 lands between the product's 0.3968 and
+0.4056. Marked CLOSED BY MEASUREMENT in place, with the original sentence left as written,
+because the thing that was wrong was the axis and not the number.
+
+**RECORDED AND DELIBERATELY NOT ACTED ON: every corpus has an INTERIOR optimum, and r = 0.5
+beats the shipping equal-weight default on 2 of 3** — nfcorpus 0.3535 vs 0.3455, fiqa 0.4056
+vs 0.3878 — while **losing scifact by 1.0 %** (0.7138 vs 0.7212). **The default is not being
+changed.** Hard rule 11: this is one harness at one scale on three corpora, the scifact loss
+is real, and "tune the default to the mean of three BEIR sets" is fitting, which is honest
+only if reported as fitted. It is a maintainer decision, and the numbers are here so that it
+can be made from measurement rather than from taste.
 
 ### G45 — `prepdata.py`'s MS MARCO source returns HTTP 404; the dataset §8 names by name cannot be fetched — **OPEN 2026-09-22**
 
@@ -2503,3 +2709,38 @@ used, the qrels-preserving subsample has to come with it.
 test. This one worked when it was written and rotted silently; the first evidence was a
 404 on a paid instance. A harness that downloads anything should fetch the smallest file
 first and fail fast, which is what happened here by luck of ordering rather than design.
+
+### G46 — `bench/fuse.sh`'s exhaustive oracle cannot express the shipping objective, so the correctness gate runs with `pg_weave.fuse_normalize = off` — **OPEN 2026-09-22**
+
+The gate compares the fused pushdown against `0.5*lex + 0.5*vec` computed from
+`weave_search()` and `weave_vec_scan()`. Since 2026-09-22 the shipping scorer divides each
+`fuse()` **key** by its own pre-scan ceiling (`doc/specs/FUSED_TOPK.md` §8d), and **that
+objective is not expressible in SQL**: the vector key's normalizer is reachable (max over
+segments of `weave_vec_scan_stats().maxscore`, the same (B2) fold the scan uses), but the
+lexical key's needs **each term's max tf**, and nothing in `sql/` exposes it —
+`weave_index_df` and `weave_index_stats` are what there is
+(`sql/pg_weave--0.1.0.sql:252-262`), and they give df, ndocs, avgdl and nterms.
+
+So the gate now sets `pg_weave.fuse_normalize = off` and says so in its banner
+(`bench/fuse.sh:320-334`). **What it still proves is worth keeping and is narrower than it
+reads:** the scan is *exact* — pivot selection, the MaxScore partition, incremental
+abandonment, summation — **for a given set of weight constants**. What it does not check is
+the constants, which is the half that changed. Those are covered elsewhere and neither cover
+is exhaustive: `sql/fuse_degenerate.sql` (6) pins bolt-count independence of the normalizer,
+and the nDCG arms in G44 pin its direction against RRF on three corpora.
+
+**The risk, named because it is not the missing coverage itself:** a gate that tests a
+**non-default configuration** is one configuration change away from testing nothing. The
+day `pg_weave.fuse_normalize` is removed, renamed, or made `PGC_POSTMASTER`, this gate either
+errors out or silently starts exercising the default while comparing against the raw
+objective — and the second of those reports mismatches that are not defects, which is how a
+red gate gets waived. It is green today and it is green about the arm nobody ships.
+
+**The fix, either form of which is an extension version bump.** Expose max tf per query term
+(the scan already accumulates it in the `src/am/amscan.c` loop that reads every segment's
+dictionary entry for the global idf, so it is a return value, not new I/O), or expose the
+per-key normalizer directly as an accessor so the oracle divides by the same constant the
+scan does. The second is less surface and more coupling: it makes the oracle agree with the
+scan **by construction**, which is exactly what an oracle must not do if the constant itself
+can be wrong. Prefer max tf, and let the oracle recompute the normalizer from it.
+

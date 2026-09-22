@@ -769,13 +769,38 @@ that predicted it was already on disk.** Split by channel:
 | fiqa | **0.149×** | 0.956× | 86 % |
 
 The lexical side clears the gate on fiqa **by itself**. The vector side prunes nothing —
-`vec_blocks_bound_skipped = 0` on all three datasets — and being 71–87 % of all calls it
+~~`vec_blocks_bound_skipped = 0` on all three datasets~~ — and being 71–87 % of all calls it
 sets the combined ratio no matter how well the lexical side does.
 `bench/RESULTS_BOUND_PRUNING.md` measured that bound pruning 0.0 % long before this run,
 and G43 recorded the generalization that *a bound computed but not acted on* is a latent
 defect. This section's own instruction — "stop and fix the bounds before optimizing
 anything else" — therefore applies to the **vector block bound**, and was answerable from
 existing data. The measurement existed; the inference did not.
+
+**CITATION CORRECTED 2026-09-22, and the verdict above is unchanged: the counter struck
+out in that paragraph is a TAUTOLOGY in a fused scan.**
+`vec_blocks_bound_skipped` increments only on `WEAVE_VSCAN_SKIP_BOUND`
+(`src/vector/vecscan.c:290-292`), which fires only when the vector shuttle's own floor —
+set by `weave_vec_shuttle_set_threshold()` (`src/vector/vecshuttle.c:1078`), whose sole
+caller is the `weave_vec_scan()` SRF driver at `vecshuttle.c:1336` — sits above a block's
+bound. A fused scan calls nothing of the sort, the field stays at its `-INFINITY` init
+(`vecshuttle.c:887`), and `bound <= threshold` is false for every finite bound. **The zero
+is structural and says nothing about bound quality.** What this section should have cited,
+and what the verdict now rests on, is two things it already had:
+
+  - `bench/RESULTS_CODE_SCAN.md:43-44` — **0.00–0.01 %** of blocks skipped on the
+    single-channel path even at *oracle* theta, i.e. against the best any block ordering
+    could achieve, confirmed at n = 200k (`:55`);
+  - (B2) = `max‖recon‖ · ‖q‖` is **≈ 1.0 by construction** on L2-normalized data with
+    `metric = 'ip'`, so the bound is the domain's own maximum and cannot get under a
+    realized score.
+
+The counter that *can* move inside a fused scan is the core's own `blkskip`
+(`weave_fuse_stats()`; `src/am/fuse.c:618`, `ub <= st->theta`, incremented at `:644`) — but
+it compares the **sum** of every contributing channel's weighted block bound (`ub += b` at
+`:611`) against theta, so it proves that range skipping happens and **cannot attribute it to
+the vector channel**. No counter in the tree can, today. `doc/GAPS.md` G44 has the audit,
+the six documents that quoted the tautology, and the measured `blkskip` figures.
 
 **So the honest statement of where the design stands:** the fused threshold demonstrably
 suppresses lexical work (0.149× on the largest corpus) and is genuinely faster end to end
@@ -785,9 +810,19 @@ normalized. Neither is a rewrite.
 
 **HALF OF THAT HAPPENED THE SAME DAY.** The sum is normalized (§8d) and the fused
 objective now beats RRF on nDCG@10 on 3 of 3 corpora, measured in the product. The vector
-block bound still prunes nothing — `vec_blocks_bound_skipped = 0` — so the `score()` and
-p50 rows are exactly where this paragraph left them, and the sentence above remains the
-honest statement with one of its two conditions discharged.
+block bound still prunes nothing — ~~`vec_blocks_bound_skipped = 0`~~, **corrected above:
+that counter cannot move in a fused scan; read `bench/RESULTS_CODE_SCAN.md:43-44` and the
+(B2) ≈ 1.0 construction instead** — so the `score()` and p50 rows are exactly where this
+paragraph left them, and the sentence above remains the honest statement with one of its
+two conditions discharged.
+
+**And "exactly where this paragraph left them" was itself wrong about one of the two:
+normalization moved the work counters, in both directions.** Measured locally 2026-09-22
+(`bench/normprod.sh`; `doc/GAPS.md` G44 has the table): the gated total improved on all
+three corpora, the lexical side improved a lot (fiqa 0.149× → **0.052×**), and the vector
+side went to **exactly 1.000×** while range skipping collapsed (fiqa `blkskip` 3,444,538 →
+6,732; scifact 97,028 → 0). The `score()` row fails either way, but it fails for a
+different reason with the normalizer on, and that reason is the next subsection.
 
 ### 8b-history. The gate went red on first contact with a real corpus, and that is what it was for.
 
@@ -924,6 +959,69 @@ is its consequence for §8b: the nDCG@10 row is **MET** at 1.053× / 1.010× / 1
 with a recorded loss on nfcorpus, and the p50 and `score()`-call rows are **untouched** by
 this work and still fail — the `score()` failure is the vector block bound pruning
 nothing, and normalization does not go near it.
+
+**AMENDED 2026-09-22 by the work counters, and the last clause of that paragraph is too
+kind: normalization does not leave the `score()` row untouched, it moves both halves of it
+in opposite directions.** Measured locally (`bench/normprod.sh`; the table is in
+`doc/GAPS.md` G44, and a count of `score()` calls is deterministic, so no EC2 was needed):
+the gated total improves on all three corpora (0.648×→0.571×, 0.903×→0.875×,
+0.541×→0.513×) and the lexical side improves a lot (fiqa 0.149×→**0.052×**, one nineteenth
+of the WAND control's BM25 contributions), while the **vector side becomes exactly 1.000×**
+and range skipping collapses (fiqa `blkskip` 3,444,538→6,732, scifact 97,028→0). The gate
+is ≤ 0.20× and is missed on all three; the vector channel is 74–87 % of the fused total, so
+it is the only column that can carry the row.
+
+**THE PROPERTY THAT EXPLAINS IT, and it is a general statement about this algorithm rather
+than a fact about one corpus: A DENSE CHANNEL WHOSE WEIGHTED CEILING SITS ABOVE THETA
+FORCES THE PIVOT TO VISIT EVERY DOCUMENT.** §5's partition can only move a channel to the
+non-essential side once theta exceeds that channel's weighted ceiling, and §2's pivot is
+the first document at which the essential channels' bounds can still reach theta. After
+normalization each key's weighted ceiling **equals its weight** — that is the property
+§8d's opening paragraph advertises as an improvement — so with `weights => '{0.5,0.5}'` the
+vector key's ceiling is 0.5 and the whole partition's ceiling is 1.0, reached only by a
+document that maxes both keys at once. Real documents score 0.11–0.35 of it (measured, one
+scifact query: theta settles at 0.110627), so theta never climbs past 0.5, the dense
+channel is never non-essential, every document is a pivot, and every pivot scores it.
+Before normalization the same query had theta 2.28239 against a vector ceiling of 1.01069:
+the vector channel went non-essential, 72 % of documents were never pivoted — and that
+*was* the ranking defect G44 opened on. **The nDCG win and the work loss are one mechanism,
+not two findings**, and any future channel with a bounded, dense score domain will do the
+same thing.
+
+**WHY TUNING CANNOT RESCUE THE ROW, measured rather than argued.** A seven-point lex:vec
+weight sweep on all three corpora (`doc/GAPS.md` G44 for the table) leaves the vector
+column at **1.000× at every one of the 21 points** (0.997–0.999× at three). Weighting the
+vector key *down* is worse than useless: it starts range skipping dramatically (fiqa
+`blkskip` 0 → 4,096,432), still does not reduce the vector channel's lane count, and costs
+nDCG@10 on every corpus. The reason is the code layout, and this project already measured
+it for another purpose (`bench/RESULTS_CODE_SCAN.md:330,417`): in `WEAVE_PACK_LANE`,
+coordinate *j* of lane *s* is one nibble at byte `j*16 + s/2`
+(`include/weave/vecpage.h:18`), so **reading one lane touches every byte of the block** —
+scoring 1 lane costs the same memory traffic as scoring 32. A probe anywhere in a block
+scores the whole block, a non-essential channel is still probed at every candidate, and
+candidates are scattered across docid space.
+
+**So §8's `score()` row is NOT REACHABLE for the vector channel by tuning the objective or
+tightening the bound.** Three structural options, all three with their cost, and **none is
+chosen here** — the choice is the maintainer's:
+
+  - **(a) Restate the row in the unit the layout has.** The vector channel's work is
+    blocks, or bytes of code read, not lanes scored; a per-lane gate on a layout whose
+    quantum is 32 lanes is measuring something the design never offered. No code, and it is
+    honest only if the restated gate is stated before it is measured against.
+  - **(b) A second, vector-major copy of the codes**, so a single lane can be scored
+    without touching its 31 neighbours. This forfeits the storage gate — a second copy of
+    the code weft — and `include/weave/vecpage.h:24-26` refuses `WEAVE_PACK_VECMAJOR` on
+    the coordinate-split page layout, so it is a new on-disk shape, not a reloption.
+  - **(c) Cluster-order the weft** so a query's candidates are contiguous and a block probe
+    is not wasted. This **CONTRADICTS the strictly-ascending-docid requirement the fused
+    vector channel depends on**: `include/weave/vecdocmap.h:35` derives (C2) from
+    `docid[]` being strictly ascending, `:105` states it as the adapter's invariant, `:122`
+    is the (C1) lower-bound search that needs it, and `:167` is the `init()` refusal that
+    enforces it. Reordering the weft for locality and keeping docid order are the same
+    knob turned two ways. `doc/PHASES.md` **V13** (warp ordering by cluster, whose own
+    justification is already recorded as gone) is exactly that ordering, so **V13 and F8
+    are not independent** — a conflict nothing in the tree had recorded before 2026-09-22.
 
 ### 8c. Why the loop stopped, reported per bolt
 

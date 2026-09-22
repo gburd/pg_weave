@@ -345,10 +345,23 @@ Four things, and it should claim exactly four things:
    §8 — three BEIR datasets, real embeddings, an RRF control over the same single
    index — reproduces the paragraph above exactly: the lexical side clears §8's
    `score()`-call gate unaided on the largest corpus (**0.149×** against a 0.20×
-   bar), while the vector side is **0.956–0.991×** of the control with
-   `vec_blocks_bound_skipped = 0` on every dataset. Since the vector channel is
+   bar), while the vector side is **0.956–0.991×** of the control. Since the vector channel is
    **71–87 %** of all fused `score()` calls, it sets the combined ratio no matter
    how well the lexical side prunes, and the gate fails at 0.54–0.90×.
+
+   **CORRECTION 2026-09-22 (evening), left here rather than applied silently:** this
+   paragraph read *"with `vec_blocks_bound_skipped = 0` on every dataset"*. That counter is
+   **structurally zero in any fused scan** and witnesses nothing — it fires only on
+   `WEAVE_VSCAN_SKIP_BOUND` (`src/vector/vecscan.c:291`), which needs the vector shuttle's
+   own threshold floor, set only by `weave_vec_shuttle_set_threshold()` whose sole caller is
+   the `weave_vec_scan()` SRF driver (`src/vector/vecshuttle.c:1336`); on the fused path the
+   field keeps its `-INFINITY` init (`:887`). `src/vector/vecshuttle.c:609-614` and `:44-46`
+   already said so and nobody propagated it. The measured 0.956–0.991× and the failing gate
+   are unaffected; the bound's uselessness rests on 0.00–0.01 % of blocks pruned at an
+   **oracle** θ (`bench/RESULTS_CODE_SCAN.md:43-44,55`) and B2 ≈ 1.0 by construction
+   (`:72,87`). `blkskip` is the informative counter but is a **combined** bound over all
+   contributing channels (`src/am/fuse.c:610,618,644`), so it cannot attribute a skip to the
+   vector channel. `doc/GAPS.md` **G46**.
 
    *The uncomfortable part is that this was written here nine days earlier and the
    gate was still attempted as though it might pass.* The measurement existed, the
@@ -407,14 +420,57 @@ Four things, and it should claim exactly four things:
    its objective ranks at least as well as RRF on three BEIR corpora with one corpus
    winning only the headline metric.* What may **not** be said is that it gets there
    by doing less work. §8's `score()`-call row still fails at 0.648× / 0.903× /
-   0.541× against a 0.20× gate, because the vector block bound prunes nothing
-   (`vec_blocks_bound_skipped = 0` on all three datasets) and the vector channel sets
+   0.541× against a 0.20× gate, because the vector block bound prunes nothing on this
+   data and the vector channel sets
    **71–87 %** of all fused `score()` calls; p50 is 0.582× / 0.795× / 0.578× against
    ≤ 0.50×. **And the latency figures that used to back the "no over-fetch is also
    cheaper" reading are STALE**: they were taken before the normalizer, which adds an
    unmeasured pre-scan pass, so an EC2 re-run is owed before any p50 or p99 is quoted
    for the shipping scorer (`bench/RESULTS_FUSE.md`, marked in place). `doc/GAPS.md`
    **G44**, `doc/specs/FUSED_TOPK.md` **sect. 8d**.
+
+   **THE WORK-REDUCTION HALF IS STILL UNSUPPORTED, AND AS OF 2026-09-22 (evening) THE
+   REASON HAS CHANGED. The notes above stay visible as history; they were correct about
+   the verdict and wrong about the cause.** Two corrections, in order of how much they
+   move:
+
+   1. **The counter this claim kept citing says nothing.** The sentence above read
+      *"(`vec_blocks_bound_skipped = 0` on all three datasets)"*; that counter is
+      **structurally zero in any fused scan**, because the fused driver never sets the
+      vector shuttle's threshold floor (`weave_vec_shuttle_set_threshold()`'s sole caller
+      is the `weave_vec_scan()` SRF, `src/vector/vecshuttle.c:1336`; the field keeps its
+      `-INFINITY` init at `:887`). This is a correction of **reasoning, not of result** —
+      the ratios are direct measurements, and the bound's failure to prune is supported by
+      0.00–0.01 % pruned at an **oracle** θ plus B2 ≈ 1.0 by construction
+      (`bench/RESULTS_CODE_SCAN.md`).
+   2. **The cause is not "the bound does not prune". It is that A DENSE CHANNEL'S WEIGHTED
+      CEILING SITS ABOVE θ, AND THE PACK LAYOUT MAKES A ONE-LANE PROBE COST A WHOLE
+      BLOCK.** Observed, not inferred (per-bolt diagnostic `NOTICE`, one scifact query):
+      with the shipping normalizer each lexical channel carries w = 0.0110 against the
+      vector channel's w = 0.4947, θ = 0.1106, the partition ceiling is exactly 1.0, and
+      the scan visits **all 5,183** documents; with the normalizer off, w = 0.5 everywhere,
+      θ = 2.2824, ceiling 23.335, and it visits 1,450 (28 %). θ cannot climb to the vector
+      channel's 0.49 because a real document scores ~0.11–0.35 of the 1.0 that would need
+      both channels maxed at once. **The ranking win and the work loss are the same
+      phenomenon.** And tuning cannot separate them: over seven lexical:vector ratios from
+      0.0625 to 4 the vector column is 1.000× at every point while nDCG falls away from its
+      optimum; a 16× vector de-weighting starts the core's range skipping dramatically
+      (fiqa `blkskip` 0 → 4,096,432) and still does not cut the vector channel's lane count,
+      because in `WEAVE_PACK_LANE` reading one lane touches every byte of its block —
+      scoring 1 lane costs the same memory traffic as scoring 32
+      (`bench/RESULTS_CODE_SCAN.md:330,417`).
+
+   **What follows for this claim.** "Fused-threshold top-k rather than
+   over-fetch-plus-RRF" may be claimed on **ranking** and on **exactness**, and must not be
+   claimed on **work saved for the vector channel** — not pending a tighter bound, which is
+   what the earlier notes implied, but pending a maintainer decision among: restating §8's
+   row in **blocks or bytes** rather than lanes; a second **vector-major** copy of the codes,
+   forfeiting the storage gate; or a **cluster-ordered weft**, which contradicts the
+   strictly-ascending-docid requirement the fused vector channel depends on
+   (`include/weave/vecdocmap.h:35,105,122`) — i.e. **claim 3's clustering lever and this
+   claim's docid adapter are not independent**, which nothing in the tree had recorded before
+   today. Full numbers in `bench/RESULTS_FUSE.md` (third measurement); `doc/GAPS.md` **G46**,
+   `doc/specs/FUSED_TOPK.md` **sect. 8d**.
 3. Queries that get **faster** as predicates get more selective, because the
    predicate is pushed into the SIMD block mask instead of collapsing recall.
    (The "graph traversal" half of this sentence is stale — the Vamana plan was
