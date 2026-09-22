@@ -684,6 +684,10 @@ int			pg_weave_build_mem_ceiling_mb = 0;
  * file; registered in _PG_init (src/am/customscan.c) with the other GUCs. */
 int			pg_weave_surf_cache_mb = 32;
 
+/* Off by default: it costs a comparison and a branch per fused score() call.  Why it
+ * exists at all is on the extern in include/weave/weave.h -- doc/GAPS.md G43. */
+bool		pg_weave_fuse_check_bounds = false;
+
 static int
 cmp_blocknumber(const void *a, const void *b)
 {

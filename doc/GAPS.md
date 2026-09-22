@@ -1950,13 +1950,37 @@ at all, on a code path where l2's correctness does not imply ip's. Rule 1 says a
 channel without a (C1)+(C2) property test is not merged; this is the subtler version,
 a test that covers a channel but not a *configuration* of it.
 
-**The decisive next step, not yet run.** `src/am/amscan.c` sets
-`st.check_bounds = 1` under `USE_ASSERT_CHECKING`, which turns every `score()` into a
-checked (C2) assertion and would raise `WEAVE_FUSE_C2_VIOLATION` naming the offending
-channel. The cluster this was found on is a release build. Build with `cassert` and run
-the reproducer: either it raises and the hypothesis is confirmed with the channel
-named, or it does not and the defect is in the mapping rather than the bound. Then
-extend `test_vecbound.c` over both metrics before touching anything.
+**The (C2) check was made reachable and RAN, and the result is a refinement rather than
+an answer.** `st.check_bounds` was wired to `USE_ASSERT_CHECKING` alone, so the check
+that names the offending channel sat behind a PostgreSQL rebuild on the one machine
+where the bug was in hand. It is now also a GUC — `pg_weave.fuse_check_bounds`, off by
+default, `PGC_USERSET` — because a correctness check reachable only by recompiling the
+server is a check nobody runs at the moment they need it.
+
+With it **on**, the reproducer raises nothing and still returns the wrong row.
+
+**And that is why it does not clear the bound: the check is structurally blind to the
+prune that is dropping rows.** `check_bounds` compares `score()` against `cbound` for
+channels the scorer actually SCORES. Incremental abandonment means the remaining
+channels are never scored — that is what abandoning is — so a `cbound` too low for a
+channel whose score is never computed has nothing to be compared against. The one prune
+that fired on this query is the one prune this check cannot audit. The two facts fit
+together rather than contradicting: a too-low vector `cbound` would both cause the
+abandonment and escape the assertion.
+
+**So the decisive step is a check that does not exist yet: verify the PRUNE, not the
+bound.** When abandonment fires, compute the remaining channels' scores anyway and
+assert that `s + actual_remaining <= theta` really held. That is strictly stronger than
+the present assertion; it is sound only as a diagnostic mode, since it defeats the prune
+it audits, so it belongs behind the same GUC; and it would convert this gap into a named
+channel in one run. `test/hegel/test_fuse_props.c` should grow the same property against
+the synthetic channels, where it is cheap — P4 already proves the fused answer equals
+the reference, but **a reference built from the same too-low bound agrees with it**,
+which is how a synthetic suite misses this class entirely. That is the sharpest lesson
+here: `weave_fuse_reference()` shares the channels' bounds with the scorer, so it can
+only catch scorer bugs, never bound bugs.
+
+Then extend `test_vecbound.c` over both metrics before touching anything.
 
 **Consequence for the benchmark, recorded because it is the reason this was found.**
 `bench/RESULTS_FUSE.md` is **not** being produced from this state. Hard rule 8: verify

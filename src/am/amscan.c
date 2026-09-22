@@ -8032,12 +8032,23 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 									  WEAVE_FUSE_END);
 				if (err != WEAVE_FUSE_OK)
 					weave_fuse_error(&st, err);
+				/*
+				 * Turn every score() into a checked (C2) assertion: under cassert
+				 * always, and otherwise whenever the operator asks for it.  Set
+				 * AFTER init, which zeroes it.
+				 *
+				 * THE GUC IS NOT A CONVENIENCE.  doc/GAPS.md G43 is a wrong answer
+				 * that reproduces on a RELEASE cluster, and this is the check that
+				 * would name the channel responsible -- so tying it to cassert alone
+				 * put the diagnostic behind a PostgreSQL rebuild, on the one machine
+				 * where the bug was in hand.  A correctness check reachable only by
+				 * recompiling the server is a check nobody runs at the moment they
+				 * need it.
+				 */
 #ifdef USE_ASSERT_CHECKING
-				/* Turn every score() into a checked (C2) assertion under cassert,
-				 * the same choice already made for the score()-returns-distance
-				 * convention elsewhere in this file.  Set AFTER init, which zeroes
-				 * it. */
 				st.check_bounds = 1;
+#else
+				st.check_bounds = pg_weave_fuse_check_bounds ? 1 : 0;
 #endif
 				err = weave_fuse_run(&st);
 				if (err != WEAVE_FUSE_OK)

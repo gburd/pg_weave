@@ -518,6 +518,35 @@ _PG_init(void)
 
 #ifdef WEAVE_TEST_HOOKS
 	/*
+	 * THE (C2) CHECK, AVAILABLE IN A RELEASE BUILD, and it is diagnostics rather
+	 * than a test hook.
+	 *
+	 * src/am/fuse.c can turn every score() into a checked assertion that the score
+	 * does not exceed the bound of the block the channel stands on -- the one thing
+	 * that catches a bound 1 % too low, which drops rows while leaving every answer
+	 * plausible (hard rule 1).  It was wired to USE_ASSERT_CHECKING alone, so
+	 * reaching it meant rebuilding PostgreSQL with cassert.  doc/GAPS.md G43 is a
+	 * wrong answer found on a real corpus against a RELEASE cluster, and the check
+	 * that would name the offending channel was therefore unreachable on the machine
+	 * where the bug reproduces.  A diagnostic that requires rebuilding the server is
+	 * a diagnostic nobody runs at the moment they need it.
+	 *
+	 * Default off, because it costs a comparison and a branch per score() call on the
+	 * hot path.  PGC_USERSET so it can bracket one query.  It can only ever turn a
+	 * silent wrong answer into an ERROR naming the channel, which is the safe
+	 * direction for a correctness check.
+	 */
+	DefineCustomBoolVariable("pg_weave.fuse_check_bounds",
+							 "Raise an error if a fused channel's score() exceeds its block_max() (C2).",
+							 "Diagnostics for doc/GAPS.md G43 and its class: a bound "
+							 "slightly too low silently drops rows rather than "
+							 "returning wrong ones.  Off by default; costs a branch "
+							 "per score() call.",
+							 &pg_weave_fuse_check_bounds,
+							 false,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/*
 	 * TEST-ONLY build.  This GUC only exists when compiled with
 	 * -DWEAVE_TEST_HOOKS (never in a release build recipe -- Makefile, meson,
 	 * and flake all omit it).  Announce loudly at load so a test-hook build can
