@@ -231,6 +231,35 @@ Four things follow, and they are readiness statements rather than a bug report:
 4. **The §8 benchmark table is now blocked only on EC2 time**, not on correctness. Gate:
    25 of 25 judged scifact queries, 0 mismatches.
 
+**And the run happened the same day, with a result that does not flatter the design
+(`bench/RESULTS_FUSE.md`).** Three BEIR corpora, real MiniLM embeddings, EC2, an RRF
+control over the same single index. **Two of five §8 rows fail, so Phase F is not
+claimable:**
+
+- **nDCG@10 is WORSE than RRF on all three datasets** — 0.982×, 0.924×, and **0.687×** on
+  fiqa — and recall@100 is worse too, so it is not a top-10 cut artefact. The fused scan
+  is *exact* (recall-vs-exhaustive 1.000, 299 of 299 comparable queries), so this is the
+  objective and not the scan: it sums **raw** BM25 (~10–20) against a **raw** quantized
+  inner product (~[−1,1]), a 33× scale mismatch, so `{0.5,0.5}` weights are effectively
+  lexical-only while RRF is scale-free by construction. `doc/GAPS.md` **G44**.
+  **Consequence for the four claims: claim 2 is UNSUPPORTED, not retracted.** Its
+  mechanism demonstrably works; a user choosing between this and RRF is choosing a
+  ranking, and right now the ranking is worse. Claim 2 must not be quoted as measured.
+- **The `score()`-call ratio fails (0.54–0.90× against a 0.20× gate), and the cause was
+  already on disk.** The lexical side clears the gate unaided on the largest corpus
+  (0.149×); the vector side is 0.956–0.991× of the control with
+  `vec_blocks_bound_skipped = 0` on every dataset, and it is 71–87 % of all calls.
+  `bench/RESULTS_BOUND_PRUNING.md` measured that bound pruning 0.0 % long before this run
+  and G43 wrote down the generalization — *a bound computed but not acted on is a latent
+  defect*. Hard rule 9 was satisfied in letter and missed in spirit: the measurement
+  existed, the inference did not. **This is the most reusable lesson of the week — taking
+  a measurement is not the same as drawing its consequence.**
+
+What cleared: the recall row (§8's most valuable), and a real latency win — p99
+0.56–0.63× of RRF, with an A/A leg putting the within-arm spread at 0.001–0.013 ms
+against between-arm deltas **170–714× larger**. That A/A leg did not exist until this run
+and is why the latency numbers are admissible at all under hard rule 10.
+
 **43 of 77 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
 Z5, Z8, Z9) and 6 withdrawn (L2, L21, V9, V10, V13, **F4**). By phase: X 4/4, L 16/20,
 Z 7/9, V 9/20, P 2/4, **F 6/9**, M 0/6, R 0/5. **Five rows were added on 2026-09-21

@@ -710,7 +710,53 @@ and no amount of SIMD recovers it. Record the negative result in
 `pg_turbovec/docs/PARITY_GAPS.md` are the house style for that, and the retracted
 "we win 2.3×" claim in the latter is exactly the mistake to avoid.
 
-### 8b. STATUS: unblocked 2026-09-22. The gate went red on first contact with a real corpus, and is now green.
+### 8b. STATUS: MEASURED 2026-09-22 on three BEIR corpora. The gate is NOT met: two rows fail.
+
+`bench/RESULTS_FUSE.md` has the run. Summary, because a spec that states a gate should
+state whether it was cleared:
+
+| row | gate | scifact | nfcorpus | fiqa | |
+|---|---|---|---|---|---|
+| recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | **PASS** |
+| p99 latency | ≤ 0.70× | 0.609× | 0.560× | 0.633× | **PASS** |
+| p50 latency | ≤ 0.50× | 0.582× | 0.795× | 0.578× | **FAIL** |
+| nDCG@10 | ≥ RRF | 0.982× | 0.924× | 0.687× | **FAIL** |
+| `score()` calls | ≤ 0.20× | 0.648× | 0.903× | 0.541× | **FAIL** |
+
+**The nDCG failure is this document's problem, not the scorer's** (`doc/GAPS.md` G44).
+The fused scan returns its objective exactly — the recall row is 1.000 — but the
+objective is a sum of **raw** channel scores, and BM25 (~10–20) against a quantized
+inner product (~[−1,1]) is a 33× scale mismatch, so `weights => '{0.5,0.5}'` is
+effectively lexical-only. It loses to a control that is scale-free because RRF ranks on
+reciprocal rank. §2's threshold algebra is untouched by this; what is missing is
+per-channel normalization *before* the sum, and (C2) survives any monotone positive
+rescaling, so there is room to add it.
+
+**The `score()`-call failure is the one this section warned about, and the measurement
+that predicted it was already on disk.** Split by channel:
+
+| dataset | lexical fused/RRF | vector fused/RRF | vector share of fused calls |
+|---|---|---|---|
+| scifact | 0.353× | 0.991× | 71 % |
+| nfcorpus | 0.581× | 0.985× | 87 % |
+| fiqa | **0.149×** | 0.956× | 86 % |
+
+The lexical side clears the gate on fiqa **by itself**. The vector side prunes nothing —
+`vec_blocks_bound_skipped = 0` on all three datasets — and being 71–87 % of all calls it
+sets the combined ratio no matter how well the lexical side does.
+`bench/RESULTS_BOUND_PRUNING.md` measured that bound pruning 0.0 % long before this run,
+and G43 recorded the generalization that *a bound computed but not acted on* is a latent
+defect. This section's own instruction — "stop and fix the bounds before optimizing
+anything else" — therefore applies to the **vector block bound**, and was answerable from
+existing data. The measurement existed; the inference did not.
+
+**So the honest statement of where the design stands:** the fused threshold demonstrably
+suppresses lexical work (0.149× on the largest corpus) and is genuinely faster end to end
+(p99 0.56–0.63×, validated against an A/A noise floor 170–714× smaller than the delta).
+It is not yet *better*, and it will not be until the vector bound prunes and the sum is
+normalized. Neither is a rewrite.
+
+### 8b-history. The gate went red on first contact with a real corpus, and that is what it was for.
 
 `bench/fuse.sh` and `bench/prepdata.py` run end to end on BEIR scifact, and their first
 real dataset found **`doc/GAPS.md` G43**: the fused path returned a plausible,
@@ -739,13 +785,19 @@ finding the wrong answer bit-for-bit unchanged. That took two minutes and should
 been first.
 
 Correctness gate as of the fix: **25 of 25 judged scifact queries, 0 mismatches** against
-the exhaustive per-channel oracle. No row of the table above is filled in yet, because the
-numbers must come from EC2 and not from a shared workstation — but the reason is now cost
-and validity, not correctness. What the blocked period also produced is the two
+the exhaustive per-channel oracle — and, on the EC2 run above, **299 of 299 comparable
+queries across three corpora**. What the blocked period also produced is the two
 instruments below, the loop-exit reporting described in §8c, and one correction to this
 document's own method: the `fuse()` fallback is not an oracle at scale, for the reason
 §7a (1) gives, so the gate compares against an exhaustive per-channel oracle built from
 `weave_search()` and `weave_vec_scan()` instead.
+
+**And the gate itself had to be fixed before it proved anything.** Its tie test demanded
+that no two documents anywhere in the corpus share a score, which is false on any corpus
+of real size — so on nfcorpus and fiqa it skipped **100 of 100** queries, the mismatch
+count stayed 0, and it printed "gate passed" having compared nothing. Only a tie
+*straddling rank 10* makes a top-10 set ambiguous. It now tests that, reports `compared`
+next to `attempted`, and **dies** when `compared` is 0.
 
 ### 8c. Why the loop stopped, reported per bolt
 

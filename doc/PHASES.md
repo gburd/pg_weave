@@ -734,11 +734,45 @@ things the gate still has no run behind, and neither is F2's: **nDCG on ≥ 2 pu
 datasets** (BEIR subset + MS MARCO), which this project has never produced, and an **RRF
 control implementation** to measure against.
 
-**~~AND THE GATE IS NOW BLOCKED ON A WRONG ANSWER, not on a missing harness
-(2026-09-22).~~ UNBLOCKED THE SAME DAY.** `bench/fuse.sh` runs end to end and its first
-real dataset found `doc/GAPS.md` **G43**: the fused path disagreed with two non-fused
-vector paths that agreed with each other. No row of §8's table had been measured and no
-EC2 run was spent, per hard rule 8 — which is the outcome that rule exists to produce.
+**~~AND THE GATE IS NOW BLOCKED ON A WRONG ANSWER~~ ... ~~UNBLOCKED THE SAME DAY.~~
+MEASURED 2026-09-22, AND THE GATE IS NOT MET.** `bench/RESULTS_FUSE.md` has the run
+(EC2 `c7i.8xlarge`, real MiniLM embeddings, three BEIR corpora, 3,633 → 57,600 docs).
+Two of five rows fail:
+
+| row | gate | scifact | nfcorpus | fiqa | |
+|---|---|---|---|---|---|
+| recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | PASS |
+| p99 latency | ≤ 0.70× | 0.609× | 0.560× | 0.633× | PASS |
+| p50 latency | ≤ 0.50× | 0.582× | 0.795× | 0.578× | FAIL |
+| nDCG@10 | ≥ RRF | 0.982× | 0.924× | 0.687× | **FAIL** |
+| `score()` calls | ≤ 0.20× | 0.648× | 0.903× | 0.541× | **FAIL** |
+
+**Phase F is therefore NOT claimable**, and the two failures have different characters:
+
+- **nDCG (`doc/GAPS.md` G44)** is the objective, not the scan. The fused top-k is exact
+  (recall 1.000), but it sums **raw** BM25 against a **raw** quantized inner product — a
+  33× scale mismatch — so equal weights make it effectively lexical-only, and RRF is
+  scale-free. Needs per-channel normalization before the sum. This is the gap that
+  matters most in the project right now, because `ARCHITECTURE.md` §9 claim 2 is
+  *fused-threshold top-k instead of RRF*, and being faster at a worse objective does not
+  support it. **Claim 2 is not retracted — its mechanism works — but it is UNSUPPORTED
+  until the ranking is competitive. Do not quote it as measured.**
+- **`score()` calls** is the **vector block bound**, and it was predictable from data
+  already on disk: the lexical side clears the gate on fiqa by itself (0.149×), while the
+  vector side is 0.956–0.991× of the control with `vec_blocks_bound_skipped = 0`
+  everywhere, and it is 71–87 % of all calls. `bench/RESULTS_BOUND_PRUNING.md` measured
+  that bound pruning 0.0 % long ago; G43 wrote down the generalization. Hard rule 9 was
+  satisfied in letter — the measurement was taken — and missed in spirit, because nobody
+  drew the consequence until a gate failed.
+
+**What DID clear.** The recall row — the one §8 calls its most valuable — is 1.000 on
+299 of 299 comparable queries against an exhaustive per-channel oracle. And the latency
+win is real and defensible: p99 0.56–0.63×, with an A/A leg (hard rule 10) putting the
+within-arm spread at 0.001–0.013 ms against between-arm deltas 170–714× larger.
+
+**MS MARCO is still missing** (`doc/GAPS.md` G45): the source `prepdata.py` fetches now
+returns HTTP 404. §8 names it, so the nDCG row is incomplete as well as failed — though a
+fourth dataset cannot turn three losses into a win.
 
 **G43 is FIXED**, and by nothing this paragraph originally predicted: the vector channel
 was innocent, no bound was too low, and the decisive next step named here (a `cassert`
@@ -750,10 +784,12 @@ plain ranked path reaches it zero times. Correctness gate now: **25 of 25 judged
 queries, 0 mismatches** against the exhaustive per-channel oracle. Regression coverage is
 `sql/orderby.sql`'s final section, with a positive control.
 
-So §8's table is blocked only on **EC2 time** now, not on correctness. Two things the gate
+~~So §8's table is blocked only on **EC2 time** now, not on correctness. Two things the gate
 still has no run behind, and neither is F2's: **nDCG on ≥ 2 public datasets** (BEIR subset
 + MS MARCO) and an **RRF control implementation** to measure against — the harness now has
-both arms, so this is a run, not a build.
+both arms, so this is a run, not a build.~~ **SUPERSEDED: the run happened, on three BEIR
+corpora with a real RRF control — see the measured table above. nDCG is no longer
+unmeasured, it is LOST (G44); MS MARCO is no longer unmeasured, it is unfetchable (G45).**
 
 **~~The property-test hole G43 named is still open~~ RETRACTED: it does not exist.**
 `test/hegel/test_vecbound.c` asserts both bound forms by name — B1 against

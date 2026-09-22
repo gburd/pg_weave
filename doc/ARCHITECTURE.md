@@ -339,6 +339,42 @@ Four things, and it should claim exactly four things:
    channel until a candidate-reduction mechanism that measurably works is in
    place.** The claim as stated is safe for lexical, fuzzy and regex; it is not
    yet safe for vector, and saying so here is cheaper than being told.
+
+   **CONFIRMED END TO END 2026-09-22, and a SECOND, INDEPENDENT deficiency found
+   (`bench/RESULTS_FUSE.md`, `doc/GAPS.md` G44).** The first real-corpus run of
+   §8 — three BEIR datasets, real embeddings, an RRF control over the same single
+   index — reproduces the paragraph above exactly: the lexical side clears §8's
+   `score()`-call gate unaided on the largest corpus (**0.149×** against a 0.20×
+   bar), while the vector side is **0.956–0.991×** of the control with
+   `vec_blocks_bound_skipped = 0` on every dataset. Since the vector channel is
+   **71–87 %** of all fused `score()` calls, it sets the combined ratio no matter
+   how well the lexical side prunes, and the gate fails at 0.54–0.90×.
+
+   *The uncomfortable part is that this was written here nine days earlier and the
+   gate was still attempted as though it might pass.* The measurement existed, the
+   inference existed, and it lived in the claims section instead of in the gate.
+   **A constraint recorded next to a claim has to be propagated to the test that
+   would otherwise contradict it**, or it is just a note that turns out to have
+   been right.
+
+   **The new finding is about the OBJECTIVE, and it is not about bounds at all.**
+   nDCG@10 came in **below** RRF on all three datasets — 0.982×, 0.924×, and
+   0.687× on fiqa — with recall@100 worse too. The fused scan is exact (§8's
+   recall row is 1.000 on 299 of 299 comparable queries), so the ranking, not the
+   scan, is what loses: `fuse()` sums **raw** channel scores, and BM25 (~10–20)
+   against a quantized inner product (~[−1,1]) is a ~33× scale mismatch, so equal
+   weights are effectively lexical-only while RRF is scale-free by construction.
+
+   **So this claim is UNSUPPORTED, not retracted, and the distinction is the
+   point.** Every mechanism it names works and is measured: one threshold, no
+   over-fetch, an exact top-k, and a genuine latency win (p99 0.56–0.63× of RRF,
+   against an A/A noise floor 170–714× smaller than the delta). But a user
+   choosing between this and RRF is choosing a **ranking**, and today the ranking
+   is worse. Being faster at computing a worse objective does not support "rather
+   than over-fetch-plus-RRF". **Do not quote claim 2 as measured until per-channel
+   score normalization lands and the nDCG row is at parity.** (C2) survives any
+   monotone positive rescaling — `w·bound ≥ w·score` needs only `w > 0` — so there
+   is room to fix it without touching §2's algebra.
 3. Queries that get **faster** as predicates get more selective, because the
    predicate is pushed into the SIMD block mask instead of collapsing recall.
    (The "graph traversal" half of this sentence is stale — the Vamana plan was

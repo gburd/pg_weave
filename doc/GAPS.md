@@ -2118,3 +2118,88 @@ was spent. The gate that caught this is `bench/fuse.sh`'s per-query comparison a
 an exhaustive per-channel oracle — which is only an oracle because
 `sql/fuse_pushdown.sql` section 2b had already worked out that the `fuse()` fallback is
 not one (`FUSED_TOPK.md` section 7a (1)).
+
+### G44 — the fused scorer's linear sum of RAW channel scores is a worse ranking function than RRF, and the gap grows with how much the dense channel matters — **OPEN 2026-09-22, found by the first real-corpus §8 run**
+
+`bench/RESULTS_FUSE.md`. nDCG@10, fused vs RRF `k'=100`, same index, same
+embeddings, nothing differing but the scorer:
+
+| dataset | docs | fused | RRF | ratio |
+|---|---|---|---|---|
+| scifact | 5,183 | 0.6720 | 0.6846 | 0.982× |
+| nfcorpus | 3,633 | 0.3161 | 0.3422 | 0.924× |
+| fiqa | 57,600 | 0.2393 | 0.3482 | **0.687×** |
+
+recall@100 is worse too (0.934×, 0.894×, 0.742×), so this is not a top-10 cut artefact.
+
+**It is not a correctness defect and the recall row proves it:** the fused scan returns
+its own top-k *exactly*, 1.000 against an exhaustive per-channel oracle on all three
+datasets. The objective is what loses.
+
+**Mechanism, and it is arithmetic rather than subtle.** `weights => '{0.5,0.5}'` sums
+**raw, unnormalized** channel scores. BM25 is unbounded and reaches ~10–20 on these
+corpora; a quantized inner product lives in ~[−1, 1]. Measured on scifact: max BM25
+≈ 10.0 against max vector score ≈ 0.305, a **33× scale mismatch**. At equal weights the
+vector term cannot reorder the BM25 ranking by more than a nudge, so the fused arm is
+**effectively lexical-only** — and it is competing against a control that is scale-free
+by construction, because RRF ranks on reciprocal *rank* and never sees a channel's units.
+
+**The evidence that this is the mechanism rather than a story that fits:** the deficit
+tracks how much the dense channel should contribute. fiqa is where dense retrieval
+carries the most signal in this set and is where the fused arm loses 31 %; scifact, where
+BM25 alone is strong, is within 2 %. A per-dataset trend across a 16× size range is what
+makes the diagnosis testable rather than decorative.
+
+**Why this is the most consequential gap in the project right now.** `ARCHITECTURE.md`
+§9 claim 2 is fused-threshold top-k *instead of* over-fetch-plus-RRF. Being faster at
+computing a worse objective does not support that claim — a user is choosing a ranking,
+not a scan strategy. **The claim is not retracted, because the mechanism it names works
+(see the latency and lexical-pruning rows); it is UNSUPPORTED until the objective is
+competitive.** Do not quote claim 2 as measured.
+
+**What it needs, and what it does not.** Not scorer work: per-channel score
+normalization or calibration *before* the sum. Options, none measured:
+  - normalize each channel to a comparable range from statistics the index already keeps
+    (the lexical channel knows its term-wide ceiling; the vector channel knows its
+    per-block max), which is attractive because (C2) survives any *monotone positive*
+    rescaling — `w·bound ≥ w·score` needs only `w > 0`;
+  - fit weights per dataset, which is honest only if reported as fitted and is not a
+    product answer;
+  - a rank-based fused objective, which would keep RRF's scale-freeness but gives up the
+    threshold algebra §2 is built on, since a rank is not known until the scan ends.
+The first is the only one that preserves the design. **It is also the one that makes
+V17's selectivity switch and claim 3 meaningful**, since neither matters if the ranking
+is not competitive.
+
+**Latent because every prior test used one channel or a fixture.** A single-channel
+ranking has no scale to mismatch, and `sql/fuse_pushdown.sql`'s fixtures assert the
+scorer computes *what it says it computes*, which it does. No fixed-output test can see
+"the objective is worse than a different objective" — that needs a labelled corpus, and
+this project had never run one until today.
+
+### G45 — `prepdata.py`'s MS MARCO source returns HTTP 404; the dataset §8 names by name cannot be fetched — **OPEN 2026-09-22**
+
+`bench/prepdata.py` fetches MS MARCO passage from
+`https://msmarco.z22.web.core.windows.net/msmarcoranking/`, and
+`queries.dev.small.tsv` now returns **404**. The run died there after completing all
+three BEIR datasets, so the loss is the dataset, not the run (artefacts are pulled back
+per dataset — hard rule 14 — so nothing measured was lost).
+
+`FUSED_TOPK.md` §8 names "BEIR subset + MS MARCO passage" explicitly, so the nDCG row is
+**incomplete** as well as failed. It does not change the verdict: the gate requires
+nDCG ≥ RRF and that fails on three BEIR datasets, so a fourth cannot turn three losses
+into a win. It does mean the gate cannot be *passed* later without restoring this source.
+
+Candidate replacements, unverified: the BEIR distribution carries `msmarco` in the same
+`corpus.jsonl`/`queries.jsonl`/`qrels` layout `prepdata.py` already parses, which would
+reuse the BEIR code path entirely. **The trap to avoid:** `--limit` on the BEIR path is a
+plain truncation, while `build_msmarco_sub()` deliberately keeps *every qrels-referenced
+passage* plus a seeded sample of the rest. Pointing the BEIR loader at msmarco with a
+limit would silently discard ground truth and produce a confidently wrong nDCG — the
+failure mode `build_msmarco_sub()`'s docstring was written to prevent. Whatever source is
+used, the qrels-preserving subsample has to come with it.
+
+**Process note:** a URL in a benchmark harness is a dependency with no version and no
+test. This one worked when it was written and rotted silently; the first evidence was a
+404 on a paid instance. A harness that downloads anything should fetch the smallest file
+first and fail fast, which is what happened here by luck of ordering rather than design.
