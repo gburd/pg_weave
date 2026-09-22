@@ -11,10 +11,20 @@
 | `FUSED_TOPK.md` §8 row | Gate | scifact | nfcorpus | fiqa | |
 |---|---|---|---|---|---|
 | recall vs exhaustive fused scan | 1.000 | **1.000** | **1.000** | **1.000** | **PASS** |
-| p99 latency, k=10 | ≤ 0.70× RRF | **0.609×** | **0.560×** | **0.633×** | **PASS** |
-| p50 latency, k=10 | ≤ 0.50× RRF | 0.582× | 0.795× | 0.578× | **FAIL** (faster, not 2× faster) |
-| nDCG@10 | ≥ RRF | 0.982× | 0.924× | 0.687× | **FAIL** |
-| channel `score()` calls | ≤ 0.20× RRF | 0.648× | 0.903× | 0.541× | **FAIL** |
+| p99 latency, k=10 | ≤ 0.70× RRF | **0.609×** | **0.560×** | **0.633×** | **PASS**, **STALE 2026-09-22** |
+| p50 latency, k=10 | ≤ 0.50× RRF | 0.582× | 0.795× | 0.578× | **FAIL** (faster, not 2× faster), **STALE 2026-09-22** |
+| nDCG@10 | ≥ RRF | 0.982× | 0.924× | 0.687× | **FAIL** — **SUPERSEDED 2026-09-22, now MET** |
+| channel `score()` calls | ≤ 0.20× RRF | 0.648× | 0.903× | 0.541× | **FAIL**, unchanged |
+
+**Two rows of this table no longer describe the shipping scorer, and one of them has
+been overturned — both later the same day; see "Second measurement" below.** The **nDCG**
+row was re-measured in the product with a per-key ceiling normalizer and is now **MET**
+(1.053× / 1.010× / 1.114×), so §8's gate is **3 of 5 passing** and 2 of 5 failing (p50,
+`score()` calls). The **p50 and p99** rows are **STALE, not retracted** (hard rule 13):
+they were correctly measured and the scan mechanism they measured is unchanged, but they
+were taken on the raw sum — now `pg_weave.fuse_normalize = off` — and the normalizer adds
+a pre-scan pass whose cost is **unmeasured**. They need an EC2 re-run of `bench/fuse.sh`
+before being quoted again.
 
 Both arms read **one** `weave` index over `(body, emb)`; nothing differs but the
 scorer. The control does not pay the storage cost of a real two-index RRF stack, so
@@ -24,6 +34,11 @@ which makes the two failures worse, not better.
 ## The two failures
 
 ### 1. The linear-sum objective ranks worse than RRF, and worst where the vector channel matters most
+
+**SUPERSEDED 2026-09-22, later the same day, by the per-key ceiling normalizer — see
+"Second measurement" below. Left in place (hard rule 13):** this is the measurement of the
+raw sum, which is still reachable as `pg_weave.fuse_normalize = off` and is the arm every
+figure in this section describes.
 
 | dataset | docs | nDCG@10 fused | nDCG@10 RRF | ratio | recall@100 fused | recall@100 RRF |
 |---|---|---|---|---|---|---|
@@ -152,7 +167,110 @@ falling, so the sweep does not contain it.
 Full numbers, the per-key-not-per-channel constraint, and the implementation spec in
 `doc/GAPS.md` G44.
 
-## Latency: a real win, and the A/A leg says so
+## Second measurement, 2026-09-22 (later the same day): the normalizer measured IN THE PRODUCT — the nDCG row is MET, two rows still fail, one cost is unmeasured
+
+**What still fails, first, because the normalizer touches none of it.** Both failing rows
+are unchanged by this work:
+
+| `FUSED_TOPK.md` §8 row | Gate | scifact | nfcorpus | fiqa | |
+|---|---|---|---|---|---|
+| p50 latency, k=10 | ≤ 0.50× RRF | 0.582× | 0.795× | 0.578× | **FAIL**, and now stale (below) |
+| channel `score()` calls | ≤ 0.20× RRF | 0.648× | 0.903× | 0.541× | **FAIL** |
+
+The `score()` row fails for the reason already recorded above and for no new one:
+`vec_blocks_bound_skipped = 0` on all three datasets, so the vector block bound prunes
+nothing, and the vector channel is **71–87 %** of all fused `score()` calls. Normalizing
+the objective changes which documents win; it does not make a bound prune.
+
+**And one cost is UNMEASURED, which is stated rather than glossed because it is not yet a
+number.** The normalizer adds a **pre-scan pass** — one query-LUT build and one directory
+fold per bolt per vector key. The directory is kilobytes against a code weft of megabytes,
+so the cost is *expected* to be small, but **no latency figure has been taken since the
+change**. Two consequences:
+
+- The p50 and p99 rows in this document measure **a scorer that no longer ships**: they
+  were taken on the raw sum, which is now `pg_weave.fuse_normalize = off`. They are **not
+  retracted** — correctly measured, and the scan mechanism they measured is unchanged — but
+  they are **stale** and need an **EC2 re-run of `bench/fuse.sh`** before being quoted
+  again. Marked in place in the verdict table above and in the latency section below (hard
+  rule 13).
+- Nothing here says what the normalized scorer's p50 or p99 is. Do not infer it from the
+  quality numbers.
+
+### The win: the nDCG row is MET, and it is measured in the product rather than offline
+
+`bench/normprod.sh` — three arms that are the **same statement** differing only in
+`pg_weave.fuse_normalize`, plus the RRF control, all scored through `bench/ndcg.py`. Real
+MiniLM BEIR corpora from the 2026-09-22 EC2 run, restored locally. **This needed no EC2 and
+cost nothing**: nDCG is deterministic and host-independent; only latency needs a quiet
+machine.
+
+| dataset | raw sum (the old objective) | RRF control | ceiling-normalized | norm ÷ RRF |
+|---|---|---|---|---|
+| scifact (300 q) | 0.6720 | 0.6846 | **0.7212** | **1.053×** |
+| nfcorpus (323 q) | 0.3161 | 0.3422 | **0.3455** | **1.010×** |
+| fiqa (648 q) | 0.2393 | 0.3482 | **0.3878** | **1.114×** |
+
+**Positive control:** the `raw` arm reproduces the recorded EC2 numbers to four decimals on
+all three (0.6720 / 0.3161 / 0.2393), and the RRF arm reproduces 0.6846 / 0.3422 / 0.3482.
+An arm that cannot reproduce the thing it claims to improve is measuring something else.
+
+**It is not a top-10 reshuffle.** recall@100 improves too: scifact 0.8892 → **0.9683** and
+fiqa 0.5141 → **0.7079**, against RRF's 0.9517 and 0.6932.
+
+### The loss, in the same run: nfcorpus is NOT a clean win
+
+| nfcorpus metric | ceiling-normalized | RRF | |
+|---|---|---|---|
+| nDCG@10 | **0.3455** | 0.3422 | +1.0 %, and it is the gate row |
+| recall@100 | 0.3206 | **0.3251** | **LOSES** |
+| MRR@10 | 0.5441 | **0.5514** | **LOSES** |
+
+The §8 gate row is nDCG@10, so the row is met on three of three datasets. But on nfcorpus
+the normalized arm is **one metric ahead and two behind**, and it must not be presented as
+a clean win — a reader choosing on recall or on reciprocal rank would pick RRF there.
+
+### Gate state after this run: 3 of 5 rows pass
+
+| row | gate | state |
+|---|---|---|
+| recall vs exhaustive fused scan | 1.000 | **PASS** (unchanged) |
+| p99 latency, k=10 | ≤ 0.70× RRF | **PASS** on the raw scorer — **stale** for the shipping one |
+| nDCG@10 | ≥ RRF | **PASS** — 1.053× / 1.010× / 1.114× |
+| p50 latency, k=10 | ≤ 0.50× RRF | **FAIL** — 0.582× / 0.795× / 0.578×, and stale |
+| channel `score()` calls | ≤ 0.20× RRF | **FAIL** — 0.648× / 0.903× / 0.541× |
+
+### The mechanism, because the shape of the normalizer is the load-bearing part
+
+Every channel of a `fuse()` **KEY** — not every channel — carries effective weight
+`w_key / N_key`, where `N_key` is that key's **pre-scan ceiling**: for a lexical key, the
+sum over its terms of the BM25 term bound at that term's max tf over **all** segments
+(free, because the loop that computes global idf already reads every segment's dictionary
+entry); for a vector key, the max over bolts of a new `weave_vec_weft_maxscore()` (one
+directory fold per bolt). New GUC **`pg_weave.fuse_normalize`, default on**; `off` restores
+the raw sum, which is the arm every previously recorded figure in this document was
+measured on.
+
+**The normalizer is deliberately QUERY-GLOBAL rather than per bolt, and that is
+correctness rather than tidiness.** `weave_fuse_pass()` runs one bounded top-k per bolt and
+merges the per-bolt lists **by score**, so a per-bolt normalizer would make the answer a
+function of the segment layout: it would change after an INSERT, after VACUUM and after a
+merge, silently. `sql/fuse_degenerate.sql` section (6) asserts bolt-count independence,
+with a **positive control from a deliberately mutated build** whose normalizer used each
+bolt's own ceilings — under that mutant the assertion reads `f`.
+
+Design, the per-key-not-per-channel constraint and the spec: `doc/GAPS.md` **G44** and
+`doc/specs/FUSED_TOPK.md` **sect. 8d**.
+
+## Latency: a real win, and the A/A leg says so — **STALE 2026-09-22, re-run owed**
+
+**STALE, not retracted (hard rule 13).** Every number in this section was measured with
+`pg_weave.fuse_normalize` effectively **off** — the raw sum — because the normalizer did
+not exist yet. The scan mechanism these figures measure is unchanged, and the A/A
+reasoning below still stands, but the shipping scorer now runs an extra pre-scan pass (one
+LUT build and one directory fold per bolt per vector key) whose cost is **unmeasured**.
+Quote these figures only as the raw-sum arm, and take an EC2 re-run of `bench/fuse.sh`
+before quoting a p50 or p99 for the product.
 
 | dataset | p50 fused | p50 RRF | p99 fused | p99 RRF | p50 A/A repeat | noise floor | delta ÷ noise |
 |---|---|---|---|---|---|---|---|
@@ -201,11 +319,19 @@ this week (G42, the phantom GUC in G43, this).
 
 ## What was NOT measured, and why
 
+- **The normalizer's own cost.** The shipping scorer's pre-scan pass — one query-LUT build
+  and one directory fold per bolt per vector key — has **no latency figure at all**. The
+  directory is kilobytes against a code weft of megabytes, so it is expected to be small;
+  expected is not measured, and the p50/p99 rows above predate it. An EC2 re-run of
+  `bench/fuse.sh` is owed before any latency row here is quoted for the product.
+
 - **MS MARCO passage.** §8 names it explicitly and it is **missing**. The upstream
   source `bench/prepdata.py` fetches — `msmarco.z22.web.core.windows.net/msmarcoranking/`
   — now returns **HTTP 404** for `queries.dev.small.tsv`; the hosting moved. Tracked as
   `doc/GAPS.md` **G45**. It would not change the verdict: the nDCG gate fails on three
-  BEIR datasets already, and a fourth cannot turn three losses into a win.
+  BEIR datasets already, and a fourth cannot turn three losses into a win. **Updated
+  2026-09-22: the nDCG row is now MET on all three, so the standing statement is narrower
+  — the row is met on three BEIR corpora, not on the four §8 names.**
 - **A second embedding model.** Every number here is `all-MiniLM-L6-v2`. The scale
   mismatch behind failure 1 is a property of *BM25 vs cosine-scale vectors* generally,
   but the size of the nDCG deficit is model-specific and should not be quoted as if it

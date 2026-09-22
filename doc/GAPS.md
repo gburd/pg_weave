@@ -2119,7 +2119,7 @@ an exhaustive per-channel oracle — which is only an oracle because
 `sql/fuse_pushdown.sql` section 2b had already worked out that the `fuse()` fallback is
 not one (`FUSED_TOPK.md` section 7a (1)).
 
-### G44 — the fused scorer's linear sum of RAW channel scores is a worse ranking function than RRF, and the gap grows with how much the dense channel matters — **OPEN 2026-09-22, found by the first real-corpus §8 run**
+### G44 — the fused scorer's linear sum of RAW channel scores is a worse ranking function than RRF, and the gap grows with how much the dense channel matters — **FIXED 2026-09-22, the same day it was opened: the per-key ceiling normalizer is IN THE PRODUCT, on by default, and measured there. `FUSED_TOPK.md` §8b's nDCG@10 row is now MET; its p50 and `score()`-call rows are untouched by this work and still FAIL.** Found by the first real-corpus §8 run; the original measurement, the study that produced the fix and the two things that study got wrong are all left below, annotated in place.
 
 `bench/RESULTS_FUSE.md`. nDCG@10, fused vs RRF `k'=100`, same index, same
 embeddings, nothing differing but the scorer:
@@ -2156,6 +2156,15 @@ computing a worse objective does not support that claim — a user is choosing a
 not a scan strategy. **The claim is not retracted, because the mechanism it names works
 (see the latency and lexical-pruning rows); it is UNSUPPORTED until the objective is
 competitive.** Do not quote claim 2 as measured.
+
+**AMENDED 2026-09-22 by the implementation at the end of this entry, and the amendment does
+not license the claim.** The objective *is* now competitive — ceiling-normalized nDCG@10
+beats RRF on 3 of 3 corpora in the product — so the reason claim 2 is unsupported has
+changed rather than gone: it is now the p50 row (0.795× on nfcorpus against a 0.50× gate)
+and the `score()`-call row (0.903× against 0.20×). A user choosing a ranking now has a
+reason to choose this one; the claim that the scan strategy is *also* the cheaper one is
+still unmeasured for the shipping default, because the normalizer's own cost has not been
+timed. Still do not quote claim 2 as measured.
 
 **What it needs, and what it does not.** Not scorer work: per-channel score
 normalization or calibration *before* the sum. Options, none measured:
@@ -2211,7 +2220,13 @@ way (each channel's effective weight is still a positive constant, so (C2), the 
 sums and the MaxScore partition are untouched), which is exactly why this would have been
 easy to get wrong and hard to notice.
 
-**WHAT IS NOT YET ESTABLISHED, and it is the whole implementation risk.** `maxn` uses the
+**WHAT IS NOT YET ESTABLISHED, and it is the whole implementation risk.**
+**[ANSWERED 2026-09-22 by the product measurement at the end of this entry: the median
+1.37× relative misweighting costs nothing the gate can see. The ceiling-normalized arm, in
+the product, beats RRF on nDCG@10 on 3 of 3 corpora and beats the realized-max `maxn`
+study figure on 2 of 3. The paragraph stays as written because the risk was real when it
+was written, and because the proxy-versus-product comparison at the end of the entry is
+only readable against it.]** `maxn` uses the
 **realized** maximum, which a single-pass threshold scan cannot know before it starts. The
 obvious pre-scan substitute is the key's **ceiling** (the sum of its channels' `maxscore`),
 and measured against the realized maximum over 25 scifact queries:
@@ -2312,11 +2327,155 @@ partition are untouched — and each key's ceiling then equals exactly its weigh
 makes `suffix[0] = Σ w_key` and the weights directly interpretable as relative influence
 for the first time.
 
+**[IMPLEMENTED 2026-09-22 exactly as this paragraph specifies, plus ONE CONSTRAINT it does
+not mention and which turned out to be the day's real finding: the normalizer has to be one
+constant for the whole QUERY, not one per bolt. `doc/specs/FUSED_TOPK.md` §8d is the
+specification as built; the narrative is directly below.]**
+
 **Latent because every prior test used one channel or a fixture.** A single-channel
 ranking has no scale to mismatch, and `sql/fuse_pushdown.sql`'s fixtures assert the
 scorer computes *what it says it computes*, which it does. No fixed-output test can see
 "the objective is worse than a different objective" — that needs a labelled corpus, and
 this project had never run one until today.
+
+---
+
+**IMPLEMENTED AND MEASURED IN THE PRODUCT, 2026-09-22.** The specification of what shipped
+— the rule, the two `N_key` derivations, the guard, the GUC and the per-bolt constraint —
+is `doc/specs/FUSED_TOPK.md` §8d and is not repeated here. What is here is the narrative:
+the finding the study did not contain, the test and its positive controls, the product
+measurement, the loss, and how well the study predicted the product.
+
+Briefly, so this entry reads on its own: every channel of a `fuse()` key now carries
+effective weight `w_key / N_key`, where `N_key` is the key's pre-scan ceiling — for a
+lexical key the sum of `weave_bm25_term_bound()` over its terms at each term's max tf
+**over all segments**, accumulated in the `src/am/amscan.c` loop that already reads every
+segment's dictionary entry for the global idf, so at zero extra I/O; for a vector key the
+maximum over bolts of `weave_vec_weft_maxscore()` (`src/vector/vecshuttle.c`), which is
+bound (B2) over one directory pass plus `weave_vec_scan_maxscore()` for the metric's
+domain. `w/N` is positive and finite, which is all `include/weave/fuse.h` note 3 asks, so
+nothing in the algebra moved. `pg_weave.fuse_normalize` (`PGC_USERSET`, default **on**,
+defined outside any `#ifdef` — AGENTS.md's twelfth member) turns it off and restores the
+raw sum.
+
+**THE FINDING THAT WAS NOT IN THE SPEC, AND IT IS THE MOST IMPORTANT PART OF THIS ENTRY:
+the normalizer has to be ONE CONSTANT FOR THE WHOLE QUERY, NOT ONE PER BOLT.**
+`weave_fuse_pass()` runs one bounded top-k **per bolt** and merges the per-bolt lists **by
+score** — `src/am/amscan.c` sorts the accumulated rows and truncates to the pass width,
+under a comment asserting that merging exact per-bolt top-k lists yields an exact global
+top-k. That merge is exact only while every bolt scored against the *same objective*.
+`WeaveShuttle.maxscore` is per bolt, so the obvious implementation — read the ceiling off
+the shuttle you just opened — would rank each bolt against a different objective and make
+the answer **a function of the segment layout**: it would change after an INSERT, after
+VACUUM and after a merge, with no error anywhere and plausible output every time. That is
+why the maximum is taken before the first bolt is scanned, and why
+`weave_vec_weft_maxscore()` exists at all instead of a read of `sh->maxscore`. Note also
+that the studies above measured a query-global normalizer — they normalized in SQL over the
+whole corpus — so a per-bolt implementation would not even have been the thing that was
+measured. This is the same shape as G43 and as the whole "plausible wrong answer" family:
+the defect has no error message and no wrong-looking output, and its trigger is a
+maintenance operation rather than a query.
+
+**THE TEST, AND ITS POSITIVE CONTROL.** `sql/fuse_degenerate.sql` section (6): 300
+documents with `'alpha'` at a tf unique per document plus `'beta'` in all of them, index
+built; then a second, VACUUM-flushed batch of 300 with the same `'alpha'` ladder and **no
+`'beta'`** — a run of two segments is below the tiered auto-merge threshold, so both
+persist. The query is `fuse(d <=> 'alpha beta', d <=> 'gamma', weights '{1,1}') LIMIT 10`,
+taken before and after `weave_merge()` and compared as an id **set**. A mutant build whose
+normalizer used each bolt's own ceilings returns `{1..9,308}` before the merge and
+`{1..9,11}` after it, so the assertion reads **f**; the shipping build reads **t**, twice
+in a row. Expected output regenerated and verified line by line.
+
+**THREE EARLIER FIXTURES COULD NOT FAIL, and that is the lesson worth keeping.** (a) A
+two-key query over an 80-document index and (b) a 4,000-row index built under
+`maintenance_work_mem = '1MB'` both had exactly **one** segment — `nseg = 1` — so "per
+bolt" and "per query" were the same thing and the mutant passed. The test now asserts
+`weave_index_nsegments() > 1` before it asserts anything else, so that can never be silent
+again. (c) A genuine three-bolt fixture whose bolts differed in max tf (2, 8, 1) **also
+passed under the mutant**, and the reason is BM25 itself: the term bound at tf=1 and at
+tf=8 differs by about **25 %, not 8×**, because of tf saturation. What separates a
+per-bolt normalizer from a per-query one is **a query term present in one bolt and absent
+from another** — then the key's ceiling is a sum over a *different number of terms* in each
+bolt and the scale moves by a factor rather than a percent. Generalization, and it is not
+specific to normalizers: **when you design a fixture to discriminate two implementations,
+ask which quantity actually differs between them and by how much.** Three of four fixtures
+here were sensitive to the wrong quantity, and two of the three were additionally testing a
+one-bolt index.
+
+**A SECOND POSITIVE CONTROL, UNPLANNED, AND IT HAD BEEN RED IN A CHECKED-IN EXPECTED FILE
+SINCE THE FILE WAS WRITTEN.** `sql/fuse_degenerate.sql`'s own control assertion
+`weights_change_the_answer` was recorded as **f**, contradicting the comment directly above
+it — "The weighting has to MATTER, or every assertion above would pass against a scorer
+that ignored the weights entirely". The mechanism, measured: with the raw sum, `'zeta'`
+(2 of 40 documents, so a large idf) dominated so thoroughly that `0.01 × zeta` still
+outranked `0.99 × alpha`. The weights were being applied correctly and **could not reach
+the ranking**. With the normalizer the 0.99/0.01 arm returns `{34,38}` — the two highest-tf
+`'alpha'` documents — and the control passes. A new section (5a) pins the raw behaviour
+under `pg_weave.fuse_normalize = off`, so both objectives are now tested rather than one.
+This is the eleventh and twelfth members' lesson arriving from a third direction: the file
+recorded its own control failing, in a file that was reviewed and committed, and nobody
+read the value against the sentence above it.
+
+**MEASURED IN THE PRODUCT, not in a study.** `bench/normprod.sh`: quality only, **no
+EC2** — nDCG is deterministic and host-independent, and only latency needs a quiet machine.
+Three arms that are **the same statement** differing only in the GUC, plus the RRF control,
+all scored through `bench/ndcg.py`. 100 % of the corpora are the real MiniLM BEIR sets from
+the 2026-09-22 EC2 run, restored into local databases. nDCG@10:
+
+| dataset | raw sum (normalizer off) | RRF control | ceiling-normalized | norm ÷ RRF |
+|---|---|---|---|---|
+| scifact (300 q) | 0.6720 | 0.6846 | **0.7212** | **1.053×** |
+| nfcorpus (323 q) | 0.3161 | 0.3422 | **0.3455** | **1.010×** |
+| fiqa (648 q) | 0.2393 | 0.3482 | **0.3878** | **1.114×** |
+
+**Positive control of the harness, and it did NOT pass the first time.** The raw arm
+reproduces the recorded EC2 nDCG to four decimals on all three (0.6720 / 0.3161 / 0.2393)
+and the RRF arm reproduces 0.6846 / 0.3422 / 0.3482. On the first run scifact's RRF read
+**0.6834** instead of 0.6846, because `normprod.sh`'s copy of the RRF generator defaulted
+`RRFK=100` where `bench/fuse.sh` uses 60. A 0.18 % error, caught immediately by the
+control, that would otherwise have quietly re-baselined the comparison in the fix's favour
+— and note that it was in the *control* arm, which is the arm nobody inspects when the
+headline number looks good.
+
+**recall@100 moves the same way, so this is not a top-10 reshuffle:** scifact 0.8892 →
+0.9683 and fiqa 0.5141 → 0.7079, against RRF's 0.9517 and 0.6932.
+
+**THE LOSS, recorded as prominently as the wins (hard rule 8): ON NFCORPUS THE NORMALIZED
+ARM LOSES TWO OF THREE METRICS TO RRF.** recall@100 **0.3206 vs 0.3251** and MRR@10
+**0.5441 vs 0.5514**, while winning nDCG@10 0.3455 vs 0.3422. The gate row is nDCG, so the
+row is met — but the win on that dataset is **1.0 %** and it comes with two regressions.
+This must not be presented as a clean sweep: it is two clear wins and one draw that the
+gate scores as a win.
+
+**THE STUDY'S PREDICTION AGAINST THE PRODUCT'S MEASUREMENT.** The ceiling proxy (ratio
+0.73, derived above) predicted 0.7133 / 0.3489 / 0.3763. The product measures 0.7212 /
+0.3455 / 0.3878: **direction right on 3 of 3, magnitude within 1–3 %**, and on nfcorpus the
+product is slightly **worse** than the proxy predicted (0.3455 vs 0.3489). A proxy that
+gets the direction right on three datasets and the magnitude to a few percent is a good
+proxy. It is not the measurement (hard rule 11), and the product is now the measurement —
+which is also why the sweep numbers above stay marked as a study rather than being quietly
+upgraded.
+
+**WHAT IS STILL OPEN, and none of it is closed by this work.**
+
+  - **The p50 latency row still FAILS** (gate ≤ 0.50×; measured 0.582× / 0.795× / 0.578×)
+    and **the `score()`-call row still FAILS** (gate ≤ 0.20×; measured 0.648× / 0.903× /
+    0.541×). The mechanism is unchanged and is not the objective: the vector block bound
+    prunes nothing (`vec_blocks_bound_skipped = 0` on all three datasets) and 71–87 % of
+    all fused `score()` calls are the vector channel, so the vector side sets the ratio no
+    matter how well the lexical side prunes. Nothing about normalization touches that.
+  - **The normalizer's own cost is UNMEASURED.** One LUT build and one directory pass per
+    bolt per vector key, ahead of the first bolt. Kilobytes of directory against megabytes
+    of codes is a reason to expect it to be small, not a measurement; no latency figure has
+    been taken since the change, so `FUSED_TOPK.md` §8's p50/p99 rows describe the
+    pre-normalizer build and need an EC2 re-run before they are quoted for the default.
+  - **fiqa's optimum ratio is still at or below the lowest ratio swept**, so the
+    equal-weight default is probably not optimal there even now. Unchanged by this work.
+
+**Local gates green on the change:** `installcheck` pg17 and pg18, `tap-pg17`,
+`make check-standalone`, and the four lint targets. Per hard rule 12 that is not evidence
+at scale — and the thing that needs scale here is exactly the thing not re-measured, which
+is latency.
 
 ### G45 — `prepdata.py`'s MS MARCO source returns HTTP 404; the dataset §8 names by name cannot be fetched — **OPEN 2026-09-22**
 

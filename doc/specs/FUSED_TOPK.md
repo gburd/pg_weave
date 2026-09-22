@@ -710,7 +710,7 @@ and no amount of SIMD recovers it. Record the negative result in
 `pg_turbovec/docs/PARITY_GAPS.md` are the house style for that, and the retracted
 "we win 2.3×" claim in the latter is exactly the mistake to avoid.
 
-### 8b. STATUS: MEASURED 2026-09-22 on three BEIR corpora. The gate is NOT met: two rows fail.
+### 8b. STATUS: MEASURED 2026-09-22 on three BEIR corpora. The gate is NOT met: two rows fail. (A third, nDCG@10, failed on the same run and was FIXED the same day — §8d.)
 
 `bench/RESULTS_FUSE.md` has the run. Summary, because a spec that states a gate should
 state whether it was cleared:
@@ -720,8 +720,35 @@ state whether it was cleared:
 | recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | **PASS** |
 | p99 latency | ≤ 0.70× | 0.609× | 0.560× | 0.633× | **PASS** |
 | p50 latency | ≤ 0.50× | 0.582× | 0.795× | 0.578× | **FAIL** |
-| nDCG@10 | ≥ RRF | 0.982× | 0.924× | 0.687× | **FAIL** |
+| nDCG@10, normalizer **on** (the default since 2026-09-22) | ≥ RRF | 1.053× | 1.010× | 1.114× | **MET** |
+| ~~nDCG@10, raw weighted sum~~ | ≥ RRF | 0.982× | 0.924× | 0.687× | **FAILED — this is the `pg_weave.fuse_normalize = off` arm. SUPERSEDED 2026-09-22 by §8d, and left in the table because it is the baseline the fix is measured against** |
 | `score()` calls | ≤ 0.20× | 0.648× | 0.903× | 0.541× | **FAIL** |
+
+**THE nDCG ROW IS MET AS OF 2026-09-22, and it was met in the product rather than in a
+study.** `bench/normprod.sh` scores three arms that are the *same statement* differing
+only in `pg_weave.fuse_normalize`, plus the RRF control, all through `bench/ndcg.py` on
+the same MiniLM BEIR corpora the EC2 run used: nDCG@10 **0.7212 / 0.3455 / 0.3878**
+normalized, against 0.6846 / 0.3422 / 0.3482 for RRF and 0.6720 / 0.3161 / 0.2393 for the
+raw sum. The harness reproduces *both* recorded EC2 arms to four decimals, which is the
+only reason the comparison is admissible; the arms, the positive controls and one recorded
+loss are in `doc/GAPS.md` G44, and the mechanism is §8d. **It is not a clean sweep.** On
+nfcorpus the normalized arm wins the gated row by 1.0 % and *loses* recall@100 (0.3206 vs
+0.3251) and MRR@10 (0.5441 vs 0.5514) to RRF. The row is met; the dataset is a draw.
+
+**Both latency rows and the `score()` row were measured on the pre-normalizer build**,
+where `pg_weave.fuse_normalize` did not exist. Normalization changes no mechanism either
+row depends on — it divides weights by constants before the scan starts — but the vector
+half of it adds one LUT build and one directory pass **per bolt per vector key** ahead of
+the first bolt, and **that cost is unmeasured**. So p50 (0.582× / 0.795× / 0.578×), p99
+(0.609× / 0.560× / 0.633×) and `score()` (0.648× / 0.903× / 0.541×) stand as numbers for
+the raw arm and need an EC2 re-run before any of them is quoted for the shipping default.
+The p99 **PASS** is in exactly that position too: a pass measured on a build that is no
+longer the default is not a pass for the default.
+
+**SUPERSEDED 2026-09-22 by §8d, and left in place because the fix was derived from it.**
+Every sentence in the next paragraph still describes the `pg_weave.fuse_normalize = off`
+arm exactly, and that arm is still selectable, which is why it is worded in the present
+tense rather than corrected.
 
 **The nDCG failure is this document's problem, not the scorer's** (`doc/GAPS.md` G44).
 The fused scan returns its objective exactly — the recall row is 1.000 — but the
@@ -755,6 +782,12 @@ suppresses lexical work (0.149× on the largest corpus) and is genuinely faster 
 (p99 0.56–0.63×, validated against an A/A noise floor 170–714× smaller than the delta).
 It is not yet *better*, and it will not be until the vector bound prunes and the sum is
 normalized. Neither is a rewrite.
+
+**HALF OF THAT HAPPENED THE SAME DAY.** The sum is normalized (§8d) and the fused
+objective now beats RRF on nDCG@10 on 3 of 3 corpora, measured in the product. The vector
+block bound still prunes nothing — `vec_blocks_bound_skipped = 0` — so the `score()` and
+p50 rows are exactly where this paragraph left them, and the sentence above remains the
+honest statement with one of its two conditions discharged.
 
 ### 8b-history. The gate went red on first contact with a real corpus, and that is what it was for.
 
@@ -798,6 +831,99 @@ of real size — so on nfcorpus and fiqa it skipped **100 of 100** queries, the 
 count stayed 0, and it printed "gate passed" having compared nothing. Only a tie
 *straddling rank 10* makes a top-10 set ambiguous. It now tests that, reports `compared`
 next to `attempted`, and **dies** when `compared` is 0.
+
+### 8d. The per-key ceiling normalizer as built (2026-09-22): what it is, why it is ONE constant for the whole query, and what it costs
+
+Per `fuse()` **key**, every channel of that key carries effective weight `w_key / N_key`,
+where `N_key` is the key's **pre-scan score ceiling**. Per key and not per channel, for
+the reason `doc/GAPS.md` G44 records at length: a lexical key expands to one channel *per
+query term*, so dividing each channel by its own ceiling would rescale the query's terms
+against each other and partially undo idf weighting, which is the thing BM25 is for.
+`w/N` is positive and finite, which is all `include/weave/fuse.h` note 3 requires of a
+weight, so **(C2), the suffix sums and §5's MaxScore partition are untouched** — the
+normalizer is arithmetic on the weights and nothing in §2's algebra can tell it happened.
+One property improves: each key's weighted ceiling now equals *exactly* its weight, so
+`suffix[0]` is the sum of the weights, and a `weights` array means relative influence for
+the first time rather than "whatever scale this channel happens to emit".
+
+**The lexical key's `N_key`** is the sum, over the key's terms, of
+`weave_bm25_term_bound(idf_t, max over ALL SEGMENTS of that term's max tf)`, computed at
+the same `(idf, k1 = 1.2, b = 0.75, avgdl)` the cursors will use — a different `avgdl` or
+`k1` here would normalize by a constant no channel can reach. It is accumulated inside
+the loop in `src/am/amscan.c` that already reads every segment's dictionary entry to
+compute the global idf, so **it costs zero extra I/O**: the max-tf-over-segments is one
+more accumulator over bytes already in hand. A term absent from the whole index
+(`idf < 0`) contributes no channel to the scan, and contributes nothing to `N_key` either.
+
+**The vector key's `N_key`** is the maximum over bolts of `weave_vec_weft_maxscore()`
+(`src/vector/vecshuttle.c`, declared in `include/weave/vector.h`): bound (B2) folded over
+one directory pass, then `weave_vec_scan_maxscore()` to reach the metric's domain. Those
+are the same two functions `weave_vec_shuttle_begin()` calls, *called* rather than
+reproduced, because a second copy of the domain conversion is precisely the failure
+`include/weave/vecscan.h`'s domain rule exists to prevent. The skip conditions are the
+bolt loop's, verbatim and in the same order, so a bolt this pass will not score cannot
+set the scale for a key that never reads it, and a refusal returns false with a reason
+rather than throwing — the scan is about to make the same refusal for the same bolt with a
+message the user can connect to their query. Cost: **one LUT build and one directory pass
+per bolt per vector key. THAT COST IS UNMEASURED.** The directory is one record per 32
+lanes, so it is kilobytes against a code weft of megabytes, and the pass duplicates one
+`begin()` runs anyway — but that is an argument that it is small, not a measurement that
+it is, and §8b's p50/p99 rows therefore predate the change and need an EC2 re-run.
+
+**THE CONSTRAINT THAT IS NOT OBVIOUS, and it is the reason the previous paragraph cannot
+be simplified: the normalizer must be ONE CONSTANT FOR THE WHOLE QUERY, not one per
+bolt.** `weave_fuse_pass()` runs one bounded top-k **per bolt** and then merges the
+per-bolt lists **by score** — `src/am/amscan.c` sorts the accumulated rows and truncates
+to the pass width, under a comment asserting that merging exact per-bolt top-k lists
+yields an exact global top-k. That assertion holds only while every bolt scored against
+the *same objective*. `WeaveShuttle.maxscore` is per bolt, so the obvious implementation —
+read the ceiling off the shuttle you just opened — would rank each bolt against a
+different objective and make the answer **a function of the segment layout**: it would
+change after an INSERT, after VACUUM and after a merge, with no error anywhere and a
+plausible top-k every time. That is why the maximum is taken **before the first bolt is
+scanned**, and it is the entire reason `weave_vec_weft_maxscore()` exists instead of a
+read of `sh->maxscore`; holding one shuttle open per bolt up front is what the per-bolt
+scratch context exists to avoid, so hoisting shuttle creation is not an alternative.
+Independently: the studies in `bench/RESULTS_FUSE.md` normalized in SQL over the whole
+corpus, i.e. they measured a **query-global** normalizer, so a per-bolt implementation
+would not even have been the thing that was measured.
+
+**The guard.** A non-positive or non-finite `N_key` **leaves the weight alone** rather
+than dividing. The two failure directions are bad in different ways: a zero weight makes
+`weave_fuse_init()` refuse the scan outright, and an infinity silently zeroes the channel —
+the worse of the two, because it returns an answer. Both are reachable: a key whose every
+term is absent from the index has ceiling 0, and so does a vector key with no weft in any
+bolt. In both cases the channel has nothing to contribute, so falling back to the raw
+weight costs nothing and keeps the scan runnable.
+
+**The knob.** `pg_weave.fuse_normalize`, `PGC_USERSET`, **default on**:
+`DefineCustomBoolVariable()` in `src/am/customscan.c`, the variable in `src/am/am.c`, the
+`extern` in `include/weave/weave.h`, and **outside any `#ifdef`** — deliberately, because
+AGENTS.md's twelfth member is a GUC that was placed inside `#ifdef WEAVE_TEST_HOOKS` and
+therefore existed in no build anyone runs, while `SHOW` cheerfully echoed a placeholder
+back. `PGC_USERSET` because it changes a ranking and nothing on disk, which is
+`doc/CONVENTIONS.md`'s reloption/GUC split. Off restores the raw weighted sum, and that
+is not a curiosity: it is the arm every figure in `bench/RESULTS_FUSE.md` was measured on,
+and an A/B that cannot reproduce its own baseline is not an A/B (hard rule 10). The GUC's
+*existence* was verified the way the twelfth member says you must — `pg_settings` shows a
+non-null `short_desc` in a session that has already touched a `weave` index — and not by
+`SHOW`.
+
+**Regression coverage** is `sql/fuse_degenerate.sql` section (6), which takes a fused
+top-10 across a `weave_merge()` that collapses two bolts into one and asserts the id
+**set** is unchanged, having first asserted `weave_index_nsegments() > 1` so the section
+cannot be silently vacuous; and section (5a), which pins the raw sum under
+`pg_weave.fuse_normalize = off` so both objectives are tested rather than one. Both have
+positive controls, and three earlier fixtures for (6) **could not fail** — the fixture
+design lesson, including why bolts that differ in max tf do not discriminate the two
+implementations (BM25's tf saturation puts the term bound at tf=1 and tf=8 about 25 %
+apart, not 8×), is in `doc/GAPS.md` G44 and in that section's own header comment.
+
+**The measurement is in `doc/GAPS.md` G44 and is not duplicated here.** What belongs here
+is its consequence for §8b: the nDCG@10 row is **MET** at 1.053× / 1.010× / 1.114× RRF,
+with a recorded loss on nfcorpus, and the p50 and `score()`-call rows are **untouched** by
+this work and still fail — the `score()` failure is the vector block bound pruning
+nothing, and normalization does not go near it.
 
 ### 8c. Why the loop stopped, reported per bolt
 

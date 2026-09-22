@@ -956,6 +956,124 @@ weave_vec_shuttle_begin(const WeaveVecWeft *w, int segno, const float *query,
 	return &vs->sh;
 }
 
+/*
+ * THE BOLT-WIDE CEILING WITHOUT OPENING A SHUTTLE, for the fused objective's
+ * per-key normalizer (doc/specs/FUSED_TOPK.md sect. 8d).
+ *
+ * WHY THIS EXISTS RATHER THAN READING sh->maxscore OFF A SHUTTLE.  The normalizer
+ * has to be the same constant for every bolt of one query, because
+ * weave_fuse_pass() in src/am/amscan.c merges the per-bolt top-k lists BY SCORE.  A
+ * per-bolt normalizer would score each bolt against a slightly different objective,
+ * and the merge would then interleave two rankings -- an answer that changes with
+ * the segment count, which is to say with VACUUM and merge.  So the maximum over
+ * bolts has to be known before the FIRST bolt is scanned, and a shuttle cannot
+ * supply it: holding one open per bolt up front is exactly what the per-bolt
+ * scratch context exists to avoid.
+ *
+ * It is the same value weave_vec_shuttle_begin() computes -- bound (B2) folded over
+ * one directory pass, then weave_vec_scan_maxscore() to reach the metric's domain --
+ * and it calls those same two functions rather than reproducing their arithmetic,
+ * because a second copy of the domain conversion is the failure
+ * include/weave/vecscan.h's "THE DOMAIN RULE" is about.
+ *
+ * Cost is one LUT build and one directory pass per bolt per vector key.  The
+ * directory is one record per 32 lanes, so it is kilobytes against a code weft of
+ * megabytes; the pass this duplicates is the one begin() already runs.
+ *
+ * It RETURNS FALSE and sets *why instead of throwing.  Every refusal here is one
+ * weave_vec_shuttle_begin() is about to make again for the same bolt, with a message
+ * that names the bolt and the index; throwing from a normalizer pass would report
+ * the same fault from a place the reader cannot connect to their query.  The caller
+ * decides, and src/am/amscan.c's decision is to leave the bolt out of the maximum
+ * and let the scan raise the real error.
+ */
+bool
+weave_vec_weft_maxscore(const WeaveVecWeft *w, const float *query, int qdim,
+						float *out, const char **why)
+{
+	MemoryContext ctx;
+	MemoryContext old;
+	WeaveVecScanState core;
+	WeaveQuantizer q;
+	WeaveQueryLut lut;
+	VecDirCursor mc;
+	const char *lw = NULL;
+	float		acc = 0.0f;
+	uint32		b;
+	bool		ok = false;
+
+	if (w == NULL || query == NULL || out == NULL)
+	{
+		if (why != NULL)
+			*why = "a null weft, query or output pointer";
+		return false;
+	}
+
+	/* begin() raises on this; here it is a refusal, for the reason above. */
+	if (qdim != (int) w->meta.dim || w->meta.calibstart != InvalidBlockNumber)
+	{
+		if (why != NULL)
+			*why = (qdim != (int) w->meta.dim)
+				? "the query's dimension is not the weft's"
+				: "the weft carries a calibration this build cannot read";
+		return false;
+	}
+
+	/*
+	 * Its own context, reset by the caller's next call rather than growing with
+	 * the bolt count: the LUT is dim x 2^bits floats, so a hundred-bolt index
+	 * would otherwise hold a hundred of them alive for the length of the scan.
+	 */
+	ctx = AllocSetContextCreate(CurrentMemoryContext,
+								"weave vector normalizer",
+								ALLOCSET_SMALL_SIZES);
+	old = MemoryContextSwitchTo(ctx);
+
+	/*
+	 * allow = NULL, nwarp = 0: no allowlist.  A ceiling over the bolt's live lanes
+	 * only would be tighter, and it would also make the normalizer depend on which
+	 * rows a predicate admits -- so the same document would score differently
+	 * depending on the WHERE clause it arrived under.  The normalizer is a property
+	 * of the query and the data, and this is where that is decided.
+	 */
+	if (weave_vec_scan_begin(&core, &w->geom, (int) w->meta.metric,
+							 NULL, 0) != 0)
+		lw = core.why != NULL ? core.why : "the weft cannot be code-scanned";
+	else if (weave_quantizer_init(&q, (int) w->meta.dim, (int) w->meta.bits,
+								  NULL, vec_palloc, vec_pfree) != 0)
+		lw = "the quantizer geometry is unsupported";
+	else if (weave_query_lut_build(&lut, &q, query, vec_palloc) != 0)
+		lw = "the query table could not be built";
+	else
+	{
+		ok = true;
+		dir_cur_begin(&mc, w);
+		for (b = 0; b < w->geom.nblocks; b++)
+		{
+			WeaveVecDirRec r;
+
+			CHECK_FOR_INTERRUPTS();
+			if (!dir_cur_next(&mc, &r, &lw))
+			{
+				ok = false;
+				break;
+			}
+			weave_vec_scan_maxscore_fold(&acc, &r);
+		}
+		dir_cur_end(&mc);
+
+		if (ok)
+			*out = weave_vec_scan_maxscore(&core, &lut, acc);
+	}
+
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(ctx);
+
+	if (!ok && why != NULL)
+		*why = lw != NULL ? lw : "unknown reason";
+	return ok;
+}
+
 void
 weave_vec_shuttle_set_threshold(WeaveShuttle *s, float4 theta)
 {

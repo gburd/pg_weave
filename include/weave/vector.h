@@ -794,6 +794,22 @@ extern WeaveShuttle *weave_vec_shuttle_begin(const WeaveVecWeft *w, int segno,
 											 float4 weight);
 
 /*
+ * The bolt-wide score ceiling -- WeaveShuttle.maxscore -- computed WITHOUT opening
+ * a shuttle, for the fused objective's per-key normalizer (FUSED_TOPK.md sect. 8d).
+ *
+ * The normalizer must be one constant for the whole query, because the fused pass
+ * merges per-bolt top-k lists by score; a per-bolt normalizer ranks each bolt
+ * against a different objective and the answer then changes with the segment count.
+ * That maximum has to exist before the first bolt is scanned, which is why this is
+ * not "read sh->maxscore".  The definition at src/vector/vecshuttle.c says what it
+ * costs and why it refuses rather than throws.
+ *
+ * Returns false and sets *why (a static string) on any refusal; *out is untouched.
+ */
+extern bool weave_vec_weft_maxscore(const WeaveVecWeft *w, const float *query,
+									int qdim, float *out, const char **why);
+
+/*
  * The driver's current top-k floor, handed to the decision core so that
  * WEAVE_VSCAN_SKIP_BOUND is reachable at all.
  *
