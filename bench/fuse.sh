@@ -224,6 +224,48 @@ rrf_sql() {                     # rrf_sql <wq> <vec> <limit>
            "$1" "$1" "$KP" "$2" "$2" "$KP" "$RRFK" "$RRFK" "$3"
 }
 
+# ---------------------------------------------------------------------------
+# THE NORMALIZATION STUDY (doc/GAPS.md G44), opt-in via FUSE_NORMSTUDY=1.
+#
+# The first real-corpus run measured the fused arm's nDCG BELOW RRF on all three
+# BEIR datasets -- 0.687x on fiqa -- while its recall-vs-exhaustive row was 1.000.
+# So the scan is exact and the OBJECTIVE is what loses: fuse() sums RAW channel
+# scores, and BM25 (~10-20) against a quantized inner product (~[-1,1]) is a ~33x
+# scale mismatch, which makes equal weights effectively lexical-only.  RRF wins by
+# being scale-free, not by being cleverer.
+#
+# BEFORE WRITING ANY C, MEASURE WHETHER NORMALIZATION ACTUALLY FIXES IT.  That is
+# hard rule 9, and this is cheap: the arms below compute candidate objectives in
+# SQL from the index's OWN per-channel scores -- the exact numbers the fused scan
+# sums -- so a scheme that wins here is a scheme worth implementing in the scorer,
+# and one that loses here has cost nothing.  It is a QUALITY question, so it does
+# not need EC2: nDCG is deterministic and host-independent.  Only latency is not.
+#
+# Two schemes, because a single one cannot distinguish "normalization helps" from
+# "this particular normalization helps":
+#
+#   maxn  divide each channel by its realized per-query MAXIMUM.  Zero stays the
+#         floor, which is right for BM25 (an absent term contributes exactly 0).
+#   mmn   per-channel min-max over the corpus, which is the textbook choice and
+#         the one that treats a negative inner product as the bottom of a range
+#         rather than as a penalty.
+#
+# NULLIF guards a zero denominator; GREATEST guards a non-positive maximum, which
+# for ip over L2-normalized vectors means a query anti-correlated with the entire
+# corpus -- rare, but dividing by it would INVERT the channel rather than scale it,
+# and an inverted channel would look like a normalization failure instead of a
+# degenerate query.
+# ---------------------------------------------------------------------------
+normsum_sql() {                 # normsum_sql <wq> <vec> <limit> -- scheme maxn
+    printf "WITH a AS (SELECT m.id, s.score FROM weave_search('fd_weave', %s::wquery, %s) s JOIN fdmap m ON m.rowtid = s.ctid), v AS (SELECT m.id, s.score FROM weave_vec_scan('fd_weave', %s::wvec, %s) s JOIN fdmap m USING (docid)), mx AS (SELECT GREATEST((SELECT max(score) FROM a), 1e-9) AS ml, GREATEST((SELECT max(score) FROM v), 1e-9) AS mv) SELECT f.id FROM fd f LEFT JOIN a ON a.id = f.id LEFT JOIN v ON v.id = f.id CROSS JOIN mx ORDER BY 0.5*COALESCE(a.score,0)/NULLIF(mx.ml,0) + 0.5*COALESCE(v.score,0)/NULLIF(mx.mv,0) DESC, f.id LIMIT %s;" \
+           "$1" "$NDOCS" "$2" "$NDOCS" "$3"
+}
+
+minmaxsum_sql() {               # minmaxsum_sql <wq> <vec> <limit> -- scheme mmn
+    printf "WITH a AS (SELECT m.id, s.score FROM weave_search('fd_weave', %s::wquery, %s) s JOIN fdmap m ON m.rowtid = s.ctid), v AS (SELECT m.id, s.score FROM weave_vec_scan('fd_weave', %s::wvec, %s) s JOIN fdmap m USING (docid)), mx AS (SELECT COALESCE((SELECT min(score) FROM a),0) AS nl, GREATEST((SELECT max(score) FROM a), 1e-9) AS ml, COALESCE((SELECT min(score) FROM v),0) AS nv, GREATEST((SELECT max(score) FROM v), 1e-9) AS mv) SELECT f.id FROM fd f LEFT JOIN a ON a.id = f.id LEFT JOIN v ON v.id = f.id CROSS JOIN mx ORDER BY 0.5*(COALESCE(a.score,mx.nl)-mx.nl)/NULLIF(mx.ml-mx.nl,0) + 0.5*(COALESCE(v.score,mx.nv)-mx.nv)/NULLIF(mx.mv-mx.nv,0) DESC, f.id LIMIT %s;" \
+           "$1" "$NDOCS" "$2" "$NDOCS" "$3"
+}
+
 # psql literal quoting for a text value, done by the server so a quote or backslash
 # in a query string cannot terminate the literal.
 QLIT=$(mktemp); trap 'rm -f "$QLIT" "$VLIT"' EXIT
@@ -396,6 +438,16 @@ say "$DS: quality pass, fused arm"
 RUN_FUSED=$(run_quality fused fused_sql)
 say "$DS: quality pass, RRF control arm"
 RUN_RRF=$(run_quality rrf rrf_sql)
+# The G44 normalization study, opt-in: two candidate objectives scored through the
+# same run-file + ndcg.py path as the two real arms, so a scheme cannot win here by
+# being measured differently.
+RUN_MAXN=""; RUN_MMN=""
+if [ "${FUSE_NORMSTUDY:-0}" = 1 ]; then
+    say "$DS: quality pass, normalization study (maxn)"
+    RUN_MAXN=$(run_quality maxn normsum_sql)
+    say "$DS: quality pass, normalization study (mmn)"
+    RUN_MMN=$(run_quality mmn minmaxsum_sql)
+fi
 
 # ---------------------------------------------------------------------------
 # WORK COUNTERS.  One arm's whole quality pass, bracketed by resets.
@@ -480,6 +532,11 @@ rm -f "$LAT_F" "$LAT_R" "$LAT_F2"
 # ---------------------------------------------------------------------------
 Q_FUSED=$(python3 bench/ndcg.py --qrels "$DIR/qrels.tsv" --run "$RUN_FUSED" --k 10 --label fused | tail -1)
 Q_RRF=$(python3 bench/ndcg.py --qrels "$DIR/qrels.tsv" --run "$RUN_RRF" --k 10 --label rrf | tail -1)
+Q_MAXN=""; Q_MMN=""
+if [ -n "$RUN_MAXN" ]; then
+    Q_MAXN=$(python3 bench/ndcg.py --qrels "$DIR/qrels.tsv" --run "$RUN_MAXN" --k 10 --label maxn | tail -1)
+    Q_MMN=$(python3 bench/ndcg.py --qrels "$DIR/qrels.tsv" --run "$RUN_MMN" --k 10 --label mmn | tail -1)
+fi
 
 # ---------------------------------------------------------------------------
 # Report.  TSV on stdout, one table per concern, for bench/aws/run.sh to tee.
@@ -504,6 +561,12 @@ printf '\n### fuse_quality\n'
 # filled -- which reads, in a results file, as two zeros nobody measured.
 printf 'label\tnqueries_scored\tndcg@10\trecall@100\tmrr@10\n'
 printf '%s\n%s\n' "$Q_FUSED" "$Q_RRF"
+# `fused` and `maxn` differ ONLY in the objective -- same index, same query set, same
+# per-channel scores, same scorer -- so the gap between those two rows is the whole
+# value of normalization, isolated.  `fused` reproducing its recorded number is also
+# the positive control for the study: if it does not, the study is measuring
+# something else.
+[ -n "$Q_MAXN" ] && printf '%s\n%s\n' "$Q_MAXN" "$Q_MMN"
 
 printf '\n### fuse_latency\n'
 printf 'arm\tp50_ms\tp99_ms\tqueries\treps\n'
