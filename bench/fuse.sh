@@ -317,17 +317,31 @@ SQL
 MAPOK=$($PSQL -t -A -c "SELECT count(*) = (SELECT count(*) FROM fd) FROM fdmap;")
 [ "$MAPOK" = "t" ] || die "the docid map does not cover every row: weave_vec_lanes() and ctid order disagree"
 
-say "$DS: correctness gate on $CHECKN queries (pushdown vs exhaustive per-channel oracle)"
+# THE GATE RUNS WITH THE NORMALIZER OFF, AND THAT IS A LIMITATION, NOT A CHOICE.
+#
+# The oracle below computes `0.5*lex + 0.5*vec` from the two SRFs.  Since 2026-09-22
+# the shipping scorer divides each fuse() KEY by its own pre-scan ceiling
+# (doc/specs/FUSED_TOPK.md sect. 8d), and this oracle CANNOT express that objective:
+# the vector key's normalizer is available in SQL (max over segments of
+# weave_vec_scan_stats().maxscore, the same (B2) fold the scan uses), but the lexical
+# key's needs each term's max tf, and NOTHING in the SQL surface exposes max tf.  So
+# the exhaustive comparison is made against the raw objective, on the arm that still
+# computes it, and what it proves is that THE SCAN IS EXACT -- pivot selection,
+# partition, abandonment, summation -- for a given set of weight constants.  What it
+# does NOT check is the constants themselves; that is sql/fuse_degenerate.sql (6)
+# (bolt-count independence) plus the nDCG arms below.  doc/GAPS.md G46.
+GATESET="$SETUP SET pg_weave.fuse_normalize = off;"
+say "$DS: correctness gate on $CHECKN queries (pushdown vs exhaustive per-channel oracle, normalizer OFF -- see the comment)"
 BAD=0
 TIED=0
 FBDIFF=0
 while IFS=$'\t' read -r qid wq qv; do
-    got=$( { echo "$SETUP SET enable_seqscan = off;"; fused_sql "$wq" "$qv" 10; } \
+    got=$( { echo "$GATESET SET enable_seqscan = off;"; fused_sql "$wq" "$qv" 10; } \
            | psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A | sort -n | tr '\n' ' ')
 
     # The fallback, kept as a DIAGNOSTIC rather than a gate: the size of the
     # disagreement is sect. 7a (1) measured at corpus scale, which no test has done.
-    fb=$( { echo "$SETUP SET enable_indexscan = off; SET enable_bitmapscan = off;"; fused_sql "$wq" "$qv" 10; } \
+    fb=$( { echo "$GATESET SET enable_indexscan = off; SET enable_bitmapscan = off;"; fused_sql "$wq" "$qv" 10; } \
           | psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A | sort -n | tr '\n' ' ')
     [ "$got" = "$fb" ] || FBDIFF=$((FBDIFF + 1))
 
@@ -420,7 +434,7 @@ run_quality() {                 # run_quality <arm>
     local arm=$1 gen=$2 out="$OUT/run-$DS-$1.tsv"
     local sqlf; sqlf=$(mktemp)
     {
-        echo "$SETUP"
+        echo "$SETUP ${FUSE_ARM_PRE:-}"
         while IFS=$'\t' read -r qid wq qv; do
             printf "\\\\echo QID %s\n" "$qid"
             $gen "$wq" "$qv" "$QDEPTH"
@@ -434,8 +448,14 @@ run_quality() {                 # run_quality <arm>
     printf '%s\n' "$out"
 }
 
-say "$DS: quality pass, fused arm"
+say "$DS: quality pass, fused arm (normalizer ON, the shipping default)"
 RUN_FUSED=$(run_quality fused fused_sql)
+# THE SAME STATEMENT WITH THE NORMALIZER OFF, which is the arm every figure recorded
+# before 2026-09-22 was measured on.  It is here so that one run carries both
+# objectives: a re-run that cannot reproduce its own baseline is not an A/B (hard
+# rule 10), and the baseline is a GUC away rather than a rebuild away.
+say "$DS: quality pass, fused arm (normalizer OFF, the recorded baseline)"
+RUN_RAW=$(FUSE_ARM_PRE="SET pg_weave.fuse_normalize = off;" run_quality raw fused_sql)
 say "$DS: quality pass, RRF control arm"
 RUN_RRF=$(run_quality rrf rrf_sql)
 # The G44 normalization study, opt-in: two candidate objectives scored through the
@@ -460,7 +480,7 @@ work_of() {                     # work_of <gen> -- prints one TSV row
     local gen=$1
     local sqlf; sqlf=$(mktemp)
     {
-        echo "$SETUP"
+        echo "$SETUP ${FUSE_ARM_PRE:-}"
         echo "SELECT weave_fuse_stats_reset(); SELECT weave_work_stats_reset();"
         while IFS=$'\t' read -r qid wq qv; do
             $gen "$wq" "$qv" 10
@@ -475,8 +495,10 @@ work_of() {                     # work_of <gen> -- prints one TSV row
     rm -f "$sqlf"
 }
 
-say "$DS: work counters, fused arm"
+say "$DS: work counters, fused arm (normalizer ON)"
 W_FUSED=$(work_of fused_sql)
+say "$DS: work counters, fused arm (normalizer OFF)"
+W_RAW=$(FUSE_ARM_PRE="SET pg_weave.fuse_normalize = off;" work_of fused_sql)
 say "$DS: work counters, RRF control arm"
 W_RRF=$(work_of rrf_sql)
 
@@ -498,13 +520,19 @@ W_RRF=$(work_of rrf_sql)
 # conservative estimate and the one that can actually bound a claim.
 # ---------------------------------------------------------------------------
 say "$DS: latency, $LATN queries x $REPS reps, arms alternated, with an A/A leg"
-LAT_F=$(mktemp); LAT_R=$(mktemp); LAT_F2=$(mktemp)
+# A FOURTH LEG, added 2026-09-22: the fused arm with the normalizer OFF.  The
+# normalizer adds a pre-scan pass -- one LUT build and one directory fold per bolt
+# per vector key -- and nothing had measured it.  Alternated in the same rotation as
+# the others so drift cannot land on it, and reported as its own row: fused minus
+# fused_raw IS the normalizer's cost, measured rather than argued.
+LAT_F=$(mktemp); LAT_R=$(mktemp); LAT_F2=$(mktemp); LAT_RAW=$(mktemp)
 while IFS=$'\t' read -r qid wq qv; do
-    for leg in "fused_sql:$LAT_F" "rrf_sql:$LAT_R" "fused_sql:$LAT_F2"; do
-        gen=${leg%%:*}
-        dest=${leg#*:}
+    for leg in "fused_sql:$LAT_F:" "rrf_sql:$LAT_R:" "fused_sql:$LAT_F2:" "fused_sql:$LAT_RAW:SET pg_weave.fuse_normalize = off;"; do
+        gen=$(echo "$leg" | cut -d: -f1)
+        dest=$(echo "$leg" | cut -d: -f2)
+        pre=$(echo "$leg" | cut -d: -f3-)
         {
-            echo "$SETUP"
+            echo "$SETUP $pre"
             for _ in $(seq 1 "$REPS"); do
                 printf 'EXPLAIN (ANALYZE, TIMING OFF, SUMMARY ON) %s\n' "$($gen "$wq" "$qv" 10)"
             done
@@ -524,7 +552,8 @@ pctl() {                        # pctl <file> -- p50 TAB p99
 P_FUSED=$(pctl "$LAT_F")
 P_RRF=$(pctl "$LAT_R")
 P_FUSED2=$(pctl "$LAT_F2")
-rm -f "$LAT_F" "$LAT_R" "$LAT_F2"
+P_RAW=$(pctl "$LAT_RAW")
+rm -f "$LAT_F" "$LAT_R" "$LAT_F2" "$LAT_RAW"
 
 # ---------------------------------------------------------------------------
 # SCORE.  bench/ndcg.py excludes queries with no positive judgment and PENALIZES
@@ -532,6 +561,7 @@ rm -f "$LAT_F" "$LAT_R" "$LAT_F2"
 # ---------------------------------------------------------------------------
 Q_FUSED=$(python3 bench/ndcg.py --qrels "$DIR/qrels.tsv" --run "$RUN_FUSED" --k 10 --label fused | tail -1)
 Q_RRF=$(python3 bench/ndcg.py --qrels "$DIR/qrels.tsv" --run "$RUN_RRF" --k 10 --label rrf | tail -1)
+Q_RAW=$(python3 bench/ndcg.py --qrels "$DIR/qrels.tsv" --run "$RUN_RAW" --k 10 --label raw | tail -1)
 Q_MAXN=""; Q_MMN=""
 if [ -n "$RUN_MAXN" ]; then
     Q_MAXN=$(python3 bench/ndcg.py --qrels "$DIR/qrels.tsv" --run "$RUN_MAXN" --k 10 --label maxn | tail -1)
@@ -560,7 +590,7 @@ printf '\n### fuse_quality\n'
 # qrels, not per-arm measurements), so the table advertised two columns it never
 # filled -- which reads, in a results file, as two zeros nobody measured.
 printf 'label\tnqueries_scored\tndcg@10\trecall@100\tmrr@10\n'
-printf '%s\n%s\n' "$Q_FUSED" "$Q_RRF"
+printf '%s\n%s\n%s\n' "$Q_FUSED" "$Q_RAW" "$Q_RRF"
 # `fused` and `maxn` differ ONLY in the objective -- same index, same query set, same
 # per-channel scores, same scorer -- so the gap between those two rows is the whole
 # value of normalization, isolated.  `fused` reproducing its recorded number is also
@@ -577,10 +607,13 @@ printf 'rrf\t%s\t%s\t%s\n' "$P_RRF" "$LATN" "$REPS"
 # has to clear.  Reported as a row rather than folded into the fused numbers so
 # that nobody can average the two and lose the only estimate of spread there is.
 printf 'fused_aa\t%s\t%s\t%s\n' "$P_FUSED2" "$LATN" "$REPS"
+# The normalizer's cost: same statement, same rotation, one GUC apart.
+printf 'fused_raw\t%s\t%s\t%s\n' "$P_RAW" "$LATN" "$REPS"
 
 printf '\n### fuse_work\n'
 printf 'arm\tlex_contribs_fused_side\tlex_contribs_wand\tvec_lanes\tvec_blocks\tvec_blocks_bound_skipped\tfuse_scores_total\tpivots\tblkskip\trqskip\tpasses\truns\n'
 printf 'fused\t%s\n' "$W_FUSED"
+printf 'fused_raw\t%s\n' "$W_RAW"
 printf 'rrf\t%s\n' "$W_RRF"
 
 printf '\n### fuse_plans\n'
