@@ -1118,6 +1118,19 @@ chosen here** — the choice is the maintainer's:
     justification is already recorded as gone) is exactly that ordering, so **V13 and F8
     are not independent** — a conflict nothing in the tree had recorded before 2026-09-22.
 
+    **(c) IS DEAD, MEASURED 2026-09-23, and the conflict above is therefore moot.** It was
+    taken as a maintainer decision and withdrawn the same day without a line of format
+    code: `bench/code_scan.c` already had `order=clustered|natural` with a real k-means, so
+    one TSV→`.fvecs` converter answered it on the three BEIR corpora §8's nDCG row uses.
+    **0.00 % of blocks pruned and 100.00 % of lanes scored in BOTH orderings, on all three,
+    and 0.00 % at an ORACLE threshold** — the ceiling over every block ordering. The
+    clustered blocks are tighter by 4 % (mean radius 1.0436 → 0.9992, scifact) where the
+    bound needs **2.12–3.40×**; more clusters is worse, because at `lists > n/32` one
+    32-lane block spans several. `bench/RESULTS_CLUSTER_ORDER.md`. So F8's ascending-docid
+    contract is NOT reopened, V13 is withdrawn, and **(b) is the only structural option
+    left** — it attacks bytes-per-lane rather than lanes-touched, which this result says
+    nothing about.
+
 **AND AS OF 2026-09-22 (night) THIS IS NO LONGER ONLY THE `score()` ROW'S PROBLEM.** The EC2
 re-run measured the same mechanism costing **latency**: p99 fails at 0.710× / 0.612× / 1.000×
 (it passed at 0.609× / 0.560× / 0.633× on the raw sum) and fiqa's p50 is **1.172× the RRF

@@ -368,9 +368,22 @@ storage gate — or (c) a cluster-ordered weft, which contradicts the strictly-a
 requirement the fused vector channel depends on** (`include/weave/vecdocmap.h:35,105,122`).
 All three are maintainer decisions, ~~presented and not taken~~ **— (a) was TAKEN 2026-09-22 as
 a MEASUREMENT decision and did not rescue the row (in blocks the vector ratio is 1.000×,
-exactly as in lanes); (b) and (c) remain open, and one of them is the single blocker. Dated
+exactly as in lanes); (c) was TAKEN 2026-09-23 and WITHDRAWN THE SAME DAY BY MEASUREMENT;
+(b) is now the only one left, and it is the single blocker. Dated
 block below.** `doc/GAPS.md` **G46**,
 `doc/specs/FUSED_TOPK.md` **sect. 8d**.
+
+**(c) IS DEAD, MEASURED 2026-09-23 BEFORE IT WAS BUILT.** `bench/code_scan.c` already carried
+`order=clustered|natural` with a real k-means, so decision (c) cost one TSV→`.fvecs`
+converter and an hour instead of a page-format version bump, a 4-byte/doc docid→lane
+indirection, a merge path rewritten from merge-sort to re-clustering, and a reopened F8. On
+the three BEIR corpora the nDCG row uses: **0.00 % of blocks pruned and 100.00 % of lanes
+scored in BOTH orderings, and 0.00 % at an ORACLE threshold**, which is the ceiling over every
+possible block ordering. Clustering is not failing to happen — the clustered arm's mean block
+radius really is smaller (1.0436 → 0.9992 on scifact) — it is failing to matter, because the
+bound needs a **2.12–3.40×** smaller radius and gets 4 %. And the knob has no better setting:
+at `lists > n/32` one 32-lane block spans several clusters and the radius returns to the
+natural-order value. `bench/RESULTS_CLUSTER_ORDER.md`; V13 is withdrawn in `doc/PHASES.md`.
 
 **MEASURED ON EC2 2026-09-22 (night), run `pgweave-20260922-224507`: THE OWED LATENCY RE-RUN
 HAPPENED, AND IT IS A LOSS — §8 IS 2 OF 5, THE p99 ROW WENT FROM PASS TO FAIL, AND ON fiqa THE
