@@ -320,3 +320,112 @@ DBS="normsci normnf normfiqa" bash bench/gatesweep.sh
 ```
 
 Report: `/scratch/pg_weave/gatesweep/gatesweep-full.tsv`.
+
+## MEASURED ON A QUIET MACHINE, 2026-09-23: the latency curve falls, on every corpus, at every point
+
+Everything above is counters, and counters cannot close claim 3. The claim is that a
+query gets **faster**; a user does not feel a pivot count. This is the latency half,
+on EC2 `c7i.8xlarge` (32 vCPU / 64 GB), us-east-2, commit `3076580`, ext 0.20.0,
+PG17, real all-MiniLM-L6-v2 embeddings computed on the instance, the same three BEIR
+corpora loaded through the same `bench/fuse.sh` loader the work pass used
+(`FUSE_LOAD_ONLY=1`, added for this). `k=10`, weights `{0.5,0.5}`, 25 queries × 7
+reps × **2 slots per point**, first rep of each statement dropped.
+
+| corpus | sel 1.000 | sel 0.100 | sel 0.010 | sel 0.001 |
+|---|---|---|---|---|
+| scifact (5,183) p50 ms | 2.547 | 1.941 | 0.799 | 0.359 |
+| | 1.000× | 0.762× | 0.314× | **0.141× (7.1× faster)** |
+| nfcorpus (3,633) p50 ms | 1.575 | 1.203 | 0.581 | 0.275 |
+| | 1.000× | 0.764× | 0.369× | **0.175× (5.7× faster)** |
+| fiqa (57,600) p50 ms | 26.400 | 19.677 | 6.283 | 1.911 |
+| | 1.000× | 0.745× | 0.238× | **0.072× (13.8× faster)** |
+
+**p99 moves with p50 rather than against it**, which is the result that would have
+killed the claim had it gone the other way — a scan that wins on the median by
+deferring work into the tail has not made anything faster. scifact 1.000× / 0.662× /
+0.276× / 0.134×; nfcorpus 1.000× / 0.737× / 0.361× / 0.182×; fiqa 1.000× / 0.682× /
+0.227× / 0.074×.
+
+**Nine of nine gated points fall, and every step clears its own noise floor by at
+least 21×** (hard rule 10, and the A/A leg here is per *point* because this sweep has
+no competitor — each point is measured once in the first rotation and again in the
+second, after every other point has run):
+
+| corpus | step | Δp50 ms | A/A spread ms | Δ / A/A |
+|---|---|---|---|---|
+| scifact | 1.000 → 0.100 | 0.606 | 0.029 | 21× |
+| | 0.100 → 0.010 | 1.142 | 0.010 | 114× |
+| | 0.010 → 0.001 | 0.440 | 0.001 | 440× |
+| nfcorpus | 1.000 → 0.100 | 0.372 | 0.007 | 53× |
+| | 0.100 → 0.010 | 0.622 | 0.011 | 57× |
+| | 0.010 → 0.001 | 0.306 | 0.010 | 31× |
+| fiqa | 1.000 → 0.100 | 6.723 | 0.132 | 51× |
+| | 0.100 → 0.010 | 13.394 | 0.002 | 6,697× |
+| | 0.010 → 0.001 | 4.372 | 0.001 | 4,372× |
+
+### The number to quote is 5.7–13.8×, NOT 1,000×, and the reason is the more useful part
+
+The pivot and `score()` columns fall as selectivity *exactly* — 1.000× / 0.101× /
+0.010× / 0.001×, three digits, measured above. Latency does not, and anyone reading
+the work table alone would over-promise by two orders of magnitude. What latency
+actually tracks is the **blocks-scored** column, the one this document already
+predicted from `1 − (1−s)^32` before measuring it:
+
+| corpus | quantity | 0.100 | 0.010 | 0.001 |
+|---|---|---|---|---|
+| scifact | blocks scored | 0.969× | 0.265× | 0.031× |
+| | **p50 latency** | **0.762×** | **0.314×** | **0.141×** |
+| | pivots | 0.100× | 0.010× | 0.001× |
+| nfcorpus | blocks scored | 0.868× | 0.272× | 0.035× |
+| | **p50 latency** | **0.764×** | **0.369×** | **0.175×** |
+| fiqa | blocks scored | 0.961× | 0.272× | 0.031× |
+| | **p50 latency** | **0.745×** | **0.238×** | **0.072×** |
+
+Latency sits **between** the two curves and hugs the block curve: at the 0.010 point
+it is within 1.2–1.4× of blocks-scored on all three corpora, and 24–37× away from
+pivots. So the design's own cost model — a 32-lane block is the unit of vector work,
+and a gate at selectivity `s` still touches `1 − (1−s)^32` of them — is the model that
+predicts what a user experiences. The pivot count is real work and it really does fall
+1,000×; it is simply not what the clock is measuring.
+
+This also bounds the remaining upside honestly. Latency falls *less* than blocks at
+the 0.001 point (0.072–0.175× against 0.031–0.035×), and the gap is the work that is
+selectivity-independent: `weave_fuse_vec_warpmap()` is O(nvec) with an 8 B/doc palloc
+per query per bolt, and both it and the block directory are read in full on every scan
+regardless of the gate (see the CORRECTION section above). At the most selective point
+that residue is most of what is left. **The warp map is therefore the next lever, and
+this is the measurement that says so** — it is worth little on an unfiltered query and
+nearly everything on a highly selective one, which is the opposite of the intuition
+that would prioritise it by profile share alone.
+
+### What this run does not establish
+
+- **Still a lexical predicate.** Every point is `body @@@ term`; `WEAVE_CH_DOCVALS`
+  remains a reserved page kind, so `WHERE category = 'x'` cannot reach the index. The
+  "What this cannot see" section above applies unchanged, and it is the largest gap
+  between what claim 3 says and what has been measured.
+- **Small corpora.** 3,633 / 5,183 / 57,600 documents. Hard rule 11's second scale is
+  satisfied *within* this run in the sense that three corpora spanning 16× agree, and
+  the largest is also the one with the steepest curve — but nothing here is a million
+  rows, and the fixed residue that limits the 0.001 point is the part most likely to
+  amortise differently at scale.
+- **One k, one weights vector, one embedding model**, as before.
+- **The host failed one regression test.** `installcheck` reported `1 of 19` — the G27
+  vacuum-rewrite pin, which passed locally only because the planner there chose a
+  sequential scan (fixed in `a254a3e`). The numbers above stand because that test is a
+  96-row vacuum pin and this sweep never vacuums, but the *harness* had no business
+  continuing: it piped `make installcheck` into `tail`, so the failure was recorded and
+  ignored. `run_smoke` is now fatal on a red installcheck and the override has to be
+  asked for by name. **This paragraph is the disclosure, not a footnote** — it is the
+  first EC2 run in this project whose host is known to have been red, and the reason it
+  is known is that the run found the defect that had been hiding every previous one.
+
+### Reproduce (EC2)
+
+```sh
+AWS_PROFILE=hotdog AWS_REGION=us-east-2 FUSE_DATASETS="scifact nfcorpus fiqa" \
+  FUSE_LIMIT=200000 LATN=25 REPS=7 bash bench/aws/run.sh c7i.8xlarge gatesweep
+```
+
+Artefacts: `bench/aws/out/<run>/gatesweep-{scifact,nfcorpus,fiqa}.tsv` (work) and
+`gatesweep-lat-*.tsv` (latency, one row per point per slot).
