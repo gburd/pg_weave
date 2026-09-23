@@ -334,6 +334,29 @@ the hard way:
 | `make check-pdlower` | reading `pd_lower` anywhere but `weave_page_entry_end()` in `include/weave/am.h`. That value comes off disk on a page held under a share lock, so forming `page + pd_lower` is UB before any dereference. **Added 2026-09-16 after the upstream review**: pg_fts 1.7.0 fixed one such site (an impossible merge allocation that left the index permanently unvacuumable), 1.7.1 found eight siblings and concluded "I should have grepped the siblings then". This repo had the helper *first* and still had four stragglers — one of them a genuine out-of-bounds **read**: `src/pages/trgm_page.c` computed `avail = pd_lower - contents_offset` as an unsigned `Size`, so a torn page underflowed it to a huge value, and the `Min()` against the remaining blob length then clamped it to a length spanning the whole page *chain*. It could not overrun the destination buffer, which is exactly why it read safe. The lint is the grep, made permanent |
 | ~~`make check-unity`~~ | **DELETED by task L1.** It guarded the `src/am/am.c` unity build against someone adding the three `#include`d `.c` files to `OBJS` and getting duplicate symbols. L1 split the file, so all three are ordinary translation units in `OBJS` and the failure mode the target existed to catch is structurally gone -- there is no `#include` of a `.c` file left to conflict with. Keeping the target would have required inverting it, and an inverted guard asserts the absence of a mistake nobody is positioned to make |
 
+**AN OPTION LIST IS A CACHE, AND IT GOES STALE — 2026-09-23, and it cost a maintainer
+decision.** `doc/specs/FUSED_TOPK.md` §8d listed three structural options for the vector
+work row, one of which (cluster-order the weft) `doc/PHASES.md` **V13** had recorded as
+*already refuted* since 2026-09-13 — same experiment, 0.00 % on real corpora, natural order
+measuring the same 0.00 %. The option list was never updated, the decision was taken from
+the option list, and an hour of measurement was spent re-deriving a conclusion the tree
+already held. Two rules follow, and the second is the one that generalizes past option
+lists:
+
+- **Before presenting options for a decision, grep each option for its own status row.**
+  A task id (V13 here) is where a refutation lands; a prose option list in a spec is where
+  it does not.
+- **When two documents in this tree disagree about whether something is settled, the one
+  with the task id and the gate is the newer claim** — status is maintained per task, and
+  narrative sections are written once and re-read forever.
+
+*The same review also caught a recommendation of mine that had not been measured*: "page
+traffic would follow the blocks-scored curve" ignored two structures that are read in full
+on every scan (the block directory and the warp map), so the real win is 1.8–4.3× rather
+than 32×, and the on-disk index it proposed is probably unnecessary because the chain
+measures 98.3 % dense. A recommendation is a claim, and hard rule 9 applies to it as much
+as to a design.
+
 ## Hard rules
 
 **1. Channel contracts (C1)–(C6) in `include/weave/channel.h` are correctness.**
