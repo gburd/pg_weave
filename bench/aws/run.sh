@@ -93,6 +93,11 @@ case "$JOB" in
 	# sentence-transformer model cache at ~500 MB -- 250 leaves headroom instead
 	# of prepdata.py dying partway through a download.
 	fuse) VOLGB=${VOLGB_OVERRIDE:-250} ;;
+	# vecmerge loads the same 1M x 960-d GIST corpus the cold jobs use (~4 GB of
+	# fvecs, ~4 GB of heap plus toast) and then builds a weave index over it AND
+	# merges it, so at peak it holds the index, its merge output, and the staging
+	# table at once.  Same 400 as the other GIST jobs for the same reason.
+	vecmerge) VOLGB=${VOLGB_OVERRIDE:-400} ;;
 esac
 REGION=$(aws configure get region --profile "$PROFILE")
 RUN=pgweave-$(date -u +%Y%m%d-%H%M%S)
@@ -1124,6 +1129,97 @@ SQL
 	say "p0 merge A/B done -- see $OUT/p0_merge.log"
 }
 
+run_vecmerge() {
+	# Hard rule 12's gate for the VECTOR weft's merge and vacuum paths, which until
+	# 2026-09-23 did not exist: no job in this file built a vector-carrying weave
+	# index at scale, and no job called weave_check() at all.  See bench/vecmerge.sh
+	# for what is asserted and why; this function is the EC2 wrapper plus the
+	# mutation control, which has to live here because the host has no git history.
+	fetch_gist
+
+	say "vecmerge: clean arm, ${NROWS:-1000000} x 960-d, build + $((${NBATCH:-4})) merges + 3 vacuums"
+	# Artifacts are pulled BEFORE the status check, so a failure still yields the
+	# per-stage weave_check output that says which invariant broke.
+	$SSH "cd pg_weave && OUT=\$HOME/out NROWS=${NROWS:-1000000} \
+			BATCH=${BATCH:-50000} NBATCH=${NBATCH:-4} DELFRAC=${DELFRAC:-10} \
+			bash bench/vecmerge.sh" 2>&1 | tee "$OUT/vecmerge.log"
+	rc=${PIPESTATUS[0]}
+	$SSH 'cd ~/out && tar cf - .' | tar xf - -C "$OUT" 2>/dev/null || true
+	$SSH 'cd /scratch/vecmerge && tar cf - check.*.tsv' | tar xf - -C "$OUT" 2>/dev/null || true
+	[ "$rc" = 0 ] || die "vecmerge.sh failed (see $OUT/vecmerge.log)"
+
+	# ---------------------------------------------------------------- control
+	#
+	# THE CLEAN ARM ABOVE PROVES NOTHING ON ITS OWN.  weave_check() reporting no
+	# violations is exactly what an invariant that cannot fire also reports, and this
+	# project has now shipped three gates that reported on something other than the
+	# thing under test (AGENTS.md, eleventh and twelfth members).  So: break the
+	# writer by one page, rebuild, rebuild the index, and require weave_check() to
+	# NAME the violation.
+	#
+	# `+ 2` rather than `+ 1` deliberately.  A one-page error can land on the
+	# block's own second strip page, whose header claims the same block, and the
+	# invariant would correctly pass; two pages clears a two-page block.  This is the
+	# same mutation the local control uses, so the two are comparable.
+	#
+	# A SMALLER CORPUS, and that is not a weakening: the mutation is in a per-block
+	# store, so every block in the index carries it and the first one found fails the
+	# check.  What the small arm cannot tell you is whether the invariant scales,
+	# which the clean arm above already answered.
+	say "control: mutating the code-page pointer by +2 pages"
+	$SSH 'set -e
+		cd pg_weave
+		sed -i "s/rec\.firstpage = (weave_uint32) BufferGetBlockNumber(codes\.buf);/rec.firstpage = (weave_uint32) BufferGetBlockNumber(codes.buf) + 2;/" \
+			src/vector/vecwrite.c
+		grep -q "BufferGetBlockNumber(codes.buf) + 2;" src/vector/vecwrite.c \
+			|| { echo "MUTATION DID NOT APPLY -- the sed pattern no longer matches"; exit 1; }
+		echo "mutation applied:"; grep -n "codes.buf) + 2" src/vector/vecwrite.c' \
+		2>&1 | tee "$OUT/mutant_setup.log" || die "could not apply the mutation"
+
+	# ASSERT THE MUTANT BUILT.  A mutation harness that treats "the check did not
+	# succeed" as "the mutation was caught" reports a compile error as a pass; that
+	# happened here for real on a V7 leg (AGENTS.md).  `with_llvm=no` because PGXS's
+	# bitcode step on this image aborts and leaves a half-written bitcode directory
+	# that later kills backends in unrelated tests.
+	$SSH 'set -e
+		cd pg_weave
+		make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config with_llvm=no 2>&1 | tail -20
+		test -f pg_weave.so || { echo "MUTANT DID NOT BUILD"; exit 1; }
+		sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config with_llvm=no >/dev/null
+		sudo -u postgres pg_ctlcluster 17 main restart
+		echo "mutant built and installed"' \
+		2>&1 | tee -a "$OUT/mutant_setup.log" || die "the mutant did not build"
+
+	say "control: the mutated writer must be caught by weave_check()"
+	# THE SQL GOES OVER AS A FILE.  Quoting a string literal through a single-quoted
+	# ssh argument, a remote shell and psql has already cost this harness two
+	# debugging rounds (see the tuning step and run_p0merge's backtick note), and the
+	# failure mode here is the worst kind: `"mut doc"` is a valid IDENTIFIER, so a
+	# mis-quoted literal is a column-does-not-exist error at best and a silently
+	# different test at worst.
+	$SSH 'cat > /tmp/mut.sql' <<'MUTSQL'
+DROP TABLE IF EXISTS vmut;
+CREATE TABLE vmut (id int, d wdoc, v wvec(960));
+INSERT INTO vmut SELECT id, to_wdoc('mut doc ' || id), v FROM vmsrc WHERE id <= 200000;
+CREATE INDEX vmut_weave ON vmut USING weave (d, v) WITH (metric = 'ip');
+\echo === weave_check on the mutant ===
+SELECT invariant, ok, detail FROM weave_check('vmut_weave', true) WHERE NOT ok;
+MUTSQL
+	$SSH 'psql -X -q -v ON_ERROR_STOP=1 -f /tmp/mut.sql' \
+		2>&1 | tee "$OUT/mutant_check.log" || true
+
+	# The control passes only if the check FAILED, and only if it failed for the
+	# right reason.  `grep firstpage` rather than `grep -c '^f'`: an unrelated
+	# violation would satisfy "not clean" while proving nothing about this field.
+	if grep -q 'firstpage' "$OUT/mutant_check.log"; then
+		say "control PASSED: weave_check() named the firstpage violation"
+	else
+		cat "$OUT/mutant_check.log" >&2
+		die "control FAILED: the mutated writer was NOT caught -- every clean result
+		     in this run is therefore uninformative about firstpage"
+	fi
+}
+
 run_bound() {
 	# The measurement from bench/RESULTS_BOUND_PRUNING.md, on real hardware and
 	# over more dimensions than a laptop run covers.  This is the number the
@@ -1158,6 +1254,9 @@ case "$JOB" in
 	# number is taken off it, which is this project's own rule about correctness
 	# preceding latency applied to the machine rather than to the code.
 	fuse)       run_smoke; run_fuse ;;
+	# run_smoke first for the same reason: it is where `sudo make install` happens,
+	# and vecmerge's whole output is weave_check(), which needs the extension.
+	vecmerge)   run_smoke; run_vecmerge ;;
 	all)     run_smoke; run_bound; run_lexical ;;
 	*)     die "unknown job: $JOB" ;;
 esac
