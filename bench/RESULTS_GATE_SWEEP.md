@@ -258,6 +258,42 @@ wrong answer. **Measure the hit rate on a merged and vacuumed index before choos
 that is the case where the density argument is weakest; if it collapses there, the on-disk
 index is still the fallback plan at 0.125 B/doc.
 
+## MEASURED AFTER THE FIX, 2026-09-23 (night): the page curve now moves
+
+G27 is implemented -- `WeaveVecDirRec` carries `firstpage`, the code cursor seeks to it,
+and the VMETA version went 2 -> 3. Buffers for the same query, same guards, same fixture,
+before and after, at 0.1 % selectivity:
+
+| corpus | unfiltered (before / after) | gated 0.1 % (before / after) | gain |
+|---|---|---|---|
+| scifact | 1199 / 1199 | 1045 / **513** | **2.04x** |
+| fiqa | 9111 / 9111 | 8727 / **1823** | **4.79x** |
+
+The projection this file made before the change was 1.8x / 4.3x, from geometry plus the
+lexical-only ablation. Measured: 2.04x / 4.79x. The **unfiltered** arm is unchanged to
+within one buffer, which is the control that matters: with no predicate a fused scan visits
+every block, so the seek has nothing to skip and must cost nothing.
+
+**The correctness evidence is a diff, not an argument.** All twelve rows of
+`bench/gatesweep.sh`'s counters -- pivots, lexical contributions, vector `score()` calls,
+gate scores, lanes, blocks, `blkskip`, `rqskip`, vetoes, abandonments -- are
+**bit-identical** before and after on all three corpora. The change alters which pages are
+READ, not which blocks are scored, and the counters say so in the strongest available form.
+
+Also verified on the paths hard rule 12 names: `weave_check()` reports **0 failing
+invariants** on a fresh build, on a three-bolt index, after `weave_merge()`, and after a
+`DELETE` + `VACUUM` rewrite, and the fused scan answers on the rewritten weft. Positive
+control for the new invariant: a writer mutated to store `firstpage + 2` makes
+`weave_check()` report *"bolt 0 block 0: firstpage 251 is not a code page carrying this
+block"* and makes the scan **refuse** rather than score another block's codes.
+
+*And one process note, because it cost twenty minutes and is the AGENTS.md
+stale-artifact family wearing yet another hat:* after reverting the mutant and rebuilding,
+the **running cluster still had the mutant library loaded** -- `lpg.sh` was never restarted
+-- so the next run's failures were the positive control still firing, on what looked like
+clean code. The tell was that the stored pointer was exactly `correct + 2`. A source revert
+is not a deployed revert.
+
 ## What this cannot see
 
 - **The predicate is a lexical term, not a scalar facet.** `WEAVE_CH_DOCVALS` is a declared

@@ -1060,7 +1060,38 @@ conclusion independent of which of `amgettuple` / `amgetbitmap` the planner pick
 someone adds a path that reads a heap page directly, property 2 is what breaks, and
 no test will say so.
 
-### G27 — the codes chain has no block→page index, so a skipped block still costs its page reads — **OPEN 2026-09-17, found by V8; PROMOTED 2026-09-23 to the single structural fix §8's vector row needs**
+### G27 — the codes chain has no block→page index, so a skipped block still costs its page reads — **FIXED 2026-09-23** (implemented, measured, invariant-checked; hard rule 12's scale run is owed)
+
+**FIXED, and by the design the third attempt arrived at: one `weave_uint32 firstpage` in
+`WeaveVecDirRec`** (284 -> 288 bytes, records per directory page unchanged at 28, so zero
+extra pages), `WEAVE_VMETA_VERSION` 2 -> 3 with v2 refused as v1 already was, a validated
+O(1) seek in the code cursor, and a `weave_check()` invariant.
+
+*Measured on the shipping scan,* buffers for a fused query at 0.1 % selectivity:
+**scifact 1045 -> 513 (2.04x)**, **fiqa 8727 -> 1823 (4.79x)**, against a pre-registered
+projection of 1.8x / 4.3x. The unfiltered arm is unchanged to within one buffer, which is
+the control: with no predicate every block is visited, so the seek must cost nothing.
+
+*Answer-preserving, by diff rather than by argument:* all twelve rows of
+`bench/gatesweep.sh`'s work counters are **bit-identical** before and after on all three
+corpora -- pivots, lexical contributions, vector `score()`, gate scores, lanes, blocks,
+`blkskip`, `rqskip`, vetoes, abandonments.
+
+*Checked on the paths that matter:* `weave_check()` reports 0 failing invariants on a fresh
+build, a three-bolt index, after `weave_merge()`, and after a `DELETE` + `VACUUM` rewrite,
+and the fused scan answers on the rewritten weft. Positive control: a writer mutated to
+store `firstpage + 2` makes `weave_check()` say *"bolt 0 block 0: firstpage 251 is not a code
+page carrying this block"* and makes the scan **refuse** rather than score another block's
+codes. `make check-standalone`, `installcheck-pg17`, `installcheck-pg18` and `tap-pg17` all
+pass; `test/hegel/test_vecpage.c`'s record-size pin was updated from 284 to 288 with the
+records-per-page assertion left beside it, because that pair is what proves the field was
+free.
+
+**Owed:** hard rule 12's scale run -- this touches merge and vacuum, and local green is not
+evidence for those. `bench/RESULTS_GATE_SWEEP.md` carries the numbers and the three refuted
+designs.
+
+*Original entry follows.*
 
 **2026-09-23: this gap is now the recommended fix for something much bigger than it was
 filed as, and it got there by measurement rather than argument.** `bench/gatesweep.sh`

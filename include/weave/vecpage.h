@@ -127,6 +127,41 @@ typedef struct WeaveVecDirRec
 	float		minnorm;		/* min ||v|| over live lanes (L2 bound) */
 	float		censcale;		/* the centroid's own renormalization scale */
 	float		cenrad;			/* R, bound (B3) */
+
+	/*
+	 * THE BLOCK'S FIRST STRIP PAGE -- what makes a scan able to READ only the
+	 * blocks it will score (doc/GAPS.md G27, measured in
+	 * bench/RESULTS_GATE_SWEEP.md).  Without it the code cursor walks the whole
+	 * WEAVE_PK_VCODES chain from `codestart`, so a predicate that cuts scored
+	 * blocks 32x cuts page traffic by 1.0x: 502 / 515 / 502 / 424 buffers measured
+	 * at 100 % / 10 % / 1 % / 0.1 % selectivity, flat.
+	 *
+	 * HERE, AND NOT IN A CHAIN OF ITS OWN, because it is free here and is not
+	 * there.  Records per directory page is
+	 * (WEAVE_VECPAGE_PAYLOAD - sizeof(WeaveVecDirHdr)) / sizeof(WeaveVecDirRec)
+	 * = 8144 / 284 = 28 before this field and 8144 / 288 = 28 after it, so the
+	 * directory occupies exactly the same pages -- verified against a real index,
+	 * where ceil(162/28) = 6 and ceil(1800/28) = 65 are the directory page counts
+	 * measured inside the scifact and fiqa code spans.  A separate chain would add
+	 * a page kind, a root in WeaveVecMeta, its own pages and its own reads.
+	 *
+	 * NOT DERIVABLE BY ARITHMETIC, which is why it is stored.  `codestart + b *
+	 * strips_per_block` was measured over the states that matter: 94 % correct on a
+	 * freshly merged weft, 100 % after a second merge, and 5 % after a DELETE +
+	 * VACUUM rewrite (maximum deviation 213 pages), because a rewrite draws
+	 * recycled pages from the FSM.  Two rewrites of one table disagreed, so the
+	 * distribution is a function of the index's vacuum history, not of the writer.
+	 *
+	 * A STALE VALUE IS A WRONG ANSWER, NOT AN ERROR -- it sends a scan at another
+	 * block's codes -- so it belongs to the same maintenance rule as the five bound
+	 * fields below, and weave_check() asserts that it names a WEAVE_PK_VCODES page
+	 * claiming this block.  The reader additionally re-validates on every seek: the
+	 * code cursor already refuses a page whose header does not carry the block the
+	 * block-major order calls for, which turns a corrupt pointer into a refusal
+	 * rather than a silently wrong distance.
+	 */
+	weave_uint32 firstpage;
+
 	float		lane[2 * WEAVE_VEC_BLOCK];	/* interleaved (scale, norm) per lane,
 											 * the WeaveVecLane pair flattened so
 											 * this header needs no backend type */

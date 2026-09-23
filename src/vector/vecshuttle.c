@@ -350,14 +350,37 @@ code_cur_block(VecCodeCursor *c, bool want, const char **why)
 /*
  * Assemble block `target`, walking (and validating) every block between without
  * scattering any of them.  Forward-only.
+ *
+ * `firstpage` is the target block's own first strip page, from its directory record
+ * (G27).  When it is usable the intervening blocks are not visited at all, which is
+ * the whole point: a gated fused scan scores a small fraction of the blocks and used
+ * to read every page of every one it skipped.  `0` means "no pointer" and keeps the
+ * original walk, so the two paths differ only in which pages are READ -- the block
+ * this returns, and every validation it passes, are identical either way.
+ *
+ * THE JUMP IS NOT TRUSTED.  A pointer off disk could name any page, so it is bounds
+ * checked here and then verified by code_cur_block()'s existing refusal of a page
+ * whose header does not carry the block the block-major order calls for.  A corrupt
+ * pointer is therefore a refusal, never a distance computed from another block's
+ * codes.  Seeking also resets the cycle guard: `npages` counts pages this cursor has
+ * read, and a seek makes the walked-page count no longer an upper bound on progress.
  */
 static bool
-code_cur_advance(VecCodeCursor *c, uint32 target, bool want, const char **why)
+code_cur_advance(VecCodeCursor *c, uint32 target, weave_uint32 firstpage,
+				 bool want, const char **why)
 {
 	if (target < c->blockno)
 	{
 		*why = "the vector code cursor cannot go backwards";
 		return false;
+	}
+	if (firstpage != 0 && firstpage != WEAVE_METAPAGE_BLKNO &&
+		(BlockNumber) firstpage < RelationGetNumberOfBlocks(c->w->index))
+	{
+		c->blk = (BlockNumber) firstpage;
+		c->blockno = target;
+		c->npages = 0;
+		return code_cur_block(c, want, why);
 	}
 	while (c->blockno < target)
 		if (!code_cur_block(c, false, why))
@@ -483,7 +506,7 @@ vec_load_block(VecShuttle *vs, uint32 b)
 
 	avail = vec_block_avail(vs, b, &vs->rec, vs->nlanes);
 	want = (avail != 0);
-	if (!code_cur_advance(&vs->code, b, want, &why))
+	if (!code_cur_advance(&vs->code, b, vs->rec.firstpage, want, &why))
 		vec_shuttle_fail(vs, "the code chain", why);
 
 	vs->onblock = true;

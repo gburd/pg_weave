@@ -1040,6 +1040,62 @@ wvck_vector(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 				break;
 			}
 
+			/*
+			 * `firstpage` IS A LOCATION, NOT A STATISTIC (doc/GAPS.md G27).
+			 * weave_vecblock_stats() computes the record from a block's codes and
+			 * cannot know which page those codes came from, so the field is copied
+			 * across before the memcmp and verified directly below instead.
+			 *
+			 * Copied rather than skipped, because the alternative is a memcmp over a
+			 * struct with one field the recomputation cannot fill -- which fails on
+			 * EVERY block and makes weave_check() useless while looking thorough.
+			 * That is exactly what happened the first time this field existed.
+			 */
+			fresh.firstpage = stored.firstpage;
+
+			/*
+			 * And here is the invariant that makes a stale pointer detectable at
+			 * all.  A wrong `firstpage` is not an error at scan time, it is a WRONG
+			 * ANSWER: the scan would read another block's codes and compute a
+			 * distance in the right units from the wrong documents.  The scan's own
+			 * guard (the code cursor refuses a page whose header does not claim the
+			 * block the block-major order calls for) turns that into a refusal, but
+			 * only for the blocks a given query happens to visit.  This visits all
+			 * of them.
+			 */
+			{
+				Buffer		fpbuf;
+				Page		fppage;
+				bool		fpok;
+
+				if (stored.firstpage == 0 ||
+					(BlockNumber) stored.firstpage == WEAVE_METAPAGE_BLKNO ||
+					(BlockNumber) stored.firstpage >=
+					RelationGetNumberOfBlocks(cx->index))
+				{
+					ok = false;
+					appendStringInfo(&d, "%sbolt %u block %u: firstpage %u is not a block of this relation",
+									 d.len > 0 ? "; " : "", s, b,
+									 stored.firstpage);
+					break;
+				}
+				fpbuf = ReadBuffer(cx->index, (BlockNumber) stored.firstpage);
+				LockBuffer(fpbuf, BUFFER_LOCK_SHARE);
+				fppage = BufferGetPage(fpbuf);
+				fpok = (!PageIsNew(fppage) &&
+						WeavePageHasKind(fppage, WEAVE_PK_VCODES) &&
+						((const WeaveVecStripHdr *) PageGetContents(fppage))->blockno == b);
+				UnlockReleaseBuffer(fpbuf);
+				if (!fpok)
+				{
+					ok = false;
+					appendStringInfo(&d, "%sbolt %u block %u: firstpage %u is not a code page carrying this block",
+									 d.len > 0 ? "; " : "", s, b,
+									 stored.firstpage);
+					break;
+				}
+			}
+
 			if (memcmp(&fresh, &stored, sizeof(WeaveVecDirRec)) != 0)
 			{
 				ok = false;

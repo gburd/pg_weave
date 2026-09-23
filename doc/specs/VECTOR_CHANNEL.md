@@ -565,17 +565,36 @@ vacuum's lane update both do exactly that. Block-major keeps single-block access
 `ceil(dim/coords_per_page)` pages (2 at 960-d) and still gives V15's prefix stage its
 `m/dim` byte reduction, at the cost of a strided rather than sequential read.
 
-**Correction, from V7's reader: single-block access is not O(1) today, it is O(pages
-in the weft).** Block-major makes a block's strips *consecutive* on the code chain,
-but nothing records *where* they start, and `WeaveVecDirRec` is full at 284 bytes --
-fixed by the O(1)-addressing requirement the directory exists for -- so there is no
-room to record it without a format change. `weave_vec_block_read()` therefore walks
-from `codestart` and takes the strips whose header names the block it wants. V7's
-callers (`weave_check()`, the round-trip test, `weave_vec_strips()`) walk the whole
-weft anyway, so it costs them nothing; **V10's rerank window and vacuum's lane update
-cannot afford it, and the task that needs them owes the format an index over the
-strips.** Stated here rather than left implicit because the block-major argument above
-is what makes single-block access sound cheap, and by itself it does not.
+~~**Correction, from V7's reader: single-block access is not O(1) today, it is O(pages
+in the weft).**~~ **FIXED 2026-09-23 (doc/GAPS.md G27), and the fix is one field.**
+Block-major makes a block's strips *consecutive* on the code chain, and
+`WeaveVecDirRec` now **records where they start** -- `firstpage`, validated on every
+seek by the code cursor's existing refusal of a page whose header does not carry the
+block the block-major order calls for, and by `weave_check()` over every block. So
+single-block access is O(1) at last: the directory page is computable, and the record
+on it names the strip page.
+
+*The paragraph this replaces said there was "no room to record it without a format
+change", which was true and stopped one step short.* The record grew 284 -> 288 bytes
+and **records per page did not move** -- `8144/284` and `8144/288` both floor to 28 --
+so the directory occupies exactly the same pages it did, verified against a real index
+(6 directory pages for scifact's 162 blocks, 65 for fiqa's 1,800). The format change
+was real, it was free in pages, and the VMETA version went 2 -> 3 with v2 refused like
+v1 before it.
+
+*Why not arithmetic instead of a stored pointer:* `codestart + b * strips_per_block` was
+measured on the states that matter and hits 94 % on a freshly merged weft, 100 % after
+a second merge, and **5 % after a `DELETE` + `VACUUM` rewrite** (deviation up to 213
+pages), because a rewrite draws recycled pages from the FSM. Two rewrites of one table
+disagreed, so addressability is a function of the index's vacuum history rather than of
+the writer. `bench/RESULTS_GATE_SWEEP.md`.
+
+*What it bought, measured on the shipping scan:* buffers for a fused query at 0.1 %
+selectivity fell **1045 -> 513 on scifact (2.0x)** and **8727 -> 1823 on fiqa (4.8x)**,
+with all twelve rows of `bench/gatesweep.sh`'s work counters **bit-identical** before
+and after -- the fix changes which pages are read, not which blocks are scored, and the
+counters prove it. V10's rerank window and vacuum's lane update can now afford
+single-block access; they could not before.
 
 **The slicing is asserted end to end, at a dim that slices.** `weave_vec_strips()`
 reports every code page's header as stored, and `sql/vecindex.sql` pins the
@@ -591,10 +610,13 @@ and a writer that ignored the strip plan's `j0` entirely passed everything.
 first strip" rule is unimplementable at the declared maximum. Instead:
 
 - **The fixed part goes in a block directory**: `WeaveWarp firstwarp`, `uint32
-  livemask`, the four bound floats, and the 32 `WeaveVecLane` sidecars. 284 bytes at
-  every `dim`, so directory record `i` is at a computable page and offset -- O(1),
-  which is what "score block `i`" needs. 28 records per page; 3,125 blocks at
-  n=1M/960-d is 112 pages against 3,847 pages of codes, under 3 %.
+  livemask`, the four bound floats, the 32 `WeaveVecLane` sidecars, and (since G27)
+  `firstpage`, the block's first strip page. **288 bytes** at every `dim`, so directory
+  record `i` is at a computable page and offset -- O(1), which is what "score block
+  `i`" needs. Still 28 records per page, because `8144/284` and `8144/288` both floor
+  to 28: the pointer that makes single-block CODE access O(1) cost zero directory
+  pages. 3,125 blocks at n=1M/960-d is 112 pages against 3,847 pages of codes, under
+  3 %.
 - **The centroid code becomes strips of its own**, sliced by coordinate exactly like
   the lanes and written after the block's code strips. It is an input to bound (B3)
   only, and `bench/RESULTS_BOUND_PRUNING.md` measured that bound pruning **0.00 %**

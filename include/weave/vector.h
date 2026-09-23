@@ -207,7 +207,23 @@ typedef struct WeaveVecMeta
  * version ever wrote a v1 weft: the vector weft and this change are both after tag
  * v2026.09.06, so the refusal is reachable only from a working tree.
  */
-#define WEAVE_VMETA_VERSION		2
+#define WEAVE_VMETA_VERSION		3
+
+/*
+ * 3 since G27's block->page pointer: WeaveVecDirRec gained `firstpage`, which moved
+ * every record's offset on a directory page (record `i` is at `i * sizeof(rec)`), so
+ * a v2 directory page cannot be parsed by this build and is REFUSED exactly as a v1
+ * weft is -- doc/CONVENTIONS.md decision 3 again, and for a stronger reason: a
+ * best-effort read would misparse every record after the first and hand the scanner
+ * bounds belonging to other blocks, which is a wrong answer rather than an error.
+ *
+ * THE REFUSAL COSTS NOTHING RELEASED.  The only tag that exists is v2026.09.06, at
+ * extension 0.3.0, which predates the vector weft entirely (the weft writers landed
+ * after it, and the weft's SQL surface first appears in the 0.7.0 -> 0.8.0 script).
+ * So no released version ever wrote a v2 weft either, and the same sentence the v1
+ * note above could make still holds: the refusal is reachable only from a working
+ * tree, whose indexes are rebuilt with REINDEX.
+ */
 
 #define WEAVE_VMETA_F_NORMALIZED	0x01	/* inputs were unit-normalized at
 											 * build; cosine == ip */
