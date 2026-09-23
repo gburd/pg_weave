@@ -987,9 +987,16 @@ The two-failure framing below is the 2026-09-22 daytime state and stays as histo
 win is real and defensible: p99 0.56–0.63×, with an A/A leg (hard rule 10) putting the
 within-arm spread at 0.001–0.013 ms against between-arm deltas 170–714× larger.
 
-**MS MARCO is still missing** (`doc/GAPS.md` G45): the source `prepdata.py` fetches now
-returns HTTP 404. §8 names it, so the nDCG row is incomplete as well as failed — though a
-fourth dataset cannot turn three losses into a win.
+**~~MS MARCO is still missing~~ THE SOURCE IS RESTORED, the dataset is still UNMEASURED**
+(`doc/GAPS.md` G45, fixed 2026-09-23): only `queries.dev.small.tsv` had 404'd — the qrels,
+the collection and `queries.tar.gz` all still answer, and dev.small is by definition the
+subset of `queries.dev.tsv` named by the qrels, so `prepdata.py` now reconstructs it
+exactly (6,980 of 6,980 qids matched; a `--limit 20000` fixture builds with
+`nqrels_dropped 0`). What is owed is the RUN: every recorded number is
+`all-MiniLM-L6-v2` and `fuse.sh` refuses hash embeddings, so §8's dataset row is
+unmeasured rather than blocked. A fourth dataset still cannot turn three losses into a
+win — and since 2026-09-22 the three are wins, so it cannot turn three wins into four
+either until it is run.
 
 **G43 is FIXED**, and by nothing this paragraph originally predicted: the vector channel
 was innocent, no bound was too low, and the decisive next step named here (a `cassert`
@@ -1007,6 +1014,8 @@ still has no run behind, and neither is F2's: **nDCG on ≥ 2 public datasets** 
 both arms, so this is a run, not a build.~~ **SUPERSEDED: the run happened, on three BEIR
 corpora with a real RRF control — see the measured table above. nDCG is no longer
 unmeasured, it is LOST (G44); MS MARCO is no longer unmeasured, it is unfetchable (G45).**
+**— and G45's half of that is SUPERSEDED 2026-09-23: the source is fetchable again (one
+file of the set had gone, not the hosting), so MS MARCO is back to plain unmeasured.**
 
 **~~The property-test hole G43 named is still open~~ RETRACTED: it does not exist.**
 `test/hegel/test_vecbound.c` asserts both bound forms by name — B1 against
