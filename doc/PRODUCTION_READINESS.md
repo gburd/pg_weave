@@ -385,6 +385,38 @@ bound needs a **2.12–3.40×** smaller radius and gets 4 %. And the knob has no
 at `lists > n/32` one 32-lane block spans several clusters and the radius returns to the
 natural-order value. `bench/RESULTS_CLUSTER_ORDER.md`; V13 is withdrawn in `doc/PHASES.md`.
 
+**DECISION REVIEW, 2026-09-23, asked for explicitly and answered against the measurements
+rather than against the reasoning that produced them.** Three decisions were taken that day.
+
+- **(c) cluster-ordered weft + reopen F8 — WRONG, and the refuting evidence was already in
+  this tree.** `doc/PHASES.md` V13 had recorded the same experiment's 0.00 % since
+  2026-09-13; `FUSED_TOPK.md` §8d carried (c) as live anyway, and the decision was taken
+  from §8d. Cost: one hour, no code, and two results the older entry did not have (the
+  oracle-theta ceiling, and `lists` being non-monotone). The withdrawal is now **complete**
+  rather than partial: cluster ordering had three possible payoffs — tighter bounds
+  (measured dead), cluster probing (ruled out by V9's 4-bit measurement), and candidate
+  contiguity (dead by construction, because a fused scan's candidate set is defined by the
+  gate, not by vector similarity). Recorded as a stale-option-list failure in `AGENTS.md`.
+- **Upstream reports as committed docs — correct**, and cheap to revisit since they are
+  unpushed.
+- **Deferring the EC2 re-run — correct, and it looks better in hindsight than when it was
+  taken.** The two measurements that landed afterwards (cluster ordering, the gate sweep)
+  both changed what an EC2 run should measure; a paid run that morning would have measured
+  the pre-correction hypothesis, and the gated latency curve claim 3 needs was not yet in
+  any harness.
+
+**And the recommendation that replaced (c) needed correcting too, which is the more useful
+half of this review.** "Page traffic would follow the blocks-scored curve (0.031×)" was
+wrong: the block directory and the warp map are read in full on every scan regardless of the
+gate, so the real projection is **1.8× / 4.3× fewer total query buffers** (0.06–0.07× of the
+vector weft), measured from geometry and confirmed by a lexical-only ablation that puts the
+vector channel at 61 % of scifact's buffers and 89 % of fiqa's. The *direction* survives —
+addressing, not layout, and the vector-major copy stays dominated — but the on-disk index is
+probably unnecessary: the code chain measures **98.3–98.5 % dense**, so a speculative
+`codestart + b × strips_per_block` validated by the cursor's existing check, with a fallback
+to the chain walk, gets the same win for zero format change. Hit rate on a merged and
+vacuumed index is the measurement that decides it.
+
 **MEASURED ON EC2 2026-09-22 (night), run `pgweave-20260922-224507`: THE OWED LATENCY RE-RUN
 HAPPENED, AND IT IS A LOSS — §8 IS 2 OF 5, THE p99 ROW WENT FROM PASS TO FAIL, AND ON fiqa THE
 FUSED ARM IS SLOWER THAN THE RRF CONTROL IT EXISTS TO REPLACE.** `c7i.8xlarge` (32 vCPU),

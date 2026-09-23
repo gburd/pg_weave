@@ -117,6 +117,40 @@ failed twice — on GIST-960d and GloVe-200d (`bench/RESULTS_CODE_SCAN.md`, 0.00
 - **`bits=4`.** One width, the ratified one. A wider code tightens B1 (2.234, useless here),
   not B2 or B3.
 
+## Completeness check (added 2026-09-23, after the fact): cluster ordering had THREE possible payoffs, and only one was measured above
+
+The run above measures the **bound** leg. A reviewer asking "is that the only way cluster
+ordering could have paid?" deserves the other two named, because a refutation that covers
+one of three mechanisms is not a refutation.
+
+1. **Tighter block bounds** → measured dead above: 0.00 % in both orderings and 0.00 % at
+   an oracle threshold, with the required radius 2.12–3.40× below the best achievable.
+2. **Cluster PROBING (IVF): visit only the clusters near the query.** Ruled out elsewhere
+   and not re-measured here — `doc/PHASES.md` **V9** is demoted on the sibling project's
+   1M × 1024-d measurement that 4-bit flat beats `lists=1024` IVF at *every* recall target,
+   with 4-bit IVF's recall ceiling at 0.959 under any rerank window. 4 bits is pg_weave's
+   ratified width, so this is a measurement at the shape that ships, not an extrapolation.
+3. **Candidate CONTIGUITY: "so a query's candidates are contiguous and a block probe is not
+   wasted"** — the wording option (c) actually used in `FUSED_TOPK.md` §8d. This one is dead
+   by construction and the argument is short: in a fused scan the candidate set is defined
+   by the **gate** (the predicate), not by vector similarity, so an ordering derived from
+   vector clusters cannot make it contiguous. And without a gate the candidate set is *every
+   document*, where contiguity means nothing. `bench/RESULTS_GATE_SWEEP.md` is the measurement
+   of what the gated candidate set actually costs, and the lever there is an addressing
+   change, not an ordering.
+
+All three legs are closed, so the withdrawal is complete rather than partial.
+
+**One process note, because it is the more expensive mistake of the two made here.**
+`doc/PHASES.md` V13 had recorded since **2026-09-13** that the bound prunes 0.00 % on real
+corpora *with one k-means cluster per block*, and that natural order measures the same
+0.00 % — the same experiment this file re-ran. `FUSED_TOPK.md` §8d nonetheless carried (c)
+as a live option with no mention of it, and the decision was taken from §8d. Two documents
+in one tree disagreed about whether an option was already refuted, and the option list was
+the stale one. The measurement cost an hour and produced two things the 2026-09-13 entry did
+not have — the oracle-theta ceiling, and the non-monotonicity in `lists` — so it was not
+wasted. But the cheaper move was to read our own V13 row first.
+
 ## Consequence for the maintainer decision of 2026-09-23
 
 The decision was "cluster-ordered weft, and reopen F8". **It is withdrawn before

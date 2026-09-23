@@ -1146,6 +1146,18 @@ chosen here** — the choice is the maintainer's:
     does not reduce the page count for a scattered candidate set at all.
     `bench/RESULTS_GATE_SWEEP.md`.
 
+    **(d) CORRECTED the same day on both numbers and mechanism, and the corrections are in
+    `bench/RESULTS_GATE_SWEEP.md` under a named heading.** The win is **1.8× / 4.3× fewer
+    total query buffers** (0.06–0.07× of the vector weft), not 0.031×: the block directory
+    and the warp map are read in full on every scan regardless of the gate, and the original
+    projection forgot both. An ablation against a lexical-only arm does confirm the premise —
+    the vector channel is 61 % of scifact's buffers and 89 % of fiqa's. And the on-disk index
+    is probably unnecessary: the code chain measures **98.3–98.5 % dense** with the slack being
+    exactly the interleaved directory pages, so `codestart + b × strips_per_block` works as a
+    *speculative* address validated by the check the cursor already makes, falling back to the
+    chain walk — zero format change, no migration. Measure the hit rate on a merged and
+    vacuumed index first.
+
   - **THE UNFILTERED ROW DESERVES A STATED PROOF RATHER THAN A REPEATED FAILURE.** At
     `s = 1` both arms perform an exhaustive vector scan: the RRF control's vector branch is
     a flat top-k′, and the fused arm cannot do better, because the only two mechanisms that

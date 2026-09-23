@@ -141,6 +141,91 @@ selectivity instead of 1.000×.
 unnecessary: the claim is measurably true in CPU work today and the one structure that
 makes it true in I/O is a 0.125 B/doc additive index, not a redesign.
 
+## CORRECTION 2026-09-23 (same day): the projection above was too good, and the fix is cheaper than the one recommended
+
+Hard rule 13 says a retraction gets a named home at the original claim. This section is
+that home, and it revises the recommendation this file made a few hours earlier in two
+ways — one against it, one for it. The finding that page traffic is flat while scored
+blocks fall 32× is **unchanged**; what changes is the size of the available win and the
+implementation that gets it.
+
+### 1. "Page traffic would follow the blocks-scored column, 0.031×" — WRONG. The floor is ~0.06×, and in TOTAL query terms 1.8–4.3×.
+
+Two structures are read **in full on every scan regardless of the gate**, and the original
+projection forgot both:
+
+- **The block directory.** The directory cursor is forward-only like the code cursor, and
+  with the normalizer ON a *second* transient directory cursor runs in
+  `weave_vec_shuttle_begin()` to fold the weft's max score (the G44 normalizer's vector
+  `N_key`). scifact 6 pages, fiqa 65.
+- **The warp map.** `weave_fuse_vec_warpmap()` (`src/am/amscan.c:7620`) walks **every**
+  lane of the bolt to build `docid[]` and `allow[]` — O(nvec) page reads plus an 8-byte
+  per-document allocation, per query, per bolt, before any gating happens. scifact 6
+  pages, fiqa 57.
+
+So the achievable vector-page figure at `s = 0.001` is not `0.031 ×` of the weft but
+`(dir + warp + vmeta + scored_blocks × strips_per_block) / weft_pages`.
+
+### 2. The ablation that should have been run first: is the vector chain even the dominant page cost?
+
+It is, and it grows with scale — but the measurement was owed before a recommendation, not
+after. Same queries, same guards, buffers summed from `EXPLAIN (ANALYZE, BUFFERS)`; the
+vector channel's marginal cost is the fused arm minus a lexical-only arm on the same
+predicate:
+
+| | scifact unfiltered | scifact gated 0.1 % | fiqa unfiltered | fiqa gated 0.1 % |
+|---|---|---|---|---|
+| fused total | 1199 | 1045 | 9111 | 8727 |
+| lexical-only | 470 | 482 | 966 | 978 |
+| **vector marginal** | **729** | **563 (0.77×)** | **8145** | **7749 (0.95×)** |
+
+The vector channel is **61 %** of scifact's buffers and **89 %** of fiqa's, and its own page
+cost falls to 0.77× / 0.95× under a 1000× tighter predicate while its scored blocks fall to
+0.031×. Both halves of the original finding survive; the premise behind the recommendation
+is now measured instead of assumed.
+
+Corrected projection, from the measured geometry (`weave_vec_meta`, `weave_vec_strips`:
+2 strip pages per block on both corpora):
+
+| corpus | weft pages | floor (dir+warp+vmeta) | scored blocks at 0.1 % | vector pages after the fix | vector ratio | **total query buffers** |
+|---|---|---|---|---|---|---|
+| scifact | ~337 | 13 | 5 | ~23 | 0.07× | 705 → ~391 (**1.8×**) |
+| fiqa | ~3,723 | 123 | 56 | ~235 | 0.06× | ~4,556 → ~1,068 (**4.3×**) |
+
+**So the honest claim is 1.8–4.3× fewer buffers on these corpora, rising with corpus size,
+not 32×.** And after the fix the *floor* is the warp map, which is then the largest
+selectivity-independent term (57 of fiqa's 235) — a lazily built or range-restricted warp
+map becomes the next question, not a new one to answer now.
+
+### 3. The recommended implementation was the more expensive of two, and the cheaper one needs no format change at all
+
+The recommendation was a new on-disk block→page index at 0.125 B/doc — which still beats
+the vector-major copy by 768×, so the conclusion against (b) stands. But the on-disk index
+is not required, because the layout is **already nearly addressable**, measured on the real
+local indexes with `weave_vec_strips()`:
+
+| corpus | code pages | first | last | span | density | interleave |
+|---|---|---|---|---|---|---|
+| scifact | 324 | 506 | 834 | 329 | 98.5 % | 5 non-code pages inside the span |
+| fiqa | 3,600 | 2,085 | 5,748 | 3,664 | 98.3 % | 64 non-code pages inside the span |
+
+The slack is **exactly** the interleaved directory pages (scifact has 6 directory pages,
+1 at `dirstart` and 5 inside the code span; fiqa 65, 1 + 64), because the two chains are
+appended concurrently by `vec_chain_append()` — one directory page per 28 blocks, i.e. one
+per 56 code pages. That is not a formula to rely on, but it does not have to be:
+
+> **`codestart + b × strips_per_block` as a SPECULATIVE address, validated by the check the
+> cursor already makes ("page k of block b must claim block b",
+> `src/vector/vecshuttle.c:230`), falling back to the chain walk on a miss.**
+
+Zero on-disk bytes, no new page kind, no `WEAVE_VMETA` version bump, no migration script,
+no expected-output regeneration — and the fallback keeps it correct under FSM page reuse,
+which is the objection that ruled out arithmetic in the first place. With 98.3 % density the
+speculative address misses about 1 time in 57 and a miss costs one wasted page read, not a
+wrong answer. **Measure the hit rate on a merged and vacuumed index before choosing**, since
+that is the case where the density argument is weakest; if it collapses there, the on-disk
+index is still the fallback plan at 0.125 B/doc.
+
 ## What this cannot see
 
 - **The predicate is a lexical term, not a scalar facet.** `WEAVE_CH_DOCVALS` is a declared

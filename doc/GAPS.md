@@ -1078,10 +1078,33 @@ the only remaining option for `FUSED_TOPK.md` §8's vector work row:
 | vector-major second copy | bytes touched within a block | **96–192 B** | **no** — each survivor is on its own page |
 | **block→page index (this gap)** | which pages are read at all | **0.125 B** (one `BlockNumber` per 32-lane block) | **yes** |
 
-7.2 KB — one page — for fiqa's 1,800 blocks. See `bench/RESULTS_GATE_SWEEP.md`. And the
-contiguity shortcut is not available: `weave_new_buffer()` can hand out recycled FSM pages,
-so `codestart + b·strips_per_block` is unsound and an index is required rather than
-arithmetic.
+7.2 KB — one page — for fiqa's 1,800 blocks. See `bench/RESULTS_GATE_SWEEP.md`.
+
+**CORRECTED the same day, twice, and both corrections matter to whoever implements this.**
+
+*The ratio was overclaimed.* Page traffic cannot follow the blocks-scored column to 0.031×,
+because two structures are read in full on every scan regardless of the gate: the block
+**directory** (forward-only cursor, and with the normalizer ON a second transient cursor
+folds the weft max score) and the **warp map** (`weave_fuse_vec_warpmap()`,
+`src/am/amscan.c:7620`, walks every lane to build `docid[]`/`allow[]`). Measured geometry
+(`weave_vec_meta`, `weave_vec_strips`: 2 strip pages per block) gives the real projection at
+`s = 0.001`: vector pages 337 → ~23 on scifact and ~3,723 → ~235 on fiqa, i.e. **0.06–0.07×
+of the weft**, and in total query buffers **1.8× / 4.3×** — rising with corpus size. An
+ablation against a lexical-only arm confirms the premise the recommendation rested on: the
+vector channel is **61 %** of scifact's buffers and **89 %** of fiqa's.
+
+*And the on-disk index may not be needed at all.* Measured with `weave_vec_strips()` on the
+real local indexes, the code chain is **98.3–98.5 % dense** (scifact 324 pages in a 329-page
+span, fiqa 3,600 in 3,664), and the slack is **exactly** the interleaved directory pages —
+one per 28 blocks, because `vec_chain_append()` appends both chains concurrently. So
+`codestart + b × strips_per_block` works as a **speculative** address, validated by the check
+the cursor already performs ("page k of block b must claim block b",
+`src/vector/vecshuttle.c:230`), with a fallback to the chain walk on a miss. That is zero
+on-disk bytes, no page kind, no `WEAVE_VMETA` bump, no migration, no expected-output churn,
+and it stays correct under FSM page reuse — which was the objection that ruled out
+arithmetic. A miss costs one wasted page read, roughly 1 in 57. **Measure the hit rate on a
+MERGED and VACUUMED index before choosing**, because that is where the density argument is
+weakest; the 0.125 B/doc on-disk index remains the fallback design.
 
 *Original entry follows.*
 
