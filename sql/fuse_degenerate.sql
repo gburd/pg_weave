@@ -349,6 +349,13 @@ SELECT id FROM fb
  ORDER BY fuse(d <=> 'alpha beta'::wquery, d <=> 'gamma'::wquery,
                weights => '{1,1}') LIMIT 10;
 
+-- THE STATISTIC THE GATE'S ORACLE NEEDS (doc/GAPS.md G46), captured while the index
+-- still has two bolts.  `weave_index_max_tf()` reports the maximum over EVERY segment,
+-- which is the value the fused normalizer uses, so 'beta' -- present in the first bolt
+-- only -- must already read 6 here rather than 0.
+CREATE TEMP TABLE b_mtf_before AS
+SELECT weave_index_max_tf('fb_weave', 'alpha beta gamma'::wquery) AS mtf;
+
 SELECT weave_merge('fb_weave') IS NOT NULL AS merged;
 SELECT weave_index_nsegments('fb_weave') = 1 AS one_bolt_after_merge;
 
@@ -363,6 +370,29 @@ SELECT (SELECT array_agg(id ORDER BY id) FROM b_multi)
        = (SELECT array_agg(id ORDER BY id) FROM b_one)
        AS bolt_independent;
 
-DROP TABLE b_multi, b_one;
+-- ---------------------------------------------------------------------------
+-- (6a) weave_index_max_tf() -- and the invariance the normalizer rests on.
+--
+-- A merge rewrites every posting list and renumbers every docid, but the maximum tf
+-- of a term over the WHOLE index cannot change, because the max over segments of a
+-- per-segment maximum is the max over the merged segment.  That is precisely why the
+-- normalizer can be computed before the first bolt is scanned and still be one
+-- constant for the query (section (6) above), so it is asserted rather than assumed:
+-- if this equality ever fails, the fused ranking depends on the segment layout again
+-- and the merge stops being answer-preserving.
+--
+-- The absolute values are pinned too, because an equality alone would also hold if
+-- both sides were zero -- the shape of a gate that cannot fail.
+-- ---------------------------------------------------------------------------
+SELECT (SELECT mtf FROM b_mtf_before)
+       = weave_index_max_tf('fb_weave', 'alpha beta gamma'::wquery)
+       AS max_tf_survives_the_merge,
+       weave_index_max_tf('fb_weave', 'alpha beta gamma'::wquery) AS max_tf_values,
+       weave_index_max_tf('fb_weave', 'nosuchtermanywhere'::wquery) AS max_tf_absent,
+       array_length(weave_index_max_tf('fb_weave', 'alpha beta gamma'::wquery), 1)
+       = array_length(weave_index_df('fb_weave', 'alpha beta gamma'::wquery), 1)
+       AS zips_with_df;
+
+DROP TABLE b_multi, b_one, b_mtf_before;
 DROP TABLE fb;
 RESET max_parallel_workers_per_gather;

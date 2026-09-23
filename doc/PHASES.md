@@ -825,8 +825,9 @@ dramatically (fiqa `blkskip` 0 → 4,096,432) and still does not reduce the vect
 lane count, because in `WEAVE_PACK_LANE` reading one lane touches every byte of its block —
 scoring 1 lane costs the same memory traffic as scoring 32
 (`bench/RESULTS_CODE_SCAN.md:330,417`). So V13/V14/V15/V18 are no longer the only frame for
-this row. **Three options, named here and NOT chosen — this is a maintainer decision and no
-task id is invented for it:** (a) restate §8's row in the unit the layout has, **blocks or
+this row. **Three options, named here and ~~NOT chosen — this is a maintainer decision and no
+task id is invented for it:~~ (a) was TAKEN 2026-09-22 as a MEASUREMENT decision, (b) and (c)
+remain open; see the dated decisions below:** (a) restate §8's row in the unit the layout has, **blocks or
 bytes** rather than lanes; (b) a second **vector-major** copy of the codes, forfeiting the
 storage gate; (c) **cluster-order the weft** so candidates are contiguous, which contradicts
 the strictly-ascending-docid requirement the fused vector channel depends on
@@ -854,7 +855,7 @@ verified, no orphaned volumes, keys or security groups.
 | nDCG@10 | ≥ RRF | 1.053× | 1.010× | 1.114× | 0.982× / 0.924× / 0.687× | **MET** |
 | p99 latency | ≤ 0.70× | 0.710× | 0.612× | **1.000×** | 0.609× / 0.560× / 0.633× | **FAIL on two of three — WAS PASS** |
 | p50 latency | ≤ 0.50× | 0.710× | 0.827× | **1.172×** | 0.582× / 0.795× / 0.578× | **FAIL**, fiqa slower than the control |
-| `score()` calls | ≤ 0.20× | 0.571× | 0.875× | 0.513× | 0.648× / 0.903× / 0.541× | **FAIL** |
+| ~~`score()` calls~~ | ≤ 0.20× | 0.571× | 0.875× | 0.513× | 0.648× / 0.903× / 0.541× | **FAIL — and the row is SUPERSEDED 2026-09-22 by the per-channel restatement below; the unit changed, the verdict did not** |
 
 **So the gate is 2 of 5 (recall, nDCG) and it was 2 of 5 before the normalizer (recall, p99):
 THE CHANGE TRADED p99 FOR nDCG.** The normalizer's own p50 cost, same statement one GUC apart,
@@ -872,8 +873,10 @@ contributing channel. **And the work row therefore cannot stand in for the laten
 gate rows moved in opposite directions. `FUSED_TOPK.md` §8 now carries the recommendation that
 a work row count **pivots** as well as `score()` calls.
 
-**Two maintainer decisions are open, presented and not taken, and no task id is invented for
-either.** (1) **Should `pg_weave.fuse_normalize` stay ON by default?** On: the ranking beats RRF
+**~~Two maintainer decisions are open, presented and not taken, and no task id is invented for
+either.~~ BOTH DECIDED 2026-09-22 — the presentation stays as written because it is what the
+decisions were made from, and no task id is invented for either.** (1) **Should
+`pg_weave.fuse_normalize` stay ON by default?** On: the ranking beats RRF
 on three corpora and the scan is slower than RRF on the largest. Off: the scan is fast (p99
 passes) and the ranking loses to RRF on all three, which is the state that made
 `ARCHITECTURE.md` §9 claim 2 unsupported to begin with. The GUC is `PGC_USERSET`, so a user can
@@ -883,6 +886,57 @@ cluster-ordered weft — which is now the **single blocker for three of the five
 `score()`) rather than one, and of which (a) cannot help p50 or p99 at all because the clock does
 not care what unit a gate is written in. `bench/RESULTS_FUSE.md` (fourth measurement),
 `doc/GAPS.md` **G44**, `doc/specs/FUSED_TOPK.md` **sect. 8b** and **8d**.
+
+**DECIDED 2026-09-22 — both of them, and the gate does not move: it is still 2 of 5.**
+
+  1. **`pg_weave.fuse_normalize` STAYS ON BY DEFAULT.** A user chooses a **ranking**, not a
+     scan strategy: off, the fused objective loses to a plain RRF control on all three corpora
+     measured (0.982× / 0.924× / 0.687×), and a fused scan that ranks worse than the two-query
+     control it replaces has no reason to exist; on, it beats RRF everywhere measured (1.053× /
+     1.010× / 1.114×). **The price is recorded, not hidden:** p99 **PASS → FAIL** (0.609× /
+     0.560× / 0.633× → 0.710× / 0.612× / 1.000×), p50 0.582× / 0.795× / 0.578× → 0.710× /
+     0.827× / 1.172×, fiqa slower than the control. `PGC_USERSET` means a deployment can have
+     the old trade per query or per session, **which is why this is a default and not a fork in
+     the design**, and the latency regression is **not accepted as permanent** — it is charged
+     to the single blocker below.
+  2. **§8's work row is RESTATED per channel**, each channel in its own unit: lexical **BM25
+     contributions** (gate ≤ 0.20×), vector **CODE BLOCKS READ** against the control's own code
+     scan (gate ≤ 0.20×), and **pivots per query reported but NOT gated**, because the RRF
+     control has no pivot loop and there is nothing to take a ratio against. Forced by two
+     measurements: a one-lane read in `WEAVE_PACK_LANE` touches every byte of its block, so a
+     **lane is not a unit of cost and a block is** (measured in the V15/V16 work,
+     `bench/RESULTS_CODE_SCAN.md:330,417`); and the lane-based row said normalization made the
+     fused arm *cheaper* on all three datasets while the clock said fiqa's p50 **doubled**,
+     which is a work row that cannot predict the row it stands in for. The pivot count is what
+     tracks the clock (fiqa pivots 5.3×, p50 2.0×). **The restatement does NOT rescue the row**
+     — in blocks the vector ratio is **1.000×**, exactly as in lanes — so it buys honesty about
+     the unit, not a pass. This is §8d's option (a), taken as a **measurement** decision only.
+
+**The work row in the new units** (local, deterministic, `bench/normprod.sh` with
+`PHASES=work`; the harness computes the ratios itself in both `bench/normprod.sh` and
+`bench/fuse.sh` and the two agree to the digit on nfcorpus):
+
+| row | gate | scifact | nfcorpus | fiqa | |
+|---|---|---|---|---|---|
+| lexical work: BM25 contributions | ≤ 0.20× | 0.203× | 0.380× | **0.052×** | **MET on fiqa**, missed on the other two (scifact just over) |
+| vector work: **code blocks read** | ≤ 0.20× | 1.000× | 1.000× | 1.000× | **FAIL everywhere** |
+| pivots per query | *reported, not gated* | 5,183 | 3,627 | 57,572 | corpora of 5,183 / 3,633 / 57,600 documents — **a full pass over the docid space** |
+
+**The abandonment fact, because it explains both halves at once: incremental abandonment fires
+constantly, not rarely** — on fiqa **36,709,890 abandonments over 37,306,460 pivots, 0.98 per
+pivot** — and that is what produced the lexical improvement (2.8× fewer BM25 contributions). It
+cannot help the vector channel for an arithmetic reason: the fused core sorts scored channels by
+**descending weighted ceiling** (`src/am/fuse.c:163-165`) and abandons on
+`s + csuffix[j+1] <= theta` (`:716`), so the vector channel — weight **0.4947** against
+**0.0110** per lexical channel after normalization — is summed **first** and scored before any
+abandonment test runs. **Reversing the order is DEAD ON ARITHMETIC, not on effort:** the test
+would be `s_lex + w_vec * block_max_vec <= theta`, and `w_vec * block_max` is ~0.49 against a
+theta of ~0.11, so it can never fire; it would still be dead at k = 10 rather than the ladder's
+k = 128. Recorded so nobody spends a week on it. And a per-block vector bound carries no
+information on L2-normalized data ((B1), (B2), (B3) all ≈ 1.0 unless a block is coherent in
+direction), so **the single blocker is the size of the vector channel's candidate set**, and it
+runs through (b) or (c) above. `bench/RESULTS_FUSE.md` (fifth measurement), `doc/GAPS.md`
+**G44**, `doc/specs/FUSED_TOPK.md` **sect. 8** and **8d**.
 
 **Phase F is therefore NOT claimable**, and the two failures have different characters:
 

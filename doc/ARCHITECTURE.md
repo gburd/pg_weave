@@ -499,13 +499,33 @@ Four things, and it should claim exactly four things:
    BEIR corpora with the nfcorpus caveat, and "NO OVER-FETCH IS ALSO CHEAPER" MAY NOT BE STATED
    AT ALL** — not as measured, not as expected, not hedged. It is measured, and on the largest
    corpus in the set it is false. The §8 gate is **2 of 5** (recall, nDCG) and was **2 of 5**
-   before the normalizer (recall, p99): **the change traded p99 for nDCG.** A maintainer
-   decision is open on whether `pg_weave.fuse_normalize` should stay on by default — on, the
+   before the normalizer (recall, p99): **the change traded p99 for nDCG.** ~~A maintainer
+   decision is open on whether~~ **[DECIDED 2026-09-22: it stays on — see the dated note
+   below.]** `pg_weave.fuse_normalize` should stay on by default — on, the
    ranking wins and the scan is slower than RRF on fiqa; off, the scan is fast and the ranking
    loses on all three, which is the state that made this claim unsupported in the first place —
    and the third route, a smaller vector candidate set, is now the **single blocker for three of
    the five rows**. The GUC is `PGC_USERSET`, so a user can already choose per query.
    `doc/GAPS.md` **G44** and **G46**, `doc/specs/FUSED_TOPK.md` **sect. 8b** and **8d**.
+
+   **DECIDED 2026-09-22, AND THIS CLAIM GAINS NOTHING FROM IT — the note is here so nobody
+   reads a settled decision as a new claim.** The maintainer decided that
+   `pg_weave.fuse_normalize` **stays on by default**, with the price named rather than
+   absorbed: the ranking half of this claim is bought at **p99 FAIL** (0.710× / 0.612× /
+   1.000×, where the raw sum passed at 0.609× / 0.560× / 0.633×) and **p50 0.710× / 0.827× /
+   1.172×**, fiqa slower than the control. The reason recorded with the decision is that a
+   user chooses a **ranking**, not a scan strategy, and with the normalizer off this claim's
+   ranking half is simply false (0.982× / 0.924× / 0.687×); the GUC is `PGC_USERSET`, so the
+   old trade is available per query. **What does not change is the work-reduction half: it
+   remains UNSUPPORTED in the restated units too.** §8's work row was restated the same day
+   into per-channel units — lexical BM25 contributions, **vector code blocks read**, and
+   pivots per query reported but not gated — and **the vector ratio is 1.000× in blocks
+   exactly as it was in lanes**, with the normalized arm pivoting once per document in the
+   corpus (5,183 / 3,627 / 57,572 against 5,183 / 3,633 / 57,600). The lexical half is met on
+   fiqa alone (0.052×). So "no over-fetch is also cheaper" still **may not be stated**, and
+   the sentence this claim is allowed to make is the one above, unchanged. `doc/GAPS.md`
+   **G44**, `doc/specs/FUSED_TOPK.md` **sect. 8** and **8d**, `bench/RESULTS_FUSE.md` (fifth
+   measurement).
 3. Queries that get **faster** as predicates get more selective, because the
    predicate is pushed into the SIMD block mask instead of collapsing recall.
    (The "graph traversal" half of this sentence is stale — the Vamana plan was
