@@ -1080,6 +1080,66 @@ the only remaining option for `FUSED_TOPK.md` §8's vector work row:
 
 7.2 KB — one page — for fiqa's 1,800 blocks. See `bench/RESULTS_GATE_SWEEP.md`.
 
+**MEASURED VERDICT AND CHOSEN DESIGN, 2026-09-23 (evening). The speculative address is
+REFUTED and the third option is better than both of the first two.**
+
+*The speculative `codestart + b × strips_per_block` is dead.* `/scratch/pg_weave/addrprobe.sql`
+built the three states that matter from real 384-d vectors and measured the hit rate of the
+guess (interleave-corrected) against the truth from `weave_vec_strips()`:
+
+| state | blocks | naive hit | interleaved hit | max deviation |
+|---|---|---|---|---|
+| fresh build, then merged | 162 | 28 | **152 (94 %)** | 22 pages |
+| after `DELETE` + `VACUUM` (tombstone rewrite) | 122 | 6 | **6 (5 %)** | **213 pages** |
+| after a second merge | 162 | 28 | **162 (100 %)** | 0 |
+
+A vacuum rewrite draws recycled pages and destroys addressability — 5 %, which is worse than
+useless: a validated guess that misses pays the fallback walk *plus* the wasted read, and a
+long-lived index accumulates exactly these segments. So the earlier "no format change needed"
+correction is itself **retracted**; the density argument held only for the states that had
+never been vacuumed.
+
+*And the on-disk index chain this gap was filed as is not the cheapest fix either.* Put the
+pointer in the directory record that every scan already addresses in O(1):
+
+> **`WeaveVecDirRec` gains one `weave_uint32 firstpage`, the block's first strip page.**
+
+The arithmetic is why this is the answer, and it is exact rather than approximate.
+`weave_vecdir_recs_per_page()` is `(usable − sizeof(WeaveVecDirHdr)) / sizeof(WeaveVecDirRec)`
+with `usable = WEAVE_VECPAGE_PAYLOAD = 8152`, so it is `8144 / 284 = 28` today and
+`8144 / 288 = 28` with the extra field. **The directory occupies the same number of pages
+before and after** — confirmed against the relation, since `ceil(162/28) = 6` and
+`ceil(1800/28) = 65` are exactly the interleaved-page counts measured inside the code spans.
+
+| option | new page kind? | extra pages | survives a vacuum rewrite? |
+|---|---|---|---|
+| vector-major second copy | no | **+96–192 B/doc** | n/a — does not address page count |
+| separate block→page index chain (as filed) | **yes** | +0.125 B/doc | yes |
+| speculative address + validation | no | 0 | **NO — 5 % hit rate** |
+| **`firstpage` in `WeaveVecDirRec`** | **no** | **0** | **yes** |
+
+Implementation shape, in the order it has to be built:
+
+1. `include/weave/vecpage.h`: the field, and a `WEAVE_VMETA_VERSION` bump so a reader can
+   tell a populated `firstpage` from a zero one. **Old wefts keep the chain walk** — the
+   doclen-sidecar precedent (`am.h`, v4): a self-describing decoder means no `REINDEX`.
+2. `src/vector/vecwrite.c`: populate it in the build/merge strip appender, which already knows
+   each page's number as it appends, and **in every path that moves a strip page** — the same
+   discipline the five bound fields already carry, and the same hazard: a stale `firstpage`
+   would send a scan at another block's codes, which is a wrong answer rather than an error.
+3. `src/vector/vecshuttle.c`: `code_cur_seek()`, validated by the check the cursor already
+   makes ("page k of block b must claim block b", `:230`), falling back to the walk on any
+   mismatch or on an old weft.
+4. `weave_check()`: every block's `firstpage` names a `WEAVE_PK_VCODES` page claiming that
+   block. This is the invariant that makes step 2's hazard detectable.
+5. A property test that seeks every block in random order and compares against the chain
+   walk, and — because hard rule 12 applies, this touches merge and vacuum — a scale run.
+
+Expected win, corrected and measured rather than projected: **1.8× (scifact) / 4.3× (fiqa)
+fewer total query buffers at 0.1 % selectivity**, rising with corpus size; the vector weft
+drops to 0.06–0.07 % of its pages, after which the **warp map** (`weave_fuse_vec_warpmap()`,
+O(nvec) unconditionally) is the dominant selectivity-independent term.
+
 **CORRECTED the same day, twice, and both corrections matter to whoever implements this.**
 
 *The ratio was overclaimed.* Page traffic cannot follow the blocks-scored column to 0.031×,

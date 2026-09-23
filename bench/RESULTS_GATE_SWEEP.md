@@ -218,6 +218,24 @@ per 56 code pages. That is not a formula to rely on, but it does not have to be:
 > cursor already makes ("page k of block b must claim block b",
 > `src/vector/vecshuttle.c:230`), falling back to the chain walk on a miss.**
 
+**RETRACTED THE SAME EVENING — the speculative address survives a merge and not a vacuum.**
+The hit rate was measured on the three states that matter instead of argued from the
+fresh-build density: fresh-then-merged **152 of 162 (94 %)**, after a second merge **162 of
+162**, and after `DELETE` + `VACUUM` **6 of 122 (5 %)** with a maximum deviation of 213
+pages. A vacuum rewrite draws recycled pages, which is precisely the objection the density
+argument talked itself out of, and a miss costs the fallback walk *plus* the wasted read. The
+paragraph below is left in place because the reasoning is a good example of a plausible
+argument that a one-file probe overturned (`/scratch/pg_weave/addrprobe.sql`).
+
+**WHAT IS BEING BUILT INSTEAD, and it is cheaper than the on-disk index chain too:** one
+`weave_uint32 firstpage` inside `WeaveVecDirRec`, the record every scan already addresses in
+O(1). `weave_vecdir_recs_per_page()` is `(8152 − 8) / 284 = 28` today and
+`(8152 − 8) / 288 = 28` with the field, so **the directory occupies the same number of pages**
+— verified against the relation, where `ceil(162/28) = 6` and `ceil(1800/28) = 65` are exactly
+the interleaved page counts measured inside the code spans. No new page kind, no extra pages,
+and correct under page recycling because the pointer is written by whoever moved the page.
+`doc/GAPS.md` G27 carries the build order.
+
 Zero on-disk bytes, no new page kind, no `WEAVE_VMETA` version bump, no migration script,
 no expected-output regeneration — and the fallback keeps it correct under FSM page reuse,
 which is the objection that ruled out arithmetic in the first place. With 98.3 % density the
