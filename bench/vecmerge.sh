@@ -241,7 +241,7 @@ burn_xids() {
 }
 
 # ---------------------------------------------------------------- 2. build
-say "build: $((NROWS - NBATCH * BATCH)) rows, then $NBATCH x $BATCH inserted"
+say "build: $((NROWS - NBATCH * BATCH)) rows, then $NBATCH x $BATCH inserted, then $VACCYC vacuum cycles"
 NBUILD=$((nsrc - NBATCH * BATCH))
 [ "$NBUILD" -gt 0 ] || fail "NROWS too small for $NBATCH x $BATCH"
 
