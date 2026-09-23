@@ -1060,7 +1060,30 @@ conclusion independent of which of `amgettuple` / `amgetbitmap` the planner pick
 someone adds a path that reads a heap page directly, property 2 is what breaks, and
 no test will say so.
 
-### G27 — the codes chain has no block→page index, so a skipped block still costs its page reads — **OPEN 2026-09-17, found by V8**
+### G27 — the codes chain has no block→page index, so a skipped block still costs its page reads — **OPEN 2026-09-17, found by V8; PROMOTED 2026-09-23 to the single structural fix §8's vector row needs**
+
+**2026-09-23: this gap is now the recommended fix for something much bigger than it was
+filed as, and it got there by measurement rather than argument.** `bench/gatesweep.sh`
+measured claim 3 for the first time: with the predicate tightened from 100 % to 0.1 %,
+pivots and vector `score()` calls fall **exactly** with selectivity and scored code blocks
+follow `1 − (1 − s)^32` (0.969× / 0.265× / 0.031×, nine of nine points near the formula on
+three corpora) — while `EXPLAIN (ANALYZE, BUFFERS)` reports **502 / 515 / 502 / 424**
+buffers, flat. The 32× reduction in scored blocks buys 1.0× in pages, and THIS gap is why.
+
+That makes the block→page index the alternative to the vector-major second copy that was
+the only remaining option for `FUSED_TOPK.md` §8's vector work row:
+
+| | fixes | cost per doc | helps a scattered candidate set? |
+|---|---|---|---|
+| vector-major second copy | bytes touched within a block | **96–192 B** | **no** — each survivor is on its own page |
+| **block→page index (this gap)** | which pages are read at all | **0.125 B** (one `BlockNumber` per 32-lane block) | **yes** |
+
+7.2 KB — one page — for fiqa's 1,800 blocks. See `bench/RESULTS_GATE_SWEEP.md`. And the
+contiguity shortcut is not available: `weave_new_buffer()` can hand out recycled FSM pages,
+so `codestart + b·strips_per_block` is unsound and an index is required rather than
+arithmetic.
+
+*Original entry follows.*
 
 `weave_vec_block_read()` locates block `b` by walking the **entire** `WEAVE_PK_VCODES`
 chain from `codestart` and matching `blockno` on each strip. Two separate costs come
