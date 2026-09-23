@@ -1188,7 +1188,17 @@ run_vecmerge() {
 	rc=${PIPESTATUS[0]}
 	$SSH 'cd ~/out && tar cf - .' | tar xf - -C "$OUT" 2>/dev/null || true
 	$SSH 'cd /scratch/vecmerge && tar cf - check.*.tsv' | tar xf - -C "$OUT" 2>/dev/null || true
-	[ "$rc" = 0 ] || die "vecmerge.sh failed (see $OUT/vecmerge.log)"
+	# NOT `|| die` HERE, and that is a correction.  The first run of this job failed
+	# the clean arm's page ratchet, died at this line, and so never ran the mutation
+	# control below -- which is the only thing that makes the eight CLEAN
+	# weave_check() results that run did produce mean anything.  A control gated
+	# behind the success of the arm it validates is not a control.  The status is
+	# carried to the end of the function instead.
+	if [ "$rc" != 0 ]; then
+		say "vecmerge.sh FAILED (see $OUT/vecmerge.log) -- running the control anyway,
+		     because a red clean arm is exactly when you need to know whether the
+		     invariant can fire"
+	fi
 
 	# ---------------------------------------------------------------- control
 	#
@@ -1260,6 +1270,14 @@ MUTSQL
 		die "control FAILED: the mutated writer was NOT caught -- every clean result
 		     in this run is therefore uninformative about firstpage"
 	fi
+
+	# Now the clean arm's status, after the control has had its say.  Both results are
+	# reported so a reader can tell the two apart: "the invariant works and something
+	# else is wrong" is a different state from "the invariant is blind".
+	[ "$rc" = 0 ] || die "the control passed but the clean arm FAILED -- the firstpage
+	                      invariant is demonstrably able to fire, so the failure is in
+	                      something else this job measures.  See $OUT/vecmerge.log and
+	                      $OUT/vecmerge.tsv"
 }
 
 run_gatesweep() {
