@@ -542,6 +542,17 @@ DROP TABLE vwbig;
 -- Multi-block on purpose: 1024 dimensions is 2 strip pages per block and 96 rows
 -- is 3 blocks, so the scan has to JUMP over intervening blocks rather than fall
 -- into the next one.
+--
+-- `metric = 'ip'` IS LOAD-BEARING, and the first version of this test did not have
+-- it.  The scan assertion below orders by `<#>`, and F8 refuses at PLAN time to
+-- order a weave index by an operator that is not the weft's metric -- so on an l2
+-- index the planner either errors or, if its costs happen to favour a sequential
+-- scan, answers correctly in the EXECUTOR without reading the weft at all.  The
+-- second is what happened locally: the test passed, and it passed by a path that
+-- touched none of the rewritten weft it claims to read.  It failed on the first host
+-- whose cost settings chose the index (2026-09-23, EC2).  A test whose subject
+-- depends on a planner decision is not testing its subject, which is why the plan is
+-- asserted explicitly below rather than left to the costs.
 -- ---------------------------------------------------------------------------
 CREATE TABLE vwg27 (id serial, d wdoc, v wvec(1024));
 INSERT INTO vwg27 (d, v)
@@ -549,7 +560,7 @@ SELECT ('doc ' || i)::wdoc,
        (SELECT ('[' || string_agg(((i * 7 + j) % 17 - 8)::text, ',') || ']')::wvec(1024)
           FROM generate_series(1, 1024) j)
   FROM generate_series(1, 96) i;
-CREATE INDEX vwg27_weave ON vwg27 USING weave (d, v);
+CREATE INDEX vwg27_weave ON vwg27 USING weave (d, v) WITH (metric = 'ip');
 
 SELECT nblocks >= 3 AS at_least_three_blocks FROM weave_vec_meta('vwg27_weave');
 SELECT count(*) AS violations_fresh FROM weave_check('vwg27_weave', true) WHERE NOT ok;
@@ -574,9 +585,42 @@ DELETE FROM vwg27 WHERE id % 3 = 0;
 VACUUM vwg27;
 SELECT count(*) AS violations_after_rewrite
   FROM weave_check('vwg27_weave', true) WHERE NOT ok;
+-- THE PLAN FIRST, THEN THE ANSWER.  Without the plan assertion the row count below
+-- is satisfied by a sequential scan, and a sequential scan reads the heap rather than
+-- the rewritten weft -- so it would hold no matter what the directory says.
+--
+-- ASSERTED AS A BOOLEAN, NOT AS PLAN TEXT, and that is the second lesson from the
+-- same bug.  A bare `EXPLAIN (COSTS OFF)` here passed on PG17 and failed on PG18,
+-- which prints `Disabled: true` under a node reached despite `enable_seqscan = off`
+-- -- so the expected output would have had to differ per major for a reason that has
+-- nothing to do with this test.  Scanning the plan for the two markers that matter
+-- says exactly what is being claimed and survives every cosmetic EXPLAIN change.
+SET enable_seqscan = off;
+DO $$
+DECLARE
+	ln		text;
+	scan	boolean := false;
+	ordby	boolean := false;
+BEGIN
+	FOR ln IN
+		EXECUTE 'EXPLAIN (COSTS OFF) SELECT id FROM vwg27
+		           ORDER BY v <#> (SELECT v FROM vwg27 ORDER BY id LIMIT 1) LIMIT 10'
+	LOOP
+		IF ln LIKE '%Index Scan using vwg27_weave%' THEN scan := true; END IF;
+		IF ln LIKE '%Order By:%' THEN ordby := true; END IF;
+	END LOOP;
+	IF NOT scan THEN
+		RAISE EXCEPTION 'the ordering did not reach the weave index; the row count below would measure the heap';
+	END IF;
+	IF NOT ordby THEN
+		RAISE EXCEPTION 'the index was scanned but the ordering was not pushed into it';
+	END IF;
+	RAISE NOTICE 'plan reads the rewritten weft: index scan with a pushed-down Order By';
+END $$;
 SELECT count(*) AS rows_from_the_rewritten_weft
   FROM (SELECT id FROM vwg27
          ORDER BY v <#> (SELECT v FROM vwg27 ORDER BY id LIMIT 1) LIMIT 10) t;
+RESET enable_seqscan;
 
 DROP TABLE vwg27;
 

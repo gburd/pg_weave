@@ -377,11 +377,24 @@ run_smoke() {
 		2>&1 | tee "$OUT/codec.log"
 
 	say "installcheck (regression + isolation)"
+	# THE STATUS IS TAKEN, NOT PIPED PAST.  Until 2026-09-23 the remote command
+	# ended in `| tail -30` and the local one in `| tee`, so BOTH exit statuses
+	# belonged to the last command in a pipeline and `make installcheck` could fail
+	# while the job carried on and took numbers off the host.  It did: a gatesweep
+	# run recorded `1 of 19 tests failed` in this very log and then measured three
+	# corpora.  AGENTS.md's eleventh member, sitting in the harness that fronts every
+	# EC2 measurement this project has published.
+	#
+	# The status has to be rescued on BOTH sides of the ssh: the remote shell's own
+	# exit status is `tail`'s, so the log goes to a file, the status is saved, the
+	# tail is printed, and the status is re-raised.
 	$SSH 'cd pg_weave && sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
 		  sudo -u postgres pg_ctlcluster 17 main start 2>/dev/null || true
 		  sudo -u postgres createuser -s ubuntu 2>/dev/null || true
-		  make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config 2>&1 | tail -30' \
+		  make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/tmp/ic.log 2>&1
+		  rc=$?; tail -30 /tmp/ic.log; exit $rc' \
 		| tee "$OUT/installcheck.log"
+	icrc=${PIPESTATUS[0]}
 	$SSH 'cd pg_weave && cat regression.diffs 2>/dev/null | head -60' > "$OUT/regression.diffs" 2>/dev/null
 
 	# No separate TAP step: TAP_TESTS = 1 in the Makefile means `make
@@ -390,6 +403,24 @@ run_smoke() {
 	# the TAP results.
 	grep -E '^(t/|All tests|Result:|Files=)' "$OUT/installcheck.log" \
 		> "$OUT/tap.log" 2>/dev/null || true
+
+	# FATAL, and the dispatch comment at the bottom of this file already said why:
+	# "the host has passed regression + isolation + TAP before any number is taken
+	# off it, which is this project's own rule about correctness preceding latency
+	# applied to the machine rather than to the code."  That was a claim the code did
+	# not enforce.  SMOKE_TOLERATE_RED=1 exists for the one legitimate case -- a run
+	# whose PURPOSE is to measure a host with a known-red test -- and it has to be
+	# asked for, so the number it produces is labelled by its own invocation.
+	if [ "$icrc" != 0 ]; then
+		say "installcheck FAILED; the diff is:"
+		cat "$OUT/regression.diffs" >&2
+		[ "${SMOKE_TOLERATE_RED:-0}" = 1 ] \
+			|| die "installcheck failed on this host -- no number taken from it is
+			        trustworthy until you know whether the red test touches what you
+			        are measuring.  Re-run with SMOKE_TOLERATE_RED=1 if you have
+			        decided it does not."
+		say "SMOKE_TOLERATE_RED=1: continuing over a red installcheck BY REQUEST"
+	fi
 }
 
 # Ship and install the UPSTREAM fork, pg_fts, so bench/lexical.sh gets its third
