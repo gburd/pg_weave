@@ -1140,6 +1140,51 @@ fewer total query buffers at 0.1 % selectivity**, rising with corpus size; the v
 drops to 0.06–0.07 % of its pages, after which the **warp map** (`weave_fuse_vec_warpmap()`,
 O(nvec) unconditionally) is the dominant selectivity-independent term.
 
+**THIRD AND FINAL CORRECTION, same evening: an explicit per-block pointer is MANDATORY, and
+it cannot live in `WeaveVecDirRec` as cheaply as the arithmetic above suggested.**
+
+*Why no formula can work.* Two vacuum rewrites of the same table produced opposite structures.
+The rewrite of the insert-built segments hit **6 of 122 (5 %)** with a maximum deviation of 213
+pages; a later rewrite of a *merged* segment came out locally contiguous — **117 of 121 page
+deltas equal to `strips_per_block`**, the other 4 being the interleaved directory pages. Both
+are rewrites through the same single writer (`weave_vec_write_weft()`), so the difference is
+not in the code: it is which pages the **FSM free list** happened to hold, which is a function
+of the index's vacuum and merge history. A speculative address is therefore not merely
+sometimes wrong, it has **unpredictable performance** — 5 % or 97 % depending on history —
+which is worse for a planner and for a benchmark than a structure that is always right.
+
+*Why the pointer cannot simply be added to the directory record.* Growing `WeaveVecDirRec`
+from 284 to 288 bytes keeps records-per-page at 28 (that arithmetic stands), but it moves
+**every record's offset**: record `i` sits at `i × sizeof(rec)`, so a v3 reader misparses every
+v2 record after the first. Supporting both would make the record size version-dependent at
+every read site (`weave_vecdir_read`, the shuttle's directory cursor, `vecstats`,
+`weave_check()`, two SRFs). And `weave_vec_weft_open()` **refuses an unknown version outright**
+(`src/vector/vecwrite.c:917`), so the "old wefts keep the chain walk, no `REINDEX`" sentence
+written above is **false as the code stands** — found by reading the gate rather than assuming
+it, and it is the third thing this entry got wrong before any code was written.
+
+*The hardened design, which is G27 as originally filed plus a migration story:*
+
+1. **New chain `WEAVE_PK_VCIDX`**: a dense array of `BlockNumber`, entry `b` = block `b`'s
+   first strip page. O(1) addressable exactly like the directory (entry `b` on page
+   `b / (payload / 4)`), **0.125 bytes per document**, 7.2 KB for fiqa's 1,800 blocks. No
+   record-offset change anywhere, so no version-dependent parsing.
+2. **`WeaveVecMeta` gains `cidxstart`**, version 2 → 3, and the version gate is relaxed to
+   accept **both**: on a v2 weft the field reads as **0**, which is `WEAVE_METAPAGE_BLKNO` and
+   can never be a valid chain root, so 0 is a sound "absent → walk the chain" sentinel. This
+   depends on VMETA pages being zero-filled past the struct (`weave_init_page` plus a fresh
+   page); **assert that on a real v2 weft before relying on it**, because if it does not hold
+   the fallback is a `REINDEX` requirement and that changes the release note.
+3. **Writer**: collect each block's first strip page during the existing block loop (a
+   huge-safe `nblocks × 4` transient array) and emit the chain after it. One writer serves
+   build, merge *and* the vacuum rewrite, which is why this is one change and not three.
+4. **Reader**: `code_cur_seek()` in `src/vector/vecshuttle.c`, validated by the check the
+   cursor already makes, falling back to the walk on mismatch or on a v2 weft.
+5. **`weave_check()`**: every entry names a `WEAVE_PK_VCODES` page claiming that block — the
+   invariant that makes a stale pointer (a wrong answer, not an error) detectable.
+6. **Gates**: a property test seeking every block in random order against the chain walk; and
+   because this touches merge and vacuum, hard rule 12's scale run before it counts as done.
+
 **CORRECTED the same day, twice, and both corrections matter to whoever implements this.**
 
 *The ratio was overclaimed.* Page traffic cannot follow the blocks-scored column to 0.031×,

@@ -227,9 +227,23 @@ argument talked itself out of, and a miss costs the fallback walk *plus* the was
 paragraph below is left in place because the reasoning is a good example of a plausible
 argument that a one-file probe overturned (`/scratch/pg_weave/addrprobe.sql`).
 
-**WHAT IS BEING BUILT INSTEAD, and it is cheaper than the on-disk index chain too:** one
-`weave_uint32 firstpage` inside `WeaveVecDirRec`, the record every scan already addresses in
-O(1). `weave_vecdir_recs_per_page()` is `(8152 − 8) / 284 = 28` today and
+**WHAT IS BEING BUILT INSTEAD — and the first answer to that question was wrong too.** The
+`firstpage`-inside-`WeaveVecDirRec` idea is retracted: the arithmetic (28 records per page
+before and after) holds, but growing the record moves **every record's offset**, so a v3
+reader misparses v2 records and the size becomes version-dependent at six read sites — and
+`weave_vec_weft_open()` refuses an unknown version outright, so old wefts would need a
+`REINDEX` rather than falling back to the walk. What is being built is `doc/GAPS.md` **G27**
+as originally filed — a separate `WEAVE_PK_VCIDX` chain of one `BlockNumber` per block,
+0.125 B/doc, O(1) addressable, with `cidxstart` in `WeaveVecMeta` reading 0 on a v2 weft and
+0 meaning "walk". Retained here because the sequence is the lesson: three designs in one
+evening, each refuted by a measurement or by reading the code it would have to change.
+
+**And the reason no formula survives:** two vacuum rewrites of the same table produced
+opposite structures — **6 of 122 (5 %)** hits with a 213-page deviation for the rewrite of
+insert-built segments, and **117 of 121 page deltas equal to `strips_per_block`** for the
+rewrite of a merged segment. Same writer, so the difference is the **FSM free list**, i.e.
+the index's vacuum and merge history. A speculative address is not just sometimes wrong, it
+has unpredictable performance, which is worse than a structure that is always right. `weave_vecdir_recs_per_page()` is `(8152 − 8) / 284 = 28` today and
 `(8152 − 8) / 288 = 28` with the field, so **the directory occupies the same number of pages**
 — verified against the relation, where `ceil(162/28) = 6` and `ceil(1800/28) = 65` are exactly
 the interleaved page counts measured inside the code spans. No new page kind, no extra pages,
