@@ -2876,32 +2876,68 @@ is the **size of the vector channel's candidate set**, and nothing in this entry
 maintainer any more. `bench/RESULTS_FUSE.md` (fifth measurement),
 `doc/specs/FUSED_TOPK.md` §8 and §8d.
 
-### G45 — `prepdata.py`'s MS MARCO source returns HTTP 404; the dataset §8 names by name cannot be fetched — **OPEN 2026-09-22**
+### G45 — `prepdata.py`'s MS MARCO source returns HTTP 404; the dataset §8 names by name cannot be fetched — **FIXED 2026-09-23** (the fixture builds again; the nDCG run on it is still owed)
 
-`bench/prepdata.py` fetches MS MARCO passage from
+**~~OPEN 2026-09-22.~~** `bench/prepdata.py` fetched MS MARCO passage from
 `https://msmarco.z22.web.core.windows.net/msmarcoranking/`, and
-`queries.dev.small.tsv` now returns **404**. The run died there after completing all
-three BEIR datasets, so the loss is the dataset, not the run (artefacts are pulled back
+`queries.dev.small.tsv` returned **404**. The run died there after completing all
+three BEIR datasets, so the loss was the dataset, not the run (artefacts are pulled back
 per dataset — hard rule 14 — so nothing measured was lost).
 
-`FUSED_TOPK.md` §8 names "BEIR subset + MS MARCO passage" explicitly, so the nDCG row is
-**incomplete** as well as failed. It does not change the verdict: the gate requires
-nDCG ≥ RRF and that fails on three BEIR datasets, so a fourth cannot turn three losses
-into a win. It does mean the gate cannot be *passed* later without restoring this source.
+**The source was not gone; one file was.** Probing the whole set is what closed this, and
+it took one minute: `qrels.dev.small.tsv` (200, 143,300 bytes), `collection.tar.gz` (200,
+1,035,009,698 bytes), `collectionandqueries.tar.gz` (200) and `queries.tar.gz` (200,
+18,882,551 bytes) all still answer at the same base. Only the bare `queries.dev.small.tsv`
+is gone. The conclusion recorded on 2026-09-22 — "the hosting moved" — was wrong, and the
+diagnosis that mattered was *enumerating the siblings of the thing that failed* rather
+than reasoning about why it failed.
 
-Candidate replacements, unverified: the BEIR distribution carries `msmarco` in the same
-`corpus.jsonl`/`queries.jsonl`/`qrels` layout `prepdata.py` already parses, which would
-reuse the BEIR code path entirely. **The trap to avoid:** `--limit` on the BEIR path is a
-plain truncation, while `build_msmarco_sub()` deliberately keeps *every qrels-referenced
-passage* plus a seeded sample of the rest. Pointing the BEIR loader at msmarco with a
-limit would silently discard ground truth and produce a confidently wrong nDCG — the
-failure mode `build_msmarco_sub()`'s docstring was written to prevent. Whatever source is
-used, the qrels-preserving subsample has to come with it.
+**The fix reconstructs dev.small rather than substituting a different corpus.**
+`queries.tar.gz` carries `queries.dev.tsv`, the FULL 101,093-query dev set, and
+"dev.small" is *by definition* the subset of dev whose qids appear in
+`qrels.dev.small.tsv`. So filtering reproduces the missing file exactly instead of
+approximating it, and the BEIR-msmarco route the original entry proposed — with its trap
+of a plain `--limit` truncation silently discarding ground truth — is not needed at all.
+`build_msmarco_sub()` keeps its qrels-preserving reservoir sample untouched.
 
-**Process note:** a URL in a benchmark harness is a dependency with no version and no
-test. This one worked when it was written and rotted silently; the first evidence was a
-404 on a paid instance. A harness that downloads anything should fetch the smallest file
-first and fail fast, which is what happened here by luck of ordering rather than design.
+**Verified end to end, not by HTTP status:** 6,980 unique qids in the qrels, 6,980 rows
+matched in `queries.dev.tsv` — which is the published size of dev.small — and a full
+`--dataset msmarco-sub --limit 20000 --embed hash` run exits 0 with
+`nqrels 7437, nqrels_dropped 0, nqueries 6980, unjudged_queries_dropped 0`. Nothing
+judged was dropped, which is the property the subsample exists to have.
+
+**Positive control, and it took three attempts because the harness defended itself
+twice.** The new fatal assertion is "every qrels qid has text" — a judged query with no
+text would hand an arm a query it cannot answer and average zeros into the nDCG row, the
+same class of failure as dropping a judged passage. To make it fire:
+
+1. Appending a bogus qid row to the cached qrels and pointing `--out` at a *different*
+   directory tested nothing: a different `--out` means a different `_cache`, so the file
+   was downloaded fresh. Exit 0.
+2. Appending it to the cache the run actually used still tested nothing: `fetch()`
+   compares the cached size against the remote `Content-Length` and **re-downloaded the
+   pristine file**, repairing the tamper. Exit 0. That size check was written to catch
+   truncated downloads and it catches sabotage by the same mechanism.
+3. Substituting an existing qid with a **byte-length-preserving** one that does not occur
+   in `queries.dev.tsv` (`300674` → `999999`, file size identical at 143,300) fires it:
+   `exit=1`, `1 of 6980 qrels query ids have no text in queries.dev.tsv (e.g. 999999);
+   dev.small cannot be reconstructed from this source`.
+
+The first two attempts are the interesting part, because both LOOKED like a passing
+positive-control run and both had examined nothing — the eleventh-member shape arriving
+from the direction of a cache.
+
+**What is still owed:** an nDCG measurement *on* this dataset. `bench/fuse.sh` refuses
+hash embeddings unless `FUSE_ALLOW_HASH=1` (deliberately: every recorded number is
+`all-MiniLM-L6-v2`), and `sentence-transformers` is not installed on the local host. So
+§8's dataset list is no longer *blocked*, it is unmeasured — a distinction hard rule 11
+cares about. It belongs to the next run that has the embedding model.
+
+**Process note, unchanged and now paid for twice:** a URL in a benchmark harness is a
+dependency with no version and no test. This one worked when it was written and rotted
+silently; the first evidence was a 404 on a paid instance. A harness that downloads
+anything should fetch the smallest file first and fail fast, which is what happened here
+by luck of ordering rather than design.
 
 ### G46 — `bench/fuse.sh`'s exhaustive oracle cannot express the shipping objective, so the correctness gate runs with `pg_weave.fuse_normalize = off` — **OPEN 2026-09-22**
 

@@ -763,6 +763,16 @@ this week (G42, the phantom GUC in G43, this).
   BEIR datasets already, and a fourth cannot turn three losses into a win. **Updated
   2026-09-22: the nDCG row is now MET on all three, so the standing statement is narrower
   — the row is met on three BEIR corpora, not on the four §8 names.**
+  **SUPERSEDED 2026-09-23 on the mechanism, and the correction matters because it was
+  the reason this was thought unfixable: the hosting did NOT move.** Every sibling file at
+  that base still returns 200 — the qrels, `collection.tar.gz`, `queries.tar.gz` — and only
+  the bare `queries.dev.small.tsv` is gone. `prepdata.py` now reconstructs it from
+  `queries.dev.tsv` filtered by the qrels' qids, which is the *definition* of dev.small, not
+  an approximation of it: 6,980 of 6,980 qids matched, and a `--limit 20000` fixture builds
+  with `nqrels_dropped 0`. **So this bullet stays in the loss list, with its reason
+  changed: the dataset is now UNMEASURED rather than unfetchable.** Every number in this
+  file is `all-MiniLM-L6-v2` and `fuse.sh` refuses hash embeddings by design, so the run
+  waits on a host with the model.
 - **A second embedding model.** Every number here is `all-MiniLM-L6-v2`. The scale
   mismatch behind failure 1 is a property of *BM25 vs cosine-scale vectors* generally,
   but the size of the nDCG deficit is model-specific and should not be quoted as if it

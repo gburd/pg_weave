@@ -386,27 +386,72 @@ def build_msmarco_sub(cache_dir, limit, seed):
     if limit is None:
         die("--dataset msmarco-sub requires --limit (subsample size)")
 
-    queries_path = fetch(cache_dir, MSMARCO_BASE + "queries.dev.small.tsv")
     qrels_path = fetch(cache_dir, MSMARCO_BASE + "qrels.dev.small.tsv")
+    queries_tar_path = fetch(cache_dir, MSMARCO_BASE + "queries.tar.gz")
     collection_path = fetch(cache_dir, MSMARCO_BASE + "collection.tar.gz")
-
-    queries = {}
-    with open(queries_path, "r", encoding="utf-8", newline="") as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) != 2:
-                die("queries.dev.small.tsv line %d: expected 2 fields, got %d"
-                    % (lineno, len(parts)))
-            qid, text = parts
-            queries[qid] = text
 
     with open(qrels_path, "r", encoding="utf-8") as f:
         qrels = parse_msmarco_qrels(f.read())
     if not qrels:
         die("qrels.dev.small.tsv parsed to zero rows")
+
+    # THE QUERIES ARE RECONSTRUCTED, NOT DOWNLOADED (doc/GAPS.md G45).
+    # `queries.dev.small.tsv` used to be fetchable next to the qrels at this same
+    # base and now returns 404 -- the surrounding files (`qrels.dev.small.tsv`,
+    # `collection.tar.gz`, `queries.tar.gz`) all still return 200, so the source is
+    # alive and one file left it.  `queries.tar.gz` carries `queries.dev.tsv`, the
+    # FULL 101,093-query dev set, and "dev.small" is by definition the subset of
+    # dev whose qids appear in `qrels.dev.small.tsv`.  Filtering therefore
+    # reproduces the missing file exactly rather than approximating it: verified
+    # 2026-09-23, 6,980 unique qids in the qrels and 6,980 rows matched in
+    # queries.dev.tsv, which is the published size of dev.small.
+    #
+    # The assertion below is the part that matters.  A query id in the qrels with
+    # no text would give a scored arm a query it cannot answer and an nDCG row
+    # that silently averages in zeros -- the same class of failure as dropping a
+    # judged passage, which is what the docstring above exists to prevent.  So a
+    # miss is fatal, not skipped.
+    needed_qids = {qid for qid, _pid, _rel in qrels}
+    queries = {}
+    try:
+        qtf = tarfile.open(queries_tar_path, mode="r:gz")
+    except tarfile.TarError as e:
+        die("%r is not a valid tar.gz (partial download?): %s"
+            % (queries_tar_path, e))
+    with qtf:
+        qmember = None
+        for candidate in qtf.getmembers():
+            if candidate.name.endswith("queries.dev.tsv"):
+                qmember = candidate
+                break
+        if qmember is None:
+            die("%r: no queries.dev.tsv member (members: %s)"
+                % (queries_tar_path, ", ".join(qtf.getnames())))
+        qstream = qtf.extractfile(qmember)
+        if qstream is None:
+            die("%r: queries.dev.tsv member could not be opened"
+                % queries_tar_path)
+        for lineno, raw_line in enumerate(qstream, 1):
+            line = raw_line.decode("utf-8").rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 2:
+                die("queries.dev.tsv line %d: expected 2 fields, got %d"
+                    % (lineno, len(parts)))
+            qid, text = parts
+            if qid in needed_qids:
+                queries[qid] = text
+
+    missing_qids = needed_qids - set(queries)
+    if missing_qids:
+        die("%d of %d qrels query ids have no text in queries.dev.tsv "
+            "(e.g. %s); dev.small cannot be reconstructed from this source"
+            % (len(missing_qids), len(needed_qids),
+               ", ".join(sorted(missing_qids)[:5])))
+    print("reconstructed dev.small: %d queries from queries.dev.tsv, "
+          "filtered by %d qrels rows" % (len(queries), len(qrels)),
+          file=sys.stderr)
 
     required_pids = {pid for _qid, pid, _rel in qrels}
     if len(required_pids) > limit:
