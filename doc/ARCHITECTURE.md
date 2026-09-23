@@ -529,20 +529,43 @@ Four things, and it should claim exactly four things:
 3. Queries that get **faster** as predicates get more selective, because the
    predicate is pushed into the SIMD block mask instead of collapsing recall.
 
-   **MEASURED 2026-09-23, AND THE CLAIM IS HALF MET — state it this way until the
-   other half lands** (`bench/RESULTS_GATE_SWEEP.md`). In the work the CPU does the
-   claim holds exactly: pivots and vector `score()` calls are **selectivity, to three
-   digits**, on scifact, nfcorpus and fiqa (1.000× / 0.101× / 0.010× / 0.001× at
-   100 % / 10 % / 1 % / 0.1 %), and scored code blocks follow `1 − (1 − s)^32` — nine
-   of nine points within a few percent of the formula. In the pages a query touches
-   it does **not** hold: 502 / 515 / 502 / 424 buffers across the same four
-   selectivities, flat, because the code cursor walks the whole `WEAVE_PK_VCODES`
-   chain and nothing records where a block's strips are (`doc/GAPS.md` G27,
-   `src/vector/vecwrite.c:1222-1235`). Also narrower than the sentence above reads:
-   the only predicate that can be pushed into the index today is another **lexical
-   term**, because `WEAVE_CH_DOCVALS`'s page kind is still reserved. Two honest
-   phrasings until then: "the scan scores fewer documents as the predicate tightens"
-   is measured; "the query reads less" is not.
+   **MEASURED IN FULL 2026-09-23 — work, pages AND latency — AND THE CLAIM IS
+   SUPPORTED, with one scope correction that is part of the claim now**
+   (`bench/RESULTS_GATE_SWEEP.md`). Three passes, in this order, because each one
+   corrected the reading of the one before it:
+
+   - **The work the CPU does: selectivity, to three digits.** Pivots and vector
+     `score()` calls are 1.000× / 0.101× / 0.010× / 0.001× at 100 % / 10 % / 1 % /
+     0.1 % on scifact, nfcorpus and fiqa, and scored code blocks follow
+     `1 − (1 − s)^32` — predicted first, then matched at nine of nine points.
+   - **The pages a query touches: was flat, now falls.** The first pass measured
+     502 / 515 / 502 / 424 buffers across the four selectivities — **flat** — because
+     the code cursor walked the whole `WEAVE_PK_VCODES` chain and nothing recorded
+     where a block's strips were. `doc/GAPS.md` G27 fixed that by storing
+     `firstpage` in the directory record (commit `33dcc1b`, 288 B per record, zero
+     extra pages): at 0.1 % selectivity scifact went 1045 → 513 buffers (**2.04×**)
+     and fiqa 8727 → 1823 (**4.79×**), with all twelve work-counter rows
+     bit-identical. **The flat numbers above are SUPERSEDED, not deleted** — they are
+     what the design did before the pointer existed, and they are why it exists.
+   - **Latency, on a quiet machine: 5.7× to 13.8× faster at 0.1 % selectivity**,
+     p50 *and* p99, nine of nine gated points falling, every step clearing its own
+     A/A noise floor by at least 21× (EC2 `c7i.8xlarge`; scifact 0.141×, nfcorpus
+     0.175×, fiqa 0.072× against their unfiltered selves).
+
+   **Quote 5.7–13.8×, never 1,000×.** The pivot count falls as selectivity exactly,
+   and reading that column alone over-promises by two orders of magnitude. What the
+   clock tracks is the **blocks-scored** curve — latency is within 1.2–1.4× of it at
+   the 1 % point on all three corpora, and 24–37× away from pivots. That the
+   design's own unit of vector work is what predicts the user-visible number is the
+   strongest form this claim has; it is also the discipline the claim has to keep.
+
+   **THE SCOPE CORRECTION, which belongs in the claim and not in a footnote:** the
+   only predicate that can be pushed into the index today is another **lexical
+   term**, because `WEAVE_CH_DOCVALS`'s page kind is still reserved. So "as
+   predicates get more selective" means "as a second `@@@` term gets rarer", not yet
+   `WHERE category = 'x'`. Both honest phrasings — "the scan scores fewer documents"
+   and "the query reads less and returns sooner" — are now measured; the word
+   *predicates* is the part still writing a cheque the code does not cash.
    (The "graph traversal" half of this sentence is stale — the Vamana plan was
    withdrawn in V9's history. The mask is the live mechanism, and it is
    *predicate*-driven, which is why the failure of the *score*-driven block bound
