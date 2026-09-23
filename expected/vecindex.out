@@ -844,5 +844,79 @@ SELECT sum(bytes) = pg_relation_size('vwbig_weave') AS sums_to_relation_size
 (1 row)
 
 DROP TABLE vwbig;
+-- ---------------------------------------------------------------------------
+-- G27: a block's directory record names its first code page, and that pointer
+-- must survive the paths that MOVE pages.
+--
+-- The design rests on this and nothing else: `codestart + b * strips_per_block`
+-- was measured at 94 % correct on a freshly merged weft and **5 %** after a
+-- DELETE + VACUUM rewrite, because a rewrite draws recycled pages from the FSM
+-- (bench/RESULTS_GATE_SWEEP.md).  So the stored pointer is what makes single-block
+-- access sound, and a rewrite is exactly where a writer that forgot to maintain it
+-- would still pass every other test -- the answers stay plausible, they are just
+-- computed from another block's codes, which is why weave_check() has an invariant
+-- for it rather than a comment.
+--
+-- Multi-block on purpose: 1024 dimensions is 2 strip pages per block and 96 rows
+-- is 3 blocks, so the scan has to JUMP over intervening blocks rather than fall
+-- into the next one.
+-- ---------------------------------------------------------------------------
+CREATE TABLE vwg27 (id serial, d wdoc, v wvec(1024));
+INSERT INTO vwg27 (d, v)
+SELECT ('doc ' || i)::wdoc,
+       (SELECT ('[' || string_agg(((i * 7 + j) % 17 - 8)::text, ',') || ']')::wvec(1024)
+          FROM generate_series(1, 1024) j)
+  FROM generate_series(1, 96) i;
+CREATE INDEX vwg27_weave ON vwg27 USING weave (d, v);
+SELECT nblocks >= 3 AS at_least_three_blocks FROM weave_vec_meta('vwg27_weave');
+ at_least_three_blocks 
+-----------------------
+ t
+(1 row)
+
+SELECT count(*) AS violations_fresh FROM weave_check('vwg27_weave', true) WHERE NOT ok;
+ violations_fresh 
+------------------
+                0
+(1 row)
+
+-- COVERAGE, not the pointer itself, and the difference is worth stating because the
+-- obvious reading of this query is wrong: `firstpage` has no SQL surface, so nothing
+-- here compares it to anything.  What this asserts is that the two readers agree on
+-- which blocks EXIST -- weave_vec_strips() walks the code chain and reports each
+-- page's own header, weave_vec_blocks() reads through the directory -- so a block
+-- that one can see and the other cannot is caught.  The pointer comparison is
+-- weave_check()'s vector_block_stats_match_codes invariant above, which reads the
+-- record and then reads the page it names; that is the assertion with teeth, and the
+-- mutation that stores firstpage + 2 makes it fire.
+SELECT count(*) AS blocks_the_two_readers_disagree_about
+  FROM (SELECT blockno FROM weave_vec_strips('vwg27_weave') GROUP BY blockno) s
+  FULL JOIN (SELECT blockno FROM weave_vec_blocks('vwg27_weave')) b USING (blockno)
+ WHERE s.blockno IS NULL OR b.blockno IS NULL;
+ blocks_the_two_readers_disagree_about 
+---------------------------------------
+                                     0
+(1 row)
+
+-- A VACUUM that rewrites the weft recycles pages, which is the case arithmetic
+-- cannot survive.  The invariant must still hold, and the scan must still answer.
+DELETE FROM vwg27 WHERE id % 3 = 0;
+VACUUM vwg27;
+SELECT count(*) AS violations_after_rewrite
+  FROM weave_check('vwg27_weave', true) WHERE NOT ok;
+ violations_after_rewrite 
+--------------------------
+                        0
+(1 row)
+
+SELECT count(*) AS rows_from_the_rewritten_weft
+  FROM (SELECT id FROM vwg27
+         ORDER BY v <#> (SELECT v FROM vwg27 ORDER BY id LIMIT 1) LIMIT 10) t;
+ rows_from_the_rewritten_weft 
+------------------------------
+                           10
+(1 row)
+
+DROP TABLE vwg27;
 DROP VIEW dead_warps, null_warps;
 DROP TABLE vw;
