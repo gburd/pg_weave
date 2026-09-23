@@ -700,7 +700,10 @@ control. `bench/fuse.sql` and `bench/RESULTS_FUSE.md`.
 | nDCG@10 | RRF `k'=100` | ≥ RRF, on ≥2 public datasets (BEIR subset + MS MARCO passage) |
 | p50 latency, k=10 | RRF `k'=100` | ≤ 0.5× RRF |
 | p99 latency, k=10 | RRF `k'=100` | ≤ 0.7× RRF |
-| channel score() calls | RRF `k'=100` | ≤ 0.2× RRF (this is the mechanism; if it is not much lower, the bounds are too loose and §2 is wrong) |
+| ~~channel score() calls~~ | ~~RRF `k'=100`~~ | ~~≤ 0.2× RRF (this is the mechanism; if it is not much lower, the bounds are too loose and §2 is wrong)~~ **SUPERSEDED 2026-09-22 (maintainer decision; the three rows below replace it). Left visible under hard rule 13 because every figure this project published for this row — 0.648× / 0.903× / 0.541× raw, 0.571× / 0.875× / 0.513× normalized — was measured in this unit, and the reason it was wrong is the finding** |
+| **lexical work: BM25 contributions** | the WAND control's own BM25 contributions | ≤ 0.20× |
+| **vector work: CODE BLOCKS READ** | the control's own code scan, in blocks | ≤ 0.20× |
+| **pivots per query** | — | **REPORTED, NOT GATED.** The RRF control has no pivot loop, so there is nothing to take a ratio against; a number with no denominator is a diagnostic, and calling it a gate would be inventing the denominator |
 | recall vs exhaustive fused scan | — | ~~≥ 0.99 with graph on;~~ **1.000**, and it is 1.000 *by construction* now that the graph channel is withdrawn (§6) — every implemented channel is exact, so this row tests the scorer's pruning, not an approximation. A single miss is a (C2) violation, which makes it the most valuable row in the table rather than the weakest |
 
 **AMENDED 2026-09-22 (night): if this table keeps a work row, the row should count PIVOTS as
@@ -715,6 +718,35 @@ whole reason it is in this table. The counter already exists (`weave_fuse_stats(
 missing is the gate's arithmetic. **No number is invented for the restated row here** — a gate
 is honest only if it is written down before it is measured against (§8d option (a) makes the
 same point about the unit).
+
+**DECIDED 2026-09-22 — MAINTAINER DECISION, and it is the amendment above carried out: the
+work row is restated PER CHANNEL, each channel in the unit its own storage has, plus one
+ungated diagnostic.** The three rows in the table are what the gate now reads; the single
+`score()`-call ratio is struck through above rather than deleted. Two measurements forced
+the restatement, and neither is about the fused core:
+
+  - **A lane is not a unit of cost; a block is.** In `WEAVE_PACK_LANE`, coordinate *j* of
+    lane *s* is one nibble at byte `j*16 + s/2` (`include/weave/vecpage.h:18`), so a
+    one-lane read touches **every byte of its block** — scoring 1 lane costs the same
+    memory traffic as scoring 32. This project measured that during the V15/V16 work for
+    an unrelated reason (`bench/RESULTS_CODE_SCAN.md:330,417`), which is why the restated
+    unit is not a new claim about the layout: it is a gate catching up with a measurement
+    that was already on disk.
+  - **The lane-based row could not predict the latency row, and on the run that mattered
+    the two disagreed in SIGN.** In lanes, normalization made the fused arm *cheaper* on
+    all three corpora (0.648 → 0.571, 0.903 → 0.875, 0.541 → 0.513). The clock said fiqa's
+    p50 **doubled**. A work row that moves opposite to the row it stands in for is
+    measuring the wrong thing. What tracks the clock is the **pivot count** — fiqa's pivots
+    rose **5.3×** against a p50 of **2.0×** — which is why pivots per query are reported.
+
+**And the restatement does NOT rescue the row. Stated plainly so nobody reads it as a
+pass:** measured in **blocks**, the vector ratio is **1.000×** — exactly what it was in
+lanes — so the vector half of the gate is still failed on all three corpora. The
+restatement buys **honesty about the unit, not a pass**. What it does buy is that the two
+halves can now fail separately and be fixed separately: under the restated row the
+**lexical** half is **MET on fiqa** (0.052×) and missed on scifact (0.203×, just over) and
+nfcorpus (0.380×), while the **vector** half is missed **everywhere at 1.000×**. Figures,
+harness and the full-pass statement: `bench/RESULTS_FUSE.md` (fifth measurement) and §8d.
 
 If the `score()` call ratio is not dramatically lower, stop and fix the bounds
 before optimizing anything else — a loose bound makes the entire design pointless
@@ -734,7 +766,10 @@ state whether it was cleared:
 | nDCG@10, normalizer **on** (the default since 2026-09-22) | ≥ RRF | 1.053× | 1.010× | 1.114× | **MET** |
 | p99 latency, normalizer **on** | ≤ 0.70× | 0.710× | 0.612× | **1.000×** | **FAIL on two of three — measured 2026-09-22 (night), run `pgweave-20260922-224507`** |
 | p50 latency, normalizer **on** | ≤ 0.50× | 0.710× | 0.827× | **1.172×** | **FAIL**, and on fiqa the fused arm is **slower than the RRF control it replaces** |
-| `score()` calls, normalizer **on** | ≤ 0.20× | 0.571× | 0.875× | 0.513× | **FAIL** |
+| ~~`score()` calls, normalizer **on**~~ | ≤ 0.20× | 0.571× | 0.875× | 0.513× | **FAIL — and SUPERSEDED 2026-09-22 by the restated per-channel row (§8, maintainer decision). Left visible: it is the unit every published figure for this row was measured in** |
+| lexical work (BM25 contribs), normalizer **on** | ≤ 0.20× | 0.203× | 0.380× | **0.052×** | **MET on fiqa, missed on scifact (just over) and nfcorpus** |
+| vector work (**code blocks read**), normalizer **on** | ≤ 0.20× | 1.000× | 1.000× | 1.000× | **FAIL — the same 1.000× the lane unit reported, so restating the unit changed nothing about the verdict** |
+| pivots per query, normalizer **on** | *reported, not gated* | 5,183 | 3,627 | 57,572 | against corpora of 5,183 / 3,633 / 57,600 documents — **the fused scan is a full pass over the docid space** |
 | ~~p99 latency, raw weighted sum~~ | ≤ 0.70× | 0.609× | 0.560× | 0.633× | **PASSED — left visible and dated (hard rule 13). SUPERSEDED 2026-09-22 (night): this is the `pg_weave.fuse_normalize = off` arm, and the re-run of the same statement one GUC away FAILS. The row moved because the change moved it, not because the number went stale** |
 | ~~p50 latency, raw weighted sum~~ | ≤ 0.50× | 0.582× | 0.795× | 0.578× | **FAILED then too; superseded 2026-09-22 (night) by 0.710× / 0.827× / 1.172×** |
 | ~~nDCG@10, raw weighted sum~~ | ≥ RRF | 0.982× | 0.924× | 0.687× | **FAILED — this is the `pg_weave.fuse_normalize = off` arm. SUPERSEDED 2026-09-22 by §8d, and left in the table because it is the baseline the fix is measured against** |
@@ -1096,6 +1131,60 @@ three, which is the state that made `doc/ARCHITECTURE.md` §9 claim 2 unsupporte
 with. It is the first knob in this project whose two settings each fail a **different** gate
 row, and a user can already pick per statement. `bench/RESULTS_FUSE.md` (fourth measurement)
 has the table the decision should be made from.
+
+**DECIDED 2026-09-22 — MAINTAINER DECISION: `pg_weave.fuse_normalize` STAYS ON BY DEFAULT.**
+The paragraph above stays as written because it is the table the decision was made from. The
+reasoning, recorded so it can be argued with later:
+
+  - **A user chooses a RANKING, not a scan strategy.** With the normalizer off the fused
+    objective **loses to a plain RRF control on all three corpora measured** — 0.982× /
+    0.924× / 0.687× — and a fused scan that ranks worse than the two-query control it
+    replaces has no reason to exist. With it on the ranking **beats RRF everywhere
+    measured**: 1.053× / 1.010× / 1.114×.
+  - **The price is recorded and not hidden.** p99 went from **PASS** (0.609× / 0.560× /
+    0.633×) to **FAIL** (0.710× / 0.612× / 1.000×), p50 from 0.582× / 0.795× / 0.578× to
+    0.710× / 0.827× / 1.172×, and on fiqa the fused arm is **slower than the control**.
+  - **This is a default, not a fork in the design**, because the GUC is `PGC_USERSET`: a
+    deployment that wants the old trade can have it per query or per session.
+  - **The latency regression is not accepted as permanent.** It is charged to the one open
+    blocker — the **size of the vector channel's candidate set** — and not to the
+    normalizer, which is arithmetic on the weights (see the ceiling property above).
+
+**INCREMENTAL ABANDONMENT IS FIRING CONSTANTLY, NOT RARELY, AND IT CANNOT HELP THE VECTOR
+CHANNEL FOR AN ARITHMETIC REASON (2026-09-22).** On fiqa the normalized arm records
+**36,709,890 abandonments over 37,306,460 pivots — 0.98 per pivot**. That is not a
+diagnostic that has never fired; it is the mechanism doing its job, and it is what produced
+the lexical improvement (**2.8× fewer BM25 contributions**, 5,884,038 → 2,065,310). It does
+nothing for the vector channel, and the reason is the **summation order**, not the
+implementation: the fused core sorts its scored channels by **descending weighted ceiling**
+(`src/am/fuse.c:163-165`) and sums in that order, abandoning on
+`s + csuffix[j+1] <= theta` (`:716`), and after normalization the vector channel carries by far the largest
+weight — **0.4947 against 0.0110** for each lexical channel — so it is summed **FIRST** and
+its score is computed **before any abandonment test can run**.
+
+**The obvious repair — reverse the order, put the expensive channel last — is DEAD ON
+ARITHMETIC, not on effort, and it was checked so that nobody spends a week on it.** The test
+that would have to fire is
+
+```
+s_lex + w_vec * block_max_vec <= theta
+```
+
+and on L2-normalized data with `metric = 'ip'` the vector block bound is ≈ 1.0, so
+`w_vec * block_max_vec` is **≈ 0.49** while **theta is ≈ 0.11** (measured, one scifact
+query: 0.110627). The left side can never fall below the right, so the test can never fire —
+with `s_lex` at exactly 0, 0.49 > 0.11 already. It would remain dead at **k = 10** rather
+than the ladder's k = 128, because a tighter k raises theta but nowhere near 0.49. Reversing
+the order would cost the abandonment the *lexical* channels currently get and buy nothing.
+
+**And it follows from the same arithmetic that no per-block vector bound can help either:**
+on L2-normalized data (B1), (B2) and (B3) are all ≈ 1.0 unless a block happens to be
+**coherent in direction**, so the bound carries no information to act on. Every route to a
+smaller vector candidate set therefore runs through the three structural options (a)/(b)/(c)
+above — restated unit, a vector-major second copy, or a cluster-ordered weft that conflicts
+with F8's ascending-docid requirement. **The 2026-09-22 decision takes (a), and takes it as
+a MEASUREMENT decision only: it restates §8's work row in blocks and explicitly does NOT
+claim the row.** In blocks the vector ratio is 1.000×, exactly as it was in lanes.
 
 ### 8c. Why the loop stopped, reported per bolt
 

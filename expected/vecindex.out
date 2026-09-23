@@ -15,7 +15,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.19.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.20.0" of extension "pg_weave" is already installed
 CREATE TABLE vi (id serial, d wdoc, v wvec(4), v2 wvec(4));
 INSERT INTO vi(d, v, v2)
   SELECT to_wdoc('shared common' || (g % 7) || ' rare' || g),

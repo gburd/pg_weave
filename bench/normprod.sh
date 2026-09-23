@@ -39,6 +39,9 @@ WEIGHTS=${WEIGHTS:-'{0.5,0.5}'}
 # three, because a `norm`-only run has no positive control in it: the raw and rrf
 # arms reproducing their recorded values is what makes the comparison admissible.
 ARMS=${ARMS:-norm raw rrf}
+# PHASES=quality|work|both.  The work pass needs no run files and the quality pass no
+# counters, so a question about one should not pay for the other.
+PHASES=${PHASES:-both}
 # TAG keeps one sweep point from overwriting another's run files.
 TAG=${TAG:+-$TAG}
 mkdir -p "$OUT"
@@ -114,9 +117,11 @@ run_arm() {                     # run_arm <label> <gen> <pre>
     printf '%s\n' "$out"
 }
 
-say "$DS: $NQ queries, depth $QDEPTH, weights $WEIGHTS, arms: $ARMS"
+say "$DS: $NQ queries, depth $QDEPTH, weights $WEIGHTS, arms: $ARMS, phases: $PHASES"
+has_phase() { case " $PHASES both " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 has_arm() { case " $ARMS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 R_NORM=""; R_RAW=""; R_RRF=""
+if ! has_phase quality; then :; else
 if has_arm norm; then
     say "$DS: fused arm, normalizer ON (the product as it now ships)"
     R_NORM=$(run_arm norm fused_sql "SET pg_weave.fuse_normalize = on;")
@@ -128,6 +133,7 @@ fi
 if has_arm rrf; then
     say "$DS: RRF control (same index, two over-fetches)"
     R_RRF=$(run_arm rrf rrf_sql "")
+fi
 fi
 
 score() { python3 bench/ndcg.py --qrels "$DIR/$DS/qrels.tsv" --run "$1" --k 10 --label "$2" | tail -1; }
@@ -163,7 +169,7 @@ work_of() {                     # work_of <gen> <pre>
             $gen "$wq" "$qv" 10
             printf '\n'
         done < "$QLIT"
-        echo "SELECT f.scores - f.vec_scores - f.gate_scores, w.lex_contribs, w.vec_lanes, w.vec_blocks, w.vec_blocks_bound_skipped, f.scores, f.pivots, f.blkskip FROM weave_fuse_stats() f, weave_work_stats() w;"
+        echo "SELECT f.scores - f.vec_scores - f.gate_scores, w.lex_contribs, w.vec_lanes, w.vec_blocks, w.vec_blocks_bound_skipped, f.scores, f.pivots, f.blkskip, f.abandon, f.veto, f.bounds, f.seeks FROM weave_fuse_stats() f, weave_work_stats() w;"
     } > "$sqlf"
     psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A -F $'\t' -f "$sqlf" | tail -1
     rm -f "$sqlf"
@@ -184,7 +190,7 @@ if has_arm rrf; then
 fi
 
 {
-    printf 'arm\tlex_fused_side\tlex_wand\tvec_lanes\tvec_blocks\tvec_blocks_bound_skipped\tfuse_scores_total\tpivots\tblkskip\n'
+    printf 'arm\tlex_fused_side\tlex_wand\tvec_lanes\tvec_blocks\tvec_blocks_bound_skipped\tfuse_scores_total\tpivots\tblkskip\tabandon\tveto\tbounds\tseeks\n'
     [ -n "$W_NORM" ] && printf 'norm\t%s\n' "$W_NORM"
     [ -n "$W_RAW" ] && printf 'raw\t%s\n' "$W_RAW"
     [ -n "$W_RRF" ] && printf 'rrf\t%s\n' "$W_RRF"
@@ -199,18 +205,23 @@ fi
 # so the shuttle's own floor stays -INFINITY and that counter is structurally
 # zero.  `blkskip` is the fused core's own block-bound prune (src/am/fuse.c),
 # which is the one that could move.
-awk -F'\t' -v ds="$DS" 'NR>1{ for(i=2;i<=NF;i++) c[$1"_"i]=$i }
+awk -F'\t' -v ds="$DS" -v nq="$NQ" 'NR>1{ for(i=2;i<=NF;i++) c[$1"_"i]=$i }
 END {
     split("norm raw", arms, " ");
-    printf "\n%s: score() calls vs the RRF control (fused/rrf; gate is <= 0.20x)\n", ds;
+    printf "\n%s: work per channel, each in ITS OWN UNIT (gate <= 0.20x; see FUSED_TOPK sect. 8 as restated 2026-09-22)\n", ds;
+    printf "  %-5s %-28s %-28s %-22s %s\n", "arm", "lexical: BM25 contribs", "vector: CODE BLOCKS read", "pivots/query", "diagnostics";
     for (a in arms) {
         n = arms[a];
-        lex = c[n"_2"]; vec = c[n"_4"];
-        rlex = c["rrf_3"]; rvec = c["rrf_4"];
-        printf "  %-5s lexical %8.3fx   vector %8.3fx   total %8.3fx   (fused blkskip=%d, vec_blocks_bound_skipped=%d)\n",
-            n, (rlex ? lex/rlex : 0), (rvec ? vec/rvec : 0),
-            ((rlex+rvec) ? (lex+vec)/(rlex+rvec) : 0), c[n"_9"], c[n"_6"];
+        lex = c[n"_2"]; vblk = c[n"_5"]; piv = c[n"_8"];
+        rlex = c["rrf_3"]; rvblk = c["rrf_5"];
+        printf "  %-5s %12d %7.3fx       %12d %7.3fx    %12.0f      blkskip=%d abandon=%d veto=%d\n",
+            n, lex, (rlex ? lex/rlex : 0), vblk, (rvblk ? vblk/rvblk : 0),
+            (nq ? piv/nq : 0), c[n"_9"], c[n"_10"], c[n"_11"];
     }
+    printf "  %-5s %12d %7.3fx       %12d %7.3fx    %12s      (the control has no pivot loop)\n",
+        "rrf", c["rrf_3"], 1.0, c["rrf_5"], 1.0, "-";
+    printf "  LANES, the unit this row used to be reported in, for continuity: norm %.3fx  raw %.3fx\n",
+        (c["rrf_4"] ? c["norm_4"]/c["rrf_4"] : 0), (c["rrf_4"] ? c["raw_4"]/c["rrf_4"] : 0);
 }' "$OUT/work-$DS$TAG.tsv"
 
 # The verdict, computed here rather than by eye: the gate row is "fused nDCG >= RRF".

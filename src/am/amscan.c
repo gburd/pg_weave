@@ -4747,6 +4747,87 @@ weave_index_df(PG_FUNCTION_ARGS)
 	PG_RETURN_ARRAYTYPE_P(result);
 }
 
+PG_FUNCTION_INFO_V1(weave_index_max_tf);
+
+/*
+ * weave_index_max_tf(regclass, wquery) -> bigint[] of the MAXIMUM TERM FREQUENCY
+ * per distinct query term, taken over every segment.
+ *
+ * WHY THIS IS IN THE SQL SURFACE AT ALL, since nothing in the server needs it:
+ * doc/GAPS.md G46.  The fused scorer divides each fuse() KEY by that key's pre-scan
+ * ceiling (doc/specs/FUSED_TOPK.md sect. 8d), and for a lexical key the ceiling is the
+ * sum over its terms of the BM25 term bound at max tf.  bench/fuse.sh's correctness
+ * gate compares the pushdown against an EXHAUSTIVE oracle assembled in SQL, and
+ * without max tf that oracle cannot express the objective the scan computes -- so the
+ * gate had to be run against a non-default configuration, which is one configuration
+ * change away from testing nothing.
+ *
+ * MAX TF AND NOT THE CEILING ITSELF, deliberately.  A `weave_fuse_key_norm()` would be
+ * one call instead of an expression, and it would agree with the scan BY CONSTRUCTION:
+ * both would be the same C code, so the oracle would stop being independent and the
+ * gate would stop being able to catch an error in the bound arithmetic.  Exposing the
+ * raw statistic makes the oracle recompute `idf * mtf * (k1+1) / (mtf + k1*(1-b))` for
+ * itself, which is the one part of the normalizer a fixed-output test cannot reach.
+ *
+ * THE MAXIMUM OVER SEGMENTS, not per segment, because that is what the scan uses: a
+ * per-bolt normalizer would rank each bolt against a different objective (sect. 8d),
+ * so src/am/amscan.c's fused pass takes the max over every segment's dictionary entry
+ * before the first bolt is scanned.  This function answers the same question with the
+ * same loop.
+ *
+ * The array has ONE ELEMENT PER WEAVE_QI_VAL ITEM, in query order -- exactly the shape
+ * and order weave_index_df() returns -- so the two can be zipped positionally by a
+ * caller.  A term absent from every segment yields 0, whose term bound is 0, which is
+ * the same contribution the scan gives it (it skips a term with no posting anywhere).
+ */
+Datum
+weave_index_max_tf(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	WeaveQuery	q = PG_GETARG_WQUERY(1);
+	Relation	index;
+	WeaveMetaPageData meta;
+	Datum	   *elems;
+	int			n = 0;
+	uint32		i;
+	ArrayType  *result;
+
+	index = index_open(indexoid, AccessShareLock);
+	weave_read_meta(index, &meta);
+
+	elems = (Datum *) palloc(q->nitems * sizeof(Datum));	/* alloc-ok: one per query item, bounded by the parser */
+	for (i = 0; i < q->nitems; i++)
+	{
+		WeaveQueryItem *it = &q->items[i];
+
+		if (it->type == WEAVE_QI_VAL)
+		{
+			uint32		mtf = 0;
+			uint32		s;
+
+			for (s = 0; s < meta.nsegments; s++)
+			{
+				uint32		df;
+				uint32		smtf;
+				BlockNumber firstblk;
+				uint32		firstoff;
+
+				if (weave_lookup_dict(index, &meta.segs[s],
+									  WEAVE_QUERY_ITEMTEXT(q, it), it->termlen,
+									  &df, &smtf, &firstblk, &firstoff) &&
+					smtf > mtf)
+					mtf = smtf;
+			}
+			elems[n++] = Int64GetDatum((int64) mtf);
+		}
+	}
+	index_close(index, AccessShareLock);
+
+	result = construct_array(elems, n, INT8OID, 8, true, 'd');
+	PG_FREE_IF_COPY(q, 1);
+	PG_RETURN_ARRAYTYPE_P(result);
+}
+
 /* ----- index-only scored top-K search (WAND-style) ----- */
 
 #include "funcapi.h"

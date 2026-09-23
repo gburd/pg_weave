@@ -317,21 +317,35 @@ SQL
 MAPOK=$($PSQL -t -A -c "SELECT count(*) = (SELECT count(*) FROM fd) FROM fdmap;")
 [ "$MAPOK" = "t" ] || die "the docid map does not cover every row: weave_vec_lanes() and ctid order disagree"
 
-# THE GATE RUNS WITH THE NORMALIZER OFF, AND THAT IS A LIMITATION, NOT A CHOICE.
+# THE GATE RUNS AGAINST THE SHIPPING OBJECTIVE, WHICH IT COULD NOT DO FOR ONE DAY.
 #
-# The oracle below computes `0.5*lex + 0.5*vec` from the two SRFs.  Since 2026-09-22
-# the shipping scorer divides each fuse() KEY by its own pre-scan ceiling
-# (doc/specs/FUSED_TOPK.md sect. 8d), and this oracle CANNOT express that objective:
-# the vector key's normalizer is available in SQL (max over segments of
-# weave_vec_scan_stats().maxscore, the same (B2) fold the scan uses), but the lexical
-# key's needs each term's max tf, and NOTHING in the SQL surface exposes max tf.  So
-# the exhaustive comparison is made against the raw objective, on the arm that still
-# computes it, and what it proves is that THE SCAN IS EXACT -- pivot selection,
-# partition, abandonment, summation -- for a given set of weight constants.  What it
-# does NOT check is the constants themselves; that is sql/fuse_degenerate.sql (6)
-# (bolt-count independence) plus the nDCG arms below.  doc/GAPS.md G46.
-GATESET="$SETUP SET pg_weave.fuse_normalize = off;"
-say "$DS: correctness gate on $CHECKN queries (pushdown vs exhaustive per-channel oracle, normalizer OFF -- see the comment)"
+# From the morning of 2026-09-22 the scorer divided each fuse() KEY by its own pre-scan
+# ceiling (doc/specs/FUSED_TOPK.md sect. 8d) while this oracle still computed
+# `0.5*lex + 0.5*vec`, so the gate had to be run with `pg_weave.fuse_normalize = off` --
+# a gate testing a non-default configuration, which is one configuration change away
+# from testing nothing.  doc/GAPS.md G46 is that gap; 0.20.0's `weave_index_max_tf()`
+# closes it, and the oracle below now builds the same objective the scan does.
+#
+# THE ORACLE RECOMPUTES THE CEILING RATHER THAN ASKING FOR IT, which is the whole point
+# of exposing max tf instead of a normalizer accessor: the BM25 term bound
+# `idf * mtf * (k1+1) / (mtf + k1*(1-b))` is written out HERE, in SQL, from three
+# statistics the index publishes (df, max tf, ndocs).  An accessor would have returned
+# the scan's own number and the comparison would have shared code with the thing it
+# checks.  k1 = 1.2 and b = 0.75 are the scan's hardcoded constants
+# (src/am/amscan.c, weave_bm25_factors_init call sites); a term absent everywhere has
+# mtf = 0 and contributes 0, which is what the scan gives it too.
+#
+# The vector key's normalizer is the max over segments of the shuttle's own (B2) fold,
+# which weave_vec_scan_stats() reports per bolt.  k = 1 because only `maxscore` is read;
+# the row count is irrelevant.
+# GATE_PRE exists for ONE purpose: the positive control for this gate.  Setting it to
+# `SET pg_weave.fuse_normalize = off;` makes the pushdown compute a DIFFERENT objective
+# from the oracle, and the gate must then report mismatches -- measured on nfcorpus,
+# 2026-09-23 on 25 queries: 25 of 25 AGREE with it unset, and 14 of 25 MISMATCH with it
+# set, which fails the run.  A gate that
+# cannot be made to fail has not been shown to work (AGENTS.md, eleventh member).
+GATESET="$SETUP ${GATE_PRE:-}"
+say "$DS: correctness gate on $CHECKN queries (pushdown vs exhaustive per-channel oracle, normalizer ON -- the shipping objective)"
 BAD=0
 TIED=0
 FBDIFF=0
@@ -346,11 +360,24 @@ while IFS=$'\t' read -r qid wq qv; do
     [ "$got" = "$fb" ] || FBDIFF=$((FBDIFF + 1))
 
     read -r tiefree want < <(psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A -F $'\t' <<SQL
-WITH s AS (
+WITH t AS (
+    SELECT df, mtf
+      FROM unnest(weave_index_df('fd_weave', $wq::wquery),
+                  weave_index_max_tf('fd_weave', $wq::wquery)) AS u(df, mtf)
+), nrm AS (
+    SELECT GREATEST((SELECT sum(CASE WHEN t.mtf = 0 THEN 0::float8
+                                     ELSE ln(1.0 + ((SELECT ndocs FROM weave_index_stats('fd_weave'))
+                                                    - t.df + 0.5) / (t.df + 0.5))
+                                          * t.mtf * 2.2 / (t.mtf + 1.2 * (1.0 - 0.75))
+                                END) FROM t), 1e-9) AS nl,
+           GREATEST((SELECT max(maxscore)::float8
+                       FROM weave_vec_scan_stats('fd_weave', $qv::wvec, 1)), 1e-9) AS nv
+), s AS (
     SELECT m.id,
-           0.5::float8 * COALESCE(a.score, 0::float8)
-           + 0.5::float8 * COALESCE(v.score::float8, 0::float8) AS score
+           (0.5::float8 / nrm.nl) * COALESCE(a.score, 0::float8)
+           + (0.5::float8 / nrm.nv) * COALESCE(v.score::float8, 0::float8) AS score
       FROM fdmap m
+      CROSS JOIN nrm
       LEFT JOIN weave_search('fd_weave', $wq::wquery, $NDOCS) a ON a.ctid = m.rowtid
       LEFT JOIN weave_vec_scan('fd_weave', $qv::wvec, $NDOCS) v ON v.docid = m.docid
 ), r AS (
@@ -489,7 +516,7 @@ work_of() {                     # work_of <gen> -- prints one TSV row
         # scores minus the vector adapters' share minus the gates' share IS the
         # lexical contribution count, which is the unit the control's lex_contribs
         # is in.  Derived here rather than assumed, per the 0.19.0 migration note.
-        echo "SELECT f.scores - f.vec_scores - f.gate_scores, w.lex_contribs, w.vec_lanes, w.vec_blocks, w.vec_blocks_bound_skipped, f.scores, f.pivots, f.blkskip, f.rqskip, f.passes, f.runs FROM weave_fuse_stats() f, weave_work_stats() w;"
+        echo "SELECT f.scores - f.vec_scores - f.gate_scores, w.lex_contribs, w.vec_lanes, w.vec_blocks, w.vec_blocks_bound_skipped, f.scores, f.pivots, f.blkskip, f.rqskip, f.passes, f.runs, f.abandon, f.veto, f.bounds, f.seeks FROM weave_fuse_stats() f, weave_work_stats() w;"
     } > "$sqlf"
     psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A -F $'\t' -f "$sqlf" | tail -1
     rm -f "$sqlf"
@@ -611,10 +638,43 @@ printf 'fused_aa\t%s\t%s\t%s\n' "$P_FUSED2" "$LATN" "$REPS"
 printf 'fused_raw\t%s\t%s\t%s\n' "$P_RAW" "$LATN" "$REPS"
 
 printf '\n### fuse_work\n'
-printf 'arm\tlex_contribs_fused_side\tlex_contribs_wand\tvec_lanes\tvec_blocks\tvec_blocks_bound_skipped\tfuse_scores_total\tpivots\tblkskip\trqskip\tpasses\truns\n'
+printf 'arm\tlex_contribs_fused_side\tlex_contribs_wand\tvec_lanes\tvec_blocks\tvec_blocks_bound_skipped\tfuse_scores_total\tpivots\tblkskip\trqskip\tpasses\truns\tabandon\tveto\tbounds\tseeks\n'
 printf 'fused\t%s\n' "$W_FUSED"
 printf 'fused_raw\t%s\n' "$W_RAW"
 printf 'rrf\t%s\n' "$W_RRF"
+
+# ---------------------------------------------------------------------------
+# THE WORK ROW, IN THE UNITS SECT. 8 WAS RESTATED TO USE ON 2026-09-22.
+#
+# It used to be one ratio over "score() calls", which counted the vector channel in
+# LANES.  Two measurements killed that unit.  First, in WEAVE_PACK_LANE a one-lane
+# read touches every byte of its block, so a lane is not a unit of cost -- a block is,
+# and the block ratio is what a pruning mechanism has to move.  Second, the lane ratio
+# said normalization made the fused arm cheaper on all three datasets while the CLOCK
+# said fiqa's p50 doubled; a work row that cannot predict the latency row is measuring
+# the wrong thing.  What tracks the clock is the PIVOT COUNT, so it is reported per
+# query beside the ratios -- as a diagnostic, not a gate, because the RRF control has
+# no pivot loop and there is therefore nothing to take a ratio against.
+#
+# Computed here, in the script, so that nobody divides two table rows by hand and
+# picks the wrong columns -- which is how the 0.20x row was quoted for a month.
+# ---------------------------------------------------------------------------
+printf '\n### fuse_work_ratios\n'
+printf 'arm\tlex_contribs_vs_control\tvec_blocks_vs_control\tvec_lanes_vs_control\tpivots_per_query\tabandon\tblkskip\n'
+{ printf 'fused\t%s\n' "$W_FUSED"; printf 'fused_raw\t%s\n' "$W_RAW"; printf 'rrf\t%s\n' "$W_RRF"; } \
+  | awk -F'\t' -v nq="$NQ" '{ for (i=2;i<=NF;i++) c[$1"_"i]=$i }
+      END {
+        split("fused fused_raw rrf", a, " ");
+        for (k = 1; k <= 3; k++) {
+            n = a[k];
+            lex = (n == "rrf") ? c["rrf_3"] : c[n"_2"];
+            printf "%s\t%.3f\t%.3f\t%.3f\t%.0f\t%d\t%d\n", n,
+                   (c["rrf_3"] ? lex / c["rrf_3"] : 0),
+                   (c["rrf_5"] ? c[n"_5"] / c["rrf_5"] : 0),
+                   (c["rrf_4"] ? c[n"_4"] / c["rrf_4"] : 0),
+                   (nq ? c[n"_8"] / nq : 0), c[n"_13"], c[n"_9"];
+        }
+      }'
 
 printf '\n### fuse_plans\n'
 printf 'arm\tplan\n'

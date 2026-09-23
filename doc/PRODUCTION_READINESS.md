@@ -37,7 +37,7 @@ n-gram).
 | Quantizer reachable from SQL (`weave_quantize_roundtrip`) | **works** | lets reconstruction error be measured on a real corpus before the index exists |
 | Vector *indexing* (the AM accepting a `wvec` column) | **does not exist** | tasks V7–V9. **This is the gap between pg_weave and its own product definition** |
 | Vector storage pages, IVF, ANN | **does not exist** | tasks V7, V9, V13, V14 |
-| Fused-threshold top-k | **works, and 2 of 5 §8 gate rows pass** | F1/F2/F5–F8 done; the flagship `fuse(body <=> q, emb <#> v)` is answered by the index. `bench/RESULTS_FUSE.md`: recall vs exhaustive 1.000 (raw objective only, G46) and nDCG@10 **above** RRF on three BEIR corpora (1.053× / 1.010× / 1.114×) with the per-key normalizer — while **p50 (0.710× / 0.827× / 1.172× vs ≤ 0.50×), p99 (0.710× / 0.612× / 1.000× vs ≤ 0.70×) and the `score()`-call ratio (0.571× / 0.875× / 0.513× vs ≤ 0.20×) all FAIL**. **Measured on EC2 2026-09-22 (night) for the shipping scorer: p99 used to PASS at 0.609× / 0.560× / 0.633× on the raw sum, so the normalizer TRADED p99 FOR nDCG — and on fiqa the fused arm is now SLOWER than the RRF control it replaces** (p50 1.172×; the normalizer costs +19 % / +3 % / +104 % of p50, fiqa's doubled). Cause is the pivot walk, not the pre-scan pass: fiqa pivots 5.3×, vector lanes +4.6 %. nfcorpus also loses recall@100 and MRR@10 to RRF where nDCG wins. **Open maintainer decision: should `pg_weave.fuse_normalize` stay on by default** (on = better ranking, slower than RRF on the largest corpus; off = fast, ranks worse than RRF on all three) |
+| Fused-threshold top-k | **works, and 2 of 5 §8 gate rows pass** | F1/F2/F5–F8 done; the flagship `fuse(body <=> q, emb <#> v)` is answered by the index. `bench/RESULTS_FUSE.md`: recall vs exhaustive 1.000 (raw objective only, G46) and nDCG@10 **above** RRF on three BEIR corpora (1.053× / 1.010× / 1.114×) with the per-key normalizer — while **p50 (0.710× / 0.827× / 1.172× vs ≤ 0.50×), p99 (0.710× / 0.612× / 1.000× vs ≤ 0.70×) and the `score()`-call ratio (0.571× / 0.875× / 0.513× vs ≤ 0.20×) all FAIL**. **Measured on EC2 2026-09-22 (night) for the shipping scorer: p99 used to PASS at 0.609× / 0.560× / 0.633× on the raw sum, so the normalizer TRADED p99 FOR nDCG — and on fiqa the fused arm is now SLOWER than the RRF control it replaces** (p50 1.172×; the normalizer costs +19 % / +3 % / +104 % of p50, fiqa's doubled). Cause is the pivot walk, not the pre-scan pass: fiqa pivots 5.3×, vector lanes +4.6 %. nfcorpus also loses recall@100 and MRR@10 to RRF where nDCG wins. **DECIDED 2026-09-22: `pg_weave.fuse_normalize` STAYS ON BY DEFAULT** (a user chooses a ranking, not a scan strategy; off, the objective loses to RRF on all three corpora, and the GUC is `PGC_USERSET` so the old trade is available per query or per session). The work row is also **restated per channel** the same day — lexical BM25 contributions 0.203× / 0.380× / **0.052×** (**met on fiqa**), vector **code blocks read 1.000× everywhere** (failed), pivots per query reported and not gated. **The single blocker is the size of the vector channel's candidate set** |
 | pgvector / tsvector compatibility | **does not exist** | specified only; M1–M3, and 1.0 requirements rather than polish |
 | Fuzzy / approximate regex / n-gram channel | **compiles, unreachable** | Z1/Z2 done (TRE vendored at `f864ed0` and current, GUCs wired); no routing (Z3–Z7). **Four of the six named product capabilities are here**, so this is on the 1.0 path |
 | Prefix search (`term*`) | **works via the lexical dictionary walk** | inherited; measured 3.8–7.7× faster than tsvector+GIN (`bench/RESULTS_LEXICAL.md`). Z4 re-routes it through SuRF, which must not regress it |
@@ -85,10 +85,19 @@ mechanically checkable. `doc/PHASES.md` has the task-level detail.
    that won the nDCG row costs **+19 % / +3 % / +104 %** of p50 — so **the change traded p99
    for nDCG**, and the "unmeasured pre-scan pass" was the wrong suspect: the cost is the pivot
    walk (fiqa pivots 5.3×, vector lanes +4.6 %). **What a fused 1.0 claim is blocked on is now
-   three rows with one cause** — the size of the vector channel's candidate set — **plus an
-   open maintainer decision on whether `pg_weave.fuse_normalize` stays on by default**, since
-   its two settings each fail a different gate row. `bench/RESULTS_FUSE.md` (fourth
-   measurement), `doc/GAPS.md` G44.
+   three rows with one cause** — the size of the vector channel's candidate set — ~~**plus an
+   open maintainer decision on whether `pg_weave.fuse_normalize` stays on by default**~~
+   **[DECIDED 2026-09-22: IT STAYS ON. A user chooses a ranking, not a scan strategy; with the
+   normalizer off the fused objective loses to a plain RRF control on all three corpora
+   measured (0.982× / 0.924× / 0.687×), and a fused scan that ranks worse than the control it
+   replaces has no reason to exist. The price is named rather than absorbed — p99 PASS → FAIL,
+   p50 worse on every corpus, fiqa slower than the control — and `PGC_USERSET` means the old
+   trade is available per query or per session, which is why this is a default and not a fork
+   in the design. The latency regression is charged to the blocker above, not accepted as
+   permanent. §8's work row was restated per channel the same day and the vector half still
+   fails at 1.000× in blocks, so the gate stays at 2 of 5]**, since
+   its two settings each fail a different gate row. `bench/RESULTS_FUSE.md` (fourth and fifth
+   measurements), `doc/GAPS.md` G44.
 3. **Every channel must have a bound property test.** A too-low `block_max()`
    silently drops rows and no regression test catches it
    (`doc/TESTING.md`). Non-negotiable.
@@ -357,7 +366,10 @@ refined rather than replaced: **this row needs either (a) §8's row restated in 
 bytes rather than lanes, or (b) a second vector-major copy of the codes — forfeiting the
 storage gate — or (c) a cluster-ordered weft, which contradicts the strictly-ascending-docid
 requirement the fused vector channel depends on** (`include/weave/vecdocmap.h:35,105,122`).
-All three are maintainer decisions, presented and not taken. `doc/GAPS.md` **G46**,
+All three are maintainer decisions, ~~presented and not taken~~ **— (a) was TAKEN 2026-09-22 as
+a MEASUREMENT decision and did not rescue the row (in blocks the vector ratio is 1.000×,
+exactly as in lanes); (b) and (c) remain open, and one of them is the single blocker. Dated
+block below.** `doc/GAPS.md` **G46**,
 `doc/specs/FUSED_TOPK.md` **sect. 8d**.
 
 **MEASURED ON EC2 2026-09-22 (night), run `pgweave-20260922-224507`: THE OWED LATENCY RE-RUN
@@ -374,7 +386,7 @@ orphaned volumes, keys or security groups.
 | nDCG@10 | ≥ RRF | 1.053× | 1.010× | 1.114× | 0.982× / 0.924× / 0.687× | **MET** |
 | p99 latency | ≤ 0.70× | 0.710× | 0.612× | **1.000×** | 0.609× / 0.560× / 0.633× | **FAIL on two of three — WAS PASS** |
 | p50 latency | ≤ 0.50× | 0.710× | 0.827× | **1.172×** | 0.582× / 0.795× / 0.578× | **FAIL**, fiqa slower than the control |
-| `score()` calls | ≤ 0.20× | 0.571× | 0.875× | 0.513× | 0.648× / 0.903× / 0.541× | **FAIL** |
+| ~~`score()` calls~~ | ≤ 0.20× | 0.571× | 0.875× | 0.513× | 0.648× / 0.903× / 0.541× | **FAIL — row SUPERSEDED 2026-09-22 by the per-channel restatement below; the unit changed, the verdict did not** |
 
 **The gate was 2 of 5 before the normalizer (recall, p99) and it is 2 of 5 after it (recall,
 nDCG): the change TRADED p99 FOR nDCG.** The normalizer's own p50 cost is **+19 % / +3 % /
@@ -392,9 +404,61 @@ the list: **should `pg_weave.fuse_normalize` stay ON by default?** On, the ranki
 three corpora and the scan is slower than RRF on the largest; off, the scan is fast and the
 ranking loses to RRF on all three, which is the state that made claim 2 unsupported to begin
 with. The GUC is `PGC_USERSET`, so a user can already choose per query, and this is the first
-knob in the project whose two settings each fail a different gate row. **Presented, not taken.**
+knob in the project whose two settings each fail a different gate row. ~~**Presented, not taken.**~~
 `bench/RESULTS_FUSE.md` (fourth measurement), `doc/GAPS.md` **G44**,
 `doc/specs/FUSED_TOPK.md` **sect. 8b** and **8d**.
+
+**BOTH DECISIONS TAKEN 2026-09-22, AND THE GATE DOES NOT MOVE: IT IS STILL 2 OF 5. The list of
+open maintainer decisions for the fused scan is now EMPTY, and the blocker list is ONE ITEM
+LONG.**
+
+1. **`pg_weave.fuse_normalize` STAYS ON BY DEFAULT.** A user chooses a **ranking**, not a scan
+   strategy: with the normalizer off the fused objective loses to a plain RRF control on all
+   three corpora measured (0.982× / 0.924× / 0.687×), and a fused scan that ranks worse than
+   the two-query control it replaces has no reason to exist; with it on the ranking beats RRF
+   everywhere measured (1.053× / 1.010× / 1.114×). **The price is recorded and not hidden:**
+   p99 **PASS → FAIL** (0.609× / 0.560× / 0.633× → 0.710× / 0.612× / 1.000×), p50 0.582× /
+   0.795× / 0.578× → 0.710× / 0.827× / 1.172×, and on fiqa the fused arm is slower than the
+   control. Because the GUC is **`PGC_USERSET`**, a deployment that wants the old trade can
+   have it per query or per session — **which is why this is a default and not a fork in the
+   design** — and the latency regression is **not accepted as permanent**: it is charged to the
+   one open blocker, the size of the vector channel's candidate set.
+2. **§8's work row is RESTATED per channel, in each channel's own unit:** lexical **BM25
+   contributions** (gate ≤ 0.20×), vector **CODE BLOCKS READ** against the control's own code
+   scan (gate ≤ 0.20×), and **pivots per query reported but NOT gated**, because the RRF control
+   has no pivot loop and there is nothing to take a ratio against. Two measurements forced it: a
+   one-lane read in `WEAVE_PACK_LANE` touches every byte of its block, so **a lane is not a unit
+   of cost and a block is** (measured in the V15/V16 work,
+   `bench/RESULTS_CODE_SCAN.md:330,417`); and the lane-based row said normalization made the
+   fused arm *cheaper* on all three datasets (0.648→0.571, 0.903→0.875, 0.541→0.513) while the
+   clock said fiqa's p50 **doubled** — a work row that cannot predict the latency row is
+   measuring the wrong thing, and the **pivot count** is what tracks the clock (fiqa pivots
+   5.3×, p50 2.0×).
+
+| row | gate | scifact | nfcorpus | fiqa | |
+|---|---|---|---|---|---|
+| lexical work: BM25 contributions | ≤ 0.20× | 0.203× | 0.380× | **0.052×** | **MET on fiqa**, missed on scifact (just over) and nfcorpus |
+| vector work: **code blocks read** | ≤ 0.20× | 1.000× | 1.000× | 1.000× | **FAIL everywhere** |
+| pivots per query | *reported, not gated* | 5,183 | 3,627 | 57,572 | corpora of 5,183 / 3,633 / 57,600 documents — **a full pass over the docid space** |
+
+**Restating the row does not rescue it:** in blocks the vector ratio is **1.000×, exactly as it
+was in lanes**, so decision 2 buys **honesty about the unit, not a pass**. What it buys
+operationally is that the two halves fail separately: the lexical half is **met on fiqa** and the
+vector half is missed everywhere.
+
+**And the reason the vector half cannot be fixed cheaply is now arithmetic rather than a
+suspicion.** Incremental abandonment fires **constantly** — on fiqa **36,709,890 abandonments
+over 37,306,460 pivots, 0.98 per pivot** — which is what produced the lexical improvement (2.8×
+fewer BM25 contributions). It cannot help the vector channel because the fused core sums scored
+channels in **descending weighted ceiling** order and the normalized vector channel carries
+**0.4947** against **0.0110** per lexical channel, so it is summed **first** and scored before
+any abandonment test can run. **Reversing that order is dead on arithmetic, not on effort:** the
+test would be `s_lex + w_vec * block_max_vec <= theta`, and `w_vec * block_max` is ~0.49 against
+a theta of ~0.11; it would still be dead at k = 10. A per-block vector bound carries no
+information on L2-normalized data either ((B1), (B2), (B3) all ≈ 1.0 unless a block is coherent
+in direction). **So a fused 1.0 claim is blocked on exactly one thing: a smaller vector
+candidate set, by (b) or (c).** `bench/RESULTS_FUSE.md` (fifth measurement), `doc/GAPS.md`
+**G44**, `doc/specs/FUSED_TOPK.md` **sect. 8** and **8d**.
 
 **43 of 77 tasks are done** (`doc/PHASES.md`), phase X included, with 4 partials (V6,
 Z5, Z8, Z9) and 6 withdrawn (L2, L21, V9, V10, V13, **F4**). By phase: X 4/4, L 16/20,
