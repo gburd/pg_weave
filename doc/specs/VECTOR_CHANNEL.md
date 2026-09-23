@@ -456,6 +456,18 @@ and silently degrades the fused scorer to a full scan. Hence task **V13**: assig
 warp positions in the order the IVF build's k-means clustering produces. The
 partition is computed anyway for the out-of-core pass; it just has to be used.
 
+> **RETRACTED 2026-09-23 (hard rule 13), and the retracted part is the "hence".** The
+> premise above — "(B3) with a random warp order prunes 0.0 %" — stands. The inference
+> does not: a *clustered* warp order also prunes 0.00 %. Measured on scifact, nfcorpus
+> and fiqa with one real k-means cluster per 32-lane block, both orderings prune 0.00 %
+> of blocks and score 100.00 % of lanes, and so does an ORACLE threshold, which bounds
+> every possible ordering. The clustered blocks are tighter (mean radius 1.0436 → 0.9992
+> on scifact) by 4 %, where the bound needs 2.12–3.40×. Task **V13 is withdrawn**; the
+> heap-order build this paragraph warns about is not, on this evidence, costing anything.
+> `bench/RESULTS_CLUSTER_ORDER.md`. What survives is narrower and still true: **R is what
+> the bound turns on, and on 384-d normalized sentence embeddings no ordering makes R
+> small enough.**
+
 ## 7. Storage
 
 Page kinds. **These are no longer bits.** Task X1 (2026-09-10) replaced the flat
@@ -1622,7 +1634,7 @@ lanes. That is task V11 and its gate is a torn-write injection TAP test.
 | V7 crash safety | extend `t/001_crash_recovery.pl` to a vector index | not started |
 | V8 shuttle contract | `test_quantize.c` P8 (C2 soundness) + `bench/bound_pruning.c` soundness assert | passing, 17741 checks |
 | V9 IVF recall/latency/storage, **including a probes-vs-recall sweep** (§8a: probe count, not rerank window, is what a fixed-`nprobe` recall ceiling needs) | `bench/RESULTS_VECTOR.md` | not started |
-| V13 warp ordering | `bench/bound_pruning.c` ≥ 90 % blocks pruned | harness exists, ordering not built |
+| V13 warp ordering | `bench/bound_pruning.c` ≥ 90 % blocks pruned | **gate unreachable; task WITHDRAWN 2026-09-23.** `bench/RESULTS_CLUSTER_ORDER.md` measures 0.00 % on scifact/nfcorpus/fiqa with one k-means cluster per block — and 0.00 % at an oracle threshold, which is the ceiling over all orderings. The 90 % in this gate came from `bound_pruning.c`'s synthetic σ = 0.35 construction, already retracted at the top of `RESULTS_BOUND_PRUNING.md` |
 | V14 block header maintenance | `weave_check()` recompute-and-compare | not started |
 
 `test/hegel/test_quantize.c` currently runs 17,741 checks with 0 failures across
