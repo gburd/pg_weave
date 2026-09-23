@@ -201,6 +201,22 @@ BUILD_S=$(awk -v a="$BUILD_START" -v b="$BUILD_END" 'BEGIN{printf "%.1f", b-a}')
 $PSQL -c "ANALYZE fd;" >/dev/null
 IDXMB=$($PSQL -t -A -c "SELECT round(pg_relation_size('fd_weave')/1048576.0, 1);")
 
+# LOAD-ONLY EXIT.  Everything above is the corpus shape three scripts need and only
+# this one knows how to build: `fd`/`fq`/`fqrel`, the wquery derivation, and the
+# single (body, emb) index.  bench/normprod.sh's header already says "PGDATABASE must
+# name a database bench/fuse.sh has already loaded", which meant running the whole
+# 25-minute-per-arm measurement to get a loaded database -- and bench/gatesweep.sh
+# needs the same thing.  Exiting here is not a mode of the benchmark; it is the
+# benchmark's setup made reachable, so the two consumers cannot drift onto a
+# differently-built corpus.
+if [ "${FUSE_LOAD_ONLY:-0}" = 1 ]; then
+    say "$DS: LOAD ONLY -- $NDOCS docs, $NQ queries, index ${IDXMB} MB in ${BUILD_S}s, db=$DB"
+    printf 'dataset\tdb\tndocs\tnq\tdim\tembed\tindex_mb\tbuild_s\tweavever\n'
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$DS" "$DB" "$NDOCS" "$NQ" "$DIM" "$EMBED" "$IDXMB" "$BUILD_S" "$WEAVEVER"
+    exit 0
+fi
+
 # Both arms, both passes, no parallelism: see the header.
 SETUP="SET max_parallel_workers_per_gather = 0;"
 

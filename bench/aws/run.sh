@@ -98,6 +98,9 @@ case "$JOB" in
 	# merges it, so at peak it holds the index, its merge output, and the staging
 	# table at once.  Same 400 as the other GIST jobs for the same reason.
 	vecmerge) VOLGB=${VOLGB_OVERRIDE:-400} ;;
+	# gatesweep loads the same BEIR corpora as fuse through the same loader, plus
+	# the sentence-transformer model cache.  Same 250 for the same reason.
+	gatesweep) VOLGB=${VOLGB_OVERRIDE:-250} ;;
 esac
 REGION=$(aws configure get region --profile "$PROFILE")
 RUN=pgweave-$(date -u +%Y%m%d-%H%M%S)
@@ -442,6 +445,33 @@ run_lexical() {
 		2>&1 | tee "$OUT/lexical.log"
 }
 
+# The CPU embedder, factored out of run_fuse when the gatesweep job needed the same
+# corpus.  Idempotent: pip no-ops on a second install, so two jobs in one session
+# pay for it once.  Everything it guards against is in the comments below, each of
+# which corresponds to a run that died after paying for provisioning.
+ensure_embedder() {
+	say "installing sentence-transformers into a venv (pulls torch CPU -- several minutes with NO output; this is EXPECTED, not a hang)"
+	$SSH 'set -e
+		export DEBIAN_FRONTEND=noninteractive
+		sudo apt-get -qq install -y python3-venv >/dev/null
+		python3 -m venv /scratch/venv
+		/scratch/venv/bin/pip install --quiet --upgrade pip
+		/scratch/venv/bin/pip install --quiet torch \
+			--index-url https://download.pytorch.org/whl/cpu
+		/scratch/venv/bin/pip install --quiet sentence-transformers
+		/scratch/venv/bin/python3 -c "import sentence_transformers, torch; \
+print(\"EMBEDDER_OK st\", sentence_transformers.__version__, \"torch\", torch.__version__)"' \
+		2>&1 | tee "$OUT/fuse-pip-install.log" \
+		|| die "sentence-transformers install FAILED -- tail of $OUT/fuse-pip-install.log:
+$(tail -30 "$OUT/fuse-pip-install.log")"
+	# Assert the IMPORT succeeded, not merely that pip exited 0: a resolver that
+	# installs a broken combination still exits 0, and the failure would then
+	# surface as prepdata.py dying after the corpus download.
+	grep -q EMBEDDER_OK "$OUT/fuse-pip-install.log" \
+		|| die "sentence-transformers installed but does not import (see $OUT/fuse-pip-install.log)"
+	say "embedder ready: $(grep EMBEDDER_OK "$OUT/fuse-pip-install.log")"
+}
+
 run_fuse() {
 	# The fused-retrieval benchmark (doc/specs/FUSED_TOPK.md): each dataset gets
 	# CPU-embedded with a sentence-transformer (bench/prepdata.py), then scored
@@ -467,26 +497,7 @@ run_fuse() {
 	# Installed ONCE, before any dataset, not per-dataset: pip no-ops on a second
 	# install, and running it inside the loop would just make the "is this hung?"
 	# moment happen four times instead of once.
-	say "installing sentence-transformers into a venv (pulls torch CPU -- several minutes with NO output; this is EXPECTED, not a hang)"
-	$SSH 'set -e
-		export DEBIAN_FRONTEND=noninteractive
-		sudo apt-get -qq install -y python3-venv >/dev/null
-		python3 -m venv /scratch/venv
-		/scratch/venv/bin/pip install --quiet --upgrade pip
-		/scratch/venv/bin/pip install --quiet torch \
-			--index-url https://download.pytorch.org/whl/cpu
-		/scratch/venv/bin/pip install --quiet sentence-transformers
-		/scratch/venv/bin/python3 -c "import sentence_transformers, torch; \
-print(\"EMBEDDER_OK st\", sentence_transformers.__version__, \"torch\", torch.__version__)"' \
-		2>&1 | tee "$OUT/fuse-pip-install.log" \
-		|| die "sentence-transformers install FAILED -- tail of $OUT/fuse-pip-install.log:
-$(tail -30 "$OUT/fuse-pip-install.log")"
-	# Assert the IMPORT succeeded, not merely that pip exited 0: a resolver that
-	# installs a broken combination still exits 0, and the failure would then
-	# surface as prepdata.py dying after the corpus download.
-	grep -q EMBEDDER_OK "$OUT/fuse-pip-install.log" \
-		|| die "sentence-transformers installed but does not import (see $OUT/fuse-pip-install.log)"
-	say "embedder ready: $(grep EMBEDDER_OK "$OUT/fuse-pip-install.log")"
+	ensure_embedder
 
 	local datasets=${FUSE_DATASETS:-"scifact nfcorpus fiqa"}
 	local limit=${FUSE_LIMIT:-0}
@@ -1220,6 +1231,65 @@ MUTSQL
 	fi
 }
 
+run_gatesweep() {
+	# CLAIM 3 OF doc/ARCHITECTURE.md sect. 9, the half that has never been measured:
+	# does a fused query get FASTER as the predicate gets more selective?
+	#
+	# The work half was measured locally on 2026-09-23 (bench/RESULTS_GATE_SWEEP.md)
+	# and split in two: CPU work tracks selectivity to three digits, while page
+	# traffic was FLAT until G27 stored the code-page pointer, after which it falls
+	# 2.04x on scifact and 4.79x on fiqa at 0.1 %.  Counts are host-independent so
+	# that needed no instance.  Latency is not, and latency is what the claim is
+	# about -- a user does not feel a pivot count.
+	#
+	# WHAT WOULD MAKE THIS RUN WORTHLESS, and what stops it: a point whose plan has
+	# no `Index Cond:` measures the executor filtering rows and draws a beautiful
+	# flat curve (gatesweep.sh dies on it); a single drifting point read as the curve
+	# (every point is measured twice, in non-adjacent slots, and the A/A spread is
+	# reported beside the ratio); and a corpus built differently from the one the work
+	# pass used (both go through fuse.sh's loader, now reachable as FUSE_LOAD_ONLY).
+	ensure_embedder
+
+	local datasets=${FUSE_DATASETS:-"scifact nfcorpus fiqa"}
+	local limit=${FUSE_LIMIT:-0}
+	local bench=/scratch/bench
+
+	for D in $datasets; do
+		say "gatesweep: preparing $D (embed=minilm, limit=$limit)"
+		$SSH "cd pg_weave && mkdir -p $bench && \
+			  /scratch/venv/bin/python3 bench/prepdata.py --dataset $D \
+				--out $bench --embed minilm --limit \"$limit\"" \
+			2>&1 | tee "$OUT/gs-$D-prep.log" \
+			|| die "prepdata.py failed for $D (see $OUT/gs-$D-prep.log)"
+
+		# One database per dataset, so the sweep can be re-run against any of them
+		# afterwards without reloading -- and so a failure on the third dataset does
+		# not take the first two down with it.
+		say "gatesweep: loading $D"
+		$SSH "cd pg_weave && PGDATABASE=gs_$D FUSE_LOAD_ONLY=1 \
+			  bash bench/fuse.sh $bench $D" \
+			2>&1 | tee "$OUT/gs-$D-load.log" \
+			|| die "fuse.sh load failed for $D (see $OUT/gs-$D-load.log)"
+		grep -q 'LOAD ONLY' "$OUT/gs-$D-load.log" \
+			|| die "$D: fuse.sh did not take the load-only path -- it may have run the
+			        whole benchmark, or the corpus is not loaded"
+
+		say "gatesweep: sweeping $D (LAT=1, ${LATN:-25} queries x ${REPS:-7} reps x 2 slots)"
+		$SSH "cd pg_weave && DBS=gs_$D K=${K:-10} NQ=${GSNQ:-0} LAT=1 \
+			  LATN=${LATN:-25} REPS=${REPS:-7} OUT=/scratch/gatesweep TAG=$D \
+			  bash bench/gatesweep.sh" \
+			2>&1 | tee "$OUT/gs-$D-sweep.log"
+		rc=${PIPESTATUS[0]}
+		# Pulled per dataset (hard rule 14), and BEFORE the status check so a point
+		# that died still leaves the points that succeeded on local disk.
+		for f in gatesweep-$D.tsv gatesweep-lat-$D.tsv; do
+			$SSH "cat /scratch/gatesweep/$f" > "$OUT/$f" 2>/dev/null \
+				|| say "gatesweep: could not pull $f for $D"
+		done
+		[ "$rc" = 0 ] || die "gatesweep.sh failed for $D (see $OUT/gs-$D-sweep.log)"
+	done
+}
+
 run_bound() {
 	# The measurement from bench/RESULTS_BOUND_PRUNING.md, on real hardware and
 	# over more dimensions than a laptop run covers.  This is the number the
@@ -1257,6 +1327,10 @@ case "$JOB" in
 	# run_smoke first for the same reason: it is where `sudo make install` happens,
 	# and vecmerge's whole output is weave_check(), which needs the extension.
 	vecmerge)   run_smoke; run_vecmerge ;;
+	# gatesweep needs the extension installed (run_smoke) and, unlike the work pass
+	# that runs on the workstation for free, a quiet machine -- it is the only
+	# latency measurement claim 3 has.
+	gatesweep)  run_smoke; run_gatesweep ;;
 	all)     run_smoke; run_bound; run_lexical ;;
 	*)     die "unknown job: $JOB" ;;
 esac

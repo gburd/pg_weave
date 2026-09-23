@@ -13,10 +13,25 @@
 # every ratio-against-RRF row has to argue about what the control should be allowed
 # to do with the predicate, and this one does not.
 #
-# WORK ONLY, NO LATENCY, DELIBERATELY.  This runs on the workstation, where every
-# latency figure is worthless (AGENTS.md).  The counters it reads are deterministic
-# and host-independent, which is the same reason nDCG is measured locally and p99 is
-# not.  If the work curve is flat, no EC2 run can make the latency curve fall.
+# WORK BY DEFAULT; LATENCY ONLY WHEN ASKED, AND ONLY ON EC2.  This runs on the
+# workstation, where every latency figure is worthless (AGENTS.md).  The counters it
+# reads are deterministic and host-independent, which is the same reason nDCG is
+# measured locally and p99 is not.  If the work curve is flat, no EC2 run can make
+# the latency curve fall -- which is why the work pass came first and shipped alone.
+#
+# `LAT=1` adds the latency pass, and it exists because the work pass ALONE cannot
+# support claim 3.  Claim 3 is a claim about queries, not about counters, and after
+# G27 the two halves of the work curve disagree in an interesting way: CPU work
+# tracks selectivity to three digits, while page traffic only started falling at all
+# once the code-page pointer was stored (2.04x on scifact, 4.79x on fiqa at 0.1 %).
+# A latency curve is the arbiter of which of those a user feels.  It needs a quiet
+# machine, so `LAT=1` belongs to bench/aws/run.sh's `gatesweep` job and nowhere else.
+#
+# THE A/A LEG IS PER POINT, NOT PER ARM (hard rule 10).  There is no competitor here,
+# so the noise floor has to come from measuring the SAME selectivity point twice in
+# non-adjacent slots: every point is measured once in the first rotation and again in
+# the second, after every other point has run.  A between-point delta smaller than a
+# point's own slot1-slot2 spread is not a result.
 #
 # THREE THINGS THIS CANNOT SEE, stated here so a reader does not infer them:
 #
@@ -38,6 +53,7 @@
 #
 # usage: [DBS="normsci normnf normfiqa"] [K=10] [NQ=0] bench/gatesweep.sh
 #        NQ=0 means every query in fq.
+#        LAT=1 adds the latency pass (LATN queries x REPS reps x 2 slots per point).
 #
 # Copyright (c) 2025-2026, Gregory Burd
 
@@ -46,11 +62,15 @@ set -uo pipefail
 DBS=${DBS:-"normsci normnf normfiqa"}
 K=${K:-10}
 NQ=${NQ:-0}
+LAT=${LAT:-0}
+LATN=${LATN:-50}
+REPS=${REPS:-7}
 OUT=${OUT:-/scratch/pg_weave/gatesweep}
 TAG=${TAG:-$(date +%Y%m%d-%H%M%S)}
 
 mkdir -p "$OUT"
 REPORT=$OUT/gatesweep-$TAG.tsv
+LATREPORT=$OUT/gatesweep-lat-$TAG.tsv
 
 say() { printf '%s\n' "$*" >&2; }
 die() { printf 'gatesweep.sh: %s\n' "$*" >&2; exit 1; }
@@ -74,6 +94,19 @@ TERMS=(
 
 printf 'db\tndocs\tnq\ttarget\tterm\tgate_rows\tsel\tpivots\tlex_contribs\tvec_scores\tgate_scores\tvec_lanes\tvec_blocks\tblkskip\trqskip\tveto\tabandon\n' \
     > "$REPORT"
+if [ "$LAT" = 1 ]; then
+    printf 'db\tndocs\ttarget\tterm\tsel\tslot\tp50_ms\tp99_ms\tqueries\treps\n' > "$LATREPORT"
+fi
+
+# p50 and p99 from a file of one measurement per line.  Identical to bench/fuse.sh's,
+# on purpose: two scripts measuring the same index with two percentile conventions
+# would produce a difference that is neither script's subject.
+pctl() {
+    sort -g "$1" | awk '{v[NR]=$1}
+        END { if (NR==0) { printf "0\t0"; exit }
+              p=int(NR*0.99); if (p<1) p=NR;
+              printf "%.3f\t%.3f", v[int((NR+1)/2)], v[p] }'
+}
 
 for DB in $DBS; do
     PSQL="psql -X -q -v ON_ERROR_STOP=1 -d $DB"
@@ -95,6 +128,11 @@ for DB in $DBS; do
     NQUSED=$(wc -l < "$QLIT")
 
     say "$DB: $N docs, $NQUSED queries, k=$K -- measuring term document frequencies"
+
+    # The resolved points, kept so the latency pass can replay exactly the shapes the
+    # counter pass measured.  Re-deriving them there would let the two passes drift
+    # onto different terms, and then the work curve could not explain the latency one.
+    PTS=$(mktemp)
 
     # One count(*) per candidate, on the index.  The dictionary's df would be cheaper
     # but it is per segment and includes tombstoned documents; the gate's real
@@ -163,8 +201,59 @@ for DB in $DBS; do
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$DB" "$N" "$NQUSED" "$TARGET" "${TERM:--}" "$GROWS" "$SEL" "$ROW" \
             | tr -d '\r' >> "$REPORT"
+        printf '%s\t%s\t%s\t%s\n' "$TARGET" "${TERM:--}" "$SEL" "$WHERE" >> "$PTS"
         say "$DB target=$TARGET term=${TERM:--} sel=$SEL -> $ROW"
     done
+
+    # ------------------------------------------------------------------ latency
+    #
+    # Two rotations over the points, one query at a time.  Interleaving by QUERY
+    # rather than running each point to completion is what keeps a drift in the
+    # machine -- another tenant, a thermal step, a background autovacuum -- from
+    # landing entirely on one point and being read as claim 3 succeeding or failing.
+    #
+    # `EXPLAIN (ANALYZE, TIMING OFF, SUMMARY ON)` and dropping the first rep, exactly
+    # as bench/fuse.sh does: TIMING OFF removes per-node instrumentation overhead and
+    # leaves the one number wanted, and the first rep of a fresh statement pays for
+    # the plan and the cold buffers.
+    if [ "$LAT" = 1 ]; then
+        say "$DB: latency, $(wc -l < "$PTS") points x $LATN queries x $REPS reps x 2 slots"
+        declare -A LATF
+        while IFS=$'\t' read -r tgt term sel whr; do
+            LATF["$tgt:1"]=$(mktemp); LATF["$tgt:2"]=$(mktemp)
+        done < "$PTS"
+
+        while IFS=$'\t' read -r qid wq qv; do
+            for slot in 1 2; do
+                while IFS=$'\t' read -r tgt term sel whr; do
+                    {
+                        echo "SET enable_seqscan=off; SET enable_bitmapscan=off;"
+                        for _ in $(seq 1 "$REPS"); do
+                            printf "EXPLAIN (ANALYZE, TIMING OFF, SUMMARY ON) SELECT id FROM fd %s ORDER BY fuse(body <=> %s::wquery, emb <#> %s::wvec, weights => '{0.5,0.5}') LIMIT %s;\n" \
+                                "$whr" "$wq" "$qv" "$K"
+                        done
+                    } | psql -X -q -d "$DB" -t -A \
+                      | sed -n 's/^Execution Time: \([0-9.]*\) ms$/\1/p' \
+                      | tail -n +2 \
+                      >> "${LATF["$tgt:$slot"]}"
+                done < "$PTS"
+            done
+        done < <(head -n "$LATN" "$QLIT")
+
+        while IFS=$'\t' read -r tgt term sel whr; do
+            for slot in 1 2; do
+                f=${LATF["$tgt:$slot"]}
+                n=$(wc -l < "$f")
+                [ "$n" -gt 0 ] || die "$DB target=$tgt slot=$slot: no timings came back"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$DB" "$N" "$tgt" "$term" "$sel" "$slot" "$(pctl "$f")" \
+                    "$LATN" "$REPS" >> "$LATREPORT"
+                rm -f "$f"
+            done
+        done < "$PTS"
+        unset LATF
+    fi
+    rm -f "$PTS"
     rm -f "$QLIT" "$DFFILE"
 done
 
@@ -187,3 +276,26 @@ awk -F'\t' 'NR==1{next}
                base_v[k] ? f[10]/base_v[k] : 0, base_b[k] ? f[13]/base_b[k] : 0;
       }
     }' "$REPORT" >&2
+
+if [ "$LAT" = 1 ]; then
+    say ""
+    say "latency report: $LATREPORT"
+    say ""
+    # THE A/A COLUMN IS THE ONE TO READ FIRST.  `aa` is |slot1 - slot2| for the same
+    # point; `vs_1.0` is the ratio of slot 1 against the unfiltered point of the same
+    # database.  Claim 3 is supported at a point only if the ratio moved by more than
+    # that point's own aa spread -- otherwise the machine moved, not the query.
+    awk -F'\t' 'NR==1{next}
+        { key=$1 "\t" $3; if ($6=="1") p50[key]=$7; else q50[key]=$7
+          if ($3=="1.0") { if ($6=="1") base[$1]=$7 }
+          if (!seen[key]++) order[++n]=key; sel[key]=$5; term[key]=$4 }
+        END {
+          printf "%-9s %-7s %-8s %10s %10s %9s %9s\n", "db", "target", "sel",
+                 "p50_slot1", "p50_slot2", "aa_ms", "vs_1.0";
+          for (i = 1; i <= n; i++) {
+            k = order[i]; split(k, f, "\t"); d = p50[k] - q50[k]; if (d < 0) d = -d;
+            printf "%-9s %-7s %-8s %10.3f %10.3f %9.3f %8.3fx\n", f[1], f[2], sel[k],
+                   p50[k], q50[k], d, base[f[1]] ? p50[k]/base[f[1]] : 0;
+          }
+        }' "$LATREPORT" >&2
+fi
