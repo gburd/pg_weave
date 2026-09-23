@@ -1179,11 +1179,12 @@ run_vecmerge() {
 	# mutation control, which has to live here because the host has no git history.
 	fetch_gist
 
-	say "vecmerge: clean arm, ${NROWS:-1000000} x 960-d, build + $((${NBATCH:-4})) merges + 3 vacuums"
+	say "vecmerge: clean arm, ${NROWS:-1000000} x 960-d, build + ${NBATCH:-4} merges + ${VACCYC:-4} vacuum cycles"
 	# Artifacts are pulled BEFORE the status check, so a failure still yields the
 	# per-stage weave_check output that says which invariant broke.
 	$SSH "cd pg_weave && OUT=\$HOME/out NROWS=${NROWS:-1000000} \
 			BATCH=${BATCH:-50000} NBATCH=${NBATCH:-4} DELFRAC=${DELFRAC:-10} \
+			VACCYC=${VACCYC:-4} \
 			bash bench/vecmerge.sh" 2>&1 | tee "$OUT/vecmerge.log"
 	rc=${PIPESTATUS[0]}
 	$SSH 'cd ~/out && tar cf - .' | tar xf - -C "$OUT" 2>/dev/null || true
