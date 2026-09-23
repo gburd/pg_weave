@@ -703,6 +703,46 @@ weave_vec_write_weft(Relation index, WeaveVecAccum *acc)
 		vec_block_stats(acc, &g, perm, b, block, &rec, recon, lane_scale,
 						lane_norm, slot, cen, cencode, tmpcode);
 
+		/*
+		 * The block's strips, in the order weave_vecweft_strip_plan() defines:
+		 * lane strips then centroid strips, block-major.  ONE page per strip; the
+		 * greedy several-strips-per-page packing sect. 7.1 leaves to the writer is
+		 * not implemented, so the low-dim waste it describes is real and recorded
+		 * rather than claimed away.
+		 *
+		 * BEFORE THE DIRECTORY RECORD, and that order is load-bearing since G27:
+		 * the record carries `firstpage`, the block number of the strip page
+		 * emitted first below, and vec_chain_append() only knows a page's number
+		 * after it has allocated it.  Writing the record first -- as this loop did
+		 * until 2026-09-23 -- would mean patching a page whose GenericXLog cycle
+		 * the chain has already closed.
+		 */
+		for (k = 0; k < g.strips_per_block; k++)
+		{
+			WeaveVecStripPlan p;
+			uint32		i = b * (uint32) g.strips_per_block + (uint32) k;
+			int			n;
+
+			if (weave_vecweft_strip_plan(&g, i, &p) != 0)
+				elog(ERROR, "no plan for vector strip %u of %u", i, g.nstrips);
+
+			page = vec_chain_append(&codes);
+			if (k == 0)
+				rec.firstpage = (weave_uint32) BufferGetBlockNumber(codes.buf);
+			if ((p.flags & WEAVE_VSTRIP_F_CENTROID) != 0)
+				n = weave_censtrip_build(PageGetContents(page),
+										 WEAVE_VECPAGE_PAYLOAD, &g, &p, cencode);
+			else
+				n = weave_strip_build(PageGetContents(page),
+									  WEAVE_VECPAGE_PAYLOAD, acc->layout,
+									  g.dim, g.bits, p.blockno, p.j0,
+									  p.ncoords, p.flags, block);
+			if (n < 0)
+				elog(ERROR, "could not build vector strip %u (block %u, j0 %d)",
+					 i, p.blockno, p.j0);
+			vec_page_used(page, n);
+		}
+
 		/* A fresh directory page every rpp records; record `b` goes in slot
 		 * b % rpp of it, which is the O(1) addressing the fixed-size record buys
 		 * (weave_vecdir_page_index / weave_vecdir_slot_index). */
@@ -721,40 +761,11 @@ weave_vec_write_weft(Relation index, WeaveVecAccum *acc)
 			vec_page_used(page, (int) (sizeof(WeaveVecDirHdr) +
 									   (Size) nrecs * sizeof(WeaveVecDirRec)));
 		}
+		if (rec.firstpage == 0 || rec.firstpage == WEAVE_METAPAGE_BLKNO)
+			elog(ERROR, "vector block %u produced no first strip page", b);
 		if (weave_vecdir_write(PageGetContents(dir.page), WEAVE_VECPAGE_PAYLOAD,
 							   WEAVE_VECPAGE_PAYLOAD, dirslot, &rec) != 0)
 			elog(ERROR, "could not write the directory record for vector block %u", b);
-
-		/*
-		 * The block's strips, in the order weave_vecweft_strip_plan() defines:
-		 * lane strips then centroid strips, block-major.  ONE page per strip; the
-		 * greedy several-strips-per-page packing sect. 7.1 leaves to the writer is
-		 * not implemented, so the low-dim waste it describes is real and recorded
-		 * rather than claimed away.
-		 */
-		for (k = 0; k < g.strips_per_block; k++)
-		{
-			WeaveVecStripPlan p;
-			uint32		i = b * (uint32) g.strips_per_block + (uint32) k;
-			int			n;
-
-			if (weave_vecweft_strip_plan(&g, i, &p) != 0)
-				elog(ERROR, "no plan for vector strip %u of %u", i, g.nstrips);
-
-			page = vec_chain_append(&codes);
-			if ((p.flags & WEAVE_VSTRIP_F_CENTROID) != 0)
-				n = weave_censtrip_build(PageGetContents(page),
-										 WEAVE_VECPAGE_PAYLOAD, &g, &p, cencode);
-			else
-				n = weave_strip_build(PageGetContents(page),
-									  WEAVE_VECPAGE_PAYLOAD, acc->layout,
-									  g.dim, g.bits, p.blockno, p.j0,
-									  p.ncoords, p.flags, block);
-			if (n < 0)
-				elog(ERROR, "could not build vector strip %u (block %u, j0 %d)",
-					 i, p.blockno, p.j0);
-			vec_page_used(page, n);
-		}
 	}
 
 	vec_chain_close(&codes);

@@ -526,3 +526,5 @@ doing:
 - `weave-index-am` — access-method callbacks, locking, WAL, MVCC, CIC
 - `weave-testing` — the five test layers and when each applies
 - `weave-bench` — benchmarking credibly, including the EC2 workflow
+
+See .agent-steering-domains.md for domain-specific steering (local).

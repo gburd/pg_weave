@@ -666,12 +666,21 @@ main(void)
 	CHECK(weave_strip_coordbytes(4) == 16, "4-bit coordinate stride is not 16 bytes");
 
 	/*
-	 * D5, same discipline: 284 bytes per record and 8 bytes of page header, so an
-	 * 8,160-byte page holds 28 records with 208 bytes of slack.  Hard-coded so a
+	 * D5, same discipline: 288 bytes per record and 8 bytes of page header, so an
+	 * 8,160-byte page holds 28 records with 88 bytes of slack.  Hard-coded so a
 	 * struct that grows silently is caught here rather than by a reader that
 	 * addresses the wrong slot.
+	 *
+	 * 288 SINCE G27, AND THE RECORDS-PER-PAGE ASSERTION BELOW IS WHY THE FIELD
+	 * COULD GO HERE.  The record gained `firstpage` (the block's first strip page,
+	 * so a gated scan reads only the blocks it scores) and the per-page count did
+	 * NOT move: 8152/284 and 8152/288 both floor to 28, so the directory occupies
+	 * exactly the same pages.  If a later field pushes the count below 28 that is a
+	 * storage regression as well as a format change, which is what makes these two
+	 * assertions worth keeping side by side.  The slack shrank 208 -> 88, so there
+	 * is room for one more 4-byte field and not for two of 44.
 	 */
-	CHECK(sizeof(WeaveVecDirRec) == 284, "WeaveVecDirRec is %zu bytes, not 284",
+	CHECK(sizeof(WeaveVecDirRec) == 288, "WeaveVecDirRec is %zu bytes, not 288",
 		  sizeof(WeaveVecDirRec));
 	CHECK(sizeof(WeaveVecDirHdr) == 8, "WeaveVecDirHdr is %zu bytes, not 8",
 		  sizeof(WeaveVecDirHdr));

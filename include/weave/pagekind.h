@@ -187,7 +187,7 @@ typedef enum WeavePageKind
 	 * per-object-discriminator precedent and what weave_check() needs.  Appended
 	 * rather than inserted; these ids are on-disk ABI.
 	 */
-	WEAVE_PK_VDIR = 27,			/* vector: the fixed 284-byte per-block records */
+	WEAVE_PK_VDIR = 27,			/* vector: the fixed 288-byte per-block records */
 
 	/*
 	 * Allocated by the merge producer (doc/specs/VECTOR_CHANNEL.md sect. 7.3),
