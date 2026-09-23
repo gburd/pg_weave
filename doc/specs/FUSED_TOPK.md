@@ -1156,7 +1156,12 @@ chosen here** — the choice is the maintainer's:
     exactly the interleaved directory pages, so `codestart + b × strips_per_block` works as a
     *speculative* address validated by the check the cursor already makes, falling back to the
     chain walk — zero format change, no migration. Measure the hit rate on a merged and
-    vacuumed index first.
+    vacuumed index first. **DONE, AND IT REFUTED THE SPECULATIVE ADDRESS: 94 % after a merge,
+    100 % after a second merge, and 5 % after a `DELETE` + `VACUUM` rewrite (max deviation 213
+    pages), because a rewrite draws recycled pages.** The chosen fix is therefore one
+    `weave_uint32 firstpage` inside `WeaveVecDirRec`, which costs **zero extra pages** —
+    records per directory page are `8144/284 = 28` today and `8144/288 = 28` with it, verified
+    against the measured directory page counts — and no new page kind. `doc/GAPS.md` G27.
 
   - **THE UNFILTERED ROW DESERVES A STATED PROOF RATHER THAN A REPEATED FAILURE.** At
     `s = 1` both arms perform an exhaustive vector scan: the RRF control's vector branch is
