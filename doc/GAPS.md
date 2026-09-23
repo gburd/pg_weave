@@ -1950,11 +1950,34 @@ dropped; the first three fixtures tried reproduced nothing. Positive control: wi
 guard reverted the assertion reports 128 of 130 documents, missing exactly the two
 postings in the skipped final block.
 
-**Still owed, and not closed by this fix:** the abandonment audit added here
-(`WEAVE_FUSE_C2_ABANDON` / `fuse_audit_abandon()`) has not fired on anything, so it has
-no positive control and its silence means nothing — the twelfth-member lesson applied to
-this commit's own instrument. The `test_vecbound.c` item recorded below turned out not to
-exist; it is retracted in place.
+**~~Still owed, and not closed by this fix:~~ CLOSED 2026-09-23.** The abandonment audit added
+here (`WEAVE_FUSE_C2_ABANDON` / `fuse_audit_abandon()`) had not fired on anything, so it had
+no positive control and its silence meant nothing — the twelfth-member lesson applied to
+this commit's own instrument. It has now fired: **P9 in `test/hegel/test_fuse_props.c`**, a
+hand-built two-channel fixture, three legs over one set of channels.
+
+Why a generator mode could not do it, which is also why a million random trials never
+reached the audit while the *prune* fired 590,910 times in 62,000 of them: the audit needs
+four conditions simultaneously — a finite theta (heap full), the sabotaged channel sorting
+**last** by weighted ceiling so it lands in the unscored suffix, the leading channel's block
+max **above** its score at the pivot so the block prune does not take the document first,
+and the sabotaged channel's true contribution large enough to carry the document back over
+theta. The fixture: A at weight 1.0 scoring 1.0/0.8/0.8/0.8 over one block, B at weight 0.5
+scoring 0.0/1.0/1.0/1.0 with `block_max` scaled to 0.01, k = 1.
+
+- **bound 100× too low, `check_bounds` on** → `WEAVE_FUSE_C2_ABANDON`, naming B.
+- **honest bound, `check_bounds` on** → OK, answer warp 1 at 1.3.
+- **bound 100× too low, `check_bounds` off** → OK, answer **warp 0 at 1.0**. Hard rule 1 in
+  one fixture: same channels, same scores, no error, a plausible answer, best document gone.
+
+Two mutants, because a passing gate is not a positive control. Stubbing the audit call out
+(the pre-fixture state) makes leg 1 return OK and P9 fails 2 checks. Disabling the
+abandonment **prune** instead makes leg 1 return `C2_VIOLATION` (6) rather than OK — with
+nothing abandoned, B is scored and the *per-score* check catches the same bound. That is the
+sharpest available statement of why P7 never covered this: the two checks partition the
+class by whether the channel was scored, and **which one fires is decided by a prune, not by
+the bound**. The `test_vecbound.c` item recorded below turned out not to exist; it is
+retracted in place.
 
 ---
 
