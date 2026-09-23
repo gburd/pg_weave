@@ -73,6 +73,15 @@ DIM=${DIM:-960}
 BATCH=${BATCH:-50000}
 NBATCH=${NBATCH:-4}
 DELFRAC=${DELFRAC:-10}
+# FOUR vacuum cycles, not three, and the reason is the first 1M run.  It failed a
+# cycle1-vs-cycle3 ratchet at 190,091 -> 283,924 pages -- while the same script at
+# 20k rows produced 2,577 -> 4,039 -> 2,577, an OSCILLATION whose peak simply landed
+# on a different cycle.  A three-cycle ratchet cannot tell those apart, because its
+# verdict depends on the parity of the cycle the relocation pass happens to fire on.
+# Comparing cycles of the SAME parity (3 vs 1, 4 vs 2) separates a trend from a
+# swing, and the peak-to-trough ratio is reported either way because a transient 1.5x
+# is a real cost to a user even when it is bounded.
+VACCYC=${VACCYC:-4}
 CORPUS=${CORPUS:-/scratch/corpus/gist/gist_base.fvecs}
 OUT=${OUT:-$HOME/out}
 WORK=${WORK:-/scratch/vecmerge}
@@ -87,6 +96,27 @@ REPORT=$OUT/vecmerge.tsv
 # One row per (stage, metric).  A flat long table rather than a wide one, because
 # the stages are added to over time and a wide table silently shifts columns.
 emit() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$REPORT"; }
+
+# DEFERRED FAILURE, and the first run of this script at 1M rows is why it exists.  The
+# page ratchet at the end of the vacuum legs failed, `fail()` exited, and everything
+# after it never ran -- including the ANSWER check.  Worse, the mutation control in
+# bench/aws/run.sh sits after this script and also never ran, so the eight clean
+# weave_check() results the run DID produce were left uninformative: nothing had
+# demonstrated that the invariant could fire on that host at all (AGENTS.md, twelfth
+# member -- until a check has fired once, its silence is not evidence).
+#
+# An assertion that is fatal WHERE IT SITS decides what else gets measured, which
+# turns the ordering of a script into a policy nobody wrote down.  `defer` records the
+# failure, keeps going, and the script exits non-zero at the end.  `fail` is kept for
+# the cases where continuing really is meaningless -- a corpus that did not load, a
+# weave_check() that errored rather than reported.
+DEFERRED=0
+defer() {
+	printf '\033[31mFAIL (deferred): %s\033[0m\n' "$*" >&2
+	printf 'deferred_failure\t%s\t1\n' \
+		"$(printf '%s' "$1" | tr -d '\t\n' | cut -c1-70)" >>"$REPORT"
+	DEFERRED=$((DEFERRED + 1))
+}
 
 # ---------------------------------------------------------------- 1. load
 #
@@ -180,6 +210,17 @@ snapshot() {
 	read -r lanes dig < <(lane_digest "$idx")
 	emit "$stage" live_lanes "$lanes"
 	emit "$stage" lane_digest "$dig"
+	# THE VECTOR / NON-VECTOR SPLIT, EMITTED RATHER THAN LEFT TO BE DERIVED.  The first
+	# run of this script failed its page ratchet, and the one question that decided
+	# whether G27 was implicated -- is the growth inside the weft or outside it? -- had
+	# to be computed by hand from the buckets afterwards.  It is the discriminating
+	# number, so it gets a row.  (It was outside: every vector bucket was byte-identical
+	# across all three vacuum cycles while the total grew 1.49x.)
+	vecp=$($PSQL -tAc "SELECT coalesce(sum(npages), 0) FROM weave_index_size_detail('$idx')
+	                    WHERE kind LIKE 'vector%'")
+	relp=$($PSQL -tAc "SELECT pg_relation_size('$idx') / 8192")
+	emit "$stage" vector_pages "$vecp"
+	emit "$stage" nonvector_pages "$((relp - vecp))"
 	# Blocks and TOTAL lanes (live + dead), because the merge assertion below needs
 	to=$($PSQL -tA -F' ' -c "SELECT count(*), count(DISTINCT blockno)
 	                           FROM weave_vec_lanes('$idx')")
@@ -270,9 +311,8 @@ for i in $(seq 1 "$NBATCH"); do
 	# is the block count rising by the batch: the merge emitted new blocks, and
 	# check_clean then opened the page every one of their records names.
 	blocks_now=$(awk -F'\t' -v s="merge$i" '$1 == s && $2 == "blocks" {print $3}' "$REPORT")
-	awk -v a="$blocks_prev" -v b="$blocks_now" -v i="$i" 'BEGIN { if (b <= a) {
-		printf "FAIL: merge%s left the block count at %d; the directory was not rewritten, so this cycle tested nothing\n", i, b
-		exit 1 } }' || fail "merge$i did no weft work"
+	awk -v a="$blocks_prev" -v b="$blocks_now" 'BEGIN { exit (b <= a) }' \
+		|| defer "merge$i left the block count at $blocks_now; the directory was not rewritten, so this cycle tested nothing"
 	say "cycle $i: blocks $blocks_prev -> $blocks_now, directory rewritten"
 	blocks_prev=$blocks_now
 done
@@ -289,7 +329,7 @@ say "deleting every ${DELFRAC}th row"
 $PSQL -c "DELETE FROM vm WHERE id % $DELFRAC = 0"
 emit delete rows_deleted "$($PSQL -tAc "SELECT count(*) FROM vmsrc WHERE id % $DELFRAC = 0")"
 
-for cyc in 1 2 3; do
+for cyc in $(seq 1 "$VACCYC"); do
 	burn_xids
 	say "vacuum cycle $cyc"
 	/usr/bin/time -f "vacuum$cyc %e s" $PSQL -c "VACUUM vm" \
@@ -298,15 +338,31 @@ for cyc in 1 2 3; do
 	snapshot vm_weave "vacuum$cyc"
 done
 
-# The ratchet compares LATER cycles to the FIRST vacuum, never to the pre-vacuum
-# size, for the tombstone-blob reason above.  Unbounded growth per cycle is G18's
-# signature and it is the failure this leg exists to notice.
-p1=$(awk -F'\t' '$1 == "vacuum1" && $2 == "relpages" {print $3}' "$REPORT")
-p3=$(awk -F'\t' '$1 == "vacuum3" && $2 == "relpages" {print $3}' "$REPORT")
-say "relpages: vacuum1 $p1 -> vacuum3 $p3"
-awk -v a="$p1" -v b="$p3" 'BEGIN { if (b > a * 1.05) {
-	printf "FAIL: index grew %d -> %d pages over two further vacuum cycles\n", a, b
-	exit 1 } }' || fail "unbounded growth across vacuum cycles (doc/GAPS.md G18 shape)"
+# THE RATCHET, ON MATCHING PARITY.  Later cycles are compared to the FIRST vacuum,
+# never to the pre-vacuum size, for the tombstone-blob reason above -- and only to
+# cycles of the same parity, for the oscillation reason at the top of this file.
+pg() { awk -F'\t' -v s="vacuum$1" -v k="$2" '$1 == s && $2 == k {print $3}' "$REPORT"; }
+SERIES=""
+for cyc in $(seq 1 "$VACCYC"); do SERIES="$SERIES $(pg "$cyc" relpages)"; done
+VSERIES=""
+for cyc in $(seq 1 "$VACCYC"); do VSERIES="$VSERIES $(pg "$cyc" vector_pages)"; done
+say "relpages across $VACCYC vacuum cycles:$SERIES"
+say "vector pages across the same cycles:$VSERIES"
+emit vacuum relpages_series "$(printf '%s' "$SERIES" | tr -s ' ' ',' | sed 's/^,//')"
+emit vacuum vector_pages_series "$(printf '%s' "$VSERIES" | tr -s ' ' ',' | sed 's/^,//')"
+
+# The transient, reported rather than asserted: peak / trough over the series.
+read -r pk tr <<<"$(printf '%s\n' $SERIES | awk 'NR==1{mn=mx=$1} {if($1>mx)mx=$1; if($1<mn)mn=$1} END{print mx, mn}')"
+emit vacuum peak_to_trough "$(awk -v a="$pk" -v b="$tr" 'BEGIN{printf "%.3f", a/b}')"
+say "peak/trough over the series: $pk / $tr = $(awk -v a="$pk" -v b="$tr" 'BEGIN{printf "%.2fx", a/b}')"
+
+for cyc in $(seq 3 "$VACCYC"); do
+	earlier=$((cyc - 2))
+	a=$(pg "$earlier" relpages); b=$(pg "$cyc" relpages)
+	av=$(pg "$earlier" vector_pages); bv=$(pg "$cyc" vector_pages)
+	awk -v a="$a" -v b="$b" 'BEGIN { exit (b > a * 1.05) }' \
+		|| defer "vacuum$cyc is $b pages against vacuum$earlier's $a -- same parity, so this is a TREND and not the oscillation (doc/GAPS.md G18 shape); vector pages $av -> $bv is what says whether the weft is implicated"
+done
 
 # ---------------------------------------------------------------- 5. the answer
 #
@@ -361,9 +417,13 @@ read -r nq recall < <(awk '{ n++; s += $1 } END { printf "%d %.4f\n", n, s / (n 
 emit answer queries "$nq"
 emit answer recall_at_10 "$recall"
 say "answer check: recall@10 = $recall over $nq queries"
-awk -v r="$recall" 'BEGIN { if (r < 0.90) {
-	printf "FAIL: recall@10 %.4f is below the floor a working scan cannot miss\n", r
-	exit 1 } }' || fail "recall collapse -- the scan is reading the wrong codes"
+awk -v r="$recall" 'BEGIN { exit (r < 0.90) }' \
+	|| defer "recall@10 $recall is below the floor a working scan cannot miss -- the scan is reading the wrong codes"
 
+if [ "$DEFERRED" != 0 ]; then
+	say "vecmerge: $DEFERRED DEFERRED FAILURE(S) -- report at $REPORT"
+	column -t -s$'\t' "$REPORT" || cat "$REPORT"
+	exit 1
+fi
 say "vecmerge: all stages clean; report at $REPORT"
 column -t -s$'\t' "$REPORT" || cat "$REPORT"
