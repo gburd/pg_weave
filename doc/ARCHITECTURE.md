@@ -528,6 +528,21 @@ Four things, and it should claim exactly four things:
    measurement).
 3. Queries that get **faster** as predicates get more selective, because the
    predicate is pushed into the SIMD block mask instead of collapsing recall.
+
+   **MEASURED 2026-09-23, AND THE CLAIM IS HALF MET — state it this way until the
+   other half lands** (`bench/RESULTS_GATE_SWEEP.md`). In the work the CPU does the
+   claim holds exactly: pivots and vector `score()` calls are **selectivity, to three
+   digits**, on scifact, nfcorpus and fiqa (1.000× / 0.101× / 0.010× / 0.001× at
+   100 % / 10 % / 1 % / 0.1 %), and scored code blocks follow `1 − (1 − s)^32` — nine
+   of nine points within a few percent of the formula. In the pages a query touches
+   it does **not** hold: 502 / 515 / 502 / 424 buffers across the same four
+   selectivities, flat, because the code cursor walks the whole `WEAVE_PK_VCODES`
+   chain and nothing records where a block's strips are (`doc/GAPS.md` G27,
+   `src/vector/vecwrite.c:1222-1235`). Also narrower than the sentence above reads:
+   the only predicate that can be pushed into the index today is another **lexical
+   term**, because `WEAVE_CH_DOCVALS`'s page kind is still reserved. Two honest
+   phrasings until then: "the scan scores fewer documents as the predicate tightens"
+   is measured; "the query reads less" is not.
    (The "graph traversal" half of this sentence is stale — the Vamana plan was
    withdrawn in V9's history. The mask is the live mechanism, and it is
    *predicate*-driven, which is why the failure of the *score*-driven block bound

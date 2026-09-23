@@ -1131,6 +1131,32 @@ chosen here** — the choice is the maintainer's:
     left** — it attacks bytes-per-lane rather than lanes-touched, which this result says
     nothing about.
 
+  - **(d) A BLOCK→PAGE INDEX. IT EXISTS, IT IS CHEAPER THAN (b) ON BOTH AXES, AND IT WAS
+    FOUND BY MEASURING CLAIM 3 RATHER THAN BY LOOKING FOR IT (2026-09-23).**
+    `bench/gatesweep.sh` swept predicate selectivity over the three corpora this section's
+    nDCG row uses. Pivots and vector `score()` calls fall **exactly** with selectivity
+    (1.000× / 0.101× / 0.010× / 0.001× at 100 % / 10 % / 1 % / 0.1 %) and scored code
+    blocks follow `1 − (1 − s)^32` to three digits — so **this section's ≤ 0.20× vector
+    row IS satisfiable, below about 0.6 % selectivity, in the unit it is written in.**
+    What does not fall is page traffic: **502 / 515 / 502 / 424** buffers, flat, because
+    the code cursor walks the whole `WEAVE_PK_VCODES` chain and nothing records where a
+    block's strips live (`src/vector/vecwrite.c:1222-1235`, `doc/GAPS.md` **G27**). Hence
+    (d): one `BlockNumber` per 32-lane block, **0.125 bytes per document**, 7.2 KB for
+    fiqa's 1,800 blocks — against (b)'s 96–192 bytes per document for a second copy that
+    does not reduce the page count for a scattered candidate set at all.
+    `bench/RESULTS_GATE_SWEEP.md`.
+
+  - **THE UNFILTERED ROW DESERVES A STATED PROOF RATHER THAN A REPEATED FAILURE.** At
+    `s = 1` both arms perform an exhaustive vector scan: the RRF control's vector branch is
+    a flat top-k′, and the fused arm cannot do better, because the only two mechanisms that
+    could skip a block are the block bound — measured at **0.00 %** on real corpora twice,
+    most recently with a real k-means where even an ORACLE threshold prunes 0.00 %
+    (`bench/RESULTS_CLUSTER_ORDER.md`) — and demotion of the channel to non-essential,
+    which is arithmetically impossible while its weighted ceiling (0.4947) exceeds theta
+    (0.1106). **So 1.000× is the row's achievable minimum in the unfiltered shape, not a
+    deficit to close there.** That is not a licence to call the row passed: it says the row
+    can only discriminate where a predicate exists — which is also where claim 3 lives.
+
 **AND AS OF 2026-09-22 (night) THIS IS NO LONGER ONLY THE `score()` ROW'S PROBLEM.** The EC2
 re-run measured the same mechanism costing **latency**: p99 fails at 0.710× / 0.612× / 1.000×
 (it passed at 0.609× / 0.560× / 0.633× on the raw sum) and fiqa's p50 is **1.172× the RRF
