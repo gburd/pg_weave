@@ -45,6 +45,10 @@
  *		fails if it never does -- a test that cannot see a 1 %-too-low bound is
  *		not testing hard rule 1, and AGENTS.md records what happens when a guard's
  *		output is identical under every input the harness can produce
+ *	P9	the ABANDONMENT audit (fuse_audit_abandon, WEAVE_FUSE_C2_ABANDON) fires.
+ *		A separate property from P7 because it is separate code reached by a
+ *		different path -- the bound of a channel the scan never scores -- and it
+ *		had never fired on anything at all before this fixture existed
  *
  * Build and run:
  *		cc -O2 -Wall -Wextra -I include -o /tmp/tf test/hegel/test_fuse_props.c \
@@ -729,6 +733,154 @@ c2_detection_trial(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * P9: the ABANDONMENT audit fires, and the document it is about is the one the
+ * unaudited run loses
+ *
+ * THE POSITIVE CONTROL THE G43 COMMIT OWED (doc/GAPS.md G43, doc/PHASES.md).
+ * fuse_audit_abandon() has never fired on anything -- not on the bug it was built
+ * to catch, not on three BEIR corpora, not on a million random trials -- so its
+ * silence has meant nothing at all.  P7 does not cover it: P7's violation is
+ * caught by the PER-SCORE check, on a channel the scan actually scores, and
+ * abandonment's whole purpose is to not score the channel whose bound is wrong.
+ * The two checks are separate code and only one of them has ever run.
+ *
+ * Reaching it needs four conditions at once, which is why the random generator
+ * never has: theta must be finite (the heap full), the sabotaged channel must sort
+ * LAST by weighted ceiling (so it is in the suffix rather than scored first), the
+ * BLOCK prune must not take the document first (so the leading channel's block max
+ * must exceed its score at the pivot), and the sabotaged channel's true
+ * contribution must be big enough to carry the document back over theta.  Hence a
+ * hand-built fixture rather than a generator mode.
+ *
+ * Three legs over ONE fixture, and the third is what makes the first meaningful:
+ *	 a. bound scaled to 0.01, check_bounds ON	-> WEAVE_FUSE_C2_ABANDON, naming B
+ *	 b. honest bound, check_bounds ON			-> OK, and the answer is warp 1
+ *	 c. bound scaled to 0.01, check_bounds OFF	-> OK, and the answer is warp 0
+ * Leg c is hard rule 1 in four documents: the same index, a bound 100x too low,
+ * no error, a plausible answer, and the best document silently gone.
+ *
+ * TWO MUTANTS, because a passing gate is not a positive control (AGENTS.md, the
+ * eleventh member).  Stubbing the audit call out -- the state this file was in
+ * before the fixture existed -- makes leg a return OK and P9 fails 2 checks.
+ * Disabling the abandonment PRUNE instead makes leg a return C2_VIOLATION (6),
+ * not OK: with nothing abandoned, B is scored and the per-score check catches the
+ * same bound.  That is the cleanest statement of why P7 does not cover P9 -- the
+ * two checks partition the class by whether the channel was scored, and which one
+ * fires is decided by a prune, not by the bound.
+ * ------------------------------------------------------------------------- */
+
+static void
+abandon_audit_trial(void)
+{
+	SynthSpec	spa;
+	SynthSpec	spb;
+	SynthChan	cha;
+	SynthChan	chb;
+	WeaveFuseChan *chan[2];
+	WeaveFuseHit heap[1];
+	WeaveFuseState st;
+	WeaveFuseError err;
+	int			leg;
+
+	/*
+	 * A: the leading channel.  One block over all four warps, so its block max is
+	 * warp 0's 1.0 while its score at warps 1..3 is 0.8 -- that gap is what keeps
+	 * the block prune off the document the audit has to see.
+	 */
+	memset(&spa, 0, sizeof(spa));
+	spa.flavour = CH_SCORED;
+	spa.n = 4;
+	spa.pos[0] = 0;
+	spa.pos[1] = 1;
+	spa.pos[2] = 2;
+	spa.pos[3] = 3;
+	spa.sc[0] = 1.0f;
+	spa.sc[1] = 0.8f;
+	spa.sc[2] = 0.8f;
+	spa.sc[3] = 0.8f;
+	spa.bs = 4;
+	spa.weight = 1.0f;
+	spa.maxscore = 1.0f;
+	spa.bound_scale = 1.0f;
+
+	/*
+	 * B: the sabotaged channel.  Its weighted ceiling (0.5) is below A's (1.0), so
+	 * fuse_sort_scored() puts it second and the abandonment test reaches it as an
+	 * unscored suffix.  (C1) is NOT violated -- its true scores are within its
+	 * declared maxscore -- so the only broken contract is (C2), which is the one
+	 * the per-score check cannot see here.
+	 */
+	memset(&spb, 0, sizeof(spb));
+	spb.flavour = CH_SCORED;
+	spb.n = 4;
+	spb.pos[0] = 0;
+	spb.pos[1] = 1;
+	spb.pos[2] = 2;
+	spb.pos[3] = 3;
+	spb.sc[0] = 0.0f;
+	spb.sc[1] = 1.0f;
+	spb.sc[2] = 1.0f;
+	spb.sc[3] = 1.0f;
+	spb.bs = 4;
+	spb.weight = 0.5f;
+	spb.maxscore = 1.0f;
+
+	for (leg = 0; leg < 3; leg++)
+	{
+		spb.bound_scale = (leg == 1) ? 1.0f : 0.01f;
+
+		synth_bind(&cha, &spa);
+		synth_bind(&chb, &spb);
+		chan[0] = &cha.ch;
+		chan[1] = &chb.ch;
+
+		/*
+		 * k = 1: theta is finite from the first document on, which is the
+		 * condition every prune in sect. 3 needs and the reason a k of 10 over a
+		 * four-document fixture would test nothing.
+		 */
+		err = weave_fuse_init(&st, chan, 2, heap, 1, NULL, 4);
+		CHECK(9, err == WEAVE_FUSE_OK, "leg %d: init refused (err=%d)",
+			  leg, (int) err);
+		if (err != WEAVE_FUSE_OK)
+			return;
+		st.check_bounds = (leg == 2) ? 0 : 1;
+		err = weave_fuse_run(&st);
+
+		if (leg == 0)
+		{
+			CHECK(9, err == WEAVE_FUSE_C2_ABANDON,
+				  "an abandonment on a bound 100x too low was not caught "
+				  "(err=%d)", (int) err);
+			CHECK(9, st.badchan == &chb.ch,
+				  "the abandonment audit named the wrong channel");
+		}
+		else
+		{
+			CHECK(9, err == WEAVE_FUSE_OK, "leg %d: unexpected error %d",
+				  leg, (int) err);
+			CHECK(9, st.nheap == 1, "leg %d: heap holds %d", leg, st.nheap);
+			if (st.nheap == 1)
+			{
+				/*
+				 * leg 1 keeps warp 1 at 0.8 + 0.5 = 1.3; leg 2 abandons it on
+				 * the too-low bound and settles for warp 0 at 1.0 + 0.0.  Same
+				 * channels, same scores, same k -- only the bound differs.
+				 */
+				CHECK(9, st.heap[0].warp == (leg == 1 ? 1u : 0u),
+					  "leg %d returned warp %u", leg, st.heap[0].warp);
+				CHECK(9, st.heap[0].score > (leg == 1 ? 1.25f : 0.95f) &&
+					  st.heap[0].score < (leg == 1 ? 1.35f : 1.05f),
+					  "leg %d returned score %g", leg, st.heap[0].score);
+			}
+			if (leg == 2)
+				CHECK(9, st.nabandon > 0,
+					  "leg 2 abandoned nothing, so it proves nothing");
+		}
+	}
+}
+
+/* ---------------------------------------------------------------------------
  * Refusals at init
  * ------------------------------------------------------------------------- */
 
@@ -828,6 +980,7 @@ main(int argc, char **argv)
 
 	for (i = 0; i < 4000; i++)
 		c2_detection_trial();
+	abandon_audit_trial();
 	init_refusal_trials();
 
 	printf("trials: %ld\n", trials);
@@ -838,6 +991,8 @@ main(int argc, char **argv)
 	printf("P5 no dead row returned  : %8ld checks\n", prop_checks[5]);
 	printf("P6 gates are conjunctive : %8ld checks\n", prop_checks[6]);
 	printf("P7 refusals and (C2)     : %8ld checks\n", prop_checks[7]);
+	printf("P9 abandonment audit     : %8ld checks (the audit fires, and the "
+		   "unaudited run loses warp 1)\n", prop_checks[9]);
 	/*
 	 * P8, and the RATE is the finding rather than the pass.  A bound 1 % too low
 	 * changes the answer in a fraction of a percent of queries; a bound 10 % too
