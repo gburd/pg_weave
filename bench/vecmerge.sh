@@ -118,6 +118,14 @@ emit() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$REPORT"; }
 # failure, keeps going, and the script exits non-zero at the end.  `fail` is kept for
 # the cases where continuing really is meaningless -- a corpus that did not load, a
 # weave_check() that errored rather than reported.
+# pg_freespacemap is contrib and is what budget_demand() reads.  UNCONDITIONAL, and it
+# was inside the corpus-load branch for one revision -- which is the branch that does NOT
+# run on a host where the staging table already exists (the VECMERGE_LOAD_ONLY / vecctl
+# flow, and every re-run).  A setup step behind a cache check runs exactly when it is
+# least needed.  Asserted here rather than failing at first use, five hours in.
+$PSQL -c "CREATE EXTENSION IF NOT EXISTS pg_freespacemap" >/dev/null \
+	|| fail "pg_freespacemap is not available; budget_demand() cannot run"
+
 DEFERRED=0
 defer() {
 	printf '\033[31mFAIL (deferred): %s\033[0m\n' "$*" >&2
@@ -242,6 +250,24 @@ snapshot() {
 	                           FROM weave_vec_lanes('$idx')")
 	emit "$stage" total_lanes "${to%% *}"
 	emit "$stage" blocks "${to##* }"
+}
+
+# DEMAND (live pages a compaction pass must relocate) and BUDGET (free pages below the
+# live data that are recyclable at pass start), by the allocator's own criterion: a block
+# counts as free when the free space map records >= BLCKSZ/2, which is the same test
+# weave_low_free_fits_live() and weave_index_is_compacted() use.  Needs pg_freespacemap.
+#
+# These two numbers are why doc/GAPS.md G47's option 3 could be refuted without building
+# it: DEMAND > BUDGET means the pass MUST extend by the shortfall whatever placement
+# policy it uses, so no amount of front-packing cleverness can converge in one pass.
+budget_demand() {
+	$PSQL -tA -F' ' -c "
+		WITH f AS (SELECT blkno, avail FROM pg_freespace('$1')),
+		     ll AS (SELECT max(blkno) AS lastlive FROM f WHERE avail < 4096 AND blkno > 0)
+		SELECT (SELECT count(*) FROM f, ll
+		         WHERE blkno > 0 AND blkno < lastlive AND avail < 4096) + 1,
+		       (SELECT count(*) FROM f, ll
+		         WHERE blkno > 0 AND blkno < lastlive AND avail >= 4096)"
 }
 
 # The answer check, as a function so it can run at the BUILD stage and again at the
@@ -397,11 +423,51 @@ say "deleting every ${DELFRAC}th row"
 $PSQL -c "DELETE FROM vm WHERE id % $DELFRAC = 0"
 emit delete rows_deleted "$($PSQL -tAc "SELECT count(*) FROM vmsrc WHERE id % $DELFRAC = 0")"
 
+# WHY THE CYCLE IS ONE psql SESSION AND NOT THREE.
+#
+# The page series alone cannot say WHY the file moved, and at 1M a run that comes back
+# with "190091, 185234, 283924" and nothing else buys another five-hour instance to
+# answer the obvious follow-up.  weave_alloc_stats() answers it -- extend high with
+# defer high means the recycle gate is the constraint; extend high with defer ZERO means
+# the free list was never consulted, a different bug (L19) -- but the counters are
+# BACKEND-LOCAL, so the reset, the VACUUM and the read must be the same backend.  Split
+# across three `psql -c` calls the read returns a fresh backend's zeros and prints
+# extend=0 for a cycle that grew the file by 1,462 pages; that is exactly what happened
+# the first time this was measured locally.
+#
+# DEMAND and BUDGET are recorded for the same reason, and they are the numbers that
+# PREDICT the outcome rather than describe it (bench/RESULTS_G47_VACATE.md): a pass whose
+# recyclable free space below the live data is smaller than the live data must extend by
+# the shortfall, whatever placement policy it uses.  Both use the allocator's own
+# BLCKSZ/2 criterion against the same free space map the allocator reads.
 for cyc in $(seq 1 "$VACCYC"); do
 	burn_xids
 	say "vacuum cycle $cyc"
-	/usr/bin/time -f "vacuum$cyc %e s" $PSQL -c "VACUUM vm" \
-		2>&1 | tee -a "$OUT/vacuum.log"
+	{
+		echo 'SELECT weave_alloc_stats_reset();'
+		echo 'VACUUM vm;'
+		echo "SELECT 'STATS ' || lowfree_reuse || ' ' || lowfree_defer || ' '
+		          || fsm_reuse || ' ' || fsm_defer || ' ' || extend
+		        FROM weave_alloc_stats();"
+	} >"$WORK/cyc.sql"
+	t0=$(date +%s.%N)
+	$PSQL -tA -f "$WORK/cyc.sql" >"$WORK/cyc.out" 2>&1 \
+		|| { cat "$WORK/cyc.out" >&2; fail "vacuum cycle $cyc errored"; }
+	t1=$(date +%s.%N)
+	cat "$WORK/cyc.out" >>"$OUT/vacuum.log"
+	read -r lr ld fr fd ex < <(sed -n 's/^STATS //p' "$WORK/cyc.out")
+	[ -n "$ex" ] || fail "vacuum cycle $cyc printed no STATS line -- the counters are
+	     backend-local and this cycle did not read them in the session that vacuumed"
+	emit "vacuum$cyc" secs "$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')"
+	emit "vacuum$cyc" lowfree_reuse "$lr"
+	emit "vacuum$cyc" lowfree_defer "$ld"
+	emit "vacuum$cyc" fsm_reuse "$fr"
+	emit "vacuum$cyc" fsm_defer "$fd"
+	emit "vacuum$cyc" extend "$ex"
+	read -r demand budget < <(budget_demand vm_weave)
+	emit "vacuum$cyc" demand "$demand"
+	emit "vacuum$cyc" budget "$budget"
+	say "cycle $cyc: extend=$ex reuse=$lr defer=$ld | next pass demand=$demand budget=$budget shortfall=$((demand - budget))"
 	check_clean vm_weave "vacuum$cyc"
 	snapshot vm_weave "vacuum$cyc"
 done
@@ -429,6 +495,13 @@ for cyc in $(seq 1 "$VACCYC"); do VSERIES="$VSERIES $(pg "$cyc" vector_pages)"; 
 say "relpages across $VACCYC vacuum cycles:$SERIES"
 say "vector pages across the same cycles:$VSERIES"
 emit vacuum relpages_series "$(printf '%s' "$SERIES" | tr -s ' ' ',' | sed 's/^,//')"
+# THE EXTEND SERIES, next to the page series, because the page series is the SYMPTOM and
+# this is the cost.  Option 4 took it from 1,461 to 115 per grow cycle at 20k while
+# leaving the trough identical, so a run that records only pages cannot see the win.
+ESERIES=""
+for cyc in $(seq 1 "$VACCYC"); do ESERIES="$ESERIES $(pg "$cyc" extend)"; done
+say "extends across the same cycles:$ESERIES"
+emit vacuum extend_series "$(printf '%s' "$ESERIES" | tr -s ' ' ',' | sed 's/^,//')"
 emit vacuum vector_pages_series "$(printf '%s' "$VSERIES" | tr -s ' ' ',' | sed 's/^,//')"
 
 # The transient, reported rather than asserted: peak / trough over the series.  A
@@ -450,6 +523,71 @@ for cyc in $(seq 5 "$VACCYC"); do
 	awk -v a="$a" -v b="$b" 'BEGIN { exit (b > a * 1.05) }' \
 		|| defer "vacuum$cyc is $b pages against vacuum$earlier's $a -- same parity, neither is the post-delete cycle, so this is a TREND and not the swing (doc/GAPS.md G18 shape); vector pages $av -> $bv says whether the weft is implicated"
 done
+
+# ------------------------------------------------- 4b. the floor, which is AEL-only
+#
+# THE CLAIM THIS LEG EXISTS TO TEST AT SCALE.  doc/GAPS.md G47 is two defects, and after
+# option 4 the surviving one is that plain VACUUM never reaches the size floor -- it
+# cannot, because reaching it needs pages freed by the same transaction to be reusable
+# within it, and under ShareUpdateExclusiveLock that hands a concurrent scan a page it is
+# still reading.  weave_vacuum() holds AccessExclusiveLock, where weave_page_recyclable()
+# is licensed to bypass that gate, and at 20k it converges to the exact floor in ONE call
+# and then does nothing at all (bench/RESULTS_G47_VACATE.md).
+#
+# Both halves are asserted, because the second is what separates "converged" from "stable
+# while still working forever": with the vacate phase ablated under AEL the file sat at a
+# constant 2,693 pages while extending 115 every single cycle, which any size-based check
+# would have called converged.
+burn_xids
+say "weave_vacuum() under AccessExclusiveLock: the floor leg"
+{
+	echo 'SELECT weave_alloc_stats_reset();'
+	echo "SELECT weave_vacuum('vm_weave');"
+	echo "SELECT 'STATS ' || lowfree_reuse || ' ' || lowfree_defer || ' '
+	          || fsm_reuse || ' ' || fsm_defer || ' ' || extend
+	        FROM weave_alloc_stats();"
+} >"$WORK/ael1.sql"
+t0=$(date +%s.%N)
+$PSQL -tA -f "$WORK/ael1.sql" >"$WORK/ael1.out" 2>&1 \
+	|| { cat "$WORK/ael1.out" >&2; fail "weave_vacuum() errored"; }
+t1=$(date +%s.%N)
+read -r alr ald afr afd aex < <(sed -n 's/^STATS //p' "$WORK/ael1.out")
+[ -n "$aex" ] || fail "the AEL leg printed no STATS line"
+emit ael secs "$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')"
+emit ael extend "$aex"
+emit ael lowfree_reuse "$alr"
+emit ael lowfree_defer "$ald"
+check_clean vm_weave ael
+snapshot vm_weave ael
+AEL1=$($PSQL -tAc "SELECT pg_relation_size('vm_weave') / 8192")
+VACLAST=$(awk -F'\t' -v s="vacuum$VACCYC" '$1 == s && $2 == "relpages" {print $3}' "$REPORT")
+say "weave_vacuum(): $VACLAST -> $AEL1 pages (extend=$aex reuse=$alr defer=$ald)"
+
+# Second call must do NOTHING AT ALL.  Not "must not grow" -- zero allocations.
+burn_xids
+{
+	echo 'SELECT weave_alloc_stats_reset();'
+	echo "SELECT weave_vacuum('vm_weave');"
+	echo "SELECT 'STATS ' || lowfree_reuse || ' ' || lowfree_defer || ' '
+	          || fsm_reuse || ' ' || fsm_defer || ' ' || extend
+	        FROM weave_alloc_stats();"
+} >"$WORK/ael2.sql"
+$PSQL -tA -f "$WORK/ael2.sql" >"$WORK/ael2.out" 2>&1 \
+	|| { cat "$WORK/ael2.out" >&2; fail "the second weave_vacuum() errored"; }
+read -r blr bld bfr bfd bex < <(sed -n 's/^STATS //p' "$WORK/ael2.out")
+[ -n "$bex" ] || fail "the second AEL leg printed no STATS line"
+AEL2=$($PSQL -tAc "SELECT pg_relation_size('vm_weave') / 8192")
+emit ael2 relpages "$AEL2"
+emit ael2 extend "$bex"
+emit ael2 alloc_total "$((bex + blr + bfr))"
+say "second weave_vacuum(): $AEL1 -> $AEL2 pages, allocations $((bex + blr + bfr))"
+
+[ "$AEL1" -lt "$VACLAST" ] \
+	|| defer "weave_vacuum() (AEL) returned $AEL1 pages against plain VACUUM's $VACLAST -- the AEL path is supposed to reach a floor the share-lock path cannot (doc/GAPS.md G47)"
+[ "$AEL2" = "$AEL1" ] \
+	|| defer "a second weave_vacuum() moved the file $AEL1 -> $AEL2: the AEL path did not reach a fixed point in one call, which is the half of weave_vacuum_compact()'s header contract that is supposed to be true"
+[ "$((bex + blr + bfr))" = 0 ] \
+	|| defer "a converged index still allocated $((bex + blr + bfr)) pages on the next weave_vacuum() (extend=$bex lowfree=$blr fsm=$bfr) -- a stable SIZE while still relocating is not convergence, and it is exactly what the ablated arm did at 20k"
 
 # ---------------------------------------------------------------- 5. the answer
 #
