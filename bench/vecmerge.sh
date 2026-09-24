@@ -159,6 +159,14 @@ read -r nsrc nvec dmin dmax < <($PSQL -tA -F' ' -c \
 say "staging table ok: $nsrc rows, dim $DIM"
 emit load rows "$nsrc"
 
+# LOAD-ONLY EXIT, for bench/aws/run.sh's `vecctl` job.  The mutation control needs
+# `vmsrc` and nothing else from this script, and iterating on a control should not cost
+# the five hours the clean arm takes.
+if [ "${VECMERGE_LOAD_ONLY:-0}" = 1 ]; then
+	say "VECMERGE_LOAD_ONLY=1: corpus staged, stopping before the build"
+	exit 0
+fi
+
 # ---------------------------------------------------------------- helpers
 #
 # An ORDER-INDEPENDENT digest of the live lanes, in constant memory.  The obvious

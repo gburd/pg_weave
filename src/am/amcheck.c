@@ -1082,14 +1082,45 @@ wvck_vector(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 				fpbuf = ReadBuffer(cx->index, (BlockNumber) stored.firstpage);
 				LockBuffer(fpbuf, BUFFER_LOCK_SHARE);
 				fppage = BufferGetPage(fpbuf);
-				fpok = (!PageIsNew(fppage) &&
-						WeavePageHasKind(fppage, WEAVE_PK_VCODES) &&
-						((const WeaveVecStripHdr *) PageGetContents(fppage))->blockno == b);
+
+				/*
+				 * `firstpage` NAMES THE BLOCK'S FIRST STRIP, NOT MERELY ONE OF ITS
+				 * STRIPS, and checking only the latter left a detection gap that a
+				 * 1M-row mutation control found by failing (2026-09-24).
+				 *
+				 * The original condition was page-kind plus `blockno == b`.  A block
+				 * spans `strips_per_block` pages -- three at 960 dimensions and four
+				 * at 1024, measured -- and EVERY one of them carries `blockno == b`.
+				 * So a `firstpage` off by one or two pages pointed at the same
+				 * block's second or third strip and the invariant reported the index
+				 * CLEAN, while a scan starting there follows `nextblk` off the end of
+				 * the block into block b+1 and correctly refuses.  An offline checker
+				 * that calls an index healthy when its queries error is worse than no
+				 * checker: it is the tool you reach for to decide whether to trust a
+				 * relation.
+				 *
+				 * `j0 == 0` is the distinguishing field -- the strip header records
+				 * the first coordinate stored on its page, so only the block's first
+				 * lane strip has zero -- and the centroid flag has to be excluded
+				 * because a centroid strip also starts at coordinate 0 and is not
+				 * where the code cursor may begin.
+				 */
+				fpok = false;
+				if (!PageIsNew(fppage) &&
+					WeavePageHasKind(fppage, WEAVE_PK_VCODES))
+				{
+					const WeaveVecStripHdr *fphdr =
+						(const WeaveVecStripHdr *) PageGetContents(fppage);
+
+					fpok = (fphdr->blockno == b &&
+							fphdr->j0 == 0 &&
+							(fphdr->flags & WEAVE_VSTRIP_F_CENTROID) == 0);
+				}
 				UnlockReleaseBuffer(fpbuf);
 				if (!fpok)
 				{
 					ok = false;
-					appendStringInfo(&d, "%sbolt %u block %u: firstpage %u is not a code page carrying this block",
+					appendStringInfo(&d, "%sbolt %u block %u: firstpage %u is not this block's first lane strip",
 									 d.len > 0 ? "; " : "", s, b,
 									 stored.firstpage);
 					break;
