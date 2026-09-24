@@ -96,6 +96,103 @@ the override must be asked for by name. The red test was the G27 vacuum pin itse
 which passed locally only because the planner there chose a sequential scan; it says
 nothing about page accounting, but the harness had no business deciding that.
 
+## Run 2 — commit `6e9be57`, host GREEN, 4 vacuum cycles
+
+Same corpus, same shape, four vacuum cycles instead of three. `installcheck` passed on
+this host, so the new fatal gate works. Merges and deep checks clean again, 9 of 9.
+
+**The page numbers came back BIT-IDENTICAL to run 1:** relpages `190091, 185234, 283924,
+185234`, vector pages constant at 86,265 in every cycle. Two independent runs, the same
+four integers — hard rule 11's second observation, obtained for free.
+
+**And they refute run 1's verdict.** Cycle 4 equals cycle 2 *to the page*, so there is
+no ratchet on even cycles at all. The odd cycles are cycle 1 and cycle 3, and cycle 1 is
+not a steady-state datum — L19 established that the first VACUUM after a big delete
+legitimately grows the index by the livedocs tombstone blob. So the parity ratchet
+compared a steady-state cycle against the post-delete special case and called the
+difference a trend. **That was the third wrong baseline this one assertion has had**, and
+the pattern in all three is the same: a comparison asserted before the series was known.
+
+What is actually true, and is now recorded as a measurement rather than a verdict: a
+**recurring ~1.53× swing tied to the relocation pass**, visible in the wall clock as
+clearly as in the pages — vacuums took 1279 / 554 / 1130 / 561 s, alternating — with the
+trough exactly stable. Cycle 1 is excluded as a baseline, the first assertable pair is 5
+against 3, and `VACCYC` defaults to 6 because that is the smallest run producing two
+steady-state odd samples. Below 5 the script says out loud that no ratchet assertion is
+possible instead of making one.
+
+**Second wrong assertion, also mine:** `recall@10 >= 0.90`, a floor invented without
+measuring what this index delivers. At 1M × 960-d it returns **0.8500**, per-query hits
+`8 9 9 8 8 9 9 7 9 9`. Run 3 then measured recall at the **build** stage, before any
+merge or vacuum: **also 0.8500**. So it is quantization loss, present from the build, and
+the absolute floor was simply wrong. Recall is now **differential** — build versus final,
+the index against itself, the only baseline here that was not invented — and it is a
+strictly better test of the merge and vacuum paths this script exists for.
+
+## Run 3 — commit `45fa7f5`, 6 vacuum cycles, and the control finally fired
+
+Clean arm: **13 of 13 deep checks clean**, four merges, six vacuums, the alternating
+wall-clock signature holding throughout (1219 / 554 / 1097 / 557 / 1119 / 550 s),
+build-stage recall 0.8500.
+
+Then the control reported that `weave_check()` did **not** catch a code-page pointer
+mutated by +2 pages. The conclusion available from that alone — "the invariant is blind"
+— is the wrong one, and the run's own data says why: `vector_codes` 75,000 pages over
+25,000 blocks is exactly **three strip pages per block** at 960 dimensions, and all
+three carry the same `blockno`. `firstpage + 2` named the same block's third strip, and
+an invariant checking only page-kind plus `blockno == b` was right to pass it.
+
+**What the scan does with that pointer is the other half.** `code_cur_block()` reads
+`strips_per_block` pages from wherever it starts and follows `nextblk`, so a cursor
+beginning at the third strip runs off the end of the block into block b+1, whose header
+carries the wrong blockno, and the scan **refuses**. So the state was: a scan that
+errors, and an offline checker that calls the index clean.
+
+**That is worse than a blind checker.** `weave_check()` is the tool you reach for to
+decide whether to trust a relation, and it was answering "healthy" about an index whose
+queries fail.
+
+### The fix, and the control that now demonstrates it
+
+`src/am/amcheck.c`: `firstpage` must name the block's **first lane strip**, not merely
+one of its strips. `WeaveVecStripHdr.j0` records the first coordinate stored on a page,
+so only the first lane strip has zero; the centroid flag is excluded because a centroid
+strip also starts at coordinate 0 and is not where the code cursor may begin. At three
+strips per block this moves the undetectable wrong values from two per block to none.
+
+Verified on EC2 (job `vecctl`, 200k rows, commit `3bd606b`) — **both legs fire**:
+
+```
+=== LEG 1: weave_check on the mutant ===
+ vector_block_stats_match_codes | f | bolt 0 block 0: firstpage 1832 is not this
+                                     block's first lane strip
+=== LEG 2: a scan of the mutant ===
+ERROR:  weave vector scan cannot read bolt 0 of index "vmut_weave"
+DETAIL: the code chain: a vector code page does not carry the block the chain's
+        block-major order calls for.
+```
+
+So G27's invariant has a demonstrated **true positive**, and the 13 clean results above
+mean what they appear to mean. The control asks both questions separately now, because
+checking only `weave_check()` is what made a detection gap look like a blind invariant —
+different defects, different fixes. And a `vecctl` job runs the control alone: three
+full runs went by without it ever firing, each discovery costing a five-hour clean arm,
+and a control you cannot iterate on is a control you do not really have.
+
+*One last time, in the gate written to catch exactly this:* the leg-2 pattern required
+the explanation on the `ERROR:` line, but it is in `DETAIL:` — so the control printed
+"the scan refused: no" two lines below a scan refusing. Fixed in `9f9d46f`.
+
+## Status
+
+| question | answer |
+|---|---|
+| G27's `firstpage` correct across merges at 1M? | **yes** — 13 of 13 deep checks clean, live-lane digest byte-identical across every merge |
+| across VACUUM rewrites at 1M? | **yes** — same checks, and the weft is byte-stable across all six cycles |
+| is the invariant able to fail? | **yes, demonstrated** on EC2 after being tightened to require the block's first lane strip |
+| is the non-vector page swing a defect? | **open.** Reproducible to the page across two runs, bounded and period-2 in every series measured, tied to the relocation pass. Not G27 — every vector bucket is constant. Needs its own investigation |
+| recall at 1M × 960-d 4-bit | **0.8500**, present from the build; not a merge or vacuum effect |
+
 ## Reproduce
 
 ```sh
