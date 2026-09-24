@@ -3182,3 +3182,97 @@ scan does. The second is less surface and more coupling: it makes the oracle agr
 scan **by construction**, which is exactly what an oracle must not do if the constant itself
 can be wrong. Prefer max tf, and let the oracle recompute the normalizer from it.
 
+
+### G47 — with a vector weft, `weave_vacuum_compact()` has no fixed point: every other VACUUM rewrites the live segment, extends the relation, truncates nothing, and achieves no net change — **OPEN 2026-09-24**
+
+**The function's own header states the contract this violates:** *"Converge a bloated
+index to its size floor in ONE call, stably (repeated calls do not oscillate) and NEVER
+returning larger than we started."* Repeated calls oscillate forever, and the call that
+starts at 2,577 pages returns 4,039 — 1.57× larger.
+
+**Measured, and it reproduces at three scales.** 20k × 96-d locally:
+`2577 → 4039 → 2577 → 4039 → 2577 → 4039`. 2,000 × 96-d, the smallest fixture found:
+`438 → 280 → 424 → 280 → 424`. 1M × 960-d on EC2: `190091, 185234, 283924, 185234` —
+**bit-identical across two independent runs** (`bench/RESULTS_VECMERGE_SCALE.md`).
+Period 2, peak/trough 1.53–1.57×.
+
+**Attributed by ablation, not by argument.** A lexical-only index over the *same*
+documents with the *same* history (build, two insert+merge cycles, 10 % delete) converges:
+`442 → 373 → 211 → 211 → 211 → 211`, 31 free pages. Put a vector weft in and it never
+converges. In the failing case the weft is 1,166 of the 1,346 live pages.
+
+**Mechanism, from the allocator counters rather than from reading the source**
+(`weave_alloc_stats()`, the instrument L19 added for exactly this discrimination):
+
+| cycle | lowfree_reuse | lowfree_defer | fsm_defer | extend | result |
+|---|---|---|---|---|---|
+| shrink | **1346** | 0 | 0 | 0 | 2,577 |
+| grow | 1230 | **1346** | 116 | **1462** | 4,039 |
+
+Three exact equalities carry the diagnosis: `extend` (1462) is the page swing;
+`lowfree_reuse` on a grow cycle (1230) is *every* free page below the live data; and
+`lowfree_defer` on a grow cycle (1346) is the **next** cycle's `lowfree_reuse`, to the
+page, at every scale measured. So: `weave_vacuum_compact()`'s **vacate phase frees the
+pages its pack phase needs**, a page freed by the current transaction is never
+recyclable within it (`weave_free_page` stamps `ReadNextTransactionId()`,
+`weave_page_recyclable` asks `GlobalVisCheckRemovableXid()`), and the pack therefore
+extends by the shortfall. The next VACUUM finds those pages recyclable, packs into them,
+and truncates back down. Then the cycle repeats.
+
+**Two structures make it invisible to the existing guards:**
+
+- **`weave_index_is_compacted()` term (1)** counts free pages below the highest live
+  block and fires above `max(nblocks/50, 8)` — 1,230 against a threshold of 51. But
+  those 1,230 are holes the *previous* pass created, and the next pass cannot fill them
+  either: it needs `live` (1,346) destinations and has 1,230. A hole you cannot fill is
+  not a reason to run a pass.
+- **The "never return larger than we started" backstop** only walks down a *contiguous
+  free tail*. What grew the file is **live data** relocated above `startblocks`, so it
+  breaks on the first live page and truncates nothing. Confirmed: `freetail = 0` in
+  **both** steady states, so `weave_truncate_free_tail()` can never help, and neither
+  state is front-packed. The floor is 1,347 pages; the two states sit at 1.91× and 3.00×.
+
+**This is not G18 and L19 did not cause it.** G18 was *unbounded* growth with
+`lowfree_reuse = 0` — the free list never consulted. Here reuse is maximal every cycle
+and the growth is bounded. Same family, different defect. L19's probe
+(`weave_any_free_page_recyclable()`) does not stop it, because pages *are* recyclable —
+just not enough of them, and not the ones the pass is about to free.
+
+**Cost.** Not bloat — bounded — but pure waste: ~1,346 page relocations, 1,462
+extensions, and GenericXLog WAL for all of it, on every other VACUUM, forever, for no
+net change. At 1M × 960-d that is ~94,000 pages (≈770 MB) of churn per cycle and a
+1.53× file-size swing a user can see.
+
+**Pinned by** `t/015_alloc_outcomes.pl`'s `vector weft present` arm, as a **TODO** block
+(so it records the shape today and turns into a loud "unexpectedly succeeded" when
+fixed) plus a non-TODO `no_ratchet` assertion, because the oscillation being *bounded*
+is the half that keeps this a waste defect rather than a bloat defect. `t/015` could not
+have caught it before: its `no_ratchet()` takes the max of cycles 2..N against cycle 1,
+so for a period-2 swing its verdict is decided by the parity of the cycle the loop
+starts on. The new `converges()` assertion is the property that was missing — and the
+three pre-existing arms pass it, which is why a tighter threshold on them was not the
+answer.
+
+**THE FIX IS A MAINTAINER DECISION, because both credible options change what a plain
+`VACUUM` does.** Stated with costs, not ranked:
+
+1. **Reuse freed pages immediately when holding `AccessExclusiveLock`.** Under AEL no
+   other backend can hold a snapshot that reads the pages being freed, so the recycle
+   gate is not protecting anything — and `weave_vacuum_compact()` **already knows this
+   for the probe**, which it skips under AEL (`amvacuum.c:511`). Extending the same
+   reasoning to the allocator lets the two-phase pass complete in one call and reach the
+   floor. *Cost:* only helps the AEL caller; `weave_vacuumcleanup()` runs under
+   ShareUpdateExclusiveLock and would still oscillate, so this needs (2) as well.
+2. **Under a share lock, skip the pass when it must extend** — when the recyclable free
+   space below the live data is less than the live size, the rewrite provably cannot
+   truncate and can only grow the file. *Cost:* a plain `VACUUM` would stop compacting
+   in exactly the shape that most needs it, leaving the index above its floor until an
+   AEL path runs. That is the **"skip forever" trap the code explicitly warns about**
+   (`amvacuum.c:500-509`), and the sibling project shipped that regression once.
+
+A third option — teach the pack phase to place the new weft so the result is genuinely
+front-packed — is the only one that fixes it without a policy change, and is also the
+largest; nothing here has measured whether it is possible with write-before-free.
+
+**Hard rule 12 applies to any of them:** this is the vacuum path, so a fix needs the
+1M-scale run (`bench/aws/run.sh ... vecmerge`), not local green.

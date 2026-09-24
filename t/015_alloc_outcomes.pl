@@ -270,6 +270,132 @@ no_ratchet('stalled xid horizon, L18 disabled', $off_sizes);
 no_ratchet('stalled xid horizon, shipped default', $on_sizes);
 no_ratchet('advancing xid horizon', $burn_sizes);
 
+# CONVERGENCE, WHICH IS A DIFFERENT PROPERTY FROM no_ratchet AND HAS NEVER BEEN TESTED.
+#
+# weave_vacuum_compact()'s own header states the contract: "Converge a bloated index to
+# its size floor in ONE call, stably (repeated calls do not oscillate) and NEVER
+# returning larger than we started."  Nothing asserted the "do not oscillate" half, and
+# no_ratchet() structurally cannot: it takes the MAX of cycles 2..N and compares it
+# against cycle 1, so for a period-2 swing its verdict is decided by the PARITY of the
+# cycle the loop happened to start on.  Land the peak on cycle 1 and every later cycle is
+# <= it and the arm passes.  (The same parity trap bit bench/vecmerge.sh's page ratchet
+# three times in one session; it is worth recognising by shape.)
+#
+# A ratchet is unbounded growth.  An oscillation is bounded and still a defect: every
+# other VACUUM relocates the live segment, extends the relation, truncates nothing, and
+# achieves no net change -- measured at 20k rows as 1,346 relocations plus 1,462 extends
+# per cycle, forever, for a 1.57x file swing (doc/GAPS.md G47).
+#
+# The assertion is that the series reaches a FIXED POINT: the last two cycles agree.  A
+# small epsilon because per-cycle bookkeeping may legitimately differ by a page or two;
+# the swing this exists to catch is 57%, so the epsilon cannot hide it.
+sub converges
+{
+	my ($label, $sizes) = @_;
+	my $n = scalar @{$sizes};
+	my ($a, $b) = ($sizes->[$n - 2], $sizes->[$n - 1]);
+	my $slack = int($a * 0.01) + 4;
+	cmp_ok(abs($b - $a), '<=', $slack,
+		"$label: repeated VACUUMs reach a fixed point (series: "
+		. join(' -> ', @{$sizes}) . ")");
+}
+converges('stalled xid horizon, L18 disabled', $off_sizes);
+converges('stalled xid horizon, shipped default', $on_sizes);
+converges('advancing xid horizon', $burn_sizes);
+
+# ---------------------------------------------------------------------------
+# THE ARM THAT DOES NOT CONVERGE, AND WHY IT IS A SEPARATE FIXTURE.
+#
+# Every arm above converges: the lexical-only `docs` index reaches 1164 pages and
+# stays, or 94 with the horizon advancing, and does no work on cycles 2..5.  So the
+# assertions above pass, and they would keep passing through the defect below --
+# which is precisely why this arm exists rather than a tighter threshold on those.
+#
+# Put a VECTOR WEFT in the index and repeated VACUUMs stop converging.  Measured at
+# 20k rows x 96-d: 2577 -> 4039 -> 2577 -> 4039 -> 2577 -> 4039, forever, peak/trough
+# 1.57x, and at 1M x 960-d on EC2 the same shape reproduced BIT-IDENTICALLY across two
+# independent runs (190091, 185234, 283924, 185234).  A lexical-only index over the
+# same documents with the same history converges in three cycles (442 -> 373 -> 211 ->
+# 211 -> 211), which is the ablation that attributes it to the weft.
+#
+# MECHANISM, measured with the counters this file exists to provide rather than read
+# off the source (doc/GAPS.md G47).  Per grow cycle: lowfree_reuse=1230 (every free
+# page below the live data), lowfree_defer=1346, extend=1462 -- and the deferred count
+# equals the NEXT cycle's reuse count exactly.  weave_vacuum_compact()'s vacate phase
+# frees the pages its pack phase needs, and a page freed by the current transaction is
+# never recyclable within it, so the pack extends by the shortfall instead.  The next
+# VACUUM finds those pages recyclable, packs, and truncates back down.  Neither state
+# is front-packed (freetail=0 in both, so weave_truncate_free_tail() can never help)
+# and both sit far above the 1347-page floor, at 1.91x and 3.00x.
+#
+# 2000 rows is the smallest fixture found that reproduces it (438 279 424 279 424),
+# which is what keeps this arm cheap.
+#
+# TODO, NOT A FAILING TEST, deliberately.  The defect is real and unfixed; the fix is
+# a maintainer decision because the credible options change what a plain VACUUM does
+# (doc/GAPS.md G47 states them).  A TODO block pins the shape now and turns into a
+# LOUD "unexpectedly succeeded" the moment a fix lands, which is the behaviour wanted
+# from a gate for a known defect -- as opposed to deleting the gate, or landing red.
+$node->safe_psql('postgres', q{
+    CREATE TABLE vdocs (id int, d wdoc, v wvec(96));
+    INSERT INTO vdocs
+      SELECT i, to_wdoc('b' || (i % 97) || ' g' || (i % 31) || ' d' || i),
+             (SELECT '[' || string_agg(((i * 7 + k * 13) % 101 - 50)::text, ',') || ']'
+                FROM generate_series(1, 96) k)::wvec
+        FROM generate_series(1, 1600) i;
+    CREATE INDEX vdocs_weave ON vdocs USING weave (d, v) WITH (metric = 'ip');
+    INSERT INTO vdocs
+      SELECT i, to_wdoc('b' || (i % 97) || ' later ' || i), NULL
+        FROM generate_series(1601, 2000) i;
+    SELECT weave_merge('vdocs_weave');
+    DELETE FROM vdocs WHERE id % 10 = 0;
+});
+
+my @vsizes;
+for my $cycle (1 .. 5)
+{
+    # Same explicit xid burn as the arms above: without an advancing horizon nothing
+    # is recyclable anywhere and the oscillation cannot even form (verified -- with a
+    # stalled horizon the file sits flat at the peak).
+    $node->safe_psql('postgres', q{
+        CREATE TABLE IF NOT EXISTS xidburn2(i int);
+        DO $$ BEGIN FOR k IN 1..200 LOOP
+            INSERT INTO xidburn2 VALUES (k); DELETE FROM xidburn2;
+        END LOOP; END $$;
+    });
+    my $s = bracket(q{VACUUM vdocs;});
+    push @vsizes, $node->safe_psql('postgres',
+        q{SELECT pg_relation_size('vdocs_weave') / current_setting('block_size')::int});
+    diag("  [vector weft] cycle $cycle: $vsizes[-1] pages, " . fmt($s));
+}
+diag('vector weft: ' . join(' -> ', @vsizes));
+
+{
+    local $TODO = 'doc/GAPS.md G47: with a vector weft, weave_vacuum_compact() has no '
+        . 'fixed point -- the vacate phase frees the pages the pack phase needs';
+    converges('vector weft present', \@vsizes);
+}
+
+# A TODO failure is not itemised by prove's default output, so the verdict is stated
+# here explicitly -- otherwise "All tests successful" is the only thing the log says
+# about it, which is indistinguishable from the arm not having run (AGENTS.md: a test
+# result needs evidence the test RAN).  This line also tells whoever fixes G47 what to
+# do next, which a silent TODO does not.
+{
+    my $slack = int($vsizes[-2] * 0.01) + 4;
+    my $converged = abs($vsizes[-1] - $vsizes[-2]) <= $slack;
+    diag(sprintf('G47 status: last two cycles %d vs %d (slack %d) -- %s',
+        $vsizes[-2], $vsizes[-1], $slack,
+        $converged
+            ? 'CONVERGED. G47 may be FIXED: drop the TODO above and let this arm gate it'
+            : 'still oscillating, which is the expected state while G47 is open'));
+}
+
+# Not a TODO, because it holds today and is the half that keeps G47 a waste-of-work
+# defect rather than a bloat defect: the oscillation is BOUNDED.  If this ever fails,
+# G47 has become a ratchet and is a different, worse bug.
+no_ratchet('vector weft present', \@vsizes);
+
 # THE LOAD-BEARING ONE: the skip must not have turned into "never reclaim".
 cmp_ok($burn_sizes->[-1], '<', int($burn_start * 0.9),
     'plain VACUUM RECLAIMS once the xid horizon advances (the skip did not degrade into never working)');
