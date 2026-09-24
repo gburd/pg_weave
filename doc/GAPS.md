@@ -1060,7 +1060,34 @@ conclusion independent of which of `amgettuple` / `amgetbitmap` the planner pick
 someone adds a path that reads a heap page directly, property 2 is what breaks, and
 no test will say so.
 
-### G27 — the codes chain has no block→page index, so a skipped block still costs its page reads — **FIXED 2026-09-23** (implemented, measured, invariant-checked; hard rule 12's scale run is owed)
+### G27 — the codes chain has no block→page index, so a skipped block still costs its page reads — **FIXED 2026-09-23; hard rule 12's scale run DONE 2026-09-24, and it found a detection gap in the invariant**
+
+> **SCALE RUN, 2026-09-24** (`bench/RESULTS_VECMERGE_SCALE.md`). Three runs at 1M × 960-d
+> on EC2, four merges and up to six vacuum cycles each. `weave_check(deep)` clean at
+> every stage of every run, the live-lane digest byte-identical across every merge, and
+> the whole weft byte-stable across all six vacuum cycles.
+>
+> **But the first two runs could not say that, and the reason is worth keeping.** The
+> mutation control never fired — twice for harness reasons, and the third time because
+> `firstpage + 2` is *not a detectable mutation at this geometry*: `vector_codes` 75,000
+> pages over 25,000 blocks is exactly three strip pages per block at 960 dimensions, and
+> all three carry the same `blockno`. The invariant as originally written checked
+> page-kind plus `blockno == b`, so it passed a pointer naming the same block's third
+> strip — while a scan starting there follows `nextblk` into block b+1 and **refuses**.
+> An offline checker that calls an index healthy when its queries error is worse than no
+> checker.
+>
+> Tightened to require the block's **first lane strip** (`WeaveVecStripHdr.j0 == 0` and
+> not the centroid flag), which at three strips per block takes the undetectable wrong
+> values from two per block to none. True positive demonstrated on EC2:
+> `firstpage 1832 is not this block's first lane strip`. The control now asks both
+> questions — does the checker catch it, does the scan refuse it — because checking only
+> the first is what made a detection gap look like a blind invariant.
+>
+> **Also found, and not G27's:** a reproducible ~1.53× swing in NON-vector pages across
+> vacuum cycles, bit-identical across two runs, period-2, tied to the relocation pass.
+> Every vector bucket is constant to the page. Tracked separately; it is the G18 shape
+> and L19 was supposed to have closed it.
 
 **FIXED, and by the design the third attempt arrived at: one `weave_uint32 firstpage` in
 `WeaveVecDirRec`** (284 -> 288 bytes, records per directory page unchanged at 28, so zero
