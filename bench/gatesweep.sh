@@ -65,12 +65,15 @@ NQ=${NQ:-0}
 LAT=${LAT:-0}
 LATN=${LATN:-50}
 REPS=${REPS:-7}
+CTL=${CTL:-1}
+CTLN=${CTLN:-10}
 OUT=${OUT:-/scratch/pg_weave/gatesweep}
 TAG=${TAG:-$(date +%Y%m%d-%H%M%S)}
 
 mkdir -p "$OUT"
 REPORT=$OUT/gatesweep-$TAG.tsv
 LATREPORT=$OUT/gatesweep-lat-$TAG.tsv
+CTLREPORT=$OUT/gatesweep-ctl-$TAG.tsv
 
 say() { printf '%s\n' "$*" >&2; }
 die() { printf 'gatesweep.sh: %s\n' "$*" >&2; exit 1; }
@@ -96,6 +99,9 @@ printf 'db\tndocs\tnq\ttarget\tterm\tgate_rows\tsel\tpivots\tlex_contribs\tvec_s
     > "$REPORT"
 if [ "$LAT" = 1 ]; then
     printf 'db\tndocs\ttarget\tterm\tsel\tslot\tp50_ms\tp99_ms\tqueries\treps\n' > "$LATREPORT"
+fi
+if [ "$CTL" = 1 ]; then
+    printf 'db\tndocs\ttarget\tterm\tsel\tarm\tbuffers\trecheck_removed\tqueries\n' > "$CTLREPORT"
 fi
 
 # p50 and p99 from a file of one measurement per line.  Identical to bench/fuse.sh's,
@@ -253,6 +259,64 @@ for DB in $DBS; do
         done < "$PTS"
         unset LATF
     fi
+
+    # ------------------------------------------------- the mechanism control
+    #
+    # WHAT THE LATENCY CURVE DOES NOT SHOW.  The work and latency passes measure that the
+    # fused scan gets cheaper as the predicate tightens -- a MONOTONICITY claim about one
+    # arm.  Claim 3 also asserts a MECHANISM: "the predicate is pushed into the SIMD block
+    # mask instead of collapsing recall".  Nothing measured that, and it is the half a
+    # reader is entitled to be sceptical about, because the obvious alternative -- fetch in
+    # vector order and recheck the predicate afterwards -- is what every filtered-ANN
+    # implementation without a shared docid space has to do.
+    #
+    # THE CONTROL IS OUR OWN INDEX, WHICH IS WHY IT IS WORTH ANYTHING.  Both arms below
+    # carry the SAME `Index Cond:` on the SAME index over the SAME corpus, and both are
+    # asserted to have one.  The only difference is where the predicate acts: inside the
+    # scan for `fuse()`, or as a per-candidate recheck for a plain vector ORDER BY.  So a
+    # difference cannot be attributed to an engine, a corpus, a build or a plan shape --
+    # the three things that make a cross-engine filtered-ANN comparison unfalsifiable.
+    #
+    # `Rows Removed by Index Recheck` IS THE MEASUREMENT, not the buffer count.  It is the
+    # over-fetch, counted by the executor rather than by us, and it is what "collapsing
+    # recall" looks like when you keep recall instead: the vector-order arm must walk and
+    # discard candidates to fill k, and the fused arm must not discard any.
+    #
+    # Buffers are deterministic and host-independent, so this pass runs anywhere -- which
+    # is why it defaults ON while the latency pass defaults off.  CTLN is small because the
+    # control arm reads ~100x more pages than the fused arm at a tight gate.
+    if [ "$CTL" = 1 ]; then
+        say "$DB: mechanism control, $CTLN queries x $(wc -l < "$PTS") points, fused vs vector-order"
+        while IFS=$'\t' read -r tgt term sel whr; do
+            for arm in fused vecorder; do
+                tb=0; tr=0; nq=0
+                while IFS=$'\t' read -r qid wq qv; do
+                    case $arm in
+                      fused) ob="fuse(body <=> $wq::wquery, emb <#> $qv::wvec, weights => '{0.5,0.5}')" ;;
+                      vecorder) ob="emb <#> $qv::wvec" ;;
+                    esac
+                    plan=$(psql -X -q -d "$DB" -tA <<SQL
+SET enable_seqscan=off; SET enable_bitmapscan=off;
+EXPLAIN (ANALYZE, TIMING OFF, BUFFERS, COSTS OFF)
+SELECT id FROM fd $whr ORDER BY $ob LIMIT $K;
+SQL
+)
+                    # BOTH arms must carry an Index Cond, or the comparison is between a
+                    # gated scan and an executor filter and says nothing about the mask.
+                    # Only checked where there IS a predicate.
+                    if [ -n "$whr" ] && ! printf '%s' "$plan" | grep -q 'Index Cond'; then
+                        die "$DB $arm target=$tgt: no Index Cond; the control would be comparing the executor"
+                    fi
+                    b=$(printf '%s' "$plan" | sed -n 's/.*Buffers: shared hit=\([0-9]*\).*/\1/p' | head -1)
+                    r=$(printf '%s' "$plan" | sed -n 's/.*Rows Removed by Index Recheck: \([0-9]*\).*/\1/p' | head -1)
+                    tb=$((tb + ${b:-0})); tr=$((tr + ${r:-0})); nq=$((nq + 1))
+                done < <(head -n "$CTLN" "$QLIT")
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$DB" "$N" "$tgt" "$term" "$sel" "$arm" "$tb" "$tr" "$nq" >>"$CTLREPORT"
+                say "  $arm target=$tgt: buffers=$tb recheck_removed=$tr over $nq queries"
+            done
+        done < "$PTS"
+    fi
     rm -f "$PTS"
     rm -f "$QLIT" "$DFFILE"
 done
@@ -276,6 +340,22 @@ awk -F'\t' 'NR==1{next}
                base_v[k] ? f[10]/base_v[k] : 0, base_b[k] ? f[13]/base_b[k] : 0;
       }
     }' "$REPORT" >&2
+
+if [ "$CTL" = 1 ]; then
+    say ""
+    say "mechanism control: $CTLREPORT"
+    say ""
+    awk -F'\t' 'NR==1{next}
+        { k=$1 "\t" $3; if ($6=="fused") { fb[k]=$7; fr[k]=$8 } else { vb[k]=$7; vr[k]=$8 }
+          if (!seen[k]++) o[++n]=k; sel[k]=$5 }
+        END {
+          printf "%-9s %-7s %-8s %10s %10s %7s %9s %9s\n", "db", "target", "sel",
+                 "fused_buf", "vecord_buf", "ratio", "fused_rm", "vecord_rm";
+          for (i=1;i<=n;i++) { k=o[i]; split(k,f,"\t");
+            printf "%-9s %-7s %-8s %10d %10d %6.1fx %9d %9d\n", f[1], f[2], sel[k],
+                   fb[k], vb[k], fb[k] ? vb[k]/fb[k] : 0, fr[k], vr[k] } }' \
+        "$CTLREPORT" >&2
+fi
 
 if [ "$LAT" = 1 ]; then
     say ""

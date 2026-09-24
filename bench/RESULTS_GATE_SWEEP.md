@@ -420,7 +420,83 @@ that would prioritise it by profile share alone.
   first EC2 run in this project whose host is known to have been red, and the reason it
   is known is that the run found the defect that had been hiding every previous one.
 
-### Reproduce (EC2)
+### The MECHANISM, measured 2026-09-24 — and it costs 0.7x when there is no predicate
+
+Everything above is monotonicity: the same arm gets cheaper as the predicate tightens.
+Claim 3 also asserts a **mechanism** — "the predicate is pushed into the SIMD block mask
+instead of collapsing recall" — and nothing had measured that. It is the half a reader is
+entitled to be sceptical about, because the obvious alternative (fetch in vector order,
+recheck the predicate per candidate) is what a system without a shared docid space is
+forced into.
+
+**The control is our own index**, which is the only reason it is worth anything. Both arms
+carry the same `Index Cond:` on the same index over the same corpus, both are *asserted*
+to have one, and the only difference is where the predicate acts: inside the scan for
+`fuse()`, or as a per-candidate recheck for a plain `ORDER BY emb <#> q`. A difference
+cannot be blamed on an engine, a corpus, a build or a plan shape — the four things that
+make a cross-engine filtered-ANN comparison unfalsifiable. **This is not a measurement of
+any other engine.**
+
+10 queries per point, buffers and `Rows Removed by Index Recheck` summed, `k=10`.
+Deterministic, so measured on the workstation.
+
+| corpus | sel | fused buffers | vector-order buffers | ratio | fused discarded | vector-order discarded |
+|---|---|---|---|---|---|---|
+| scifact | 1.000 | 6,166 | 4,074 | **0.7×** | 0 | 0 |
+| | 0.100 | 6,188 | 14,113 | 2.3× | 0 | 1,565 |
+| | 0.010 | 3,799 | 129,791 | 34.2× | 0 | 23,023 |
+| | 0.001 | 2,245 | 255,594 | **113.9×** | 0 | 51,780 |
+| nfcorpus | 1.000 | 3,639 | 2,975 | **0.8×** | 0 | 0 |
+| | 0.100 | 3,458 | 22,210 | 6.4× | 0 | 3,179 |
+| | 0.010 | 2,093 | 63,418 | 30.3× | 0 | 10,754 |
+| | 0.001 | 1,163 | 183,237 | **157.6×** | 0 | 36,290 |
+| fiqa | 1.000 | 49,130 | 38,610 | **0.8×** | 0 | 0 |
+| | 0.100 | 47,984 | 56,957 | 1.2× | 0 | 1,073 |
+| | 0.010 | 22,268 | 177,444 | 8.0× | 0 | 17,164 |
+| | 0.001 | 9,381 | 913,695 | **97.4×** | 0 | 227,054 |
+
+**`Rows Removed by Index Recheck` is the measurement, not the buffer count.** It is the
+over-fetch, counted by the executor rather than by us, and it is what "collapsing recall"
+looks like if you insist on keeping recall instead: the vector-order arm walks and
+discards up to 227,054 candidates to return 100 rows, and **the fused arm discards zero,
+at every point, on every corpus.** That is the mask doing the thing claim 3 says it does.
+
+**THE LOSS, stated first among equals (hard rule 8): with no predicate the fused path is
+0.7–0.8× — i.e. 1.2–1.4× MORE expensive.** It has to scan the lexical channel as well, and
+there is no gate to pay for it. So the honest shape of claim 3 is not "fused is better",
+it is **"fused converts predicate selectivity into speed, and costs about 30 % when there
+is no selectivity to convert"**. The crossover is between 10 % and 1 % selectivity on every
+corpus measured (scifact 2.3× at 0.100, fiqa only 1.2× at 0.100). A user whose queries
+carry no predicate should not use the fused path, and nothing in the design hides that.
+
+**One number to resist over-reading:** the 97–158× column is buffers for a *vector-order
+plan that keeps exact recall*. An approximate filtered-ANN implementation that accepts
+recall loss does less work than this control and is not measured here. What the control
+establishes is the cost of the *exact* alternative on the same index, which is the
+comparison the fused algorithm is actually against.
+
+### Two levers this ruled out, both of which I had asserted before measuring
+
+- **The warp map.** `weave_fuse_vec_warpmap()` is read unconditionally, so it looked like
+  the residue that keeps latency above the blocks-scored curve. Measured: the warp bucket
+  is 57 pages on fiqa against 1,823 buffers at the 0.1 % point — **6.7 %**, and 12 of 513
+  on scifact. Not a headline lever. The earlier note that it "is therefore the next lever"
+  was inferred from the *shape* of the latency-vs-blocks gap and is **withdrawn**.
+- **The G44 normalizer's pre-scan.** It walks the whole block directory per query, which
+  looked like the selectivity-independent cost. Ablated with `pg_weave.fuse_normalize`:
+  776 vs 792 buffers at the 0.001 point — **within noise, and slightly cheaper with it
+  on**. The directory is 65 pages, read once and cached; the "O(nblocks) per query" reading
+  was mine, and it came from mis-reading `weave_work_stats().vec_lanes` as per-query when
+  it is cumulative across all 648 queries. fiqa is 1,800 blocks per bolt, not 36,450.
+
+Hard rule 9 exists for exactly this: two plausible levers, both sized in an afternoon,
+both an order of magnitude smaller than asserted. The remaining vector-side budget at a
+tight gate is ~423 buffers of which ~122 are unconditional, so **no vector-side change can
+win more than ~15 % of a gated query.** At the gated point the lexical channel is the
+larger half (390 of 813 buffers on fiqa — 8 posting lists read in full), which is where a
+next lever would have to come from.
+
+## Reproduce (EC2)## Reproduce (EC2)
 
 ```sh
 AWS_PROFILE=hotdog AWS_REGION=us-east-2 FUSE_DATASETS="scifact nfcorpus fiqa" \
