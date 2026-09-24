@@ -73,15 +73,23 @@ DIM=${DIM:-960}
 BATCH=${BATCH:-50000}
 NBATCH=${NBATCH:-4}
 DELFRAC=${DELFRAC:-10}
-# FOUR vacuum cycles, not three, and the reason is the first 1M run.  It failed a
-# cycle1-vs-cycle3 ratchet at 190,091 -> 283,924 pages -- while the same script at
-# 20k rows produced 2,577 -> 4,039 -> 2,577, an OSCILLATION whose peak simply landed
-# on a different cycle.  A three-cycle ratchet cannot tell those apart, because its
-# verdict depends on the parity of the cycle the relocation pass happens to fire on.
-# Comparing cycles of the SAME parity (3 vs 1, 4 vs 2) separates a trend from a
-# swing, and the peak-to-trough ratio is reported either way because a transient 1.5x
-# is a real cost to a user even when it is bounded.
-VACCYC=${VACCYC:-4}
+# SIX vacuum cycles, and the count has moved twice, each time because the previous
+# count could not decide the question.
+#
+# Three failed a cycle1-vs-cycle3 ratchet at 190,091 -> 283,924 pages.  The same
+# script at 20k rows gave 2,577 -> 4,039 -> 2,577, a period-2 OSCILLATION whose peak
+# merely landed on a different cycle, so three cycles cannot tell a trend from a swing.
+#
+# Four then produced, at 1M, `190091, 185234, 283924, 185234`: cycle 4 EQUAL to cycle 2
+# to the page -- so the even cycles are provably stable -- while the odd cycles are
+# cycle 1 and cycle 3, and **cycle 1 is not a steady-state datum**.  L19 established
+# that the first VACUUM after a big delete legitimately grows the index by the livedocs
+# tombstone blob, so comparing cycle 3 against it asks the wrong question.  That leaves
+# ONE usable odd sample, which cannot establish a trend either.
+#
+# Six gives cycles 3 and 5 as two steady-state odd samples.  It is the smallest run
+# that can answer the question, which is why it is the default.
+VACCYC=${VACCYC:-6}
 CORPUS=${CORPUS:-/scratch/corpus/gist/gist_base.fvecs}
 OUT=${OUT:-$HOME/out}
 WORK=${WORK:-/scratch/vecmerge}
@@ -228,6 +236,54 @@ snapshot() {
 	emit "$stage" blocks "${to##* }"
 }
 
+# The answer check, as a function so it can run at the BUILD stage and again at the
+# end; the differential between those two is the assertion (see section 5).
+answer_check() {
+	local idx=$1 stage=$2 nq=${NQ:-10}
+	say "answer check ($stage): index recall@10 against an exact sequential scan"
+	$PSQL -tAc "SELECT v::text FROM vmsrc WHERE id % (($nsrc / $nq)) = 1 LIMIT $nq" \
+		>"$WORK/queries.txt"
+	[ "$(wc -l <"$WORK/queries.txt")" -ge 3 ] || fail "could not sample query vectors"
+
+	: >"$OUT/answers.$stage.tsv"
+	local qv lit plan idxids exids hit
+	while IFS= read -r qv; do
+		lit=${qv//\'/\'\'}
+		# The exact arm forbids every index path, so it is a sequential scan computing
+		# float distances -- the reference.  The index arm forbids only bitmapscan, and
+		# its plan is ASSERTED to be an index scan: a plan that fell back to a
+		# sequential scan would agree with the reference perfectly while testing
+		# nothing, which is exactly how sql/vecindex.sql's own G27 pin passed locally
+		# for two commits without reading the weft (fixed in a254a3e).
+		plan=$($PSQL -tAc "SET enable_bitmapscan = off;
+		                   EXPLAIN (COSTS OFF) SELECT id FROM vm
+		                     ORDER BY v <#> '$lit'::wvec LIMIT 10" | tr -d ' ')
+		case $plan in
+			*IndexScan*|*CustomScan*|*Weave*) ;;
+			*) printf '%s\n' "$plan" >&2
+			   fail "$stage: the index arm is not using the index -- see the plan above" ;;
+		esac
+		idxids=$($PSQL -tAc "SET enable_bitmapscan = off;
+		                     SELECT string_agg(id::text, ',' ORDER BY id) FROM (
+		                       SELECT id FROM vm ORDER BY v <#> '$lit'::wvec LIMIT 10) t")
+		exids=$($PSQL -tAc "SET enable_indexscan = off; SET enable_bitmapscan = off;
+		                    SELECT string_agg(id::text, ',' ORDER BY id) FROM (
+		                      SELECT id FROM vm WHERE v IS NOT NULL
+		                        ORDER BY v <#> '$lit'::wvec LIMIT 10) t")
+		hit=$($PSQL -tAc "SELECT count(*) FROM
+		                    unnest(string_to_array('$idxids', ',')) a
+		                    JOIN unnest(string_to_array('$exids', ',')) b ON a = b")
+		printf '%s\n' "$hit" >>"$OUT/answers.$stage.tsv"
+	done <"$WORK/queries.txt"
+
+	local n r
+	read -r n r < <(awk '{ n++; s += $1 } END { printf "%d %.4f\n", n, s / (n * 10) }' \
+		"$OUT/answers.$stage.tsv")
+	emit "answer_$stage" queries "$n"
+	emit "answer_$stage" recall_at_10 "$r"
+	say "answer check ($stage): recall@10 = $r over $n queries"
+}
+
 # The horizon has to move or nothing is recyclable and the vacuum legs measure an
 # artifact (project memory: three wrong mechanisms came from this).
 # Separate psql invocations on purpose: `SELECT txid_current() FROM
@@ -261,6 +317,10 @@ check_clean vm_weave build
 snapshot vm_weave build
 blocks_prev=$(awk -F'\t' '$1 == "build" && $2 == "blocks" {print $3}' "$REPORT")
 say "build: $blocks_prev blocks"
+
+# The recall baseline, taken BEFORE any merge or vacuum: section 5 asserts the
+# difference against this, not against a number chosen by hand.
+answer_check vm_weave build
 
 # ---------------------------------------------------------------- 3. insert + merge
 #
@@ -338,9 +398,21 @@ for cyc in $(seq 1 "$VACCYC"); do
 	snapshot vm_weave "vacuum$cyc"
 done
 
-# THE RATCHET, ON MATCHING PARITY.  Later cycles are compared to the FIRST vacuum,
-# never to the pre-vacuum size, for the tombstone-blob reason above -- and only to
-# cycles of the same parity, for the oscillation reason at the top of this file.
+# THE RATCHET, ON MATCHING PARITY, WITH CYCLE 1 EXCLUDED.  Three separate corrections
+# are baked into this block and each one came from a run that asserted the wrong thing:
+#
+#  1. Compare later cycles to an earlier VACUUM, never to the pre-vacuum size -- the
+#     first vacuum after a big delete legitimately grows the index by the livedocs
+#     tombstone blob (L19).
+#  2. Compare only cycles of the SAME PARITY, because the relocation pass fires on
+#     alternate cycles (measured: wall clock 1279 / 554 / 1130 / 561 s) and a
+#     cross-parity comparison measures the swing rather than the trend.
+#  3. EXCLUDE CYCLE 1 as a baseline entirely.  It is both odd AND the post-delete
+#     special case from (1), so using it as the odd-parity reference conflates the two
+#     and is what produced this script's first FAIL verdict -- a verdict the data does
+#     not support, since cycle 4 came back exactly equal to cycle 2.
+#
+# So: cycle 3 is reported, never asserted against; the assertions start at cycle 5.
 pg() { awk -F'\t' -v s="vacuum$1" -v k="$2" '$1 == s && $2 == k {print $3}' "$REPORT"; }
 SERIES=""
 for cyc in $(seq 1 "$VACCYC"); do SERIES="$SERIES $(pg "$cyc" relpages)"; done
@@ -351,74 +423,61 @@ say "vector pages across the same cycles:$VSERIES"
 emit vacuum relpages_series "$(printf '%s' "$SERIES" | tr -s ' ' ',' | sed 's/^,//')"
 emit vacuum vector_pages_series "$(printf '%s' "$VSERIES" | tr -s ' ' ',' | sed 's/^,//')"
 
-# The transient, reported rather than asserted: peak / trough over the series.
+# The transient, reported rather than asserted: peak / trough over the series.  A
+# recurring 1.5x swing is a real cost to a user even when it is bounded, and it is a
+# DIFFERENT defect from a ratchet -- so it gets a number and not a verdict.
 read -r pk tr <<<"$(printf '%s\n' $SERIES | awk 'NR==1{mn=mx=$1} {if($1>mx)mx=$1; if($1<mn)mn=$1} END{print mx, mn}')"
 emit vacuum peak_to_trough "$(awk -v a="$pk" -v b="$tr" 'BEGIN{printf "%.3f", a/b}')"
 say "peak/trough over the series: $pk / $tr = $(awk -v a="$pk" -v b="$tr" 'BEGIN{printf "%.2fx", a/b}')"
 
-for cyc in $(seq 3 "$VACCYC"); do
+if [ "$VACCYC" -lt 5 ]; then
+	say "VACCYC=$VACCYC: NO ratchet assertion is possible (cycle 1 is the post-delete
+	     special case, so the first assertable same-parity pair is 5 against 3).  The
+	     series above is reported and nothing is claimed from it."
+fi
+for cyc in $(seq 5 "$VACCYC"); do
 	earlier=$((cyc - 2))
 	a=$(pg "$earlier" relpages); b=$(pg "$cyc" relpages)
 	av=$(pg "$earlier" vector_pages); bv=$(pg "$cyc" vector_pages)
 	awk -v a="$a" -v b="$b" 'BEGIN { exit (b > a * 1.05) }' \
-		|| defer "vacuum$cyc is $b pages against vacuum$earlier's $a -- same parity, so this is a TREND and not the oscillation (doc/GAPS.md G18 shape); vector pages $av -> $bv is what says whether the weft is implicated"
+		|| defer "vacuum$cyc is $b pages against vacuum$earlier's $a -- same parity, neither is the post-delete cycle, so this is a TREND and not the swing (doc/GAPS.md G18 shape); vector pages $av -> $bv says whether the weft is implicated"
 done
 
 # ---------------------------------------------------------------- 5. the answer
 #
-# Everything above is structural.  This asks the scan the question a wrong
-# `firstpage` would answer incorrectly WITHOUT erroring: does the index's own top-k
-# agree with an exact sequential scan over the same table?  The recheck is on a
-# sample of queries because the exact arm is a full pass per query.
-# RECALL, NOT EQUALITY, AND THE DIFFERENCE MATTERS.  The index answers from 4-bit
-# codes, so its top-10 is not required to equal the exact top-10 and an equality
-# assertion here would fail for a reason that has nothing to do with this gate.  What
-# a wrong `firstpage` produces is not a near miss: the scan's code cursor refuses a
-# page whose header does not claim the block block-major order calls for, so the
-# query ERRORS -- and if it somehow did not, it would be scoring other documents'
-# codes and recall would collapse toward zero.  The floor below is therefore set
-# where only a broken scan can miss it, and the MEASURED value is what gets recorded.
-say "answer check: index recall@10 against an exact sequential scan"
-NQ=${NQ:-10}
-$PSQL -tAc "SELECT v::text FROM vmsrc WHERE id % (($nsrc / $NQ)) = 1 LIMIT $NQ" \
-	>"$WORK/queries.txt"
-[ "$(wc -l <"$WORK/queries.txt")" -ge 3 ] || fail "could not sample query vectors"
-
-: >"$OUT/answers.tsv"
-while IFS= read -r qv; do
-	lit=${qv//\'/\'\'}
-	# The exact arm forbids every index path, so it is a sequential scan computing
-	# float distances -- the reference.  The index arm forbids only bitmapscan, and
-	# the plan is asserted to be an index scan, because a plan that fell back to a
-	# seq scan would agree with the reference perfectly while testing nothing.
-	plan=$($PSQL -tAc "SET enable_bitmapscan = off;
-	                   EXPLAIN (COSTS OFF) SELECT id FROM vm
-	                     ORDER BY v <#> '$lit'::wvec LIMIT 10" | tr -d ' ')
-	case $plan in
-		*IndexScan*|*CustomScan*|*Weave*) ;;
-		*) printf '%s\n' "$plan" >&2
-		   fail "the index arm is not using the index -- see the plan above" ;;
-	esac
-	idxids=$($PSQL -tAc "SET enable_bitmapscan = off;
-	                     SELECT string_agg(id::text, ',' ORDER BY id) FROM (
-	                       SELECT id FROM vm ORDER BY v <#> '$lit'::wvec LIMIT 10) t")
-	exids=$($PSQL -tAc "SET enable_indexscan = off; SET enable_bitmapscan = off;
-	                    SELECT string_agg(id::text, ',' ORDER BY id) FROM (
-	                      SELECT id FROM vm WHERE v IS NOT NULL
-	                        ORDER BY v <#> '$lit'::wvec LIMIT 10) t")
-	hit=$($PSQL -tAc "SELECT count(*) FROM
-	                    unnest(string_to_array('$idxids', ',')) a
-	                    JOIN unnest(string_to_array('$exids', ',')) b ON a = b")
-	printf '%s\n' "$hit" >>"$OUT/answers.tsv"
-done <"$WORK/queries.txt"
-
-read -r nq recall < <(awk '{ n++; s += $1 } END { printf "%d %.4f\n", n, s / (n * 10) }' \
-	"$OUT/answers.tsv")
-emit answer queries "$nq"
-emit answer recall_at_10 "$recall"
-say "answer check: recall@10 = $recall over $nq queries"
-awk -v r="$recall" 'BEGIN { exit (r < 0.90) }' \
-	|| defer "recall@10 $recall is below the floor a working scan cannot miss -- the scan is reading the wrong codes"
+# Everything above is structural.  This asks the scan the question a wrong `firstpage`
+# would answer incorrectly WITHOUT erroring: does the index's own top-10 still agree
+# with an exact sequential scan over the same table?
+#
+# RECALL, NOT EQUALITY -- the index answers from 4-bit codes, so its top-10 is not
+# required to equal the exact one.
+#
+# AND NOT AN ABSOLUTE FLOOR EITHER, which is the correction.  The first version
+# asserted recall >= 0.90, a number I made up without measuring what this index
+# delivers, and at 1M x 960-d it returns 0.8500 -- per-query hits 8 9 9 8 8 9 9 7 9 9.
+# That uniform spread is quantization loss.  A wrong `firstpage` does not look like
+# that: the scan's code cursor refuses a page whose header does not claim the block
+# block-major order calls for, so the query ERRORS; and if it somehow did not, it would
+# be scoring other documents' codes and the per-query hits would be near zero and
+# BIMODAL.  An absolute floor cannot tell 0.85-because-4-bits from
+# 0.85-because-broken, and it fails on the first honest number.
+#
+# So the check is DIFFERENTIAL: recall is measured once right after the build, before
+# any merge or vacuum, and again at the end.  What is asserted is that the second is
+# not materially worse than the first.  That compares the index to itself, which is the
+# only baseline here that was not invented -- and it is also a strictly better test of
+# the merge and vacuum paths, which is what this script is for.
+answer_check vm_weave final
+R_BUILD=$(awk -F'\t' '$1 == "answer_build" && $2 == "recall_at_10" {print $3}' "$REPORT")
+R_FINAL=$(awk -F'\t' '$1 == "answer_final" && $2 == "recall_at_10" {print $3}' "$REPORT")
+emit answer recall_build "$R_BUILD"
+emit answer recall_final "$R_FINAL"
+say "recall@10: build $R_BUILD -> after $NBATCH merges and $VACCYC vacuums $R_FINAL"
+# 0.02 absolute, which is two query-slots out of a hundred at NQ=10.  Tighter than that
+# would flag the sampling noise of ten queries; looser would not notice a channel that
+# had started dropping a few documents per block.
+awk -v a="$R_BUILD" -v b="$R_FINAL" 'BEGIN { exit (b < a - 0.02) }' \
+	|| defer "recall@10 fell from $R_BUILD at build to $R_FINAL after the merges and vacuums -- the structural checks passed, so this is the scan reading a weft the merge or vacuum damaged in a way weave_check() does not model"
 
 if [ "$DEFERRED" != 0 ]; then
 	say "vecmerge: $DEFERRED DEFERRED FAILURE(S) -- report at $REPORT"
