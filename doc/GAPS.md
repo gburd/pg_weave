@@ -3345,3 +3345,59 @@ stays because an A/B that cannot reproduce its own baseline is not an A/B (hard 
 allocator decision counts are deterministic and host-independent, which is why the
 matrix is local and free. A *change* to this path still needs the 1M-scale run
 (`bench/aws/run.sh ... vecmerge`), not local green.
+
+
+### G48 — a lexical seek skips the DECODE but reads every PAGE it passes over, so the channel that dominates a gated query has no way to skip I/O — **OPEN 2026-09-24, ceiling UNMEASURED**
+
+**Where this came from.** `bench/RESULTS_GATE_SWEEP.md` sized two vector-side levers and
+withdrew both, leaving the arithmetic that the vector channel cannot win more than ~15 %
+of a gated query: at the tight gate the lexical channel is the larger half, 390 of 813
+buffers on fiqa. So the next lever has to be lexical, and the first question is what the
+lexical channel's floor actually is.
+
+**What is established, by reading the code rather than by measuring it.**
+`wand_skip_blocks()` (`src/am/amscan.c`) exists precisely to make a seek cheap, and its
+header says so: it advances "past whole 128-blocks whose docids are all < target, reading
+only block HEADERS (no FOR decode) … what lets a seek over a high-df term skip hundreds
+of thousands of postings without decoding." That is true and it is the right design for
+CPU. But the loop that implements it does `ReadBuffer(c->index, c->curblk)` once per page
+and follows `nextblk` to the next, so **a forward seek across N pages of a posting chain
+reads all N buffers.** It skips the decode, not the I/O.
+
+Consequences worth stating separately, because they have different fixes:
+
+- **The fused threshold cannot turn into avoided reads on the lexical side.** The shuttle
+  has a real `block_max()` (`src/query/lexshuttle.c`) and the core does seek past blocks
+  the bound rules out — so the pruning *works*, and every page it prunes over is read
+  anyway. The pruning is free in CPU and costs full price in buffers.
+- **This is the structure BlockMax-WAND normally has and we do not**: per-block
+  `first_docid` and `block_max` held OUTSIDE the chain, so a block can be rejected
+  without touching its page. We store both, in the block header, on the page you must
+  read to see them.
+- The chain's start is not the problem — the dictionary gives the first page directly. It
+  is the traversal that is linear in pages.
+
+**WHAT IS NOT MEASURED, AND NOTHING SHOULD BE BUILT UNTIL IT IS.** The number that
+decides whether this is a lever or a footnote is the split of those 390 buffers into
+*pages read only to skip over* versus *pages read to decode a block that scored*. If the
+first is 10 % of the total the whole idea is a footnote; if it is 80 % it is the largest
+remaining lever in the project. **I do not know which, and the shape of the code is not
+evidence for either** — this is the same error as the warp map and the normalizer pre-scan,
+both of which were asserted as levers from a plausible mechanism and came back at 6.7 %
+and within-noise. A recommendation is a claim (AGENTS.md).
+
+**The instrument that would settle it**, which does not exist today: the lexical
+counterpart of `weave_vecwork_blocks` / `weave_vecwork_blk_bound`. Two counters, one site
+each — pages read inside `wand_skip_blocks()` (skip-only traffic) and pages read inside
+`wand_load_block()` (decode traffic) — surfaced through `weave_work_stats()`. Note that
+adding columns there means a version bump and a DROP + CREATE in the upgrade script: a
+function whose whole result is `OUT` parameters has those parameters as its return type,
+so a column cannot be added in place (the 0.10→0.11 and 0.12→0.13 scripts both say so).
+`weave_lex_contribs` cannot substitute: it deliberately counts the single-channel WAND
+path only, so it is zero for exactly the fused queries this is about.
+
+Also unmeasured and cheaper to get wrong: whether the same pages are being re-read across
+the several terms of a query (posting lists share pages), in which case shared_buffers
+absorbs most of the cost and the EXPLAIN BUFFERS figure already reflects that. The
+measurement must therefore be buffer *reads* as the executor counts them, not page visits
+as a counter counts them, or it will overstate the lever.

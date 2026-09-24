@@ -496,6 +496,17 @@ win more than ~15 % of a gated query.** At the gated point the lexical channel i
 larger half (390 of 813 buffers on fiqa — 8 posting lists read in full), which is where a
 next lever would have to come from.
 
+**And the first thing found on the lexical side is a mechanism, not a number, so it is
+recorded as `doc/GAPS.md` G48 with its ceiling explicitly unmeasured.** `wand_skip_blocks()`
+makes a seek cheap in CPU exactly as its header claims — block headers only, no FOR decode
+— but it `ReadBuffer`s every page it passes over, so a forward seek across N pages of a
+posting chain reads all N. The lexical `block_max()` is real and the core does prune with
+it; the pruning is free in CPU and costs full price in buffers, because the per-block
+`first_docid` and `block_max` a skip would consult live on the page the skip is trying to
+avoid. Whether that is the larger part of the 390 or a tenth of it is **not measured**, and
+the two levers withdrawn above were both asserted from exactly this kind of plausible
+mechanism. The instrument that would settle it is named in G48.
+
 ## Reproduce (EC2)## Reproduce (EC2)
 
 ```sh
