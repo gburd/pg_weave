@@ -1229,19 +1229,45 @@ run_vecmerge() {
 		echo "mutation applied:"; grep -n "codes.buf) + 2" src/vector/vecwrite.c' \
 		2>&1 | tee "$OUT/mutant_setup.log" || die "could not apply the mutation"
 
-	# ASSERT THE MUTANT BUILT.  A mutation harness that treats "the check did not
-	# succeed" as "the mutation was caught" reports a compile error as a pass; that
-	# happened here for real on a V7 leg (AGENTS.md).  `with_llvm=no` because PGXS's
-	# bitcode step on this image aborts and leaves a half-written bitcode directory
-	# that later kills backends in unrelated tests.
+	# ASSERT THE MUTANT BUILT, AND NAME THE STEP THAT FAILED.  A mutation harness that
+	# treats "the check did not succeed" as "the mutation was caught" reports a compile
+	# error as a pass; that happened here for real on a V7 leg (AGENTS.md).
+	# `with_llvm=no` because PGXS's bitcode step on this image aborts and leaves a
+	# half-written bitcode directory that later kills backends in unrelated tests.
+	#
+	# THE RESTART IS A SEPARATE ASSERTION FROM THE BUILD, and conflating them is what
+	# cost run 2 its control.  `sudo -u postgres pg_ctlcluster 17 main restart` FAILS on
+	# this image -- "cluster is running from systemd, can only restart it as root" -- so
+	# `set -e` aborted the block and the job announced "the mutant did not build" about
+	# a mutant that had built and installed perfectly.  A gate that names the wrong step
+	# sends you to read the wrong log.  `run_smoke` never noticed because its own
+	# `pg_ctlcluster ... start` is followed by `|| true`.
 	$SSH 'set -e
 		cd pg_weave
 		make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config with_llvm=no 2>&1 | tail -20
 		test -f pg_weave.so || { echo "MUTANT DID NOT BUILD"; exit 1; }
 		sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config with_llvm=no >/dev/null
-		sudo -u postgres pg_ctlcluster 17 main restart
 		echo "mutant built and installed"' \
-		2>&1 | tee -a "$OUT/mutant_setup.log" || die "the mutant did not build"
+		2>&1 | tee -a "$OUT/mutant_setup.log" \
+		|| die "the mutant did not BUILD or INSTALL (the restart is a separate step) --
+		        see $OUT/mutant_setup.log"
+
+	# systemd first, because that is what this image uses; pg_ctlcluster as the fallback
+	# for an image that does not.  The server is then verified by ASKING it, not by
+	# trusting a restart's exit status: a backend still serving the OLD .so would make
+	# the control silently measure the unmutated writer, which is the one outcome this
+	# whole block exists to rule out.
+	$SSH 'set -e
+		sudo systemctl restart postgresql@17-main 2>/dev/null \
+			|| sudo pg_ctlcluster 17 main restart
+		for i in $(seq 1 30); do
+			psql -X -tAc "SELECT 1" >/dev/null 2>&1 && break
+			sleep 1
+		done
+		psql -X -tAc "SELECT 1" >/dev/null || { echo "SERVER DID NOT COME BACK"; exit 1; }
+		echo "server up after installing the mutant"' \
+		2>&1 | tee -a "$OUT/mutant_setup.log" \
+		|| die "the mutant built but the server did not come back -- see $OUT/mutant_setup.log"
 
 	say "control: the mutated writer must be caught by weave_check()"
 	# THE SQL GOES OVER AS A FILE.  Quoting a string literal through a single-quoted
