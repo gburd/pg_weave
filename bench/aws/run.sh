@@ -1396,9 +1396,17 @@ MUTSQL
 
 	# Both legs are reported, and the run fails only if NEITHER fires -- because that,
 	# and only that, means a wrong code-page pointer is undetectable.
+	# THE LEG-2 PATTERN MATCHES THE `DETAIL:` LINE, and getting that wrong once is
+	# instructive.  The first version required the explanation on the `ERROR:` line, but
+	# the scan raises `ERROR: weave vector scan cannot read bolt 0 of index "..."` and
+	# puts the reason -- "a vector code page does not carry the block the chain's
+	# block-major order calls for" -- in `DETAIL:`.  So the control printed "the scan
+	# refused: no" about a scan that had refused two lines above its own verdict.  One
+	# more gate reporting on something other than the thing under test, this time inside
+	# the gate written to catch exactly that.
 	mchk=no; mscan=no
 	grep -q 'firstpage' "$OUT/mutant_check.log" && mchk=yes
-	grep -qiE 'ERROR:.*(code page|block-major|code chain|firstpage)' \
+	grep -qE 'weave vector scan cannot read bolt|block-major order calls for' \
 		"$OUT/mutant_check.log" && mscan=yes
 	say "control: weave_check caught it: $mchk   |   the scan refused: $mscan"
 	if [ "$mchk" = no ] && [ "$mscan" = no ]; then
