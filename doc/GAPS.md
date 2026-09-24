@@ -3253,26 +3253,95 @@ starts on. The new `converges()` assertion is the property that was missing — 
 three pre-existing arms pass it, which is why a tighter threshold on them was not the
 answer.
 
-**THE FIX IS A MAINTAINER DECISION, because both credible options change what a plain
-`VACUUM` does.** Stated with costs, not ranked:
+**THE OPTIONS WERE MEASURED THE DAY AFTER THEY WERE WRITTEN, AND THE LIST BELOW IS THE
+CORRECTED ONE.** `bench/RESULTS_G47_VACATE.md` has the matrix: four arms
+({vacate on, vacate off} × {`VACUUM`, `weave_vacuum()`}), six cycles, two reps each,
+bit-identical, `weave_check(deep)` clean and the live-lane digest constant throughout.
+The original three options are kept below with their verdicts rather than deleted
+(hard rule 13), because two of the three were wrong in instructive ways.
 
-1. **Reuse freed pages immediately when holding `AccessExclusiveLock`.** Under AEL no
-   other backend can hold a snapshot that reads the pages being freed, so the recycle
-   gate is not protecting anything — and `weave_vacuum_compact()` **already knows this
-   for the probe**, which it skips under AEL (`amvacuum.c:511`). Extending the same
-   reasoning to the allocator lets the two-phase pass complete in one call and reach the
-   floor. *Cost:* only helps the AEL caller; `weave_vacuumcleanup()` runs under
-   ShareUpdateExclusiveLock and would still oscillate, so this needs (2) as well.
-2. **Under a share lock, skip the pass when it must extend** — when the recyclable free
-   space below the live data is less than the live size, the rewrite provably cannot
-   truncate and can only grow the file. *Cost:* a plain `VACUUM` would stop compacting
-   in exactly the shape that most needs it, leaving the index above its floor until an
-   AEL path runs. That is the **"skip forever" trap the code explicitly warns about**
-   (`amvacuum.c:500-509`), and the sibling project shipped that regression once.
+**What the measurement changes, first, because it reframes the whole entry: G47 is TWO
+defects and only one of them is fixable.**
 
-A third option — teach the pack phase to place the new weft so the result is genuinely
-front-packed — is the only one that fixes it without a policy change, and is also the
-largest; nothing here has measured whether it is possible with write-before-free.
+- **the waste** — the vacate phase contributes **1,346 of the 1,461 extends (92.1 %)**
+  and the entire visible file-size swing, and buys the share-lock caller *nothing*:
+  both arms sit at the **same trough, 2,578 pages**. Fixable now (option 4 below).
+- **the non-convergence** — plain `VACUUM` sits at 1.91× the floor forever. **Not
+  fixable without giving up the recycle gate**, because reaching the floor requires
+  recycling pages freed by the same transaction, and under a share lock that hands a
+  concurrent scan a page it is still reading — the field-reported crash
+  `weave_page_recyclable()` exists to prevent. The floor stays reachable only under
+  AccessExclusiveLock (`weave_vacuum()`, `REINDEX`), which is how it works today.
 
-**Hard rule 12 applies to any of them:** this is the vacuum path, so a fix needs the
-1M-scale run (`bench/aws/run.sh ... vecmerge`), not local green.
+1. ~~**Reuse freed pages immediately when holding `AccessExclusiveLock`.**~~
+   **ALREADY IMPLEMENTED — there was nothing to build.** `weave_page_recyclable()`
+   already bypasses the gate under AEL (`src/am/am.c`, "safe to bypass ONLY when no
+   concurrent scan can exist"), and the matrix shows the consequence: `weave_vacuum()`
+   converges to the **exact floor (1,347 pages) in ONE call** and then does literally
+   nothing for five more cycles — 0 extends, 0 reuses. *This option was stale the day
+   it was written, in the entry whose own AGENTS.md rule is "an option list is a cache
+   and it goes stale". Grepping the source for the option's own status row would have
+   caught it; the option list was written from the comment at `amvacuum.c:511` instead.*
+2. **Under a share lock, skip the pass when it must extend.** Still available, still the
+   "skip forever" trap (`amvacuum.c:500-509`) — but **its prize shrank by 92 %**. It was
+   worth 1,461 extends per cycle when it was written; with option 4 in place it is worth
+   115.
+3. ~~**Teach the pack phase to place the new weft genuinely front-packed.**~~
+   **REFUTED, on two independent grounds, and it never needed to be built to be
+   settled.** (a) *Arithmetic:* from the trough the pass needs **1,346 destinations and
+   has 1,231** (`DEMAND` vs `BUDGET`, both read off the free space map with the
+   allocator's own `BLCKSZ/2` criterion), so any single write-before-free pass **must**
+   extend ≥ 115 pages regardless of placement policy. (b) *Measured:* the pack phase
+   with the vacate ablated lands on exactly `2,578 + 115 = 2,693` — it **is** that
+   bound, so it is already as front-packed as write-before-free permits. The
+   destination set is fixed by what was already free, not by how the pass chooses among
+   it. There is no placement lever here.
+4. **NEW, and it is the one the measurement supports: make the vacate phase conditional
+   on the lock actually held.** Run it under AccessExclusiveLock, where it reaches the
+   floor in one call; skip it under a share lock, where it provably cannot help. The
+   predicate is already in the file — the L19 probe skip at `amvacuum.c:510` uses
+   `CheckRelationLockedByMe(index, AccessExclusiveLock, true)` for the same reason.
+   **It is not option 2** (which skips the whole pass; this skips only phase 1 and still
+   runs the pack) and **it changes no policy**: plain `VACUUM` reclaims to exactly the
+   2,578 pages it reaches today.
+
+   | | today | option 4 |
+   |---|---|---|
+   | `weave_vacuum()` (AEL) | 1,347 = floor, one call | unchanged |
+   | `VACUUM` trough / peak | 2,578 / 4,039 | 2,578 / **2,693** |
+   | extends per grow cycle | 1,461 | **115** |
+   | swing a user sees | 1.568× | **1.045×** |
+
+**And the ablation refutes the lazy reading of it too:** *deleting* the vacate phase is
+wrong. With it ablated, the AEL path stalls at 2,693 — 2.00× the floor — and keeps
+paying 115 extends every cycle forever. The vacate phase is load-bearing exactly where
+its freed pages are recyclable in-transaction, and dead weight exactly where they are
+not. That is why the fix is a condition and not a deletion.
+
+**One observation for the guard rather than the fix.** `novacate` + `weave_vacuum()`
+holds a **stable 2,693 pages while extending 115 pages every single cycle, forever**. A
+stable size with permanent work is invisible to `weave_index_is_compacted()`, whose term
+(1) sees 1,346 free pages below live against a threshold of 8 and concludes there is
+work to do. A hole the pass cannot fill is not a reason to run the pass — the same
+blindness recorded above, wearing the other arm's clothes.
+
+**A finding about fixtures that came out of pinning the start states**, recorded because
+it invalidates the obvious way to run this comparison: the same logical history (build,
+4 × insert+merge, 10 % delete) landed on **2,904 pages three times and 3,755 the
+fourth**, because a merge reuses a freed page only when the horizon has moved past its
+freeing xid. **An index's size after a history is a function of the transaction horizon
+as well as of the history.** Adding the post-delete `VACUUM` to the fixture makes it
+deterministic (2,578 on three consecutive rebuilds) — and that vacuum belongs there
+anyway, since it is the L19 cycle that is not a steady-state datum.
+
+**Instrument, and it stays in the tree:** `pg_weave.vacuum_vacate` (bool, default `on`
+= shipped behaviour, `PGC_USERSET`) ablates phase 1. It is a diagnostic, not a tuning
+knob, and it is deliberately **outside** the `WEAVE_TEST_HOOKS` block — an absent GUC is
+indistinguishable from one that is off. Its positive control is that it moved `extend`
+from 1,461 to 115; until a diagnostic has fired once, its silence is not evidence. It
+stays because an A/B that cannot reproduce its own baseline is not an A/B (hard rule 10).
+
+**Hard rule 12 applies to the fix, not to the measurement above:** page counts and
+allocator decision counts are deterministic and host-independent, which is why the
+matrix is local and free. A *change* to this path still needs the 1M-scale run
+(`bench/aws/run.sh ... vecmerge`), not local green.
