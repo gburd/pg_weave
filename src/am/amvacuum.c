@@ -417,6 +417,25 @@ weave_vacuum_compact(Relation index)
 	 * Converge a bloated index to its size floor in ONE call, stably (repeated
 	 * calls do not oscillate) and NEVER returning larger than we started.
 	 *
+	 * THAT CONTRACT HOLDS ONLY UNDER AccessExclusiveLock, AND THE HEADER CLAIMED IT
+	 * UNCONDITIONALLY UNTIL 2026-09-24 (doc/GAPS.md G47,
+	 * bench/RESULTS_G47_VACATE.md).  Measured, four arms x six cycles x two reps,
+	 * bit-identical:
+	 *
+	 *   weave_vacuum()  (AccessExclusiveLock)  1347 pages, one call, then nothing
+	 *                                          -- the floor, exactly as claimed
+	 *   VACUUM          (ShareUpdateExclusive) 2578 <-> 2693 forever, 1.91x floor
+	 *
+	 * The share-lock caller oscillates and never reaches the floor, and it cannot:
+	 * reaching the floor needs pages freed by THIS transaction to be reusable
+	 * within it, and under a share lock a concurrent scan may still be reading
+	 * them (weave_page_recyclable()'s gate, which exists for a field-reported
+	 * crash).  What was fixable was the WASTE -- the vacate phase's 1,346 extends
+	 * per cycle and a 1.568x file-size swing that reclaimed nothing -- and that is
+	 * fixed, below, by running phase 1 only under the lock that makes it work.  The
+	 * false half of the contract is left standing here as the statement it is, with
+	 * the measurement next to it, rather than quietly reworded.
+	 *
 	 * The hard case (verified): after ordinary merges the single live segment
 	 * sits at the HIGH end of the file with the freed dead pages as a LOW free
 	 * region, and that free region is SMALLER than the live segment (the file is
@@ -440,6 +459,13 @@ weave_vacuum_compact(Relation index)
 	 *     that whole low region (>= live size), so the copy fits entirely at the
 	 *     front; the phase-1 high copy is freed and becomes a contiguous free
 	 *     TAIL, which we truncate.  Result: front-packed at the floor.
+	 *
+	 * READ PHASE 2's "its free list now includes that whole low region" AS
+	 * AEL-ONLY.  That sentence is the whole premise, and under a share lock it is
+	 * false for every page phase 1 freed: the gather rejects them all
+	 * (weave_alloc_stats()'s lowfree_defer on a grow cycle equals phase 1's own
+	 * freed count, to the page).  Phase 1 is therefore skipped under a share lock;
+	 * see the comment on the condition below.
 	 *
 	 * One vacate+pass reaches the floor in the common single-segment case; the
 	 * loop re-checks and stops as soon as a pass stops shrinking, bounded by
@@ -521,12 +547,54 @@ weave_vacuum_compact(Relation index)
 		 * Phase 1: vacate -- push the live segment onto fresh high blocks so the
 		 * freed old pages form one contiguous low free region >= live size.
 		 *
-		 * SKIPPED when the low free region already exceeds the live size, which is
+		 * SKIPPED IN TWO CASES, AND THE SECOND ONE IS THE LOCK WE HOLD.
+		 *
+		 * (a) when the low free region already exceeds the live size, which is
 		 * exactly the end-of-build shape (~70% freed below ~30% live).  The vacate
 		 * is a full extra rewrite of the whole segment; skipping it halves the
 		 * compaction I/O of a fresh build.  Task L12 / gap G5.
+		 *
+		 * (b) WHEN WE DO NOT HOLD AccessExclusiveLock, because under a share lock
+		 * the phase cannot do what it exists to do.  Its premise is that phase 2's
+		 * low-bias free list "now includes that whole low region" -- but a page
+		 * freed by the current transaction is never recyclable within it
+		 * (weave_free_page stamps ReadNextTransactionId(); weave_page_recyclable
+		 * asks GlobalVisCheckRemovableXid() and bypasses that gate only under AEL,
+		 * where no concurrent scan can be reading the page).  So under
+		 * ShareUpdateExclusiveLock every page this phase frees is rejected by the
+		 * pack phase's own gather, and its extends are pure loss.
+		 *
+		 * MEASURED, four arms x six cycles x two reps, bit-identical
+		 * (bench/RESULTS_G47_VACATE.md, doc/GAPS.md G47).  20k x 96-d weft index,
+		 * plain VACUUM: with the vacate, 2578 <-> 4039 pages at 1461 extends per
+		 * grow cycle; without it, 2578 <-> 2693 at 115.  The vacate phase was
+		 * 1,346 of those 1,461 extends (92.1 %) and the whole visible file-size
+		 * swing, and the TROUGH IS THE SAME 2,578 EITHER WAY -- it reclaimed
+		 * nothing a user can see.
+		 *
+		 * AND THE ABLATION REFUTES DELETING IT, which is why this is a condition
+		 * rather than a removal: under AEL the phase is what reaches the floor.
+		 * weave_vacuum() with it converges to 1,347 pages -- the exact floor -- in
+		 * ONE call and then does nothing at all for five more cycles; with the
+		 * phase ablated the same caller stalls at 2,693 (2.00x the floor) and pays
+		 * 115 extends every cycle forever.  Load-bearing exactly where its freed
+		 * pages are recyclable in-transaction, dead weight exactly where they are
+		 * not.
+		 *
+		 * WHAT THIS DOES NOT FIX, so nobody looks for it here: plain VACUUM still
+		 * has no fixed point (2,578 <-> 2,693) and still sits at 1.91x the floor.
+		 * That half of G47 is not fixable without giving up the recycle gate, and
+		 * the gate is protecting against a field-reported crash.  This removes the
+		 * waste; the floor remains an AEL-only outcome, as it is today.
+		 *
+		 * pg_weave.vacuum_vacate=off ablates the phase outright, which is the A/B
+		 * arm the numbers above came from and the baseline any future change to
+		 * this reasoning has to reproduce (hard rule 10).  It is a diagnostic and
+		 * not a tuning knob; see the GUC's definition in src/am/customscan.c.
 		 */
-		if (!weave_low_free_fits_live(index))
+		if (pg_weave_vacuum_vacate &&
+			CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&
+			!weave_low_free_fits_live(index))
 		{
 			if (weave_compact_to_one(index, true))
 				didwork = true;

@@ -253,6 +253,7 @@ extern int pg_weave_wand_initial_k;
 extern int pg_weave_build_collapse_max_mb;
 extern int pg_weave_build_mem_ceiling_mb;
 extern double pg_weave_vacuum_tombstone_frac;
+extern bool pg_weave_vacuum_vacate;
 extern int pg_weave_surf_cache_mb;
 
 /* (C2) CHECKING INSIDE THE FUSED SCORER, reachable from SQL rather than only from a

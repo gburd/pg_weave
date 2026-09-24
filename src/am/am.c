@@ -668,6 +668,22 @@ int			pg_weave_build_collapse_max_mb = 4096;
  * Recorded as a guess rather than presented as a tuned default. */
 double		pg_weave_vacuum_tombstone_frac = 0.2;
 
+/* GUC: run weave_vacuum_compact()'s VACATE phase at all.  On is the shipped
+ * behaviour and the only value a user should have a reason to change.
+ *
+ * IT EXISTS AS AN ABLATION ARM FOR doc/GAPS.md G47, which is the claim that the
+ * vacate phase cannot do what its own header says it does.  Phase 1 rewrites the
+ * segment extend-only so that phase 2's low-bias free list "now includes that
+ * whole low region"; a page freed by the current transaction is never recyclable
+ * within it, so phase 2's list does NOT include it and phase 1's extends buy the
+ * pass nothing.  Removing a component is what discriminates; explaining it is
+ * not (AGENTS.md, twelfth member).
+ *
+ * Do not read this as a tuning knob.  If the ablation wins, the fix is a
+ * conditional in weave_vacuum_compact() that states the condition, not a GUC
+ * defaulted the other way. */
+bool		pg_weave_vacuum_vacate = true;
+
 /* GUC: per-participant flush-budget growth ceiling, in MB.  0 = keep the safe
  * default ceiling of 2 * maintenance_work_mem (unchanged behavior).  When set
  * larger, a build lets each participant's flush budget grow up to this, so a

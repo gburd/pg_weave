@@ -517,6 +517,33 @@ _PG_init(void)
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 
 	/*
+	 * THE VACATE PHASE, ABLATABLE, and it is a diagnostic rather than a tuning
+	 * knob -- see the variable's definition in src/am/am.c.
+	 *
+	 * doc/GAPS.md G47: with a vector weft, weave_vacuum_compact() has no fixed
+	 * point, and the measured mechanism is that its vacate phase frees the pages
+	 * its pack phase needs, in the same transaction, where they cannot be
+	 * recycled.  Off runs the pack phase alone.  The two arms are what decide
+	 * whether the vacate phase is load-bearing or is the defect, and neither the
+	 * source nor the header could settle it.
+	 *
+	 * OUTSIDE the WEAVE_TEST_HOOKS block below, deliberately and for the reason
+	 * the comment above gives: nothing defines that macro, so a GUC inside it does
+	 * not exist in any build anyone runs, and SET would quietly create a
+	 * placeholder that reads back as though the ablation were in force.
+	 */
+	DefineCustomBoolVariable("pg_weave.vacuum_vacate",
+							 "Run the VACATE phase of weave_vacuum()'s compaction pass.",
+							 "On by default, which is the shipped behaviour.  Off runs "
+							 "the PACK phase alone and is the ablation arm for "
+							 "doc/GAPS.md G47: the vacate phase frees pages the pack "
+							 "phase then cannot recycle, because they were freed by "
+							 "the same transaction.",
+							 &pg_weave_vacuum_vacate,
+							 true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/*
 	 * THE (C2) CHECK, AVAILABLE IN A RELEASE BUILD, and it is diagnostics rather
 	 * than a test hook.
 	 *

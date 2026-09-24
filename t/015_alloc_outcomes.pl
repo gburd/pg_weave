@@ -351,7 +351,7 @@ $node->safe_psql('postgres', q{
     DELETE FROM vdocs WHERE id % 10 = 0;
 });
 
-my @vsizes;
+my (@vsizes, @vstats);
 for my $cycle (1 .. 5)
 {
     # Same explicit xid burn as the arms above: without an advancing horizon nothing
@@ -364,37 +364,150 @@ for my $cycle (1 .. 5)
         END LOOP; END $$;
     });
     my $s = bracket(q{VACUUM vdocs;});
+    push @vstats, $s;
     push @vsizes, $node->safe_psql('postgres',
         q{SELECT pg_relation_size('vdocs_weave') / current_setting('block_size')::int});
     diag("  [vector weft] cycle $cycle: $vsizes[-1] pages, " . fmt($s));
 }
 diag('vector weft: ' . join(' -> ', @vsizes));
 
+# THE SIZE-BASED TODO WAS REPLACED BY A MECHANISM-BASED ONE, AND THE REASON IS THE
+# WHOLE POINT OF THE FIX THAT PRECEDED IT.
+#
+# Until 2026-09-24 this arm was `converges('vector weft present', \@vsizes)` under a
+# TODO, and at this fixture size the series was 438 -> 279 -> 424 -> 279 -> 424: a
+# 145-page swing, far outside converges()'s slack, so the TODO failed and pinned the
+# defect.  Option 4 (the vacate phase now runs only under AccessExclusiveLock) removed
+# 92 % of the churn, and the series became 297 -> 280 -> 283 -> 280 -> 283 -- a THREE
+# page swing, INSIDE the slack.  The arm therefore started reporting "CONVERGED, G47 may
+# be FIXED" about an index that still has no fixed point.
+#
+# A gate that can no longer fail is worse than no gate, and this one went blind by the
+# defect getting 48x smaller rather than by anyone touching it.  So the TODO now asserts
+# the MECHANISM, which is scale-free: a converged index does no allocation work.  Under
+# a share lock the pack phase still extends on alternate cycles forever (138 reuses and
+# 3 extends per cycle at this fixture size), so this fails today, for the right reason,
+# and it will keep failing until the share-lock caller genuinely reaches a fixed point --
+# at which point it flips to "unexpectedly succeeded" regardless of how small the
+# remaining swing is.
+#
+# THE UNFIXABLE HALF IS STATED HERE SO NOBODY HUNTS IT: reaching the floor under a share
+# lock requires recycling pages freed by the same transaction, and that hands a
+# concurrent scan a page it is still reading -- the field-reported crash
+# weave_page_recyclable()'s gate exists to prevent.  The floor is an AccessExclusiveLock
+# outcome (weave_vacuum(), REINDEX), which the arm below asserts.  This TODO may
+# therefore stay red permanently; if the decision is ever taken to accept that, it
+# becomes a documented limitation and this block becomes a plain assertion of the
+# oscillation's bounds.
 {
-    local $TODO = 'doc/GAPS.md G47: with a vector weft, weave_vacuum_compact() has no '
-        . 'fixed point -- the vacate phase frees the pages the pack phase needs';
-    converges('vector weft present', \@vsizes);
+    local $TODO = 'doc/GAPS.md G47, remaining half: under ShareUpdateExclusiveLock the '
+        . 'compaction pass never reaches a fixed point, so it keeps allocating forever';
+    # THE BURN IS LOAD-BEARING AND ITS ABSENCE MADE THIS ARM PASS BY DOING NOTHING.
+    # Without an advancing horizon the L19 probe (weave_any_free_page_recyclable) skips
+    # the pass outright, so "no allocation work" was true because no pass RAN -- the
+    # arm reported "TODO passed", i.e. G47 fixed, on the strength of a skipped vacuum.
+    # Same shape as a regression test that passes by not using the index.
+    $node->safe_psql('postgres', q{
+        DO $$ BEGIN FOR k IN 1..200 LOOP
+            INSERT INTO xidburn2 VALUES (k); DELETE FROM xidburn2;
+        END LOOP; END $$;
+    });
+    my $s = bracket(q{VACUUM vdocs;});
+    push @vsizes, $node->safe_psql('postgres',
+        q{SELECT pg_relation_size('vdocs_weave') / current_setting('block_size')::int});
+    is($s->{extend} + $s->{lowfree_reuse} + $s->{fsm_reuse}, 0,
+        'plain VACUUM on a settled weft index does no allocation work (G47)');
+    diag("  [vector weft] settled-state probe: $vsizes[-1] pages, " . fmt($s));
 }
 
 # A TODO failure is not itemised by prove's default output, so the verdict is stated
 # here explicitly -- otherwise "All tests successful" is the only thing the log says
 # about it, which is indistinguishable from the arm not having run (AGENTS.md: a test
-# result needs evidence the test RAN).  This line also tells whoever fixes G47 what to
-# do next, which a silent TODO does not.
+# result needs evidence the test RAN).  This line also tells whoever reads the log what
+# the CURRENT cost of G47 is, which a silent TODO does not.
 {
-    my $slack = int($vsizes[-2] * 0.01) + 4;
-    my $converged = abs($vsizes[-1] - $vsizes[-2]) <= $slack;
-    diag(sprintf('G47 status: last two cycles %d vs %d (slack %d) -- %s',
-        $vsizes[-2], $vsizes[-1], $slack,
-        $converged
-            ? 'CONVERGED. G47 may be FIXED: drop the TODO above and let this arm gate it'
-            : 'still oscillating, which is the expected state while G47 is open'));
+    my ($mn, $mx) = (sort { $a <=> $b } @vsizes)[0, -1];
+    diag(sprintf('G47 status: series %s ; peak/trough %.3fx -- %s',
+        join(' -> ', @vsizes), $mx / $mn,
+        'the WASTE half is fixed (option 4, bench/RESULTS_G47_VACATE.md: 92 % of the '
+      . 'extends and the whole 1.568x swing were the vacate phase running under a '
+      . 'share lock).  The NON-CONVERGENCE half is open and may be unfixable; the '
+      . 'floor is reachable only under AccessExclusiveLock, which the next arm gates.'));
 }
 
 # Not a TODO, because it holds today and is the half that keeps G47 a waste-of-work
 # defect rather than a bloat defect: the oscillation is BOUNDED.  If this ever fails,
 # G47 has become a ratchet and is a different, worse bug.
 no_ratchet('vector weft present', \@vsizes);
+
+# ---------------------------------------------------------------------------
+# OPTION 4: THE VACATE PHASE RUNS ONLY UNDER AccessExclusiveLock.
+#
+# doc/GAPS.md G47 / bench/RESULTS_G47_VACATE.md.  G47 is two defects and only one is
+# fixable; these two arms gate the fixable one and pin the unfixable one's shape.
+#
+# The vacate phase (phase 1 of weave_vacuum_compact) rewrites the segment extend-only
+# so that the pack phase's low-bias free list "includes that whole low region".  Under
+# a share lock that premise is FALSE for every page it frees -- a page freed by the
+# current transaction is never recyclable within it -- so its extends are pure loss.
+# Measured at 20k x 96-d, plain VACUUM: 1,346 of 1,461 extends per grow cycle (92.1 %)
+# and the whole 1.568x file swing, for the SAME trough of 2,578 pages either way.
+#
+# THE SIGNATURE IS lowfree_defer, and that is what this asserts rather than a page
+# count.  A page count is corpus-dependent and would have to be loosened until it
+# gated nothing; lowfree_defer is the mechanism itself -- the count of free-list
+# candidates the recycle gate rejected.  Pre-fix it was 1,231 and 1,346 on alternate
+# cycles; post-fix it is 0 on every cycle, because the pass no longer frees pages it
+# then has to ask for.  Scoped to this arm deliberately: the stalled-horizon arms above
+# legitimately defer pages freed by EARLIER transactions, so the same assertion there
+# would be wrong.  This arm burns xids every cycle.
+for my $i (0 .. $#vstats)
+{
+    is($vstats[$i]->{lowfree_defer} + $vstats[$i]->{fsm_defer}, 0,
+        "share-lock compaction cycle @{[$i + 1]} frees no page it then cannot reuse "
+      . "(G47 option 4: the vacate phase must not run under ShareUpdateExclusiveLock)");
+}
+
+# AND THE OTHER HALF: under AccessExclusiveLock the vacate phase is LOAD-BEARING, so
+# ablating it is not the fix.  Measured, same fixture at 20k: weave_vacuum() with the
+# phase converges to 1,347 pages -- the exact floor -- in ONE call and then does
+# nothing at all for five more cycles (0 extends, 0 reuses); with the phase ablated the
+# same caller stalls at 2,693, 2.00x the floor, and pays 115 extends every cycle
+# forever.  That contrast is why option 4 is a condition and not a deletion.
+#
+# THIS PROPERTY HAD NEVER BEEN TESTED.  The arms at the top of this file assert that
+# weave_vacuum() reclaims and that it reuses freed pages; nothing asserted that
+# repeated calls reach a FIXED POINT, which is the half of the function's header
+# contract that is actually true.  It is also the property a future G47 fix must not
+# break while chasing the share-lock half.
+my @asizes;
+for my $cycle (1 .. 3)
+{
+    my $s = bracket(q{SELECT weave_vacuum('vdocs_weave');});
+    push @asizes, $node->safe_psql('postgres',
+        q{SELECT pg_relation_size('vdocs_weave') / current_setting('block_size')::int});
+    diag("  [weave_vacuum, AEL] cycle $cycle: $asizes[-1] pages, " . fmt($s));
+}
+diag('weave_vacuum (AEL): ' . join(' -> ', @asizes));
+converges('weave_vacuum() under AccessExclusiveLock', \@asizes);
+
+# Not just a fixed point -- a fixed point BELOW where the share-lock caller sits.  If
+# these ever meet, either the AEL path stopped reaching the floor or the share-lock
+# path started, and both are things to find out about from a test rather than from a
+# user's disk usage.
+cmp_ok($asizes[-1], '<', $vsizes[-1],
+    'weave_vacuum() (AEL) reaches a smaller fixed point than plain VACUUM does');
+
+# And the second call must do NOTHING.  This is the assertion that separates "converged"
+# from "stable while working forever": with the vacate phase ablated under AEL the file
+# sat at a constant 2,693 pages while extending 115 every single cycle, which every
+# size-based assertion in this file would have called converged.
+{
+    my $s = bracket(q{SELECT weave_vacuum('vdocs_weave');});
+    is($s->{extend} + $s->{lowfree_reuse} + $s->{fsm_reuse}, 0,
+        'a converged index does no allocation work on the next weave_vacuum() '
+      . '(a stable size while still relocating is not convergence)');
+}
 
 # THE LOAD-BEARING ONE: the skip must not have turned into "never reclaim".
 cmp_ok($burn_sizes->[-1], '<', int($burn_start * 0.9),
