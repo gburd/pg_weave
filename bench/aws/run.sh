@@ -97,7 +97,7 @@ case "$JOB" in
 	# fvecs, ~4 GB of heap plus toast) and then builds a weave index over it AND
 	# merges it, so at peak it holds the index, its merge output, and the staging
 	# table at once.  Same 400 as the other GIST jobs for the same reason.
-	vecmerge) VOLGB=${VOLGB_OVERRIDE:-400} ;;
+	vecmerge|vecctl) VOLGB=${VOLGB_OVERRIDE:-400} ;;
 	# gatesweep loads the same BEIR corpora as fuse through the same loader, plus
 	# the sentence-transformer model cache.  Same 250 for the same reason.
 	gatesweep) VOLGB=${VOLGB_OVERRIDE:-250} ;;
@@ -1201,102 +1201,10 @@ run_vecmerge() {
 		     invariant can fire"
 	fi
 
-	# ---------------------------------------------------------------- control
-	#
-	# THE CLEAN ARM ABOVE PROVES NOTHING ON ITS OWN.  weave_check() reporting no
-	# violations is exactly what an invariant that cannot fire also reports, and this
-	# project has now shipped three gates that reported on something other than the
-	# thing under test (AGENTS.md, eleventh and twelfth members).  So: break the
-	# writer by one page, rebuild, rebuild the index, and require weave_check() to
-	# NAME the violation.
-	#
-	# `+ 2` rather than `+ 1` deliberately.  A one-page error can land on the
-	# block's own second strip page, whose header claims the same block, and the
-	# invariant would correctly pass; two pages clears a two-page block.  This is the
-	# same mutation the local control uses, so the two are comparable.
-	#
-	# A SMALLER CORPUS, and that is not a weakening: the mutation is in a per-block
-	# store, so every block in the index carries it and the first one found fails the
-	# check.  What the small arm cannot tell you is whether the invariant scales,
-	# which the clean arm above already answered.
-	say "control: mutating the code-page pointer by +2 pages"
-	$SSH 'set -e
-		cd pg_weave
-		sed -i "s/rec\.firstpage = (weave_uint32) BufferGetBlockNumber(codes\.buf);/rec.firstpage = (weave_uint32) BufferGetBlockNumber(codes.buf) + 2;/" \
-			src/vector/vecwrite.c
-		grep -q "BufferGetBlockNumber(codes.buf) + 2;" src/vector/vecwrite.c \
-			|| { echo "MUTATION DID NOT APPLY -- the sed pattern no longer matches"; exit 1; }
-		echo "mutation applied:"; grep -n "codes.buf) + 2" src/vector/vecwrite.c' \
-		2>&1 | tee "$OUT/mutant_setup.log" || die "could not apply the mutation"
-
-	# ASSERT THE MUTANT BUILT, AND NAME THE STEP THAT FAILED.  A mutation harness that
-	# treats "the check did not succeed" as "the mutation was caught" reports a compile
-	# error as a pass; that happened here for real on a V7 leg (AGENTS.md).
-	# `with_llvm=no` because PGXS's bitcode step on this image aborts and leaves a
-	# half-written bitcode directory that later kills backends in unrelated tests.
-	#
-	# THE RESTART IS A SEPARATE ASSERTION FROM THE BUILD, and conflating them is what
-	# cost run 2 its control.  `sudo -u postgres pg_ctlcluster 17 main restart` FAILS on
-	# this image -- "cluster is running from systemd, can only restart it as root" -- so
-	# `set -e` aborted the block and the job announced "the mutant did not build" about
-	# a mutant that had built and installed perfectly.  A gate that names the wrong step
-	# sends you to read the wrong log.  `run_smoke` never noticed because its own
-	# `pg_ctlcluster ... start` is followed by `|| true`.
-	$SSH 'set -e
-		cd pg_weave
-		make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config with_llvm=no 2>&1 | tail -20
-		test -f pg_weave.so || { echo "MUTANT DID NOT BUILD"; exit 1; }
-		sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config with_llvm=no >/dev/null
-		echo "mutant built and installed"' \
-		2>&1 | tee -a "$OUT/mutant_setup.log" \
-		|| die "the mutant did not BUILD or INSTALL (the restart is a separate step) --
-		        see $OUT/mutant_setup.log"
-
-	# systemd first, because that is what this image uses; pg_ctlcluster as the fallback
-	# for an image that does not.  The server is then verified by ASKING it, not by
-	# trusting a restart's exit status: a backend still serving the OLD .so would make
-	# the control silently measure the unmutated writer, which is the one outcome this
-	# whole block exists to rule out.
-	$SSH 'set -e
-		sudo systemctl restart postgresql@17-main 2>/dev/null \
-			|| sudo pg_ctlcluster 17 main restart
-		for i in $(seq 1 30); do
-			psql -X -tAc "SELECT 1" >/dev/null 2>&1 && break
-			sleep 1
-		done
-		psql -X -tAc "SELECT 1" >/dev/null || { echo "SERVER DID NOT COME BACK"; exit 1; }
-		echo "server up after installing the mutant"' \
-		2>&1 | tee -a "$OUT/mutant_setup.log" \
-		|| die "the mutant built but the server did not come back -- see $OUT/mutant_setup.log"
-
-	say "control: the mutated writer must be caught by weave_check()"
-	# THE SQL GOES OVER AS A FILE.  Quoting a string literal through a single-quoted
-	# ssh argument, a remote shell and psql has already cost this harness two
-	# debugging rounds (see the tuning step and run_p0merge's backtick note), and the
-	# failure mode here is the worst kind: `"mut doc"` is a valid IDENTIFIER, so a
-	# mis-quoted literal is a column-does-not-exist error at best and a silently
-	# different test at worst.
-	$SSH 'cat > /tmp/mut.sql' <<'MUTSQL'
-DROP TABLE IF EXISTS vmut;
-CREATE TABLE vmut (id int, d wdoc, v wvec(960));
-INSERT INTO vmut SELECT id, to_wdoc('mut doc ' || id), v FROM vmsrc WHERE id <= 200000;
-CREATE INDEX vmut_weave ON vmut USING weave (d, v) WITH (metric = 'ip');
-\echo === weave_check on the mutant ===
-SELECT invariant, ok, detail FROM weave_check('vmut_weave', true) WHERE NOT ok;
-MUTSQL
-	$SSH 'psql -X -q -v ON_ERROR_STOP=1 -f /tmp/mut.sql' \
-		2>&1 | tee "$OUT/mutant_check.log" || true
-
-	# The control passes only if the check FAILED, and only if it failed for the
-	# right reason.  `grep firstpage` rather than `grep -c '^f'`: an unrelated
-	# violation would satisfy "not clean" while proving nothing about this field.
-	if grep -q 'firstpage' "$OUT/mutant_check.log"; then
-		say "control PASSED: weave_check() named the firstpage violation"
-	else
-		cat "$OUT/mutant_check.log" >&2
-		die "control FAILED: the mutated writer was NOT caught -- every clean result
-		     in this run is therefore uninformative about firstpage"
-	fi
+	# The control is a separate function so it can be run ALONE (job `vecctl`).
+	# Validating a control should not cost the five hours the clean arm takes, and
+	# after three runs in which the control never actually fired, that mattered.
+	run_vecmerge_control
 
 	# Now the clean arm's status, after the control has had its say.  Both results are
 	# reported so a reader can tell the two apart: "the invariant works and something
@@ -1366,6 +1274,151 @@ run_gatesweep() {
 	done
 }
 
+# The mutation control, callable on its own.  It needs `vmsrc` in the default
+# database, which bench/vecmerge.sh loads -- so the `vecctl` job loads the corpus
+# and stops, rather than running the whole clean arm.
+# Load the corpus and stop: what the control needs from the clean arm is `vmsrc`, and
+# nothing else.  VECMERGE_LOAD_ONLY short-circuits bench/vecmerge.sh after its
+# integrity checks.
+run_vecmerge_loadonly() {
+	fetch_gist
+	say "vecctl: loading the corpus only"
+	$SSH "cd pg_weave && OUT=\$HOME/out NROWS=${NROWS:-1000000} \
+			VECMERGE_LOAD_ONLY=1 bash bench/vecmerge.sh" \
+		2>&1 | tee "$OUT/vecctl-load.log"
+	rc=${PIPESTATUS[0]}
+	[ "$rc" = 0 ] || die "corpus load failed (see $OUT/vecctl-load.log)"
+}
+
+run_vecmerge_control() {
+	# ---------------------------------------------------------------- control
+	#
+	# THE CLEAN ARM ABOVE PROVES NOTHING ON ITS OWN.  weave_check() reporting no
+	# violations is exactly what an invariant that cannot fire also reports, and this
+	# project has now shipped three gates that reported on something other than the
+	# thing under test (AGENTS.md, eleventh and twelfth members).  So: break the
+	# writer by one page, rebuild, rebuild the index, and require weave_check() to
+	# NAME the violation.
+	#
+	# `+ 2` rather than `+ 1` deliberately.  A one-page error can land on the
+	# block's own second strip page, whose header claims the same block, and the
+	# invariant would correctly pass; two pages clears a two-page block.  This is the
+	# same mutation the local control uses, so the two are comparable.
+	#
+	# A SMALLER CORPUS, and that is not a weakening: the mutation is in a per-block
+	# store, so every block in the index carries it and the first one found fails the
+	# check.  What the small arm cannot tell you is whether the invariant scales,
+	# which the clean arm above already answered.
+	say "control: mutating the code-page pointer by +2 pages"
+	$SSH 'set -e
+		cd pg_weave
+		sed -i "s/rec\.firstpage = (weave_uint32) BufferGetBlockNumber(codes\.buf);/rec.firstpage = (weave_uint32) BufferGetBlockNumber(codes.buf) + 2;/" \
+			src/vector/vecwrite.c
+		grep -q "BufferGetBlockNumber(codes.buf) + 2;" src/vector/vecwrite.c \
+			|| { echo "MUTATION DID NOT APPLY -- the sed pattern no longer matches"; exit 1; }
+		echo "mutation applied:"; grep -n "codes.buf) + 2" src/vector/vecwrite.c' \
+		2>&1 | tee "$OUT/mutant_setup.log" || die "could not apply the mutation"
+
+	# ASSERT THE MUTANT BUILT, AND NAME THE STEP THAT FAILED.  A mutation harness that
+	# treats "the check did not succeed" as "the mutation was caught" reports a compile
+	# error as a pass; that happened here for real on a V7 leg (AGENTS.md).
+	# `with_llvm=no` because PGXS's bitcode step on this image aborts and leaves a
+	# half-written bitcode directory that later kills backends in unrelated tests.
+	#
+	# THE RESTART IS A SEPARATE ASSERTION FROM THE BUILD, and conflating them is what
+	# cost run 2 its control.  `sudo -u postgres pg_ctlcluster 17 main restart` FAILS on
+	# this image -- "cluster is running from systemd, can only restart it as root" -- so
+	# `set -e` aborted the block and the job announced "the mutant did not build" about
+	# a mutant that had built and installed perfectly.  A gate that names the wrong step
+	# sends you to read the wrong log.  `run_smoke` never noticed because its own
+	# `pg_ctlcluster ... start` is followed by `|| true`.
+	$SSH 'set -e
+		cd pg_weave
+		make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config with_llvm=no 2>&1 | tail -20
+		test -f pg_weave.so || { echo "MUTANT DID NOT BUILD"; exit 1; }
+		sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config with_llvm=no >/dev/null
+		echo "mutant built and installed"' \
+		2>&1 | tee -a "$OUT/mutant_setup.log" \
+		|| die "the mutant did not BUILD or INSTALL (the restart is a separate step) --
+		        see $OUT/mutant_setup.log"
+
+	# systemd first, because that is what this image uses; pg_ctlcluster as the fallback
+	# for an image that does not.  The server is then verified by ASKING it, not by
+	# trusting a restart's exit status: a backend still serving the OLD .so would make
+	# the control silently measure the unmutated writer, which is the one outcome this
+	# whole block exists to rule out.
+	$SSH 'set -e
+		sudo systemctl restart postgresql@17-main 2>/dev/null \
+			|| sudo pg_ctlcluster 17 main restart
+		for i in $(seq 1 30); do
+			psql -X -tAc "SELECT 1" >/dev/null 2>&1 && break
+			sleep 1
+		done
+		psql -X -tAc "SELECT 1" >/dev/null || { echo "SERVER DID NOT COME BACK"; exit 1; }
+		echo "server up after installing the mutant"' \
+		2>&1 | tee -a "$OUT/mutant_setup.log" \
+		|| die "the mutant built but the server did not come back -- see $OUT/mutant_setup.log"
+
+	say "control: the mutated writer must be caught by weave_check() AND by a scan"
+	# THE SQL GOES OVER AS A FILE.  Quoting a string literal through a single-quoted
+	# ssh argument, a remote shell and psql has already cost this harness two
+	# debugging rounds (see the tuning step and run_p0merge's backtick note), and the
+	# failure mode here is the worst kind: `"mut doc"` is a valid IDENTIFIER, so a
+	# mis-quoted literal is a column-does-not-exist error at best and a silently
+	# different test at worst.
+	#
+	# TWO LEGS, AND THE SECOND ONE IS WHY THIS BLOCK WAS REWRITTEN.  Run 3 checked only
+	# weave_check(), which reported the mutant index CLEAN -- and the conclusion
+	# available from that alone was the wrong one ("the invariant is blind").  What was
+	# actually true is that the invariant had a DETECTION GAP while the scan refused
+	# correctly: a block spans three strip pages at 960 dimensions, all three carry the
+	# same blockno, so `firstpage + 2` named the same block's third strip.  Asking both
+	# questions separates "the invariant cannot see this" from "nothing can see this",
+	# which are different defects with different fixes, and the run that asked only one
+	# could not tell them apart.
+	$SSH 'cat > /tmp/mut.sql' <<'MUTSQL'
+DROP TABLE IF EXISTS vmut;
+CREATE TABLE vmut (id int, d wdoc, v wvec(960));
+INSERT INTO vmut SELECT id, to_wdoc('mut doc ' || id), v FROM vmsrc WHERE id <= 200000;
+CREATE INDEX vmut_weave ON vmut USING weave (d, v) WITH (metric = 'ip');
+\echo === LEG 1: weave_check on the mutant ===
+SELECT invariant, ok, detail FROM weave_check('vmut_weave', true) WHERE NOT ok;
+\echo === LEG 2: a scan of the mutant ===
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) FROM (SELECT id FROM vmut
+   ORDER BY v <#> (SELECT v FROM vmsrc WHERE id = 1) LIMIT 10) t;
+MUTSQL
+	# ON_ERROR_STOP is deliberately NOT set: leg 2 is EXPECTED to error, and stopping
+	# there would discard it as a failure of the harness rather than record it as the
+	# control firing.
+	$SSH 'psql -X -f /tmp/mut.sql' 2>&1 | tee "$OUT/mutant_check.log" || true
+
+	# Both legs are reported, and the run fails only if NEITHER fires -- because that,
+	# and only that, means a wrong code-page pointer is undetectable.
+	mchk=no; mscan=no
+	grep -q 'firstpage' "$OUT/mutant_check.log" && mchk=yes
+	grep -qiE 'ERROR:.*(code page|block-major|code chain|firstpage)' \
+		"$OUT/mutant_check.log" && mscan=yes
+	say "control: weave_check caught it: $mchk   |   the scan refused: $mscan"
+	if [ "$mchk" = no ] && [ "$mscan" = no ]; then
+		cat "$OUT/mutant_check.log" >&2
+		die "control FAILED on BOTH legs: a mutated code-page pointer is invisible to
+		     weave_check AND answered without error by a scan.  Every clean result in
+		     this run is uninformative about firstpage."
+	fi
+	if [ "$mchk" = no ]; then
+		cat "$OUT/mutant_check.log" >&2
+		die "control: the scan refused but weave_check did NOT -- weave_check reports an
+		     index healthy whose queries error, which is a defect in the checker, not a
+		     pass.  See src/am/amcheck.c's firstpage invariant."
+	fi
+	if [ "$mscan" = no ]; then
+		say "NOTE: weave_check caught the mutant but the scan did not refuse it.  That
+		     is the safe direction, and worth recording rather than failing on."
+	fi
+}
+
 run_bound() {
 	# The measurement from bench/RESULTS_BOUND_PRUNING.md, on real hardware and
 	# over more dimensions than a laptop run covers.  This is the number the
@@ -1403,6 +1456,12 @@ case "$JOB" in
 	# run_smoke first for the same reason: it is where `sudo make install` happens,
 	# and vecmerge's whole output is weave_check(), which needs the extension.
 	vecmerge)   run_smoke; run_vecmerge ;;
+	# The control ALONE, against a corpus loaded and nothing else.  Three full runs
+	# went by in which the control never fired -- twice for harness reasons, once
+	# because the mutation was undetectable at that geometry -- and each discovery
+	# cost a five-hour clean arm.  A control you cannot iterate on is a control you
+	# do not really have.
+	vecctl)     run_smoke; run_vecmerge_loadonly; run_vecmerge_control ;;
 	# gatesweep needs the extension installed (run_smoke) and, unlike the work pass
 	# that runs on the workstation for free, a quiet machine -- it is the only
 	# latency measurement claim 3 has.
