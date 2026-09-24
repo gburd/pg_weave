@@ -552,6 +552,20 @@ Four things, and it should claim exactly four things:
      A/A noise floor by at least 21× (EC2 `c7i.8xlarge`; scifact 0.141×, nfcorpus
      0.175×, fiqa 0.072× against their unfiltered selves).
 
+   - **The mechanism, not just the monotonicity.** Against a control that is *our own
+     index* answering the same query by the over-fetch-and-recheck route (same
+     `Index Cond:`, same corpus, so no engine or plan-shape confound), the fused scan is
+     **97–158× fewer buffers at 0.1 % selectivity** and discards **zero** candidates
+     where the control discards up to 227,054 to return 100 rows. `Rows Removed by
+     Index Recheck` is 0 at every point on every corpus. That is the mask doing what
+     this claim says it does.
+
+   **AND THE LOSS, which belongs in the claim: with no predicate the fused path is
+   0.7–0.8×, i.e. ~30 % MORE expensive**, because it scans the lexical channel with no
+   gate to pay for it. The crossover is between 10 % and 1 % selectivity on all three
+   corpora. So the claim is not "fused is faster"; it is **"fused converts predicate
+   selectivity into speed, and costs about 30 % when there is none to convert"**.
+
    **Quote 5.7–13.8×, never 1,000×.** The pivot count falls as selectivity exactly,
    and reading that column alone over-promises by two orders of magnitude. What the
    clock tracks is the **blocks-scored** curve — latency is within 1.2–1.4× of it at
