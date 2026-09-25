@@ -3341,10 +3341,32 @@ indistinguishable from one that is off. Its positive control is that it moved `e
 from 1,461 to 115; until a diagnostic has fired once, its silence is not evidence. It
 stays because an A/B that cannot reproduce its own baseline is not an A/B (hard rule 10).
 
-**Hard rule 12 applies to the fix, not to the measurement above:** page counts and
-allocator decision counts are deterministic and host-independent, which is why the
-matrix is local and free. A *change* to this path still needs the 1M-scale run
-(`bench/aws/run.sh ... vecmerge`), not local green.
+**Hard rule 12's run is DONE — 2026-09-24, run `pgweave-20260924-200357`, 1M × 960-d**
+(`bench/RESULTS_VECMERGE_SCALE.md` run 4). Option 4 holds at 50× the scale, and two
+results are stronger than a reproduction:
+
+- **peak/trough 1.53× → 1.03×**; the grow cycle went from **+98,690 pages (~771 MB)** to
+  **+4,049 (~32 MB)**; the previously-expensive vacuum cycles went from 1,097–1,219 s to
+  **566 s (1.94×)** and their alternation — the symptom that first identified the
+  relocation pass — is gone (0.6 % spread). `lowfree_defer = 0` on every cycle.
+- **The DEMAND/BUDGET law predicted each grow cycle to the page**: cycle 2 reported a
+  shortfall of 4,049 and cycle 3 extended exactly 4,049 (same for 4 → 5). That is the law
+  this entry used to refute option 3, now holding at a second scale (hard rule 11).
+- **Cycles 1 and 2 are bit-identical to the two pre-fix runs** (190,091 and 185,234), so
+  the delta is attributable: the cycles where the fix does nothing are unchanged.
+- **The floor leg quantifies what the share-lock caller gives up**: `weave_vacuum()` took
+  the settled index from 185,234 to **94,642 pages — exactly the floor** (94,641 live +
+  metapage) — in ONE call, and a second call moved it not at all with **zero
+  allocations**. The two callers differ by **1.96×, about 708 MB**.
+
+`weave_check(deep)` clean with the weft invariant present at every stage including the new
+`ael` one, recall@10 0.8500 → 0.8500 (differential), live-lane digest constant, 0 deferred
+failures, and **the mutation control fired on that host** — so the clean results are
+informative rather than silent.
+
+**The non-convergence half remains OPEN and is probably unfixable.** 1.03× is smaller than
+1.53×; it is not a fixed point. `t/015`'s G47 TODO arm stays red by design, and it is now
+mechanism-based so it cannot go quiet the way the size-based version did.
 
 
 ### G48 — a lexical seek skips the DECODE but reads every PAGE it passes over, so the channel that dominates a gated query has no way to skip I/O — **OPEN 2026-09-24, ceiling UNMEASURED**
