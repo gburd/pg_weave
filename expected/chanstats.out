@@ -16,7 +16,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.20.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.21.0" of extension "pg_weave" is already installed
 SET enable_seqscan = off;
 SET max_parallel_workers_per_gather = 0;
 CREATE TABLE cs (id serial, body text, d wdoc, v wvec(4));
@@ -527,3 +527,125 @@ RESET pg_weave.surf_cache_mb;
 DROP TABLE cs;
 DROP TABLE csb;
 DROP TABLE csg;
+-- ---- G48: the lexical channel's page traffic, split by what the page was for ----
+--
+-- doc/GAPS.md G48.  wand_skip_blocks() advances past whole 128-blocks reading only
+-- block HEADERS -- cheap in CPU, which is what its header claims and what makes a seek
+-- over a high-df term fast -- but it VISITS every page it passes over, because the
+-- per-block first_docid and block_max it consults live on those pages.  The vector
+-- channel has had this split since 0.19.0 (vec_blocks vs vec_blocks_bound_skipped); the
+-- lexical channel had nothing, so its share of a gated query's buffers was an inference
+-- from an EXPLAIN total.
+--
+-- THIS SECTION IS THE COUNTERS' POSITIVE CONTROL, and it is the reason the fixture below
+-- is 4,000 rows rather than reusing `cs`.  A counter that has never been observed to move
+-- is indistinguishable from one wired to the wrong branch, and skipping only happens when
+-- a seek jumps a cursor forward past a WHOLE block -- so it needs a term whose posting
+-- list spans many 128-blocks (here: every row) alongside a rare one to seek toward.  With
+-- `cs`'s 500 rows the busiest term spans two blocks on a single page and the control
+-- would be asserting on a single visit.
+CREATE TABLE csp (id serial, d wdoc);
+INSERT INTO csp(d)
+  SELECT to_wdoc('simple', 'common filler text doc' || g
+                 || CASE WHEN g % 1000 = 0 THEN ' needle' ELSE '' END)
+    FROM generate_series(1, 4000) g;
+CREATE INDEX csp_idx ON csp USING weave (d);
+ANALYZE csp;
+-- THE QUERY SHAPE IS LOAD-BEARING, AND THE FIRST ONE TRIED HERE MEASURED NOTHING.
+-- `SELECT count(*) ... WHERE d @@@ 'common & needle'` returns the right answer (4) with
+-- BOTH counters at ZERO: that path never opens a WandCursor at all, so it cannot touch
+-- either primitive.  Had the control been written as "the counters are non-negative" it
+-- would have passed, and the counters would have shipped wired to a branch nothing in the
+-- suite reaches -- which is the trap AGENTS.md records twice ("writing SQL that reaches a
+-- specific C function is not the same as writing SQL that returns the right answer").
+--
+-- The RANKED path is the one that traverses postings through the cursor: it opens one
+-- WandCursor per term and drives them with wand_seek(), which is where a pivot moves a
+-- lagging cursor forward past whole blocks.  weave_search() enters that machinery
+-- directly, which is also why it is the only thing that exercises the scan-side recheck.
+SELECT weave_work_stats_reset();
+ weave_work_stats_reset 
+------------------------
+ 
+(1 row)
+
+SELECT count(*) FROM weave_search('csp_idx', 'common & needle'::wquery, 10);
+ count 
+-------
+     4
+(1 row)
+
+SELECT lex_pages_load > 0 AS decoding_visits_pages
+  FROM weave_work_stats();
+ decoding_visits_pages 
+-----------------------
+ t
+(1 row)
+
+-- lex_pages_skip IS ZERO HERE AND THAT IS RECORDED RATHER THAN ASSERTED AWAY.
+--
+-- wand_skip_blocks() -- the primitive lex_pages_skip counts -- is reached only from
+-- wand_seek(), and only when the seek target lies beyond the cursor's whole current
+-- 128-block.  Seven query shapes were tried against this fixture looking for one that
+-- reaches it (conjunctions of a common term with a rare one, two rare terms at opposite
+-- ends of the docid space, ranked disjunctions at k = 1, 2, 3 and 10, and an ORDER BY with
+-- a WHERE): every one of them streamed the posting lists through wand_load_block and
+-- NONE of them called wand_skip_blocks at all.  At 4,000 dense rows the busiest term's
+-- 128th posting is at docid 128, so the traversals this corpus can produce never leave a
+-- block behind unread.
+--
+-- SO THIS COUNTER HAS NO POSITIVE CONTROL YET, AND UNTIL IT HAS ONE ITS ZERO MEANS
+-- NOTHING (AGENTS.md, twelfth member).  The evidence that the path is reachable at all is
+-- doc/GAPS.md G43, a real BEIR corpus where a term with df = 211 was sought to docid
+-- 184,499 -- three orders of magnitude past its own block.  bench/gatesweep.sh records
+-- both counters on those corpora, and G48 is where the measurement lands.  A zero below
+-- is therefore a statement about this fixture, not about the channel.
+SELECT lex_pages_skip AS skip_not_reachable_at_this_scale FROM weave_work_stats();
+ skip_not_reachable_at_this_scale 
+----------------------------------
+                                0
+(1 row)
+
+-- And the ordinary bitmap path, recorded as a ZERO on purpose: a reader who sees zeros
+-- after a plain `@@@` query needs to know that is the path not using the cursor rather
+-- than the counters being broken.  If this ever becomes non-zero the bitmap path has
+-- started traversing postings through the cursor, which would be a real change in what
+-- these numbers mean.
+SELECT weave_work_stats_reset();
+ weave_work_stats_reset 
+------------------------
+ 
+(1 row)
+
+SELECT count(*) FROM csp WHERE d @@@ 'common & needle'::wquery;
+ count 
+-------
+     4
+(1 row)
+
+SELECT lex_pages_skip AS bitmap_path_skip, lex_pages_load AS bitmap_path_load
+  FROM weave_work_stats();
+ bitmap_path_skip | bitmap_path_load 
+------------------+------------------
+                0 |                0
+(1 row)
+
+-- The ratio is corpus-dependent and is NOT asserted here -- it is what
+-- bench/gatesweep.sh measures on a real corpus, and pinning it in an expected file would
+-- turn a measurement into a constant.  What is asserted is that both branches are
+-- reachable and that the reset works, because everything downstream of these counters
+-- depends on those two facts and on nothing else about their values.
+SELECT weave_work_stats_reset();
+ weave_work_stats_reset 
+------------------------
+ 
+(1 row)
+
+SELECT lex_pages_skip AS skip_after_reset, lex_pages_load AS load_after_reset
+  FROM weave_work_stats();
+ skip_after_reset | load_after_reset 
+------------------+------------------
+                0 |                0
+(1 row)
+
+DROP TABLE csp;

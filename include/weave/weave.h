@@ -524,6 +524,46 @@ extern uint64 weave_fuse_gate_scores;	/* of `scores`, the required gates' share 
 extern uint64 weave_lex_contribs;	/* (term, doc) BM25 contributions computed by the
 									 * SINGLE-CHANNEL WAND path; see above for why
 									 * the fused path is excluded here */
+
+/*
+ * THE LEXICAL CHANNEL'S PAGE TRAFFIC, SPLIT BY WHAT THE PAGE WAS FOR (doc/GAPS.md G48).
+ *
+ * The vector channel has had `vec_blocks` and `vec_blocks_bound_skipped` since 0.19.0, so
+ * its pruning is a measured ratio.  The lexical channel had no equivalent, which is why
+ * "390 of 813 buffers at the tight gate, 8 posting lists read in full"
+ * (bench/RESULTS_GATE_SWEEP.md) is an inference from an EXPLAIN total rather than a
+ * channel measurement -- and why the next lever after the vector side was capped at ~15 %
+ * could not be sized.
+ *
+ * wand_skip_blocks() advances past whole 128-blocks reading only block HEADERS, no FOR
+ * decode, which is what makes a seek over a high-df term cheap in CPU.  It nonetheless
+ * ReadBuffer()s every page it passes over, because the per-block first_docid and
+ * block_max it consults live ON those pages.  So the question G48 asks is a ratio:
+ *
+ *     pages_skip / (pages_skip + pages_load)
+ *
+ * the fraction of the channel's page traffic spent proving blocks irrelevant.  That is
+ * the CEILING on what an out-of-chain skip structure could remove, and nothing should be
+ * built until it is known -- the warp map and the G44 normalizer pre-scan were both
+ * asserted as levers from a plausible mechanism and measured at 6.7 % and within noise.
+ *
+ * THE UNIT IS A PAGE VISIT, NOT AN I/O, and the difference matters when quoting these.
+ * A ReadBuffer() that hits shared_buffers costs a pin, a share lock and a spinlock, not a
+ * read -- so these counters bound what a skip structure could remove from the BUFFER
+ * ACCESS path, and EXPLAIN (ANALYZE, BUFFERS) is what says how many of those were
+ * genuinely read from disk.  Posting lists also share pages, so the same page can be
+ * visited once per term of a query; that is real work (each visit re-pins and re-locks)
+ * but it is not real I/O, and a claim that mixes the two overstates the lever.
+ *
+ * PATH-INDEPENDENT, unlike weave_lex_contribs: the increments sit in the two cursor
+ * primitives (wand_skip_blocks, wand_load_block), which every lexical path goes through
+ * -- fused, single-channel WAND, and a plain @@@ scan alike.  That is deliberate and it
+ * is the opposite choice from lex_contribs, for the opposite reason: contribs feed a
+ * RATIO whose two arms must not double-count, and these feed a per-query COST whose
+ * whole point is to be the same quantity however the query was planned.
+ */
+extern uint64 weave_lexwork_pages_skip; /* pages visited to SKIP blocks (headers only) */
+extern uint64 weave_lexwork_pages_load; /* pages visited to DECODE a block */
 extern uint64 weave_vecwork_lanes;	/* lanes the code-scan kernel scored, every path */
 extern uint64 weave_vecwork_blocks; /* blocks it scored, every path */
 extern uint64 weave_vecwork_blk_bound;	/* blocks the (C2) block bound pruned, every

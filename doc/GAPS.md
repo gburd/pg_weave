@@ -3423,3 +3423,58 @@ the several terms of a query (posting lists share pages), in which case shared_b
 absorbs most of the cost and the EXPLAIN BUFFERS figure already reflects that. The
 measurement must therefore be buffer *reads* as the executor counts them, not page visits
 as a counter counts them, or it will overstate the lever.
+
+---
+
+## MEASURED 2026-09-25 — the instrument exists, and the answer is 19–50 % of page VISITS
+
+`weave_work_stats()` gained `lex_pages_skip` and `lex_pages_load` (extension 0.21.0), the
+lexical counterpart of `vec_blocks` / `vec_blocks_bound_skipped`. `bench/gatesweep.sh`
+records both per point. Three BEIR corpora, 40 queries per point, **A/A repeat on fiqa
+bit-identical**:
+
+| corpus (docs) | sel 1.0 | 0.1 | 0.01 | 0.001 |
+|---|---|---|---|---|
+| fiqa (57,600) | **49.5 %** | 49.5 % | 49.4 % | 42.3 % |
+| scifact | 45.5 % | 45.5 % | 44.5 % | 32.8 % |
+| nfcorpus | 34.9 % | 34.7 % | 34.7 % | 19.4 % |
+
+(share = `lex_pages_skip / (lex_pages_skip + lex_pages_load)`; fiqa at 0.1 % is
+17,159 skip against 17,478 load over 40 queries.)
+
+**So the lever is real and it is not a footnote** — between a fifth and a half of the
+lexical channel's page traffic is spent proving blocks irrelevant. Two structures in the
+numbers matter more than the headline:
+
+- **It scales with corpus size** (nfcorpus 35 % → scifact 45 % → fiqa 49.5 %), which is
+  what the mechanism predicts: skipping needs terms whose posting lists span enough
+  128-blocks to leave whole ones behind. At Wikipedia scale it would be higher, so the
+  small-corpus numbers are a floor rather than an estimate.
+- **It FALLS as the gate tightens** (49.5 → 42.3 on fiqa, 34.9 → 19.4 on nfcorpus), and
+  the absolute traffic falls 2.8×. A tighter predicate does less lexical work *and* a
+  smaller fraction of what remains is skip-only, so this lever is worth least exactly at
+  the operating point claim 3 is about. It is a bigger win for the unfiltered query — the
+  case that currently *loses* 0.7–0.8× (`bench/RESULTS_GATE_SWEEP.md`).
+
+**WHAT IS STILL NOT MEASURED, and it is the half that decides the size of the prize.**
+These are page **visits**, not I/Os. fiqa at the gated point is (17,159 + 17,478)/40 ≈
+**866 visits per query**, while the lexical channel's share of that query's buffers is
+**390** — so most visits are repeat visits to pages already in shared_buffers, exactly the
+overstatement this entry warned about before the instrument existed. A visit costs a pin, a
+share lock and a spinlock; removing it is real work saved, but it is **not** 49.5 % of the
+I/O. Sizing the I/O half needs `EXPLAIN (ANALYZE, BUFFERS)` split by channel, or a
+`shared_blks_read`-level counter, and until that exists the honest claim is: **up to half
+of the lexical channel's buffer-access traffic is removable in principle; how much of it is
+disk is unknown.**
+
+**One negative result worth keeping.** The skip path is **unreachable from the regression
+fixture**: at 4,000 dense rows, seven query shapes (conjunctions of common with rare, two
+rare terms at opposite ends of the docid space, ranked disjunctions at k = 1, 2, 3, 10, and
+an `ORDER BY` with a `WHERE`) all streamed the posting lists through `wand_load_block` and
+**none** called `wand_skip_blocks` at all. `sql/chanstats.sql` therefore asserts
+`lex_pages_load > 0` and records `lex_pages_skip = 0` with the reason, rather than
+asserting a control it cannot satisfy. The first shape tried there was worse than useless
+and is documented in place: `count(*) ... WHERE d @@@ 'common & needle'` returns the right
+answer with **both** counters at zero, because that path never opens a cursor — had the
+control been written as "the counters are non-negative" the instrument would have shipped
+wired to a branch nothing in the suite reaches.
