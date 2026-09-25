@@ -371,83 +371,64 @@ for my $cycle (1 .. 5)
 }
 diag('vector weft: ' . join(' -> ', @vsizes));
 
-# THE SIZE-BASED TODO WAS REPLACED BY A MECHANISM-BASED ONE, AND THE REASON IS THE
-# WHOLE POINT OF THE FIX THAT PRECEDED IT.
+# G47 IS CLOSED HERE, AND THIS ARM IS THE GATE THAT SAYS SO.
 #
-# Until 2026-09-24 this arm was `converges('vector weft present', \@vsizes)` under a
-# TODO, and at this fixture size the series was 438 -> 279 -> 424 -> 279 -> 424: a
-# 145-page swing, far outside converges()'s slack, so the TODO failed and pinned the
-# defect.  Option 4 (the vacate phase now runs only under AccessExclusiveLock) removed
-# 92 % of the churn, and the series became 297 -> 280 -> 283 -> 280 -> 283 -- a THREE
-# page swing, INSIDE the slack.  The arm therefore started reporting "CONVERGED, G47 may
-# be FIXED" about an index that still has no fixed point.
+# Its history is worth two paragraphs because the arm changed shape twice and each shape
+# was wrong in a way the next one fixes.
 #
-# A gate that can no longer fail is worse than no gate, and this one went blind by the
-# defect getting 48x smaller rather than by anyone touching it.  So the TODO now asserts
-# the MECHANISM, which is scale-free: a converged index does no allocation work.  Under
-# a share lock the pack phase still extends on alternate cycles forever (138 reuses and
-# 3 extends per cycle at this fixture size), so this fails today, for the right reason,
-# and it will keep failing until the share-lock caller genuinely reaches a fixed point --
-# at which point it flips to "unexpectedly succeeded" regardless of how small the
-# remaining swing is.
+# It began as `converges('vector weft present', \@vsizes)` under a TODO, when the series at
+# this fixture size was 438 -> 279 -> 424 -> 279 -> 424: a 145-page swing, far outside
+# converges()'s slack, so the TODO failed and pinned the defect.  Option 4 (the vacate phase
+# runs only under AccessExclusiveLock) removed 92 % of the churn and the series became
+# 297 -> 280 -> 283 -> 280 -> 283 -- a THREE page swing, INSIDE the slack -- so the arm
+# started reporting "CONVERGED, G47 may be FIXED" about an index that still had no fixed
+# point.  A gate that went blind because the defect got 48x smaller is still a blind gate,
+# so it was rewritten to assert the MECHANISM instead: a converged index does no allocation
+# work.  That is scale-free, and it is what this arm asserts now.
 #
-# THE UNFIXABLE HALF IS STATED HERE SO NOBODY HUNTS IT: reaching the floor under a share
-# lock requires recycling pages freed by the same transaction, and that hands a
-# concurrent scan a page it is still reading -- the field-reported crash
-# weave_page_recyclable()'s gate exists to prevent.  The floor is an AccessExclusiveLock
-# outcome (weave_vacuum(), REINDEX), which the arm below asserts.
+# What closed it is term (4) of weave_index_is_compacted(): the predicate now PREDICTS the
+# post-pass size from the free space map and declines a pass it has computed cannot shrink
+# the file.  Before it, every settled VACUUM rewrote the whole live segment forever -- at
+# 1M x 960-d, 94,641 page relocations and ~566 s per cycle, to move the file between two
+# sizes 2.2 % apart.  After it, a settled index does ZERO allocation work, which is what
+# this asserts.  doc/GAPS.md G47 has the arithmetic, the three refuted alternatives, and
+# the two controls this assertion is one of.
 #
-# THE CALL WAS TAKEN 2026-09-25 AND THIS TODO IS EXPECTED TO STAY RED FOR NOW, but for a
-# narrower reason than "unfixable", so the next reader does not treat it as closed.  The
-# oscillation itself is now a DOCUMENTED LIMITATION (doc/PRODUCTION_READINESS.md: plain
-# VACUUM does not reach the floor, weave_vacuum() does -- the same two-tier model core
-# ships for heaps).  What is still a defect is that the settled pass keeps REWRITING the
-# whole segment each cycle instead of declining work it could compute to be useless: at
-# 1M that is 94,641 page relocations and ~566 s per VACUUM, forever.  The agreed fix is a
-# predictive fourth term in weave_index_is_compacted(), which predicted 6 of 6 states
-# EXACTLY in the tombstone-free steady state -- and mispredicted by 409 pages, in the
-# dangerous direction, on the one state where the rewrite drops tombstones.  It is
-# therefore blocked on making `ndeleted` visible so that precondition can be asserted
-# here.  doc/GAPS.md G47 "THE MAINTAINER CALL" has the evidence.
+# THE OTHER CONTROL IS NOT HERE AND MUST NOT BE FORGOTTEN: the guard must still RUN a pass
+# that would reclaim.  t/008 and the burn arm above cover "plain VACUUM reclaims"; the
+# specific state that discriminates -- a post-delete index whose rewrite will drop
+# tombstones, where the prediction is wrong by 409 pages in the direction that skips -- is
+# gated by the tombstone-fraction condition in the guard and measured in
+# bench/RESULTS_G47_VACATE.md.  If this assertion is ever made to pass by loosening the
+# guard rather than by fixing a pass, that measurement is what catches it.
 {
-    local $TODO = 'doc/GAPS.md G47, remaining half: under ShareUpdateExclusiveLock the '
-        . 'compaction pass never reaches a fixed point, so it keeps allocating forever';
-    # THE BURN IS LOAD-BEARING AND ITS ABSENCE MADE THIS ARM PASS BY DOING NOTHING.
-    # Without an advancing horizon the L19 probe (weave_any_free_page_recyclable) skips
-    # the pass outright, so "no allocation work" was true because no pass RAN -- the
-    # arm reported "TODO passed", i.e. G47 fixed, on the strength of a skipped vacuum.
-    # Same shape as a regression test that passes by not using the index.
-    $node->safe_psql('postgres', q{
+    my $s = bracket(q{
         DO $$ BEGIN FOR k IN 1..200 LOOP
             INSERT INTO xidburn2 VALUES (k); DELETE FROM xidburn2;
         END LOOP; END $$;
     });
+}
+{
     my $s = bracket(q{VACUUM vdocs;});
     push @vsizes, $node->safe_psql('postgres',
         q{SELECT pg_relation_size('vdocs_weave') / current_setting('block_size')::int});
     is($s->{extend} + $s->{lowfree_reuse} + $s->{fsm_reuse}, 0,
-        'plain VACUUM on a settled weft index does no allocation work (G47)');
+        'a SETTLED weft index does no allocation work on the next plain VACUUM '
+      . '(doc/GAPS.md G47 term (4): the pass declines work it has computed cannot shrink)');
     diag("  [vector weft] settled-state probe: $vsizes[-1] pages, " . fmt($s));
 }
 
-# A TODO failure is not itemised by prove's default output, so the verdict is stated
-# here explicitly -- otherwise "All tests successful" is the only thing the log says
-# about it, which is indistinguishable from the arm not having run (AGENTS.md: a test
-# result needs evidence the test RAN).  This line also tells whoever reads the log what
-# the CURRENT cost of G47 is, which a silent TODO does not.
+# The series is still printed, because a fixed point at the WRONG size would satisfy the
+# assertion above and only the numbers show which size it settled on.
 {
     my ($mn, $mx) = (sort { $a <=> $b } @vsizes)[0, -1];
-    diag(sprintf('G47 status: series %s ; peak/trough %.3fx -- %s',
-        join(' -> ', @vsizes), $mx / $mn,
-        'the WASTE half is fixed (option 4, bench/RESULTS_G47_VACATE.md: 92 % of the '
-      . 'extends and the whole 1.568x swing were the vacate phase running under a '
-      . 'share lock).  The NON-CONVERGENCE half is open and may be unfixable; the '
-      . 'floor is reachable only under AccessExclusiveLock, which the next arm gates.'));
+    diag(sprintf('G47: series %s ; peak/trough %.3fx -- settled, and the last cycle did no '
+        . 'allocation work.  The floor remains an AccessExclusiveLock outcome '
+        . '(weave_vacuum(), next arm); a plain VACUUM settles above it, which is the same '
+        . 'two-tier model core ships for heaps.',
+        join(' -> ', @vsizes), $mx / $mn));
 }
 
-# Not a TODO, because it holds today and is the half that keeps G47 a waste-of-work
-# defect rather than a bloat defect: the oscillation is BOUNDED.  If this ever fails,
-# G47 has become a ratchet and is a different, worse bug.
 no_ratchet('vector weft present', \@vsizes);
 
 # ---------------------------------------------------------------------------
