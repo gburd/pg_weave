@@ -151,8 +151,34 @@ threshold of 8 and concludes there is work to do. A hole the pass cannot fill is
 reason to run the pass — the same blindness G47's original entry recorded, wearing the
 other arm's clothes.
 
-## Provisional
+## Confirmed at 1M — 2026-09-24, run `pgweave-20260924-200357`
 
-Hard rule 11: one scale (20k), two fixtures, two reps. **Provisional until the 1M
-`vecmerge` run**, which hard rule 12 requires anyway before a change to the vacuum path
-is done.
+Hard rule 12's run is done (`bench/RESULTS_VECMERGE_SCALE.md` run 4), and it reproduces
+every claim above at 50× the scale:
+
+| | 20k × 96-d | 1M × 960-d |
+|---|---|---|
+| `VACUUM` peak / trough, before | 4039 / 2578 = 1.568× | 283924 / 185234 = 1.53× |
+| `VACUUM` peak / trough, after | 2693 / 2578 = **1.045×** | 189283 / 185234 = **1.03×** |
+| grow-cycle extends, after | 115 | 4,049 |
+| shortfall as a fraction of demand | 8.5 % | 4.3 % |
+| `weave_vacuum()` (AEL) | 1,347 = floor, one call, then 0 allocations | **94,642 = floor, one call, then 0 allocations** |
+| plain `VACUUM` above the floor | 1.91× | 1.96× |
+
+Two things are stronger than a reproduction. **The DEMAND/BUDGET law predicted each grow
+cycle's extends to the page at 1M** — cycle 2 reported a shortfall of 4,049 and cycle 3
+extended exactly 4,049; same for 4 → 5 — which is the law that refuted option 3, now
+holding at a second scale (hard rule 11). And **cycles 1 and 2 of the fixed run are
+bit-identical to the two pre-fix runs** (190,091 and 185,234), so the change is
+attributable rather than merely correlated: the cycles where the fix does nothing are
+unchanged.
+
+The wall clock confirms the cost was real and not bookkeeping: the previously-expensive
+cycles went from 1,097–1,219 s to 566 s (**1.94×**) and the alternation that first
+identified the relocation pass is gone (0.6 % spread across cycles 3–5).
+
+`lowfree_defer = 0` on every cycle at both scales — the signature that the vacate phase is
+no longer running under the share lock.
+
+**Still not a fixed point under a share lock**, at either scale. That half of G47 is open
+and probably unfixable; see the entry.

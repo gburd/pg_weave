@@ -183,6 +183,93 @@ and a control you cannot iterate on is a control you do not really have.
 the explanation on the `ERROR:` line, but it is in `DETAIL:` — so the control printed
 "the scan refused: no" two lines below a scan refusing. Fixed in `9f9d46f`.
 
+## Run 4 — 2026-09-24, commit `65e7c3f`, EC2 `c7i.8xlarge`, PG17: option 4 at scale
+
+Hard rule 12's run for the G47 fix (`bench/RESULTS_G47_VACATE.md`, `doc/GAPS.md` G47).
+Same corpus, same history, same instance type as runs 2 and 3: GIST-1M × 960-d, build
+800k rows, 4 × (insert 50k, `weave_merge`), delete every 10th, then **6** `VACUUM`
+cycles — plus two new legs the harness gained for this run (per-cycle allocator
+counters + DEMAND/BUDGET, and a `weave_vacuum()` floor leg).
+
+### The fix holds at 1M, and cycles 1 and 2 are bit-identical to the pre-fix runs
+
+| | runs 2 & 3 (pre-fix, bit-identical to each other) | run 4 (option 4) |
+|---|---|---|
+| relpages, cycles 1–6 | 190091, 185234, **283924**, 185234, … | 190091, 185234, **189283**, 185234, 189283, 185234 |
+| peak / trough | **1.53×** | **1.03×** |
+| grow-cycle growth | **+98,690 pages (~771 MB)** | **+4,049 pages (~32 MB)** |
+| wall clock, cycles 1–6 | 1219 / 554 / 1097 / 557 / 1119 / 550 s | 708.8 / 564.6 / **566.5** / 566.3 / **569.6** / 590.0 s |
+
+**Cycles 1 and 2 reproduce the pre-fix runs to the page** (190,091 and 185,234), which is
+what licenses attributing the difference at cycle 3 to the change rather than to the
+fixture: the history, the corpus and the instance type are the same, and the two cycles
+where the fix does nothing are identical.
+
+**The previously-expensive cycles collapsed onto the cheap ones.** The alternating wall
+clock was the symptom that first identified the relocation pass; it is now 566.5 / 566.3 /
+569.6 s — a 0.6 % spread — against 1,097–1,219 s before, so those cycles are **1.94×
+faster**. Cycle 1 remains higher (708.8 s) for the reason L19 gives: the first VACUUM
+after a big delete legitimately writes the livedocs tombstone blob.
+
+### The DEMAND/BUDGET law predicted each grow cycle to the page
+
+This is the second scale for the law that refuted G47's option 3 (hard rule 11), and it is
+exact rather than approximate:
+
+| cycle | demand | budget | shortfall predicted | extends measured |
+|---|---|---|---|---|
+| 2 → 3 | 94,641 | 90,592 | **4,049** | **4,049** |
+| 4 → 5 | 94,641 | 90,592 | **4,049** | **4,049** |
+| 1 → 2, 3 → 4, 5 → 6 | 94,641 | 95,449 / 94,641 | 0 or negative | **0** |
+
+`lowfree_defer = 0` on every cycle, which is the signature that the vacate phase is no
+longer running under the share lock — pre-fix it equalled that phase's own freed-page
+count. A pass that frees no page it then has to ask for is the whole of the fix.
+
+**One thing 1M shows that 20k could not:** at this scale the grow cycle's shortfall is
+4.3 % of demand (4,049 of 94,641) rather than 8.5 %, so the residual swing is 1.03×
+instead of 1.045×. The defect's *cost* shrinks with scale as a fraction; its *shape*
+(period 2, never a fixed point under a share lock) is identical.
+
+### The floor, and it is worth 708 MB that plain VACUUM cannot reach
+
+The new AEL leg: `weave_vacuum()` took the settled index from **185,234 to 94,642 pages
+in ONE call** (1,135.5 s; extend 94,641, reuse 94,641, defer 0), and a **second call moved
+it not at all and performed ZERO allocations**. 94,642 is exactly the floor — 94,641 live
+pages plus the metapage.
+
+So at 1M the two callers differ by **1.96×, about 708 MB**, and the distinction G47 now
+rests on is confirmed at scale: plain `VACUUM` reclaims what it can under a share lock and
+oscillates 1.03× forever above a floor it cannot reach; `weave_vacuum()` reaches the floor
+in one call and then does nothing. The zero-allocation assertion is what separates that
+from "a stable size while still relocating", which is what the ablated arm did at 20k.
+
+### Correctness, and the control that makes it mean something
+
+- `weave_check(deep)` clean with `vector_block_stats_match_codes` **present** at every
+  stage: build, all four merges, all six vacuum cycles, and the new `ael` stage.
+- **recall@10 0.8500 at build → 0.8500 after 4 merges and 6 vacuums**, the differential
+  check, unchanged. (0.8500 is quantization loss present from the build; see run 3.)
+- Live-lane digest constant; 0 deferred failures; `all stages clean`.
+- **The mutation control FIRED on this host** — `weave_check caught it: yes | the scan
+  refused: yes` — so the clean results above are informative rather than merely silent.
+- 282 TAP tests green on real PostgreSQL (19 files, including `t/001` and `t/002`, which
+  the nix sandbox cannot run), and the EC2 host reproduced `t/015`'s new arms exactly:
+  weft series 297 → 280 → 283 → 280 → 283 → 280, and `weave_vacuum()` 142 → 142 → 142
+  with zero allocations.
+
+### What this run does NOT establish
+
+- **It is one run of the fixed arm.** Its baseline is two bit-identical pre-fix runs, and
+  cycles 1 and 2 reproduce them to the page, which is the strongest within-arm evidence
+  available without paying for a fourth five-hour run — but hard rule 10 asks for the arm
+  against itself and this is not that. The page counts have been bit-identical across
+  every independent run of this fixture so far, at both scales.
+- **The non-convergence under a share lock is unfixed and probably unfixable**, as G47
+  says. 1.03× is smaller than 1.53×; it is not a fixed point.
+- **Nothing here is a latency claim** beyond the vacuum wall clock, which is a cost
+  measurement on a dedicated host, not a query benchmark.
+
 ## Status
 
 | question | answer |
