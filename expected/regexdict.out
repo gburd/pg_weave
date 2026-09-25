@@ -31,7 +31,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.20.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.21.0" of extension "pg_weave" is already installed
 SET max_parallel_workers_per_gather = 0;
 -- TWO COPIES OF THE SAME TABLE, ONE WITH A TRIGRAM WEFT AND ONE WITHOUT.  The
 -- reloption defaults off, and the narrowing exists only when it is on, so a file

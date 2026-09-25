@@ -911,6 +911,8 @@ uint64		weave_fuse_gate_scores = 0;
  * extern declarations in include/weave/weave.h.
  */
 uint64		weave_lex_contribs = 0;
+uint64		weave_lexwork_pages_skip = 0;
+uint64		weave_lexwork_pages_load = 0;
 uint64		weave_vecwork_lanes = 0;
 uint64		weave_vecwork_blocks = 0;
 uint64		weave_vecwork_blk_bound = 0;
@@ -1302,8 +1304,8 @@ Datum
 weave_work_stats(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[5];
-	bool		nulls[5];
+	Datum		values[7];
+	bool		nulls[7];
 	HeapTuple	tuple;
 	int			i;
 
@@ -1311,7 +1313,7 @@ weave_work_stats(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 	tupdesc = BlessTupleDesc(tupdesc);
 
-	for (i = 0; i < 5; i++)
+	for (i = 0; i < 7; i++)
 		nulls[i] = false;
 
 	values[0] = Int64GetDatum((int64) weave_lex_contribs);
@@ -1319,6 +1321,8 @@ weave_work_stats(PG_FUNCTION_ARGS)
 	values[2] = Int64GetDatum((int64) weave_vecwork_blocks);
 	values[3] = Int64GetDatum((int64) weave_vecwork_blk_bound);
 	values[4] = Int64GetDatum((int64) weave_vecwork_shuttles);
+	values[5] = Int64GetDatum((int64) weave_lexwork_pages_skip);
+	values[6] = Int64GetDatum((int64) weave_lexwork_pages_load);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
@@ -1329,6 +1333,8 @@ Datum
 weave_work_stats_reset(PG_FUNCTION_ARGS)
 {
 	weave_lex_contribs = 0;
+	weave_lexwork_pages_skip = 0;
+	weave_lexwork_pages_load = 0;
 	weave_vecwork_lanes = 0;
 	weave_vecwork_blocks = 0;
 	weave_vecwork_blk_bound = 0;

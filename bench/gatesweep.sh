@@ -95,7 +95,7 @@ TERMS=(
     amortization arbitrage escrow annuity
 )
 
-printf 'db\tndocs\tnq\ttarget\tterm\tgate_rows\tsel\tpivots\tlex_contribs\tvec_scores\tgate_scores\tvec_lanes\tvec_blocks\tblkskip\trqskip\tveto\tabandon\n' \
+printf 'db\tndocs\tnq\ttarget\tterm\tgate_rows\tsel\tpivots\tlex_contribs\tvec_scores\tgate_scores\tvec_lanes\tvec_blocks\tblkskip\trqskip\tveto\tabandon\tlex_pages_skip\tlex_pages_load\n' \
     > "$REPORT"
 if [ "$LAT" = 1 ]; then
     printf 'db\tndocs\ttarget\tterm\tsel\tslot\tp50_ms\tp99_ms\tqueries\treps\n' > "$LATREPORT"
@@ -198,7 +198,22 @@ for DB in $DBS; do
             # every point of the sweep -- a flat line that looks like a finding.  The
             # decomposition is fuse.sh:517's: total score() calls minus the vector
             # adapters' share minus the gates' share.
-            echo "SELECT f.pivots, f.scores - f.vec_scores - f.gate_scores, f.vec_scores, f.gate_scores, w.vec_lanes, w.vec_blocks, f.blkskip, f.rqskip, f.veto, f.abandon FROM weave_fuse_stats() f, weave_work_stats() w;"
+            #
+            # THE LEXICAL CHANNEL'S PAGE TRAFFIC, SPLIT (doc/GAPS.md G48), and unlike
+            # lex_contribs these two ARE path-independent -- they sit in the cursor
+            # primitives every lexical path goes through.  lex_pages_skip counts pages
+            # visited only to prove blocks irrelevant, lex_pages_load pages visited to
+            # decode one; the ratio is the ceiling on what an out-of-chain skip structure
+            # could remove, and it is the only lever left after the vector side was
+            # capped at ~15 %.  A page VISIT is a pin plus a share lock, not necessarily
+            # an I/O -- see the note in include/weave/weave.h before quoting these.
+            #
+            # A ZERO IN lex_pages_skip IS A RESULT, NOT A HARNESS BUG: no query shape
+            # reachable from the regression fixture (4,000 dense rows, seven shapes tried)
+            # calls wand_skip_blocks() at all, because a seek there never leaves a whole
+            # 128-block behind.  These corpora are the first place the path can be
+            # observed; if it is zero here too, the lever is zero and G48 closes.
+            echo "SELECT f.pivots, f.scores - f.vec_scores - f.gate_scores, f.vec_scores, f.gate_scores, w.vec_lanes, w.vec_blocks, f.blkskip, f.rqskip, f.veto, f.abandon, w.lex_pages_skip, w.lex_pages_load FROM weave_fuse_stats() f, weave_work_stats() w;"
         } > "$SQLF"
         ROW=$(psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A -F $'\t' -f "$SQLF" | tail -1)
         rm -f "$SQLF"

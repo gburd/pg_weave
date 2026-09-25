@@ -4979,6 +4979,10 @@ wand_load_block(WandCursor *c)
 		return;
 	}
 
+	/* G48: a page visited to DECODE a block.  Counted here and in the empty-tail
+	 * walk below rather than once per call, because one wand_load_block() can cross
+	 * several pages of empty tail before it finds a block to decode. */
+	weave_lexwork_pages_load++;
 	buf = ReadBuffer(c->index, c->curblk);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
@@ -5003,6 +5007,7 @@ wand_load_block(WandCursor *c)
 		c->curblk = next;
 		c->curoff = MAXALIGN(SizeOfPageHeaderData);
 		CHECK_FOR_INTERRUPTS();	/* buffer already released above, next not yet read: no lock held */
+		weave_lexwork_pages_load++;		/* G48 */
 		buf = ReadBuffer(c->index, c->curblk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
@@ -5239,6 +5244,10 @@ wand_skip_blocks(WandCursor *c, uint64 target)
 		bool		stopped = false;
 
 		CHECK_FOR_INTERRUPTS();	/* between posting-list pages, no buffer lock held: safe to unwind */
+		/* G48: a page visited only to SKIP over blocks -- headers read, nothing
+		 * decoded.  This is the traffic an out-of-chain skip structure could remove,
+		 * and the ratio against pages_load is what says whether that is a lever. */
+		weave_lexwork_pages_skip++;
 		buf = ReadBuffer(c->index, c->curblk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);

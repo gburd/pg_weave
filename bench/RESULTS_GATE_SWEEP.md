@@ -507,6 +507,26 @@ avoid. Whether that is the larger part of the 390 or a tenth of it is **not meas
 the two levers withdrawn above were both asserted from exactly this kind of plausible
 mechanism. The instrument that would settle it is named in G48.
 
+**G48 MEASURED, 2026-09-25.** The instrument now exists (`weave_work_stats().lex_pages_skip`
+/ `lex_pages_load`, extension 0.21.0) and this harness records both per point. Share of the
+lexical channel's page visits that are skip-only, 40 queries per point, **A/A repeat on
+fiqa bit-identical**:
+
+| corpus | sel 1.0 | 0.1 | 0.01 | 0.001 |
+|---|---|---|---|---|
+| fiqa | 49.5 % | 49.5 % | 49.4 % | 42.3 % |
+| scifact | 45.5 % | 45.5 % | 44.5 % | 32.8 % |
+| nfcorpus | 34.9 % | 34.7 % | 34.7 % | 19.4 % |
+
+It grows with corpus size and **shrinks as the gate tightens**, so unlike the two withdrawn
+vector levers it is real — but it is worth least at the operating point claim 3 is about,
+and most for the unfiltered query, which is the arm that currently loses 0.7–0.8×.
+
+**Do not quote this as an I/O saving.** These are page *visits* (a pin, a share lock, a
+spinlock each). fiqa at the gated point is ~866 visits per query against 390 buffers for
+the whole lexical channel, so most visits are repeats of pages already resident. The I/O
+half is unsized; see G48.
+
 ## Reproduce (EC2)## Reproduce (EC2)
 
 ```sh
