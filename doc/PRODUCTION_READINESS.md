@@ -207,6 +207,19 @@ These will not be fixed and belong in any evaluation:
   does not pay for it.
 - **128 segments per index** (metapage-size limit).
 - **Ranked scans do not see unflushed pending rows**; `@@@` and `weave_count()` do.
+- **A plain `VACUUM` does not return the index to its size floor; `weave_vacuum()` does.**
+  This is the same two-tier model core ships for heaps — `VACUUM` reclaims in place,
+  `VACUUM FULL` / `REINDEX` reach the floor under `AccessExclusiveLock` — and it is a
+  limitation for the same reason: reaching the floor requires reusing pages the *same
+  transaction* freed, and under the `ShareUpdateExclusiveLock` a plain `VACUUM` holds, a
+  concurrent scan may still be reading them (`weave_page_recyclable()`'s gate exists for a
+  field-reported crash). **Measured at 1M × 960-d** (`bench/RESULTS_VECMERGE_SCALE.md` run
+  4): plain `VACUUM` settles at 185,234 pages; `SELECT weave_vacuum('idx')` takes that to
+  **94,642 — exactly the floor — in one call**, and a second call does nothing at all.
+  **So: schedule `weave_vacuum()` on an index with heavy delete/update churn**; autovacuum
+  alone leaves it about 1.96× above its floor. `doc/GAPS.md` G47 has the arithmetic, the
+  three refuted alternatives, and the one remaining defect (the settled pass still rewrites
+  the segment each cycle rather than declining the work).
 
 ## Honest timeline
 
