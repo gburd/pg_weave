@@ -3448,6 +3448,53 @@ states that invariant ("the rewrite writes a segment with `ndeleted = 0`").
    `weave_vacuum()` is the documented route to the floor: 185,234 → **94,642 = exactly the
    floor** in one call, then zero allocations, worth **1.96× / ~708 MB** at 1M.
 
+**UNBLOCKED AND IMPLEMENTED, 2026-09-25 — term (4) is in, and G47's waste half is closed.**
+
+The blocker was that the guard's precondition (no tombstones about to be dropped) had to be
+assertable. Two findings, the first a loss:
+
+- **`ndeleted` exposed to SQL does NOT serve that purpose**, which is the opposite of what
+  this entry predicted an hour earlier. `weave_index_stats()` gained the column (extension
+  0.22.0) and it reads **0 at every point SQL can sample**: `ambulkdelete` sets it and the
+  compaction pass in the *same* `VACUUM` clears it, so between vacuums it is always zero.
+  The column is kept for the reason it is independently worth having — `pg_weave.vacuum_
+  tombstone_frac` is documented as tunable and nothing could see either side of its
+  comparison — but it did not unblock anything.
+- **The quantity IS visible at the point the decision is taken**, which a probe in the
+  predicate showed rather than an argument: `elog` at the decision point read
+  `tombfrac=0.100000` in the 2,904 state and `tombfrac=0.000000` in every settled state.
+  The guard runs inside `amvacuumcleanup`, after `ambulkdelete`, which is exactly where the
+  discriminator exists. So the condition is `weave_tombstone_frac(index) == 0` — **not** the
+  GUC's 0.2 threshold, which a 10 % delete does not cross.
+
+**Measured, both controls, at 20k:**
+
+| control | requirement | result |
+|---|---|---|
+| 2,904 start (the state that refuted option 2) | the pass must **RUN** | 2,904 → 2,578 (alloc 1,348), then 2,578 with **alloc 0** |
+| settled 2,578 / 2,693 | the pass must **SKIP** | **2578 ×6, extends 0 ×6 — a fixed point with zero work** |
+| `weave_vacuum()` (AEL) | unchanged, still the floor | 1,347, one call, then zero |
+| vacate ablated under AEL | still discriminates | 2,693 with 115 extends/cycle |
+
+**And the matrix caught a regression the single arm could not.** Term (4)'s prediction models
+a **pack-only** pass — what a share-lock caller does now that the vacate is AEL-only. Under
+`AccessExclusiveLock` the pass is vacate+pack and reaches the *floor*, so the first version of
+the term told `weave_vacuum()` its index was already compacted and **the floor became
+unreachable: 2,578 instead of 1,347, a 1.91× regression in the one path that had been
+working.** Six cycles of the share-lock arm looked perfect while that was true. The term is
+therefore restricted to share-lock callers, with the same `CheckRelationLockedByMe()`
+predicate option 4 uses. *Run the whole matrix on a change to this predicate, not the arm the
+change is about.*
+
+`t/015`'s G47 arm is no longer a TODO: it asserts that a settled weft index does **zero
+allocation work** on the next plain `VACUUM`, and the series is now
+297 → 280 → 280 → 280 → 280 → 280.
+
+**Still owed:** the 1M `vecmerge` run (hard rule 12 — this is the vacuum path), and the
+`PRODUCTION_READINESS.md` limitation stays as written, because the *floor* is still
+AEL-only. What changed is that a plain `VACUUM` now settles there for free instead of
+rewriting the segment forever.
+
 **Why (4) is defensible rather than a climbdown, and this is the north-star argument.**
 PostgreSQL already ships this exact two-tier model: plain `VACUUM` reclaims what it can in
 place and never returns a heap to its floor; `VACUUM FULL` and `REINDEX` reach the floor

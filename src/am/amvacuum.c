@@ -276,6 +276,70 @@ weave_tombstone_frac(Relation index)
  * Scan-only for the FSM part; a brief shared lock on the metapage for the
  * segment count and the tombstone counts.
  */
+/*
+ * Would a low-bias pack leave the file SMALLER than it is now?
+ *
+ * Which blocks the pack phase will use is not a mystery: it allocates the lowest free
+ * pages first, writes the live segment into them, frees the old copies, and truncates the
+ * free tail.  So the post-pass size is computable from the free space map before any of it
+ * happens -- which is what lets weave_index_is_compacted() decline a pass that cannot
+ * help, instead of discovering it by rewriting a multi-gigabyte segment.
+ *
+ *   LIVE = blocks the FSM shows in use;  FREE = blocks it shows free (blkno > 0)
+ *   FREE >= LIVE  ->  every live page fits below the LIVE-th lowest free block, and the
+ *                     file ends there: predicted = that block + 1
+ *   FREE <  LIVE  ->  the shortfall must be extended onto fresh high blocks, which are
+ *                     LIVE and therefore not truncatable: predicted = nblocks + shortfall
+ *
+ * VALIDATED BEFORE IT WAS BUILT, which is the only reason it is allowed to gate work
+ * (hard rule 9).  /scratch/pg_weave/g47pred.sh predicts, runs the real VACUUM, and
+ * compares: 6 of 6 states EXACT, error 0, on both branches, plus the two 1M x 960-d
+ * states to within one page (the metapage).  The one state it got wrong is the one the
+ * caller gates it out of -- see the tombstone condition there.
+ *
+ * Uses the same GetRecordedFreeSpace() >= BLCKSZ/2 criterion as every other term, so all
+ * four agree about what "free" means.  Two scans, no lock held, cancel-safe.
+ */
+static bool
+weave_pack_would_shrink(Relation index, BlockNumber nblocks)
+{
+	BlockNumber blk;
+	BlockNumber live = 0;
+	BlockNumber free = 0;
+	BlockNumber predicted;
+
+	for (blk = 1; blk < nblocks; blk++)
+	{
+		CHECK_FOR_INTERRUPTS();		/* scan-only, no lock held */
+		if (GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2)
+			free++;
+		else
+			live++;
+	}
+	if (live == 0)
+		return false;				/* nothing to relocate */
+
+	if (free >= live)
+	{
+		BlockNumber seen = 0;
+
+		predicted = nblocks;		/* fallback: the loop below always finds it */
+		for (blk = 1; blk < nblocks; blk++)
+		{
+			CHECK_FOR_INTERRUPTS();
+			if (GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2 && ++seen == live)
+			{
+				predicted = blk + 1;
+				break;
+			}
+		}
+	}
+	else
+		predicted = nblocks + (live - free);
+
+	return predicted < nblocks;
+}
+
 static bool
 weave_index_is_compacted(Relation index)
 {
@@ -333,7 +397,56 @@ weave_index_is_compacted(Relation index)
 			freebelow++;
 	}
 	threshold = Max(nblocks / 50, 8);
-	return freebelow <= threshold;
+	if (freebelow <= threshold)
+		return true;
+
+	/*
+	 * (4) WOULD A PASS ACTUALLY SHRINK THE FILE?  Terms (1)-(3) all describe a state;
+	 * this one predicts an OUTCOME, and it is the term that stops the index rewriting
+	 * itself forever (doc/GAPS.md G47, "THE MAINTAINER CALL").
+	 *
+	 * Measured, at 1M x 960-d: after the vacate phase was made AEL-only, every settled
+	 * VACUUM cycle still reused 94,641 pages -- the whole live segment, ~740 MB -- and
+	 * took ~566 s, to move the file between two sizes 2.2 % apart, forever.  Term (1)
+	 * cannot see that: it counts free pages below live (90,592 against a threshold of
+	 * 3,704) and concludes there is work to do.  A hole the pass cannot fill is not a
+	 * reason to run the pass.
+	 *
+	 * ONLY WHEN THERE ARE NO TOMBSTONES TO DROP, and that condition is the whole reason
+	 * this is sound.  The prediction below assumes the live page count does not change
+	 * during the pass.  When the rewrite physically drops tombstoned postings it does
+	 * change -- measured 1,493 -> 1,346 live pages mid-pass -- and the prediction was
+	 * then WRONG BY 409 PAGES IN THE DANGEROUS DIRECTION, forecasting growth where the
+	 * pass actually reclaimed 11.2 %.  Skipping on that forecast is precisely the
+	 * failure the rejected option 2 was rejected for, so the term is gated on
+	 * weave_tombstone_frac() == 0 rather than on the GUC's threshold: at a 10 % delete
+	 * the fraction is 0.1, which is BELOW the 0.2 default, so term (3) does not protect
+	 * this and cannot be made to without changing what a rewrite is triggered by.
+	 *
+	 * SHARE-LOCK CALLERS ONLY, AND THE MATRIX CAUGHT THAT THE HARD WAY.  The prediction
+	 * models a PACK-ONLY pass, which is what a share-lock caller performs now that the
+	 * vacate phase is AEL-only.  Under AccessExclusiveLock the pass is vacate+pack and its
+	 * outcome is different -- the freed pages ARE recyclable in that transaction, so it
+	 * reaches the size FLOOR.  Without this condition the term told weave_vacuum() its
+	 * index was already compacted and the floor became unreachable: 2,578 pages instead of
+	 * 1,347, a 1.91x regression in the one path that had been working.  Six cycles of the
+	 * share-lock arm looked perfect while that was true, which is the argument for running
+	 * the whole {vacate on, off} x {VACUUM, weave_vacuum} matrix on a change to this
+	 * predicate rather than the arm the change is about.
+	 *
+	 * NOT THE "SKIP FOREVER" TRAP (amvacuum.c's warning above), for two reasons that are
+	 * different from option 2's.  The condition is a computed OUTCOME rather than a
+	 * free-space heuristic, so it cannot be satisfied by an index that has work to do;
+	 * and it is a function of the live/free layout, so any insert, merge or delete that
+	 * changes the layout changes the answer.  t/015 requires a shrink on the
+	 * horizon-advancing arm, so a regression into permanent skipping fails a test.
+	 */
+	if (!CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&
+		weave_tombstone_frac(index) == 0.0 &&
+		!weave_pack_would_shrink(index, nblocks))
+		return true;
+
+	return false;
 }
 
 

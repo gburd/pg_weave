@@ -4663,7 +4663,25 @@ weave_index_nsegments(PG_FUNCTION_ARGS)
 
 PG_FUNCTION_INFO_V1(weave_index_stats);
 
-/* weave_index_stats(regclass) -> (ndocs float8, avgdl float8, nterms bigint) */
+/*
+ * weave_index_stats(regclass)
+ *   -> (ndocs float8, avgdl float8, nterms bigint, ndeleted float8)
+ *
+ * NDELETED WAS ADDED FOR A GUARD THAT COULD NOT OTHERWISE BE TESTED (doc/GAPS.md G47).
+ * `ndocs` already has it subtracted, so nothing reachable from SQL could distinguish an
+ * index whose next compaction pass will physically drop tombstoned postings from one whose
+ * pass will not -- and that distinction is the precondition of the predictive guard G47's
+ * call adopted.  The guard's formula predicted 6 of 6 steady states EXACTLY and then
+ * mispredicted by 409 pages, in the direction that skips a useful pass, on the one state
+ * where the rewrite drops tombstones and the live page count therefore changes mid-pass.
+ * A guard whose precondition cannot be asserted in a test is the same hazard as a
+ * diagnostic GUC that does not exist in the build (AGENTS.md, twelfth member), so the
+ * number is surfaced before the guard is written rather than after.
+ *
+ * It is also the quantity behind pg_weave.vacuum_tombstone_frac, which users are told to
+ * tune with no way to see what it is being compared against.  float8 to match ndocs, which
+ * is float8 because BM25's avgdl is.
+ */
 Datum
 weave_index_stats(PG_FUNCTION_ARGS)
 {
@@ -4671,8 +4689,8 @@ weave_index_stats(PG_FUNCTION_ARGS)
 	Relation	index;
 	WeaveMetaPageData meta;
 	TupleDesc	tupdesc;
-	Datum		values[3];
-	bool		nulls[3] = {false, false, false};
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
 	HeapTuple	tuple;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -4698,6 +4716,21 @@ weave_index_stats(PG_FUNCTION_ARGS)
 		for (s = 0; s < meta.nsegments; s++)
 			nterms += meta.segs[s].nterms;
 		values[2] = Int64GetDatum(nterms);	/* bigint: no int32 wrap at scale */
+	}
+	{
+		/*
+		 * Summed over LIVE segments only, the same way weave_tombstone_frac() does it
+		 * in src/am/amvacuum.c -- a segment whose dictstart is InvalidBlockNumber is a
+		 * dropped slot whose counts are stale, and including it would report tombstones
+		 * in an index that has none.
+		 */
+		uint32		s;
+		double		ndeleted = 0;
+
+		for (s = 0; s < meta.nsegments; s++)
+			if (meta.segs[s].dictstart != InvalidBlockNumber)
+				ndeleted += meta.segs[s].ndeleted;
+		values[3] = Float8GetDatum(ndeleted);
 	}
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
