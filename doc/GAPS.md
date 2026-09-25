@@ -3368,6 +3368,96 @@ informative rather than silent.
 1.53×; it is not a fixed point. `t/015`'s G47 TODO arm stays red by design, and it is now
 mechanism-based so it cannot go quiet the way the size-based version did.
 
+---
+
+## THE MAINTAINER CALL, 2026-09-25, and it rejects every option on the list
+
+Taken on the measurements below rather than on the option list, because the option list was
+wrong twice (option 1 was already implemented; option 3 was refutable by arithmetic).
+
+**First, what option 4 did NOT fix, which is bigger than the swing it did fix.** At 1M
+every cycle reuses **94,641 pages — the entire live segment** — and takes **~566 s**:
+
+| cycle | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| `lowfree_reuse` | 94641 | 94641 | 90592 | 94641 | 90592 | 94641 |
+| `extend` | 0 | 0 | 4049 | 0 | 4049 | 0 |
+| seconds | 708.8 | 564.6 | 566.5 | 566.3 | 569.6 | 590.0 |
+
+So a plain `VACUUM` rewrites a ~740 MB segment and writes GenericXLog for all of it, on
+**every** cycle, forever, to move the file between two sizes 2.2 % apart. On a quiet
+database autovacuum does this indefinitely. **Doing nothing is therefore not an available
+disposition** — not because of the space, which is bounded, but because an index that
+rewrites itself forever has no precedent in core and would be a review objection against
+claim 4 (`doc/ARCHITECTURE.md` §9), which is the claim the whole contrib-track goal rests
+on.
+
+**Option 2 is REFUTED by our own data, and the refutation is the useful part.** Its stated
+justification — "when the recyclable free space below the live data is less than the live
+size, the rewrite provably cannot truncate and can only grow the file" — is false. Measured
+at 20k: from **2,904 pages with budget 1,410 against demand 1,493** (budget *below* demand,
+exactly where option 2 skips) the pass reclaimed to **2,578, an 11.2 % shrink**. A pass can
+truncate a freed *tail* without ever reaching the floor. Option 2 would have skipped that
+reclaim, which is the "skip forever" failure it was already warned about arriving by a
+route nobody had noticed.
+
+**The direction that survives: let the pass PREDICT its own result and decline work it has
+computed to be useless.** Which blocks a low-bias pack will use is not a mystery — it is
+the free space map, which `weave_index_is_compacted()` already walks:
+
+```
+LIVE = blocks the FSM shows in use;  FREE = blocks it shows free
+|FREE| >= |LIVE|  ->  post-pass size = (the |LIVE|-th lowest FREE block) + 1
+|FREE| <  |LIVE|  ->  post-pass size = nblocks + (|LIVE| - |FREE|)
+```
+
+Validated by `/scratch/pg_weave/g47pred.sh`, which predicts, then runs the real `VACUUM`,
+then compares — **6 of 6 states exact, error +0, on both branches**, and it also predicts
+the two 1M states to within one page (the metapage) from data taken before the formula
+existed. Under this guard the 1M steady state becomes **185,234 held with zero work** in
+place of a 566 s rewrite per cycle.
+
+**BUT THE GUARD FAILED ITS OWN CONTROL AND IS THEREFORE NOT ADOPTED YET.** Run from the
+2,904 state — the one that refuted option 2 — the predictor said 2,987 and the pass
+delivered **2,578: an error of −409 pages, in the dangerous direction** (it predicted growth
+where there was a shrink, so a guard built on it would have skipped exactly the reclaim
+option 2 was rejected for). The mechanism is understood: that pass **drops tombstones**, so
+the live page count falls 1,493 → 1,346 *during* the pass, and the formula assumes live is
+constant. The predictor is exact precisely when the rewrite will not change the live size,
+i.e. when there are no tombstones to drop — and `weave_vacuum_compact()`'s own comment
+states that invariant ("the rewrite writes a segment with `ndeleted = 0`").
+
+**So the call is:**
+
+1. **Reject options 1, 2 and 3** — implemented already, refuted by measurement, and refuted
+   by arithmetic respectively.
+2. **Adopt the predictive guard in principle**, as a fourth term in
+   `weave_index_is_compacted()` conditioned on `ndeleted = 0`, which is the condition under
+   which it is exact. Not "skip the pass" — *the predicate that decides whether the index is
+   at its achievable floor learns that a rewrite it has computed cannot shrink is not work
+   worth doing.* That is the same shape as L18's fix, where the predicate learned what a
+   tombstone is.
+3. **Blocked on ONE measurement, and deliberately not built before it.** `ndeleted` is not
+   visible from SQL — `weave_index_stats().ndocs` already has it subtracted — so the
+   precondition the guard depends on **cannot currently be asserted in a test**, and a guard
+   whose precondition is untestable is the twelfth-member trap with a page count instead of a
+   GUC. The instrument is one column on an existing stats function (another `DROP` + `CREATE`
+   and a bump to 0.22.0). Then re-run both controls: the 2,904 state must **run**, the
+   2,578/2,693 states must **skip**.
+4. **Until then the oscillation is documented behaviour, not a bug being ignored**, and
+   `weave_vacuum()` is the documented route to the floor: 185,234 → **94,642 = exactly the
+   floor** in one call, then zero allocations, worth **1.96× / ~708 MB** at 1M.
+
+**Why (4) is defensible rather than a climbdown, and this is the north-star argument.**
+PostgreSQL already ships this exact two-tier model: plain `VACUUM` reclaims what it can in
+place and never returns a heap to its floor; `VACUUM FULL` and `REINDEX` reach the floor
+under `AccessExclusiveLock`. After option 4 our behaviour has the same shape as core's, and
+a committer recognises it. What has no precedent in core — and what option 4 removed — is an
+index whose plain `VACUUM` grows the file 1.5× and hands the space back on the next run. The
+remaining gap between 1.96× and the floor is a *documentation* obligation
+(`doc/PRODUCTION_READINESS.md` owes "run `weave_vacuum()` to reach the floor"), not a
+correctness one.
+
 
 ### G48 — a lexical seek skips the DECODE but reads every PAGE it passes over, so the channel that dominates a gated query has no way to skip I/O — **OPEN 2026-09-24, ceiling UNMEASURED**
 

@@ -395,10 +395,20 @@ diag('vector weft: ' . join(' -> ', @vsizes));
 # lock requires recycling pages freed by the same transaction, and that hands a
 # concurrent scan a page it is still reading -- the field-reported crash
 # weave_page_recyclable()'s gate exists to prevent.  The floor is an AccessExclusiveLock
-# outcome (weave_vacuum(), REINDEX), which the arm below asserts.  This TODO may
-# therefore stay red permanently; if the decision is ever taken to accept that, it
-# becomes a documented limitation and this block becomes a plain assertion of the
-# oscillation's bounds.
+# outcome (weave_vacuum(), REINDEX), which the arm below asserts.
+#
+# THE CALL WAS TAKEN 2026-09-25 AND THIS TODO IS EXPECTED TO STAY RED FOR NOW, but for a
+# narrower reason than "unfixable", so the next reader does not treat it as closed.  The
+# oscillation itself is now a DOCUMENTED LIMITATION (doc/PRODUCTION_READINESS.md: plain
+# VACUUM does not reach the floor, weave_vacuum() does -- the same two-tier model core
+# ships for heaps).  What is still a defect is that the settled pass keeps REWRITING the
+# whole segment each cycle instead of declining work it could compute to be useless: at
+# 1M that is 94,641 page relocations and ~566 s per VACUUM, forever.  The agreed fix is a
+# predictive fourth term in weave_index_is_compacted(), which predicted 6 of 6 states
+# EXACTLY in the tombstone-free steady state -- and mispredicted by 409 pages, in the
+# dangerous direction, on the one state where the rewrite drops tombstones.  It is
+# therefore blocked on making `ndeleted` visible so that precondition can be asserted
+# here.  doc/GAPS.md G47 "THE MAINTAINER CALL" has the evidence.
 {
     local $TODO = 'doc/GAPS.md G47, remaining half: under ShareUpdateExclusiveLock the '
         . 'compaction pass never reaches a fixed point, so it keeps allocating forever';
