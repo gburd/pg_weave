@@ -270,6 +270,51 @@ from "a stable size while still relocating", which is what the ablated arm did a
 - **Nothing here is a latency claim** beyond the vacuum wall clock, which is a cost
   measurement on a dedicated host, not a query benchmark.
 
+## Run 5 — 2026-09-25, commit `bc1723d`, EC2 `c7i.8xlarge`, PG17: term (4) at scale
+
+Hard rule 12's run for `weave_index_is_compacted()`'s predictive fourth term
+(`doc/GAPS.md` G47). Same corpus, history and instance type as runs 2–4.
+
+### The settled cycles stopped doing anything, which is the whole point
+
+| | runs 2 & 3 (pre-option-4) | run 4 (option 4) | **run 5 (+ term 4)** |
+|---|---|---|---|
+| relpages, cycles 1–6 | 190091, 185234, **283924**, 185234, … | 190091, 185234, 189283, 185234, 189283, 185234 | **190091, 185234, 185234, 185234, 185234, 185234** |
+| peak / trough | 1.53× | 1.03× | **1.03×, then flat** |
+| settled-cycle allocations | ~98,690 extends | 94,641 reuse + 4,049 extends | **0** |
+| settled-cycle seconds | 1,097–1,219 | 566 | **0.1** |
+
+Cycles 1 and 2 are **identical to run 4** (190,091 and 185,234, at 666 s and 540 s): the
+passes that have work to do still do it, including the post-delete pass whose rewrite drops
+tombstones. From cycle 3 the predicate declines: `extend=0 reuse=0 defer=0`, **0.1 s**, six
+times over. That is ~2,264 s of pointless `VACUUM` — 38 minutes per four cycles, forever on
+a quiet database — removed, along with ~740 MB of relocation and its GenericXLog per cycle.
+
+### The regression the local matrix caught did NOT recur at scale
+
+The first version of term (4) made the *floor* unreachable, because its prediction models a
+pack-only pass while `weave_vacuum()` performs vacate+pack under `AccessExclusiveLock`. The
+shipped version is restricted to share-lock callers, and this run confirms it at 1M:
+
+- `weave_vacuum()`: **185,234 → 94,642 pages — exactly the floor — in one call** (1,065.8 s),
+  and a second call moved it not at all with **zero allocations**. Unchanged from run 4.
+- So the two-tier model is intact: plain `VACUUM` settles at 185,234 for free; the AEL path
+  reaches 94,642 when asked. **1.96×, ~708 MB.**
+
+### Correctness
+
+`weave_check(deep)` clean with `vector_block_stats_match_codes` present at every stage
+(build, 4 merges, 6 vacuum cycles, `ael`); **recall@10 0.8500 → 0.8500** on the differential
+check; live-lane digest constant; 0 deferred failures; and **the mutation control fired**
+(`weave_check caught it: yes | the scan refused: yes`), so the clean results are informative.
+
+### What it does not establish
+
+One run of the changed arm, against run 4 as its baseline — with cycles 1 and 2 reproducing
+run 4 to the page, which is the available within-arm evidence (hard rule 10). And the
+**floor is still AEL-only**: term (4) stops the waste, it does not make a plain `VACUUM`
+reach 94,642, and `doc/PRODUCTION_READINESS.md` records that as a limitation.
+
 ## Status
 
 | question | answer |

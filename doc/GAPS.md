@@ -3490,10 +3490,19 @@ change is about.*
 allocation work** on the next plain `VACUUM`, and the series is now
 297 → 280 → 280 → 280 → 280 → 280.
 
-**Still owed:** the 1M `vecmerge` run (hard rule 12 — this is the vacuum path), and the
-`PRODUCTION_READINESS.md` limitation stays as written, because the *floor* is still
-AEL-only. What changed is that a plain `VACUUM` now settles there for free instead of
-rewriting the segment forever.
+**CONFIRMED AT 1M — run `pgweave-20260925-135520`** (`bench/RESULTS_VECMERGE_SCALE.md`
+run 5). Series **190091 185234 185234 185234 185234 185234**, extends **0 ×6**, and the
+settled cycles went from **566 s to 0.1 s** — ~2,264 s of pointless `VACUUM` per four
+cycles, removed. Cycles 1 and 2 are identical to run 4, so the passes with work to do still
+do it. `weave_vacuum()` still reaches **94,642 = exactly the floor** in one call with a
+second call doing nothing, so the regression the local matrix caught did not recur at scale.
+`weave_check(deep)` clean at every stage including `ael`, recall@10 0.8500 → 0.8500, the
+mutation control fired, 0 deferred failures.
+
+**`PRODUCTION_READINESS.md`'s limitation stays as written**, because the *floor* is still
+AEL-only. What changed is that a plain `VACUUM` now settles above it **for free** instead of
+rewriting the segment forever. **G47's waste half is CLOSED; its non-convergence half is a
+documented limitation with core's own precedent.**
 
 **Why (4) is defensible rather than a climbdown, and this is the north-star argument.**
 PostgreSQL already ships this exact two-tier model: plain `VACUUM` reclaims what it can in
