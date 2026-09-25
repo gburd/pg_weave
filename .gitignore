@@ -18,3 +18,9 @@ isolation_output/
 # The user's global core.excludesfile has a blanket "*.out" rule, which would
 # otherwise swallow the checked-in pg_regress/pg_isolation_regress fixtures.
 !expected/*.out
+
+# A local code-search index some tooling drops in the working tree.  31 MB of binary
+# blobs, one of them a proxima index -- it is a build artifact of a SEARCH TOOL, not of
+# this project, and `git add -A` swept it into a commit until the dump-guard hook refused
+# it.  Ignored rather than deleted because the tool recreates it on demand.
+.zvec-grep/

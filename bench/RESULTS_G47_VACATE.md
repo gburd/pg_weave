@@ -182,3 +182,39 @@ no longer running under the share lock.
 
 **Still not a fixed point under a share lock**, at either scale. That half of G47 is open
 and probably unfixable; see the entry.
+
+
+---
+
+## Term (4): the waste half closed, 20k and 1M — 2026-09-25
+
+Option 4 made the vacate phase AEL-only, which removed 92 % of the churn and the whole
+file-size swing. It left the pass still **rewriting the entire live segment on every
+`VACUUM`** — 94,641 relocations and ~566 s per cycle at 1M, forever. Term (4) of
+`weave_index_is_compacted()` predicts what a low-bias pack would leave the file at and
+declines a pass that cannot shrink it.
+
+| | 20k × 96-d | 1M × 960-d |
+|---|---|---|
+| series, before | 2578 ↔ 2693 | 190091 185234 189283 185234 189283 185234 |
+| series, after | **2578 ×6** | **190091 185234 185234 185234 185234 185234** |
+| settled-cycle allocations | 115 extends → **0** | 94,641 reuse + 4,049 extends → **0** |
+| settled-cycle seconds | — | 566 → **0.1** |
+| the reclaim option 2 would have skipped | 2,904 → 2,578 still happens | cycles 1–2 unchanged |
+| `weave_vacuum()` floor | 1,347, one call | **94,642, one call** |
+
+Three things this rests on, each measured rather than argued:
+
+1. **The predictor was validated before it became a guard.** `g47pred.sh` predicts, runs the
+   real `VACUUM`, compares: 6 of 6 states exact on both branches.
+2. **Its precondition is a tombstone fraction of zero**, because the one state it
+   mispredicts — by 409 pages, in the direction that skips a useful pass — is the one where
+   the rewrite drops tombstones and the live count changes mid-pass. The condition is
+   checkable only *inside* the pass: a probe at the decision point read `tombfrac=0.100000`
+   there and `0.000000` in every settled state. Exposing `ndeleted` to SQL (0.22.0) does
+   **not** serve this and it is recorded as a loss in `doc/GAPS.md` G47 — `ambulkdelete`
+   sets it and the same `VACUUM` clears it, so SQL always samples zero.
+3. **It is restricted to share-lock callers, and the matrix is why.** Unrestricted, it told
+   `weave_vacuum()` the index was compacted and the floor became unreachable — 2,578 instead
+   of 1,347, a 1.91× regression in the one path that worked, while six cycles of the arm
+   under test looked perfect.
