@@ -3753,3 +3753,68 @@ or `pfree` the detoasted datum after the `add_posting` loop — is a code change
 one real hazard to clear first (does `add_posting`/`build_term_append` **copy** the
 term bytes out of `doc`, or alias into it? aliasing means freeing the blob dangles),
 so it goes through the TDD worker→reviewer flow, not a coordinator edit.
+
+### G51 — a docvalues restriction gate silently returns ZERO rows on any index whose build flushed more than one segment: the segment MERGE does not carry the docvals weft — **FOUND 2026-09-26 by Task 8's prize measurement (rule 9), the primary CREATE INDEX path at real scale, a P0 wrong-answer**
+
+`WHERE price <op> c` over a docvals-bearing index returns an EMPTY result whenever
+the `CREATE INDEX` flushed more than one segment and finalize merged them. Confirmed
+by measurement, characterized to the mechanism:
+
+- `WHERE price > 0` (matches every row) returns **0** on a 20,000-row index, heap
+  truth 20,000. Not partial, not an error — empty. `weave_check(deep)` passes clean,
+  including `chandesc_coverage: 1 self-describing` (the merged bolt HAS a docvals
+  chandesc/root), and no corrupt-chain error fires — so the merged store loads with
+  **ndocs = 0** (or is otherwise empty); `weave_docvals_collect` skips it at
+  `amscan.c:4671`.
+- **Trigger is multi-segment build, i.e. a merge — NOT parallelism and NOT a docid
+  overflow.** Isolated on a local cluster (dvtest), all single-segment:
+  - single-segment builds are CORRECT at every scale/dim/strategy tested (t384
+    wvec(384)/3000, tv wvec(8)/40000 with confirmed `tv_w` Index Cond, dvtest.t);
+  - `thv`: **serial** build (`max_parallel_maintenance_workers=0`), high vocabulary,
+    flushed **7 segments → merged to nsegments=1 → `price>0` = 0** (heap 20,000).
+    Serial, so it is the MERGE, not the parallel assembly.
+  - `tv8_60k` (2 parallel workers → 2 segments → merge) and `fd_weave` on normfiqa
+    (real fiqa, 57,600 rows, 2 workers flushing "4 segments so far" each → merge)
+    both broken identically.
+  - The earlier "vector column + scale" and "heap > ~1024 blocks" correlations were
+    both spurious: big vectors / big bodies just cross the flush budget sooner, and
+    the flush budget being exceeded is what forces the merge. A no-vector big-body
+    table (`tbig`, relpages 4000) is equally broken; a small single-segment table is
+    fine however many blocks.
+
+**Root cause:** the build-finalize merge (`weave_merge_segments_streaming` /
+`weave_merge_all` / `weave_build_finalize`, `ambuild.c`) does not carry the docvals
+weft forward — matching the limitation recorded at Task 4 time ("docvals active on the
+CREATE INDEX heap-scan paths, INACTIVE on merge/oversized-insert/pending-flush"). What
+was filed as a G29-class *post-build-insert* edge is in fact a **P0 on the primary
+build path**: a merge is routine, not an edge — every parallel build merges worker
+outputs, and any serial build large enough to exceed the flush budget (high vocabulary
+or large corpus) flushes and merges. So a docvals gate is correct only on toy indexes.
+
+**Why every gate we have was green.** `sql/docvals.sql` (c3a5273), the hegel suite,
+and the fuzz target all build SINGLE-SEGMENT indexes, so none ever ran a docvals weft
+through a merge. This is exactly hard rule 12 ("a release touching merge — 'local
+green' is not evidence; needs scale") and the eleventh member ("a gate that has never
+run a merge is not evidence"). The regression that would have caught it did not exist.
+
+**Blocks Task 8** (`doc/plans/2026-09-26-docvals-int8-slice.md`): the prize cannot be
+measured until a docvals gate returns correct rows on a merged (corpus-scale) index.
+
+**FIX (TDD flow, needs a compile — coordinator does not hack it inline):**
+1. `weave_merge_segments_streaming` must merge the docvals wefts of its inputs into
+   the output segment (concatenate the (docid,value) pairs of every input bolt that
+   carries a docvals weft, re-sort by global docid — they already interleave — drop
+   pairs whose docid is tombstoned, write one store). The (docid,value) pairs are
+   self-contained (Option A), so this is a straight k-way merge on the docid key with
+   no warp-map dependency. An input bolt with no docvals weft contributes nothing (the
+   documented pre-Task-4 / lexical-only case).
+2. Decide the mixed case: merging a docvals-bearing bolt with a non-bearing one must
+   either (a) omit docvals from the output (and NOT write a self-describing chandesc
+   that then reads as ndocs=0 — the current silent-empty trap), or (b) require all
+   inputs to carry it. (a) is safer for older indexes; whichever, the merged
+   chandesc must not advertise a docvals weft it cannot serve — CONVENTIONS decision 2.
+3. `sql/docvals.sql` gains a **forced-multi-segment** case: build with a tiny
+   `maintenance_work_mem` + high vocabulary (or `max_parallel_maintenance_workers>0`)
+   so `weave_index_nsegments` proves a merge ran, then `dv_agree()` across all five
+   strategies. A positive control: assert the pre-fix build produces `nsegments>1` and
+   the gate is empty, so the test can fail.

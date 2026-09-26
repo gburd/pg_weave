@@ -226,16 +226,39 @@ git commit -m "docvals: regression test for index-vs-heap agreement; regen 0.24.
 
 ---
 
-### Task 8: End-to-end proof — re-run the prize spike on a real docvals column
+### Task 7.5 (BLOCKER, found by Task 8 on 2026-09-26): docvals must survive segment merge — G51
+
+**Task 8 is BLOCKED on this.** Measuring the prize (below) surfaced a P0: on any index
+whose build flushed >1 segment (routine — every parallel build merges worker outputs,
+and any serial build over the flush budget flushes+merges), the finalize merge does NOT
+carry the docvals weft, so a `WHERE price <op> c` gate silently returns **zero** rows
+(even `price > 0`, which matches everything). Full characterization, repro, and the fix
+sketch are in `doc/GAPS.md` G51. Single-segment builds — every existing docvals test —
+are correct, which is why all gates were green (hard rule 12 / eleventh member: no test
+ever ran a docvals weft through a merge).
+
+- [ ] Merge carries docvals: `weave_merge_segments_streaming` k-way-merges the inputs'
+      (docid,value) pairs on the global docid key, drops tombstoned docids, writes one
+      store; a non-bearing input contributes nothing; the merged chandesc must not
+      advertise a docvals weft it cannot serve (CONVENTIONS decision 2 — no self-describing
+      ndocs=0 trap).
+- [ ] `sql/docvals.sql` gains a forced-multi-segment case (tiny `maintenance_work_mem` +
+      high vocabulary so `weave_index_nsegments > 1`), `dv_agree()` across all five
+      strategies, with a pre-fix positive control (nsegments>1 ⇒ gate empty ⇒ test fails).
+- [ ] TDD flow (worker→reviewer→re-reviewer), coordinator compiles + runs the gates.
+
+### Task 8: End-to-end proof — re-run the prize spike on a real docvals column — **BLOCKED on Task 7.5**
 
 The slice's gate (spec §11 step 1): the scalar arm must now *fall* with selectivity like the lexical arm, capturing the prize `RESULTS_DOCVALS_PRIZE.md` measured against the un-pushable filter.
 
-**Files:**
-- Modify: `bench/RESULTS_DOCVALS_PRIZE.md` (add a "MEASURED WITH THE CHANNEL" section); a throwaway harness in `/scratch/pg_weave/`.
+**Setup done 2026-09-26 (normfiqa): ext upgraded 0.23→0.25, `price bigint` added (scattered rank over `hashint8(id)`, exact sel 0.1/0.01/0.001), `fd_weave` rebuilt with `price int8_docval_ops`. The rebuild flushed 4+ segments across 2 workers and merged → docvals gate returns 0 (G51). Re-run Step 2 after Task 7.5 lands + REINDEX.**
 
-- [ ] **Step 1:** On `lpg`, add an int8 facet to `normfiqa`/`normsci` **without churning the vector weft** — build a fresh index that includes `price int8_docval_ops` where `price` is a precomputed column (add the column, then `REINDEX`, so the warp map is rebuilt in docid order — the churn lesson from the sizing spike).
+**Files:**
+- Modify: `bench/RESULTS_DOCVALS_PRIZE.md` (add a "MEASURED WITH THE CHANNEL" section); harness `/scratch/pg_weave/dvprize8.sh` (arm D = `WHERE price<=K`, pushable, added).
+
+- [ ] **Step 1:** On `lpg`, add an int8 facet to `normfiqa`/`normsci` **without churning the vector weft** — build a fresh index that includes `price int8_docval_ops` where `price` is a precomputed column (add the column, then `REINDEX`, so the warp map is rebuilt in docid order — the churn lesson from the sizing spike). **DONE for normfiqa; REINDEX again after Task 7.5.**
 - [ ] **Step 2:** Run the two arms from the sizing spike, but arm S now uses `WHERE price <op> const` (pushable) instead of `id % N` (filter). Capture `vec_blocks` across selectivity 0.1/0.01/0.001. (Coordinator; work counters are deterministic/host-independent — no EC2 needed.)
-- [ ] **Step 3: Assert the prize is captured** — arm S `vec_blocks` now *falls* with selectivity (matching arm L within the selectivity-match tolerance), not grows. If it does not, the gate is not pruning — stop and diagnose (reach for the ablation: is the Index Cond present? is the gate set non-empty and sorted?).
+- [ ] **Step 3: Assert the prize is captured** — arm S `vec_blocks` now *falls* with selectivity (matching arm L within the selectivity-match tolerance), not grows. If it does not, the gate is not pruning — stop and diagnose (reach for the ablation: is the Index Cond present? is the gate set non-empty and sorted?). **Before trusting a fall, confirm the gate returns the CORRECT row COUNT vs heap truth (the G51 lesson: an empty gate looks like `vec_blocks=0` = a fake infinite prize).**
 - [ ] **Step 4:** Record the measured before/after in `RESULTS_DOCVALS_PRIZE.md` (losses as prominently as wins — if it captures less than the projected 82.8×, say by how much and why).
 
 **Measurement discipline for this task (see `bench/METHODOLOGY.md`, AGENTS.md rules 15–16):**
