@@ -48,6 +48,7 @@
 #include "weave/fuse.h"				/* F2.2: the fused-threshold top-k core */
 #include "weave/vecdocmap.h"		/* F8: the vector channel's docid-space adapter */
 #include "weave/gate.h"				/* F2.2: the boolean gate shuttle a WHERE qual becomes */
+#include "weave/docvals.h"			/* Docvals: the int8 scalar store the docvalues gate evaluates */
 #include <math.h>
 #include "access/genam.h"
 #include "access/generic_xlog.h"
@@ -273,6 +274,22 @@ typedef struct WeaveScanOpaqueData
 								 * amcanmulticol is true. */
 
 	/*
+	 * THE DOCVALUES RESTRICTION GATE (task Docvals).  A comparison on a docvalues
+	 * column (`price < 100`, strategy 1..5 on the int8_docval_ops column) is a
+	 * RESTRICTION scankey, dispatched by attribute channel exactly like the cgram
+	 * key above -- reading it as a wquery (the lexical fallback) walks an integer
+	 * Datum as a varlena and segfaults (doc/GAPS.md G49).  Captured here and
+	 * honoured by evaluating the segment's docvalues store into a docid set: the
+	 * plain path emits the matching TIDs, the fused path feeds them to the gate
+	 * shuttle.  v1 honours ONE docvalues qual; the constant is widened to int64
+	 * from its scankey subtype so a cross-type int4/int2 constant compares exactly.
+	 */
+	bool		dvScan;			/* a docvalues restriction scankey was supplied */
+	AttrNumber	dvAttno;		/* 1-based index attnum of the docvalues column */
+	WeaveDvStrat dvOp;			/* comparison strategy 1..5 (< <= = >= >) */
+	int64		dvConst;		/* the comparison constant, widened to int64 */
+
+	/*
 	 * THE FUSED MULTI-CHANNEL ORDERING SCAN (task F2.2), which is a FOURTH
 	 * order-by shape over the same ordered[]/cand[] machinery.  It is recognized
 	 * by a transport key -- strategy WEAVE_STRAT_FUSE_WEIGHTS, `<~>`, whose right
@@ -335,6 +352,11 @@ typedef WeaveScanOpaqueData *WeaveScanOpaque;
  * and weave_gettuple() are above it. */
 static bool weave_cgram_collect(Relation index, const char *pat, int patlen,
 								bool ci, TidSet *out);
+
+/* the docvalues restriction gate (task Docvals); defined next to weave_cgram_collect,
+ * declared here because weave_gettuple()/weave_getbitmap() above it consult it. */
+static void weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c,
+								  TidSet *out);
 
 /* ranked-scan growth (L14); defined next to the visibility machinery */
 static int weave_topk_candidates_guarded(Relation index, WeaveQuery q, int wantk,
@@ -2355,6 +2377,10 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->cgramPatLen = 0;
 	so->cgramCI = false;
 	so->cgramLossy = false;
+	so->dvScan = false;
+	so->dvAttno = 0;
+	so->dvOp = WEAVE_DV_EQ;
+	so->dvConst = 0;
 	if (scan->numberOfKeys >= 1)
 	{
 		/*
@@ -2384,6 +2410,8 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 			AttrNumber	att = scan->keyData[k].sk_attno;
 			bool		iscgram = (att >= 1 && att <= layout.nkeys &&
 								   layout.kind[att - 1] == (uint16) WEAVE_WK_CGRAM);
+			bool		isdocval = (att >= 1 && att <= layout.nkeys &&
+									layout.kind[att - 1] == (uint16) WEAVE_WK_DOCVALS);
 
 			if (iscgram && !so->cgramScan)
 			{
@@ -2404,7 +2432,31 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 				 */
 				MemoryContextSwitchTo(old);
 			}
-			else if (!iscgram && !so->queryValid)
+			else if (isdocval && !so->dvScan)
+			{
+				/*
+				 * A docvalues comparison.  Dispatched by CHANNEL, not strategy --
+				 * a docvalues `<` and a lexical `@@@` are both strategy 1, and the
+				 * lexical fallback below would DatumGetWQuery() an int8 Datum and
+				 * crash (doc/GAPS.md G49).  The constant is widened to int64 from
+				 * the key's SUBTYPE so a cross-type int4/int2 constant (`price <
+				 * 100`, whose 100 is int4) compares exactly; a same-type int8
+				 * constant has sk_subtype 0/int8.
+				 */
+				Oid			sub = scan->keyData[k].sk_subtype;
+				Datum		arg = scan->keyData[k].sk_argument;
+
+				so->dvAttno = att;
+				so->dvOp = (WeaveDvStrat) scan->keyData[k].sk_strategy;
+				if (sub == INT4OID)
+					so->dvConst = (int64) DatumGetInt32(arg);
+				else if (sub == INT2OID)
+					so->dvConst = (int64) DatumGetInt16(arg);
+				else
+					so->dvConst = DatumGetInt64(arg);	/* int8 or same-type */
+				so->dvScan = true;
+			}
+			else if (!iscgram && !isdocval && !so->queryValid)
 			{
 				so->query = DatumGetWQuery(scan->keyData[k].sk_argument);
 				so->queryValid = true;
@@ -2767,7 +2819,7 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 		if (so->cgramPat == NULL)
 			return false;
 	}
-	else if (!so->queryValid || so->query == NULL)
+	else if (!so->dvScan && (!so->queryValid || so->query == NULL))
 		return false;
 
 	/*
@@ -2796,7 +2848,39 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 				so->plainRecheck = so->cgramLossy;
 			}
 			else
-				weave_collect_matches(scan->indexRelation, so->query, &m, &so->plainRecheck);
+			{
+				/*
+				 * Lexical (`@@@`) and/or docvalues (`price < c`) restriction
+				 * keys.  A docvalues gate is EXACT, so when it is the only key
+				 * no recheck is owed; when it accompanies a lexical key the two
+				 * sorted sets are intersected (AND) and the lexical recheck
+				 * carries.  weave_docvals_collect() honours the key that would
+				 * otherwise segfault the lexical fallback (doc/GAPS.md G49).
+				 */
+				bool		haveLex = so->queryValid && so->query != NULL;
+
+				if (haveLex)
+					weave_collect_matches(scan->indexRelation, so->query, &m,
+										  &so->plainRecheck);
+				else
+				{
+					m.tids = NULL;
+					m.n = 0;
+					so->plainRecheck = false;
+				}
+
+				if (so->dvScan)
+				{
+					TidSet		dvset;
+
+					weave_docvals_collect(scan->indexRelation, so->dvOp,
+										  so->dvConst, &dvset);
+					if (haveLex)
+						m = tidset_and(m, dvset);
+					else
+						m = dvset;
+				}
+			}
 			so->plainTids = m.tids;
 			so->nplain = m.n;
 			so->plainpos = 0;
@@ -3955,6 +4039,35 @@ weave_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		return matches.n;
 	}
 
+	/*
+	 * A docvalues restriction (`price < c`), possibly conjoined with a lexical
+	 * `@@@`.  Honoured here so it never reaches the so->query test below, which
+	 * would DatumGetWQuery() an int8 and crash (doc/GAPS.md G49).  The docvalues
+	 * set is EXACT, so a docvalues-only bitmap goes out non-lossy; with a lexical
+	 * key too, the two sorted sets are intersected and the lexical recheck flag
+	 * carries.
+	 */
+	if (so->dvScan)
+	{
+		TidSet		dvset;
+		bool		haveLex = so->queryValid && so->query != NULL;
+		bool		lossy = false;
+
+		pgstat_count_index_scan(scan->indexRelation);
+		weave_docvals_collect(scan->indexRelation, so->dvOp, so->dvConst, &dvset);
+		matches = dvset;
+		if (haveLex)
+		{
+			TidSet		lexset;
+
+			weave_collect_matches(scan->indexRelation, so->query, &lexset, &lossy);
+			matches = tidset_and(lexset, dvset);
+		}
+		if (matches.n > 0)
+			tbm_add_tuples(tbm, matches.tids, matches.n, lossy);
+		return matches.n;
+	}
+
 	if (!so->queryValid || so->query == NULL)
 		return 0;
 	/* Count the index scan for pg_stat_user_indexes.idx_scan; idx_tup_read is
@@ -4495,6 +4608,100 @@ weave_cgram_collect(Relation index, const char *pat, int patlen, bool ci,
 	weave_chan_cgram_scan++;	/* the route SERVED this scan (weave/weave.h) */
 	return true;
 }
+
+/*
+ * weave_docvals_collect -- the docvalues restriction gate as a TID set.
+ *
+ * Evaluate `value op c` over every bolt's docvalues store and return the heap
+ * TIDs of the matching documents.  This is the plain-path sibling of
+ * weave_collect_matches() (`@@@`) and weave_cgram_collect() (`@~`): the executor
+ * receives the TIDs and applies MVCC visibility on the heap, so a value for a
+ * since-deleted docid is harmless (its heap tuple is gone).  The set is EXACT --
+ * the store maps each docid to its value with no over-generation -- so no recheck
+ * is owed.
+ *
+ * Per-bolt the store's docid array is strictly ascending, so weave_dv_eval_int8()
+ * emits ascending global docids; across bolts the ranges can interleave, so the
+ * concatenation is sorted before return, which is the precondition tidset_and()
+ * and the plain-scan consumers rely on.  A bolt with no docvalues weft (a merged
+ * or pre-Task-4 bolt) contributes nothing -- the documented v1 limitation
+ * (doc/specs/DOCVALS_CHANNEL.md sect. 11), not an error.
+ */
+static int
+weave_docvals_cmp_tid(const void *a, const void *b)
+{
+	return ItemPointerCompare((ItemPointer) a, (ItemPointer) b);
+}
+
+static void
+weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
+{
+	WeaveMetaPageData meta;
+	ItemPointerData *tids = NULL;
+	int			ntids = 0;
+	int			captids = 0;
+	uint32		s;
+
+	out->tids = NULL;
+	out->n = 0;
+
+	if (RelationGetNumberOfBlocks(index) == 0)
+		return;					/* buildempty(): no metapage, no bolts */
+
+	weave_read_meta(index, &meta);
+
+	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		const WeaveSegMeta *seg = &meta.segs[s];
+		AttrNumber	attno = 0;
+		BlockNumber root;
+		const void *img;
+		uint32		ndocs = 0;
+		uint64	   *docids;
+		int			nmatch;
+		int			i;
+
+		if (seg->dictstart == InvalidBlockNumber)
+			continue;			/* consumed slot */
+		root = weave_docvals_root_for_segment(index, seg, &attno);
+		if (root == InvalidBlockNumber)
+			continue;			/* this bolt carries no docvalues weft */
+
+		img = weave_docvals_load(index, root, CurrentMemoryContext, &ndocs);
+		if (ndocs == 0)
+		{
+			pfree((void *) img);
+			continue;
+		}
+
+		/* corpus-scale: one docid per document in the bolt (check-alloc). */
+		docids = (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) ndocs * sizeof(uint64));
+		nmatch = weave_dv_eval_int8(img, op, c, docids, ndocs);
+
+		if (nmatch > 0)
+		{
+			if (ntids + nmatch > captids)
+			{
+				captids = Max(captids ? captids * 2 : 1024, ntids + nmatch);
+				tids = (ItemPointerData *)
+					(tids
+					 ? WEAVE_REALLOC_MAYBE_HUGE(tids, (Size) captids * sizeof(ItemPointerData))
+					 : WEAVE_ALLOC_MAYBE_HUGE((Size) captids * sizeof(ItemPointerData)));
+			}
+			for (i = 0; i < nmatch; i++)
+				weave_docid_to_tid(docids[i], &tids[ntids++]);
+		}
+		pfree(docids);
+		pfree((void *) img);
+	}
+
+	if (ntids > 1)
+		qsort(tids, ntids, sizeof(ItemPointerData), weave_docvals_cmp_tid);
+
+	out->tids = tids;
+	out->n = ntids;
+}
+
 void
 weave_endscan(IndexScanDesc scan)
 {
