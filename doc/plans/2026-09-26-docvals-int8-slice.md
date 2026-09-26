@@ -141,24 +141,25 @@ git commit -m "docvals: int8_docval_ops opclass, layout.dvattno, extension 0.24.
 
 Populate the store during index build and record its root in the chandesc, in ascending `(kind,attnum)` order (spec §9). Mirror the vector accumulator (`weave_vec_accum_add`) and `weave_attach_chandesc`.
 
+> **DONE 2026-09-26.** Two things this task's design surfaced that the plan had wrong or left open, both recorded here (AGENTS.md: a decision gets a written home, not a quiet edit):
+> 1. **The store format was reopened (self-contained docid array, spec §3).** Tracing Task 4→6 showed the fused gate consumes **global** docids (`weave_tid_to_docid`, sparse) while the committed store was a dense array indexed by segment-local docid, with no map between them. Rather than borrow the vector warp map (which would make a facet gate require a vector column), the store now carries its own strictly-ascending `uint64` global-docid array and `weave_dv_eval_int8()` emits global docids directly. This reopened Tasks 1–2 (`docvals.h`, `docvals_page.c`, both tests) — sound because 0.24.0 is unreleased. User-confirmed Option A over warp-map reuse.
+> 2. **`weave_check` did NOT already cover it.** `wvck_mark_reachable()` enumerates the surf/vector/cgram chains explicitly; an unmarked DOCVALS chain would be reported as a leak. Added a single-chain walk mirroring the surf arm (`amcheck.c`). `weave_free_segment` needs **no** arm: the DOCVALS weft is one nextblk chain, freed by the default `weave_free_chain` like the fuzzy weft.
+
 **Files:**
-- Modify: `src/am/ambuild.c` — a `WeaveDocvalsAccum` in `WeaveBuildState`; collect in `weave_build_callback` (~786, alongside the vec/cgram `values[...]` reads); finalize writes the store via `weave_docvals_write`
-- Modify: `src/am/am.c` — `weave_chandesc_for_segment`/`weave_attach_chandesc` (~2644) grow a `dvroot`/`dvattno`; `weave_free_segment` (~3799) gains a `WEAVE_WK_DOCVALS` free arm; `weave_check` chandesc-reachability already covers it
-- Modify: `include/weave/am.h` — `weave_attach_chandesc` signature
+- Modify: `src/am/ambuild.c` — a `WeaveDocvalsAccum` in `WeaveBuildState`; collect in `weave_build_callback` (alongside the vec/cgram `values[...]` reads); finalize writes the store via `weave_docvals_write_weft`. Active only on the two CREATE INDEX heap-scan paths; the merge and post-build insert/flush paths pass it inactive (their rows carry no docvalues gate — the documented G29-class limitation, spec §11).
+- Modify: `src/am/am.c` — `weave_chandesc_for_segment`/`weave_attach_chandesc` grow a `dvroot`; the DOCVALS weft is emitted between FUZZY(3) and CGRAM(5); `weave_free_segment` uses the default free arm (comment added); `weave_docvals_root_for_segment` helper added.
+- Modify: `src/am/amcheck.c` — DOCVALS reachability walk (see note 2).
+- Modify: `include/weave/am.h` — `WeaveDocvalsAccum` + accum/write_weft/root_for_segment decls; `weave_attach_chandesc` and `weave_docvals_write` signatures.
 
 **Interfaces:**
-- Consumes: `weave_docvals_write` (T2), `layout.dvattno` (T3).
-- Produces (T6): a bolt whose `chandesc` has a `WEAVE_WK_DOCVALS` weft rooting a valid store; `weave_docvals_root_for_segment(seg, &attnum)` helper (mirror `vecwrite.c`'s root lookup ~1007).
+- Consumes: `weave_docvals_write_weft` (T2), `layout.dvattno` (T3).
+- Produces (T6): a bolt whose `chandesc` has a `WEAVE_WK_DOCVALS` weft rooting a valid store; `weave_docvals_root_for_segment(index, seg, &attnum)` helper.
 
-- [ ] **Step 1: Write the failing test** — a TAP or `sql` check: build a 2,000-row index with an int8 `price`, then `SELECT (weave_check('t_w')).*` asserts `chandesc_reachable` true and a docvals weft is present; and a new `weave_docvals_dump('t_w', segno)` debug SRF (or reuse `weave_page_info`) shows `WEAVE_PK_DOCVALS` pages. Expected to fail: no weft written.
-- [ ] **Step 2: Run to verify it fails** (coordinator).
-- [ ] **Step 3: Implement** — accumulator + callback collection + finalize write + chandesc attach in `(kind,attnum)` order (WEAVE_WK_DOCVALS=4 between FUZZY=3 and CGRAM=5 — the ordering `am.c:2575` warns about) + free arm.
-- [ ] **Step 4: Build + gates** (coordinator) — `nix build .#pg17`; `installcheck-pg17` green; `weave_check` reports the weft reachable; `check-alloc`/`check-pdlower` clean.
-- [ ] **Step 5: Commit**
-```bash
-git add src/am/ambuild.c src/am/am.c include/weave/am.h
-git commit -m "docvals: write the int8 store at build and attach the weft in chandesc order"
-```
+- [x] **Step 1: Write the failing test** — verified on the local `lpg` cluster (2000-row index with `price int8_docval_ops`).
+- [x] **Step 2: Run to verify it fails** (coordinator) — the pre-Task-4 `.so` wrote no docvalues page.
+- [x] **Step 3: Implement** — accumulator + callback collection + finalize write + chandesc attach in `(kind,attnum)` order + amcheck reachability walk.
+- [x] **Step 4: Build + gates** (coordinator) — `nix build .#pg17`/`.#pg18` exit 0; `installcheck-pg17`/`pg18` exit 0; `make check-standalone` (docvals 7,592,101 checks / 0 failures; positive control fires) + fuzz (435,938 cases, teeth abort under `-DPLANT_BUG`); `check-alloc`/`check-pdlower` clean. Live: `weave_check('t_w', true)` reports `chandesc_reachable` and `pages_reachable_or_freed` both `t`, and `weave_page_info` shows 4 `docvalues` pages for 2000 rows.
+- [x] **Step 5: Commit**
 
 ---
 

@@ -60,19 +60,25 @@
 	(BLCKSZ - (int) MAXALIGN(SizeOfPageHeaderData) - (int) MAXALIGN(sizeof(WeavePageOpaqueData)))
 
 /*
- * Serialize the int8 store (header + n int64 values) into one contiguous buffer.
- * Returns a palloc'd image and sets *len_out to its byte length.
+ * Serialize the int8 store (header + n int64 values + n uint64 global docids)
+ * into one contiguous buffer.  Returns a palloc'd image and sets *len_out to its
+ * byte length.
  *
  * The layout is byte-for-byte what weave_docvals_validate() expects and what the
  * WEAVE_DOCVALS_TEST_HELPERS build (weave_docvals_build) produces, so a store
  * written here reads back through the same validator the standalone property
- * test drives.
+ * test drives.  The docids array is the dense-index -> global-docid map the gate
+ * emits through (see include/weave/docvals.h): it must be strictly ascending,
+ * which weave_docvals_write_weft() guarantees by sorting and the validator
+ * re-checks on the way back in.
  */
 static uint8 *
-docvals_serialize(const int64 *vals, uint32 n, Size *len_out)
+docvals_serialize(const int64 *vals, const uint64 *docids, uint32 n,
+				  Size *len_out)
 {
 	WeaveDocvalsHeader h;
 	uint32		voff = (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader));
+	uint32		doff = voff + n * 8u;
 	Size		len;
 	uint8	   *img;
 
@@ -85,13 +91,14 @@ docvals_serialize(const int64 *vals, uint32 n, Size *len_out)
 	Assert(voff == (uint32) MAXALIGN(sizeof(WeaveDocvalsHeader)));
 
 	/*
-	 * check-alloc: n is corpus-scale (one value per docid in the segment), so
-	 * the image size derives from a corpus-scale quantity and goes through the
-	 * huge-safe path -- the exact allocation class behind four real crashes in
-	 * this extension's ancestor (AGENTS.md's lint table).  values_off + n*8 is
-	 * computed in Size; on a 64-bit target n (uint32) * 8 cannot wrap.
+	 * check-alloc: n is corpus-scale (one value and one docid per docid in the
+	 * segment), so the image size derives from a corpus-scale quantity and goes
+	 * through the huge-safe path -- the exact allocation class behind four real
+	 * crashes in this extension's ancestor (AGENTS.md's lint table).
+	 * values_off + n*8 + n*8 is computed in Size; on a 64-bit target n (uint32) *
+	 * 8 cannot wrap.
 	 */
-	len = (Size) voff + (Size) n * 8;
+	len = (Size) voff + (Size) n * 8 + (Size) n * 8;
 	img = (uint8 *) WEAVE_ALLOC_MAYBE_HUGE(len);
 
 	h.magic = WEAVE_DOCVALS_MAGIC;
@@ -101,11 +108,14 @@ docvals_serialize(const int64 *vals, uint32 n, Size *len_out)
 	h.null_off = 0;
 	h.zonemap_off = 0;
 	h.values_off = voff;
-	h.reserved = 0;
+	h.docids_off = doff;
 	memcpy(img, &h, sizeof(h));
 
 	if (n > 0)
+	{
 		memcpy(img + voff, vals, (Size) n * 8);
+		memcpy(img + doff, docids, (Size) n * 8);
+	}
 
 	*len_out = len;
 	return img;
@@ -113,7 +123,7 @@ docvals_serialize(const int64 *vals, uint32 n, Size *len_out)
 
 BlockNumber
 weave_docvals_write(Relation index, GenericXLogState *state,
-					const int64 *vals, uint32 n)
+					const int64 *vals, const uint64 *docids, uint32 n)
 {
 	BlockNumber first = InvalidBlockNumber;
 	Buffer		prevbuf = InvalidBuffer;
@@ -121,7 +131,7 @@ weave_docvals_write(Relation index, GenericXLogState *state,
 	GenericXLogState *prevstate = NULL;
 	Size		len;
 	Size		off = 0;
-	uint8	   *img = docvals_serialize(vals, n, &len);
+	uint8	   *img = docvals_serialize(vals, docids, n, &len);
 
 	Assert(len > 0);			/* always >= sizeof(WeaveDocvalsHeader) */
 
@@ -344,4 +354,147 @@ weave_docvals_load(Relation index, BlockNumber root,
 		*ndocs_out = h.ndocs;
 	}
 	return (const void *) img;
+}
+
+/* ---------------------------------------------------------------------------
+ * Build-time accumulator (WeaveDocvalsAccum, include/weave/am.h)
+ *
+ * One (docid, value) pair per indexed document, appended in heap-scan order by
+ * the build callback; weave_docvals_write_weft() sorts them into
+ * strictly-ascending docid order and lays down the store.  The mirror of the
+ * vector accumulator (src/vector/vecwrite.c), kept far simpler because there is
+ * nothing to quantize: a docvalue is its own bytes.
+ * ------------------------------------------------------------------------- */
+
+void
+weave_docvals_accum_init(WeaveDocvalsAccum *acc, MemoryContext ctx, bool active)
+{
+	acc->ctx = ctx;
+	acc->active = active;
+	acc->docid = NULL;
+	acc->value = NULL;
+	acc->n = 0;
+	acc->cap = 0;
+}
+
+void
+weave_docvals_accum_reset(WeaveDocvalsAccum *acc)
+{
+	/*
+	 * NULL the pointers and zero the counters, exactly like
+	 * weave_vec_accum_reset(): the caller frees acc->ctx with
+	 * MemoryContextReset() right after, so a pfree here would only pre-empt that,
+	 * and a pointer left set would dangle into the freed context.  active and ctx
+	 * survive so the next segment reuses the same accumulator.
+	 */
+	acc->docid = NULL;
+	acc->value = NULL;
+	acc->n = 0;
+	acc->cap = 0;
+}
+
+void
+weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
+						Datum value, bool isnull)
+{
+	if (!acc->active)
+		return;
+
+	/*
+	 * v1 is NOT NULL.  A placeholder value would silently include NULL rows in a
+	 * `col < x` gate (NULL is UNKNOWN, i.e. excluded), so refuse rather than
+	 * store one; the null-bitmap slice (doc/specs/DOCVALS_CHANNEL.md sect. 11)
+	 * lifts this.  Reachable only at build/REINDEX of a column that admits NULLs.
+	 */
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("weave docvalues column must not contain NULL in this version"),
+				 errhint("Declare the column NOT NULL, or omit it from the index until the null-bitmap slice lands.")));
+
+	if (acc->n >= acc->cap)
+	{
+		/* corpus-scale: one pair per indexed document, so the doubling `cap`
+		 * goes through the huge-safe allocator (check-alloc). */
+		uint32		want = acc->cap ? acc->cap * 2 : 1024;
+
+		acc->docid = acc->docid
+			? WEAVE_REALLOC_MAYBE_HUGE(acc->docid, (Size) want * sizeof(uint64))
+			: WEAVE_ALLOC_MAYBE_HUGE((Size) want * sizeof(uint64));
+		acc->value = acc->value
+			? WEAVE_REALLOC_MAYBE_HUGE(acc->value, (Size) want * sizeof(int64))
+			: WEAVE_ALLOC_MAYBE_HUGE((Size) want * sizeof(int64));
+		acc->cap = want;
+	}
+
+	acc->docid[acc->n] = weave_tid_to_docid(tid);
+	acc->value[acc->n] = DatumGetInt64(value);
+	acc->n++;
+}
+
+/* (docid, value) pair for the sort: one array so qsort moves both halves
+ * together without an indirection per comparison, the vec_docid_order() shape. */
+typedef struct DocvalsPair
+{
+	uint64		docid;
+	int64		value;
+} DocvalsPair;
+
+static int
+docvals_cmp_pair(const void *a, const void *b)
+{
+	uint64		x = ((const DocvalsPair *) a)->docid;
+	uint64		y = ((const DocvalsPair *) b)->docid;
+
+	/* No tie is possible: a docid is derived from a ctid and every heap tuple
+	 * has its own.  Compared as unsigned; a subtraction would overflow. */
+	if (x < y)
+		return -1;
+	return x > y ? 1 : 0;
+}
+
+BlockNumber
+weave_docvals_write_weft(Relation index, WeaveDocvalsAccum *acc)
+{
+	DocvalsPair *pairs;
+	uint64	   *docids;
+	int64	   *vals;
+	BlockNumber root;
+	uint32		i;
+
+	if (!acc->active || acc->n == 0)
+		return InvalidBlockNumber;
+
+	/*
+	 * Sort into strictly-ascending docid order -- the store's invariant and the
+	 * order the gate emits through -- then split into the two contiguous arrays
+	 * the writer takes.  check-alloc: acc->n is corpus-scale, so every size
+	 * derived from it uses the huge-safe allocator.
+	 */
+	pairs = (DocvalsPair *) WEAVE_ALLOC_MAYBE_HUGE((Size) acc->n * sizeof(DocvalsPair));
+	for (i = 0; i < acc->n; i++)
+	{
+		pairs[i].docid = acc->docid[i];
+		pairs[i].value = acc->value[i];
+	}
+	qsort(pairs, acc->n, sizeof(DocvalsPair), docvals_cmp_pair);
+
+	docids = (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) acc->n * sizeof(uint64));
+	vals = (int64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) acc->n * sizeof(int64));
+	for (i = 0; i < acc->n; i++)
+	{
+		docids[i] = pairs[i].docid;
+		vals[i] = pairs[i].value;
+	}
+
+	/* GenericXLogState is NULL here: weave_docvals_write() writes each payload
+	 * page on its own cycle and only names the parameter to document the
+	 * record-the-root-last contract (see its comment); the caller records the
+	 * returned root in the channel descriptor LAST. */
+	root = weave_docvals_write(index, NULL, vals, docids, acc->n);
+
+	pfree(vals);
+	pfree(docids);
+	pfree(pairs);
+	return root;
 }

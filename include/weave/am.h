@@ -1247,7 +1247,7 @@ extern void weave_add_segment_with_room(Relation index, const WeaveSegMeta *seg)
  */
 extern void weave_attach_chandesc(Relation index, WeaveSegMeta *seg,
 								  BlockNumber surfroot, BlockNumber vecroot,
-								  BlockNumber cgramroot);
+								  BlockNumber cgramroot, BlockNumber dvroot);
 
 /* ---------------------------------------------------------------------------
  * The cgram weft: corpus byte trigrams -> docids (task Z8)
@@ -1431,7 +1431,8 @@ extern bool weave_surf_consult(Relation index, const WeaveSegMeta *seg,
  * (corpus-scale) uses the huge-safe allocator.
  */
 extern BlockNumber weave_docvals_write(Relation index, GenericXLogState *state,
-									   const int64 *vals, uint32 n);
+									   const int64 *vals, const uint64 *docids,
+									   uint32 n);
 
 /*
  * Walk the chain from `root`, concatenate the page payloads into one contiguous
@@ -1445,6 +1446,58 @@ extern BlockNumber weave_docvals_write(Relation index, GenericXLogState *state,
  */
 extern const void *weave_docvals_load(Relation index, BlockNumber root,
 									  MemoryContext cxt, uint32 *ndocs_out);
+
+/*
+ * Build-time accumulator for one int8 docvalues column, the mirror of
+ * WeaveVecAccum (include/weave/vector.h): the build callback appends one
+ * (docid, value) pair per indexed document in HEAP-SCAN order, and
+ * weave_docvals_write_weft() sorts them into strictly-ascending docid order and
+ * lays the store down.  It is by value in WeaveBuildState, so its footprint is
+ * counted by the build's memory budget like the vector and cgram accumulators.
+ *
+ * INACTIVE (active == false) on every path that has no docvalues to collect: an
+ * index with no docvalues column, and -- in this v1 slice -- the merge and the
+ * post-build insert/pending-flush paths, whose rows therefore carry no docvalues
+ * gate (the documented G29-class limitation, doc/specs/DOCVALS_CHANNEL.md sect.
+ * 11).  A NULL value is refused with an ERROR in this slice (v1 is NOT NULL); a
+ * later slice stores it in a null bitmap.
+ */
+typedef struct WeaveDocvalsAccum
+{
+	MemoryContext ctx;			/* bs->ctx: the build budget must count this */
+	bool		active;			/* false when there is nothing to collect */
+	uint64	   *docid;			/* n; weave_tid_to_docid of the heap tuple */
+	int64	   *value;			/* n; the int8 facet value at that docid */
+	uint32		n;
+	uint32		cap;
+} WeaveDocvalsAccum;
+
+extern void weave_docvals_accum_init(WeaveDocvalsAccum *acc, MemoryContext ctx,
+									 bool active);
+extern void weave_docvals_accum_reset(WeaveDocvalsAccum *acc);
+extern void weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
+									Datum value, bool isnull);
+
+/*
+ * Write the weft from the accumulator and return its WEAVE_PK_DOCVALS root, or
+ * InvalidBlockNumber when the accumulator is inactive or empty (an absent weft
+ * costs zero bytes, including its descriptor slot).  Sorts the (docid, value)
+ * pairs into strictly-ascending docid order -- the store's own invariant and the
+ * order the gate emits through -- so the caller may append in any order.  That
+ * root is passed to weave_attach_chandesc() LAST, once it is known.
+ */
+extern BlockNumber weave_docvals_write_weft(Relation index,
+											WeaveDocvalsAccum *acc);
+
+/*
+ * The docvalues weft's root block and the index attnum it indexes, read from a
+ * bolt's channel descriptor (mirrors the vector root lookup): sets *attnum and
+ * returns the root, or returns InvalidBlockNumber (and leaves *attnum 0) when the
+ * bolt carries no docvalues weft.  Consumed by the scan-start gate build.
+ */
+extern BlockNumber weave_docvals_root_for_segment(Relation index,
+												  const WeaveSegMeta *seg,
+												  AttrNumber *attnum);
 
 /*
  * The one posting decoder.  Every channel reads a term's postings through this:

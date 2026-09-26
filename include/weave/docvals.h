@@ -9,11 +9,25 @@
  * docid space -- the same docid space the lexical and vector wefts use, which is
  * what lets a selective facet bound skip work in another channel.
  *
+ * THE STORE IS SELF-CONTAINED IN THE GLOBAL DOCID SPACE.  The fused core drives
+ * every channel in the GLOBAL docid space -- weave_tid_to_docid() = heap block *
+ * MaxHeapTuplesPerPage + offset (include/weave/am.h, include/weave/gate.h) --
+ * which is SPARSE, not the dense [0,ndocs) array index.  So a docvalues gate must
+ * emit those global docids, and the only structure that maps a dense index to a
+ * global docid is a per-bolt map.  The vector weft's warp map is one such map, but
+ * it exists only when the bolt has a vector column, and claim 3 (a selective WHERE
+ * makes the scan faster) must hold for a facet gate whether or not a vector column
+ * is present.  So THIS store carries its OWN map: alongside the dense value array
+ * it stores a parallel, STRICTLY ASCENDING array of the global docid each dense
+ * index denotes (doc/specs/DOCVALS_CHANNEL.md sect. 3, "self-contained docid
+ * array", decided 2026-09-26).  weave_dv_eval_int8() therefore emits GLOBAL
+ * DOCIDS, ready to feed weave_gate_shuttle_from_tidset() with no external map.
+ *
  * This slice covers a SINGLE int8 (int64) column with no nulls and no zone-map.
  * It is extracted here as pure standalone C (no PostgreSQL includes) so it can
  * be exercised by standalone property tests (test/hegel/) while remaining the
- * single source of truth -- the backend page writer (a later task) will
- * #include this header rather than carry its own copy, and will assert that its
+ * single source of truth -- the backend page writer (src/pages/docvals_page.c)
+ * #includes this header rather than carry its own copy, and asserts that its
  * MAXALIGN agrees with WEAVE_DV_MAXALIGN below.
  *
  * When included from a PostgreSQL backend TU, postgres.h has already defined
@@ -52,18 +66,26 @@ typedef uint8_t uint8;
 /*
  * On-disk header for a v1 int8 docvalues store.  Fixed-width fields only, so the
  * byte layout is identical on every target: the total is 28 bytes with no
- * trailing padding (largest member is 4-byte aligned), and the int8 value array
- * begins at values_off == WEAVE_DV_MAXALIGN(28) == 32.  These bytes come off
- * disk and are NOT trusted; weave_docvals_validate() checks every field before
- * any value is read.
+ * trailing padding (largest member is 4-byte aligned).  The store has three
+ * regions after the header:
  *
- * Reconciling with doc/specs/DOCVALS_CHANNEL.md §3: the spec's header lists
+ *	 values	 : ndocs int64 values, begins at values_off == WEAVE_DV_MAXALIGN(28).
+ *	 docids	 : ndocs uint64 GLOBAL docids (weave_tid_to_docid), STRICTLY ascending,
+ *			   begins at docids_off == values_off + ndocs*8.  docids[i] is the
+ *			   global docid the dense index i denotes; the two arrays are parallel.
+ *
+ * These bytes come off disk and are NOT trusted; weave_docvals_validate() checks
+ * every field, and the strict ascent of the docid array, before any value or
+ * docid is read -- because a non-ascending docid array is a confident wrong gate
+ * set, not an error, if it reaches the evaluator (the exact hazard
+ * include/weave/vecdocmap.h spends its header on).
+ *
+ * Reconciling with doc/specs/DOCVALS_CHANNEL.md sect. 3: the spec's header lists
  * typid/typlen/typbyval/collation, but this v1 slice is int8-only, so all of
- * that type identity collapses to a single typid_kind (== 1 for int8) and no
- * width/byval/collation word is needed yet.  The float/date/text slices, whose
- * type and collation metadata the spec anticipates, arrive under a bumped
- * version consuming the currently-`reserved` word -- which is why both
- * typid_kind and reserved exist here rather than the full spec field set.
+ * that type identity collapses to a single typid_kind (== 1 for int8).  The
+ * float/date/text slices, whose type and collation metadata the spec anticipates,
+ * arrive under a bumped version.  null_off and zonemap_off are 0 in v1 and
+ * reserved for the null bitmap and per-block zone-map those later slices add.
  */
 typedef struct WeaveDocvalsHeader
 {
@@ -78,7 +100,10 @@ typedef struct WeaveDocvalsHeader
 								 * non-breaking addition a v1 reader rejects (it
 								 * requires ==0) rather than silently misreads. */
 	uint32		values_off;		/* MAXALIGN(sizeof header); start of int8 array */
-	uint32		reserved;		/* 0; kept for a future flags/pad word */
+	uint32		docids_off;		/* values_off + ndocs*8; start of the parallel
+								 * uint64 global-docid array (see the file header:
+								 * the store is self-contained in the global docid
+								 * space and needs no external warp map). */
 } WeaveDocvalsHeader;
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
@@ -90,12 +115,12 @@ _Static_assert(sizeof(WeaveDocvalsHeader) == 28,
 #define WEAVE_DOCVALS_MAGIC		0x57445631u
 
 /*
- * Local MAXALIGN.  The int8 values are 8-byte int64, so the value array is
- * 8-byte aligned.  The mask is size_t-width (~(size_t) 7, not ~7u) so a 64-bit
- * argument's high bits are not truncated by a 32-bit int mask.  This matches
- * PostgreSQL's MAXALIGN for the 8-byte case (MAXIMUM_ALIGNOF == 8 on every
- * platform this project targets); the backend page writer will assert that
- * agreement rather than assume it.
+ * Local MAXALIGN.  The int8 values are 8-byte int64 and the docids are 8-byte
+ * uint64, so both arrays are 8-byte aligned.  The mask is size_t-width
+ * (~(size_t) 7, not ~7u) so a 64-bit argument's high bits are not truncated by a
+ * 32-bit int mask.  This matches PostgreSQL's MAXALIGN for the 8-byte case
+ * (MAXIMUM_ALIGNOF == 8 on every platform this project targets); the backend page
+ * writer asserts that agreement rather than assume it.
  */
 #define WEAVE_DV_MAXALIGN(x)	(((x) + 7) & ~(size_t) 7)
 
@@ -115,16 +140,22 @@ typedef enum
 
 /*
  * Returns NULL if img (of byte length len) is a structurally valid v1 int8 store
- * for its stated ndocs; otherwise a STATIC reason string.  On-disk bytes are not
- * trusted, so every field is checked and nothing past len is ever read: the size
- * bound values_off + ndocs*8 is computed in uint64 so a large ndocs cannot wrap
- * a size_t and admit a too-short image.
+ * for its stated ndocs, whose docid array is strictly ascending; otherwise a
+ * STATIC reason string.  On-disk bytes are not trusted, so every field is checked
+ * and nothing past len is ever read: the size bound docids_off + ndocs*8 is
+ * computed in uint64 so a large ndocs cannot wrap a size_t and admit a too-short
+ * image.
  */
 static inline const char *
 weave_docvals_validate(const void *img, size_t len)
 {
 	WeaveDocvalsHeader h;
-	uint64		need;
+	const unsigned char *base = (const unsigned char *) img;
+	uint32		voff = (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader));
+	uint64		docids_need;
+	uint64		total_need;
+	uint32		i;
+	uint64		prev = 0;
 
 	if (len < sizeof(WeaveDocvalsHeader))
 		return "image shorter than header";
@@ -143,33 +174,51 @@ weave_docvals_validate(const void *img, size_t len)
 		return "unsupported docvalues version";
 	if (h.typid_kind != 1)
 		return "unsupported value kind (v1 is int8 only)";
-	if (h.values_off != (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader)))
+	if (h.values_off != voff)
 		return "values_off does not match aligned header size";
 	if (h.null_off != 0)
 		return "null_off must be 0 in v1";
 	if (h.zonemap_off != 0)
 		return "zonemap_off must be 0 in v1";
-	if (h.reserved != 0)
-		return "reserved must be 0 in v1";
 
 	/*
-	 * Overflow-safe size check: values_off + ndocs*8 in uint64.  ndocs is uint32
-	 * so ndocs*8 <= ~3.4e10 cannot wrap uint64, and comparing the uint64 bound
-	 * against len (widened to uint64) never truncates.
+	 * Overflow-safe offsets and size check, all in uint64.  ndocs is uint32 so
+	 * ndocs*8 <= ~3.4e10 cannot wrap uint64, and values_off + ndocs*8 stays well
+	 * inside uint64, so docids_off is exact and comparisons never truncate.
 	 */
-	need = (uint64) h.values_off + (uint64) h.ndocs * 8u;
-	if ((uint64) len < need)
+	docids_need = (uint64) h.values_off + (uint64) h.ndocs * 8u;
+	if ((uint64) h.docids_off != docids_need)
+		return "docids_off does not follow the values array";
+	total_need = (uint64) h.docids_off + (uint64) h.ndocs * 8u;
+	if ((uint64) len < total_need)
 		return "image too short for stated ndocs";
+
+	/*
+	 * The docid array must be STRICTLY ascending: it is the dense-index ->
+	 * global-docid map the gate emits through, and a non-monotone or duplicated
+	 * entry would produce a wrong gate set (dropped or misordered rows), not an
+	 * error, downstream.  Validate it here at the trust boundary.  Every read is
+	 * inside [docids_off, docids_off + ndocs*8) which total_need bounds by len.
+	 */
+	for (i = 0; i < h.ndocs; i++)
+	{
+		uint64		d;
+
+		memcpy(&d, base + h.docids_off + (size_t) i * 8u, sizeof(d));
+		if (i > 0 && d <= prev)
+			return "docid array is not strictly ascending";
+		prev = d;
+	}
 
 	return NULL;
 }
 
 /*
- * Value at docid.  Caller guarantees docid < ndocs (asserted).  Reads via memcpy
- * so an unaligned img or strict-aliasing does not invoke UB.
+ * Value at dense index.  Caller guarantees idx < ndocs (asserted).  Reads via
+ * memcpy so an unaligned img or strict-aliasing does not invoke UB.
  */
 static inline int64_t
-weave_docvals_int8(const void *img, uint32_t docid)
+weave_docvals_int8(const void *img, uint32_t idx)
 {
 	WeaveDocvalsHeader h;
 	const unsigned char *base = (const unsigned char *) img;
@@ -177,22 +226,43 @@ weave_docvals_int8(const void *img, uint32_t docid)
 
 	/* memcpy the header: img need not be aligned (see the struct comment). */
 	memcpy(&h, img, sizeof(h));
-	assert(docid < h.ndocs);
-	memcpy(&v, base + h.values_off + (size_t) docid * 8u, sizeof(v));
+	assert(idx < h.ndocs);
+	memcpy(&v, base + h.values_off + (size_t) idx * 8u, sizeof(v));
 	return v;
 }
 
 /*
- * Write, in ASCENDING docid order, every docid in [0,ndocs) whose value
- * satisfies (value op c) into out[] (capacity outcap, which callers set to
- * ndocs).  Returns the count of matches.  Pure, no allocation.  A write is
+ * Global docid the dense index denotes.  Caller guarantees idx < ndocs
+ * (asserted).  memcpy for the same alignment/aliasing reason as the value read.
+ */
+static inline uint64_t
+weave_docvals_docid(const void *img, uint32_t idx)
+{
+	WeaveDocvalsHeader h;
+	const unsigned char *base = (const unsigned char *) img;
+	uint64_t	d;
+
+	memcpy(&h, img, sizeof(h));
+	assert(idx < h.ndocs);
+	memcpy(&d, base + h.docids_off + (size_t) idx * 8u, sizeof(d));
+	return d;
+}
+
+/*
+ * Write, in ASCENDING order, the GLOBAL DOCID of every dense index in [0,ndocs)
+ * whose value satisfies (value op c) into out[] (capacity outcap, which callers
+ * set to ndocs).  Returns the count of matches.  Pure, no allocation.  A write is
  * guarded by outcap so a mis-sized buffer truncates rather than overruns; the
- * returned count is always the true number of matches.  NULLs are not in this
- * slice (the store has none).
+ * returned count is always the true number of matches.
+ *
+ * The output is ascending because the docid array is strictly ascending in the
+ * dense index and the pass visits indices in order (the validator has already
+ * refused a store whose docid array is not).  NULLs are not in this slice (the
+ * store has none).
  */
 static inline int
 weave_dv_eval_int8(const void *img, WeaveDvStrat op, int64_t c,
-				   uint32_t *out, uint32_t outcap)
+				   uint64_t *out, uint32_t outcap)
 {
 	WeaveDocvalsHeader h;
 	uint32_t	n;
@@ -233,7 +303,7 @@ weave_dv_eval_int8(const void *img, WeaveDvStrat op, int64_t c,
 		if (match)
 		{
 			if ((uint32_t) count < outcap)
-				out[count] = i;
+				out[count] = weave_docvals_docid(img, i);
 			count++;
 		}
 	}
@@ -241,30 +311,35 @@ weave_dv_eval_int8(const void *img, WeaveDvStrat op, int64_t c,
 }
 
 /*
- * Test-only helpers to build an in-memory store from an int64 array.  Guarded so
- * they never enter a backend build; the property test defines
+ * Test-only helpers to build an in-memory store from parallel value and docid
+ * arrays.  Guarded so they never enter a backend build; the property test defines
  * WEAVE_DOCVALS_TEST_HELPERS.
  */
 #ifdef WEAVE_DOCVALS_TEST_HELPERS
 
-/* Bytes a store of ndocs int8 values occupies: values_off + ndocs*8. */
+/* Bytes a store of ndocs int8 values occupies: header + values + docids. */
 static inline size_t
 weave_docvals_store_len(uint32_t ndocs)
 {
 	return (size_t) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader))
-		+ (size_t) ndocs * 8u;
+		+ (size_t) ndocs * 8u	/* values */
+		+ (size_t) ndocs * 8u;	/* docids */
 }
 
 /*
- * Fill header + values into buf, which must be at least
- * weave_docvals_store_len(ndocs) bytes.
+ * Fill header + values + docids into buf, which must be at least
+ * weave_docvals_store_len(ndocs) bytes.  The caller supplies the docids
+ * (strictly ascending for a well-formed store; the test also builds malformed
+ * ones on purpose to check the validator refuses them).
  */
 static inline void
-weave_docvals_build(void *buf, const int64_t *vals, uint32_t ndocs)
+weave_docvals_build(void *buf, const int64_t *vals, const uint64_t *docids,
+					uint32_t ndocs)
 {
 	WeaveDocvalsHeader *h = (WeaveDocvalsHeader *) buf;
 	unsigned char *base = (unsigned char *) buf;
 	uint32		voff = (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader));
+	uint32		doff = voff + ndocs * 8u;
 	uint32_t	i;
 
 	h->magic = WEAVE_DOCVALS_MAGIC;
@@ -274,10 +349,12 @@ weave_docvals_build(void *buf, const int64_t *vals, uint32_t ndocs)
 	h->null_off = 0;
 	h->zonemap_off = 0;
 	h->values_off = voff;
-	h->reserved = 0;
+	h->docids_off = doff;
 
 	for (i = 0; i < ndocs; i++)
 		memcpy(base + voff + (size_t) i * 8u, &vals[i], sizeof(int64_t));
+	for (i = 0; i < ndocs; i++)
+		memcpy(base + doff + (size_t) i * 8u, &docids[i], sizeof(uint64_t));
 }
 
 #endif							/* WEAVE_DOCVALS_TEST_HELPERS */

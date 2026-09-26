@@ -53,15 +53,32 @@ One weft per docvals column, `chandesc` slot kind `WEAVE_WK_DOCVALS`, root = a
 segment-local docid space, shared by every weft in the bolt), so lookup is an array index,
 not a search.
 
+**The store is self-contained in the global docid space (decided 2026-09-26, build-order
+step 1).** The fused core drives every channel in the **global** docid space
+(`weave_tid_to_docid()` = heap block × `MaxHeapTuplesPerPage` + offset — sparse), which is
+where the lexical and gate channels live; the vector weft's dense lane index is relabelled
+into it by its warp map (`vecdocmap.h`). A docvalues gate must therefore emit **global**
+docids, and the only per-bolt structure that maps a dense index to a global docid is that
+warp map — which exists **only when the bolt has a vector column**. Claim 3 (a selective
+`WHERE` makes the scan faster) must hold for a facet gate whether or not a vector column is
+present, so the docvalues store does **not** borrow the warp map: it carries **its own**
+strictly-ascending array of the global docid each dense index denotes, parallel to the value
+array. `weave_dv_eval_int8()` then emits global docids directly, ready for
+`weave_gate_shuttle_from_tidset()` with no external map. (The alternative — reuse the vector
+warp map — was rejected because it silently makes the facet gate require a vector column, a
+surprising limitation that undermines the general claim-3 story. Cost of the chosen design:
++8 bytes/doc on disk.)
+
 **Versioned header** (format v1), sized so the deferred zone-map (§ decision 2) is a
-non-breaking addition — it carries a `zonemap_off` that is 0 in v1 and a reserved
-`flags` word, following the X1 pattern of self-describing spare fields:
+non-breaking addition — it carries a `zonemap_off` that is 0 in v1, following the X1 pattern
+of self-describing spare fields:
 
 | region | v1 contents |
 |---|---|
-| header | magic, format version, value typid, `typlen`/`typbyval`, collation oid (text), ndocs, `null_off`, `zonemap_off` (0 in v1), reserved |
-| null bitmap | one bit per docid, 1 = NULL; absent if the column is `NOT NULL` |
-| values | see below |
+| header | magic, format version, value typid (int8-kind in v1), ndocs, `null_off` (0 in v1), `zonemap_off` (0 in v1), `values_off`, `docids_off` |
+| null bitmap | one bit per docid, 1 = NULL; absent if the column is `NOT NULL` (v1 is NOT NULL: build ERRORs on a NULL) |
+| values | dense per-docid value array (see below) |
+| docids | dense **strictly-ascending** `uint64` array: the global docid (`weave_tid_to_docid`) each dense index denotes — the self-contained map above |
 | *(reserved)* | zone-map: per-block min/max, added later without a version bump |
 
 **Fixed-width types (int2/4/8, float4/8, date, timestamp, bool):** a dense array indexed by
