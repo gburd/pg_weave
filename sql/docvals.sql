@@ -139,3 +139,64 @@ SELECT NOT EXISTS (SELECT 1 FROM dv_gated
 DROP TABLE dv_gated, dv_ungated;
 DROP FUNCTION dv_agree(text);
 DROP TABLE dv;
+
+-- ---------------------------------------------------------------------------
+-- (6) THE DOCVALS WEFT SURVIVES A SEGMENT MERGE (doc/GAPS.md G51).  A build that
+-- flushes more than one segment, or a post-build INSERT + VACUUM that flushes a
+-- second segment, is merged by weave_merge() into one bolt.  The merge must carry
+-- the docvals weft of every input that has one into the output bolt; before the
+-- G51 fix it wrote an EMPTY store, so a `price <op> c` gate over the merged bolt
+-- returned ZERO rows -- a silent wrong answer that every existing test missed
+-- because they all build a single segment (hard rule 12 / the eleventh member: no
+-- test had ever run a docvals weft through a merge).
+--
+-- POSITIVE CONTROL: the `> 1` assertion makes a merge that never happened (one
+-- segment) impossible to pass off as a fix, and `pre_merge_gate = 150` shows the
+-- gate was correct on the first segment BEFORE the merge, so a post-merge 0 is the
+-- merge losing it, not the build never writing it.
+-- ---------------------------------------------------------------------------
+CREATE TABLE dvm (id bigint PRIMARY KEY, body wdoc, price bigint);
+INSERT INTO dvm SELECT g, to_wdoc('common doc ' || (g % 5)), g
+  FROM generate_series(1, 300) g;
+CREATE INDEX dvm_w ON dvm USING weave (body, price int8_docval_ops);
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- gate correct on the single build segment (rows 1..300, price = id)
+SELECT count(*) AS pre_merge_gate FROM dvm WHERE price <= 150;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+-- a post-build INSERT + VACUUM flushes a SECOND segment (weave.sql's fixture
+-- shape); a run of two is below the tiered auto-merge threshold, so both persist
+INSERT INTO dvm SELECT g, to_wdoc('common doc ' || (g % 5)), g
+  FROM generate_series(301, 600) g;
+VACUUM dvm;
+SELECT weave_index_nsegments('dvm_w') > 1 AS more_than_one_segment;
+
+SELECT weave_merge('dvm_w') IS NOT NULL AS merged;
+SELECT weave_index_nsegments('dvm_w') = 1 AS one_segment_after_merge;
+
+-- THE GATE STILL WORKS AFTER THE MERGE.  price <= 150 selects the 150 rows the
+-- first (docvals-bearing) segment held; the merged bolt must still answer it.
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) AS post_merge_gate FROM dvm WHERE price <= 150;
+-- and it agrees with the heap, forced both ways
+CREATE TEMP TABLE dvm_idx AS SELECT id FROM dvm WHERE price <= 150;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE dvm_seq AS SELECT id FROM dvm WHERE price <= 150;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+SELECT count(*) AS merged_gate_disagreements FROM (
+    SELECT id FROM dvm_idx EXCEPT SELECT id FROM dvm_seq
+    UNION ALL
+    SELECT id FROM dvm_seq EXCEPT SELECT id FROM dvm_idx
+) d;
+
+DROP TABLE dvm_idx, dvm_seq;
+DROP TABLE dvm;
+
