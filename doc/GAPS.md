@@ -3712,3 +3712,44 @@ scan does not honour returns rows with plausible scores):
 FIX lands with the combined Task 5+6 (scan honours the docvalues gate). Until
 then, 0.24.0 must not be released, and a defensive guard that turns the crash into
 a clean `ERROR` is the minimum if any 0.24.x is cut before the gate is done.
+
+### G50 — the build callback detoasts every lexical/cgram value into the long-lived `bs->ctx` and never frees it until the flush reset — **OPEN 2026-09-26, found by the pg_turbovec Z6 review, and NOT the unbounded form of that bug**
+
+`weave_build_callback` (`src/am/ambuild.c:851,921`) switches into `bs->ctx` and
+calls `PG_DETOAST_DATUM(values[lexidx])`; `weave_cgram_accum_add`
+(`ambuild.c:2372-2373`) and `weave_insert_oversized_as_segment`
+(`ambuild.c:5803,5826,5852`) do the same. When the column value is toasted or
+compressed — which is the common case for the large text bodies this index is
+built for — `PG_DETOAST_DATUM` palloc's a fresh decoded blob **in `bs->ctx`**, and
+nothing frees it until the next `MemoryContextReset(bs->ctx)` at segment flush.
+Only the *extracted* postings need to outlive the row; the raw decoded blob does
+not.
+
+This is the exact shape of the sibling project's Z6 defect (pg_turbovec, root-caused
+2026-09-26): a `PostgresType` decoded per row via `FromDatum::from_datum` accumulated
+in the long-lived `ambuild` context because the build path had no memory-context
+management — 2M rows × ~5 kB of decoded CBOR = ~9.5 GiB resident in a build whose
+whole design spills the corpus to disk. Their fix was a per-tuple context reset
+around the callback, taking build peak from 12.16 → 3.45 GiB and 16 % off wall time.
+
+**Why this is the BOUNDED form for us, not theirs (recorded per hard rule 8, as
+much a design win as a gap).** pg_weave's flush budget is
+`MemoryContextMemAllocated(bs->ctx, true)` (`ambuild.c:846-848`), which *counts*
+these dead detoast blobs, so peak is bounded by `maintenance_work_mem`, not by the
+corpus — the unbounded-peak OOM that hit them cannot happen here. The residual cost
+is efficiency, not survival: dead per-row blobs inflate the budget accounting, so
+segments flush **earlier and smaller** than the live working set warrants →
+more segments → more merge work. That is a G20-family (ingest-amplification) cost,
+not a correctness or peak-memory cost.
+
+**Owed before any fix (hard rule 9): measure it.** Build an index on a corpus whose
+lexical column is genuinely toasted (bodies > ~2 kB so `PG_DETOAST_DATUM` actually
+copies) and compare, at a fixed `maintenance_work_mem`: (a) segment count and mean
+segment size, (b) `MemoryContextMemAllocated(bs->ctx, true)` sampled between flushes
+vs. the live-postings-only footprint, (c) total merge work. If the dead-blob share
+of the budget is small (short docs, uncompressed) the fix buys nothing and should
+not ship. The fix itself — detoast into a per-tuple scratch context reset every row,
+or `pfree` the detoasted datum after the `add_posting` loop — is a code change with
+one real hazard to clear first (does `add_posting`/`build_term_append` **copy** the
+term bytes out of `doc`, or alias into it? aliasing means freeing the blob dangles),
+so it goes through the TDD worker→reviewer flow, not a coordinator edit.

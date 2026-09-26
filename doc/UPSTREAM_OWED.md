@@ -49,15 +49,15 @@ yet and the search for a usable one costs ~195 deferred probes. Unbounded probin
 179,418 pages but costs 48 % wall clock. Details in
 `bench/RESULTS_G20_SNAPSHOT_ALLOC.md`.
 
-## To pg_tre — a `uleven.c` out-of-bounds read, still present at 4.0.2
+## To pg_tre — a `uleven.c` out-of-bounds read — **DELIVERED 2026-09-23** (pg_tre `ea2fd95`, "doc/reports: out-of-bounds read in uleven.c, reported from pg_weave")
 
-We fixed it on import; their `src/query/uleven.c` still has the unguarded loop. Ours is
-`src/query/uleven.c` with the guard. Send the guard, and note that we are a
-PostgreSQL-licensed fork of their MIT code so the flow back is one-directional by
-licence, not by preference.
+Sent. We fixed it on import (`src/query/uleven.c` has the guard); their
+`src/query/uleven.c` still had the unguarded loop at 4.0.2. The report also carried
+the thank-you notes below. Kept here (not deleted) as the provenance record for the
+guard divergence; the debt itself is discharged.
 
-**Also worth telling them:** pg_tre 4.0.0 removing the custom resource manager and
-converting all 22 WAL sites to generic WAL converged on the choice we made at fork time
+**Told them, as a thank-you rather than a bug:** pg_tre 4.0.0 removing the custom
+resource manager and converting all 22 WAL sites to generic WAL converged on the choice we made at fork time
 for `trusted` eligibility. Their `6227d7c` (first pending page left `pending_head`
 un-WAL-logged) is the bug class we audited for and did not find, and one thing they may
 want: `blbuildempty()`'s post-PG-16 form is **not** a safe template for an init fork,

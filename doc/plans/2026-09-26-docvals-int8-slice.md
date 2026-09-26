@@ -237,6 +237,10 @@ The slice's gate (spec §11 step 1): the scalar arm must now *fall* with selecti
 - [ ] **Step 2:** Run the two arms from the sizing spike, but arm S now uses `WHERE price <op> const` (pushable) instead of `id % N` (filter). Capture `vec_blocks` across selectivity 0.1/0.01/0.001. (Coordinator; work counters are deterministic/host-independent — no EC2 needed.)
 - [ ] **Step 3: Assert the prize is captured** — arm S `vec_blocks` now *falls* with selectivity (matching arm L within the selectivity-match tolerance), not grows. If it does not, the gate is not pruning — stop and diagnose (reach for the ablation: is the Index Cond present? is the gate set non-empty and sorted?).
 - [ ] **Step 4:** Record the measured before/after in `RESULTS_DOCVALS_PRIZE.md` (losses as prominently as wins — if it captures less than the projected 82.8×, say by how much and why).
+
+**Measurement discipline for this task (see `bench/METHODOLOGY.md`, AGENTS.md rules 15–16):**
+- The `vec_blocks` sweep is a work counter — deterministic, host-independent, no EC2. If a *latency* number is added, it must follow the harness rules: inline the query vector as a literal (no `ORDER BY` subquery — it adds ~90 ms InitPlan on every arm), one `psql -f` session per arm with the warm-up discarded, and time the top-level `EXPLAIN (ANALYZE)` Execution Time (the Index-Scan node excludes our in-AM rerank).
+- **Do not report a selectivity floor as a wall (rule 15).** The prior 2k-row `lpg` probe that showed `vec_scores` rising is a LIMIT-driven widening confound, not a ceiling — this task must use a corpus large enough that top-k is filled well inside the vector stream at every selectivity, and label any residual "grid-limited" with the depth/LIMIT that produced it rather than concluding the gate "cannot" prune.
 - [ ] **Step 5: Commit**
 ```bash
 git add bench/RESULTS_DOCVALS_PRIZE.md
