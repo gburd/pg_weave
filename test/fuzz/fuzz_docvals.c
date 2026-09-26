@@ -58,16 +58,33 @@ rnd(void)
 	return (uint32_t) ((z ^ (z >> 31)) >> 16);
 }
 
+/* Fill docids[0..n) strictly ascending and sparse, the weave_tid_to_docid()
+ * shape, so a well-formed image passes the validator's strict-ascent check. */
+static void
+fill_docids(uint64_t *docids, uint32_t n)
+{
+	uint32_t	i;
+	uint64_t	d = rnd() % 4u;
+
+	for (i = 0; i < n; i++)
+	{
+		docids[i] = d;
+		d += 1u + (rnd() % 8u);
+	}
+}
+
 #ifdef PLANT_BUG
 /*
- * The planted bug: weave_docvals_validate() with the image-length guard deleted.
- * Everything else is identical.  A too-short image with a large ndocs is then
- * accepted, and the read-all-values postcondition below MUST overrun.
+ * The planted bug: weave_docvals_validate() with the image-length guard deleted
+ * (and, since it can no longer be reached safely, the strict-ascent loop it
+ * feeds).  Everything else is identical.  A too-short image with a large ndocs is
+ * then accepted, and the read-all-values/docids postcondition below MUST overrun.
  */
 static const char *
 weak_validate(const void *img, size_t len)
 {
 	WeaveDocvalsHeader h;
+	uint32_t	voff = (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader));
 
 	if (len < sizeof(WeaveDocvalsHeader))
 		return "image shorter than header";
@@ -78,16 +95,17 @@ weak_validate(const void *img, size_t len)
 		return "unsupported version";
 	if (h.typid_kind != 1)
 		return "unsupported value kind";
-	if (h.values_off != (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader)))
+	if (h.values_off != voff)
 		return "values_off mismatch";
 	if (h.null_off != 0)
 		return "null_off must be 0";
 	if (h.zonemap_off != 0)
 		return "zonemap_off must be 0";
-	if (h.reserved != 0)
-		return "reserved must be 0";
+	if ((uint64_t) h.docids_off != (uint64_t) voff + (uint64_t) h.ndocs * 8u)
+		return "docids_off mismatch";
 	/* THE MISSING GUARD:
-	 * need = values_off + ndocs*8; if (len < need) return "too short"; */
+	 * total = docids_off + ndocs*8; if (len < total) return "too short";
+	 * (and the strict-ascent loop it makes safe) */
 	return NULL;
 }
 #define VALIDATE(img, len)	weak_validate((img), (len))
@@ -110,6 +128,7 @@ verify_accepted(const unsigned char *img, size_t len)
 	uint64_t	need;
 	uint32_t	d;
 	int64_t		acc = 0;
+	uint64_t	dacc = 0;
 
 	assert(len >= sizeof(WeaveDocvalsHeader));
 	memcpy(&h, img, sizeof(h));
@@ -119,16 +138,23 @@ verify_accepted(const unsigned char *img, size_t len)
 	assert(h.values_off == (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader)));
 	assert(h.null_off == 0);
 	assert(h.zonemap_off == 0);
-	assert(h.reserved == 0);
+	assert((uint64_t) h.docids_off ==
+		   (uint64_t) h.values_off + (uint64_t) h.ndocs * 8u);
 
-	need = (uint64_t) h.values_off + (uint64_t) h.ndocs * 8u;
+	need = (uint64_t) h.docids_off + (uint64_t) h.ndocs * 8u;
 	assert((uint64_t) len >= need);
 
-	/* Read every value: in the accepted case this is in-bounds by construction;
-	 * under PLANT_BUG a too-short accepted image overruns here and ASan aborts. */
+	/* Read every value AND every docid: in the accepted case this is in-bounds by
+	 * construction; under PLANT_BUG a too-short accepted image overruns here (the
+	 * docid array sits last, so its read is the sharpest overrun) and ASan
+	 * aborts, proving the harness detects the dropped guard instead of passing
+	 * vacuously. */
 	for (d = 0; d < h.ndocs; d++)
 		acc ^= weave_docvals_int8(img, d);
+	for (d = 0; d < h.ndocs; d++)
+		dacc ^= weave_docvals_docid(img, d);
 	(void) acc;
+	(void) dacc;
 }
 
 #define MAXN	512
@@ -149,12 +175,14 @@ main(void)
 		size_t		len = weave_docvals_store_len(n);
 		unsigned char *exact = (unsigned char *) malloc(len);
 		int64_t	   *vals = (int64_t *) malloc((n ? n : 1) * sizeof(int64_t));
+		uint64_t   *docids = (uint64_t *) malloc((n ? n : 1) * sizeof(uint64_t));
 		uint32_t	i;
 		const char *why;
 
 		for (i = 0; i < n; i++)
 			vals[i] = (int64_t) (((uint64_t) rnd() << 32) | rnd());
-		weave_docvals_build(exact, vals, n);
+		fill_docids(docids, n);
+		weave_docvals_build(exact, vals, docids, n);
 
 		why = VALIDATE(exact, len);
 		if (why != NULL)
@@ -163,13 +191,17 @@ main(void)
 					n, why);
 			free(exact);
 			free(vals);
+			free(docids);
 			return 1;
 		}
 		verify_accepted(exact, len);
 		for (i = 0; i < n; i++)
 			assert(weave_docvals_int8(exact, i) == vals[i]);
+		for (i = 0; i < n; i++)
+			assert(weave_docvals_docid(exact, i) == docids[i]);
 		free(exact);
 		free(vals);
+		free(docids);
 		iters++;
 	}
 
@@ -181,12 +213,14 @@ main(void)
 		size_t		len = weave_docvals_store_len(n);
 		unsigned char *full = (unsigned char *) malloc(len);
 		int64_t	   *vals = (int64_t *) malloc((n ? n : 1) * sizeof(int64_t));
+		uint64_t   *docids = (uint64_t *) malloc((n ? n : 1) * sizeof(uint64_t));
 		uint32_t	i;
 		size_t		cut;
 
 		for (i = 0; i < n; i++)
 			vals[i] = (int64_t) rnd();
-		weave_docvals_build(full, vals, n);
+		fill_docids(docids, n);
+		weave_docvals_build(full, vals, docids, n);
 
 		for (cut = 0; cut <= len; cut++)
 		{
@@ -207,6 +241,7 @@ main(void)
 		}
 		free(full);
 		free(vals);
+		free(docids);
 	}
 
 	/* 3. random single- and multi-byte corruption of a well-formed image, plus a
@@ -217,6 +252,7 @@ main(void)
 		size_t		len = weave_docvals_store_len(n);
 		unsigned char *scratch = (unsigned char *) malloc(len);
 		int64_t	   *vals = (int64_t *) malloc((n ? n : 1) * sizeof(int64_t));
+		uint64_t   *docids = (uint64_t *) malloc((n ? n : 1) * sizeof(uint64_t));
 		int			nsmash = 1 + (int) (rnd() % 8);
 		unsigned char *exact;
 		size_t		avail;
@@ -226,7 +262,8 @@ main(void)
 
 		for (i = 0; i < n; i++)
 			vals[i] = (int64_t) rnd();
-		weave_docvals_build(scratch, vals, n);
+		fill_docids(docids, n);
+		weave_docvals_build(scratch, vals, docids, n);
 		for (k = 0; k < nsmash; k++)
 			scratch[rnd() % len] = (unsigned char) rnd();
 
@@ -246,6 +283,7 @@ main(void)
 		free(exact);
 		free(scratch);
 		free(vals);
+		free(docids);
 		iters++;
 	}
 
@@ -272,7 +310,7 @@ main(void)
 			h.null_off = 0;
 			h.zonemap_off = 0;
 			h.values_off = (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader));
-			h.reserved = 0;
+			h.docids_off = h.values_off + h.ndocs * 8u;
 			memcpy(exact, &h, sizeof(h));
 		}
 		why = VALIDATE(exact, avail);

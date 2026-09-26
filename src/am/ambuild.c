@@ -261,6 +261,16 @@ typedef struct WeaveBuildState
 								 * inserted row's vector since doc/GAPS.md G23
 								 * closed, so the flush is no longer one of
 								 * them. */
+	AttrNumber	dvattno;		/* 1-based index attnum of the int8 docvalues
+								 * column, or 0 when the index has none.  Same
+								 * resolve-once reasoning as vecattno above. */
+	WeaveDocvalsAccum dv;		/* the docvalues producer: one (docid, value)
+								 * pair per indexed document.  ACTIVE only on the
+								 * two CREATE INDEX heap-scan paths in this v1
+								 * slice; INACTIVE on merge, oversized-insert and
+								 * pending-flush, whose rows therefore carry no
+								 * docvalues gate until the post-build slice lands
+								 * (doc/specs/DOCVALS_CHANNEL.md sect. 11). */
 } WeaveBuildState;
 
 /*
@@ -313,6 +323,24 @@ weave_build_cgramattno(Relation index)
 
 	weave_index_layout(index, &layout);
 	return layout.cgramattno;
+}
+
+/*
+ * Which values[] slot holds the int8 docvalues column, or 0 when the index has
+ * none.  A fourth one-line wrapper, for the reason weave_build_vecattno() gives:
+ * the WeaveBuildState initializers do not all want a docvalues producer.  In this
+ * v1 slice only the two CREATE INDEX heap-scan paths do; the merge and the
+ * post-build insert/flush paths pass 0 so their output bolts carry no docvalues
+ * weft (the documented limitation, doc/specs/DOCVALS_CHANNEL.md sect. 11), which
+ * a combined helper would make easy to get wrong.
+ */
+static AttrNumber
+weave_build_dvattno(Relation index)
+{
+	WeaveIndexLayout layout;
+
+	weave_index_layout(index, &layout);
+	return layout.dvattno;
 }
 
 static int
@@ -772,6 +800,8 @@ weave_build_flush_segment(Relation index, WeaveBuildState *bs)
 	weave_vec_accum_reset(&bs->vec);
 	weave_cgram_accum_reset(&bs->cgram);	/* same reason: the reset below frees
 											 * its pair array and fold scratch */
+	weave_docvals_accum_reset(&bs->dv);		/* same reason: the reset below frees
+											 * its docid and value arrays */
 	MemoryContextReset(bs->ctx);
 	bs->terms = NULL;
 	bs->nterms = 0;
@@ -867,6 +897,25 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 		int			cgidx = bs->cgramattno - 1;
 
 		weave_cgram_accum_add(&bs->cgram, tid, values[cgidx], isnull[cgidx]);
+	}
+
+	/*
+	 * THE DOCVALUES PRODUCER (task Docvals).
+	 *
+	 * Inside bs->ctx like the producers above and for the same reason: the flush
+	 * budget is MemoryContextMemAllocated(bs->ctx, true), and this collects one
+	 * (docid, value) pair per document, which is corpus-scale.  Like the cgram
+	 * producer it is NOT warp-positional -- a docvalue is keyed by docid, and the
+	 * store carries its own dense-index -> docid map -- so there is no
+	 * "skipping shifts every later document" hazard.  v1 is NOT NULL:
+	 * weave_docvals_accum_add() ERRORs on a NULL rather than store a placeholder
+	 * that would silently include NULL rows in a `col < x` gate.
+	 */
+	if (bs->dvattno != 0)
+	{
+		int			dvidx = bs->dvattno - 1;
+
+		weave_docvals_accum_add(&bs->dv, tid, values[dvidx], isnull[dvidx]);
 	}
 
 	doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
@@ -2724,6 +2773,7 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 	BlockNumber surfroot;
 	BlockNumber vecroot;
 	BlockNumber cgramroot;
+	BlockNumber dvroot;
 	int			i;
 
 	postings = (BlockNumber *) palloc(Max(bs->nterms, 1) * sizeof(BlockNumber));	/* alloc-ok: bs->nterms is a single build/pending segment, bounded by maintenance_work_mem (the merge path spills to disk instead) */
@@ -2779,7 +2829,15 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 	 * which is the promise sect. 6 of the segment format makes for an absent weft.
 	 */
 	cgramroot = weave_build_cgram_weft(index, &bs->cgram);
-	weave_attach_chandesc(index, seg, surfroot, vecroot, cgramroot);	/* v6: last, so every root is known */
+	/*
+	 * The docvalues weft, from the docvalues accumulator.  InvalidBlockNumber
+	 * when this state has no docvalues column or collected nothing (an inactive
+	 * accumulator), in which case the bolt carries no DOCVALS descriptor and
+	 * costs zero docvalues bytes.  Sorts its (docid, value) pairs into ascending
+	 * docid order -- the store invariant and the order the gate emits through.
+	 */
+	dvroot = weave_docvals_write_weft(index, &bs->dv);
+	weave_attach_chandesc(index, seg, surfroot, vecroot, cgramroot, dvroot);	/* v6: last, so every root is known */
 	doclen_collector_free(&dc);
 	pfree(postings);
 	pfree(offsets);
@@ -3465,6 +3523,8 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 		 * output term's postings. */
 		tbs.cgramattno = 0;
 		weave_cgram_accum_init(&tbs.cgram, termctx, false);
+		tbs.dvattno = 0;		/* v1: docvalues weft is not produced by merge */
+		weave_docvals_accum_init(&tbs.dv, termctx, false);
 		/* Inactive (active = false), so no weft is written and this width is
 		 * never read -- it gets the reloption's real value anyway, because the
 		 * day doc/GAPS.md G23 closes is the day `active` flips to true on
@@ -3675,7 +3735,14 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	 * above).
 	 */
 	cgramroot = weave_build_cgram_weft(index, &bs->cgram);
-	weave_attach_chandesc(index, seg, surfroot, vecroot, cgramroot);
+	/*
+	 * No docvalues weft on the merge in this v1 slice: the docvalues store is not
+	 * merged (doc/specs/DOCVALS_CHANNEL.md sect. 11), so the merged bolt carries
+	 * no DOCVALS descriptor and a docvalues gate over it builds nothing -- the
+	 * documented limitation, the same shape the post-build insert path has.
+	 */
+	weave_attach_chandesc(index, seg, surfroot, vecroot, cgramroot,
+						  InvalidBlockNumber);
 
 	for (i = 0; i < nsel; i++)
 		weave_doclens_free(&srcv[i].doclens);
@@ -3810,6 +3877,8 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 	 * refuses one -- the merged weft would not cover every document of the bolt. */
 	bs.cgramattno = 0;
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, ncgrambolts > 0);
+	bs.dvattno = 0;				/* v1: docvalues weft is not produced by merge */
+	weave_docvals_accum_init(&bs.dv, bs.ctx, false);
 	weave_vec_accum_init(&bs.vec, bs.ctx, nvecbolts > 0, (int) vgeom.bits,
 						 (WeaveMetric) vgeom.metric);
 	if (nvecbolts > 0 &&
@@ -4042,6 +4111,8 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	 * (weave_cgram_merge_append). */
 	bs.cgramattno = 0;
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, ncgrambolts > 0);
+	bs.dvattno = 0;				/* v1: docvalues weft is not produced by merge */
+	weave_docvals_accum_init(&bs.dv, bs.ctx, false);
 	/* PRODUCER 2: active exactly when an input carries a weft, and made ready for
 	 * pre-encoded lanes at the geometry the inputs agreed on -- not at the current
 	 * `bits` reloption, which may have changed since they were written. */
@@ -5002,6 +5073,8 @@ weave_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	 * therefore the only kind that can see the raw text a trigram comes from. */
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
+	bs.dvattno = weave_build_dvattno(index);
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0);
 	/* The metric is only consulted when there IS a vector column: it is the one
 	 * reloption accessor that THROWS (cosine and l1 have no compressed-domain
 	 * bound -- src/am/am.c), and throwing over the metric of a channel this index
@@ -5292,6 +5365,8 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * therefore the only kind that can see the raw text a trigram comes from. */
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
+	bs.dvattno = weave_build_dvattno(index);
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0);
 	/* The metric is only consulted when there IS a vector column: it is the one
 	 * reloption accessor that THROWS (cosine and l1 have no compressed-domain
 	 * bound -- src/am/am.c), and throwing over the metric of a channel this index
@@ -5524,6 +5599,9 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 	 */
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
+	bs.dvattno = 0;				/* v1: docvalues not collected on the oversized
+								 * insert (post-build rows); sect. 11 */
+	weave_docvals_accum_init(&bs.dv, bs.ctx, false);
 	weave_vec_accum_init(&bs.vec, bs.ctx, bs.vecattno != 0,
 						 weave_index_vec_bits(index),
 						 (WeaveMetric) (bs.vecattno != 0 ?
@@ -5994,6 +6072,9 @@ weave_flush_pending(Relation index)
 	 */
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
+	bs.dvattno = 0;				/* v1: docvalues not collected on the pending
+								 * flush (post-build rows); sect. 11 */
+	weave_docvals_accum_init(&bs.dv, bs.ctx, false);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;

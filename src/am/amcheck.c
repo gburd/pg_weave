@@ -1368,6 +1368,24 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 				(void) wvck_walk_chain(cx, surfroot, WEAVE_PK_SURF, &e);
 
 			/*
+			 * The DOCVALS weft is ONE nextblk-linked chain (the surf blob-chain
+			 * shape), so a single walk marks it -- unlike the vector and cgram
+			 * wefts below, whose root names several sub-chains.  Marking it is not
+			 * optional: an unmarked docvalues chain would be reported by
+			 * pages_reachable_or_freed as a leak of the whole store, and
+			 * weave_free_segment() frees it through the same default arm, so if
+			 * the two ever disagree this invariant is what says so.
+			 */
+			{
+				AttrNumber	dvattno;
+				BlockNumber dvroot = weave_docvals_root_for_segment(cx->index,
+																	seg, &dvattno);
+
+				if (dvroot != InvalidBlockNumber)
+					(void) wvck_walk_chain(cx, dvroot, WEAVE_PK_DOCVALS, &e);
+			}
+
+			/*
 			 * The vector weft is FOUR chains and the descriptor names only the
 			 * first: the WEAVE_VMETA page, which names the directory, the code
 			 * strips and the warp map.  Marking only the root would report every

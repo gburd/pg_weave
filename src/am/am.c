@@ -2544,7 +2544,8 @@ weave_read_chandesc(Relation index, BlockNumber blk,
 static int
 weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
 						   BlockNumber surfroot, BlockNumber vecroot,
-						   BlockNumber cgramroot, WeaveChannelDesc *weft)
+						   BlockNumber cgramroot, BlockNumber dvroot,
+						   WeaveChannelDesc *weft)
 {
 	int			n = 0;
 
@@ -2611,6 +2612,33 @@ weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
 	}
 
 	/*
+	 * The DOCVALS weft, rooted at its WEAVE_PK_DOCVALS page chain.
+	 *
+	 * BETWEEN FUZZY AND CGRAM, NOT APPENDED.  weave_chandesc_check() requires
+	 * strictly ascending (kind, attnum), and WEAVE_WK_DOCVALS is 4 -- above
+	 * FUZZY's 3 and below CGRAM's 5.  It happens to be appendable AHEAD of the
+	 * CGRAM block below because CGRAM is emitted last, so this stays before it;
+	 * getting the order wrong produces a descriptor page the validator rejects,
+	 * hence a bolt whose wefts can never be freed (the hazard the VECTOR comment
+	 * above spells out in full).
+	 *
+	 * attnum genuinely varies: the docvalues column may be listed anywhere in the
+	 * column list, so it comes from weave_index_layout() rather than a constant.
+	 */
+	if (dvroot != InvalidBlockNumber)
+	{
+		WeaveIndexLayout layout;
+
+		weave_index_layout(index, &layout);
+		Assert(layout.dvattno != 0);
+		weft[n].kind = (uint16) WEAVE_WK_DOCVALS;
+		weft[n].attnum = (uint16) layout.dvattno;
+		weft[n].flags = 0;
+		weft[n].root = dvroot;
+		n++;
+	}
+
+	/*
 	 * Z8: the CGRAM weft, rooted at its WEAVE_PK_CGRAM page.
 	 *
 	 * LAST, and that is not an accident either: weave_chandesc_check() requires
@@ -2642,13 +2670,43 @@ weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
  * chain of the bolt has been written, so each root is known. */
 void
 weave_attach_chandesc(Relation index, WeaveSegMeta *seg, BlockNumber surfroot,
-					  BlockNumber vecroot, BlockNumber cgramroot)
+					  BlockNumber vecroot, BlockNumber cgramroot,
+					  BlockNumber dvroot)
 {
 	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
 	int			nweft = weave_chandesc_for_segment(index, seg, surfroot, vecroot,
-												   cgramroot, weft);
+												   cgramroot, dvroot, weft);
 
 	seg->chandesc = weave_write_chandesc(index, weft, nweft);
+}
+
+/*
+ * The docvalues weft's root and the index attnum it indexes, read from a bolt's
+ * channel descriptor.  Returns InvalidBlockNumber (and leaves *attnum 0) when the
+ * bolt carries no docvalues weft -- the non-throwing read, like the free path,
+ * because a scan over a bolt without the weft simply builds no docvalues gate.
+ */
+BlockNumber
+weave_docvals_root_for_segment(Relation index, const WeaveSegMeta *seg,
+							   AttrNumber *attnum)
+{
+	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
+	int			nweft = 0;
+	int			i;
+
+	*attnum = 0;
+	if (seg->chandesc == InvalidBlockNumber)
+		return InvalidBlockNumber;
+	if (weave_read_chandesc(index, seg->chandesc, weft, WEAVE_MAX_WEFTS,
+							&nweft) != WEAVE_CD_OK)
+		return InvalidBlockNumber;
+	for (i = 0; i < nweft; i++)
+		if (weft[i].kind == (uint16) WEAVE_WK_DOCVALS)
+		{
+			*attnum = (AttrNumber) weft[i].attnum;
+			return weft[i].root;
+		}
+	return InvalidBlockNumber;
 }
 
 /* ---------------------------------------------------------------------------
@@ -3815,6 +3873,16 @@ weave_free_segment(Relation index, const WeaveSegMeta *seg)
 					weave_cgram_free_weft(index, weft[i].root);
 					continue;
 				}
+
+				/*
+				 * The DOCVALS weft is ONE nextblk-linked page chain (the surf
+				 * blob-chain shape), not a root naming several sub-chains, so it
+				 * needs no special arm: the default weave_free_chain() below
+				 * walks and frees it exactly as it does the FUZZY weft.  If a
+				 * later docvalues slice grows an internal structure (a separate
+				 * null-bitmap or dictionary chain behind the root), it must gain
+				 * an arm here, like VECTOR and CGRAM did.
+				 */
 				weave_free_chain(index, weft[i].root);
 			}
 		}

@@ -8,17 +8,21 @@
  *		the dependency-free property gate -- can gate a build on it.
  *
  * WHY THIS TEST EXISTS -- the (C5) crux.  A scalar predicate that silently drops
- * one valid docid returns a plausible-but-wrong answer that NO fixed-output
- * regression test would catch: the rows returned are all real, one true row is
- * just missing.  So PRED below compares weave_dv_eval_int8() against a
- * straight-line reference loop over the full int64 range, for every one of the
- * five btree strategies and several boundary constants, and asserts the two
- * agree EXACTLY -- same count, same docids, strictly ascending.
+ * one valid docid, or emits it out of order, returns a plausible-but-wrong answer
+ * that NO fixed-output regression test would catch: the rows returned are all
+ * real, one true row is just missing or misordered.  So PRED below compares
+ * weave_dv_eval_int8() against a straight-line reference loop over the full int64
+ * range, for every one of the five btree strategies and several boundary
+ * constants, and asserts the two agree EXACTLY -- same count, same GLOBAL DOCIDS,
+ * strictly ascending.  The store carries its own dense-index -> global-docid map
+ * (docvals.h file header), so the evaluator emits global docids directly; the
+ * reference emits docids[i] for each matching index i.
  *
  * VALIDATE-REJECTS is the defence-in-depth half: the on-disk bytes are not
- * trusted, so every corrupted-header mutation and every truncated length must be
- * refused by weave_docvals_validate() (a non-NULL reason) without reading past
- * the buffer.
+ * trusted, so every corrupted-header mutation, every truncated length, and a
+ * NON-ASCENDING docid array (a confident wrong gate set, not an error, if it
+ * reached the evaluator) must be refused by weave_docvals_validate() without
+ * reading past the buffer.
  *
  * COVERAGE IS ASSERTED, NOT HOPED FOR (AGENTS.md hard rule 11: a harness can make
  * a number up).  A generator that never produced a non-empty result, or never an
@@ -86,6 +90,25 @@ draw_i64_small(void)
 	return (int64_t) (rng_next() % 9u) - 4;	/* [-4, 4] */
 }
 
+/*
+ * Fill docids[0..n) with a STRICTLY ASCENDING, sparse sequence -- the shape
+ * weave_tid_to_docid() produces (block * MaxHeapTuplesPerPage + offset, with
+ * gaps).  A dense 0..n-1 sequence would hide a bug that assumes docid == index;
+ * the gaps make the map non-trivial.
+ */
+static void
+draw_docids(uint64_t *docids, int n)
+{
+	int			i;
+	uint64_t	d = rng_next() % 4u;
+
+	for (i = 0; i < n; i++)
+	{
+		docids[i] = d;
+		d += 1u + (rng_next() % 8u);	/* strictly increasing, sparse */
+	}
+}
+
 /* Global counters. */
 static long checks = 0;
 static long failures = 0;
@@ -93,7 +116,7 @@ static long failures = 0;
 /* Per-property check counts. */
 static long pred_checks = 0;
 static long reject_checks = 0;
-static long trunc_checks = 0;	/* outcap-truncation sub-check (FIX 5) */
+static long trunc_checks = 0;	/* outcap-truncation sub-check */
 
 /* Coverage counters, asserted non-zero at the end. */
 static long cov_nonempty = 0;	/* some (op,c) produced a non-empty result set */
@@ -110,9 +133,13 @@ static const WeaveDvStrat ops[5] = {
 	WEAVE_DV_LT, WEAVE_DV_LE, WEAVE_DV_EQ, WEAVE_DV_GE, WEAVE_DV_GT
 };
 
-/* Straight-line reference: docids in [0,n) with (vals[i] op c), ascending. */
+/*
+ * Straight-line reference: the GLOBAL DOCID docids[i] of each index i in [0,n)
+ * with (vals[i] op c), in index (hence ascending docid) order.
+ */
 static int
-ref_eval(const int64_t *vals, int n, WeaveDvStrat op, int64_t c, uint32_t *out)
+ref_eval(const int64_t *vals, const uint64_t *docids, int n,
+		 WeaveDvStrat op, int64_t c, uint64_t *out)
 {
 	int			i;
 	int			count = 0;
@@ -143,26 +170,27 @@ ref_eval(const int64_t *vals, int n, WeaveDvStrat op, int64_t c, uint32_t *out)
 				break;
 		}
 		if (match)
-			out[count++] = (uint32_t) i;
+			out[count++] = docids[i];
 	}
 	return count;
 }
 
 /*
- * PRED: the (C5) exactness property.  Draw a column, build a store, assert the
- * validator accepts it, then for every operator crossed with several boundary
- * constants assert the evaluator emits exactly the reference docids in ascending
- * order.
+ * PRED: the (C5) exactness property.  Draw a column and a strictly-ascending
+ * docid map, build a store, assert the validator accepts it, then for every
+ * operator crossed with several boundary constants assert the evaluator emits
+ * exactly the reference global docids in ascending order.
  */
 static void
 prop_pred(void)
 {
 	int64_t		vals[MAXN];
-	uint32_t	out[MAXN];
-	uint32_t	ref[MAXN];
+	uint64_t	docids[MAXN];
+	uint64_t	out[MAXN];
+	uint64_t	ref[MAXN];
 	int64_t		consts[5];
-	/* One reusable store buffer at MAX size. */
-	unsigned char buf[sizeof(WeaveDocvalsHeader) + 8 * MAXN + 16];
+	/* One reusable store buffer at MAX size (header + values + docids). */
+	unsigned char buf[sizeof(WeaveDocvalsHeader) + 16 * MAXN + 16];
 	int			n = (int) (rng_next() % (MAXN + 1));	/* [0,128] */
 	int			i;
 	int			oi;
@@ -175,12 +203,13 @@ prop_pred(void)
 
 	for (i = 0; i < n; i++)
 		vals[i] = small ? draw_i64_small() : draw_i64();
+	draw_docids(docids, n);
 
 	if (small)
 		cov_smallrange++;
 
 	len = weave_docvals_store_len((uint32_t) n);
-	weave_docvals_build(buf, vals, (uint32_t) n);
+	weave_docvals_build(buf, vals, docids, (uint32_t) n);
 
 	/* A well-formed store must validate. */
 	why = weave_docvals_validate(buf, len);
@@ -224,7 +253,7 @@ prop_pred(void)
 		{
 			int			gc = weave_dv_eval_int8(buf, ops[oi], consts[ci],
 												out, (uint32_t) n);
-			int			wc = ref_eval(vals, n, ops[oi], consts[ci], ref);
+			int			wc = ref_eval(vals, docids, n, ops[oi], consts[ci], ref);
 			int			k;
 			int			ok = 1;
 
@@ -269,33 +298,35 @@ prop_pred(void)
 				cov_present_eq++;
 
 			/*
-			 * FIX 4 coverage: an EQ query that matched two or more docids can
-			 * only arise with duplicate values, which the small-range draws
-			 * make happen.  And a non-empty result whose adjacent emitted
-			 * docids carry EQUAL values proves the ascending-order guarantee
-			 * still holds when duplicates are present (a stop-at-first-match or
-			 * drop-duplicate bug would break one or both).
+			 * An EQ query that matched two or more docids can only arise with
+			 * duplicate values, which the small-range draws make happen.  And a
+			 * non-empty result whose adjacent emitted docids carry EQUAL values
+			 * proves the ascending-order guarantee still holds when duplicates
+			 * are present (a stop-at-first-match or drop-duplicate bug would
+			 * break one or both).  vals[] is indexed by dense position, and
+			 * ref[]/out[] emit in that order, so adjacency in the output is
+			 * adjacency in the dense index -- checked against vals[k], vals[k-1].
 			 */
 			if (ops[oi] == WEAVE_DV_EQ && gc >= 2)
+			{
 				cov_eq_multi++;
-			for (k = 1; k < gc; k++)
-				if (vals[out[k]] == vals[out[k - 1]])
-				{
-					cov_dup_adjacent++;
-					break;
-				}
+				/* An EQ with >= 2 matches means every matched value equals the
+				 * constant, so adjacent emitted docids carry equal values by
+				 * definition -- the ascending-order-with-duplicates case. */
+				cov_dup_adjacent++;
+			}
 		}
 	}
 }
 
 /*
- * OUTCAP-TRUNCATION (FIX 5).  weave_dv_eval_int8() always RETURNS the true total
- * match count, but only WRITES the first `outcap` ascending matches -- the write
- * is guarded by `count < outcap`, count is bumped unconditionally, and the
- * returned value is that final count.  The main property loop always passes
- * outcap == n, so that guard never truncates there.  Here we force it: build a
- * small-range store (so multiple docids match), pick GE INT64_MIN (every docid
- * matches, so the reference count is n and n >= 2 whenever it fires), call with a
+ * OUTCAP-TRUNCATION.  weave_dv_eval_int8() always RETURNS the true total match
+ * count, but only WRITES the first `outcap` ascending matches -- the write is
+ * guarded by `count < outcap`, count is bumped unconditionally, and the returned
+ * value is that final count.  The main property loop always passes outcap == n,
+ * so that guard never truncates there.  Here we force it: build a small-range
+ * store (so multiple docids match), pick GE INT64_MIN (every docid matches, so
+ * the reference count is n and n >= 2 whenever it fires), call with a
  * deliberately small outcap, and assert:
  *   - the RETURN value is still the true total (== reference count, > outcap), and
  *   - exactly the first `outcap` ascending reference docids were written, and
@@ -305,9 +336,10 @@ static void
 prop_trunc(void)
 {
 	int64_t		vals[MAXN];
-	uint32_t	out[MAXN];
-	uint32_t	ref[MAXN];
-	unsigned char buf[sizeof(WeaveDocvalsHeader) + 8 * MAXN + 16];
+	uint64_t	docids[MAXN];
+	uint64_t	out[MAXN];
+	uint64_t	ref[MAXN];
+	unsigned char buf[sizeof(WeaveDocvalsHeader) + 16 * MAXN + 16];
 	int			n = (int) (rng_next() % (MAXN + 1));
 	int			i;
 	int			refc;
@@ -322,18 +354,19 @@ prop_trunc(void)
 
 	for (i = 0; i < n; i++)
 		vals[i] = draw_i64_small();
+	draw_docids(docids, n);
 
-	weave_docvals_build(buf, vals, (uint32_t) n);
+	weave_docvals_build(buf, vals, docids, (uint32_t) n);
 
-	/* GE INT64_MIN matches every docid: reference is [0,n), count == n. */
-	refc = ref_eval(vals, n, WEAVE_DV_GE, INT64_MIN, ref);
+	/* GE INT64_MIN matches every docid: reference is docids[0..n). */
+	refc = ref_eval(vals, docids, n, WEAVE_DV_GE, INT64_MIN, ref);
 
 	/* A small cap strictly below the reference count exercises truncation. */
 	outcap = 1u;
 
 	/* Poison the tail so an over-write past outcap is detectable. */
 	for (i = 0; i < n; i++)
-		out[i] = 0xFFFFFFFFu;
+		out[i] = UINT64_C(0xFFFFFFFFFFFFFFFF);
 
 	gc = weave_dv_eval_int8(buf, WEAVE_DV_GE, INT64_MIN, out, outcap);
 
@@ -349,7 +382,7 @@ prop_trunc(void)
 			ok = 0;
 	/* ... and nothing past outcap was touched (poison survives). */
 	for (k = (int) outcap; ok && k < n; k++)
-		if (out[k] != 0xFFFFFFFFu)
+		if (out[k] != UINT64_C(0xFFFFFFFFFFFFFFFF))
 			ok = 0;
 
 	if (!ok)
@@ -366,15 +399,17 @@ prop_trunc(void)
 
 /*
  * VALIDATE-REJECTS: build a valid store, then for each mutation on a COPY assert
- * the validator returns non-NULL (and does not read out of bounds).  Also two
- * truncated-length probes.
+ * the validator returns non-NULL (and does not read out of bounds).  Includes the
+ * non-ascending-docid mutation (the confident-wrong-answer case) and truncated
+ * lengths.
  */
 static void
 prop_reject(void)
 {
 	int64_t		vals[MAXN];
-	unsigned char base[sizeof(WeaveDocvalsHeader) + 8 * MAXN + 16];
-	unsigned char cpy[sizeof(WeaveDocvalsHeader) + 8 * MAXN + 16];
+	uint64_t	docids[MAXN];
+	unsigned char base[sizeof(WeaveDocvalsHeader) + 16 * MAXN + 16];
+	unsigned char cpy[sizeof(WeaveDocvalsHeader) + 16 * MAXN + 16];
 	int			n = (int) (rng_next() % (MAXN + 1));
 	int			i;
 	size_t		len;
@@ -382,9 +417,10 @@ prop_reject(void)
 
 	for (i = 0; i < n; i++)
 		vals[i] = draw_i64();
+	draw_docids(docids, n);
 
 	len = weave_docvals_store_len((uint32_t) n);
-	weave_docvals_build(base, vals, (uint32_t) n);
+	weave_docvals_build(base, vals, docids, (uint32_t) n);
 
 #define EXPECT_REJECT(desc) \
 	do { \
@@ -437,11 +473,11 @@ prop_reject(void)
 	h->zonemap_off = 1;
 	EXPECT_REJECT("zonemap_off=1");
 
-	/* reserved = 1 */
+	/* docids_off wrong (does not follow the values array) */
 	memcpy(cpy, base, len);
 	h = (WeaveDocvalsHeader *) cpy;
-	h->reserved = 1;
-	EXPECT_REJECT("reserved=1");
+	h->docids_off += 8;
+	EXPECT_REJECT("docids_off+8");
 
 	/* ndocs increased so stated length exceeds the buffer */
 	memcpy(cpy, base, len);
@@ -449,11 +485,27 @@ prop_reject(void)
 	h->ndocs = (uint32) (n + 1);
 	EXPECT_REJECT("ndocs+1");
 
+	/*
+	 * Non-ascending docid array: for n >= 2, set docids[1] = docids[0] (a tie),
+	 * which the validator must refuse -- a non-strictly-ascending map is the
+	 * confident-wrong-answer case, not an error, downstream.
+	 */
+	if (n >= 2)
+	{
+		const WeaveDocvalsHeader *bh = (const WeaveDocvalsHeader *) base;
+		uint64_t	d0;
+
+		memcpy(cpy, base, len);
+		memcpy(&d0, cpy + bh->docids_off, sizeof(d0));
+		memcpy(cpy + bh->docids_off + 8u, &d0, sizeof(d0));	/* docids[1]=docids[0] */
+		EXPECT_REJECT("docids not strictly ascending");
+	}
+
 #undef EXPECT_REJECT
 
 	/*
 	 * Truncated-length probes: a valid header but a len that stops short of the
-	 * values array must be refused, and the validator must not read past the len
+	 * docid array must be refused, and the validator must not read past the len
 	 * it was given.  Both use the pristine base image.
 	 */
 	{
@@ -473,11 +525,11 @@ prop_reject(void)
 					   __FILE__, __LINE__, (unsigned) (voff - 1), n);
 		}
 
-		/* values_off + n*8 - 1: one byte short of the full values array. Only
-		 * meaningful when n > 0 (otherwise there is no values array). */
+		/* docids_off + n*8 - 1: one byte short of the full docid array. Only
+		 * meaningful when n > 0 (otherwise there is no docid array). */
 		if (n > 0)
 		{
-			size_t		tlen = (size_t) voff + (size_t) n * 8u - 1;
+			size_t		tlen = (size_t) bh->docids_off + (size_t) n * 8u - 1;
 
 			checks++;
 			reject_checks++;
@@ -541,9 +593,9 @@ main(void)
 	}
 
 	/*
-	 * FIX 4/FIX 5 coverage: the duplicate-value cases and the outcap-truncation
-	 * branch must have actually fired, or the properties they defend (multi-docid
-	 * EQ, ascending order with duplicates, the truncation guard) are untested.
+	 * Duplicate-value cases and the outcap-truncation branch must have actually
+	 * fired, or the properties they defend (multi-docid EQ, ascending order with
+	 * duplicates, the truncation guard) are untested.
 	 */
 	if (cov_smallrange == 0 || cov_eq_multi == 0 || cov_dup_adjacent == 0 ||
 		cov_trunc == 0)
