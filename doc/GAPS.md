@@ -3515,7 +3515,7 @@ remaining gap between 1.96× and the floor is a *documentation* obligation
 correctness one.
 
 
-### G48 — a lexical seek skips the DECODE but reads every PAGE it passes over, so the channel that dominates a gated query has no way to skip I/O — **OPEN 2026-09-24, ceiling UNMEASURED**
+### G48 — a lexical seek skips the DECODE but reads every PAGE it passes over, so the channel that dominates a gated query has no way to skip I/O — **OPEN 2026-09-24; visit ceiling 19–50 % (0.21.0), I/O half 54–85 % under pressure / ~0 resident (0.23.0)**
 
 **Where this came from.** `bench/RESULTS_GATE_SWEEP.md` sized two vector-side levers and
 withdrew both, leaving the arithmetic that the vector channel cannot win more than ~15 %
@@ -3624,3 +3624,50 @@ and is documented in place: `count(*) ... WHERE d @@@ 'common & needle'` returns
 answer with **both** counters at zero, because that path never opens a cursor — had the
 control been written as "the counters are non-negative" the instrument would have shipped
 wired to a branch nothing in the suite reaches.
+
+## I/O HALF MEASURED 2026-09-26 — skip-only is 54–85 % of the lexical channel's DISK reads under pressure, ~0 resident (extension 0.23.0)
+
+`weave_work_stats()` gained `lex_reads_skip` / `lex_reads_load`: the delta of
+`pgBufferUsage.shared_blks_read` (the quantity `EXPLAIN (ANALYZE, BUFFERS)` reports) taken
+around each `ReadBuffer` at the skip and decode sites. That is the only way to split one
+index-scan node's reads into skip-traffic and decode-traffic — the node-level BUFFERS figure
+aggregates both, which is why the earlier entry could not settle this from EXPLAIN alone.
+40 fused queries at sel 1.0 (the unfiltered shape, highest skip fraction); **A/A on fiqa
+bit-identical (1798 vs 1799).**
+
+**Resident (default 128 MB pool; fiqa's index is 45 MB, so it fits):** fiqa 216 skip reads
+against 17,160 skip *visits* — 1.3 %, cold-start only. **When the index fits in RAM the
+49.5 % visit fraction overstates the I/O by ~40× and the lever is worth ~nothing.** This is
+the rule-9 baseline the earlier entry demanded.
+
+**Under pressure (`shared_buffers` swept; fiqa 45 MB is the only local index big enough to
+stress a pool):** skip-only's share of the lexical channel's *reads* runs 85 % at 1 MB →
+54.5 % at 32 MB → 50 % resident — **at or ABOVE its 49.5 % visit share, not below it.**
+`load reads` is nearly pool-independent (317 → 216); all the pressure lands on `skip reads`
+(1,798 → 216). The mechanism is locality: a skip-walk strides across many distinct pages of
+a high-df chain and misses nearly all of them under a small pool, while a decode lands on a
+few tightly-clustered pages, often ones the skip just read. Full curve and tables:
+`bench/RESULTS_GATE_SWEEP.md` "G48's I/O HALF MEASURED".
+
+**So the honest verdict, both halves as prominent (hard rule 8):**
+
+- **The lever is real and grows with exactly the thing it is meant to help** — index larger
+  than the buffer pool, which is the regime BlockMax-WAND's out-of-chain skip list exists
+  for. A skip list would turn ~45 skip reads/query (fiqa, 1 MB) into a few dense skip-list
+  reads.
+- **But it is the UNFILTERED arm's lever, not claim 3's.** At a tight gate the skip visit
+  fraction already falls (49.5 → 42.3) and absolute lexical work falls 2.8×, so the I/O
+  prize shrinks at claim 3's operating point. It helps the arm that currently *loses*
+  0.7–0.8×.
+- **One corpus at genuine pressure — provisional under rule 11.** scifact/nfcorpus nearly
+  fit even a small pool, so their reads are cold-start-dominated and load-heavy (fiqa 85 %,
+  scifact 27.7 %, nfcorpus 7.6 % at 1 MB — the small ones are not under real pressure). The
+  54–85 % curve needs the 1M scale to firm up, which is an EC2 run.
+- **The format change is therefore justified in principle, not yet scheduled.** Confirming
+  at 1M and weighing BlockMax-WAND against the scalar-docvals channel — which serves claim 3
+  directly rather than the unfiltered arm — comes first.
+
+The counter's positive control is `sql/chanstats.sql`: `lex_reads_*` are state-dependent
+(≈0 when resident, which the installcheck cluster always is, since `shared_buffers` is fixed
+there), so — like the skip/load *ratio* — only the deterministic reset-to-zero is asserted
+in regression; the non-zero split is measured in bench under a constrained pool.

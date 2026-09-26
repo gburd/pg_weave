@@ -564,6 +564,32 @@ extern uint64 weave_lex_contribs;	/* (term, doc) BM25 contributions computed by 
  */
 extern uint64 weave_lexwork_pages_skip; /* pages visited to SKIP blocks (headers only) */
 extern uint64 weave_lexwork_pages_load; /* pages visited to DECODE a block */
+
+/*
+ * G48's I/O HALF.  The pages_* counters above are page VISITS -- a visit to a page
+ * already in shared_buffers is a pin and a lock, not a read.  These two are the subset
+ * of those visits that MISSED the buffer pool, so they are what a skip structure could
+ * remove from the READ path rather than merely from the pin/lock path.  They are the
+ * difference between "up to half the buffer-access traffic is skip-only" (a visit claim)
+ * and "half the DISK traffic is skip-only" (an I/O claim), and only the second justifies
+ * a format change.
+ *
+ * MEASURED, NOT COUNTED IN THE PRIMITIVE.  A ReadBuffer() does not tell its caller
+ * whether it hit or missed, so these are taken as the delta of pgBufferUsage.shared_blks_read
+ * (executor/instrument.h) around each ReadBuffer at the skip and load sites -- the SAME
+ * quantity EXPLAIN (ANALYZE, BUFFERS) reports, attributed to a site EXPLAIN cannot split.
+ * That is the only way to divide one index-scan node's reads into skip-traffic and
+ * decode-traffic; the node-level figure aggregates both.
+ *
+ * PATH-INDEPENDENT for the same reason pages_* are, and READS ARE STATE-DEPENDENT for a
+ * reason pages_* are not: at a corpus that fits in shared_buffers these are ~0 however
+ * much skipping happens, because nothing misses.  The number is only meaningful under
+ * memory pressure (a small shared_buffers, or an index larger than RAM) -- which is the
+ * regime the lever is FOR.  A zero here at resident scale is a fact about the cache, not
+ * about the lever.
+ */
+extern uint64 weave_lexwork_reads_skip; /* of pages_skip, those that MISSED shared_buffers */
+extern uint64 weave_lexwork_reads_load; /* of pages_load, those that MISSED shared_buffers */
 extern uint64 weave_vecwork_lanes;	/* lanes the code-scan kernel scored, every path */
 extern uint64 weave_vecwork_blocks; /* blocks it scored, every path */
 extern uint64 weave_vecwork_blk_bound;	/* blocks the (C2) block bound pruned, every

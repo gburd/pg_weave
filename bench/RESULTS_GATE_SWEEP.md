@@ -527,6 +527,78 @@ spinlock each). fiqa at the gated point is ~866 visits per query against 390 buf
 the whole lexical channel, so most visits are repeats of pages already resident. The I/O
 half is unsized; see G48.
 
+## G48's I/O HALF MEASURED, 2026-09-26 — skip-only is 54–85 % of the lexical channel's DISK reads under pressure, ~0 resident (extension 0.23.0)
+
+The visit fraction above is not an I/O saving because a visit to a resident page is a pin
+and a lock, not a read. `weave_work_stats()` gained `lex_reads_skip` / `lex_reads_load`
+(0.23.0): the delta of `pgBufferUsage.shared_blks_read` — the same quantity
+`EXPLAIN (ANALYZE, BUFFERS)` reports — snapshotted around each `ReadBuffer` at the skip and
+decode sites, which is the only way to divide one index-scan node's reads into skip-traffic
+and decode-traffic (the node-level figure aggregates both). 40 fused queries at sel 1.0,
+the unfiltered shape where the skip fraction is highest. **A/A on fiqa was bit-identical
+(1798 vs 1799 skip reads).**
+
+**Resident (default `shared_buffers` = 128 MB; fiqa index is 45 MB, so it fits):**
+
+| corpus | skip visits | load visits | skip reads | load reads | skip % of *reads* |
+|---|---|---|---|---|---|
+| fiqa | 17,160 | 17,479 | 216 | 216 | 50.0 % |
+| scifact | 1,953 | 2,346 | 9 | 190 | 4.5 % |
+| nfcorpus | 84 | 157 | 1 | 59 | 1.7 % |
+
+fiqa's 216 skip reads are 1.3 % of its 17,160 skip *visits* — cold-start only, then the
+45 MB index sits resident and nothing misses. **This is the rule-9 baseline: when the index
+fits in RAM the 49.5 % visit fraction overstates the I/O by ~40×, and the lever is worth
+essentially nothing.** A skip list saves I/O it never pays.
+
+**Under memory pressure (`shared_buffers` swept down; fiqa index 45 MB is the only corpus
+big enough to stress the pool):**
+
+| shared_buffers | skip reads | load reads | skip % of reads |
+|---|---|---|---|
+| 1 MB (45× smaller than index) | 1,798 | 317 | **85.0 %** |
+| 2 MB | 1,066 | 316 | 77.1 % |
+| 4 MB | 728 | 316 | 69.7 % |
+| 8 MB | 591 | 314 | 65.3 % |
+| 16 MB | 546 | 305 | 64.2 % |
+| 32 MB | 299 | 250 | 54.5 % |
+| 128 MB (resident) | 216 | 216 | 50.0 % |
+
+Two structures in this curve decide the size of the prize, and both are stronger than the
+visit fraction suggested:
+
+- **Skip-only traffic is at or ABOVE its visit share of the lexical channel's disk reads,
+  not below it.** The visit fraction is 49.5 %; the read fraction is 50–85 %, rising with
+  pressure. The mechanism is locality: a skip-walk strides across many distinct pages of a
+  high-df posting chain (poor locality, so nearly every one misses under a small pool),
+  while a decode lands on a handful of pages with tight locality and often re-reads one the
+  skip just touched. `load reads` is nearly pool-independent (317 → 216); `skip reads` is
+  where all the pressure lands (1,798 → 216).
+- **The lever grows with exactly the thing it is meant to help.** It is ~0 when the index
+  fits in RAM and rises toward 85 % as the index outgrows the buffer pool — the
+  index-larger-than-RAM regime BlockMax-WAND's out-of-chain skip list exists for. A skip
+  list would replace ~45 skip reads/query (fiqa at 1 MB) with a few dense skip-list page
+  reads.
+
+**What this does NOT license, kept as prominent as the win (hard rule 8):**
+
+- **It is the unfiltered arm's lever, not claim 3's.** This is sel 1.0. At a tight gate the
+  skip *visit* fraction already falls (49.5 → 42.3) and absolute lexical work falls 2.8×,
+  so the I/O prize shrinks at the operating point claim 3 is about. It helps the arm that
+  currently *loses* 0.7–0.8×, which is worth having, but it is not a claim-3 accelerator.
+- **One corpus at genuine pressure (rule 11).** fiqa (45 MB) is the only local index large
+  enough to outgrow a sane pool; scifact/nfcorpus are read-cold-start-dominated and
+  load-heavy because they nearly fit. The 54–85 % curve is provisional until it reproduces
+  at the 1M scale, which is an EC2 run.
+- **So the format change is justified in principle but not yet scheduled.** The I/O half is
+  real and large in its regime — enough to keep BlockMax-WAND on the table — but confirming
+  at 1M and weighing it against the scalar-docvals channel (which serves claim 3 directly)
+  comes first.
+
+Reproduce: `/scratch/pg_weave/g48io.sh` drives an already-running cluster; restart it with
+`-c shared_buffers=<N>` between legs. `bench/gatesweep.sh` now records both read counters
+per point (≈0 on a default-pool workstation — the split needs a constrained pool).
+
 ## Reproduce (EC2)## Reproduce (EC2)
 
 ```sh

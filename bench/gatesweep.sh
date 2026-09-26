@@ -95,7 +95,7 @@ TERMS=(
     amortization arbitrage escrow annuity
 )
 
-printf 'db\tndocs\tnq\ttarget\tterm\tgate_rows\tsel\tpivots\tlex_contribs\tvec_scores\tgate_scores\tvec_lanes\tvec_blocks\tblkskip\trqskip\tveto\tabandon\tlex_pages_skip\tlex_pages_load\n' \
+printf 'db\tndocs\tnq\ttarget\tterm\tgate_rows\tsel\tpivots\tlex_contribs\tvec_scores\tgate_scores\tvec_lanes\tvec_blocks\tblkskip\trqskip\tveto\tabandon\tlex_pages_skip\tlex_pages_load\tlex_reads_skip\tlex_reads_load\n' \
     > "$REPORT"
 if [ "$LAT" = 1 ]; then
     printf 'db\tndocs\ttarget\tterm\tsel\tslot\tp50_ms\tp99_ms\tqueries\treps\n' > "$LATREPORT"
@@ -213,7 +213,14 @@ for DB in $DBS; do
             # calls wand_skip_blocks() at all, because a seek there never leaves a whole
             # 128-block behind.  These corpora are the first place the path can be
             # observed; if it is zero here too, the lever is zero and G48 closes.
-            echo "SELECT f.pivots, f.scores - f.vec_scores - f.gate_scores, f.vec_scores, f.gate_scores, w.vec_lanes, w.vec_blocks, f.blkskip, f.rqskip, f.veto, f.abandon, w.lex_pages_skip, w.lex_pages_load FROM weave_fuse_stats() f, weave_work_stats() w;"
+            # lex_reads_skip/load (G48's I/O half) are the shared_blks_read delta at the
+            # skip vs decode ReadBuffer sites.  On THIS host at default shared_buffers the
+            # index is resident, so they are ~0 (cold-start only) and the visit counters
+            # above are the story; the I/O split only appears under a small pool, which is
+            # how bench/RESULTS_GATE_SWEEP.md's G48 I/O section was measured (54-85% of
+            # fiqa's lexical reads skip-only under pressure).  Recorded here so a pressured
+            # run captures them without a code change.
+            echo "SELECT f.pivots, f.scores - f.vec_scores - f.gate_scores, f.vec_scores, f.gate_scores, w.vec_lanes, w.vec_blocks, f.blkskip, f.rqskip, f.veto, f.abandon, w.lex_pages_skip, w.lex_pages_load, w.lex_reads_skip, w.lex_reads_load FROM weave_fuse_stats() f, weave_work_stats() w;"
         } > "$SQLF"
         ROW=$(psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A -F $'\t' -f "$SQLF" | tail -1)
         rm -f "$SQLF"

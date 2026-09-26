@@ -360,8 +360,21 @@ SELECT lex_pages_skip AS bitmap_path_skip, lex_pages_load AS bitmap_path_load
 -- turn a measurement into a constant.  What is asserted is that both branches are
 -- reachable and that the reset works, because everything downstream of these counters
 -- depends on those two facts and on nothing else about their values.
+--
+-- lex_reads_skip / lex_reads_load (G48's I/O half, 0.23.0) are NOT asserted non-zero for a
+-- deeper reason than the skip counter's unreachability: they are STATE-DEPENDENT.  They are
+-- the shared_blks_read delta at the two ReadBuffer sites, so at a corpus that fits in
+-- shared_buffers -- which this 4,000-row fixture emphatically does, and which the whole
+-- suite keeps warm -- they are ~0 no matter how much skipping happens, because nothing
+-- misses.  A non-zero assertion would depend on eviction the installcheck cluster cannot be
+-- made to do (shared_buffers is fixed there), so it is measured in bench/gatesweep.sh under
+-- a deliberately small pool instead (doc/GAPS.md G48: 54-85% of fiqa's lexical reads are
+-- skip-only under pressure, ~0 resident).  What IS deterministic and therefore asserted is
+-- that the reset zeroes them -- the positive control the twelfth member requires before a
+-- counter's silence anywhere else can be read as evidence.
 SELECT weave_work_stats_reset();
-SELECT lex_pages_skip AS skip_after_reset, lex_pages_load AS load_after_reset
+SELECT lex_pages_skip AS skip_after_reset, lex_pages_load AS load_after_reset,
+       lex_reads_skip AS reads_skip_after_reset, lex_reads_load AS reads_load_after_reset
   FROM weave_work_stats();
 
 DROP TABLE csp;
