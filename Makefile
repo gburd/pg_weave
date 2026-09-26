@@ -36,6 +36,7 @@ OBJS = \
 	src/am/amsize.o \
 	src/am/amcheck.o \
 	src/pages/trgm_page.o \
+	src/pages/docvals_page.o \
 	src/util/migrate.o \
 	src/query/trgm.o \
 	src/query/cgram.o \
@@ -389,6 +390,10 @@ check-standalone:
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/cd test/fuzz/fuzz_chandesc.c; \
 	$$tmp/cd > $$tmp/cd.log 2>&1 || { cat $$tmp/cd.log; exit 1; }; \
 	tail -1 $$tmp/cd.log; \
+	echo "== docvals store: pure validator on well-formed, truncated and corrupt images =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/fdv test/fuzz/fuzz_docvals.c -lm; \
+	$$tmp/fdv > $$tmp/fdv.log 2>&1 || { cat $$tmp/fdv.log; exit 1; }; \
+	tail -1 $$tmp/fdv.log; \
 	echo "== page-bound guard (G22): end offset in range, avail never underflows =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/pb test/fuzz/fuzz_pagebound.c; \
 	$$tmp/pb > $$tmp/pb.log 2>&1 || { cat $$tmp/pb.log; exit 1; }; \

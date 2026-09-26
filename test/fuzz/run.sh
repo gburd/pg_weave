@@ -25,7 +25,7 @@ export ASAN_OPTIONS="abort_on_error=1:detect_leaks=1"
 export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
 
 echo "== building fuzzers ($CC, ASan+UBSan) =="
-for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_dictwalk fuzz_pagebound; do
+for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_docvals fuzz_dictwalk fuzz_pagebound; do
     $CC $CFLAGS "$here/$f.c" -o "$out/$f"
 done
 # fuzz_surftrie is the one fuzzer with a companion .c: the Z3 trie's builder and
@@ -43,6 +43,11 @@ $CC $CFLAGS -DFUZZ_NO_SUMTF_GUARD=1 "$here/fuzz_block.c" -o "$out/fuzz_block_nos
 # planted-bug binary for the v6 channel-descriptor decoder: the "descriptor array
 # must fit the readable bytes" guard removed.  MUST abort under ASan.
 $CC $CFLAGS -DFUZZ_NO_ARRAY_GUARD=1 "$here/fuzz_chandesc.c" -o "$out/fuzz_chandesc_noarray"
+# planted-bug binary for the docvalues store validator: the "image is long
+# enough for its stated ndocs" guard removed.  A truncated image with a large
+# ndocs is then accepted and the read-all-values postcondition overruns the
+# exact buffer.  MUST abort under ASan.
+$CC $CFLAGS -DPLANT_BUG=1 "$here/fuzz_docvals.c" -o "$out/fuzz_docvals_noguard"
 # planted-bug binaries for the Z3 surf trie.  Unlike the ones above these are
 # compile-time removals in the REAL validator (-DWEAVE_SURF_PLANT_*) rather than a
 # weakened transcription of it, because a transcribed copy drifts out of step with
@@ -72,7 +77,7 @@ $CC $CFLAGS -DWEAVE_PAGEBOUND_PLANT_NO_LOW_GUARD=1 "$here/fuzz_pagebound.c" \
 
 echo "== running fuzzers =="
 rc=0
-for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_surftrie fuzz_dictwalk \
+for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_docvals fuzz_surftrie fuzz_dictwalk \
          fuzz_pagebound; do
     if "$out/$f"; then
         echo "PASS: $f"
@@ -132,6 +137,17 @@ if "$out/fuzz_chandesc_noarray" >/dev/null 2>&1; then
     rc=1
 else
     echo "PASS: fuzz_chandesc_noarray aborted as expected (descriptor-array teeth)"
+fi
+
+# The docvals no-length-guard build lets a truncated image with a large ndocs be
+# accepted; the read-all-values postcondition then walks past the exact buffer,
+# and ASan must abort it -- proving the harness detects the missing-length-guard
+# class on the int8 docvalues store.
+if "$out/fuzz_docvals_noguard" >/dev/null 2>&1; then
+    echo "FAIL: fuzz_docvals_noguard exited 0 -- harness did NOT catch the missing length guard!"
+    rc=1
+else
+    echo "PASS: fuzz_docvals_noguard aborted as expected (image-length teeth)"
 fi
 
 # The surf-trie no-size-guard build lets a corrupt count put a whole section past
