@@ -47,6 +47,8 @@ the list of dimensions where it loses, are `doc/ARCHITECTURE.md` §§8–9.
    `FUZZY_CHANNEL.md`
 6. `doc/CONVENTIONS.md` — PostgreSQL core C style as this project applies it
 7. `doc/TESTING.md` — five layers, and why the property layer is mandatory
+8. `bench/METHODOLOGY.md` — before you write a benchmark: the harness traps that
+   make numbers wrong, and the guard against each
 
 ## Build and test, verbatim
 
@@ -483,6 +485,28 @@ sibling project needed `git-filter-repo` to undo the alternative. Related, and i
 has already paid for itself elsewhere: **pull benchmark artefacts incrementally,
 never in one final scp** — a burner expiring mid-run cost them an instance and
 zero data, because the data was already on disk.
+
+**15. A swept-parameter boundary is not a capability wall.** Adopted 2026-09-26
+from the sibling project's IVF review: a sweep capped `probes` at 128 of 1024 and
+reported the arm as "unreachable at R@10 ≥ 0.98"; extending the grid to 256/512
+reached 0.987 then 1.000 — it was grid-limited, never a wall. Before writing that a
+channel "cannot" reach a target, either extend the grid until the curve flattens or
+label the number **grid-limited** with the cap that produced it. This indicts our
+own owed docvals-prize probe (`bench/RESULTS_DOCVALS_PRIZE.md`, G49 note): the 2k-row
+`vec_scores`-rising observation is a LIMIT-driven widening confound, not evidence of
+a ceiling, and must not be reported as one.
+
+**16. A determinism / bit-identity guard must vary the axis the algorithm actually
+depends on, not a proxy.** Adopted 2026-09-26: the sibling project's
+`rotate_corpus_bit_identical_across_pool_sizes` varied the *thread count* at a fixed
+shape and passed, so a "mathematically equivalent" blocked-rotation optimization
+looked safe — but the underlying GEMM's tiling (and thus its float reduction order)
+depends on the *row count*, so blocking would have silently changed on-disk bytes.
+Only a guard varying the shape (`m=1` vs `m=300`) caught it, and only because it was
+written **before** the optimization was trusted. For pg_weave this sharpens hard
+rule 1 and every merge/build/repack "same bytes" claim: identify what the output
+byte-depends on (segment shape, docid order, chunk boundaries, tail padding — not
+just worker count) and make the guard sweep *that* axis, first.
 
 ## Where things are
 
