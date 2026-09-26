@@ -3834,3 +3834,48 @@ measured until a docvals gate returns correct rows on a merged (corpus-scale) in
    so `weave_index_nsegments` proves a merge ran, then `dv_agree()` across all five
    strategies. A positive control: assert the pre-fix build produces `nsegments>1` and
    the gate is empty, so the test can fail.
+
+### G52 — the docvalues gate is BLIND to the pending buffer: a post-build INSERT silently drops matching rows from a `WHERE price <op> c` answer, and corrupts a combined `@@@ AND price` — **FOUND 2026-09-26, a G49-class silent wrong answer, reachable by any ordinary INSERT**
+
+The lexical channel reads the pending (un-flushed insert) buffer; the docvalues gate
+does not. Measured on `lpg` (dvtest), single un-flushed INSERT after CREATE INDEX:
+
+- `body @@@ 'zebrafish'` (term unique to the inserted row) → **1** (correct; lexical
+  scans pending).
+- `price < 100` (only the inserted row qualifies) → **0**, heap truth **1**. The docvals
+  gate silently drops it.
+- `body @@@ 'alpha' AND price < 100` → **0**. The docvals gate's empty contribution kills
+  the `tidset_and`, so the COMBINED query — the common facet-plus-text case — loses the
+  row too.
+
+Persists after `weave_merge()`: the inserted row's pending item never carried a docvals
+value, so the flush wrote no docvals for it and the merge (G51) has nothing to carry — the
+gate stays wrong. Not an approximate-recall degradation (that would be the vector sibling,
+G29); this is a WRONG ANSWER to a boolean predicate, and it is asymmetric — the lexical
+channel is correct on exactly the rows the docvals gate misses, so the two disagree within
+one index.
+
+**Root cause.** `weave_insert`/`weave_pending_item_write` (`ambuild.c`) store the doc,
+vector and cgram values in each `WeavePendingItem` but NOT a docvals value; the plain and
+fused scan paths do not evaluate the docvals gate over pending items; and
+`weave_flush_pending` hardcodes `bs.dvattno = 0` (`ambuild.c:6133-6135`), so flushed
+segments carry no docvals for inserted rows. This is the limitation `DOCVALS_CHANNEL.md`
+§9 anticipated ("the docvals gate must either see pending values or the documented
+limitation extends to it") — but the §9 framing understates it: a silent wrong answer to
+a pushed-down qual is exactly the CONVENTIONS decision-2 / G49 hazard, and it is reachable
+by a plain INSERT, not an edge.
+
+**Consequence for release.** The `int8_docval_ops` opclass (0.24.0/0.25.0, both UNRELEASED)
+must not be released while this holds: it advertises search strategies the AM does not
+fully serve once a row is inserted. Same bar G49 set.
+
+**FIX = the deferred aminsert/pending docvals slice** (`DOCVALS_CHANNEL.md` §11, the
+int8-slice plan's "does NOT do"). Sketch: (1) carry an int8 docvals value in
+`WeavePendingItem` (a pending-page format bump); (2) `weave_insert` extracts the docvals
+column and passes it; (3) the pending-scan path (plain + fused) evaluates the docvals gate
+over pending items; (4) `weave_flush_pending` and `weave_insert_oversized_as_segment`
+collect docvals into the flushed segment (set `bs.dvattno` from the index). Interim
+alternative if the slice is deferred further: the scan must recheck (or refuse to claim
+exactness) whenever pending items or docvals-less segments exist, so the qual degrades to
+a correct-but-slower filter instead of a wrong answer. Planned in
+`doc/plans/2026-09-26-docvals-pending-slice.md`.
