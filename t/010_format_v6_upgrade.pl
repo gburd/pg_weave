@@ -68,14 +68,11 @@ use constant {
 	INVALID_BLOCK         => 0xFFFFFFFF,
 	WEAVE_VERSION_V5      => 5,
 	# The version this build WRITES.  v7 added the fuzzy weft, v8 the vector one,
-	# v9 a pending page whose items carry the inserted row's vector, and v10 one whose
-	# items also carry the raw gram text (doc/GAPS.md G35); the
-	# metapage is byte-identical to v6 in all three cases, so everything this test
-	# manufactures is unaffected -- but the version word it reads back is not, and
-	# hard-coding 6 here would have turned a correct version bump into a test
-	# failure.  See WEAVE_VERSION in include/weave/am.h for why a format that
+	# v9 a pending page whose items carry the inserted row's vector, v10 one whose
+	# items also carry the raw gram text (doc/GAPS.md G35), and v11 one whose items
+	# also carry the int8 docvalues value (G52); the
 	# changes no metapage field still bumps it.
-	WEAVE_VERSION_CUR     => 10,
+	WEAVE_VERSION_CUR     => 11,
 };
 
 # Rewrite the metapage of an index file into the v5 on-disk shape.  Server MUST be
@@ -293,7 +290,7 @@ is(read_metapage_version($abspath), WEAVE_VERSION_CUR,
 like($node->safe_psql('postgres',
 		q{SELECT detail FROM weave_check('docs_weave')
 		   WHERE invariant = 'metapage_version_recognized'}),
-	qr/^format v10 /, 'weave_check() now reports the current format (v10)');
+	qr/^format v11 /, 'weave_check() now reports the current format (v11)');
 
 my $cd_after = $node->safe_psql('postgres',
 	q{SELECT detail FROM weave_check('docs_weave')

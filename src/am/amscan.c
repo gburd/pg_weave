@@ -4633,6 +4633,30 @@ weave_docvals_cmp_tid(const void *a, const void *b)
 	return ItemPointerCompare((ItemPointer) a, (ItemPointer) b);
 }
 
+/*
+ * Does a single int8 docvalues value satisfy `v <op> c`?  The scalar sibling of
+ * weave_dv_eval_int8()'s inner switch (include/weave/docvals.h), used for the
+ * pending buffer where each value stands alone rather than in a store image.
+ */
+static inline bool
+weave_dv_match_int8(WeaveDvStrat op, int64 v, int64 c)
+{
+	switch (op)
+	{
+		case WEAVE_DV_LT:
+			return v < c;
+		case WEAVE_DV_LE:
+			return v <= c;
+		case WEAVE_DV_EQ:
+			return v == c;
+		case WEAVE_DV_GE:
+			return v >= c;
+		case WEAVE_DV_GT:
+			return v > c;
+	}
+	return false;
+}
+
 static void
 weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
 {
@@ -4693,6 +4717,65 @@ weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
 		}
 		pfree(docids);
 		pfree((void *) img);
+	}
+
+	/*
+	 * THE PENDING BUFFER (doc/GAPS.md G52).  Documents inserted since the last
+	 * flush live in no bolt and no docvalues store, so the segment loop above
+	 * never sees them -- yet the lexical channel DOES match them from the pending
+	 * pages, so a query `@@@ x AND facet <op> c` would AND a set that has the
+	 * inserted row against one that does not and silently drop it.  A v11 pending
+	 * item carries the row's docvalues value (rec.hasdv), so evaluate the same
+	 * comparison here and emit the matching TIDs directly.
+	 *
+	 * A pending item with rec.hasdv == false (an index with no docvalues column,
+	 * or an item in an older layout written before WEAVE_VERSION_PENDING_DV and
+	 * not yet flushed) contributes nothing -- the same v1 partial-coverage limit a
+	 * merged or pre-Task-4 bolt has (doc/specs/DOCVALS_CHANNEL.md sect. 11).  The
+	 * common case, a fresh INSERT, always carries the value.
+	 *
+	 * These are live heap tuples; the executor applies MVCC on the heap exactly as
+	 * for a segment match, so no tombstone filtering is owed here.
+	 */
+	if (meta.pendinghead != InvalidBlockNumber)
+	{
+		BlockNumber blk = meta.pendinghead;
+
+		while (blk != InvalidBlockNumber)
+		{
+			Buffer		buffer;
+			Page		page;
+			WeavePendingIter it;
+			WeavePendingRec rec;
+			BlockNumber next;
+
+			CHECK_FOR_INTERRUPTS();
+			buffer = weave_scan_readbuf(index, blk);
+			if (buffer == InvalidBuffer)
+				break;
+			LockBuffer(buffer, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buffer);
+			next = WeavePageGetOpaque(page)->nextblk;
+			weave_pending_iter_init(&it, page);
+			while (weave_pending_iter_next(&it, &rec))
+			{
+				if (!rec.hasdv)
+					continue;
+				if (!weave_dv_match_int8(op, rec.docval, c))
+					continue;
+				if (ntids + 1 > captids)
+				{
+					captids = captids ? captids * 2 : 1024;
+					tids = (ItemPointerData *)
+						(tids
+						 ? WEAVE_REALLOC_MAYBE_HUGE(tids, (Size) captids * sizeof(ItemPointerData))
+						 : WEAVE_ALLOC_MAYBE_HUGE((Size) captids * sizeof(ItemPointerData)));
+				}
+				tids[ntids++] = *rec.tid;
+			}
+			UnlockReleaseBuffer(buffer);
+			blk = next;
+		}
 	}
 
 	if (ntids > 1)

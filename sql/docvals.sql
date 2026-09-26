@@ -200,3 +200,98 @@ SELECT count(*) AS merged_gate_disagreements FROM (
 DROP TABLE dvm_idx, dvm_seq;
 DROP TABLE dvm;
 
+-- ---------------------------------------------------------------------------
+-- (7) THE DOCVALS GATE SEES UN-FLUSHED INSERTS (doc/GAPS.md G52).  Rows inserted
+-- after the build live in the PENDING buffer, in no bolt and no docvalues store.
+-- The lexical channel matches them from the pending pages, so before this fix a
+-- query `@@@ x AND facet <op> c` ANDed a lexical set that HAD the inserted row
+-- against a docvalues set that did NOT, and silently dropped it -- and a bare
+-- `facet <op> c` over a freshly inserted row returned nothing.  A v11 pending item
+-- now carries the row's int8 value, so the gate evaluates it over pending too.
+--
+-- POSITIVE CONTROL: nsegments stays 1 after the post-build INSERTs (they are
+-- pending, not a flushed second segment), and the inserted low-price row is
+-- REQUIRED to be in the index answer while the high-price one is REQUIRED to be
+-- absent -- pre-fix the first assertion returned false because the gate could not
+-- see the pending buffer.
+-- ---------------------------------------------------------------------------
+CREATE TABLE dvp (id int, body wdoc, price bigint);
+INSERT INTO dvp SELECT g, to_wdoc('common doc ' || (g % 5)), (g % 100)::bigint
+  FROM generate_series(1, 300) g;
+CREATE INDEX dvp_w ON dvp USING weave (body, price int8_docval_ops);
+
+-- rows inserted AFTER the build; small docs, so they land in the pending buffer
+INSERT INTO dvp VALUES
+  (1001, to_wdoc('zebrafish special report'), 5),
+  (1002, to_wdoc('zebrafish special report'), 95);
+
+-- still one segment: the two rows are pending, NOT flushed to a second bolt
+SELECT weave_index_nsegments('dvp_w') = 1 AS still_one_segment_pending;
+
+CREATE OR REPLACE FUNCTION dvp_agree(pred text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+    n_bad bigint;
+BEGIN
+    EXECUTE 'SET LOCAL enable_seqscan = off';
+    EXECUTE 'SET LOCAL enable_bitmapscan = off';
+    EXECUTE 'SET LOCAL enable_indexscan = on';
+    EXECUTE format('CREATE TEMP TABLE dvp_idx AS SELECT id FROM dvp WHERE %s', pred);
+    EXECUTE 'SET LOCAL enable_indexscan = off';
+    EXECUTE 'SET LOCAL enable_bitmapscan = off';
+    EXECUTE 'SET LOCAL enable_seqscan = on';
+    EXECUTE format('CREATE TEMP TABLE dvp_seq AS SELECT id FROM dvp WHERE %s', pred);
+    SELECT count(*) INTO n_bad FROM (
+        SELECT id FROM dvp_idx EXCEPT SELECT id FROM dvp_seq
+        UNION ALL
+        SELECT id FROM dvp_seq EXCEPT SELECT id FROM dvp_idx
+    ) d;
+    DROP TABLE dvp_idx;
+    DROP TABLE dvp_seq;
+    RETURN n_bad = 0;
+END;
+$$;
+
+-- the gate over pending agrees with the heap for every strategy...
+SELECT dvp_agree('price < 50')  AS lt_agrees,
+       dvp_agree('price <= 5')  AS le_agrees,
+       dvp_agree('price = 95')  AS eq_agrees,
+       dvp_agree('price >= 90') AS ge_agrees,
+       dvp_agree('price > 90')  AS gt_agrees;
+
+-- ...and so does the conjunction with the lexical channel (the G52 repro shape)
+SELECT dvp_agree($$body @@@ 'zebrafish'::wquery AND price < 50$$) AS lex_and_dv_agrees;
+
+-- POSITIVE CONTROL: the inserted low-price pending row IS in the index answer,
+-- and the high-price one is NOT.  Pre-fix the gate was blind to pending, so the
+-- first was false (the row was dropped) regardless of the heap.
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT EXISTS (SELECT 1 FROM dvp WHERE body @@@ 'zebrafish' AND price < 50 AND id = 1001)
+       AS pending_low_row_found,
+       NOT EXISTS (SELECT 1 FROM dvp WHERE body @@@ 'zebrafish' AND price < 50 AND id = 1002)
+       AS pending_high_row_excluded;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+-- FLUSH (Task 4): a VACUUM drains the pending buffer into a new segment whose
+-- docvalues store must carry the flushed rows' values, so the gate keeps finding
+-- them once they are no longer pending -- and still does after a merge (with G51).
+VACUUM dvp;
+SELECT weave_index_nsegments('dvp_w') > 1 AS flushed_second_segment;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT dvp_agree('price < 50') AS lt_agrees_after_flush;
+SELECT EXISTS (SELECT 1 FROM dvp WHERE price < 50 AND id = 1001) AS flushed_low_row_found;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT weave_merge('dvp_w') IS NOT NULL AS merged;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT dvp_agree('price < 50') AS lt_agrees_after_merge;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+DROP FUNCTION dvp_agree(text);
+DROP TABLE dvp;
+

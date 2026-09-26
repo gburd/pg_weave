@@ -5,8 +5,9 @@
 # WHY THIS EXISTS.  Task V7's second half (doc/GAPS.md G23) made a pending item
 # carry the inserted row's vector, which GREW the item header from 12 bytes to 16
 # and changed the item stride; Z8's second half (G35) grew it again to 20 for the
-# raw gram_ops text.  The three layouts are told apart by page kind
-# (WEAVE_PK_PENDING vs _V9 vs _V10), and weave_pending_iter_next() in
+# raw gram_ops text; the docvals pending slice (G52) grew it to 24 for the int8
+# docvalues value.  The four layouts are told apart by page kind
+# (WEAVE_PK_PENDING vs _V9 vs _V10 vs _V11), and weave_pending_iter_next() in
 # include/weave/am.h has a branch for each.  An index upgraded with un-flushed
 # pending documents reaches an OLD branch on its very next scan -- so it is not a
 # theoretical path, and before this file nothing executed it.  This codebase has
@@ -18,17 +19,16 @@
 # and legitimate for the same reason: the delta down to v8 is precisely known and
 # small.  An item is
 #
-#     v10: tid[6] pad[2] doclen[4] veclen[4] gramlen[4]
-#            | wdoc[doclen] ... | wvec[veclen] ... | gram[gramlen] ...
-#          stride = MAXALIGN(20 + doclen) + MAXALIGN(veclen) + MAXALIGN(gramlen)
-#     v9:  tid[6] pad[2] doclen[4] veclen[4] | wdoc[doclen] ... | wvec[veclen] ...
-#          stride = MAXALIGN(16 + doclen) + MAXALIGN(veclen)
+#     v11: tid[6] pad[2] doclen[4] veclen[4] gramlen[4] dvlen[4]
+#            | wdoc[doclen] | wvec[veclen] | gram[gramlen] | docval[dvlen]
+#          stride = MAXALIGN(24+doclen)+MAXALIGN(veclen)+MAXALIGN(gramlen)+MAXALIGN(dvlen)
 #     v8:  tid[6] pad[2] doclen[4]           | wdoc[doclen] ...
 #          stride = MAXALIGN(12 + doclen)
 #
-# so the downgrade repacks each item eight bytes earlier, drops the vector and the
-# gram text, and rewrites pd_lower and the page's kind bits.  A v8 writer produced
-# exactly these bytes.
+# so the downgrade repacks each item twelve bytes earlier, drops the vector, the
+# gram text and the docval, and rewrites pd_lower and the page's kind bits.  A v8
+# writer produced exactly these bytes.  (This index has no docvalues column, so
+# every v11 item here already has dvlen == 0; the header width is what shifts.)
 #
 # WHAT IT ASSERTS, in order of what would go unnoticed without it:
 #   1. The pending documents still answer lexically, byte-identically -- i.e. the
@@ -55,16 +55,16 @@ use constant {
 	OPAQUE_SIZE           => 8,		# MAXALIGN(sizeof(WeavePageOpaqueData))
 	WEAVE_PENDING_BIT     => 1 << 3,	# the legacy one-hot kind bit
 	WEAVE_PAGE_KIND_EXT   => 1 << 15,
-	WEAVE_PK_PENDING_V10  => 33,
-	V10_HDR               => 20,
+	WEAVE_PK_PENDING_V11  => 34,
+	V11_HDR               => 24,
 	V8_HDR                => 12,
 };
 
 sub maxalign { my ($n) = @_; return ($n + 7) & ~7; }
 
 # Rewrite every current-layout pending page in `path` into the v8 layout, dropping
-# the vectors and the gram text.  Server MUST be down.  Returns the number of pages
-# rewritten and the number of items repacked.
+# the vectors, the gram text and the docval.  Server MUST be down.  Returns the
+# number of pages rewritten and the number of items repacked.
 #
 # Blocks are SCANNED rather than walked from meta.pendinghead: the walk would
 # duplicate the metapage arithmetic t/010 already owns, and a scan cannot miss a
@@ -88,7 +88,7 @@ sub downgrade_pending_pages
 		my $opoff = BLCKSZ - OPAQUE_SIZE;
 		my ($flags, $kind) = unpack('vv', substr($page, $opoff, 4));
 		next unless ($flags & WEAVE_PAGE_KIND_EXT)
-			&& $kind == WEAVE_PK_PENDING_V10;
+			&& $kind == WEAVE_PK_PENDING_V11;
 
 		my $lower = unpack('v', substr($page, PD_LOWER_OFF, 2));
 		die "pd_lower $lower out of range on block $blk"
@@ -102,15 +102,15 @@ sub downgrade_pending_pages
 		my $out = '';
 		my $p = CONTENT_START;
 		my $onpage = 0;
-		while ($p + V10_HDR <= $lower)
+		while ($p + V11_HDR <= $lower)
 		{
-			my ($b_hi, $b_lo, $posid, $doclen, $veclen, $gramlen) =
-			  unpack('vvvxxVVV', substr($page, $p, V10_HDR));
-			my $stride = maxalign(V10_HDR + $doclen) + maxalign($veclen)
-			  + maxalign($gramlen);
+			my ($b_hi, $b_lo, $posid, $doclen, $veclen, $gramlen, $dvlen) =
+			  unpack('vvvxxVVVV', substr($page, $p, V11_HDR));
+			my $stride = maxalign(V11_HDR + $doclen) + maxalign($veclen)
+			  + maxalign($gramlen) + maxalign($dvlen);
 			last if $p + $stride > $lower;
 
-			my $doc = substr($page, $p + V10_HDR, $doclen);
+			my $doc = substr($page, $p + V11_HDR, $doclen);
 			my $item = pack('vvvxxV', $b_hi, $b_lo, $posid, $doclen) . $doc;
 			$item .= "\0" x (maxalign(V8_HDR + $doclen) - length($item));
 			$out .= $item;
@@ -122,13 +122,13 @@ sub downgrade_pending_pages
 		$nitems += $onpage;
 
 		# The tail between the new pd_lower and the opaque must be zeroed: it was
-		# never written by a v8 producer, and leaving v10 bytes there would let a
+		# never written by a v8 producer, and leaving v11 bytes there would let a
 		# reader that mis-computes pd_lower appear to work.
 		my $newlower = CONTENT_START + length($out);
 		substr($page, CONTENT_START, $opoff - CONTENT_START,
 			   $out . ("\0" x ($opoff - $newlower)));
 		substr($page, PD_LOWER_OFF, 2, pack('v', $newlower));
-		# ...and the kind LAST, so an interrupted surgery leaves a v10 page whose
+		# ...and the kind LAST, so an interrupted surgery leaves a v11 page whose
 		# items are v8 -- unparseable, which is louder than silently wrong.
 		substr($page, $opoff, 4,
 			   pack('vv', ($flags & ~WEAVE_PAGE_KIND_EXT) | WEAVE_PENDING_BIT, 0));

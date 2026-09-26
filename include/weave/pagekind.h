@@ -284,6 +284,30 @@ typedef enum WeavePageKind
 	 */
 	WEAVE_PK_PENDING_V10 = 33,	/* pending page in the v10 item layout */
 
+	/*
+	 * Allocated by the docvals pending slice (doc/GAPS.md G52), which made a
+	 * pending item carry the inserted row's int8 docvalues value so a scalar
+	 * gate (WHERE facet <op> c) is no longer blind to un-flushed INSERTs -- the
+	 * lexical channel already found those rows, so an AND of the two silently
+	 * dropped every inserted row (the gate contributed the empty set).
+	 *
+	 * A NEW KIND FOR THE SAME REASON WEAVE_PK_PENDING_V10 IS ONE: the item
+	 * HEADER grew again (WeavePendingItem gained a dvlen word, moving nothing
+	 * ahead of it but lengthening the header from 20 to 24 bytes and appending a
+	 * MAXALIGN(dvlen) trailer after the gram text).  Those strides are not
+	 * distinguishable from the bytes, so the page must DECLARE which layout its
+	 * items use, weave_insert() must never append a new item to a page of older
+	 * ones, and the discriminator has to be per PAGE because weave_insert()
+	 * deliberately does not upcast the metapage -- so one index can hold all four
+	 * layouts at once.
+	 *
+	 * EVERY pending page this version writes is this kind, including in an index
+	 * with no docvalues column, where every item simply has dvlen == 0.  The kind
+	 * names the LAYOUT, not the payload.  WEAVE_PK_PENDING_V10 joins _V9 and the
+	 * legacy WEAVE_PK_PENDING as a read-only legacy format.
+	 */
+	WEAVE_PK_PENDING_V11 = 34,	/* pending page in the v11 item layout */
+
 	WEAVE_PK_NKINDS				/* first unassigned id; not a kind */
 } WeavePageKind;
 

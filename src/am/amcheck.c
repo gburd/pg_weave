@@ -140,17 +140,19 @@ wvck_mark_alloc(BlockNumber nblocks)
  * violation (which is described into `err`).  Bounded by nblocks so a corrupt
  * chain that loops or points forward forever terminates.
  *
- * THREE ACCEPTED KINDS, for one caller: the pending chain can legitimately hold
- * WEAVE_PK_PENDING, WEAVE_PK_PENDING_V9 and WEAVE_PK_PENDING_V10 pages at once,
- * because an index upgraded across WEAVE_VERSION_PENDING_VEC or
- * WEAVE_VERSION_PENDING_CGRAM keeps its old pages and weave_insert() starts a
+ * FOUR ACCEPTED KINDS, for one caller: the pending chain can legitimately hold
+ * WEAVE_PK_PENDING, WEAVE_PK_PENDING_V9, WEAVE_PK_PENDING_V10 and
+ * WEAVE_PK_PENDING_V11 pages at once, because an index upgraded across
+ * WEAVE_VERSION_PENDING_VEC, WEAVE_VERSION_PENDING_CGRAM or
+ * WEAVE_VERSION_PENDING_DV keeps its old pages and weave_insert() starts a
  * new page rather than mixing item layouts.  Everywhere else a chain is one
- * kind, and wvck_walk_chain() below says so by passing the same kind three
+ * kind, and wvck_walk_chain() below says so by passing the same kind four
  * times.
  */
 static int64
-wvck_walk_chain_3kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
-					   WeavePageKind alt, WeavePageKind alt2, StringInfo err)
+wvck_walk_chain_4kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
+					   WeavePageKind alt, WeavePageKind alt2,
+					   WeavePageKind alt3, StringInfo err)
 {
 	int64		n = 0;
 
@@ -194,7 +196,7 @@ wvck_walk_chain_3kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 							 blk, weave_page_kind_name(want));
 			return -1;
 		}
-		if (pk != want && pk != alt && pk != alt2)
+		if (pk != want && pk != alt && pk != alt2 && pk != alt3)
 		{
 			UnlockReleaseBuffer(buf);
 			appendStringInfo(err, "block %u on a %s chain has kind \"%s\"",
@@ -214,7 +216,7 @@ static int64
 wvck_walk_chain(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 				StringInfo err)
 {
-	return wvck_walk_chain_3kinds(cx, blk, want, want, want, err);
+	return wvck_walk_chain_4kinds(cx, blk, want, want, want, want, err);
 }
 
 /*
@@ -1328,9 +1330,10 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 		StringInfoData e;
 
 		initStringInfo(&e);
-		(void) wvck_walk_chain_3kinds(cx, meta->pendinghead, WEAVE_PK_PENDING,
+		(void) wvck_walk_chain_4kinds(cx, meta->pendinghead, WEAVE_PK_PENDING,
 									  WEAVE_PK_PENDING_V9,
-									  WEAVE_PK_PENDING_V10, &e);
+									  WEAVE_PK_PENDING_V10,
+									  WEAVE_PK_PENDING_V11, &e);
 		pfree(e.data);
 	}
 

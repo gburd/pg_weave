@@ -5626,7 +5626,8 @@ weave_small_runs_worth_merging(Relation index)
 static void
 weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 								 Datum vecval, bool vecisnull,
-								 Datum gramval, bool gramisnull)
+								 Datum gramval, bool gramisnull,
+								 Datum dvval, bool dvisnull)
 {
 	WeaveBuildState bs;
 	WeaveTermEntry *entries = WEAVE_DOC_ENTRIES(doc);
@@ -5657,9 +5658,14 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 	 */
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
-	bs.dvattno = 0;				/* v1: docvalues not collected on the oversized
-								 * insert (post-build rows); sect. 11 */
-	weave_docvals_accum_init(&bs.dv, bs.ctx, false);
+	/*
+	 * THE DOCVALUES PRODUCER IS ACTIVE HERE TOO (doc/GAPS.md G52).  Like the
+	 * cgram producer above, this path writes a whole bolt inside the inserting
+	 * statement and has the row's Datum, so it runs the same producer a build
+	 * does -- an oversized INSERT is no longer absent from a scalar gate.
+	 */
+	bs.dvattno = weave_build_dvattno(index);
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0);
 	weave_vec_accum_init(&bs.vec, bs.ctx, bs.vecattno != 0,
 						 weave_index_vec_bits(index),
 						 (WeaveMetric) (bs.vecattno != 0 ?
@@ -5687,6 +5693,12 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 		 * next to producer 1 so the three producers read in one place. */
 		if (bs.cgramattno != 0)
 			weave_cgram_accum_add(&bs.cgram, tid, gramval, gramisnull);
+
+		/* PRODUCER 4, the docvalues value (doc/GAPS.md G52).  Kept beside the
+		 * others so all producers read in one place; add() ERRORs on a NULL in
+		 * this NOT-NULL v1, matching the build path. */
+		if (bs.dvattno != 0)
+			weave_docvals_accum_add(&bs.dv, tid, dvval, dvisnull);
 
 		for (j = 0; j < doc->nterms; j++)
 		{
@@ -5783,16 +5795,20 @@ static void
 weave_pending_item_write(WeavePendingItem *pi, ItemPointer tid,
 						 WeaveDoc doc, uint32 doclen,
 						 const void *vec, uint32 veclen,
-						 const void *gram, uint32 gramlen)
+						 const void *gram, uint32 gramlen,
+						 int64 docval, bool has_docval)
 {
 	Size		docend = sizeof(WeavePendingItem) + doclen;
 	Size		vecoff = MAXALIGN(docend);
 	Size		gramoff = vecoff + MAXALIGN(veclen);
+	Size		dvoff = gramoff + MAXALIGN(gramlen);
+	uint32		dvlen = has_docval ? (uint32) sizeof(int64) : 0;
 
 	pi->tid = *tid;
 	pi->doclen = doclen;
 	pi->veclen = veclen;
 	pi->gramlen = gramlen;
+	pi->dvlen = dvlen;
 	memcpy((char *) pi + sizeof(WeavePendingItem), doc, doclen);
 	if (vecoff > docend)
 		MemSet((char *) pi + docend, 0, vecoff - docend);
@@ -5809,6 +5825,9 @@ weave_pending_item_write(WeavePendingItem *pi, ItemPointer tid,
 			MemSet((char *) pi + gramoff + gramlen, 0,
 				   MAXALIGN(gramlen) - gramlen);
 	}
+	if (dvlen > 0)
+		/* sizeof(int64) == 8 == MAXALIGN(8), so the trailer needs no pad. */
+		memcpy((char *) pi + dvoff, &docval, sizeof(int64));
 }
 
 /*
@@ -5844,6 +5863,8 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	uint32		veclen = 0;
 	const void *gram = NULL;
 	uint32		gramlen = 0;
+	int64		docval = 0;
+	bool		has_docval = false;
 	WeavePageKind wantkind;
 
 	/*
@@ -5913,15 +5934,44 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	}
 
 	/*
-	 * ...and the page kind is the v10 layout either way, including for an index
-	 * with neither a vector nor a gram_ops column, whose items just carry
-	 * veclen == gramlen == 0.  The kind names the ITEM LAYOUT; see
-	 * WEAVE_PK_PENDING_V10 in weave/pagekind.h for what happened when it named
+	 * THE DOCVALUES VALUE, CARRIED FORWARD (doc/GAPS.md G52).  Unlike the vector
+	 * and the gram text, this is not a producer's raw input that a flush re-runs
+	 * an extractor over: it is the stored gate value itself, read straight from
+	 * the row and comparable at scan time with no re-derivation.  It is stored so
+	 * that the SCAN can evaluate `facet <op> c` over an un-flushed INSERT -- the
+	 * lexical channel already finds that row, so without this the AND of the two
+	 * gates silently drops it (the docvalues gate contributed the empty set).
+	 *
+	 * int8 is BY VALUE, so nothing is detoasted.  v1 docvals is NOT NULL: a NULL
+	 * value ERRORs here exactly as the build path does (weave_docvals_accum_add),
+	 * rather than being stored as a placeholder that a `col < x` gate would
+	 * silently include.  has_docval stays false only for an index with no
+	 * docvalues column, whose items carry dvlen == 0.
+	 */
+	if (layout.dvattno != 0)
+	{
+		int			dvidx = layout.dvattno - 1;
+
+		if (isnull[dvidx])
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("weave docvalues column must not contain NULL in this version"),
+					 errhint("Declare the column NOT NULL, or omit it from the index until the null-bitmap slice lands.")));
+		docval = DatumGetInt64(values[dvidx]);
+		has_docval = true;
+	}
+
+	/*
+	 * ...and the page kind is the v11 layout either way, including for an index
+	 * with no vector, gram_ops or docvalues column, whose items just carry
+	 * veclen == gramlen == dvlen == 0.  The kind names the ITEM LAYOUT; see
+	 * WEAVE_PK_PENDING_V11 in weave/pagekind.h for what happened when it named
 	 * the payload instead.
 	 */
-	wantkind = WEAVE_PK_PENDING_V10;
+	wantkind = WEAVE_PK_PENDING_V11;
 
-	need = weave_pending_item_size(doclen, veclen, gramlen);
+	need = weave_pending_item_size(doclen, veclen, gramlen,
+								   has_docval ? (uint32) sizeof(int64) : 0);
 
 	if (need > BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(WeavePageOpaqueData)))
 	{
@@ -5941,7 +5991,11 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 										 layout.cgramattno != 0 ?
 										 values[layout.cgramattno - 1] : (Datum) 0,
 										 layout.cgramattno == 0 ||
-										 isnull[layout.cgramattno - 1]);
+										 isnull[layout.cgramattno - 1],
+										 layout.dvattno != 0 ?
+										 values[layout.dvattno - 1] : (Datum) 0,
+										 layout.dvattno == 0 ||
+										 isnull[layout.dvattno - 1]);
 		return true;
 	}
 
@@ -5978,7 +6032,7 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			tailpage = GenericXLogRegisterBuffer(state, tailbuf, 0);
 			pi = (WeavePendingItem *) weave_page_entry_end(tailpage);
 			weave_pending_item_write(pi, ht_ctid, doc, doclen, vec, veclen,
-									 gram, gramlen);
+									 gram, gramlen, docval, has_docval);
 			((PageHeader) tailpage)->pd_lower += need;
 			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
 			meta = WeavePageGetMeta(metapage);
@@ -6018,7 +6072,7 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			weave_init_page(np, wantkind);
 			pi = (WeavePendingItem *) weave_page_entry_end(np);
 			weave_pending_item_write(pi, ht_ctid, doc, doclen, vec, veclen,
-									 gram, gramlen);
+									 gram, gramlen, docval, has_docval);
 			((PageHeader) np)->pd_lower += need;
 		}
 
@@ -6130,9 +6184,8 @@ weave_flush_pending(Relation index)
 	 */
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
-	bs.dvattno = 0;				/* v1: docvalues not collected on the pending
-								 * flush (post-build rows); sect. 11 */
-	weave_docvals_accum_init(&bs.dv, bs.ctx, false);
+	bs.dvattno = weave_build_dvattno(index);
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0);
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;
@@ -6246,6 +6299,23 @@ weave_flush_pending(Relation index)
 			else if (bs.cgramattno != 0 && rec.gram != NULL)
 				weave_cgram_accum_add(&bs.cgram, rec.tid,
 									  PointerGetDatum(rec.gram), false);
+
+			/*
+			 * PRODUCER 4, the docvalues weft (doc/GAPS.md G52).  A v11 pending
+			 * item carries the row's int8 value (rec.hasdv), so this flushed
+			 * segment gets a real docvalues store and the row stays answerable by
+			 * a scalar gate after the pending buffer drains.  Unlike the cgram
+			 * weft there is no all-or-nothing gate: an item without a value (an
+			 * older layout, or an index with no docvalues column) simply
+			 * contributes no pair, which is the same partial-coverage a merged
+			 * bolt has and is safe for a facet gate (an absent docid is not
+			 * emitted; the documented v1 limit, sect. 11).  Fed by docid so the
+			 * write_weft sort matches the build path.
+			 */
+			if (bs.dvattno != 0 && rec.hasdv)
+				weave_docvals_accum_add_pair(&bs.dv,
+											 weave_tid_to_docid(rec.tid),
+											 rec.docval);
 
 			entries = WEAVE_DOC_ENTRIES(rec.doc);
 
