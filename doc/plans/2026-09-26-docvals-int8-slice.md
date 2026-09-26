@@ -263,7 +263,7 @@ ever ran a docvals weft through a merge).
       at-scale delete-heavy merge run is still owed on EC2** (local delete-heavy merge
       passed, but rule 12 wants scale).
 
-### Task 8: End-to-end proof — re-run the prize spike on a real docvals column — **UNBLOCKED 2026-09-26 (Task 7.5 done); fd_weave REINDEXed, gate now correct at 57.6k**
+### Task 8: End-to-end proof — re-run the prize spike on a real docvals column — **DONE 2026-09-26. Claim 3 holds for a scalar facet: arm D vec_blocks FALLS with selectivity (fiqa 11,680→2,380→320; scifact 340→40→20), prize up to 517× (fiqa) / 648× (scifact) vs the un-pushable Filter.**
 
 The slice's gate (spec §11 step 1): the scalar arm must now *fall* with selectivity like the lexical arm, capturing the prize `RESULTS_DOCVALS_PRIZE.md` measured against the un-pushable filter.
 
@@ -272,10 +272,10 @@ The slice's gate (spec §11 step 1): the scalar arm must now *fall* with selecti
 **Files:**
 - Modify: `bench/RESULTS_DOCVALS_PRIZE.md` (add a "MEASURED WITH THE CHANNEL" section); harness `/scratch/pg_weave/dvprize8.sh` (arm D = `WHERE price<=K`, pushable, added).
 
-- [ ] **Step 1:** On `lpg`, add an int8 facet to `normfiqa`/`normsci` **without churning the vector weft** — build a fresh index that includes `price int8_docval_ops` where `price` is a precomputed column (add the column, then `REINDEX`, so the warp map is rebuilt in docid order — the churn lesson from the sizing spike). **DONE for normfiqa; REINDEX again after Task 7.5.**
-- [ ] **Step 2:** Run the two arms from the sizing spike, but arm S now uses `WHERE price <op> const` (pushable) instead of `id % N` (filter). Capture `vec_blocks` across selectivity 0.1/0.01/0.001. (Coordinator; work counters are deterministic/host-independent — no EC2 needed.)
-- [ ] **Step 3: Assert the prize is captured** — arm S `vec_blocks` now *falls* with selectivity (matching arm L within the selectivity-match tolerance), not grows. If it does not, the gate is not pruning — stop and diagnose (reach for the ablation: is the Index Cond present? is the gate set non-empty and sorted?). **Before trusting a fall, confirm the gate returns the CORRECT row COUNT vs heap truth (the G51 lesson: an empty gate looks like `vec_blocks=0` = a fake infinite prize).**
-- [ ] **Step 4:** Record the measured before/after in `RESULTS_DOCVALS_PRIZE.md` (losses as prominently as wins — if it captures less than the projected 82.8×, say by how much and why).
+- [x] **Step 1:** normfiqa AND normsci: `price` scattered rank added, `fd_weave` rebuilt with `price int8_docval_ops` (docvals now survives the multi-segment build+merge, G51 fixed).
+- [x] **Step 2:** `/scratch/pg_weave/dvprize8.sh` (arm S modulus Filter, arm L lexical, arm **D** docvals `price<=round(N*sel)`); `vec_blocks` at sel 0.1/0.01/0.001, both corpora. Work counters, deterministic, no EC2. (Fixed a harness bug: KP now derives from each corpus's N, not hardcoded to fiqa's 57,600.)
+- [x] **Step 3:** Prize captured — arm D `vec_blocks` FALLS monotonically (fiqa 11,680→2,380→320; scifact 340→40→20) while arm S RISES; arm D BEATS the lexical proxy (exact vs approximate selectivity). Correctness verified against heap FIRST (no empty-gate fake prize). The scattered facet does NOT defeat pruning (answers the plan's facet↔docid-correlation question: NO for this mechanism).
+- [x] **Step 4:** Recorded in `bench/RESULTS_DOCVALS_PRIZE.md` "MEASURED WITH THE CHANNEL" with rule-8/11/15 caveats (work-only, LIMIT 10, scifact 0.001 is a sub-k regime, latency + 1M owed).
 
 **Measurement discipline for this task (see `bench/METHODOLOGY.md`, AGENTS.md rules 15–16):**
 - The `vec_blocks` sweep is a work counter — deterministic, host-independent, no EC2. If a *latency* number is added, it must follow the harness rules: inline the query vector as a literal (no `ORDER BY` subquery — it adds ~90 ms InitPlan on every arm), one `psql -f` session per arm with the warm-up discarded, and time the top-level `EXPLAIN (ANALYZE)` Execution Time (the Index-Scan node excludes our in-AM rerank).

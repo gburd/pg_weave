@@ -75,3 +75,64 @@ only one that generalizes claim 3 — the differentiator — from "another lexic
 writer at build/flush/merge, reader, `block_max` bound property test per hard rule 1, fuzz
 target, crash-recovery + concurrency TAP, upgrade path) and needs its own design + approval
 before implementation. `doc/PHASES.md` V17's last sentence already flags this gap.
+
+## MEASURED WITH THE CHANNEL — 2026-09-26 (the channel is now built; docvals int8 slice)
+
+The sizing above compared arm S (un-pushable scalar Filter) against arm **L** (a pushable
+LEXICAL term of matched df) as a *proxy* for the prize a docvals gate would recover. The
+docvals channel now exists (`int8_docval_ops`, ext 0.25.0), so this re-runs the same spike
+with a real arm **D**: `WHERE price <op> c` on an int8 column indexed `int8_docval_ops`,
+where `price` is a scattered 1..N rank (`row_number() OVER (ORDER BY hashint8(id))`) so
+`price <= round(N*sel)` has exactly the target selectivity and is uncorrelated with docid
+(the general "any scalar facet", not a docid-contiguous best case). Harness
+`/scratch/pg_weave/dvprize8.sh` (throwaway, work counters only, deterministic /
+host-independent — `weave_work_stats().vec_blocks`, 20 queries/point, `fuse(body<=>wq,
+emb<#>qv, weights={0.5,0.5})` ORDER BY, LIMIT 10). Local `lpg`; latency deliberately not
+measured. **Correctness checked first (the G51 / rule-15 discipline: an empty gate would
+read as `vec_blocks=0` = a fake infinite prize)** — every arm D selectivity agrees with the
+heap as a set before any block is counted.
+
+| corpus | target sel | arm S blocks (Filter) | arm L blocks (lexical) | arm **D** blocks (docvals) | prize S/D |
+|---|---|---|---|---|---|
+| fiqa (57,600) | 0.1 | 41,400 | 35,420 | 11,680 | 3.5× |
+| fiqa | 0.01 | 108,000 | 9,860 | 2,380 | 45.4× |
+| fiqa | 0.001 | 165,600 | 1,100 | **320** | **517.5×** |
+| scifact (5,183) | 0.1 | 4,050 | 3,240 | 340 | 11.9× |
+| scifact | 0.01 | 9,558 | 1,800 | 40 | 238.9× |
+| scifact | 0.001 | 12,960 | 100 | **20** | **648.0×** |
+
+Three facts, and the first is the claim:
+
+- **Arm D's vector work FALLS monotonically as the predicate tightens** — fiqa
+  11,680 → 2,380 → 320, scifact 340 → 40 → 20 — while arm S (the same predicate as an
+  executor Filter, which is what `WHERE price<x` was before this channel) *rises*
+  41,400 → 108,000 → 165,600. **Claim 3 (`ARCHITECTURE.md` §9) now holds for a scalar
+  facet**, not just for another lexical term: the docvals gate's docid bound skips vector
+  work in the fused scan, and the more selective the facet the more it skips. This is the
+  differentiator, demonstrated end to end with the channel built — the inverted curve the
+  sizing measured is now a falling one.
+
+- **Arm D beats the lexical proxy (arm L)** at every selectivity below 0.1, and by a wide
+  margin at 0.001 (fiqa 320 vs 1,100; scifact 20 vs 100). The sizing under-projected the
+  prize (it capped at arm L's 82.8× / 129.6×) because a matched-df lexical term is only
+  *approximately* the target selectivity, whereas the docvals gate is *exact* — the recovered
+  prize is 517× (fiqa) / 648× (scifact) against the un-pushable baseline, larger than the
+  proxy predicted.
+
+- **The scattered facet does not defeat the pruning.** The open question the plan flagged
+  (does the prize hinge on facet↔docid spatial correlation, the `RESULTS_BOUND_PRUNING`
+  lesson?) is answered NO for this mechanism: `price` here is a hash-scattered rank,
+  uncorrelated with docid, and the block work still falls with selectivity, because the
+  fused gate bounds the *candidate docid set* the vector channel scores, not a contiguous
+  block range.
+
+Caveats (rule 8 / rule 11 / rule 15): work counters only, two corpora, LIMIT 10, warm,
+local. The scifact 0.001 cell is a **sub-k regime** — `round(5183·0.001)=5` gate rows < the
+10-row LIMIT — so its 20 blocks is the scan exhausting a 5-row gated set, a legitimate bound
+but not a top-10 fill; the fiqa cells and scifact 0.1/0.01 are all ≥ k. This is a
+work-reduction ratio, **not** a latency or a 1M-scale result (those are owed, and per
+rule 15 the falling curve shows no floor within the swept grid — it is not a wall). The
+falls reproduce across both corpora (rule 11). Found and fixed en route: **G51** — the
+first run returned `vec_blocks=0` for arm D because the segment merge dropped the docvals
+weft (silent empty gate); the numbers above are post-fix, with the index REINDEXed and the
+gate verified against the heap.
