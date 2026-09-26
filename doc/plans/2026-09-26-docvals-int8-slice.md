@@ -226,9 +226,9 @@ git commit -m "docvals: regression test for index-vs-heap agreement; regen 0.24.
 
 ---
 
-### Task 7.5 (BLOCKER, found by Task 8 on 2026-09-26): docvals must survive segment merge — G51
+### Task 7.5 (BLOCKER, found by Task 8 on 2026-09-26): docvals must survive segment merge — G51 — **DONE 2026-09-26**
 
-**Task 8 is BLOCKED on this.** Measuring the prize (below) surfaced a P0: on any index
+**Task 8 WAS BLOCKED on this; now unblocked.** Measuring the prize (below) surfaced a P0: on any index
 whose build flushed >1 segment (routine — every parallel build merges worker outputs,
 and any serial build over the flush budget flushes+merges), the finalize merge does NOT
 carry the docvals weft, so a `WHERE price <op> c` gate silently returns **zero** rows
@@ -237,17 +237,33 @@ sketch are in `doc/GAPS.md` G51. Single-segment builds — every existing docval
 are correct, which is why all gates were green (hard rule 12 / eleventh member: no test
 ever ran a docvals weft through a merge).
 
-- [ ] Merge carries docvals: `weave_merge_segments_streaming` k-way-merges the inputs'
-      (docid,value) pairs on the global docid key, drops tombstoned docids, writes one
-      store; a non-bearing input contributes nothing; the merged chandesc must not
+- [x] Merge carries docvals: `weave_merge_segments_streaming` now appends every input's
+      docvals (docid,value) pairs (new `weave_docvals_merge_append`, mirroring
+      `weave_cgram_merge_append`), drops tombstoned docids, and `weave_docvals_write_weft`
+      sorts+writes one store. A non-bearing input contributes nothing (partial coverage =
+      the pre-existing post-insert state, NOT the cgram refuse-mixed model). `write_weft`
+      returns InvalidBlockNumber for an empty union, so no self-describing ndocs=0 store.
+      Verified: mixed insert+VACUUM+merge (post_merge_gate 0→150), real fiqa 57.6k
+      multi-segment build+merge (all strategies agree with heap), delete-heavy merge
+      (134==heap, 0 disagreements). Original merge-carries-docvals sketch retained:
+- [x] (superseded) k-way-merge sketch: the merged chandesc must not
       advertise a docvals weft it cannot serve (CONVENTIONS decision 2 — no self-describing
-      ndocs=0 trap).
-- [ ] `sql/docvals.sql` gains a forced-multi-segment case (tiny `maintenance_work_mem` +
-      high vocabulary so `weave_index_nsegments > 1`), `dv_agree()` across all five
-      strategies, with a pre-fix positive control (nsegments>1 ⇒ gate empty ⇒ test fails).
-- [ ] TDD flow (worker→reviewer→re-reviewer), coordinator compiles + runs the gates.
+      ndocs=0 trap). Satisfied: partial coverage, no ndocs=0 descriptor.
+- [x] `sql/docvals.sql` gained a forced-multi-segment case (INSERT+VACUUM flushes a 2nd
+      segment — the `fuse_degenerate.sql` fixture shape, cheaper and more deterministic
+      than exceeding the 32MB flush-budget floor), asserts `weave_index_nsegments > 1`
+      (positive control), `weave_merge()`, then index==heap for `price <= 150`. Pre-fix
+      `post_merge_gate` = 0; post-fix = 150. `expected/docvals.out` regenerated via
+      pg_regress (only section 6 added; the other 19 files unchanged).
+- [x] TDD flow (worker→reviewer→re-reviewer), coordinator compiles + runs the gates.
+      Failing test written first (confirmed 0 pre-fix), worker implemented the mirror of
+      `weave_cgram_merge_append`, reviewer PASS (no memory/lifetime/correctness bug),
+      coordinator compiled + ran: installcheck-pg17 & pg18 green, docvals hegel 7.59M
+      checks/0 failures, check-alloc/pdlower/rename clean. **Rule 12 caveat: the
+      at-scale delete-heavy merge run is still owed on EC2** (local delete-heavy merge
+      passed, but rule 12 wants scale).
 
-### Task 8: End-to-end proof — re-run the prize spike on a real docvals column — **BLOCKED on Task 7.5**
+### Task 8: End-to-end proof — re-run the prize spike on a real docvals column — **UNBLOCKED 2026-09-26 (Task 7.5 done); fd_weave REINDEXed, gate now correct at 57.6k**
 
 The slice's gate (spec §11 step 1): the scalar arm must now *fall* with selectivity like the lexical arm, capturing the prize `RESULTS_DOCVALS_PRIZE.md` measured against the un-pushable filter.
 

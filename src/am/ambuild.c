@@ -51,6 +51,7 @@
 
 #include "weave/weave.h"
 #include "weave/am.h"
+#include "weave/docvals.h"			/* Docvals: the int8 scalar store the docvalues gate evaluates */
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
 #include "weave/vector.h"			/* V7: producer 1, the vector weft accumulator */
 #include <math.h>
@@ -3347,6 +3348,47 @@ merge_vec_dead_lanes(WeaveVecAccum *acc, const DoclenCollector *out)
 	pfree(have);
 }
 
+/* G51: carry an input bolt's docvals weft into the merge accumulator. Mirrors
+ * weave_cgram_merge_append, but a missing weft is NOT a failure: an input with
+ * no docvals store simply contributes nothing, so the merged store covers the
+ * union of the docvals-bearing inputs' docids -- exactly the partial coverage a
+ * post-build INSERT already produces (doc/GAPS.md G51, doc/specs/DOCVALS_CHANNEL.md
+ * sect. 11). Tombstoned docids are physically dropped, as the lexical/cgram merges do. */
+static void
+weave_docvals_merge_append(Relation index, const WeaveSegMeta *seg,
+						   WeaveDocvalsAccum *acc,
+						   const uint8 *tombdense, uint64 tombdense_n)
+{
+	AttrNumber	attno = 0;
+	BlockNumber root = weave_docvals_root_for_segment(index, seg, &attno);
+	const void *img;
+	uint32		ndocs = 0;
+	uint32		i;
+	MemoryContext old;
+
+	if (root == InvalidBlockNumber)
+		return;					/* this bolt carries no docvals weft */
+	img = weave_docvals_load(index, root, CurrentMemoryContext, &ndocs);
+	if (ndocs == 0)
+	{
+		pfree((void *) img);
+		return;
+	}
+	old = MemoryContextSwitchTo(acc->ctx);
+	for (i = 0; i < ndocs; i++)
+	{
+		uint64		d = weave_docvals_docid(img, i);
+		int64		v = weave_docvals_int8(img, i);
+
+		if (d < tombdense_n &&
+			(tombdense[d >> 3] & (uint8) (1u << (d & 7))) != 0)
+			continue;			/* tombstoned: physically drop */
+		weave_docvals_accum_add_pair(acc, d, v);
+	}
+	MemoryContextSwitchTo(old);
+	pfree((void *) img);
+}
+
 /*
  * Streaming k-way merge of the `chosen` segments into ONE new segment, bounded
  * to one term's postings at a time.  Writes the new segment's pages and fills
@@ -3371,6 +3413,7 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	BlockNumber surfroot;
 	BlockNumber vecroot;
 	BlockNumber cgramroot;
+	BlockNumber dvroot;
 	uint32		nout = 0;
 	uint32		i;
 	MemoryContext old = MemoryContextSwitchTo(bs->ctx);
@@ -3454,6 +3497,20 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 			MemoryContextSwitchTo(old);
 			return false;
 		}
+	}
+
+	/*
+	 * G51: carry the docvals weft through the merge, the same way producer 3
+	 * carries cgram. Unlike cgram this never abandons the merge -- an input
+	 * without a docvals weft just contributes nothing (partial coverage is the
+	 * documented post-insert state), so there is no all-or-none precondition.
+	 */
+	bs->dv.active = (weave_build_dvattno(index) != 0);
+	if (bs->dv.active)
+	{
+		for (i = 0; i < nsel; i++)
+			weave_docvals_merge_append(index, &chosen[i], &bs->dv,
+									   srcv[i].tombdense, srcv[i].tombdense_n);
 	}
 
 	dict_spill_begin(&spill);
@@ -3736,13 +3793,14 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	 */
 	cgramroot = weave_build_cgram_weft(index, &bs->cgram);
 	/*
-	 * No docvalues weft on the merge in this v1 slice: the docvalues store is not
-	 * merged (doc/specs/DOCVALS_CHANNEL.md sect. 11), so the merged bolt carries
-	 * no DOCVALS descriptor and a docvalues gate over it builds nothing -- the
-	 * documented limitation, the same shape the post-build insert path has.
+	 * G51 docvals weft, from the producer above -- the SAME writer the build and
+	 * the flush use. InvalidBlockNumber when no input carried a weft (write_weft
+	 * returns it for n==0), in which case the merged bolt carries no DOCVALS
+	 * descriptor: correct, and it never writes a self-describing ndocs=0 store.
 	 */
+	dvroot = weave_docvals_write_weft(index, &bs->dv);
 	weave_attach_chandesc(index, seg, surfroot, vecroot, cgramroot,
-						  InvalidBlockNumber);
+						  dvroot);
 
 	for (i = 0; i < nsel; i++)
 		weave_doclens_free(&srcv[i].doclens);

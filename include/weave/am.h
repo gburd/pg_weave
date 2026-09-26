@@ -1477,6 +1477,10 @@ extern void weave_docvals_accum_init(WeaveDocvalsAccum *acc, MemoryContext ctx,
 extern void weave_docvals_accum_reset(WeaveDocvalsAccum *acc);
 extern void weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
 									Datum value, bool isnull);
+/* Merge path's pair-level entry point (the build path uses
+ * weave_docvals_accum_add); appends a (docid, value) directly, no null check. */
+extern void weave_docvals_accum_add_pair(WeaveDocvalsAccum *acc, uint64 docid,
+										 int64 value);
 
 /*
  * Write the weft from the accumulator and return its WEAVE_PK_DOCVALS root, or

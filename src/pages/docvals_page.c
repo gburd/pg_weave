@@ -412,6 +412,15 @@ weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
 				 errmsg("weave docvalues column must not contain NULL in this version"),
 				 errhint("Declare the column NOT NULL, or omit it from the index until the null-bitmap slice lands.")));
 
+	weave_docvals_accum_add_pair(acc, weave_tid_to_docid(tid), DatumGetInt64(value));
+}
+
+void
+weave_docvals_accum_add_pair(WeaveDocvalsAccum *acc, uint64 docid, int64 value)
+{
+	if (!acc->active)
+		return;
+
 	if (acc->n >= acc->cap)
 	{
 		/* corpus-scale: one pair per indexed document, so the doubling `cap`
@@ -427,8 +436,8 @@ weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
 		acc->cap = want;
 	}
 
-	acc->docid[acc->n] = weave_tid_to_docid(tid);
-	acc->value[acc->n] = DatumGetInt64(value);
+	acc->docid[acc->n] = docid;
+	acc->value[acc->n] = value;
 	acc->n++;
 }
 

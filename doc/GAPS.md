@@ -3754,7 +3754,23 @@ one real hazard to clear first (does `add_posting`/`build_term_append` **copy** 
 term bytes out of `doc`, or alias into it? aliasing means freeing the blob dangles),
 so it goes through the TDD worker→reviewer flow, not a coordinator edit.
 
-### G51 — a docvalues restriction gate silently returns ZERO rows on any index whose build flushed more than one segment: the segment MERGE does not carry the docvals weft — **FOUND 2026-09-26 by Task 8's prize measurement (rule 9), the primary CREATE INDEX path at real scale, a P0 wrong-answer**
+### G51 — a docvalues restriction gate silently returns ZERO rows on any index whose build flushed more than one segment: the segment MERGE does not carry the docvals weft — **FOUND 2026-09-26 by Task 8's prize measurement (rule 9), the primary CREATE INDEX path at real scale, a P0 wrong-answer — FIXED 2026-09-26 (same day)**
+
+**FIXED 2026-09-26.** `weave_merge_segments_streaming` now carries the docvals weft: a
+new `weave_docvals_merge_append` (mirroring `weave_cgram_merge_append`) reads each input
+bolt's docvals store and appends its (docid,value) pairs — dropping tombstoned docids —
+into the merge accumulator, which `weave_docvals_write_weft` then sorts and writes as one
+store; the root is attached via `weave_attach_chandesc` instead of the old
+`InvalidBlockNumber`. Unlike cgram it does NOT gate merge eligibility: an input with no
+docvals weft contributes nothing, so the merged store covers the union of the
+docvals-bearing inputs' docids — the same partial coverage the post-insert path already
+has, not a refuse-mixed rule (which would stop all merges after any insert). Verified:
+the sql/docvals.sql section-(6) regression (`post_merge_gate` 0→150 with a `nsegments>1`
+positive control), real fiqa 57,600-row multi-segment build+merge (all five strategies
+agree with heap), and a delete-heavy multi-segment merge (index==heap, 0 disagreements —
+the tombstone-drop path). installcheck-pg17 & pg18 green, docvals hegel 7.59M checks / 0
+failures, check-alloc/pdlower/rename clean, reviewer PASS. Rule 12 caveat: the at-scale
+delete-heavy merge run on EC2 is still owed.
 
 `WHERE price <op> c` over a docvals-bearing index returns an EMPTY result whenever
 the `CREATE INDEX` flushed more than one segment and finalize merged them. Confirmed
