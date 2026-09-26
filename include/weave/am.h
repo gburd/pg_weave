@@ -1404,6 +1404,48 @@ extern bool weave_surf_consult(Relation index, const WeaveSegMeta *seg,
 							   uint32 generation, WeaveSurfTrie *t,
 							   Size *len, uint8 **owned);
 
+/* ---------------------------------------------------------------------------
+ * The docvalues weft: the dense int8 forward store (task Docvals).
+ *
+ * The image is format-defined and backend-independent (include/weave/docvals.h,
+ * exercised by test/hegel/test_docvals.c with no backend).  These two are the AM
+ * half -- the WEAVE_PK_DOCVALS page chain it lives on, and the two ways to move
+ * it across that boundary.  The reader/writer live in src/pages/docvals_page.c
+ * and follow weave_write_surf()/weave_read_surf() for the same reasons: a
+ * per-kind chain that weave_check() and weave_index_size_detail() can tell from
+ * every other blob, and a reader that refuses bytes that are not demonstrably a
+ * docvalues store (a gate built from trusted-but-corrupt bytes is a wrong
+ * answer, not an error -- doc/CONVENTIONS.md decision 2).
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Serialize the int8 store (header + n int64 values) and lay it across a fresh
+ * chain of WEAVE_PK_DOCVALS pages, returning the root block.  The payload pages
+ * are written FIRST, each in its own GenericXLog cycle; the root is returned only
+ * once every page exists, so the caller can record it LAST in the channel
+ * descriptor under `state` -- the ordering rule weave_attach_chandesc() and
+ * weave_vec_write_weft() follow, and the reason the caller's GenericXLogState is
+ * a parameter (it names that contract; the payload pages are written on their
+ * own cycles).  The serialized image is byte-for-byte what
+ * weave_docvals_validate() expects.  check-alloc: any size derived from `n`
+ * (corpus-scale) uses the huge-safe allocator.
+ */
+extern BlockNumber weave_docvals_write(Relation index, GenericXLogState *state,
+									   const int64 *vals, uint32 n);
+
+/*
+ * Walk the chain from `root`, concatenate the page payloads into one contiguous
+ * image allocated in `cxt`, run weave_docvals_validate(), and ereport
+ * ERRCODE_INDEX_CORRUPTED with the reason on failure (on-disk bytes are not
+ * trusted -- validation is the trust boundary, and nothing reads past the
+ * reassembled length before it runs).  Sets *ndocs_out to the validated ndocs.
+ * Returns the validated image; the caller reads it with weave_docvals_int8() /
+ * weave_dv_eval_int8().  pd_lower is read only through weave_page_entry_end()
+ * (check-pdlower).
+ */
+extern const void *weave_docvals_load(Relation index, BlockNumber root,
+									  MemoryContext cxt, uint32 *ndocs_out);
+
 /*
  * The one posting decoder.  Every channel reads a term's postings through this:
  * ambuild.c's merge, amscan.c's boolean/phrase/ranked paths, amvacuum.c's
