@@ -4992,6 +4992,7 @@ wand_load_block(WandCursor *c)
 			   *pend;
 	WeaveBlockHdr *bh;
 	const unsigned char *stream;
+	int64		rd0;			/* G48: pgBufferUsage.shared_blks_read snapshot, to attribute a MISS to the load site */
 	uint64		gaps[WEAVE_BLOCK_SIZE];
 	uint64		base;
 	int			cnt;
@@ -5016,7 +5017,9 @@ wand_load_block(WandCursor *c)
 	 * walk below rather than once per call, because one wand_load_block() can cross
 	 * several pages of empty tail before it finds a block to decode. */
 	weave_lexwork_pages_load++;
+	rd0 = pgBufferUsage.shared_blks_read;
 	buf = ReadBuffer(c->index, c->curblk);
+	weave_lexwork_reads_load += pgBufferUsage.shared_blks_read - rd0;
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	pend = weave_page_entry_end(page);
@@ -5041,7 +5044,9 @@ wand_load_block(WandCursor *c)
 		c->curoff = MAXALIGN(SizeOfPageHeaderData);
 		CHECK_FOR_INTERRUPTS();	/* buffer already released above, next not yet read: no lock held */
 		weave_lexwork_pages_load++;		/* G48 */
+		rd0 = pgBufferUsage.shared_blks_read;
 		buf = ReadBuffer(c->index, c->curblk);
+		weave_lexwork_reads_load += pgBufferUsage.shared_blks_read - rd0;
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		pend = weave_page_entry_end(page);
@@ -5275,13 +5280,16 @@ wand_skip_blocks(WandCursor *c, uint64 target)
 				   *pend;
 		BlockNumber nextblk;
 		bool		stopped = false;
+		int64		rd0;		/* G48: shared_blks_read snapshot for the skip-site miss */
 
 		CHECK_FOR_INTERRUPTS();	/* between posting-list pages, no buffer lock held: safe to unwind */
 		/* G48: a page visited only to SKIP over blocks -- headers read, nothing
 		 * decoded.  This is the traffic an out-of-chain skip structure could remove,
 		 * and the ratio against pages_load is what says whether that is a lever. */
 		weave_lexwork_pages_skip++;
+		rd0 = pgBufferUsage.shared_blks_read;
 		buf = ReadBuffer(c->index, c->curblk);
+		weave_lexwork_reads_skip += pgBufferUsage.shared_blks_read - rd0;
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		pend = weave_page_entry_end(page);
