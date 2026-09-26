@@ -3671,3 +3671,44 @@ The counter's positive control is `sql/chanstats.sql`: `lex_reads_*` are state-d
 (≈0 when resident, which the installcheck cluster always is, since `shared_buffers` is fixed
 there), so — like the skip/load *ratio* — only the deterministic reset-to-zero is asserted
 in regression; the non-zero split is measured in bench under a constrained pool.
+
+### G49 — a docvalues restriction scankey SEGFAULTS the scan: the 0.24.0 `int8_docval_ops` opclass makes core emit an index qual nothing in the scan honours — **OPEN 2026-09-26**
+
+Found while measuring Task 5 (docvals planner pushdown) before building it (hard
+rule 9). Facts, all on `lpg`, ext 0.24.0 after Task 4:
+
+- `WHERE price < 100::bigint` (operator `int8lt`, which Task 3 put in
+  `int8_docval_ops`) makes core generate a plain `Index Scan ... Index Cond:
+  (price < '100'::bigint)` on the weave index — the opclass is enough for core to
+  emit the scankey.
+- Executing that scan **segfaults the backend** (`signal 11`). weave's scan is an
+  ORDER-BY (`amcanorderbyop`) machine; a restriction scankey on the docvalues
+  column with no order-by is a shape `weave_beginscan`/`weave_rescan`/
+  `weave_gettuple` do not expect, and it dereferences past its assumptions.
+- The bare literal form `WHERE price < 100` dodges it only by accident: `100` is
+  `int4`, so the operator is `int84lt` (int8,int4), which is NOT in
+  `int8_docval_ops` (int8-only), so the qual stays an executor **Filter**. So the
+  crash is reachable today from ordinary SQL the moment the constant is int8
+  (`::bigint`, a bigint column comparison, a prepared int8 param, ...).
+
+This is a **latent P0 introduced by Task 3** (the opclass shipped in 0.24.0, still
+unreleased): an opclass that advertises search strategies core will use, with no
+scan support behind them. It is exactly the CONVENTIONS decision-2 shape one level
+up — the AM must never be handed a qual it cannot honour.
+
+Two things follow, and they COUPLE Tasks 5 and 6 (`fusepath.c`'s
+`weave_fuse_borrow_indexclauses` comment already says why: borrowing a clause the
+scan does not honour returns rows with plausible scores):
+
+1. **Safety**: the scan must either honour a docvalues restriction scankey or the
+   AM must refuse to be given one. Landing the pushdown (Task 5) without the scan
+   honouring it (Task 6) turns the segfault into a wrong answer — strictly worse.
+2. **Ergonomics**: to push down the natural `price < 100` (int4 literal) without a
+   `::bigint` cast, `int8_docval_ops` needs the cross-type operators
+   (int8,int4)/(int8,int2) the btree `integer_ops` family carries; the int8-only
+   opclass matches only int8 constants. A later type slice decides this; for now
+   the constant must be int8.
+
+FIX lands with the combined Task 5+6 (scan honours the docvalues gate). Until
+then, 0.24.0 must not be released, and a defensive guard that turns the crash into
+a clean `ERROR` is the minimum if any 0.24.x is cut before the gate is done.
