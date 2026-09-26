@@ -4074,6 +4074,14 @@ static const struct
 	 * discriminator.
 	 */
 	{"gram_ops", WEAVE_WK_CGRAM},
+	/*
+	 * P3.  `int8_docval_ops` names the scalar / docvalues channel: an int8 facet
+	 * stored per-docid so a `WHERE col <op> const` restriction becomes a gate
+	 * (doc/specs/DOCVALS_CHANNEL.md sect. 4).  Like the others the family says
+	 * WHICH CHANNEL, not which type -- an int8 column is a docvals column only
+	 * when it wears this opclass.
+	 */
+	{"int8_docval_ops", WEAVE_WK_DOCVALS},
 };
 
 /*
@@ -4206,6 +4214,23 @@ weave_index_layout(Relation index, WeaveIndexLayout *out)
 							 errdetail("Columns %d and %d both use gram_ops.",
 									   out->cgramattno, i + 1)));
 				out->cgramattno = (AttrNumber) (i + 1);
+				break;
+			case WEAVE_WK_DOCVALS:
+
+				/*
+				 * One docvals column in this version, mirroring the vector
+				 * check exactly: the v1 int8 slice writes a single
+				 * WEAVE_WK_DOCVALS weft per bolt, so a second int8_docval_ops
+				 * column would silently index only one of them.  Multiple
+				 * docvals columns are a later plan (spec sect. 11).
+				 */
+				if (out->dvattno != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("weave index supports at most one docvalues column in this version"),
+							 errdetail("Columns %d and %d both use a docvalues operator class.",
+									   out->dvattno, i + 1)));
+				out->dvattno = (AttrNumber) (i + 1);
 				break;
 			default:
 				elog(ERROR, "unhandled weave weft kind %d for index \"%s\" column %d",

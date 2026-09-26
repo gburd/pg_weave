@@ -18,7 +18,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.23.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.24.0" of extension "pg_weave" is already installed
 CREATE TABLE sf (id serial, d wdoc);
 -- Terms that exercise the trie's shape rather than a degenerate one: a shared
 -- prefix family (common/commonX), a mid band, and a per-row rare term, so the
