@@ -1638,6 +1638,12 @@ typedef struct WeaveIndexLayout
 								 * comment gives: the discriminator is the opclass.
 								 * A text column is not by itself a cgram column --
 								 * `USING weave (sku gram_ops)` is the request. */
+	AttrNumber	dvattno;		/* 1-based index attnum of the int8 docvalues
+								 * (int8_docval_ops) column, or 0 if the index has
+								 * none.  Resolved by the opclass, not the column
+								 * TYPE, for the same reason vecattno/cgramattno are:
+								 * an int8 column is a docvals facet only when it
+								 * wears int8_docval_ops. */
 } WeaveIndexLayout;
 
 extern void weave_index_layout(Relation index, WeaveIndexLayout *out);
