@@ -353,6 +353,12 @@ check-rename:
 CHECK_CC ?= cc
 STANDALONE_CFLAGS = -O2 -Wall -Wextra -Wno-unused-parameter -I include
 
+# Positive control for the docvals leg (AGENTS.md eleventh member): a passing
+# gate is not evidence the gate can fail.  The coordinator separately compiles a
+# planted-bug variant of weave/docvals.h (e.g. weave_dv_eval_int8 skipping the
+# last docid, or a flipped comparator) and confirms test_docvals EXITS NONZERO
+# on it.  That control is run out-of-tree; no permanent broken leg lives here.
+
 .PHONY: check-standalone
 check-standalone:
 	@set -e; \
@@ -446,6 +452,11 @@ check-standalone:
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/edist test/hegel/test_edist.c -lm; \
 	$$tmp/edist > $$tmp/edist.log 2>&1 || { cat $$tmp/edist.log; exit 1; }; \
 	tail -2 $$tmp/edist.log; \
+	echo "== docvals int8 store (C5): eval == a straight-line reference loop; validator rejects corruption =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -DWEAVE_DOCVALS_TEST_HELPERS \
+		-o $$tmp/docvals test/hegel/test_docvals.c -lm; \
+	$$tmp/docvals > $$tmp/docvals.log 2>&1 || { cat $$tmp/docvals.log; exit 1; }; \
+	tail -1 $$tmp/docvals.log; \
 	echo "== TRE d0e0c997 -> f864ed0 (pg_tre 1521662): backref wrong-answer fix =="; \
 	bash test/hegel/run_tre_bump.sh backref > $$tmp/tre.log 2>&1 || { cat $$tmp/tre.log; exit 1; }; \
 	tail -1 $$tmp/tre.log; \
