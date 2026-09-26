@@ -3835,7 +3835,7 @@ measured until a docvals gate returns correct rows on a merged (corpus-scale) in
    strategies. A positive control: assert the pre-fix build produces `nsegments>1` and
    the gate is empty, so the test can fail.
 
-### G52 — the docvalues gate is BLIND to the pending buffer: a post-build INSERT silently drops matching rows from a `WHERE price <op> c` answer, and corrupts a combined `@@@ AND price` — **FOUND 2026-09-26, a G49-class silent wrong answer, reachable by any ordinary INSERT**
+### G52 — the docvalues gate is BLIND to the pending buffer: a post-build INSERT silently drops matching rows from a `WHERE price <op> c` answer, and corrupts a combined `@@@ AND price` — **FOUND 2026-09-26, a G49-class silent wrong answer, reachable by any ordinary INSERT; FIXED 2026-09-26 (commit 8419ec9)**
 
 The lexical channel reads the pending (un-flushed insert) buffer; the docvalues gate
 does not. Measured on `lpg` (dvtest), single un-flushed INSERT after CREATE INDEX:
@@ -3879,3 +3879,22 @@ alternative if the slice is deferred further: the scan must recheck (or refuse t
 exactness) whenever pending items or docvals-less segments exist, so the qual degrades to
 a correct-but-slower filter instead of a wrong answer. Planned in
 `doc/plans/2026-09-26-docvals-pending-slice.md`.
+
+**FIXED 2026-09-26 (commit 8419ec9)** by the pending slice, following the v8→v9→v10
+pending-format precedent: a **v11 pending item** (`WEAVE_PK_PENDING_V11`, `WEAVE_VERSION`
+11) carries the row's int8 docvalues value as a `uint32 dvlen` + trailing `int64 docval`,
+self-describing by length (`dvlen ∈ {0,8}`; 0 = no docvalues column, and a NULL value
+ERRORs at INSERT as the build path does — v1 is NOT NULL). All four sketched steps landed
+together (they must — a format that no reader honours is a different wrong answer): (1)
+`WeavePendingItem` gained the field; (2) `weave_insert` and `weave_insert_oversized_as_segment`
+write it; (3) `weave_docvals_collect` now walks the pending chain and evaluates the same
+`v <op> c` per item — one site that fixes the plain, bitmap and fused gates; (4)
+`weave_flush_pending` sets `dvattno` from the index and folds each pending docval into the
+flushed segment (`weave_docvals_accum_add_pair`, the G51 pair entry point). An item with no
+value (older layout, or no docvalues column) contributes nothing — the same partial-coverage
+a merged bolt has (§11), safe for a facet gate. `sql/docvals.sql` §(7) is the repro turned
+gate (index==heap over pending for all five strategies, the `@@@ AND price` conjunction, a
+positive control that the inserted low-price row IS returned — false pre-fix — plus a
+flush+merge re-check); `t/019`/`t/010` updated to v11; `weave_check(deep)` accepts the
+four-kind pending chain and is asserted over a mixed v8+v11 chain. **Still owed (rule 12):
+a delete+insert+merge run at scale on EC2 before `int8_docval_ops` is release-eligible.**

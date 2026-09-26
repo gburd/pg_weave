@@ -1,8 +1,15 @@
 # Plan: docvals pending/insert slice — make the docvalues gate insert-safe (fixes G52)
 
-Status: proposed 2026-09-26. Prereqs: the int8 build+merge slice (Tasks 1–8, done;
-G49 + G51 fixed). This is the "aminsert/flush of docvals" work the int8-slice plan and
-`doc/specs/DOCVALS_CHANNEL.md` §9/§11 deferred.
+Status: **DONE 2026-09-26 (commit 8419ec9), all authoritative gates green.** Prereqs: the
+int8 build+merge slice (Tasks 1–8, done; G49 + G51 fixed). This is the "aminsert/flush of
+docvals" work the int8-slice plan and `doc/specs/DOCVALS_CHANNEL.md` §9/§11 deferred.
+
+**Ext-version decision (revises Task 6 below): NO bump.** The fix is C-only — a v11 pending
+item + scan/flush wiring, no new SQL object — so an ext migration would be empty and none is
+written. The correct version lever is the on-disk `WEAVE_VERSION` 10→11 (done), which makes
+an old `.so` fail closed on a v11-writing index. Ext `0.25.0` is unreleased (date-based tags,
+no per-ext tag), so the fix simply lands in unreleased 0.25.0; `int8_docval_ops` becomes
+release-eligible once the rule-12 at-scale delete+insert+merge run on EC2 is done (still owed).
 
 ## Why (G52)
 The docvalues gate is blind to the pending (un-flushed INSERT) buffer, while the lexical

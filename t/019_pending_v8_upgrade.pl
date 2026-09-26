@@ -238,6 +238,13 @@ is($node->safe_psql('postgres',
 		  SELECT count(*) FROM docs WHERE d @@@ 'pendingdoc'::wquery}),
 	'4', 'all four pending documents answer across the MIXED chain');
 
+# weave_check(deep) must accept the MIXED v8 + v11 pending chain: the deep walk
+# validates the pending chain kind-by-kind (amcheck's four-accepted-kinds walk),
+# so a v11 page it did not know about would be reported as a wrong-kind leak.
+is($node->safe_psql('postgres',
+		q{SELECT count(*) FROM weave_check('docs_weave', true) WHERE NOT ok}),
+	'0', 'weave_check(deep) holds over the mixed v8 + v11 pending chain');
+
 # --- 3. a flush over the mixed chain --------------------------------------
 my $lanes_before = $node->safe_psql('postgres',
 	"SELECT sum(nvec) FROM weave_vec_meta('docs_weave')");

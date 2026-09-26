@@ -179,9 +179,13 @@ and `enable_bitmapscan` off in the test, and the plan checked for the index cond
   docvals column's value into its weft's value array at the row's segment-local docid. Text
   builds the per-segment dictionary (collect distinct, sort by collation, assign ordinals).
 - **Pending / flush:** a docvals value for a not-yet-flushed row lives in the pending buffer
-  alongside its vector/lexical data; flush writes it into the new segment's store. (G29's
-  lesson: a channel that does not scan pending is absent from answers until flush — the
-  docvals gate must either see pending values or the documented limitation extends to it.)
+  alongside its vector/lexical data; flush writes it into the new segment's store. **DONE for
+  int8 (G52, commit 8419ec9):** a v11 pending item (`WEAVE_PK_PENDING_V11`) carries the
+  row's int8 value, `weave_docvals_collect` evaluates the gate over the pending chain, and
+  `weave_flush_pending` folds each pending docval into the flushed segment. (G29's lesson,
+  now discharged for this channel: a channel that does not scan pending is absent from
+  answers until flush — the docvals gate was blind to pending, a silent wrong answer, until
+  the v11 item made pending values visible and the flush carried them forward.)
 - **Merge:** concatenate value arrays in docid order; **re-dictionary** text (union the
   input dictionaries, re-sort, remap ordinals) — the merge producer-2 pattern
   (`v7-merge-producer2`). `check-alloc`/`check-pdlower` apply to every new reader.
@@ -205,6 +209,9 @@ half-built store:
 1. `int8`, comparison operators, single segment, NOT NULL — write store, pushdown, gate,
    both property tests. **Re-run `bench/RESULTS_DOCVALS_PRIZE.md`'s spike and confirm the
    scalar arm now falls with selectivity like the lexical arm** (the end-to-end proof).
+   **DONE** (int8-slice plan, Tasks 1–8: prize measured, claim 3 holds — up to 517×/648×),
+   **plus the pending/insert slice** (`2026-09-26-docvals-pending-slice.md`, G51+G52 fixed):
+   the merge carries the weft and an INSERT is answerable before and after flush.
 2. `float8`, `int4/2`, `date`, `bool` — same fixed-width path, per-type opclass + oracle.
 3. NULLs (null bitmap + exclusion) and the crash/torn-write/concurrency gates.
 4. Text: dictionary encoding, collation-sorted, ordinal-boundary resolution + its exactness
