@@ -7962,12 +7962,41 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 	 * instead of discarding rows it has already scored.  That is claim 3 of
 	 * doc/ARCHITECTURE.md sect. 9 and include/weave/fuse.h note 2's payoff.
 	 */
-	if (!so->plainInit && so->queryValid && so->query != NULL)
+	if (!so->plainInit &&
+		((so->queryValid && so->query != NULL) || so->dvScan))
 	{
 		MemoryContext old = MemoryContextSwitchTo(socxt);
 		TidSet		m;
+		bool		haveLex = so->queryValid && so->query != NULL;
 
-		weave_collect_matches(index, so->query, &m, &so->plainRecheck);
+		if (haveLex)
+			weave_collect_matches(index, so->query, &m, &so->plainRecheck);
+		else
+		{
+			m.tids = NULL;
+			m.n = 0;
+			so->plainRecheck = false;
+		}
+
+		/*
+		 * A docvalues restriction is a SECOND required predicate: intersect its
+		 * match set into the gate so the fused run's required channel is the
+		 * conjunction (lexical AND docvalues).  Docvalues-only (no @@@) makes the
+		 * docvalues set the whole gate.  This is the claim-3 payoff for a scalar
+		 * facet -- a selective `price < c` makes the scan SKIP vector work rather
+		 * than score-then-filter (doc/specs/DOCVALS_CHANNEL.md sect. 1).
+		 */
+		if (so->dvScan)
+		{
+			TidSet		dvset;
+
+			weave_docvals_collect(index, so->dvOp, so->dvConst, &dvset);
+			if (haveLex)
+				m = tidset_and(m, dvset);
+			else
+				m = dvset;
+		}
+
 		so->plainTids = m.tids;
 		so->nplain = m.n;
 		so->plainInit = true;

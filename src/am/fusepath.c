@@ -647,6 +647,9 @@ typedef struct WeaveFusePathOids
 	Oid			transport_op;	/* <~> (wdoc, float4[]) */
 	Oid			lex_family;		/* wdoc_lex_ops */
 	Oid			vec_family;		/* wvec_weave_ops */
+	Oid			dv_family;		/* int8_docval_ops, or InvalidOid on an extension
+								 * version that predates it -- then no docvalues
+								 * clause is borrowed and the qual stays a filter */
 } WeaveFusePathOids;
 
 static WeaveFusePathOids weave_fuse_path_oids = {InvalidOid};
@@ -717,6 +720,17 @@ weave_fuse_path_resolve(void)
 									list_make2(makeString(nspname),
 											   makeString("wvec_weave_ops")),
 									true);
+	/*
+	 * The docvalues opfamily is OPTIONAL: it arrived in 0.24.0, so an older
+	 * extension in the same cluster does not have it.  Resolve it missing_ok and
+	 * leave it out of the mandatory check below -- an InvalidOid simply means the
+	 * borrow accepts no docvalues clause, so the fused path still forms for every
+	 * index that predates the docvalues channel.
+	 */
+	n.dv_family = get_opfamily_oid(n.amoid,
+								   list_make2(makeString(nspname),
+											  makeString("int8_docval_ops")),
+								   true);
 
 	if (!OidIsValid(n.match_op) || !OidIsValid(n.lex_op) ||
 		!OidIsValid(n.lex_commop) || !OidIsValid(n.edist_op) ||
@@ -1108,16 +1122,20 @@ weave_fuse_weights_expr(FuncExpr *fcall, int nscores)
  * qual and the executor applies it.  The answer is the same; only the gate's
  * skipping is lost.
  *
- * ALL-OR-NOTHING, and only for `@@@` on a lexical column.  The fused pass honours
- * exactly one restriction key -- the boolean match set -- so a borrowed clause it
- * does not honour would be a pushed-down qual nobody evaluates: an Index Scan does
- * not re-check a pushed-down index qual, so rows failing it would come back with
- * plausible scores.  weave_rescan()'s cgram interaction is the same hazard one
- * level down and is why this refuses the whole list rather than filtering it.
+ * ALL-OR-NOTHING, and only for clauses the fused pass HONOURS: `@@@` on the
+ * lexical column, and a comparison on the docvalues column (any int8_docval_ops
+ * strategy).  The fused pass turns both into the run's required gate set (the
+ * lexical match set intersected with the docvalues match set, weave_fuse_pass()).
+ * A borrowed clause it does NOT honour would be a pushed-down qual nobody
+ * evaluates -- an Index Scan does not re-check a pushed-down index qual, so rows
+ * failing it would come back with plausible scores -- so any other clause makes
+ * this refuse the whole list rather than filter it.  `dvcol` is -1 when the index
+ * has no docvalues column (or the extension predates it), which reduces this to
+ * the lexical-only rule it had before.
  */
 static List *
 weave_fuse_borrow_indexclauses(RelOptInfo *rel, IndexOptInfo *index,
-							   int lexcol)
+							   int lexcol, int dvcol)
 {
 	ListCell   *lc;
 
@@ -1139,15 +1157,36 @@ weave_fuse_borrow_indexclauses(RelOptInfo *rel, IndexOptInfo *index,
 			IndexClause *ic = (IndexClause *) lfirst(lc2);
 			OpExpr	   *op;
 
-			if (ic->indexcol != lexcol || ic->lossy ||
-				list_length(ic->indexquals) != 1)
+			if (ic->lossy || list_length(ic->indexquals) != 1)
 			{
 				allmatch = false;
 				break;
 			}
 			op = (OpExpr *) ((RestrictInfo *) linitial(ic->indexquals))->clause;
-			if (!IsA(op, OpExpr) ||
-				op->opno != weave_fuse_path_oids.match_op)
+			if (!IsA(op, OpExpr))
+			{
+				allmatch = false;
+				break;
+			}
+			if (ic->indexcol == lexcol)
+			{
+				/* the boolean match gate: exactly @@@, not <=> or <@> which are
+				 * ordering operators that share this column. */
+				if (op->opno != weave_fuse_path_oids.match_op)
+				{
+					allmatch = false;
+					break;
+				}
+			}
+			else if (dvcol >= 0 && ic->indexcol == dvcol)
+			{
+				/* a docvalues comparison.  Every operator core matches to this
+				 * column is an int8_docval_ops search strategy (1..5), all of
+				 * which weave_rescan()/weave_fuse_pass() honour, so the column
+				 * identity is sufficient -- there is no ordering operator on this
+				 * column to exclude, unlike the lexical one. */
+			}
+			else
 			{
 				allmatch = false;
 				break;
@@ -1202,6 +1241,7 @@ weave_fuse_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		List	   *orderbycols = NIL;
 		List	   *indexclauses;
 		int			lexcol = -1;
+		int			dvcol = -1;
 		int			transpchan = -1;
 		int			totchan = 0;
 		int			i;
@@ -1225,6 +1265,20 @@ weave_fuse_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			}
 		if (lexcol < 0)
 			continue;
+
+		/*
+		 * The docvalues column, if this index has one and the extension defines
+		 * the opfamily.  Optional: -1 leaves weave_fuse_borrow_indexclauses at its
+		 * lexical-only behaviour, so an index with no docvalues column is
+		 * unaffected.
+		 */
+		if (OidIsValid(weave_fuse_path_oids.dv_family))
+			for (col = 0; col < index->nkeycolumns; col++)
+				if (index->opfamily[col] == weave_fuse_path_oids.dv_family)
+				{
+					dvcol = col;
+					break;
+				}
 
 		req = (WeaveFuseChanReq *) palloc0(nscores * sizeof(WeaveFuseChanReq));	/* alloc-ok: one per fuse() score argument, and fuse() has at most eight */
 		for (i = 0; i < nscores && ok; i++)
@@ -1294,7 +1348,7 @@ weave_fuse_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 										 weights, InvalidOid, InvalidOid));
 		orderbycols = lappend_int(orderbycols, lexcol);
 
-		indexclauses = weave_fuse_borrow_indexclauses(rel, index, lexcol);
+		indexclauses = weave_fuse_borrow_indexclauses(rel, index, lexcol, dvcol);
 
 		/*
 		 * pathkeys = root->query_pathkeys is what elides the Sort, and it is
