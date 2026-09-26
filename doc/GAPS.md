@@ -3672,7 +3672,7 @@ The counter's positive control is `sql/chanstats.sql`: `lex_reads_*` are state-d
 there), so — like the skip/load *ratio* — only the deterministic reset-to-zero is asserted
 in regression; the non-zero split is measured in bench under a constrained pool.
 
-### G49 — a docvalues restriction scankey SEGFAULTS the scan: the 0.24.0 `int8_docval_ops` opclass makes core emit an index qual nothing in the scan honours — **OPEN 2026-09-26**
+### G49 — a docvalues restriction scankey SEGFAULTS the scan: the 0.24.0 `int8_docval_ops` opclass makes core emit an index qual nothing in the scan honours — **FIXED 2026-09-26 (b8408a7): the scan honours a docvalues restriction scankey (weave_docvals_collect), the fused path gates on it (59dfc96), cross-type operators let the bare `price < 100` push down (dcac21e), and sql/docvals.sql pins it all (c3a5273). Every arm that once segfaulted now returns rows. NOTE: the query-time WORK-REDUCTION prize (claim 3: vector work FALLS with facet selectivity) is NOT yet demonstrated — a 2k-row lpg probe shows blkskip=0 and vec_scores rising under the widening ladder, so the proper large-corpus fixed-depth measurement is owed (may hinge on facet-docid spatial correlation, the RESULTS_BOUND_PRUNING lesson).**
 
 Found while measuring Task 5 (docvals planner pushdown) before building it (hard
 rule 9). Facts, all on `lpg`, ext 0.24.0 after Task 4:
