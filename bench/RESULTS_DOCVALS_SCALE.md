@@ -97,6 +97,37 @@ bool) share that pipeline and encode by a plain widening whose order-preservatio
 in question; the regression (`sql/docvals.sql` §8) covers them, and the float8 result is
 the at-scale evidence for the slice.
 
+### NULLs validated at 10M (added 2026-09-27, store format v2)
+
+The same 10M run carries a third index on a **NULLABLE** int8 facet (`nprice`, ~10 %
+NULL — a hash rank ending in 0 — else the same scattered 0..999) — `weave (d, nprice
+int8_docval_ops)` — asserted alongside the non-null gates at every phase. Shape confirmed
+before the build: `pct_null = 10.01 %` of 10,000,000 rows. A NULL satisfies no comparison
+(SQL three-valued logic), so the seqscan oracle excludes it; `disagreements = 0` therefore
+proves the **v2 null bitmap** excludes it too, through the same merge/vacuum/pending
+pipeline hard rule 12 governs. The load-bearing check is that `nprice < 100` and
+`nprice IS NOT NULL AND nprice < 100` return the **same** set:
+
+| phase | nullable assertion | `disagreements` |
+|---|---|---|
+| after build | `nprice < 100` = 899,173 **==** `nprice IS NOT NULL AND nprice < 100` = 899,173; `nprice >= 990` = 90,058 | 0 |
+| delete 40% + VACUUM | `nprice < 100` = 540,224 | 0 |
+| explicit merge | `nprice < 100` = 540,224 | 0 |
+| +200k INSERT (pending) | `nprice < 10` = 57,428 | 0 |
+| flush + merge | `nprice < 10` = 55,627; `nprice < 100` = 558,297 | 0 |
+
+The build-phase equality (899,173 == 899,173) is the tooth: a NULL stores a placeholder
+value the bitmap masks, so a dropped or mis-carried bitmap would let those ~1 M NULLs
+answer the comparison and diverge the two sets. They coincide at 10M across build, the
+tombstone-drop VACUUM, an explicit merge, the pending buffer, and the flush — the paths a
+freshly-built index does not exercise. This is the at-scale (rule 12) half of the NULL
+slice (`doc/plans/2026-09-27-docvals-nulls-slice.md`); the property test, the
+`sql/docvals.sql` §9 regression, the `fuzz_docvals` v2 teeth, and the `t/020`–`t/022`
+crash-recovery / torn-write / concurrency TAP are the local half. Index 456 MB / heap
+2295 MB; `nsegments` stayed 1 (the build merges internally). Instance c7i.4xlarge
+(Xeon Platinum 8488C, 30 GB), commit `5635689`.
+
+
 ## What this does NOT tell us (and one thing it surfaced)
 
 - **No vector column in the 10M correctness run**, on purpose: a first attempt with
