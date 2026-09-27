@@ -75,8 +75,8 @@ of self-describing spare fields:
 
 | region | v1 contents |
 |---|---|
-| header | magic, format version, value typid (int8-kind in v1), ndocs, `null_off` (0 in v1), `zonemap_off` (0 in v1), `values_off`, `docids_off` |
-| null bitmap | one bit per docid, 1 = NULL; absent if the column is `NOT NULL` (v1 is NOT NULL: build ERRORs on a NULL) |
+| header | magic, format version (**v2** since the NULL slice; v1 stores still read), value typid (int8-kind), ndocs, `null_off` (0 when the segment has no NULL), `zonemap_off` (0, reserved), `values_off`, `docids_off` |
+| null bitmap | **v2, DONE** (`doc/plans/2026-09-27-docvals-nulls-slice.md`): one bit per dense docid, 1 = NULL, `(ndocs+7)/8` bytes at `null_off`, MAXALIGNed after the docids array; present iff the segment holds ≥1 NULL (a NOT-NULL segment stays `null_off == 0`, byte-shape-identical to v1). A NULL no longer ERRORs at build/insert; it is recorded here and excluded from every comparison gate |
 | values | dense per-docid value array (see below) |
 | docids | dense **strictly-ascending** `uint64` array: the global docid (`weave_tid_to_docid`) each dense index denotes — the self-contained map above |
 | *(reserved)* | zone-map: per-block min/max, added later without a version bump |
@@ -135,9 +135,18 @@ only the pass's cost, which is why it is a later non-breaking addition and not v
 A NULL value satisfies **no** comparison operator (SQL three-valued logic: `NULL < x` is
 UNKNOWN, row excluded). The null bitmap is consulted first; a NULL docid is never emitted
 into a comparison gate set. `IS NULL` / `IS NOT NULL` pushdown is **deferred** — those
-predicates fall back to an executor Filter, which is correct (just unaccelerated) — so v1's
+predicates fall back to an executor Filter, which is correct (just unaccelerated) — so the
 pushdown surface is the five comparison operators only. This keeps the false-negative
 surface (§7) to one rule: emit iff not-null and comparison true.
+
+**DONE (store v2, `doc/plans/2026-09-27-docvals-nulls-slice.md`).** `weave_dv_eval_int8`
+skips a NULL docid before the comparison; `weave_docvals_isnull` reads the §3 bitmap. The
+rule is proven by `test/hegel/test_docvals.c`'s `prop_nulls` (the emitted set equals the
+independent reference `{docid : !isnull && cmp}` over random values/nulls/constants, every
+operator) and by `sql/docvals.sql` §9 (a nullable facet returns index==heap across build,
+pending INSERT, and VACUUM/merge; `IS NULL`/`IS NOT NULL` fall to a Filter and stay
+heap-correct). The false-negative hazard is why a NULL stores a placeholder value the
+bitmap masks, never a value that could satisfy a comparison.
 
 ## 7. The correctness contract (the docvals (C5) analog)
 
@@ -191,6 +200,16 @@ and `enable_bitmapscan` off in the test, and the plan checked for the index cond
   (`v7-merge-producer2`). `check-alloc`/`check-pdlower` apply to every new reader.
 - **Vacuum:** values for tombstoned docids are dropped on the rewrite like any weft; the
   store participates in the one vacuum, one WAL stream (100 % GenericXLog, hard rule 2).
+- **NULLs through all of these (DONE, `doc/plans/2026-09-27-docvals-nulls-slice.md`).**
+  Build records a NULL in the §3 bitmap (the accumulator carries a parallel `isnull`
+  array). A post-build INSERT of a NULL writes a v11 pending item with `dvlen == 0` — a
+  backward-safe reuse, because a NULL formerly ERRORed so no on-disk v11 item used that
+  encoding, and the column set is fixed at CREATE INDEX so every pending item on a
+  docvals-bearing index is v11. Flush is three-way (value / NULL / older-layout-skip) and
+  folds a pending NULL into the segment bitmap; `weave_docvals_merge_append` reads each
+  input's bitmap via `weave_docvals_isnull` and carries the NULL forward (a v1 input reads
+  as all-non-null). The crash-recovery, torn-write and concurrency gates are
+  `t/020`–`t/022` (§ PRODUCTION_READINESS gates 7–9).
 
 ## 10. Upgrade path
 
@@ -199,6 +218,17 @@ an old `.so` fail closed on a docvals-bearing index (X1). Extension bump 0.23.0 
 adds the opclasses and any SQL-visible functions. An index built before this channel simply
 has no docvals weft in any bolt's `chandesc`; a docvals qual on such an index finds no weft
 and falls back to an executor Filter (correct, unaccelerated).
+
+**The NULL slice bumps the STORE format (v1 → v2), not the extension.** No opclass or
+SQL-visible function changed, so there is no extension version bump: the operators the
+nulls affect were already defined. Versioning lives where the bytes changed — the store's
+own `version` field — exactly the CONVENTIONS rule that build-time format state is recorded
+in the segment, not in session/SQL state. The self-describing field makes both directions
+safe without a `WEAVE_VERSION` bump: a new `.so` reads an old v1 store (validator accepts
+version 1 with `null_off == 0`), and an old `.so` meeting a v2 store **fails closed** —
+its validator rejects the unknown version rather than misread the bitmap (CONVENTIONS
+decision 3). Verified by `sql/docvals.sql` §9 building v1-shaped (NOT-NULL) and v2
+(NULL-bearing) stores in one suite.
 
 ## 11. Build order (de-risking hard rule 7)
 
@@ -221,7 +251,14 @@ half-built store:
    819M checks). Five opclasses with cross-type members; `sql/docvals.sql` §8 has the
    per-type index==heap oracle incl. float8 ±0/NaN/±inf; float8 validated at 10M
    (`bench/RESULTS_DOCVALS_SCALE.md`).
-3. NULLs (null bitmap + exclusion) and the crash/torn-write/concurrency gates.
+3. NULLs (null bitmap + exclusion) and the crash/torn-write/concurrency gates. **DONE
+   2026-09-27 (`doc/plans/2026-09-27-docvals-nulls-slice.md`).** Store format v2 with an
+   optional null bitmap; the evaluator excludes NULLs; build/insert/flush/merge carry them;
+   `prop_nulls` (property), `sql/docvals.sql` §9 (index==heap on a nullable facet across
+   build/pending/VACUUM), `fuzz_docvals` (v2 bitmap, planted-bug teeth), and `t/020`–`t/022`
+   (crash-recovery / torn-write / concurrency) all green on pg17 and pg18. Scale validation
+   (10M, hard rule 12) is step 5's run, extended for a nullable facet in
+   `bench/aws/docvals_scale.sql`.
 4. Text: dictionary encoding, collation-sorted, ordinal-boundary resolution + its exactness
    test — the highest-risk piece, done last against a store the rest of the stack trusts.
 5. Merge (re-dictionary), then multiple docvals columns (AND intersection).

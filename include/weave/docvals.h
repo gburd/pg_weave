@@ -23,7 +23,9 @@
  * array", decided 2026-09-26).  weave_dv_eval_int8() therefore emits GLOBAL
  * DOCIDS, ready to feed weave_gate_shuttle_from_tidset() with no external map.
  *
- * This slice covers a SINGLE int8 (int64) column with no nulls and no zone-map.
+ * This slice covers a SINGLE int8 (int64) column with an OPTIONAL null bitmap
+ * (store format v2; a NULL is recorded and excluded from every comparison gate)
+ * and no zone-map.
  * It is extracted here as pure standalone C (no PostgreSQL includes) so it can
  * be exercised by standalone property tests (test/hegel/) while remaining the
  * single source of truth -- the backend page writer (src/pages/docvals_page.c)
