@@ -25,6 +25,7 @@
 #include "utils/rel.h"			/* RelationGetRelationName, rd_options */
 
 #include "weave/cgram.h"		/* Z8: the cgram weft's root-page layout */
+#include "weave/docvals.h"		/* WeaveDvType/WeaveDvStrat, the docvals store */
 #include "weave/chandesc.h"
 #include "weave/pagebound.h"
 #include "weave/pagekind.h"
@@ -1553,14 +1554,18 @@ typedef struct WeaveDocvalsAccum
 {
 	MemoryContext ctx;			/* bs->ctx: the build budget must count this */
 	bool		active;			/* false when there is nothing to collect */
+	WeaveDvType dvtype;			/* the facet column's type; how a raw Datum is
+								 * encoded to the stored order-preserving int64 in
+								 * weave_docvals_accum_add (the merge/flush pair
+								 * path is already-encoded and ignores this) */
 	uint64	   *docid;			/* n; weave_tid_to_docid of the heap tuple */
-	int64	   *value;			/* n; the int8 facet value at that docid */
+	int64	   *value;			/* n; the order-preserving int64 at that docid */
 	uint32		n;
 	uint32		cap;
 } WeaveDocvalsAccum;
 
 extern void weave_docvals_accum_init(WeaveDocvalsAccum *acc, MemoryContext ctx,
-									 bool active);
+									 bool active, WeaveDvType dvtype);
 extern void weave_docvals_accum_reset(WeaveDocvalsAccum *acc);
 extern void weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
 									Datum value, bool isnull);
@@ -1568,6 +1573,19 @@ extern void weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
  * weave_docvals_accum_add); appends a (docid, value) directly, no null check. */
 extern void weave_docvals_accum_add_pair(WeaveDocvalsAccum *acc, uint64 docid,
 										 int64 value);
+
+/* Map a facet column's type OID to its WeaveDvType, or ERROR if the type is not a
+ * supported docvals type.  And encode one raw Datum of that type to the stored
+ * order-preserving int64 (integers/date/bool widen; float8 via
+ * weave_dv_encode_f8).  Both live in src/pages/docvals_page.c. */
+extern WeaveDvType weave_dv_type_for_oid(Oid atttypid);
+extern int64 weave_dv_encode_datum(WeaveDvType dvtype, Datum value);
+/* Encode a query CONSTANT to the column's order-preserving int64 domain, given the
+ * column's WeaveDvType and the constant's CONCRETE type OID (the caller resolves a
+ * same-type operator's sk_subtype==0 to the column type first).  Handles the
+ * cross-type members the opclasses define (int2/int4/int8 interoperate; a float8
+ * column takes a float4 or float8 constant). */
+extern int64 weave_dv_encode_const(WeaveDvType coltype, Oid consttype, Datum arg);
 
 /*
  * Write the weft from the accumulator and return its WEAVE_PK_DOCVALS root, or

@@ -344,6 +344,24 @@ weave_build_dvattno(Relation index)
 	return layout.dvattno;
 }
 
+/*
+ * The WeaveDvType of the docvals column, or WEAVE_DV_T_INT8 when the index has
+ * none (harmless then: the accumulator is inactive, or the merge/flush pair path
+ * bypasses the encode).  Resolved from the index tuple descriptor -- no syscache.
+ * This is how the build/insert value encode learns the facet's type without the
+ * on-disk store ever recording it (the store stays int64; see weave/docvals.h).
+ */
+static WeaveDvType
+weave_build_dvtype(Relation index)
+{
+	AttrNumber	dvattno = weave_build_dvattno(index);
+
+	if (dvattno == 0)
+		return WEAVE_DV_T_INT8;
+	return weave_dv_type_for_oid(
+		TupleDescAttr(RelationGetDescr(index), dvattno - 1)->atttypid);
+}
+
 static int
 cmp_buildterm(const void *a, const void *b)
 {
@@ -3581,7 +3599,7 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 		tbs.cgramattno = 0;
 		weave_cgram_accum_init(&tbs.cgram, termctx, false);
 		tbs.dvattno = 0;		/* v1: docvalues weft is not produced by merge */
-		weave_docvals_accum_init(&tbs.dv, termctx, false);
+		weave_docvals_accum_init(&tbs.dv, termctx, false, WEAVE_DV_T_INT8);
 		/* Inactive (active = false), so no weft is written and this width is
 		 * never read -- it gets the reloption's real value anyway, because the
 		 * day doc/GAPS.md G23 closes is the day `active` flips to true on
@@ -3936,7 +3954,7 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 	bs.cgramattno = 0;
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, ncgrambolts > 0);
 	bs.dvattno = 0;				/* v1: docvalues weft is not produced by merge */
-	weave_docvals_accum_init(&bs.dv, bs.ctx, false);
+	weave_docvals_accum_init(&bs.dv, bs.ctx, false, WEAVE_DV_T_INT8);
 	weave_vec_accum_init(&bs.vec, bs.ctx, nvecbolts > 0, (int) vgeom.bits,
 						 (WeaveMetric) vgeom.metric);
 	if (nvecbolts > 0 &&
@@ -4170,7 +4188,7 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	bs.cgramattno = 0;
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, ncgrambolts > 0);
 	bs.dvattno = 0;				/* v1: docvalues weft is not produced by merge */
-	weave_docvals_accum_init(&bs.dv, bs.ctx, false);
+	weave_docvals_accum_init(&bs.dv, bs.ctx, false, WEAVE_DV_T_INT8);
 	/* PRODUCER 2: active exactly when an input carries a weft, and made ready for
 	 * pre-encoded lanes at the geometry the inputs agreed on -- not at the current
 	 * `bits` reloption, which may have changed since they were written. */
@@ -5132,7 +5150,7 @@ weave_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
 	bs.dvattno = weave_build_dvattno(index);
-	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0);
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index));
 	/* The metric is only consulted when there IS a vector column: it is the one
 	 * reloption accessor that THROWS (cosine and l1 have no compressed-domain
 	 * bound -- src/am/am.c), and throwing over the metric of a channel this index
@@ -5424,7 +5442,7 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
 	bs.dvattno = weave_build_dvattno(index);
-	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0);
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index));
 	/* The metric is only consulted when there IS a vector column: it is the one
 	 * reloption accessor that THROWS (cosine and l1 have no compressed-domain
 	 * bound -- src/am/am.c), and throwing over the metric of a channel this index
@@ -5665,7 +5683,7 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 	 * does -- an oversized INSERT is no longer absent from a scalar gate.
 	 */
 	bs.dvattno = weave_build_dvattno(index);
-	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0);
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index));
 	weave_vec_accum_init(&bs.vec, bs.ctx, bs.vecattno != 0,
 						 weave_index_vec_bits(index),
 						 (WeaveMetric) (bs.vecattno != 0 ?
@@ -5957,7 +5975,10 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("weave docvalues column must not contain NULL in this version"),
 					 errhint("Declare the column NOT NULL, or omit it from the index until the null-bitmap slice lands.")));
-		docval = DatumGetInt64(values[dvidx]);
+		docval = weave_dv_encode_datum(
+			weave_dv_type_for_oid(
+				TupleDescAttr(RelationGetDescr(index), dvidx)->atttypid),
+			values[dvidx]);
 		has_docval = true;
 	}
 
@@ -6185,7 +6206,7 @@ weave_flush_pending(Relation index)
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
 	bs.dvattno = weave_build_dvattno(index);
-	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0);
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index));
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;

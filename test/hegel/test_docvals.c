@@ -49,6 +49,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <math.h>
 
 #include "weave/docvals.h"
 
@@ -128,6 +129,13 @@ static long cov_eq_multi = 0;	/* an EQ query matched TWO OR MORE docids */
 static long cov_dup_adjacent = 0;	/* a non-empty result had adjacent-equal
 									 * values (ascending order with dups holds) */
 static long cov_trunc = 0;		/* outcap-truncation branch actually fired */
+
+/* float8-encode coverage (weave_dv_encode_f8). */
+static long f8_checks = 0;
+static long cov_f8_lt = 0;		/* a strict a<b ordering pair was checked */
+static long cov_f8_nan = 0;		/* NaN participated in a comparison */
+static long cov_f8_zero = 0;	/* a +0/-0 equality pair was checked */
+static long cov_f8_negpos = 0;	/* a negative-vs-positive pair was checked */
 
 static const WeaveDvStrat ops[5] = {
 	WEAVE_DV_LT, WEAVE_DV_LE, WEAVE_DV_EQ, WEAVE_DV_GE, WEAVE_DV_GT
@@ -545,19 +553,127 @@ prop_reject(void)
 	}
 }
 
+/*
+ * PG float8 order/equality reference (what the docvals gate MUST match): NaN is
+ * greater than every non-NaN and all NaN are equal; -0.0 == +0.0; otherwise IEEE.
+ */
+static int
+f8_lt_ref(double a, double b)
+{
+	int			na = (a != a),
+				nb = (b != b);
+
+	if (na && nb)
+		return 0;				/* NaN == NaN */
+	if (na)
+		return 0;				/* a is NaN: largest, so a < b is false */
+	if (nb)
+		return 1;				/* b is NaN: largest, so a < b is true */
+	return a < b;				/* IEEE; also gives -0.0 < +0.0 == false */
+}
+
+static int
+f8_eq_ref(double a, double b)
+{
+	int			na = (a != a),
+				nb = (b != b);
+
+	if (na || nb)
+		return na && nb;		/* NaN equals only NaN */
+	return a == b;				/* -0.0 == +0.0 == true */
+}
+
+/*
+ * PROPERTY: weave_dv_encode_f8() is an ORDER ISOMORPHISM onto int64 under PG's
+ * float8 order.  For every pair, a < b (PG) iff encode(a) < encode(b) (signed
+ * int64), and a == b (PG) iff encode(a) == encode(b).  This is hard rule 1 for the
+ * float docvals channel: a gate off by one boundary returns a plausible wrong set
+ * no fixed-output test would catch, so the ordering is checked directly.
+ *
+ * The corpus mixes the values that break naive transforms (both zeros, both
+ * infinities, NaN, subnormals, the sign boundary) with random bit patterns
+ * reinterpreted as doubles.
+ */
+static double
+f8_random(void)
+{
+	uint64_t	bits = rng_next();
+	double		d;
+
+	memcpy(&d, &bits, sizeof(d));
+	return d;
+}
+
+static void
+prop_f8encode(void)
+{
+	static const double special[] = {
+		-INFINITY, -1e308, -1.0, -1e-308, -0.0, 0.0, 1e-308, 1.0, 1e308,
+		INFINITY, NAN
+	};
+	double		xs[64];
+	int			nx = 0;
+	int			s,
+				t;
+
+	for (s = 0; s < (int) (sizeof(special) / sizeof(special[0])); s++)
+		xs[nx++] = special[s];
+	while (nx < (int) (sizeof(xs) / sizeof(xs[0])))
+		xs[nx++] = f8_random();
+
+	for (s = 0; s < nx; s++)
+	{
+		for (t = 0; t < nx; t++)
+		{
+			double		a = xs[s],
+						b = xs[t];
+			int64_t		ea = weave_dv_encode_f8(a);
+			int64_t		eb = weave_dv_encode_f8(b);
+
+			f8_checks++;
+			checks++;
+			if (f8_lt_ref(a, b) != (ea < eb))
+			{
+				if (failures <= 20)
+					printf("FAIL F8 %s:%d: lt mismatch a=%g b=%g ea=%lld eb=%lld ref=%d enc=%d\n",
+						   __FILE__, __LINE__, a, b, (long long) ea, (long long) eb,
+						   f8_lt_ref(a, b), (ea < eb));
+				failures++;
+			}
+			if (f8_eq_ref(a, b) != (ea == eb))
+			{
+				if (failures <= 20)
+					printf("FAIL F8 %s:%d: eq mismatch a=%g b=%g ea=%lld eb=%lld ref=%d enc=%d\n",
+						   __FILE__, __LINE__, a, b, (long long) ea, (long long) eb,
+						   f8_eq_ref(a, b), (ea == eb));
+				failures++;
+			}
+			if (f8_lt_ref(a, b))
+				cov_f8_lt++;
+			if ((a != a) || (b != b))
+				cov_f8_nan++;
+			if (a == 0.0 && b == 0.0)
+				cov_f8_zero++;
+			if ((a < 0.0 && b > 0.0) || (a > 0.0 && b < 0.0))
+				cov_f8_negpos++;
+		}
+	}
+}
+
 int
 main(void)
 {
 	long		i;
 
 	printf("== docvals int8 store (C5): eval == a straight-line reference loop; "
-		   "validator rejects corruption ==\n");
+		   "validator rejects corruption; float8 encode is an order isomorphism ==\n");
 
 	for (i = 0; i < TRIALS; i++)
 	{
 		prop_pred();
 		prop_trunc();
 		prop_reject();
+		prop_f8encode();
 	}
 
 	printf("trials: %d\n", TRIALS);
@@ -572,6 +688,8 @@ main(void)
 	printf("coverage: smallrange=%ld eq-multi-docid=%ld dup-adjacent=%ld "
 		   "outcap-truncated=%ld\n",
 		   cov_smallrange, cov_eq_multi, cov_dup_adjacent, cov_trunc);
+	printf("F8ENCODE order-isomorphism: %8ld checks (lt=%ld nan=%ld zero=%ld negpos=%ld)\n",
+		   f8_checks, cov_f8_lt, cov_f8_nan, cov_f8_zero, cov_f8_negpos);
 
 	/*
 	 * Assert the coverage rather than hoping for it (AGENTS.md hard rule 11).  A
@@ -604,6 +722,20 @@ main(void)
 			   "dup-adjacent=%ld outcap-truncated=%ld -- a duplicate/EQ-multi "
 			   "or outcap-truncation branch never fired, so it is untested\n",
 			   cov_smallrange, cov_eq_multi, cov_dup_adjacent, cov_trunc);
+		failures++;
+	}
+
+	/*
+	 * The float8 order-isomorphism property must have exercised a strict ordering,
+	 * a NaN comparison, a signed-zero equality and a negative-vs-positive pair, or
+	 * the transform's hard cases (the sign boundary the final XOR fixes, NaN's
+	 * canonicalisation, -0/+0 collapse) are untested.
+	 */
+	if (cov_f8_lt == 0 || cov_f8_nan == 0 || cov_f8_zero == 0 || cov_f8_negpos == 0)
+	{
+		printf("COVERAGE FAIL: f8 lt=%ld nan=%ld zero=%ld negpos=%ld -- a float8 "
+			   "encode hard case never fired, so it is untested\n",
+			   cov_f8_lt, cov_f8_nan, cov_f8_zero, cov_f8_negpos);
 		failures++;
 	}
 

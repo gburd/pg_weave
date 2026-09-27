@@ -2443,17 +2443,19 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 				 * 100`, whose 100 is int4) compares exactly; a same-type int8
 				 * constant has sk_subtype 0/int8.
 				 */
+				Oid			coloid = TupleDescAttr(RelationGetDescr(scan->indexRelation),
+													   att - 1)->atttypid;
+				WeaveDvType coltype = weave_dv_type_for_oid(coloid);
 				Oid			sub = scan->keyData[k].sk_subtype;
 				Datum		arg = scan->keyData[k].sk_argument;
 
+				/* a same-type operator has sk_subtype == 0; the constant is then
+				 * the column's own type. */
+				if (sub == InvalidOid)
+					sub = coloid;
 				so->dvAttno = att;
 				so->dvOp = (WeaveDvStrat) scan->keyData[k].sk_strategy;
-				if (sub == INT4OID)
-					so->dvConst = (int64) DatumGetInt32(arg);
-				else if (sub == INT2OID)
-					so->dvConst = (int64) DatumGetInt16(arg);
-				else
-					so->dvConst = DatumGetInt64(arg);	/* int8 or same-type */
+				so->dvConst = weave_dv_encode_const(coltype, sub, arg);
 				so->dvScan = true;
 			}
 			else if (!iscgram && !isdocval && !so->queryValid)

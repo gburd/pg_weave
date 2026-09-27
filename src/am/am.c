@@ -4152,6 +4152,19 @@ static const struct
 	 * when it wears this opclass.
 	 */
 	{"int8_docval_ops", WEAVE_WK_DOCVALS},
+	/*
+	 * Type slice 2 (doc/plans/2026-09-27-docvals-types-slice.md): the same scalar
+	 * channel for four more fixed-width types and float8.  Each is its own implicit
+	 * family (one per opclass) but they all name WEAVE_WK_DOCVALS -- the family says
+	 * WHICH CHANNEL, the column type says how a Datum is encoded to the stored
+	 * order-preserving int64 (weave_dv_type_for_oid / weave_dv_encode_datum).  The
+	 * store and wire format are unchanged; only the encode and these rows are new.
+	 */
+	{"float8_docval_ops", WEAVE_WK_DOCVALS},
+	{"int4_docval_ops", WEAVE_WK_DOCVALS},
+	{"int2_docval_ops", WEAVE_WK_DOCVALS},
+	{"date_docval_ops", WEAVE_WK_DOCVALS},
+	{"bool_docval_ops", WEAVE_WK_DOCVALS},
 };
 
 /*

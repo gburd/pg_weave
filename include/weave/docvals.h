@@ -139,6 +139,67 @@ typedef enum
 } WeaveDvStrat;
 
 /*
+ * Order-preserving type -> int64 encodings.  The on-disk store and
+ * weave_dv_eval_int8() are int64-only; every supported facet type is mapped to an
+ * int64 that sorts the SAME way the type's btree `<` does, at BOTH build/insert
+ * (the stored value) and scan (the query constant), so the single signed-int64
+ * comparison in the evaluator is exact for every type and the store never needs to
+ * know the type.  Integer-like types (int2/int4/int8/date, bool as 0/1) are
+ * order-preserving under sign-extension, so their encode is a widening cast at the
+ * call sites (they need a PostgreSQL Datum accessor).  float8 is the one
+ * non-trivial, PURE case and lives here with its property test
+ * (test/hegel/test_docvals.c).
+ */
+typedef enum
+{
+	WEAVE_DV_T_INT8 = 0,
+	WEAVE_DV_T_INT4,
+	WEAVE_DV_T_INT2,
+	WEAVE_DV_T_BOOL,
+	WEAVE_DV_T_DATE,
+	WEAVE_DV_T_FLOAT8
+} WeaveDvType;
+
+/*
+ * Map a float8 to an int64 that sorts identically to PostgreSQL's float8 `<` under
+ * SIGNED int64 comparison (the evaluator's comparison).
+ *
+ * The transform is the classic monotonic IEEE-754 one, in two moves:
+ *   1. sign-magnitude -> UNSIGNED-orderable: for a negative double flip every bit,
+ *      for a non-negative one set the sign bit.  Now -inf<..<-0<+0<..<+inf is
+ *      ascending as an UNSIGNED 64-bit value.
+ *   2. UNSIGNED-orderable -> SIGNED-orderable: XOR the sign bit, because signed
+ *      int64 order equals the unsigned order of (x ^ 2^63).  Without this step
+ *      negative floats would sort ABOVE positive ones (they were the ones whose
+ *      encoded top bit is clear) -- the bug the property test is written to catch.
+ *
+ * TWO canonicalisations, because PostgreSQL's float8 order is NOT the raw IEEE one
+ * and the gate must match the operator EXACTLY (a wrong gate is a silent wrong
+ * answer, hard rule 1):
+ *   - NaN -> INT64_MAX: PG orders NaN greater than every non-NaN and treats all NaN
+ *     equal; trusting the bits would sort a sign-set NaN to the bottom.
+ *   - signed zero: PG treats -0.0 == +0.0 but their bits differ by the sign bit, so
+ *     force d == 0 to +0.0 so both zeros share one key.
+ */
+static inline int64_t
+weave_dv_encode_f8(double d)
+{
+	uint64_t	bits;
+
+	if (d != d)
+		return INT64_MAX;			/* NaN: PG's largest, all-equal */
+	if (d == 0.0)
+		d = 0.0;					/* collapse -0.0 into +0.0 (PG: equal) */
+	memcpy(&bits, &d, sizeof(bits));
+	if (bits >> 63)
+		bits = ~bits;				/* negative: flip all */
+	else
+		bits |= (uint64_t) 1 << 63; /* non-negative: set sign bit */
+	bits ^= (uint64_t) 1 << 63;		/* unsigned-orderable -> signed-orderable */
+	return (int64_t) bits;
+}
+
+/*
  * Returns NULL if img (of byte length len) is a structurally valid v1 int8 store
  * for its stated ndocs, whose docid array is strictly ascending; otherwise a
  * STATIC reason string.  On-disk bytes are not trusted, so every field is checked

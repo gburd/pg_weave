@@ -295,3 +295,105 @@ RESET enable_bitmapscan;
 DROP FUNCTION dvp_agree(text);
 DROP TABLE dvp;
 
+-- ---------------------------------------------------------------------------
+-- (8) TYPE SLICE 2: float8 / int4 / int2 / date / bool docvals opclasses
+-- (doc/plans/2026-09-27-docvals-types-slice.md).  Each type is mapped to an
+-- order-preserving int64 at build and the query constant by the same rule at
+-- scan, so the SAME store and evaluator serve every type.  The proof is the same
+-- one the int8 slice uses: for each type and each btree strategy the index-forced
+-- answer equals the seqscan answer as a SET (dvt_agree), and a bare/cross-type
+-- constant still pushes down.  float8 additionally carries the values that break a
+-- naive encoding: +0/-0 (equal), NaN (largest), +/-Infinity.
+-- ---------------------------------------------------------------------------
+CREATE TABLE dvt (id int, body wdoc,
+                  f8 float8, i4 int4, i2 int2, dt date, bl bool);
+INSERT INTO dvt
+SELECT g, to_wdoc('common doc ' || (g % 5)),
+       (g % 100)::float8 / 4.0,          -- scattered floats 0..24.75
+       (g % 100),                        -- int4 0..99
+       (g % 100)::int2,                  -- int2 0..99
+       DATE '2000-01-01' + (g % 100),    -- 100 distinct dates
+       (g % 2 = 0)                       -- bool
+FROM generate_series(1, 500) g;
+-- float8 special values, in their own rows (NOT NULL, so no NULLs)
+INSERT INTO dvt (id, body, f8, i4, i2, dt, bl) VALUES
+  (1001, to_wdoc('special'),  'Infinity'::float8, 0, 0, DATE '2000-01-01', true),
+  (1002, to_wdoc('special'), '-Infinity'::float8, 0, 0, DATE '2000-01-01', true),
+  (1003, to_wdoc('special'),       'NaN'::float8, 0, 0, DATE '2000-01-01', true),
+  (1004, to_wdoc('special'),             0.0::float8, 0, 0, DATE '2000-01-01', true),
+  (1005, to_wdoc('special'),            -0.0::float8, 0, 0, DATE '2000-01-01', true);
+
+CREATE INDEX dvt_f8 ON dvt USING weave (body, f8 float8_docval_ops);
+CREATE INDEX dvt_i4 ON dvt USING weave (body, i4 int4_docval_ops);
+CREATE INDEX dvt_i2 ON dvt USING weave (body, i2 int2_docval_ops);
+CREATE INDEX dvt_dt ON dvt USING weave (body, dt date_docval_ops);
+CREATE INDEX dvt_bl ON dvt USING weave (body, bl bool_docval_ops);
+ANALYZE dvt;
+
+CREATE OR REPLACE FUNCTION dvt_agree(pred text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+    n_bad bigint;
+BEGIN
+    EXECUTE 'SET LOCAL enable_seqscan = off';
+    EXECUTE 'SET LOCAL enable_bitmapscan = off';
+    EXECUTE 'SET LOCAL enable_indexscan = on';
+    EXECUTE format('CREATE TEMP TABLE dvt_i AS SELECT id FROM dvt WHERE %s', pred);
+    EXECUTE 'SET LOCAL enable_indexscan = off';
+    EXECUTE 'SET LOCAL enable_bitmapscan = off';
+    EXECUTE 'SET LOCAL enable_seqscan = on';
+    EXECUTE format('CREATE TEMP TABLE dvt_s AS SELECT id FROM dvt WHERE %s', pred);
+    SELECT count(*) INTO n_bad FROM (
+        SELECT id FROM dvt_i EXCEPT SELECT id FROM dvt_s
+        UNION ALL
+        SELECT id FROM dvt_s EXCEPT SELECT id FROM dvt_i
+    ) d;
+    DROP TABLE dvt_i;
+    DROP TABLE dvt_s;
+    RETURN n_bad = 0;
+END;
+$$;
+
+-- plan shape: each facet comparison is an Index Cond, not a Filter
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM dvt WHERE f8 < 5.0::float8;
+EXPLAIN (COSTS OFF) SELECT id FROM dvt WHERE i4 < 50;
+EXPLAIN (COSTS OFF) SELECT id FROM dvt WHERE dt < DATE '2000-02-01';
+EXPLAIN (COSTS OFF) SELECT id FROM dvt WHERE bl = true;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+-- float8: every strategy agrees with the heap, including the special values
+SELECT dvt_agree('f8 < 5.0::float8')   AS f8_lt,
+       dvt_agree('f8 <= 5.0::float8')  AS f8_le,
+       dvt_agree('f8 = 5.0::float8')   AS f8_eq,
+       dvt_agree('f8 >= 5.0::float8')  AS f8_ge,
+       dvt_agree('f8 > 5.0::float8')   AS f8_gt;
+SELECT dvt_agree($$f8 < 'Infinity'::float8$$)   AS f8_lt_inf,   -- excludes +inf and NaN
+       dvt_agree($$f8 > '-Infinity'::float8$$)  AS f8_gt_neginf,-- excludes -inf
+       dvt_agree($$f8 = 0.0::float8$$)          AS f8_eq_zero,  -- +0 and -0 both match
+       dvt_agree($$f8 < 4.5::float4$$)          AS f8_lt_f4;    -- cross-type float4 const
+
+-- int4 / int2: same-type and cross-type integer constants
+SELECT dvt_agree('i4 < 50')            AS i4_lt,
+       dvt_agree('i4 = 50')            AS i4_eq,
+       dvt_agree('i4 >= 50')           AS i4_ge,
+       dvt_agree('i4 < 50::int8')      AS i4_lt_i8,   -- cross-type
+       dvt_agree('i4 < 50::int2')      AS i4_lt_i2;   -- cross-type
+SELECT dvt_agree('i2 < 50::int2')      AS i2_lt,
+       dvt_agree('i2 = 50::int2')      AS i2_eq,
+       dvt_agree('i2 < 50')            AS i2_lt_i4,   -- cross-type
+       dvt_agree('i2 < 50::int8')      AS i2_lt_i8;   -- cross-type
+
+-- date / bool
+SELECT dvt_agree($$dt < DATE '2000-02-01'$$)  AS dt_lt,
+       dvt_agree($$dt = DATE '2000-01-15'$$)  AS dt_eq,
+       dvt_agree($$dt >= DATE '2000-03-01'$$) AS dt_ge;
+SELECT dvt_agree('bl = true')          AS bl_eq_true,
+       dvt_agree('bl = false')         AS bl_eq_false,
+       dvt_agree('bl < true')          AS bl_lt_true;  -- false < true
+
+DROP FUNCTION dvt_agree(text);
+DROP TABLE dvt;
+

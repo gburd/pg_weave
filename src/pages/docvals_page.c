@@ -47,8 +47,10 @@
 #include "weave/docvals.h"
 
 #include "access/generic_xlog.h"
+#include "catalog/pg_type_d.h"	/* INT8OID/INT4OID/.../FLOAT8OID for the type map */
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "utils/date.h"			/* DateADT / DatumGetDateADT (date facet encode) */
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -366,11 +368,113 @@ weave_docvals_load(Relation index, BlockNumber root,
  * nothing to quantize: a docvalue is its own bytes.
  * ------------------------------------------------------------------------- */
 
+/*
+ * Map a facet column's type OID to its WeaveDvType.  ERROR (not a default) on an
+ * unsupported type: a column reaches here only by wearing a <type>_docval_ops
+ * opclass, and every such opclass corresponds to a case below, so an unknown OID
+ * means the opclass registry and this map disagree -- a build bug, not user error.
+ */
+WeaveDvType
+weave_dv_type_for_oid(Oid atttypid)
+{
+	switch (atttypid)
+	{
+		case INT8OID:
+			return WEAVE_DV_T_INT8;
+		case INT4OID:
+			return WEAVE_DV_T_INT4;
+		case INT2OID:
+			return WEAVE_DV_T_INT2;
+		case BOOLOID:
+			return WEAVE_DV_T_BOOL;
+		case DATEOID:
+			return WEAVE_DV_T_DATE;
+		case FLOAT8OID:
+			return WEAVE_DV_T_FLOAT8;
+		default:
+			elog(ERROR, "pg_weave: unsupported docvalues column type OID %u", atttypid);
+			return WEAVE_DV_T_INT8; /* unreachable */
+	}
+}
+
+/*
+ * Encode one raw Datum of a supported facet type to the stored, order-preserving
+ * int64 (weave/docvals.h).  Integer/date/bool widen (already order-preserving);
+ * float8 goes through the monotonic transform.  The query constant is encoded by
+ * the SAME rule at scan time, so weave_dv_eval_int8()'s signed comparison is exact.
+ */
+int64
+weave_dv_encode_datum(WeaveDvType dvtype, Datum value)
+{
+	switch (dvtype)
+	{
+		case WEAVE_DV_T_INT8:
+			return DatumGetInt64(value);
+		case WEAVE_DV_T_INT4:
+			return (int64) DatumGetInt32(value);
+		case WEAVE_DV_T_INT2:
+			return (int64) DatumGetInt16(value);
+		case WEAVE_DV_T_BOOL:
+			return DatumGetBool(value) ? 1 : 0;
+		case WEAVE_DV_T_DATE:
+			return (int64) DatumGetDateADT(value);
+		case WEAVE_DV_T_FLOAT8:
+			return weave_dv_encode_f8(DatumGetFloat8(value));
+	}
+	elog(ERROR, "pg_weave: unknown WeaveDvType %d", (int) dvtype);
+	return 0;					/* unreachable */
+}
+
+int64
+weave_dv_encode_const(WeaveDvType coltype, Oid consttype, Datum arg)
+{
+	/*
+	 * A float8 column's gate compares in the float-encoded domain, so a constant
+	 * of EITHER float type is widened to double and encoded the same way the
+	 * stored values were; nothing else is a defined cross-type here.
+	 */
+	if (coltype == WEAVE_DV_T_FLOAT8)
+	{
+		double		d = (consttype == FLOAT4OID)
+			? (double) DatumGetFloat4(arg)
+			: DatumGetFloat8(arg);
+
+		return weave_dv_encode_f8(d);
+	}
+
+	/*
+	 * Integer family (int2/int4/int8/date/bool): every value is order-preserved by
+	 * a plain widening to int64, so a cross-type integer constant is read at ITS
+	 * OWN width and widened -- the stored column values were widened the same way,
+	 * so the signed comparison is exact regardless of which integer width either
+	 * side is.
+	 */
+	switch (consttype)
+	{
+		case INT2OID:
+			return (int64) DatumGetInt16(arg);
+		case INT4OID:
+			return (int64) DatumGetInt32(arg);
+		case INT8OID:
+			return DatumGetInt64(arg);
+		case DATEOID:
+			return (int64) DatumGetDateADT(arg);
+		case BOOLOID:
+			return DatumGetBool(arg) ? 1 : 0;
+		default:
+			elog(ERROR, "pg_weave: unsupported docvalues constant type OID %u",
+				 consttype);
+			return 0;			/* unreachable */
+	}
+}
+
 void
-weave_docvals_accum_init(WeaveDocvalsAccum *acc, MemoryContext ctx, bool active)
+weave_docvals_accum_init(WeaveDocvalsAccum *acc, MemoryContext ctx, bool active,
+						 WeaveDvType dvtype)
 {
 	acc->ctx = ctx;
 	acc->active = active;
+	acc->dvtype = dvtype;
 	acc->docid = NULL;
 	acc->value = NULL;
 	acc->n = 0;
@@ -412,7 +516,8 @@ weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
 				 errmsg("weave docvalues column must not contain NULL in this version"),
 				 errhint("Declare the column NOT NULL, or omit it from the index until the null-bitmap slice lands.")));
 
-	weave_docvals_accum_add_pair(acc, weave_tid_to_docid(tid), DatumGetInt64(value));
+	weave_docvals_accum_add_pair(acc, weave_tid_to_docid(tid),
+								 weave_dv_encode_datum(acc->dvtype, value));
 }
 
 void
