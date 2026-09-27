@@ -101,6 +101,10 @@ case "$JOB" in
 	# gatesweep loads the same BEIR corpora as fuse through the same loader, plus
 	# the sentence-transformer model cache.  Same 250 for the same reason.
 	gatesweep) VOLGB=${VOLGB_OVERRIDE:-250} ;;
+	# docvals loads a 10M-row heap (~1 GB heap + wdoc toast + wvec) and builds a
+	# weave index over it (lexical + vector + docvals wefts), then deletes 40% and
+	# merges, holding the index plus its merge output at once.  250 leaves headroom.
+	docvals) VOLGB=${VOLGB_OVERRIDE:-250} ;;
 esac
 REGION=$(aws configure get region --profile "$PROFILE")
 RUN=pgweave-$(date -u +%Y%m%d-%H%M%S)
@@ -1439,9 +1443,75 @@ run_bound() {
 		2>&1 | tee "$OUT/bound_pruning.log"
 }
 
+run_docvals() {
+	# Hard-rule-12 at-scale correctness for the docvals channel: G51 (a segment
+	# MERGE must carry each input's docvals weft, including the delete-heavy
+	# tombstone-drop path) and G52 (a post-build INSERT is answerable via the
+	# pending buffer, and stays answerable once the flush folds it into a segment).
+	# Both are LOCAL-green already; rule 12 says a release touching tombstones,
+	# merge or vacuum needs a run AT SCALE before it counts.  10M rows.
+	#
+	# The workload is uploaded VERBATIM as .sql (bench/aws/docvals_scale.sql and
+	# docvals_prize.sql), not built into a heredoc, so no local/remote shell
+	# expansion can corrupt it and the files are committed reproducible artifacts.
+	# docvals_scale.sql is SELF-CHECKING: every gate assertion compares the
+	# index-forced answer to the seqscan answer as a SET and RAISEs on any
+	# disagreement, so ON_ERROR_STOP makes a wrong answer at scale FATAL rather
+	# than a number nobody reads (skill rule: verify correctness before latency).
+	say "docvals scale: installing the extension"
+	$SSH 'cd pg_weave && make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
+		sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
+		sudo apt-get install -y gdb >/dev/null 2>&1 || true
+		sudo pg_ctlcluster 17 main restart 2>/dev/null || sudo -u postgres pg_ctlcluster 17 main restart 2>/dev/null || true
+		psql -q -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_weave"
+		echo "extension present:"; psql -tAc "\dx pg_weave"' \
+		2>&1 | tee "$OUT/docvals_setup.log" || die "docvals setup failed"
+
+	say "docvals scale: uploading workload sql"
+	$SSH 'cat > /tmp/docvals_scale.sql' < "$ROOT/bench/aws/docvals_scale.sql" \
+		|| die "docvals_scale.sql upload failed"
+	$SSH 'cat > /tmp/docvals_prize.sql' < "$ROOT/bench/aws/docvals_prize.sql" \
+		|| die "docvals_prize.sql upload failed"
+
+	say "docvals scale: running the 10M correctness workload (THE rule-12 gate)"
+	# Status rescued on BOTH sides of the ssh (AGENTS.md eleventh member): the
+	# remote shell's exit status is tail's, so log to a file, save rc, tail, exit rc.
+	$SSH 'psql -q -v ON_ERROR_STOP=1 -f /tmp/docvals_scale.sql >/tmp/dvs.log 2>&1
+		  rc=$?; tail -80 /tmp/dvs.log; exit $rc' \
+		| tee "$OUT/docvals_scale.log"
+	scrc=${PIPESTATUS[0]}
+	# ALWAYS pull the full workload log and, so a crash is diagnosable AFTER the
+	# instance is gone, the PostgreSQL server log and dmesg (OOM vs signal) -- before
+	# any die().  A backend crash at scale is exactly what rule 12 is meant to catch,
+	# and it is worthless if the evidence dies with the instance.
+	$SSH 'cat /tmp/dvs.log' > "$OUT/docvals_dvs_full.log" 2>/dev/null || true
+	$SSH 'echo "=== postgresql-17-main.log tail ==="; sudo tail -300 /var/log/postgresql/postgresql-17-main.log 2>/dev/null
+		  echo "=== dmesg tail (OOM killer leaves a record here) ==="; sudo dmesg 2>/dev/null | tail -40
+		  echo "=== any core files ==="; ls -la /tmp/core.* /var/lib/postgresql/17/main/core* 2>/dev/null || echo none' \
+		> "$OUT/docvals_serverlog.txt" 2>/dev/null || true
+	if [ "$scrc" != 0 ]; then
+		say "docvals scale FAILED -- server log / dmesg saved to $OUT/docvals_serverlog.txt"
+		# DVKEEP=1 leaves the instance UP for interactive diagnosis (gdb, re-run the
+		# crashing query).  A stray then costs money, so it is opt-in and the caller
+		# must terminate by hand -- the id is printed by cleanup() either way.
+		if [ "${DVKEEP:-0}" = 1 ]; then
+			say "DVKEEP=1: NOT terminating.  ssh with: $SSH"
+			say "instance $IID stays up -- terminate it yourself when done."
+			trap - EXIT
+			exit 1
+		fi
+		die "docvals SCALE run FAILED at 10M (mismatch OR backend crash) -- see $OUT/docvals_scale.log, docvals_dvs_full.log, docvals_serverlog.txt"
+	fi
+	say "docvals scale: ALL correctness assertions passed at 10M (G51 + G52 hold at scale)"
+
+	say "docvals prize: vec_blocks vs facet selectivity (best-effort, rule-11 second scale)"
+	$SSH 'psql -q -f /tmp/docvals_prize.sql 2>&1' | tee "$OUT/docvals_prize.log" || true
+}
+
 case "$JOB" in
 	smoke)   run_smoke ;;
 	bound)   run_bound ;;
+	docvals) run_smoke; run_docvals ;;
 	lexical) run_smoke; run_lexical ;;
 	fuzzy)   run_smoke; run_fuzzy ;;
 	bitsweep) run_bitsweep ;;

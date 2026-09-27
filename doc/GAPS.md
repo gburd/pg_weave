@@ -3770,7 +3770,9 @@ positive control), real fiqa 57,600-row multi-segment build+merge (all five stra
 agree with heap), and a delete-heavy multi-segment merge (index==heap, 0 disagreements —
 the tombstone-drop path). installcheck-pg17 & pg18 green, docvals hegel 7.59M checks / 0
 failures, check-alloc/pdlower/rename clean, reviewer PASS. Rule 12 caveat: the at-scale
-delete-heavy merge run on EC2 is still owed.
+delete-heavy merge run on EC2 is still owed. **DISCHARGED 2026-09-27** — the 10M run in
+`bench/RESULTS_DOCVALS_SCALE.md` held `index == heap` through a 40%-delete VACUUM (the
+tombstone-drop rewrite) and an explicit merge; see the G52 entry for the full note.
 
 `WHERE price <op> c` over a docvals-bearing index returns an EMPTY result whenever
 the `CREATE INDEX` flushed more than one segment and finalize merged them. Confirmed
@@ -3896,5 +3898,40 @@ a merged bolt has (§11), safe for a facet gate. `sql/docvals.sql` §(7) is the 
 gate (index==heap over pending for all five strategies, the `@@@ AND price` conjunction, a
 positive control that the inserted low-price row IS returned — false pre-fix — plus a
 flush+merge re-check); `t/019`/`t/010` updated to v11; `weave_check(deep)` accepts the
-four-kind pending chain and is asserted over a mixed v8+v11 chain. **Still owed (rule 12):
-a delete+insert+merge run at scale on EC2 before `int8_docval_ops` is release-eligible.**
+four-kind pending chain and is asserted over a mixed v8+v11 chain.
+
+**RULE-12 DEBT DISCHARGED 2026-09-27** (both G51 and G52), `bench/RESULTS_DOCVALS_SCALE.md`:
+a 10M-row EC2 run (`bench/aws/run.sh … docvals`) held `index == heap` (`disagreements=0`)
+for every gate at every phase — after the build's internal multi-segment merge, after an
+explicit `weave_merge()`, after a **40%-delete VACUUM** (the tombstone-drop rewrite, G51's
+hardest path), and after a **200k post-build INSERT** answered via the pending buffer and
+then folded into a segment by the flush (G52). The prize was also re-confirmed at 1M
+(`vec_blocks` falls ~30× as the facet tightens 100×), so Task 8 is no longer single-scale.
+`int8_docval_ops` is now release-eligible on the correctness axis.
+
+### G53 — `@@@` on a very-high-df term uses memory SUPER-LINEAR in df: a term matching ~100% of a 6.2M-row corpus OOM-kills the backend at 60 GB — **FOUND 2026-09-27 by the G51/G52 10M scale run; PRE-EXISTING lexical channel, NOT docvals; OPEN**
+
+The docvals 10M scale run (`bench/RESULTS_DOCVALS_SCALE.md`) first used `@@@ 'common'`, a
+term present in every row, and the backend was OOM-killed (signal 9, dmesg `Out of memory`)
+at **anon-rss 60 GB / total-vm 87 GB** on a 64 GB host. Isolated on the kept instance, with
+NO docvals gate involved (`SELECT count(*) FROM dvs WHERE d @@@ 'common'` alone crashes), so
+this is the lexical match/collect path, not the docvals channel:
+
+| term | df (matches) | peak backend RSS |
+|---|---|---|
+| `@@@ '3'`      | 2,040,000 (~20% of 6.2M) | ~4.6 GB (completed) |
+| `@@@ 'common'` | ~6,200,000 (~100%)       | >60 GB → OOM-killed |
+
+~4.6 GB for 2.04M matches is already ~2.3 KB per matched doc (a bare TID set of 2M is
+~12 MB), and 6.2M matches blows past 60 GB — i.e. roughly **quadratic**, not the linear
+growth a materialized TID set would show. So a common-ish term (a stopword that slips the
+filter, or any term in a large fraction of documents) can exhaust memory at corpus sizes
+this project already targets. Likely the posting-list decode / `tidset` collect allocating
+O(df) with a large per-match constant or an O(df²) merge; the exact site is unprofiled.
+
+Not a wrong answer (a soundness gap) — an availability/DoS one: a single ordinary `@@@`
+query can OOM the backend. Reachable from plain SQL. **Owed:** profile the collect at
+df≈1M–6M (the `bench/aws/run.sh` docvals instance reproduces it in one line), find the
+allocation, and bound it (stream the postings / cap the working set / spill) so a high-df
+term degrades to slower, not fatal. Until then, `bench/aws/docvals_scale.sql` and any
+scale benchmark must avoid near-universal `@@@` terms (it now uses `freq7`, df≈1%).
