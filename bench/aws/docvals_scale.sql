@@ -80,15 +80,23 @@ CREATE TABLE dvs AS
          body,
          to_wdoc(body) AS d,
          (((hashint8(id) % 1000) + 1000) % 1000)::bigint AS price,
-         ((((hashint8(id) % 1000) + 1000) % 1000)::float8 / 7.0) AS fprice
+         ((((hashint8(id) % 1000) + 1000) % 1000)::float8 / 7.0) AS fprice,
+         -- NULLABLE facet: ~10% NULL (hash rank ending in 0), else the same
+         -- scattered 0..999.  A NULL satisfies no comparison, so the seqscan
+         -- oracle excludes it -- disagreements=0 on nprice proves the v2 null
+         -- bitmap excludes it too, at 10M, through build/insert/vacuum/merge.
+         CASE WHEN (((hashint8(id) % 10) + 10) % 10) = 0 THEN NULL
+              ELSE (((hashint8(id) % 1000) + 1000) % 1000)::bigint END AS nprice
     FROM (SELECT i AS id,
                  'common doc ' || (i % 5) || ' t' || (i % 100000) || ' freq' || (i % 100) AS body
             FROM generate_series(1, 10000000) i) s;
 
 -- shape assertions BEFORE spending a build: the facet must be scattered (many
 -- distinct values) and price<100 must be ~10%, else the test proves nothing.
+-- pct_null confirms the nullable facet actually carries NULLs (~10%).
 SELECT count(*) AS nrows, count(DISTINCT price) AS distinct_price,
-       round(100.0 * count(*) FILTER (WHERE price < 100) / count(*), 2) AS pct_lt100
+       round(100.0 * count(*) FILTER (WHERE price < 100) / count(*), 2) AS pct_lt100,
+       round(100.0 * count(*) FILTER (WHERE nprice IS NULL) / count(*), 2) AS pct_null
   FROM dvs;
 
 -- NO vector column here: the 10M vector-weft build/merge is the bottleneck
@@ -101,6 +109,10 @@ CREATE INDEX dvs_w ON dvs USING weave (d, price int8_docval_ops);
 -- a float8 facet on the SAME table: proves the type-slice-2 encode holds through a
 -- real 10M build/merge/delete/pending, not just the 500-row regression.
 CREATE INDEX dvs_f8 ON dvs USING weave (d, fprice float8_docval_ops);
+-- a NULLABLE int8 facet on the SAME table: proves the v2 null bitmap excludes
+-- NULLs from a comparison gate through a real 10M build/merge/delete/pending
+-- (its own index because the layout resolves ONE docvals weft per index).
+CREATE INDEX dvs_np ON dvs USING weave (d, nprice int8_docval_ops);
 ANALYZE dvs;
 SELECT weave_index_nsegments('dvs_w') AS nsegments_after_build;
 
@@ -118,6 +130,9 @@ SELECT dvs_assert_agree('price >= 990');                        -- ~1% high end
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);   -- lexical ~1% AND facet 10%
 SELECT dvs_assert_agree('fprice < 10.0');                       -- float8 encode ~7%
 SELECT dvs_assert_agree($p$fprice < 4.5::float4$p$);            -- float8 cross-type const
+SELECT dvs_assert_agree('nprice < 100');                        -- NULLABLE facet, NULLs excluded
+SELECT dvs_assert_agree('nprice IS NOT NULL AND nprice < 100'); -- same set (redundant IS NOT NULL)
+SELECT dvs_assert_agree('nprice >= 990');                       -- nullable high end
 
 -- ===========================================================================
 -- PHASE 3 -- DELETE-HEAVY + VACUUM.  Delete ~40% spread across the whole docid
@@ -134,12 +149,15 @@ SELECT dvs_assert_agree('price < 10');
 SELECT dvs_assert_agree('price < 1');
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);
 SELECT dvs_assert_agree('fprice < 10.0');
+SELECT dvs_assert_agree('nprice < 100');                        -- nullable, after tombstone-drop VACUUM
 
 \echo ==== PHASE 4: explicit full merge, gate still == heap ====
 SELECT weave_merge('dvs_w') IS NOT NULL AS merged;
+SELECT weave_merge('dvs_np') IS NOT NULL AS merged_np;
 SELECT weave_index_nsegments('dvs_w') AS nsegments_after_merge;
 SELECT dvs_assert_agree('price < 100');
 SELECT dvs_assert_agree('price < 10');
+SELECT dvs_assert_agree('nprice < 100');                        -- nullable, after explicit merge
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);
 
 -- ===========================================================================
@@ -153,21 +171,27 @@ INSERT INTO dvs
          body,
          to_wdoc(body),
          (((hashint8(id) % 1000) + 1000) % 1000)::bigint,
-         ((((hashint8(id) % 1000) + 1000) % 1000)::float8 / 7.0)
+         ((((hashint8(id) % 1000) + 1000) % 1000)::float8 / 7.0),
+         CASE WHEN (((hashint8(id) % 10) + 10) % 10) = 0 THEN NULL
+              ELSE (((hashint8(id) % 1000) + 1000) % 1000)::bigint END
     FROM (SELECT i AS id,
                  'common doc ' || (i % 5) || ' t' || (i % 100000) || ' freq' || (i % 100) AS body
             FROM generate_series(10000001, 10200000) i) s;
 SELECT weave_index_nsegments('dvs_w') AS nsegments_after_insert;
 SELECT dvs_assert_agree('price < 10');                          -- includes pending rows
+SELECT dvs_assert_agree('nprice < 10');                         -- nullable, pending rows incl. NULLs
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);   -- AND over pending
 
 \echo ==== PHASE 6: flush pending (VACUUM) + merge, gate still == heap ====
 VACUUM dvs;
 SELECT weave_merge('dvs_w') IS NOT NULL AS merged2;
+SELECT weave_merge('dvs_np') IS NOT NULL AS merged2_np;
 SELECT weave_index_nsegments('dvs_w') AS nsegments_final;
 SELECT dvs_assert_agree('price < 10');
 SELECT dvs_assert_agree('price < 100');
 SELECT dvs_assert_agree('fprice < 10.0');
+SELECT dvs_assert_agree('nprice < 10');                         -- nullable, after flush+merge
+SELECT dvs_assert_agree('nprice < 100');
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);
 
 SELECT pg_size_pretty(pg_relation_size('dvs_w')) AS index_size,
