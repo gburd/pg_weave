@@ -1,8 +1,10 @@
 # Plan: docvals type slice 2 — float8 / int4 / int2 / date / bool (DOCVALS_CHANNEL §11 step 2)
 
-Status: proposed 2026-09-27. Prereq: the int8 slice (done; G49/G51/G52 fixed, rule-12
-discharged at 10M — `bench/RESULTS_DOCVALS_SCALE.md`). The int8 store, eval, merge, pending
-(v11) and gate are the proven template; this generalises the TYPE without touching any of it.
+Status: **DONE 2026-09-27** (commit 0547b05 + this docs commit; ext 0.26.0). All local
+gates green (installcheck pg17/pg18, standalone incl. the float order-isomorphism property
+819M/0, tap pg17/pg18 via CI, lints); float8 validated at 10M on EC2
+(`bench/RESULTS_DOCVALS_SCALE.md`). Prereq: the int8 slice (done; G49/G51/G52 fixed, rule-12
+discharged at 10M).
 
 ## The one design idea
 

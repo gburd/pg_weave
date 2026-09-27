@@ -79,7 +79,8 @@ CREATE TABLE dvs AS
   SELECT id,
          body,
          to_wdoc(body) AS d,
-         (((hashint8(id) % 1000) + 1000) % 1000)::bigint AS price
+         (((hashint8(id) % 1000) + 1000) % 1000)::bigint AS price,
+         ((((hashint8(id) % 1000) + 1000) % 1000)::float8 / 7.0) AS fprice
     FROM (SELECT i AS id,
                  'common doc ' || (i % 5) || ' t' || (i % 100000) || ' freq' || (i % 100) AS body
             FROM generate_series(1, 10000000) i) s;
@@ -97,6 +98,9 @@ SELECT count(*) AS nrows, count(DISTINCT price) AS distinct_price,
 -- The prize (which DOES need a vector column) is re-confirmed in docvals_prize.sql
 -- at a smaller vector-bearing scale.
 CREATE INDEX dvs_w ON dvs USING weave (d, price int8_docval_ops);
+-- a float8 facet on the SAME table: proves the type-slice-2 encode holds through a
+-- real 10M build/merge/delete/pending, not just the 500-row regression.
+CREATE INDEX dvs_f8 ON dvs USING weave (d, fprice float8_docval_ops);
 ANALYZE dvs;
 SELECT weave_index_nsegments('dvs_w') AS nsegments_after_build;
 
@@ -112,6 +116,8 @@ SELECT dvs_assert_agree('price < 1');                           -- ~0.1%
 SELECT dvs_assert_agree('price = 500');                         -- point
 SELECT dvs_assert_agree('price >= 990');                        -- ~1% high end
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);   -- lexical ~1% AND facet 10%
+SELECT dvs_assert_agree('fprice < 10.0');                       -- float8 encode ~7%
+SELECT dvs_assert_agree($p$fprice < 4.5::float4$p$);            -- float8 cross-type const
 
 -- ===========================================================================
 -- PHASE 3 -- DELETE-HEAVY + VACUUM.  Delete ~40% spread across the whole docid
@@ -127,6 +133,7 @@ SELECT dvs_assert_agree('price < 100');
 SELECT dvs_assert_agree('price < 10');
 SELECT dvs_assert_agree('price < 1');
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);
+SELECT dvs_assert_agree('fprice < 10.0');
 
 \echo ==== PHASE 4: explicit full merge, gate still == heap ====
 SELECT weave_merge('dvs_w') IS NOT NULL AS merged;
@@ -145,7 +152,8 @@ INSERT INTO dvs
   SELECT id,
          body,
          to_wdoc(body),
-         (((hashint8(id) % 1000) + 1000) % 1000)::bigint
+         (((hashint8(id) % 1000) + 1000) % 1000)::bigint,
+         ((((hashint8(id) % 1000) + 1000) % 1000)::float8 / 7.0)
     FROM (SELECT i AS id,
                  'common doc ' || (i % 5) || ' t' || (i % 100000) || ' freq' || (i % 100) AS body
             FROM generate_series(10000001, 10200000) i) s;
@@ -159,6 +167,7 @@ SELECT weave_merge('dvs_w') IS NOT NULL AS merged2;
 SELECT weave_index_nsegments('dvs_w') AS nsegments_final;
 SELECT dvs_assert_agree('price < 10');
 SELECT dvs_assert_agree('price < 100');
+SELECT dvs_assert_agree('fprice < 10.0');
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);
 
 SELECT pg_size_pretty(pg_relation_size('dvs_w')) AS index_size,

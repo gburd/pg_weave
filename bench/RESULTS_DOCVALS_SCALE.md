@@ -77,6 +77,26 @@ does *less* work as the predicate gets more selective. This is claim 3
 - Both are now backed by an at-scale run, not just local green. **Rule 12 discharged for
   `int8_docval_ops`.**
 
+### Type slice 2 (float8) validated at 10M (added 2026-09-27, ext 0.26.0)
+
+The same 10M run carries a second index on a **float8** facet (`fprice`, a scattered
+hash rank / 7.0) — `weave (d, fprice float8_docval_ops)` — asserted alongside the int8
+gate at every phase. The float8 encode (the monotonic IEEE-754→int64 transform,
+`weave_dv_encode_f8`) is the type slice's whole correctness risk, so proving it under a
+real 10M merge/delete/pending/flush — not just the 500-row regression — is the point:
+
+| phase | float8 assertion | `disagreements` |
+|---|---|---|
+| after build | `fprice < 10.0` = 699,066; `fprice < 4.5::float4` (cross-type) = 319,008 | 0 |
+| delete 40% + VACUUM | `fprice < 10.0` = 420,098 | 0 |
+| flush + merge | `fprice < 10.0` = 447,943 | 0 |
+
+So float8 (including the cross-type float4 constant) holds `index == heap` through the
+identical merge/pending/vacuum pipeline int8 uses. The other four types (int4/int2/date/
+bool) share that pipeline and encode by a plain widening whose order-preservation is not
+in question; the regression (`sql/docvals.sql` §8) covers them, and the float8 result is
+the at-scale evidence for the slice.
+
 ## What this does NOT tell us (and one thing it surfaced)
 
 - **No vector column in the 10M correctness run**, on purpose: a first attempt with

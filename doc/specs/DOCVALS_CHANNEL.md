@@ -213,6 +213,14 @@ half-built store:
    **plus the pending/insert slice** (`2026-09-26-docvals-pending-slice.md`, G51+G52 fixed):
    the merge carries the weft and an INSERT is answerable before and after flush.
 2. `float8`, `int4/2`, `date`, `bool` — same fixed-width path, per-type opclass + oracle.
+   **DONE 2026-09-27 (ext 0.26.0, doc/plans/2026-09-27-docvals-types-slice.md).** The
+   store and evaluator are unchanged: each type maps to an order-preserving int64 at
+   build/insert and the query constant by the same rule at scan (`weave_dv_type_for_oid`
+   / `weave_dv_encode_datum`), integers/date/bool by widening, float8 by the monotonic
+   IEEE-754 transform (`weave_dv_encode_f8`, order-isomorphism proven in `test_docvals`,
+   819M checks). Five opclasses with cross-type members; `sql/docvals.sql` §8 has the
+   per-type index==heap oracle incl. float8 ±0/NaN/±inf; float8 validated at 10M
+   (`bench/RESULTS_DOCVALS_SCALE.md`).
 3. NULLs (null bitmap + exclusion) and the crash/torn-write/concurrency gates.
 4. Text: dictionary encoding, collation-sorted, ordinal-boundary resolution + its exactness
    test — the highest-risk piece, done last against a store the rest of the stack trusts.
