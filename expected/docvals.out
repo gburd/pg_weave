@@ -545,3 +545,122 @@ SELECT dvt_agree('bl = true')          AS bl_eq_true,
 
 DROP FUNCTION dvt_agree(text);
 DROP TABLE dvt;
+-- ---------------------------------------------------------------------------
+-- (9) NULLs (doc/plans/2026-09-27-docvals-nulls-slice.md, step 3).  A NULL
+-- facet value satisfies NO comparison operator (SQL three-valued logic), so the
+-- pushed-down gate must EXCLUDE it -- the same index==heap set proof as the
+-- other slices, on a NULLABLE column, held across build, a post-build INSERT
+-- (the pending path), and a DELETE+VACUUM (the merge/tombstone rewrite).
+-- IS NULL / IS NOT NULL pushdown is deferred (spec sect. 6): they fall back to
+-- an executor Filter, which is correct but unaccelerated -- asserted by the plan
+-- shape below (no Index Cond on the IS NULL qual).
+-- ---------------------------------------------------------------------------
+CREATE TABLE dvn (id int, body wdoc, price bigint);
+-- price = g % 100, but NULL every 7th row: ~71 NULLs of 500, and 50 still
+-- occurs (g%100=50 at g=50,150,250,450 with g%7<>0), so `= 50` is non-empty.
+INSERT INTO dvn
+SELECT g, to_wdoc('common doc ' || (g % 5)),
+       CASE WHEN g % 7 = 0 THEN NULL ELSE (g % 100)::bigint END
+FROM generate_series(1, 500) g;
+CREATE INDEX dvn_w ON dvn USING weave (body, price int8_docval_ops);
+ANALYZE dvn;
+CREATE OR REPLACE FUNCTION dvn_agree(pred text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+    n_bad bigint;
+BEGIN
+    EXECUTE 'SET LOCAL enable_seqscan = off';
+    EXECUTE 'SET LOCAL enable_bitmapscan = off';
+    EXECUTE 'SET LOCAL enable_indexscan = on';
+    EXECUTE format('CREATE TEMP TABLE dvn_i AS SELECT id FROM dvn WHERE %s', pred);
+    EXECUTE 'SET LOCAL enable_indexscan = off';
+    EXECUTE 'SET LOCAL enable_bitmapscan = off';
+    EXECUTE 'SET LOCAL enable_seqscan = on';
+    EXECUTE format('CREATE TEMP TABLE dvn_s AS SELECT id FROM dvn WHERE %s', pred);
+    SELECT count(*) INTO n_bad FROM (
+        SELECT id FROM dvn_i EXCEPT SELECT id FROM dvn_s
+        UNION ALL
+        SELECT id FROM dvn_s EXCEPT SELECT id FROM dvn_i
+    ) d;
+    DROP TABLE dvn_i;
+    DROP TABLE dvn_s;
+    RETURN n_bad = 0;
+END;
+$$;
+-- plan shape: a comparison is an Index Cond; IS NULL / IS NOT NULL are NOT
+-- (they fall back to a Filter -- deferred pushdown, spec sect. 6).  The IS NULL
+-- plans are shown with seqscan ENABLED so they are a natural (not disabled) Seq
+-- Scan -- PG18 annotates a disabled-but-chosen node with "Disabled: true", which
+-- PG17 does not, so forcing the node would diverge the two majors' expected out.
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM dvn WHERE price < 50;
+          QUERY PLAN           
+-------------------------------
+ Index Scan using dvn_w on dvn
+   Index Cond: (price < 50)
+(2 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+EXPLAIN (COSTS OFF) SELECT id FROM dvn WHERE price IS NULL;
+        QUERY PLAN         
+---------------------------
+ Seq Scan on dvn
+   Filter: (price IS NULL)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM dvn WHERE price IS NOT NULL;
+          QUERY PLAN           
+-------------------------------
+ Seq Scan on dvn
+   Filter: (price IS NOT NULL)
+(2 rows)
+
+-- every comparison strategy agrees with the heap, NULLs excluded from all
+SELECT dvn_agree('price < 50')   AS lt,
+       dvn_agree('price <= 50')  AS le,
+       dvn_agree('price = 50')   AS eq,
+       dvn_agree('price >= 50')  AS ge,
+       dvn_agree('price > 50')   AS gt;
+ lt | le | eq | ge | gt 
+----+----+----+----+----
+ t  | t  | t  | t  | t
+(1 row)
+
+-- IS NULL / IS NOT NULL: correct via the Filter fallback
+SELECT dvn_agree('price IS NULL')     AS is_null,
+       dvn_agree('price IS NOT NULL') AS is_not_null;
+ is_null | is_not_null 
+---------+-------------
+ t       | t
+(1 row)
+
+-- post-build INSERT of NULL and non-NULL rows (the pending path): the gate must
+-- see them before flush, and still exclude the NULL.
+INSERT INTO dvn VALUES
+  (10001, to_wdoc('common doc 3'), NULL),
+  (10002, to_wdoc('common doc 3'), 7),
+  (10003, to_wdoc('common doc 3'), 99),
+  (10004, to_wdoc('common doc 3'), NULL);
+SELECT dvn_agree('price < 50')   AS pend_lt,
+       dvn_agree('price = 99')   AS pend_eq99,
+       dvn_agree('price IS NULL') AS pend_is_null;
+ pend_lt | pend_eq99 | pend_is_null 
+---------+-----------+--------------
+ t       | t         | t
+(1 row)
+
+-- DELETE 40% then VACUUM (tombstone rewrite + merge): still index==heap.
+DELETE FROM dvn WHERE id % 5 = 1;
+VACUUM dvn;
+SELECT dvn_agree('price < 50')   AS vac_lt,
+       dvn_agree('price >= 50')  AS vac_ge,
+       dvn_agree('price IS NULL') AS vac_is_null;
+ vac_lt | vac_ge | vac_is_null 
+--------+--------+-------------
+ t      | t      | t
+(1 row)
+
+DROP FUNCTION dvn_agree(text);
+DROP TABLE dvn;
