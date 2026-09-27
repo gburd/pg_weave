@@ -926,9 +926,10 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 	 * (docid, value) pair per document, which is corpus-scale.  Like the cgram
 	 * producer it is NOT warp-positional -- a docvalue is keyed by docid, and the
 	 * store carries its own dense-index -> docid map -- so there is no
-	 * "skipping shifts every later document" hazard.  v1 is NOT NULL:
-	 * weave_docvals_accum_add() ERRORs on a NULL rather than store a placeholder
-	 * that would silently include NULL rows in a `col < x` gate.
+	 * "skipping shifts every later document" hazard.  A NULL is RECORDED (store
+	 * v2): weave_docvals_accum_add() keeps the docid in the dense space with a
+	 * placeholder value and marks it in the null bitmap, which masks it out of
+	 * every comparison gate (a NULL is emitted for no operator).
 	 */
 	if (bs->dvattno != 0)
 	{
@@ -3397,11 +3398,20 @@ weave_docvals_merge_append(Relation index, const WeaveSegMeta *seg,
 	{
 		uint64		d = weave_docvals_docid(img, i);
 		int64		v = weave_docvals_int8(img, i);
+		bool		isnull = weave_docvals_isnull(img, i) != 0;
 
 		if (d < tombdense_n &&
 			(tombdense[d >> 3] & (uint8) (1u << (d & 7))) != 0)
 			continue;			/* tombstoned: physically drop */
-		weave_docvals_accum_add_pair(acc, d, v);
+		/*
+		 * Carry the input store's null-ness forward: a NULL docid stays NULL in
+		 * the merged store (masked out of every comparison gate), a non-NULL
+		 * docid keeps its value.  Mixing null-bearing (v2) and null-free (v1)
+		 * inputs is fine -- weave_docvals_isnull() returns 0 for a v1 store, so a
+		 * null-free input contributes only non-null pairs, and the merged bitmap
+		 * is correct over the union of docids.
+		 */
+		weave_docvals_accum_add_pair_null(acc, d, isnull ? 0 : v, isnull);
 	}
 	MemoryContextSwitchTo(old);
 	pfree((void *) img);
@@ -5713,8 +5723,9 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 			weave_cgram_accum_add(&bs.cgram, tid, gramval, gramisnull);
 
 		/* PRODUCER 4, the docvalues value (doc/GAPS.md G52).  Kept beside the
-		 * others so all producers read in one place; add() ERRORs on a NULL in
-		 * this NOT-NULL v1, matching the build path. */
+		 * others so all producers read in one place; a NULL is RECORDED in the
+		 * store's null bitmap (store v2) and masked out of every comparison
+		 * gate, matching the build path. */
 		if (bs.dvattno != 0)
 			weave_docvals_accum_add(&bs.dv, tid, dvval, dvisnull);
 
@@ -5960,26 +5971,29 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	 * lexical channel already finds that row, so without this the AND of the two
 	 * gates silently drops it (the docvalues gate contributed the empty set).
 	 *
-	 * int8 is BY VALUE, so nothing is detoasted.  v1 docvals is NOT NULL: a NULL
-	 * value ERRORs here exactly as the build path does (weave_docvals_accum_add),
-	 * rather than being stored as a placeholder that a `col < x` gate would
-	 * silently include.  has_docval stays false only for an index with no
-	 * docvalues column, whose items carry dvlen == 0.
+	 * int8 is BY VALUE, so nothing is detoasted.  A NULL is RECORDED, not
+	 * refused (store v2): the item is written with dvlen == 0 (has_docval stays
+	 * false), which on a docvals-bearing index the reader interprets as a NULL
+	 * docval -- masked out of every comparison gate, so a `col < x` gate never
+	 * emits it.  Backward-safe because a NULL formerly ERRORed here, so no
+	 * existing v11 item uses the dvlen == 0 encoding on such an index.  For an
+	 * index with no docvalues column, has_docval also stays false (dvlen == 0),
+	 * and the reader tells the two apart by the index layout, not the item.
 	 */
 	if (layout.dvattno != 0)
 	{
 		int			dvidx = layout.dvattno - 1;
 
-		if (isnull[dvidx])
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("weave docvalues column must not contain NULL in this version"),
-					 errhint("Declare the column NOT NULL, or omit it from the index until the null-bitmap slice lands.")));
-		docval = weave_dv_encode_datum(
-			weave_dv_type_for_oid(
-				TupleDescAttr(RelationGetDescr(index), dvidx)->atttypid),
-			values[dvidx]);
-		has_docval = true;
+		if (!isnull[dvidx])
+		{
+			docval = weave_dv_encode_datum(
+				weave_dv_type_for_oid(
+					TupleDescAttr(RelationGetDescr(index), dvidx)->atttypid),
+				values[dvidx]);
+			has_docval = true;
+		}
+		/* else: NULL docval -> leave has_docval == false so the item is written
+		 * with dvlen == 0 (the NULL encoding); do NOT encode a null Datum. */
 	}
 
 	/*
@@ -6322,21 +6336,35 @@ weave_flush_pending(Relation index)
 									  PointerGetDatum(rec.gram), false);
 
 			/*
-			 * PRODUCER 4, the docvalues weft (doc/GAPS.md G52).  A v11 pending
-			 * item carries the row's int8 value (rec.hasdv), so this flushed
-			 * segment gets a real docvalues store and the row stays answerable by
-			 * a scalar gate after the pending buffer drains.  Unlike the cgram
-			 * weft there is no all-or-nothing gate: an item without a value (an
-			 * older layout, or an index with no docvalues column) simply
-			 * contributes no pair, which is the same partial-coverage a merged
-			 * bolt has and is safe for a facet gate (an absent docid is not
-			 * emitted; the documented v1 limit, sect. 11).  Fed by docid so the
-			 * write_weft sort matches the build path.
+			 * PRODUCER 4, the docvalues weft (doc/GAPS.md G52).  On a
+			 * docvals-bearing index a v11 pending item falls into one of three
+			 * cases, and the flushed store must reproduce all three so the gate
+			 * answers identically before and after the flush:
+			 *
+			 *   rec.hasdv (dvlen == 8): a present value -- record the pair.
+			 *
+			 *   rec.dvslot && !rec.hasdv (v11 item, dvlen == 0): a NULL docval --
+			 *   record it as a NULL at this docid so the store's null bitmap
+			 *   masks it out of every comparison gate, exactly as a live pending
+			 *   NULL is excluded (a NULL is emitted for no operator).
+			 *
+			 *   !rec.dvslot (older layout, no dvlen field): the value is NOT
+			 *   RECOVERABLE, so contribute nothing.  That leaves the document out
+			 *   of the store -- the same partial-coverage a merged bolt has, safe
+			 *   for a facet gate (an absent docid is not emitted; sect. 11).
+			 *
+			 * Unlike the cgram weft there is no all-or-nothing gate: a missing
+			 * value only under-covers, it never wrong-answers.  Fed by docid so
+			 * the write_weft sort matches the build path.
 			 */
 			if (bs.dvattno != 0 && rec.hasdv)
 				weave_docvals_accum_add_pair(&bs.dv,
 											 weave_tid_to_docid(rec.tid),
 											 rec.docval);
+			else if (bs.dvattno != 0 && rec.dvslot)
+				weave_docvals_accum_add_pair_null(&bs.dv,
+												  weave_tid_to_docid(rec.tid),
+												  0, true);
 
 			entries = WEAVE_DOC_ENTRIES(rec.doc);
 

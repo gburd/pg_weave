@@ -543,22 +543,27 @@ weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
 	 * stays contiguous, but its stored value is a placeholder (0) the evaluator
 	 * never reads -- the packed null bitmap masks this docid out before any
 	 * comparison.  A non-NULL value is encoded to the stored order-preserving
-	 * int64 as before.  Both go through weave_docvals_accum_add_pair(), which
-	 * appends a parallel isnull==0 byte; we flip that byte on for a NULL and
-	 * bump the count.
+	 * int64 as before.  The null-aware pair append records the null bit and the
+	 * count in one place.
 	 */
-	weave_docvals_accum_add_pair(acc, weave_tid_to_docid(tid),
-								 isnull ? 0 : weave_dv_encode_datum(acc->dvtype, value));
-
-	if (isnull)
-	{
-		acc->isnull[acc->n - 1] = 1;
-		acc->nulls++;
-	}
+	weave_docvals_accum_add_pair_null(acc, weave_tid_to_docid(tid),
+									  isnull ? 0 : weave_dv_encode_datum(acc->dvtype, value),
+									  isnull);
 }
 
 void
 weave_docvals_accum_add_pair(WeaveDocvalsAccum *acc, uint64 docid, int64 value)
+{
+	/* The historical, non-null entry point: a plain (docid, value) append.
+	 * Kept as a thin wrapper so its callers (amscan and any non-null pair
+	 * source) need no isnull argument; the null-aware append below does the
+	 * work. */
+	weave_docvals_accum_add_pair_null(acc, docid, value, false);
+}
+
+void
+weave_docvals_accum_add_pair_null(WeaveDocvalsAccum *acc, uint64 docid,
+								  int64 value, bool isnull)
 {
 	if (!acc->active)
 		return;
@@ -584,12 +589,13 @@ weave_docvals_accum_add_pair(WeaveDocvalsAccum *acc, uint64 docid, int64 value)
 	}
 
 	acc->docid[acc->n] = docid;
+	/* value is a placeholder the evaluator never reads when isnull: the packed
+	 * null bitmap masks this docid out before any comparison. */
 	acc->value[acc->n] = value;
-	/* This entry point does NO null check (the merge path's pairs are never
-	 * NULL); it appends a 0 so the isnull array stays parallel.  A NULL caller
-	 * (weave_docvals_accum_add) flips this byte on afterward. */
-	acc->isnull[acc->n] = 0;
+	acc->isnull[acc->n] = isnull ? 1 : 0;
 	acc->n++;
+	if (isnull)
+		acc->nulls++;
 }
 
 /* (docid, value) pair for the sort: one array so qsort moves both halves

@@ -442,11 +442,17 @@ typedef struct WeavePendingItem
 								 * what an absent column contributes. */
 	uint32		dvlen;			/* byte length of the trailing int8 docvalues
 								 * value; 8 when the index has a docvalues column
-								 * and the value is non-NULL, 0 for an index with
-								 * no docvalues column.  v1 docvals is NOT NULL, so
-								 * dvlen == 0 never means "NULL docval" -- it means
-								 * "no docvalues column" (a NULL docval ERRORs at
-								 * INSERT, exactly as the build path does). */
+								 * and the value is non-NULL, 0 otherwise.  With
+								 * store v2 a NULL docval is RECORDED (no longer
+								 * refused), so on a docvals-bearing index dvlen ==
+								 * 0 now means EITHER "no docvalues column" OR "a
+								 * NULL docval".  The item alone cannot tell those
+								 * apart -- the READER does, from the index layout
+								 * (whether dvattno != 0), not from any byte here.
+								 * Backward-safe: before store v2 a NULL ERRORed at
+								 * INSERT, so no existing on-disk v11 item on a
+								 * docvals-bearing index uses the dvlen == 0
+								 * encoding, and the NULL meaning is unambiguous. */
 	/*
 	 * char wdoc[doclen],
 	 * then at MAXALIGN(sizeof(hdr) + doclen):                    char wvec[veclen],
@@ -751,13 +757,29 @@ typedef struct WeavePendingRec
 								 * case would be incomplete -- i.e. a false
 								 * negative (weave_flush_pending). */
 	int64		docval;			/* the int8 docvalues value, valid iff hasdv */
-	bool		hasdv;			/* does this item's LAYOUT carry a docvalues value
-								 * (dvlen == 8)?  False for an older layout OR for an
-								 * item whose index has no docvalues column (dvlen ==
-								 * 0).  Both mean "this document contributes nothing
-								 * to the docvalues gate", which is the same v1
-								 * partial-coverage limit a merged/pre-Task-4 bolt
-								 * has (doc/specs/DOCVALS_CHANNEL.md sect. 11). */
+	bool		hasdv;			/* does this item carry a PRESENT docvalues value
+								 * (dvlen == 8)?  False for an older layout, for an
+								 * item whose index has no docvalues column, AND for
+								 * a NULL docval on a docvals-bearing index (dvslot
+								 * && !hasdv; store v2 records NULLs as dvlen == 0).
+								 * All three mean "this document contributes nothing
+								 * to a comparison gate" -- and for the NULL case
+								 * that is exactly correct: a NULL is emitted for NO
+								 * comparison operator (doc/specs/DOCVALS_CHANNEL.md
+								 * sect. 6).  The absent/older-layout cases are the
+								 * same partial-coverage limit a merged bolt has
+								 * (sect. 11). */
+	bool		dvslot;			/* is this item's LAYOUT v11, i.e. does it have a
+								 * dvlen field at all?  True only for the v11
+								 * layout; false for v10/v9/v8.  Distinct from
+								 * hasdv, and the distinction is load-bearing: on a
+								 * docvals-bearing index a NULL docval is exactly
+								 * `dvslot && !hasdv` (the item has a dvlen field
+								 * and it is 0), whereas `!dvslot` means the older
+								 * layout simply cannot represent a docval and the
+								 * flush leaves that document out of the store
+								 * (partial coverage), rather than folding it in as
+								 * a NULL. */
 } WeavePendingRec;
 
 static inline void
@@ -824,6 +846,8 @@ weave_pending_iter_next(WeavePendingIter *it, WeavePendingRec *rec)
 	rec->gramlen = 0;
 	rec->docval = 0;
 	rec->hasdv = false;
+	rec->dvslot = false;		/* only the v11 layout has a dvlen field; set
+								 * true in that branch below */
 	/* both the v11 (24-byte) and v10 (20-byte) headers carry a gram field */
 	rec->hasgram = (it->hdrsz == sizeof(WeavePendingItem) ||
 					it->hdrsz == sizeof(WeavePendingItemV10));
@@ -847,6 +871,9 @@ weave_pending_iter_next(WeavePendingIter *it, WeavePendingRec *rec)
 			rec->vec = it->ptr + docoff;
 		if (pi->gramlen > 0)
 			rec->gram = it->ptr + docoff + MAXALIGN((Size) pi->veclen);
+		rec->dvslot = true;		/* v11 layout: a dvlen field is present, so a
+								 * dvlen == 0 here is a representable NULL, not an
+								 * unrepresentable older layout */
 		if (pi->dvlen == 8)
 		{
 			/* copied out rather than dereferenced: the trailer is MAXALIGN'd
@@ -1592,6 +1619,16 @@ extern void weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
  * the docid/value/isnull arrays stay the same length across both entry points. */
 extern void weave_docvals_accum_add_pair(WeaveDocvalsAccum *acc, uint64 docid,
 										 int64 value);
+/* Null-aware pair entry point for the flush and merge paths, which already hold
+ * an encoded int64 (not a raw Datum) and must carry a NULL forward from a
+ * pending item or an input store's null bitmap.  Appends (docid, value) and, when
+ * isnull, marks the just-appended pair NULL and bumps acc->nulls; value is a
+ * placeholder (pass 0) in that case.  weave_docvals_accum_add_pair() is this with
+ * isnull == false, and keeps its non-null contract for callers that never carry
+ * a NULL (e.g. amscan). */
+extern void weave_docvals_accum_add_pair_null(WeaveDocvalsAccum *acc,
+											  uint64 docid, int64 value,
+											  bool isnull);
 
 /* Map a facet column's type OID to its WeaveDvType, or ERROR if the type is not a
  * supported docvals type.  And encode one raw Datum of that type to the stored

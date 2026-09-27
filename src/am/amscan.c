@@ -4730,11 +4730,14 @@ weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
 	 * item carries the row's docvalues value (rec.hasdv), so evaluate the same
 	 * comparison here and emit the matching TIDs directly.
 	 *
-	 * A pending item with rec.hasdv == false (an index with no docvalues column,
-	 * or an item in an older layout written before WEAVE_VERSION_PENDING_DV and
-	 * not yet flushed) contributes nothing -- the same v1 partial-coverage limit a
-	 * merged or pre-Task-4 bolt has (doc/specs/DOCVALS_CHANNEL.md sect. 11).  The
-	 * common case, a fresh INSERT, always carries the value.
+	 * A pending item with rec.hasdv == false contributes nothing to a comparison
+	 * gate, and that is correct in all three of its cases: an index with no
+	 * docvalues column; an older layout (pre-WEAVE_VERSION_PENDING_DV) not yet
+	 * flushed -- the documented partial-coverage limit (sect. 11); AND a NULL
+	 * docval on a docvals-bearing index (dvslot && dvlen == 0, store v2), which a
+	 * comparison gate must exclude because a NULL is emitted for no operator
+	 * (sect. 6).  The common case, a fresh INSERT of a present value, always
+	 * carries it (rec.hasdv).
 	 *
 	 * These are live heap tuples; the executor applies MVCC on the heap exactly as
 	 * for a segment match, so no tombstone filtering is owed here.
@@ -4761,6 +4764,10 @@ weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
 			weave_pending_iter_init(&it, page);
 			while (weave_pending_iter_next(&it, &rec))
 			{
+				/* Excludes a present-value item that does not match, an index
+				 * with no docvalues column, an older un-flushed layout, AND a
+				 * NULL docval (dvslot && !hasdv) -- the last correctly, since a
+				 * NULL is emitted for no comparison operator. */
 				if (!rec.hasdv)
 					continue;
 				if (!weave_dv_match_int8(op, rec.docval, c))
