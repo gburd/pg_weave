@@ -1517,10 +1517,14 @@ extern bool weave_surf_consult(Relation index, const WeaveSegMeta *seg,
  * own cycles).  The serialized image is byte-for-byte what
  * weave_docvals_validate() expects.  check-alloc: any size derived from `n`
  * (corpus-scale) uses the huge-safe allocator.
+ *
+ * `nullbits`, when non-NULL, is an `n`-byte per-doc array (nonzero == NULL, in
+ * the SAME dense order as vals/docids); the writer packs it into the v2 null
+ * bitmap and records null_off.  NULL means the store has no bitmap (null_off 0).
  */
 extern BlockNumber weave_docvals_write(Relation index, GenericXLogState *state,
 									   const int64 *vals, const uint64 *docids,
-									   uint32 n);
+									   const uint8 *nullbits, uint32 n);
 
 /*
  * Walk the chain from `root`, concatenate the page payloads into one contiguous
@@ -1547,8 +1551,9 @@ extern const void *weave_docvals_load(Relation index, BlockNumber root,
  * index with no docvalues column, and -- in this v1 slice -- the merge and the
  * post-build insert/pending-flush paths, whose rows therefore carry no docvalues
  * gate (the documented G29-class limitation, doc/specs/DOCVALS_CHANNEL.md sect.
- * 11).  A NULL value is refused with an ERROR in this slice (v1 is NOT NULL); a
- * later slice stores it in a null bitmap.
+ * 11).  A NULL value is RECORDED in a null bitmap (store v2): the pair still
+ * occupies its dense docid slot with a placeholder value, and the bitmap masks
+ * that docid out of every comparison gate.
  */
 typedef struct WeaveDocvalsAccum
 {
@@ -1560,8 +1565,20 @@ typedef struct WeaveDocvalsAccum
 								 * path is already-encoded and ignores this) */
 	uint64	   *docid;			/* n; weave_tid_to_docid of the heap tuple */
 	int64	   *value;			/* n; the order-preserving int64 at that docid */
+	uint8	   *isnull;			/* n; one byte per appended pair, nonzero == the
+								 * row's facet value is NULL.  A NULL pair still
+								 * occupies a dense docid slot so the docid space
+								 * stays contiguous (the gate emits through a dense
+								 * index -> global-docid map); its value[] entry is
+								 * a placeholder the evaluator never reads, because
+								 * the packed null bitmap masks that docid out
+								 * before any comparison (v2 store, sect. 6 of
+								 * doc/specs/DOCVALS_CHANNEL.md).  Kept parallel to
+								 * docid/value by both add entry points. */
 	uint32		n;
 	uint32		cap;
+	uint32		nulls;			/* count of pairs with isnull != 0; write_weft
+								 * lays down a null bitmap iff this is > 0 */
 } WeaveDocvalsAccum;
 
 extern void weave_docvals_accum_init(WeaveDocvalsAccum *acc, MemoryContext ctx,
@@ -1570,7 +1587,9 @@ extern void weave_docvals_accum_reset(WeaveDocvalsAccum *acc);
 extern void weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
 									Datum value, bool isnull);
 /* Merge path's pair-level entry point (the build path uses
- * weave_docvals_accum_add); appends a (docid, value) directly, no null check. */
+ * weave_docvals_accum_add); appends a (docid, value) directly, no null check.
+ * Its pairs are never NULL, but it still appends a parallel isnull==0 byte so
+ * the docid/value/isnull arrays stay the same length across both entry points. */
 extern void weave_docvals_accum_add_pair(WeaveDocvalsAccum *acc, uint64 docid,
 										 int64 value);
 

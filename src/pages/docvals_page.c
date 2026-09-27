@@ -75,12 +75,14 @@
  * re-checks on the way back in.
  */
 static uint8 *
-docvals_serialize(const int64 *vals, const uint64 *docids, uint32 n,
-				  Size *len_out)
+docvals_serialize(const int64 *vals, const uint64 *docids,
+				  const uint8 *nullbits, uint32 n, Size *len_out)
 {
 	WeaveDocvalsHeader h;
 	uint32		voff = (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader));
 	uint32		doff = voff + n * 8u;
+	uint32		noff = (uint32) WEAVE_DV_MAXALIGN((Size) doff + (Size) n * 8u);
+	bool		has_nulls = (nullbits != NULL);
 	Size		len;
 	uint8	   *img;
 
@@ -88,9 +90,14 @@ docvals_serialize(const int64 *vals, const uint64 *docids, uint32 n,
 	 * The header's local WEAVE_DV_MAXALIGN must agree with the backend's
 	 * MAXALIGN, or the offset the store records and the offset a reader recomputes
 	 * would differ.  docvals.h anticipates this assertion in the comment on
-	 * WEAVE_DV_MAXALIGN; make it rather than assume it.
+	 * WEAVE_DV_MAXALIGN; make it rather than assume it.  The second assert mirrors
+	 * the first for the null-bitmap offset: it must equal the single MAXALIGNed
+	 * post-docids offset the header/validator recompute (weave_docvals_validate()
+	 * rejects any other value), so the byte the writer packs a bit into and the
+	 * byte weave_docvals_isnull() reads it back from are the same byte.
 	 */
 	Assert(voff == (uint32) MAXALIGN(sizeof(WeaveDocvalsHeader)));
+	Assert(noff == (uint32) MAXALIGN((Size) doff + (Size) n * 8u));
 
 	/*
 	 * check-alloc: n is corpus-scale (one value and one docid per docid in the
@@ -98,16 +105,20 @@ docvals_serialize(const int64 *vals, const uint64 *docids, uint32 n,
 	 * through the huge-safe path -- the exact allocation class behind four real
 	 * crashes in this extension's ancestor (AGENTS.md's lint table).
 	 * values_off + n*8 + n*8 is computed in Size; on a 64-bit target n (uint32) *
-	 * 8 cannot wrap.
+	 * 8 cannot wrap.  When a bitmap is present, the store runs to the aligned
+	 * post-docids offset plus ceil(n/8) bytes (the v2 shape).
 	 */
-	len = (Size) voff + (Size) n * 8 + (Size) n * 8;
+	if (has_nulls)
+		len = (Size) noff + (Size) ((n + 7u) / 8u);
+	else
+		len = (Size) voff + (Size) n * 8 + (Size) n * 8;
 	img = (uint8 *) WEAVE_ALLOC_MAYBE_HUGE(len);
 
 	h.magic = WEAVE_DOCVALS_MAGIC;
-	h.version = 1;
+	h.version = 2;
 	h.typid_kind = 1;			/* int8 */
 	h.ndocs = n;
-	h.null_off = 0;
+	h.null_off = has_nulls ? noff : 0;
 	h.zonemap_off = 0;
 	h.values_off = voff;
 	h.docids_off = doff;
@@ -119,13 +130,31 @@ docvals_serialize(const int64 *vals, const uint64 *docids, uint32 n,
 		memcpy(img + doff, docids, (Size) n * 8);
 	}
 
+	if (has_nulls)
+	{
+		uint32		nbytes = (n + 7u) / 8u;
+		uint32		i;
+
+		/*
+		 * Pack the per-doc byte array into the bit-per-doc bitmap: bit i set iff
+		 * docid i is NULL, byte i>>3 bit i&7 -- exactly the reader's shape in
+		 * weave_docvals_isnull().  Zero the region first so unused trailing bits
+		 * (beyond n) stay 0.
+		 */
+		memset(img + noff, 0, nbytes);
+		for (i = 0; i < n; i++)
+			if (nullbits[i])
+				img[noff + (i >> 3)] |= (uint8) (1u << (i & 7u));
+	}
+
 	*len_out = len;
 	return img;
 }
 
 BlockNumber
 weave_docvals_write(Relation index, GenericXLogState *state,
-					const int64 *vals, const uint64 *docids, uint32 n)
+					const int64 *vals, const uint64 *docids,
+					const uint8 *nullbits, uint32 n)
 {
 	BlockNumber first = InvalidBlockNumber;
 	Buffer		prevbuf = InvalidBuffer;
@@ -133,7 +162,7 @@ weave_docvals_write(Relation index, GenericXLogState *state,
 	GenericXLogState *prevstate = NULL;
 	Size		len;
 	Size		off = 0;
-	uint8	   *img = docvals_serialize(vals, docids, n, &len);
+	uint8	   *img = docvals_serialize(vals, docids, nullbits, n, &len);
 
 	Assert(len > 0);			/* always >= sizeof(WeaveDocvalsHeader) */
 
@@ -477,8 +506,10 @@ weave_docvals_accum_init(WeaveDocvalsAccum *acc, MemoryContext ctx, bool active,
 	acc->dvtype = dvtype;
 	acc->docid = NULL;
 	acc->value = NULL;
+	acc->isnull = NULL;			/* lazily allocated alongside docid/value */
 	acc->n = 0;
 	acc->cap = 0;
+	acc->nulls = 0;
 }
 
 void
@@ -493,8 +524,10 @@ weave_docvals_accum_reset(WeaveDocvalsAccum *acc)
 	 */
 	acc->docid = NULL;
 	acc->value = NULL;
+	acc->isnull = NULL;
 	acc->n = 0;
 	acc->cap = 0;
+	acc->nulls = 0;
 }
 
 void
@@ -505,19 +538,23 @@ weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
 		return;
 
 	/*
-	 * v1 is NOT NULL.  A placeholder value would silently include NULL rows in a
-	 * `col < x` gate (NULL is UNKNOWN, i.e. excluded), so refuse rather than
-	 * store one; the null-bitmap slice (doc/specs/DOCVALS_CHANNEL.md sect. 11)
-	 * lifts this.  Reachable only at build/REINDEX of a column that admits NULLs.
+	 * A NULL is RECORDED, not refused (store v2, doc/specs/DOCVALS_CHANNEL.md
+	 * sect. 6).  The pair still occupies a dense docid slot so the docid space
+	 * stays contiguous, but its stored value is a placeholder (0) the evaluator
+	 * never reads -- the packed null bitmap masks this docid out before any
+	 * comparison.  A non-NULL value is encoded to the stored order-preserving
+	 * int64 as before.  Both go through weave_docvals_accum_add_pair(), which
+	 * appends a parallel isnull==0 byte; we flip that byte on for a NULL and
+	 * bump the count.
 	 */
-	if (isnull)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("weave docvalues column must not contain NULL in this version"),
-				 errhint("Declare the column NOT NULL, or omit it from the index until the null-bitmap slice lands.")));
-
 	weave_docvals_accum_add_pair(acc, weave_tid_to_docid(tid),
-								 weave_dv_encode_datum(acc->dvtype, value));
+								 isnull ? 0 : weave_dv_encode_datum(acc->dvtype, value));
+
+	if (isnull)
+	{
+		acc->isnull[acc->n - 1] = 1;
+		acc->nulls++;
+	}
 }
 
 void
@@ -529,7 +566,9 @@ weave_docvals_accum_add_pair(WeaveDocvalsAccum *acc, uint64 docid, int64 value)
 	if (acc->n >= acc->cap)
 	{
 		/* corpus-scale: one pair per indexed document, so the doubling `cap`
-		 * goes through the huge-safe allocator (check-alloc). */
+		 * goes through the huge-safe allocator (check-alloc).  isnull grows in
+		 * lockstep with docid/value so the three arrays stay parallel across
+		 * both add entry points. */
 		uint32		want = acc->cap ? acc->cap * 2 : 1024;
 
 		acc->docid = acc->docid
@@ -538,11 +577,18 @@ weave_docvals_accum_add_pair(WeaveDocvalsAccum *acc, uint64 docid, int64 value)
 		acc->value = acc->value
 			? WEAVE_REALLOC_MAYBE_HUGE(acc->value, (Size) want * sizeof(int64))
 			: WEAVE_ALLOC_MAYBE_HUGE((Size) want * sizeof(int64));
+		acc->isnull = acc->isnull
+			? WEAVE_REALLOC_MAYBE_HUGE(acc->isnull, (Size) want * sizeof(uint8))
+			: WEAVE_ALLOC_MAYBE_HUGE((Size) want * sizeof(uint8));
 		acc->cap = want;
 	}
 
 	acc->docid[acc->n] = docid;
 	acc->value[acc->n] = value;
+	/* This entry point does NO null check (the merge path's pairs are never
+	 * NULL); it appends a 0 so the isnull array stays parallel.  A NULL caller
+	 * (weave_docvals_accum_add) flips this byte on afterward. */
+	acc->isnull[acc->n] = 0;
 	acc->n++;
 }
 
@@ -552,6 +598,8 @@ typedef struct DocvalsPair
 {
 	uint64		docid;
 	int64		value;
+	uint8		isnull;			/* travels with the pair through the sort so a
+								 * NULL keeps masking its own docid after reorder */
 } DocvalsPair;
 
 static int
@@ -573,6 +621,7 @@ weave_docvals_write_weft(Relation index, WeaveDocvalsAccum *acc)
 	DocvalsPair *pairs;
 	uint64	   *docids;
 	int64	   *vals;
+	uint8	   *nullbits = NULL;
 	BlockNumber root;
 	uint32		i;
 
@@ -590,23 +639,39 @@ weave_docvals_write_weft(Relation index, WeaveDocvalsAccum *acc)
 	{
 		pairs[i].docid = acc->docid[i];
 		pairs[i].value = acc->value[i];
+		pairs[i].isnull = acc->isnull[i];
 	}
 	qsort(pairs, acc->n, sizeof(DocvalsPair), docvals_cmp_pair);
 
 	docids = (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) acc->n * sizeof(uint64));
 	vals = (int64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) acc->n * sizeof(int64));
+
+	/*
+	 * Build the per-doc nullbits array (in sorted, dense order) only when this
+	 * weft actually carries a NULL, so a NOT-NULL segment lays down the exact
+	 * v2-without-bitmap shape (null_off == 0).  check-alloc: acc->n is
+	 * corpus-scale, so the byte array goes through the huge-safe allocator.
+	 */
+	if (acc->nulls > 0)
+		nullbits = (uint8 *) WEAVE_ALLOC_MAYBE_HUGE((Size) acc->n * sizeof(uint8));
+
 	for (i = 0; i < acc->n; i++)
 	{
 		docids[i] = pairs[i].docid;
 		vals[i] = pairs[i].value;
+		if (nullbits != NULL)
+			nullbits[i] = pairs[i].isnull;
 	}
 
 	/* GenericXLogState is NULL here: weave_docvals_write() writes each payload
 	 * page on its own cycle and only names the parameter to document the
 	 * record-the-root-last contract (see its comment); the caller records the
-	 * returned root in the channel descriptor LAST. */
-	root = weave_docvals_write(index, NULL, vals, docids, acc->n);
+	 * returned root in the channel descriptor LAST.  nullbits is NULL for a
+	 * NOT-NULL segment (no bitmap) and non-NULL when acc->nulls > 0. */
+	root = weave_docvals_write(index, NULL, vals, docids, nullbits, acc->n);
 
+	if (nullbits != NULL)
+		pfree(nullbits);
 	pfree(vals);
 	pfree(docids);
 	pfree(pairs);
