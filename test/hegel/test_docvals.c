@@ -130,6 +130,15 @@ static long cov_dup_adjacent = 0;	/* a non-empty result had adjacent-equal
 									 * values (ascending order with dups holds) */
 static long cov_trunc = 0;		/* outcap-truncation branch actually fired */
 
+/* prop_nulls (v2 store + null-aware evaluator). */
+static long null_checks = 0;
+static long cov_null_some = 0;	/* a trial had >= 1 NULL docid */
+static long cov_null_none = 0;	/* a trial had 0 NULL docids */
+static long cov_null_all = 0;	/* a trial had every docid NULL */
+static long cov_null_nobitmap = 0;	/* a trial built a null_off==0 (v2, no bitmap) store */
+static long cov_null_op[6] = {0};	/* each of the 5 operators over a v2 store */
+static long null_teeth_checks = 0;	/* validator-teeth sub-checks on v2 bitmaps */
+
 /* float8-encode coverage (weave_dv_encode_f8). */
 static long f8_checks = 0;
 static long cov_f8_lt = 0;		/* a strict a<b ordering pair was checked */
@@ -451,11 +460,11 @@ prop_reject(void)
 	h->magic ^= 0xFFu;
 	EXPECT_REJECT("bad magic");
 
-	/* version = 2 */
+	/* version = 3 (unknown; a reader refuses anything but 1 or 2) */
 	memcpy(cpy, base, len);
 	h = (WeaveDocvalsHeader *) cpy;
-	h->version = 2;
-	EXPECT_REJECT("version=2");
+	h->version = 3;
+	EXPECT_REJECT("version=3");
 
 	/* typid_kind = 2 */
 	memcpy(cpy, base, len);
@@ -554,9 +563,259 @@ prop_reject(void)
 }
 
 /*
- * PG float8 order/equality reference (what the docvals gate MUST match): NaN is
- * greater than every non-NaN and all NaN are equal; -0.0 == +0.0; otherwise IEEE.
+ * Reference for the null-aware evaluator: the GLOBAL DOCID docids[i] of each
+ * index i in [0,n) that is NOT null and satisfies (vals[i] op c), in ascending
+ * docid order.  isnull may be NULL, meaning no docid is null (the null_off==0
+ * store shape).
  */
+static int
+ref_eval_nulls(const int64_t *vals, const uint64_t *docids, const uint8_t *isnull,
+			   int n, WeaveDvStrat op, int64_t c, uint64_t *out)
+{
+	int			i;
+	int			count = 0;
+
+	for (i = 0; i < n; i++)
+	{
+		int			match;
+
+		if (isnull != NULL && isnull[i])
+			continue;			/* NULL satisfies no comparison */
+
+		switch (op)
+		{
+			case WEAVE_DV_LT:
+				match = (vals[i] < c);
+				break;
+			case WEAVE_DV_LE:
+				match = (vals[i] <= c);
+				break;
+			case WEAVE_DV_EQ:
+				match = (vals[i] == c);
+				break;
+			case WEAVE_DV_GE:
+				match = (vals[i] >= c);
+				break;
+			case WEAVE_DV_GT:
+				match = (vals[i] > c);
+				break;
+			default:
+				match = 0;
+				break;
+		}
+		if (match)
+			out[count++] = docids[i];
+	}
+	return count;
+}
+
+/*
+ * PROP_NULLS: the v2 store + null-aware evaluator.  The Review Focus hazard is a
+ * NULL whose value slot happens to be arithmetically < (or =, >) the constant:
+ * it must be excluded by the null bitmap BEFORE the comparison, never emitted.
+ * So we build a v2 store from random (value, docid, isnull) triples, run
+ * weave_dv_eval_int8() for every operator, and assert the emitted global-docid
+ * set EQUALS { docids[i] : !isnull[i] && cmp(vals[i], op, c) } -- same count,
+ * same members, strictly ascending.
+ *
+ * The second half is validator teeth on the v2 bitmap region: a well-formed v2
+ * store must validate, and each of null_off-past-end, bitmap-one-byte-short,
+ * version==1-with-null_off, and null_off-off-by-8 must be refused.
+ */
+static void
+prop_nulls(void)
+{
+	int64_t		vals[MAXN];
+	uint64_t	docids[MAXN];
+	uint8_t		isnull[MAXN];
+	uint64_t	out[MAXN];
+	uint64_t	ref[MAXN];
+	/* header + values + docids + a MAXALIGN slop + the bitmap (<= 16B at MAXN). */
+	unsigned char buf[sizeof(WeaveDocvalsHeader) + 16 * MAXN + 64];
+	int			n = (int) (rng_next() % (MAXN + 1));	/* [0,128] */
+	int			i;
+	int			oi;
+	int			nulls = 0;
+	int			mode = (int) (rng_next() % 4u);	/* 0 none-bitmapless,1 none,2 all,3 mix */
+	int			has_bitmap = (mode != 0);
+	const uint8_t *nullbits;
+	const char *why;
+	size_t		len;
+	int			small = ((rng_next() % 3u) == 0);
+
+	for (i = 0; i < n; i++)
+		vals[i] = small ? draw_i64_small() : draw_i64();
+
+	/* Salt in the extremes so INT64_MIN/MAX participate in comparisons. */
+	if (n > 0 && (rng_next() % 4u) == 0)
+		vals[rng_next() % (uint32_t) n] = INT64_MIN;
+	if (n > 0 && (rng_next() % 4u) == 0)
+		vals[rng_next() % (uint32_t) n] = INT64_MAX;
+
+	draw_docids(docids, n);
+
+	for (i = 0; i < n; i++)
+	{
+		switch (mode)
+		{
+			case 1:				/* bitmap present, no bit set */
+				isnull[i] = 0;
+				break;
+			case 2:				/* every docid NULL */
+				isnull[i] = 1;
+				break;
+			case 3:				/* random mix */
+				isnull[i] = (uint8_t) (rng_next() & 1u);
+				break;
+			default:			/* mode 0: no bitmap at all */
+				isnull[i] = 0;
+				break;
+		}
+		if (isnull[i])
+			nulls++;
+	}
+
+	nullbits = has_bitmap ? isnull : NULL;
+
+	len = weave_docvals_store_len_nulls((uint32_t) n, has_bitmap);
+	weave_docvals_build_nulls(buf, vals, docids, nullbits, (uint32_t) n);
+
+	/* A well-formed v2 store (with or without a bitmap) must validate. */
+	why = weave_docvals_validate(buf, len);
+	checks++;
+	null_checks++;
+	if (why != NULL)
+	{
+		failures++;
+		if (failures <= 20)
+			printf("FAIL NULLS %s:%d: valid v2 store rejected (n=%d mode=%d): %s\n",
+				   __FILE__, __LINE__, n, mode, why);
+	}
+
+	/* Coverage: some-null vs no-null, all-null, and the bitmapless shape. */
+	if (nulls > 0)
+		cov_null_some++;
+	else
+		cov_null_none++;
+	if (n > 0 && nulls == n)
+		cov_null_all++;
+	if (!has_bitmap)
+		cov_null_nobitmap++;
+
+	/* Exactness for every operator against the reference (isnull-aware). */
+	for (oi = 0; oi < 5; oi++)
+	{
+		int64_t		c = small ? draw_i64_small() : draw_i64();
+		int			gc;
+		int			wc;
+		int			k;
+		int			ok = 1;
+
+		/* Occasionally pin the constant to an extreme boundary. */
+		if ((rng_next() % 5u) == 0)
+			c = ((rng_next() & 1u) ? INT64_MIN : INT64_MAX);
+
+		gc = weave_dv_eval_int8(buf, ops[oi], c, out, (uint32_t) n);
+		wc = ref_eval_nulls(vals, docids,
+							 has_bitmap ? isnull : NULL, n, ops[oi], c, ref);
+
+		checks++;
+		null_checks++;
+		cov_null_op[(int) ops[oi]]++;
+
+		if (gc != wc)
+			ok = 0;
+		else
+		{
+			for (k = 0; ok && k < wc; k++)
+				if (out[k] != ref[k])
+					ok = 0;
+			for (k = 1; ok && k < gc; k++)
+				if (!(out[k] > out[k - 1]))
+					ok = 0;
+		}
+
+		if (!ok)
+		{
+			failures++;
+			if (failures <= 20)
+				printf("FAIL NULLS %s:%d: n=%d mode=%d op=%d c=%" PRId64
+					   " expected %d got %d\n",
+					   __FILE__, __LINE__, n, mode, (int) ops[oi], c, wc, gc);
+		}
+	}
+
+	/*
+	 * Validator teeth on the bitmap region.  Only meaningful when a bitmap is
+	 * present (null_off != 0) and ndocs > 0 (so the bitmap has >= 1 byte, which
+	 * the one-byte-short probe needs).  Build a fresh bitmapped store here so the
+	 * teeth do not depend on mode.
+	 */
+	if (n > 0)
+	{
+		unsigned char tbuf[sizeof(WeaveDocvalsHeader) + 16 * MAXN + 64];
+		unsigned char cpy[sizeof(WeaveDocvalsHeader) + 16 * MAXN + 64];
+		size_t		tlen = weave_docvals_store_len_nulls((uint32_t) n, 1);
+		WeaveDocvalsHeader *th;
+		const char *r;
+
+		for (i = 0; i < n; i++)
+			isnull[i] = (uint8_t) (rng_next() & 1u);
+		weave_docvals_build_nulls(tbuf, vals, docids, isnull, (uint32_t) n);
+
+		/* A well-formed v2 store WITH a bitmap must validate (positive control). */
+		checks++;
+		null_teeth_checks++;
+		r = weave_docvals_validate(tbuf, tlen);
+		if (r != NULL)
+		{
+			failures++;
+			if (failures <= 20)
+				printf("FAIL NULLS %s:%d: valid bitmapped v2 rejected (n=%d): %s\n",
+					   __FILE__, __LINE__, n, r);
+		}
+
+#define EXPECT_NULL_REJECT(desc, vlen) \
+		do { \
+			const char *rr; \
+			checks++; \
+			null_teeth_checks++; \
+			rr = weave_docvals_validate(cpy, (vlen)); \
+			if (rr == NULL) \
+			{ \
+				failures++; \
+				if (failures <= 20) \
+					printf("FAIL NULLS %s:%d: %s wrongly accepted (n=%d)\n", \
+						   __FILE__, __LINE__, (desc), n); \
+			} \
+		} while (0)
+
+		/* (a) null_off past the image end (caught by the offset-equality
+		 * check: null_off no longer equals the one legal aligned offset). */
+		memcpy(cpy, tbuf, tlen);
+		th = (WeaveDocvalsHeader *) cpy;
+		th->null_off = (uint32) tlen + 8u;
+		EXPECT_NULL_REJECT("null_off past end", tlen);
+
+		/* (b) bitmap truncated by one byte (len one short of the full store). */
+		memcpy(cpy, tbuf, tlen);
+		EXPECT_NULL_REJECT("bitmap one byte short", tlen - 1);
+
+		/* (c) version==1 with null_off!=0. */
+		memcpy(cpy, tbuf, tlen);
+		th = (WeaveDocvalsHeader *) cpy;
+		th->version = 1;
+		EXPECT_NULL_REJECT("version=1 with null_off!=0", tlen);
+
+		/* (d) null_off not the required aligned offset (off by 8). */
+		memcpy(cpy, tbuf, tlen);
+		th = (WeaveDocvalsHeader *) cpy;
+		th->null_off += 8u;
+		EXPECT_NULL_REJECT("null_off off-by-8", tlen);
+
+#undef EXPECT_NULL_REJECT
+	}
+}
 static int
 f8_lt_ref(double a, double b)
 {
@@ -673,6 +932,7 @@ main(void)
 		prop_pred();
 		prop_trunc();
 		prop_reject();
+		prop_nulls();
 		prop_f8encode();
 	}
 
@@ -680,6 +940,8 @@ main(void)
 	printf("PRED  eval == reference loop : %8ld checks\n", pred_checks);
 	printf("REJECT validator refuses junk: %8ld checks\n", reject_checks);
 	printf("TRUNC outcap truncation guard: %8ld checks\n", trunc_checks);
+	printf("NULLS v2 eval + validator teeth: %8ld checks (%ld teeth)\n",
+		   null_checks + null_teeth_checks, null_teeth_checks);
 	printf("coverage: nonempty=%ld empty=%ld present-EQ-hit=%ld "
 		   "ops LT=%ld LE=%ld EQ=%ld GE=%ld GT=%ld\n",
 		   cov_nonempty, cov_empty, cov_present_eq,
@@ -739,11 +1001,38 @@ main(void)
 		failures++;
 	}
 
+	/*
+	 * prop_nulls coverage: some-null and no-null stores must both have occurred,
+	 * an all-null store must have occurred (the "emit nothing" extreme), the
+	 * bitmapless v2 shape (null_off==0) must have been exercised, and every one
+	 * of the five operators must have run over a v2 store -- else the null-aware
+	 * path is a green with a hole in it.
+	 */
+	if (cov_null_some == 0 || cov_null_none == 0 || cov_null_all == 0 ||
+		cov_null_nobitmap == 0 ||
+		cov_null_op[WEAVE_DV_LT] == 0 || cov_null_op[WEAVE_DV_LE] == 0 ||
+		cov_null_op[WEAVE_DV_EQ] == 0 || cov_null_op[WEAVE_DV_GE] == 0 ||
+		cov_null_op[WEAVE_DV_GT] == 0)
+	{
+		printf("COVERAGE FAIL: null some=%ld none=%ld all=%ld nobitmap=%ld "
+			   "LT=%ld LE=%ld EQ=%ld GE=%ld GT=%ld -- a null-path case never "
+			   "fired, so it is untested\n",
+			   cov_null_some, cov_null_none, cov_null_all, cov_null_nobitmap,
+			   cov_null_op[WEAVE_DV_LT], cov_null_op[WEAVE_DV_LE],
+			   cov_null_op[WEAVE_DV_EQ], cov_null_op[WEAVE_DV_GE],
+			   cov_null_op[WEAVE_DV_GT]);
+		failures++;
+	}
+
 	if (failures > 0)
 	{
+		printf("prop_nulls: %ld checks, %ld failures\n",
+			   null_checks + null_teeth_checks, failures);
 		printf("FAILED -- %ld checks, %ld failures\n", checks, failures);
 		return 1;
 	}
+	printf("prop_nulls: %ld checks, 0 failures\n",
+		   null_checks + null_teeth_checks);
 	printf("%ld checks, %ld failures\n", checks, failures);
 	return 0;
 }

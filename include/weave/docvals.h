@@ -64,15 +64,29 @@ typedef uint8_t uint8;
 #endif
 
 /*
- * On-disk header for a v1 int8 docvalues store.  Fixed-width fields only, so the
- * byte layout is identical on every target: the total is 28 bytes with no
- * trailing padding (largest member is 4-byte aligned).  The store has three
- * regions after the header:
+ * On-disk header for an int8 docvalues store (v1, or v2 with an optional null
+ * bitmap).  Fixed-width fields only, so the byte layout is identical on every
+ * target: the total is 28 bytes with no trailing padding (largest member is
+ * 4-byte aligned).  The store has up to four regions after the header:
  *
  *	 values	 : ndocs int64 values, begins at values_off == WEAVE_DV_MAXALIGN(28).
  *	 docids	 : ndocs uint64 GLOBAL docids (weave_tid_to_docid), STRICTLY ascending,
  *			   begins at docids_off == values_off + ndocs*8.  docids[i] is the
  *			   global docid the dense index i denotes; the two arrays are parallel.
+ *	 nulls	 : (v2 only, present iff null_off != 0) a bitmap of ceil(ndocs/8)
+ *			   bytes, one bit per dense docid, bit set == that docid's value is
+ *			   NULL.  It begins at null_off == WEAVE_DV_MAXALIGN(docids_off +
+ *			   ndocs*8), i.e. immediately after the docid array, 8-byte aligned.
+ *
+ * WHY null_off == 0 MEANS "NO NULLS", AND WHY THE OFFSET IS ALIGNED.  A segment
+ * with no NULL facet values (the common case, and every NOT-NULL column) carries
+ * no bitmap at all: null_off == 0 is the sentinel for "the whole dense space is
+ * non-null", so a v2 store pays nothing for a facet that never nulls, and a v1
+ * store (which predates the bitmap) reads unchanged.  When a bitmap IS present it
+ * sits at the MAXALIGNed end of the docid array so the region keeps the same
+ * 8-byte discipline as the two arrays before it; a reader that trusted an
+ * arbitrary null_off could be walked off the image, so the validator recomputes
+ * the one legal offset and refuses any other.
  *
  * These bytes come off disk and are NOT trusted; weave_docvals_validate() checks
  * every field, and the strict ascent of the docid array, before any value or
@@ -81,19 +95,21 @@ typedef uint8_t uint8;
  * include/weave/vecdocmap.h spends its header on).
  *
  * Reconciling with doc/specs/DOCVALS_CHANNEL.md sect. 3: the spec's header lists
- * typid/typlen/typbyval/collation, but this v1 slice is int8-only, so all of
+ * typid/typlen/typbyval/collation, but this int8 slice is int8-only, so all of
  * that type identity collapses to a single typid_kind (== 1 for int8).  The
  * float/date/text slices, whose type and collation metadata the spec anticipates,
- * arrive under a bumped version.  null_off and zonemap_off are 0 in v1 and
- * reserved for the null bitmap and per-block zone-map those later slices add.
+ * arrive under a further-bumped version.  zonemap_off is 0 and reserved for the
+ * per-block zone-map a later slice adds.
  */
 typedef struct WeaveDocvalsHeader
 {
 	uint32		magic;			/* 0x57445631 == "WDV1"; wrong => not our store */
-	uint16		version;		/* 1; a reader refuses anything it does not know */
+	uint16		version;		/* 1 or 2; a reader refuses anything else */
 	uint16		typid_kind;		/* 1 == int8; the only value kind in this slice */
 	uint32		ndocs;			/* number of per-docid values; the id space size */
-	uint32		null_off;		/* 0 in v1: no null bitmap yet (no nulls handled) */
+	uint32		null_off;		/* 0 == no null bitmap (all non-null); else the
+								 * v2 bitmap offset, MAXALIGN(docids_off+ndocs*8).
+								 * Must be 0 for version 1 (see the file header). */
 	uint32		zonemap_off;	/* 0 in v1: reserved for a later per-block min/max
 								 * zone-map.  Adding it later only sets this to a
 								 * nonzero offset and appends bytes, so it is a
@@ -200,10 +216,11 @@ weave_dv_encode_f8(double d)
 }
 
 /*
- * Returns NULL if img (of byte length len) is a structurally valid v1 int8 store
- * for its stated ndocs, whose docid array is strictly ascending; otherwise a
- * STATIC reason string.  On-disk bytes are not trusted, so every field is checked
- * and nothing past len is ever read: the size bound docids_off + ndocs*8 is
+ * Returns NULL if img (of byte length len) is a structurally valid int8 store
+ * (version 1, or version 2 with an optional null bitmap) for its stated ndocs,
+ * whose docid array is strictly ascending; otherwise a STATIC reason string.
+ * On-disk bytes are not trusted, so every field is checked and nothing past len
+ * is ever read: the size bounds (docids_off + ndocs*8, and the bitmap end) are
  * computed in uint64 so a large ndocs cannot wrap a size_t and admit a too-short
  * image.
  */
@@ -231,16 +248,14 @@ weave_docvals_validate(const void *img, size_t len)
 
 	if (h.magic != WEAVE_DOCVALS_MAGIC)
 		return "bad magic (not a weave docvalues store)";
-	if (h.version != 1)
+	if (h.version != 1 && h.version != 2)
 		return "unsupported docvalues version";
 	if (h.typid_kind != 1)
 		return "unsupported value kind (v1 is int8 only)";
 	if (h.values_off != voff)
 		return "values_off does not match aligned header size";
-	if (h.null_off != 0)
-		return "null_off must be 0 in v1";
 	if (h.zonemap_off != 0)
-		return "zonemap_off must be 0 in v1";
+		return "zonemap_off must be 0";
 
 	/*
 	 * Overflow-safe offsets and size check, all in uint64.  ndocs is uint32 so
@@ -253,6 +268,28 @@ weave_docvals_validate(const void *img, size_t len)
 	total_need = (uint64) h.docids_off + (uint64) h.ndocs * 8u;
 	if ((uint64) len < total_need)
 		return "image too short for stated ndocs";
+
+	/*
+	 * Null bitmap (v2 only).  null_off == 0 is the "no nulls" sentinel and is
+	 * the only legal value for version 1; a nonzero null_off must be version 2,
+	 * must equal the single MAXALIGNed post-docids offset (any other value could
+	 * point the reader off the image -- the bytes are not trusted), and its
+	 * ceil(ndocs/8)-byte bitmap must fit within len.  All arithmetic is uint64
+	 * for the same overflow discipline as the docid/value bounds above.
+	 */
+	if (h.null_off != 0)
+	{
+		uint64		null_need = WEAVE_DV_MAXALIGN(total_need);
+		uint64		bitmap_end;
+
+		if (h.version != 2)
+			return "null_off set but version is not 2";
+		if ((uint64) h.null_off != null_need)
+			return "null_off is not the aligned post-docids offset";
+		bitmap_end = (uint64) h.null_off + ((uint64) h.ndocs + 7u) / 8u;
+		if ((uint64) len < bitmap_end)
+			return "image too short for the null bitmap";
+	}
 
 	/*
 	 * The docid array must be STRICTLY ascending: it is the dense-index ->
@@ -310,6 +347,28 @@ weave_docvals_docid(const void *img, uint32_t idx)
 }
 
 /*
+ * Is the value at dense index idx NULL?  Caller guarantees idx < ndocs
+ * (asserted).  A store with no bitmap (null_off == 0) has no NULLs, so this
+ * returns 0 without touching any region past the header -- the "no nulls"
+ * sentinel is why a NOT-NULL segment and every v1 store cost nothing here.  When
+ * a bitmap is present, bit (idx & 7) of byte (idx >> 3) is set iff idx is NULL;
+ * the validator has already bounded [null_off, null_off + ceil(ndocs/8)) inside
+ * len, so this single byte read is in-image.
+ */
+static inline int
+weave_docvals_isnull(const void *img, uint32_t idx)
+{
+	WeaveDocvalsHeader h;
+	const unsigned char *base = (const unsigned char *) img;
+
+	memcpy(&h, img, sizeof(h));
+	assert(idx < h.ndocs);
+	if (h.null_off == 0)
+		return 0;
+	return (base[h.null_off + (size_t) (idx >> 3)] >> (idx & 7u)) & 1;
+}
+
+/*
  * Write, in ASCENDING order, the GLOBAL DOCID of every dense index in [0,ndocs)
  * whose value satisfies (value op c) into out[] (capacity outcap, which callers
  * set to ndocs).  Returns the count of matches.  Pure, no allocation.  A write is
@@ -318,8 +377,10 @@ weave_docvals_docid(const void *img, uint32_t idx)
  *
  * The output is ascending because the docid array is strictly ascending in the
  * dense index and the pass visits indices in order (the validator has already
- * refused a store whose docid array is not).  NULLs are not in this slice (the
- * store has none).
+ * refused a store whose docid array is not).  A NULL docid (its null bit set) is
+ * emitted for NO operator: NULL is not less than, equal to, or greater than any
+ * constant, so it is skipped before the comparison rather than being compared as
+ * whatever int64 happens to sit in its value slot.
  */
 static inline int
 weave_dv_eval_int8(const void *img, WeaveDvStrat op, int64_t c,
@@ -336,8 +397,14 @@ weave_dv_eval_int8(const void *img, WeaveDvStrat op, int64_t c,
 
 	for (i = 0; i < n; i++)
 	{
-		int64_t		v = weave_docvals_int8(img, i);
+		int64_t		v;
 		int			match;
+
+		/* A NULL docid satisfies no comparison; skip before the op switch. */
+		if (weave_docvals_isnull(img, i))
+			continue;
+
+		v = weave_docvals_int8(img, i);
 
 		switch (op)
 		{
@@ -416,6 +483,65 @@ weave_docvals_build(void *buf, const int64_t *vals, const uint64_t *docids,
 		memcpy(base + voff + (size_t) i * 8u, &vals[i], sizeof(int64_t));
 	for (i = 0; i < ndocs; i++)
 		memcpy(base + doff + (size_t) i * 8u, &docids[i], sizeof(uint64_t));
+}
+
+/*
+ * Bytes a v2 store occupies: header + values + docids, plus (when has_nulls) the
+ * MAXALIGNed null bitmap of ceil(ndocs/8) bytes.  Mirrors the layout the writer
+ * produces and the validator recomputes.
+ */
+static inline size_t
+weave_docvals_store_len_nulls(uint32_t ndocs, int has_nulls)
+{
+	size_t		body = weave_docvals_store_len(ndocs);
+
+	if (!has_nulls)
+		return body;
+	return (size_t) WEAVE_DV_MAXALIGN(body) + (size_t) ((ndocs + 7u) / 8u);
+}
+
+/*
+ * Fill a version-2 store into buf, which must be at least
+ * weave_docvals_store_len_nulls(ndocs, nullbits != NULL) bytes.  When nullbits is
+ * non-NULL it is a per-doc byte array (nonzero == NULL) that is packed into the
+ * bitmap and null_off is set to the aligned post-docids offset; when it is NULL
+ * the store has no bitmap (null_off == 0, all non-null -- a NOT-NULL segment).
+ */
+static inline void
+weave_docvals_build_nulls(void *buf, const int64_t *vals, const uint64_t *docids,
+						  const uint8_t *nullbits, uint32_t ndocs)
+{
+	WeaveDocvalsHeader *h = (WeaveDocvalsHeader *) buf;
+	unsigned char *base = (unsigned char *) buf;
+	uint32		voff = (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader));
+	uint32		doff = voff + ndocs * 8u;
+	uint32		noff = (uint32) WEAVE_DV_MAXALIGN((size_t) doff + (size_t) ndocs * 8u);
+	uint32_t	i;
+
+	h->magic = WEAVE_DOCVALS_MAGIC;
+	h->version = 2;
+	h->typid_kind = 1;
+	h->ndocs = ndocs;
+	h->null_off = (nullbits != NULL) ? noff : 0;
+	h->zonemap_off = 0;
+	h->values_off = voff;
+	h->docids_off = doff;
+
+	for (i = 0; i < ndocs; i++)
+		memcpy(base + voff + (size_t) i * 8u, &vals[i], sizeof(int64_t));
+	for (i = 0; i < ndocs; i++)
+		memcpy(base + doff + (size_t) i * 8u, &docids[i], sizeof(uint64_t));
+
+	if (nullbits != NULL)
+	{
+		uint32		nbytes = (ndocs + 7u) / 8u;
+
+		for (i = 0; i < nbytes; i++)
+			base[noff + i] = 0;
+		for (i = 0; i < ndocs; i++)
+			if (nullbits[i])
+				base[noff + (i >> 3)] |= (unsigned char) (1u << (i & 7u));
+	}
 }
 
 #endif							/* WEAVE_DOCVALS_TEST_HELPERS */
