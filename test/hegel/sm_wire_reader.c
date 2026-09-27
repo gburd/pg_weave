@@ -14,9 +14,29 @@
  *      and it is in the family sparsemap 5.5.0 fixed for big-endian hosts -- so if
  *      little-endian behaviour changed too, every existing index needs a REINDEX
  *      and the release notes must say so.
- *   3. reproduction: the new version, given the same bits, serializes to
- *      BYTE-IDENTICAL output.  That is the strongest form of "the wire format is
- *      unchanged": not merely readable, but reproduced.
+ *   3. reproduction: the new version, given the same bits, serializes to output
+ *      that ROUND-TRIPS to the same set, and -- whenever it lands in the same
+ *      encoding the old version used -- is BYTE-IDENTICAL.  Byte-identity is the
+ *      strongest form of "the wire format is unchanged": not merely readable, but
+ *      reproduced.  It is asserted only when the new and old serialized SIZES
+ *      match; a size difference means the new version chose a different, smaller
+ *      encoding for the same set, which is a re-encoding, not a wire break.
+ *
+ *      NAMED NOTE (sparsemap v5.7.0, 2026-09-27): v5.7.0 adds a self-describing
+ *      "small-set" mode -- a set whose largest index is below a small cap is stored
+ *      as a bare uint64 word array behind the same 8-byte header, selected by the
+ *      header word's top bit (SM_SMALL_FLAG).  For near-zero sets ({0}, {0..63},
+ *      ...) this is SMALLER than the old chunk form, so this reader now sees the new
+ *      library re-serialize those cases to fewer bytes than the old writer emitted.
+ *      That is expected and safe: (a) old on-disk bytes always have that top bit
+ *      clear (a chunk count never approaches 2^63) so they still decode as chunk
+ *      mode -- checks (1) and (2) prove it for every corpus case; (b) pg_weave only
+ *      ever reads its own blobs with an EQUAL-OR-NEWER library, never an older one,
+ *      so the smaller encoding is forward-safe; (c) pg_weave keeps no canonical
+ *      byte encoding of a blob (no byte-wise dedup/compare), so a set changing
+ *      representation across a bump is invisible to it.  We therefore assert
+ *      round-trip on the re-encoded cases and byte-identity on the rest, and print
+ *      the re-encoded count so the divergence is never silent.
  *
  * Copyright (c) 2025-2026, Gregory Burd
  *
@@ -41,6 +61,7 @@
 
 static int	failures = 0;
 static long checks = 0;
+static long reencoded = 0;
 
 #define CHECK(cond, ...) \
 	do { \
@@ -156,7 +177,10 @@ main(int argc, char **argv)
 		CHECK(steps == n, "case %d (%s): iterated %d bits, expected %d",
 			  c, smw_name(c), steps, n);
 
-		/* (3) byte-identical reproduction from the same inputs */
+		/* (3) reproduction: round-trip always; byte-identity when the new
+		 * version lands in the same-sized encoding the old one used.  A smaller
+		 * size is the v5.7.0 small-set re-encoding (see the NAMED NOTE above),
+		 * not a wire break -- so we require the new bytes to round-trip. */
 		memset(rebuilt, 0, sizeof(rebuilt));
 		sm_init(&map2, rebuilt, sizeof(rebuilt));
 		for (i = 0; i < n; i++)
@@ -168,17 +192,51 @@ main(int argc, char **argv)
 		{
 			size_t		nsz = sm_get_size(&map2);
 
-			CHECK(nsz == sz, "case %d (%s): NEW serializes %zu bytes, OLD %zu",
-				  c, smw_name(c), nsz, sz);
 			if (nsz == sz)
 				CHECK(memcmp(sm_get_data(&map2), blob, sz) == 0,
 					  "case %d (%s): NEW bytes differ from OLD for identical input",
 					  c, smw_name(c));
+			else
+			{
+				/* Re-encoded (expected for near-zero sets under v5.7.0's
+				 * small-set mode): the new bytes must round-trip to the same
+				 * set.  Open the new serialization fresh and re-check membership
+				 * and iteration against the corpus. */
+				static unsigned char rt[SMW_BUFSZ];
+				sm_t		map3;
+				int			rsteps = 0;
+				uint64_t	ridx;
+				sm_cursor_t rcur = SM_CURSOR_INIT;
+
+				reencoded++;
+				memcpy(rt, sm_get_data(&map2), nsz);
+				sm_open(&map3, rt, nsz);
+				for (i = 0; i < n; i++)
+					CHECK(sm_contains(&map3, bits[i], NULL),
+						  "case %d (%s): re-encoded NEW blob lost bit %llu",
+						  c, smw_name(c), (unsigned long long) bits[i]);
+				ridx = SM_IDX_MAX;
+				for (;;)
+				{
+					ridx = sm_next_member(&map3, ridx, &rcur);
+					if (ridx == SM_IDX_MAX)
+						break;
+					if (rsteps < n)
+						CHECK(ridx == bits[rsteps],
+							  "case %d (%s): re-encoded iteration differs at "
+							  "step %d", c, smw_name(c), rsteps);
+					if (++rsteps > n + 8)
+						break;
+				}
+				CHECK(rsteps == n, "case %d (%s): re-encoded iterated %d, "
+					  "expected %d", c, smw_name(c), rsteps, n);
+			}
 		}
 	}
 
 	fclose(f);
-	printf("\n%ld checks, %d failures\n", checks, failures);
+	printf("\n%ld checks, %d failures, %ld case(s) re-encoded smaller by the new "
+		   "version (round-trip verified)\n", checks, failures, reencoded);
 	if (failures)
 		printf("\nWIRE FORMAT IS NOT COMPATIBLE with the vendored version's "
 			   "predecessor. Existing indexes would need a REINDEX; that must be "
