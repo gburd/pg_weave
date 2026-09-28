@@ -3387,7 +3387,8 @@ weave_docvals_merge_append(Relation index, const WeaveSegMeta *seg,
 
 	if (root == InvalidBlockNumber)
 		return;					/* this bolt carries no docvals weft */
-	img = weave_docvals_load(index, root, CurrentMemoryContext, &ndocs);
+	img = weave_docvals_load(index, root, CurrentMemoryContext, &ndocs,
+							 WEAVE_DV_KIND_INT8);
 	if (ndocs == 0)
 	{
 		pfree((void *) img);

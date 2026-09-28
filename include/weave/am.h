@@ -1560,11 +1560,16 @@ extern BlockNumber weave_docvals_write(Relation index, GenericXLogState *state,
  * trusted -- validation is the trust boundary, and nothing reads past the
  * reassembled length before it runs).  Sets *ndocs_out to the validated ndocs.
  * Returns the validated image; the caller reads it with weave_docvals_int8() /
- * weave_dv_eval_int8().  pd_lower is read only through weave_page_entry_end()
- * (check-pdlower).
+ * weave_dv_eval_int8() (want_kind WEAVE_DV_KIND_INT8) or with the dictionary
+ * readers / weave_dv_eval_ord() (WEAVE_DV_KIND_TEXT).  A structurally valid store
+ * of the OTHER kind is an ERROR: an int8 reader handed a text store would compare
+ * dictionary ordinals against an int8 constant -- a wrong answer, not a crash --
+ * so the kind the caller can interpret is checked here, at the trust boundary.
+ * pd_lower is read only through weave_page_entry_end() (check-pdlower).
  */
 extern const void *weave_docvals_load(Relation index, BlockNumber root,
-									  MemoryContext cxt, uint32 *ndocs_out);
+									  MemoryContext cxt, uint32 *ndocs_out,
+									  int want_kind);
 
 /*
  * Build-time accumulator for one int8 docvalues column, the mirror of

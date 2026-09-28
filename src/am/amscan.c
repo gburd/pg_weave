@@ -4693,7 +4693,8 @@ weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
 		if (root == InvalidBlockNumber)
 			continue;			/* this bolt carries no docvalues weft */
 
-		img = weave_docvals_load(index, root, CurrentMemoryContext, &ndocs);
+		img = weave_docvals_load(index, root, CurrentMemoryContext, &ndocs,
+								 WEAVE_DV_KIND_INT8);
 		if (ndocs == 0)
 		{
 			pfree((void *) img);

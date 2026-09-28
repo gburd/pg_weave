@@ -494,6 +494,7 @@ main(void)
 			h.zonemap_off = 0;
 			h.values_off = (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader));
 			h.docids_off = h.values_off + h.ndocs * 8u;
+			h.dict_off = 0;
 			memcpy(exact, &h, sizeof(h));
 		}
 		why = VALIDATE(exact, avail);

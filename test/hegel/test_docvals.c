@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * test_docvals.c
- *		Property test for the pg_weave int8 scalar docvalues store
+ *		Property test for the pg_weave scalar docvalues store (int8 v1/v2, text v3)
  *		(include/weave/docvals.h), the backend-independent value array a scalar
  *		facet predicate is evaluated over.  No PostgreSQL, no cmocka, no hegel:
  *		plain C, its own PRNG and check counters, so `make check-standalone` --
@@ -24,6 +24,20 @@
  * reached the evaluator) must be refused by weave_docvals_validate() without
  * reading past the buffer.
  *
+ * TEXT and TEXTREJ cover the v3 text store (dictionary ordinals in the value
+ * array, a collation-sorted dictionary region).  TEXT computes its reference
+ * DIRECTLY from each document's string under the comparator, never from the
+ * ordinals, so it independently checks the constant -> (lo, hi) boundary
+ * resolution and weave_dv_eval_ord()'s operator mapping -- the one place an
+ * off-by-one silently drops or admits the rows equal to the constant
+ * (doc/specs/DOCVALS_CHANNEL.md sect. 7).  The comparator here is memcmp order;
+ * the backend injects varstr_cmp under the column collation, and the search is
+ * correct for any comparator that totally orders the dictionary.  TEXTREJ
+ * mutates each dictionary field (dict_off, ndict, offs[], out-of-range ordinals,
+ * version/kind mismatches) and every truncation, and requires a refusal.  PRED
+ * and NULLS additionally scribble on the former header padding (dict_off in a
+ * v1/v2 image) to prove nothing reads it outside version 3.
+ *
  * COVERAGE IS ASSERTED, NOT HOPED FOR (AGENTS.md hard rule 11: a harness can make
  * a number up).  A generator that never produced a non-empty result, or never an
  * empty one, or never exercised one of the five operators, would make PRED pass
@@ -45,6 +59,7 @@
  *-------------------------------------------------------------------------
  */
 #include <stdio.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -227,6 +242,17 @@ prop_pred(void)
 
 	len = weave_docvals_store_len((uint32_t) n);
 	weave_docvals_build(buf, vals, docids, (uint32_t) n);
+
+	/*
+	 * Bytes 28..31 (dict_off) are alignment padding in v1/v2, and stores written
+	 * before v3 may carry garbage there: scribble on them so a validator or
+	 * reader that interprets dict_off outside version 3 fails this property.
+	 */
+	{
+		uint32_t	junk = (uint32_t) rng_next();
+
+		memcpy(buf + offsetof(WeaveDocvalsHeader, dict_off), &junk, sizeof(junk));
+	}
 
 	/* A well-formed store must validate. */
 	why = weave_docvals_validate(buf, len);
@@ -460,7 +486,10 @@ prop_reject(void)
 	h->magic ^= 0xFFu;
 	EXPECT_REJECT("bad magic");
 
-	/* version = 3 (unknown; a reader refuses anything but 1 or 2) */
+	/*
+	 * version = 3 on an int8 image: v3 is the text format, so it is refused
+	 * both for typid_kind 1 and for having no dictionary region.
+	 */
 	memcpy(cpy, base, len);
 	h = (WeaveDocvalsHeader *) cpy;
 	h->version = 3;
@@ -679,6 +708,17 @@ prop_nulls(void)
 
 	len = weave_docvals_store_len_nulls((uint32_t) n, has_bitmap);
 	weave_docvals_build_nulls(buf, vals, docids, nullbits, (uint32_t) n);
+
+	/*
+	 * Bytes 28..31 (dict_off) are alignment padding in v1/v2, and stores written
+	 * before v3 may carry garbage there: scribble on them so a validator or
+	 * reader that interprets dict_off outside version 3 fails this property.
+	 */
+	{
+		uint32_t	junk = (uint32_t) rng_next();
+
+		memcpy(buf + offsetof(WeaveDocvalsHeader, dict_off), &junk, sizeof(junk));
+	}
 
 	/* A well-formed v2 store (with or without a bitmap) must validate. */
 	why = weave_docvals_validate(buf, len);
@@ -919,13 +959,605 @@ prop_f8encode(void)
 	}
 }
 
+/* ---------------------------------------------------------------------------
+ * The v3 (text, dictionary-encoded) store.
+ *
+ * WHY THE REFERENCE IS COMPUTED FROM THE STRINGS, NOT THE ORDINALS.  The whole
+ * point of prop_text is to check the ordinal mapping -- the boundaries lo/hi
+ * and the five ordinal predicates in weave_dv_eval_ord() -- so a reference that
+ * compared ordinals would share any mistake in that mapping and agree with it.
+ * Instead the reference compares each doc's VALUE STRING against the constant
+ * with the same comparator the dictionary is sorted by, which is what the SQL
+ * operator means.  An off-by-one (upper_bound using < 0, LE mapped to o <= hi,
+ * GT to o > lo ...) then changes exactly the rows equal to the constant, and the
+ * small alphabet below makes such rows common.
+ *
+ * The values are drawn over "ab" or "abc" with lengths 0..5, so duplicates, the
+ * empty string (a REAL value, never NULL: Review Focus 1) and shared prefixes
+ * ("a" < "aa" < "ab") are frequent.  The constants are drawn half from the
+ * dictionary and half from a wider alphabet ('`' sorts below 'a', 'd' above
+ * 'c') and a longer length, so they also fall between entries, below all and
+ * above all (Review Focus 2).
+ * ---------------------------------------------------------------------------
+ */
+#define TEXT_VMAX	5			/* stored values: lengths 0..5 */
+#define TEXT_KMAX	6			/* constants: lengths 0..6 */
+#define TEXT_NCONST 4			/* constants per prop_text trial */
+#define TEXT_BUFSZ	4096		/* >= store_len_text(MAXN, 1, MAXN, MAXN*VMAX) */
+#define TEXT_EVERY	2			/* prop_text runs every TEXT_EVERY trials */
+#define TEXT_REJECT_EVERY 20	/* prop_text_reject: every N trials (O(len^2)) */
+
+typedef struct TextCase
+{
+	int			n;
+	int			has_bitmap;
+	int			nnull;
+	uint32_t	ndict;
+	uint64_t	docids[MAXN];
+	uint8_t		isnull[MAXN];
+	unsigned char vals[MAXN][TEXT_VMAX];
+	uint32_t	vlen[MAXN];
+	int64_t		ords[MAXN];
+	unsigned char dict[MAXN][TEXT_VMAX];
+	uint32_t	dlen[MAXN];
+	uint32_t	offs[MAXN + 1];
+	unsigned char blob[MAXN * TEXT_VMAX];
+	size_t		len;
+	size_t		shift;			/* img == back + shift; 1 => unaligned image */
+	unsigned char *img;
+	unsigned char back[TEXT_BUFSZ + 8];
+} TextCase;
+
+static TextCase text_tc;
+static unsigned char text_cpy_back[TEXT_BUFSZ + 8];
+
+static long text_checks = 0;
+static long text_reject_checks = 0;
+static long text_cmp_calls = 0;		/* the injected comparator was used */
+static long cov_text_op[6] = {0};
+static long cov_text_nonempty = 0;
+static long cov_text_empty = 0;
+static long cov_text_present = 0;	/* hi - lo == 1 */
+static long cov_text_absent = 0;	/* hi == lo with ndict > 0 */
+static long cov_text_below = 0;		/* constant below every entry */
+static long cov_text_above = 0;		/* constant above every entry */
+static long cov_text_emptyval = 0;	/* '' matched `= ''` as a real value */
+static long cov_text_nulls = 0;		/* a trial with >= 1 NULL docid */
+static long cov_text_nobitmap = 0;	/* a v3 store with null_off == 0 */
+static long cov_text_ndict0 = 0;	/* a (valid) v3 store with ndict == 0 */
+static long cov_text_unaligned = 0; /* the image started at an odd address */
+static long cov_text_eqmulti = 0;	/* `=` matched >= 2 docids */
+static long cov_text_trunc = 0;		/* outcap truncation fired */
+static long cov_text_ordrej = 0;	/* the ordinal-range mutation ran */
+static long cov_text_decrej = 0;	/* the decreasing-offs mutation ran */
+
+/*
+ * memcmp order, shorter-is-less on an equal prefix: the byte order a "C"
+ * collation gives, and a strict total order on byte strings, which is all the
+ * boundary search requires of cmp.  ctx, when non-NULL, counts calls so the run
+ * can assert the injected comparator was actually exercised.
+ */
+static int
+text_cmp(void *ctx, const void *a, uint32_t alen, const void *b, uint32_t blen)
+{
+	uint32_t	m = (alen < blen) ? alen : blen;
+	int			r = (m > 0) ? memcmp(a, b, m) : 0;
+
+	if (ctx != NULL)
+		(*(long *) ctx)++;
+	if (r != 0)
+		return r;
+	return (alen < blen) ? -1 : (alen > blen) ? 1 : 0;
+}
+
+/* Does (c = cmp(value, k)) satisfy op?  The SQL meaning, on the strings. */
+static int
+text_ref_match(WeaveDvStrat op, int c)
+{
+	switch (op)
+	{
+		case WEAVE_DV_LT:
+			return c < 0;
+		case WEAVE_DV_LE:
+			return c <= 0;
+		case WEAVE_DV_EQ:
+			return c == 0;
+		case WEAVE_DV_GE:
+			return c >= 0;
+		case WEAVE_DV_GT:
+			return c > 0;
+		default:
+			return 0;
+	}
+}
+
+/*
+ * Draw a random text column and build its v3 store into tc->img: values, NULLs,
+ * the dictionary by distinct + sort under text_cmp (the writer's job), ords by
+ * lookup, and a NULL docid's slot filled with a random int64 -- the validator
+ * must skip NULL slots, not range-check them, so garbage there is a teeth test
+ * of its own.
+ */
+static void
+text_case_build(TextCase *tc)
+{
+	int			asz = 2 + (int) (rng_next() % 2u);	/* "ab" or "abc" */
+	int			mode = (int) (rng_next() % 8u);
+	int			i;
+	uint32_t	d;
+	uint32_t	boff;
+
+	tc->n = (int) (rng_next() % (MAXN + 1));
+	tc->has_bitmap = (mode != 0);
+	tc->nnull = 0;
+	draw_docids(tc->docids, tc->n);
+
+	for (i = 0; i < tc->n; i++)
+	{
+		uint32_t	j;
+
+		tc->vlen[i] = (uint32_t) (rng_next() % (TEXT_VMAX + 1));
+		for (j = 0; j < tc->vlen[i]; j++)
+			tc->vals[i][j] = (unsigned char) ('a' + (int) (rng_next() % (uint64_t) asz));
+
+		switch (mode)
+		{
+			case 0:				/* no bitmap at all */
+			case 1:				/* bitmap present, nothing NULL */
+				tc->isnull[i] = 0;
+				break;
+			case 2:				/* every docid NULL */
+				tc->isnull[i] = 1;
+				break;
+			default:			/* ~25% NULL */
+				tc->isnull[i] = (uint8_t) ((rng_next() % 4u) == 0);
+				break;
+		}
+		if (tc->isnull[i])
+			tc->nnull++;
+	}
+
+	/* Dictionary: distinct non-NULL values, sorted ascending by text_cmp. */
+	tc->ndict = 0;
+	for (i = 0; i < tc->n; i++)
+	{
+		uint32_t	pos = 0;
+		int			c = 1;
+
+		if (tc->isnull[i])
+			continue;
+		while (pos < tc->ndict &&
+			   (c = text_cmp(NULL, tc->dict[pos], tc->dlen[pos],
+							 tc->vals[i], tc->vlen[i])) < 0)
+			pos++;
+		if (pos < tc->ndict && c == 0)
+			continue;			/* duplicate */
+		memmove(&tc->dict[pos + 1], &tc->dict[pos],
+				(size_t) (tc->ndict - pos) * sizeof(tc->dict[0]));
+		memmove(&tc->dlen[pos + 1], &tc->dlen[pos],
+				(size_t) (tc->ndict - pos) * sizeof(tc->dlen[0]));
+		memcpy(tc->dict[pos], tc->vals[i], tc->vlen[i]);
+		tc->dlen[pos] = tc->vlen[i];
+		tc->ndict++;
+	}
+
+	/* Ordinals by exact lookup; NULL slots get garbage. */
+	for (i = 0; i < tc->n; i++)
+	{
+		if (tc->isnull[i])
+		{
+			tc->ords[i] = (int64_t) rng_next();
+			continue;
+		}
+		for (d = 0; d < tc->ndict; d++)
+			if (text_cmp(NULL, tc->dict[d], tc->dlen[d],
+						 tc->vals[i], tc->vlen[i]) == 0)
+				break;
+		tc->ords[i] = (int64_t) d;
+	}
+
+	/* Packed blob + offsets. */
+	boff = 0;
+	for (d = 0; d < tc->ndict; d++)
+	{
+		tc->offs[d] = boff;
+		memcpy(tc->blob + boff, tc->dict[d], tc->dlen[d]);
+		boff += tc->dlen[d];
+	}
+	tc->offs[tc->ndict] = boff;
+
+	/* Half the images start at an odd address: every reader must memcpy. */
+	tc->shift = (size_t) (rng_next() & 1u);
+	tc->img = tc->back + tc->shift;
+	tc->len = weave_docvals_store_len_text((uint32_t) tc->n, tc->has_bitmap,
+										   tc->ndict, boff);
+	if (tc->len > TEXT_BUFSZ)
+	{
+		printf("FAIL TEXT %s:%d: TEXT_BUFSZ too small (%zu)\n",
+			   __FILE__, __LINE__, tc->len);
+		exit(1);
+	}
+	weave_docvals_build_text(tc->img, tc->ords, tc->docids,
+							 tc->has_bitmap ? tc->isnull : NULL,
+							 (uint32_t) tc->n, tc->offs, tc->ndict, tc->blob);
+}
+
+#define TEXT_FAIL(...) \
+	do { \
+		failures++; \
+		if (failures <= 20) \
+		{ \
+			printf("FAIL TEXT %s:%d: ", __FILE__, __LINE__); \
+			printf(__VA_ARGS__); \
+			printf("\n"); \
+		} \
+	} while (0)
+
+/*
+ * PROP_TEXT: a v3 store the helper builds validates, its dictionary reads back
+ * exactly, and for random constants and all five operators
+ * eval_ord(op, lower_bound(k), upper_bound(k)) emits exactly
+ * { docid : !NULL && cmp(value, k) satisfies op } in ascending order.
+ */
+static void
+prop_text(void)
+{
+	TextCase   *tc = &text_tc;
+	uint64_t	out[MAXN];
+	uint64_t	ref[MAXN];
+	const char *why;
+	uint32_t	d;
+	int			ci;
+	int			oi;
+
+	text_case_build(tc);
+
+	checks++;
+	text_checks++;
+	why = weave_docvals_validate(tc->img, tc->len);
+	if (why != NULL)
+	{
+		TEXT_FAIL("valid v3 store rejected (n=%d ndict=%u bitmap=%d): %s",
+				  tc->n, tc->ndict, tc->has_bitmap, why);
+		return;
+	}
+	if (tc->nnull > 0)
+		cov_text_nulls++;
+	if (!tc->has_bitmap)
+		cov_text_nobitmap++;
+	if (tc->ndict == 0)
+		cov_text_ndict0++;
+	if (tc->shift != 0)
+		cov_text_unaligned++;
+
+	/* The dictionary reads back entry for entry. */
+	checks++;
+	text_checks++;
+	if (weave_docvals_ndict(tc->img) != tc->ndict)
+		TEXT_FAIL("ndict %u != built %u", weave_docvals_ndict(tc->img), tc->ndict);
+	for (d = 0; d < tc->ndict; d++)
+	{
+		uint32_t	elen;
+		const unsigned char *e = weave_docvals_dict_entry(tc->img, d, &elen);
+
+		checks++;
+		text_checks++;
+		if (elen != tc->dlen[d] || (elen > 0 && memcmp(e, tc->dict[d], elen) != 0))
+			TEXT_FAIL("dict_entry(%u) does not round-trip", d);
+	}
+
+	for (ci = 0; ci < TEXT_NCONST; ci++)
+	{
+		unsigned char key[TEXT_KMAX];
+		uint32_t	klen;
+		uint32_t	lo;
+		uint32_t	hi;
+		uint32_t	rlo = 0;
+		uint32_t	rhi = 0;
+
+		if (tc->ndict > 0 && (rng_next() & 1u))
+		{
+			d = (uint32_t) (rng_next() % tc->ndict);
+			klen = tc->dlen[d];
+			memcpy(key, tc->dict[d], klen);
+		}
+		else
+		{
+			uint32_t	j;
+
+			klen = (uint32_t) (rng_next() % (TEXT_KMAX + 1));
+			for (j = 0; j < klen; j++)
+				key[j] = (unsigned char) ('`' + (int) (rng_next() % 5u)); /* `abcd */
+		}
+
+		lo = weave_dv_dict_lower_bound(tc->img, key, klen, text_cmp, &text_cmp_calls);
+		hi = weave_dv_dict_upper_bound(tc->img, key, klen, text_cmp, &text_cmp_calls);
+
+		/* Linear-scan boundaries over the dictionary the test built. */
+		for (d = 0; d < tc->ndict; d++)
+		{
+			int			c = text_cmp(NULL, tc->dict[d], tc->dlen[d], key, klen);
+
+			if (c < 0)
+				rlo++;
+			if (c <= 0)
+				rhi++;
+		}
+
+		checks++;
+		text_checks++;
+		if (lo != rlo || hi != rhi || lo > hi || hi > tc->ndict || hi - lo > 1u)
+			TEXT_FAIL("bounds lo=%u hi=%u, expected lo=%u hi=%u (ndict=%u klen=%u)",
+					  lo, hi, rlo, rhi, tc->ndict, klen);
+
+		if (hi - lo == 1u)
+			cov_text_present++;
+		else if (tc->ndict > 0)
+			cov_text_absent++;
+		if (tc->ndict > 0 && hi == 0)
+			cov_text_below++;
+		if (tc->ndict > 0 && lo == tc->ndict)
+			cov_text_above++;
+
+		for (oi = 0; oi < 5; oi++)
+		{
+			int			gc = weave_dv_eval_ord(tc->img, ops[oi], lo, hi,
+											   out, (uint32_t) tc->n);
+			int			wc = 0;
+			int			i;
+			int			ok = 1;
+
+			/* Reference: straight from the value strings, never the ordinals. */
+			for (i = 0; i < tc->n; i++)
+			{
+				if (tc->isnull[i])
+					continue;
+				if (text_ref_match(ops[oi],
+								   text_cmp(NULL, tc->vals[i], tc->vlen[i],
+											key, klen)))
+					ref[wc++] = tc->docids[i];
+			}
+
+			checks++;
+			text_checks++;
+			cov_text_op[(int) ops[oi]]++;
+
+			if (gc != wc)
+				ok = 0;
+			for (i = 0; ok && i < wc; i++)
+				if (out[i] != ref[i])
+					ok = 0;
+			for (i = 1; ok && i < gc; i++)
+				if (!(out[i] > out[i - 1]))
+					ok = 0;
+			if (!ok)
+				TEXT_FAIL("n=%d ndict=%u op=%d klen=%u lo=%u hi=%u expected %d got %d",
+						  tc->n, tc->ndict, (int) ops[oi], klen, lo, hi, wc, gc);
+
+			if (gc > 0)
+				cov_text_nonempty++;
+			else
+				cov_text_empty++;
+			if (ops[oi] == WEAVE_DV_EQ && klen == 0 && gc > 0)
+				cov_text_emptyval++;
+			if (ops[oi] == WEAVE_DV_EQ && gc >= 2)
+				cov_text_eqmulti++;
+
+			/*
+			 * Same outcap contract as weave_dv_eval_int8(): true count
+			 * returned, only the first outcap ascending matches written.
+			 */
+			if (ok && wc >= 2)
+			{
+				uint32_t	cap = (uint32_t) wc / 2u;
+				int			tc2;
+
+				for (i = 0; i < tc->n; i++)
+					out[i] = UINT64_C(0xFFFFFFFFFFFFFFFF);
+				tc2 = weave_dv_eval_ord(tc->img, ops[oi], lo, hi, out, cap);
+				checks++;
+				text_checks++;
+				for (i = 0; ok && i < (int) cap; i++)
+					if (out[i] != ref[i])
+						ok = 0;
+				for (i = (int) cap; ok && i < tc->n; i++)
+					if (out[i] != UINT64_C(0xFFFFFFFFFFFFFFFF))
+						ok = 0;
+				if (tc2 != wc || !ok)
+					TEXT_FAIL("outcap=%u: returned %d (want %d) or wrote past cap",
+							  cap, tc2, wc);
+				else
+					cov_text_trunc++;
+			}
+		}
+	}
+}
+
+static void
+text_put_u32(unsigned char *p, size_t off, uint32_t v)
+{
+	memcpy(p + off, &v, sizeof(v));
+}
+
+static void
+text_put_u16(unsigned char *p, size_t off, uint16_t v)
+{
+	memcpy(p + off, &v, sizeof(v));
+}
+
+/*
+ * PROP_TEXT_REJECT: every structural lie in a v3 image's dictionary region, and
+ * every version/kind disagreement, is refused -- and so is every truncation of
+ * a valid image.  Each mutation is applied to a fresh copy at the SAME
+ * alignment as the original (so the unaligned case is covered here too).
+ */
+static void
+prop_text_reject(void)
+{
+	TextCase   *tc = &text_tc;
+	unsigned char *cpy;
+	WeaveDocvalsHeader h;
+	size_t		offsbase;
+	size_t		len;
+	size_t		tl;
+	uint32_t	nd;
+	const char *why;
+
+	text_case_build(tc);
+	cpy = text_cpy_back + tc->shift;
+	len = tc->len;
+	nd = tc->ndict;
+	memcpy(&h, tc->img, sizeof(h));
+	offsbase = (size_t) h.dict_off + 4u;
+
+	/* Positive control: the unmutated image validates. */
+	checks++;
+	text_reject_checks++;
+	why = weave_docvals_validate(tc->img, len);
+	if (why != NULL)
+	{
+		TEXT_FAIL("reject: valid v3 store rejected (n=%d ndict=%u): %s",
+				  tc->n, nd, why);
+		return;
+	}
+
+#define EXPECT_TEXT_REJECT(desc) \
+	do { \
+		checks++; \
+		text_reject_checks++; \
+		if (weave_docvals_validate(cpy, len) == NULL) \
+			TEXT_FAIL("reject: %s wrongly accepted (n=%d ndict=%u)", \
+					  (desc), tc->n, nd); \
+	} while (0)
+#define TEXT_FRESH()	memcpy(cpy, tc->img, len)
+
+	/* dict_off misaligned */
+	TEXT_FRESH();
+	text_put_u32(cpy, offsetof(WeaveDocvalsHeader, dict_off), h.dict_off + 1u);
+	EXPECT_TEXT_REJECT("dict_off misaligned");
+
+	/* dict_off aligned but not the recomputed offset */
+	TEXT_FRESH();
+	text_put_u32(cpy, offsetof(WeaveDocvalsHeader, dict_off), h.dict_off - 8u);
+	EXPECT_TEXT_REJECT("dict_off - 8");
+
+	/* dict_off past the end */
+	TEXT_FRESH();
+	text_put_u32(cpy, offsetof(WeaveDocvalsHeader, dict_off),
+				 (uint32_t) WEAVE_DV_MAXALIGN(len) + 8u);
+	EXPECT_TEXT_REJECT("dict_off past end");
+
+	/* dict_off == 0 on a v3 store */
+	TEXT_FRESH();
+	text_put_u32(cpy, offsetof(WeaveDocvalsHeader, dict_off), 0);
+	EXPECT_TEXT_REJECT("dict_off == 0");
+
+	/* ndict too large for len, and ndict == UINT32_MAX (ndict+1 must not wrap) */
+	TEXT_FRESH();
+	text_put_u32(cpy, h.dict_off, (uint32_t) (len / 4u) + 1u);
+	EXPECT_TEXT_REJECT("ndict too large for len");
+	TEXT_FRESH();
+	text_put_u32(cpy, h.dict_off, UINT32_MAX);
+	EXPECT_TEXT_REJECT("ndict == UINT32_MAX");
+
+	/* offs[0] != 0 */
+	TEXT_FRESH();
+	text_put_u32(cpy, offsbase, 1u);
+	EXPECT_TEXT_REJECT("offs[0] != 0");
+
+	/* offs decreasing at some interior j (needs two entries) */
+	if (nd >= 2)
+	{
+		uint32_t	j = 1u + (uint32_t) (rng_next() % (nd - 1u));
+
+		TEXT_FRESH();
+		text_put_u32(cpy, offsbase + (size_t) j * 4u, tc->offs[j + 1] + 1u);
+		EXPECT_TEXT_REJECT("offs decreasing");
+		cov_text_decrej++;
+	}
+
+	/* offs[ndict] past the end (by one byte, and by UINT32_MAX) */
+	TEXT_FRESH();
+	text_put_u32(cpy, offsbase + (size_t) nd * 4u, tc->offs[nd] + 1u);
+	EXPECT_TEXT_REJECT("offs[ndict] one past end");
+	TEXT_FRESH();
+	text_put_u32(cpy, offsbase + (size_t) nd * 4u, UINT32_MAX);
+	EXPECT_TEXT_REJECT("offs[ndict] == UINT32_MAX");
+
+	/* An ordinal >= ndict (and a negative one) on a NON-NULL docid. */
+	{
+		int			i;
+
+		for (i = 0; i < tc->n; i++)
+			if (!tc->isnull[i])
+				break;
+		if (i < tc->n)
+		{
+			int64_t		bad = (int64_t) nd;
+			size_t		voff = (size_t) h.values_off + (size_t) i * 8u;
+
+			TEXT_FRESH();
+			memcpy(cpy + voff, &bad, sizeof(bad));
+			EXPECT_TEXT_REJECT("ordinal == ndict on a non-NULL docid");
+			bad = -1;
+			TEXT_FRESH();
+			memcpy(cpy + voff, &bad, sizeof(bad));
+			EXPECT_TEXT_REJECT("ordinal == -1 on a non-NULL docid");
+			cov_text_ordrej++;
+		}
+	}
+
+	/* Version/kind disagreement, and an unknown version. */
+	TEXT_FRESH();
+	text_put_u16(cpy, offsetof(WeaveDocvalsHeader, typid_kind), WEAVE_DV_KIND_INT8);
+	EXPECT_TEXT_REJECT("version 3 with typid_kind 1");
+	TEXT_FRESH();
+	text_put_u16(cpy, offsetof(WeaveDocvalsHeader, version), 2);
+	EXPECT_TEXT_REJECT("version 2 with typid_kind 2");
+	TEXT_FRESH();
+	text_put_u16(cpy, offsetof(WeaveDocvalsHeader, version), 4);
+	EXPECT_TEXT_REJECT("version 4");
+
+#undef TEXT_FRESH
+#undef EXPECT_TEXT_REJECT
+
+	/*
+	 * Every truncation of the valid image is refused (the built length is
+	 * exact: the blob ends at len).  Each truncated prefix is placed flush
+	 * against the END of a len-byte heap block, so a validator read past the
+	 * length it was given runs off the allocation and ASan reports it.
+	 */
+	{
+		unsigned char *heap = (unsigned char *) malloc(len);
+
+		if (heap == NULL)
+		{
+			printf("FAIL TEXT %s:%d: out of memory\n", __FILE__, __LINE__);
+			exit(1);
+		}
+		for (tl = 0; tl < len; tl++)
+		{
+			unsigned char *t = heap + (len - tl);
+
+			memcpy(t, tc->img, tl);
+			checks++;
+			text_reject_checks++;
+			if (weave_docvals_validate(t, tl) == NULL)
+				TEXT_FAIL("reject: truncation len=%zu of %zu wrongly accepted "
+						  "(n=%d ndict=%u)", tl, len, tc->n, nd);
+		}
+		free(heap);
+	}
+}
+
 int
 main(void)
 {
 	long		i;
 
 	printf("== docvals int8 store (C5): eval == a straight-line reference loop; "
-		   "validator rejects corruption; float8 encode is an order isomorphism ==\n");
+		   "validator rejects corruption; float8 encode is an order isomorphism; "
+		   "text v3 ordinal gate == string reference ==\n");
 
 	for (i = 0; i < TRIALS; i++)
 	{
@@ -934,6 +1566,10 @@ main(void)
 		prop_reject();
 		prop_nulls();
 		prop_f8encode();
+		if (i % TEXT_EVERY == 0)
+			prop_text();
+		if (i % TEXT_REJECT_EVERY == 0)
+			prop_text_reject();
 	}
 
 	printf("trials: %d\n", TRIALS);
@@ -952,6 +1588,20 @@ main(void)
 		   cov_smallrange, cov_eq_multi, cov_dup_adjacent, cov_trunc);
 	printf("F8ENCODE order-isomorphism: %8ld checks (lt=%ld nan=%ld zero=%ld negpos=%ld)\n",
 		   f8_checks, cov_f8_lt, cov_f8_nan, cov_f8_zero, cov_f8_negpos);
+	printf("TEXT  v3 ordinal eval == string reference: %8ld checks (%d trials, %ld cmp calls)\n",
+		   text_checks, TRIALS / TEXT_EVERY, text_cmp_calls);
+	printf("TEXTREJ v3 validator refuses junk: %8ld checks (%d trials)\n",
+		   text_reject_checks, TRIALS / TEXT_REJECT_EVERY);
+	printf("coverage: text LT=%ld LE=%ld EQ=%ld GE=%ld GT=%ld nonempty=%ld empty=%ld "
+		   "present=%ld absent=%ld below=%ld above=%ld emptyval=%ld eqmulti=%ld\n",
+		   cov_text_op[WEAVE_DV_LT], cov_text_op[WEAVE_DV_LE], cov_text_op[WEAVE_DV_EQ],
+		   cov_text_op[WEAVE_DV_GE], cov_text_op[WEAVE_DV_GT], cov_text_nonempty,
+		   cov_text_empty, cov_text_present, cov_text_absent, cov_text_below,
+		   cov_text_above, cov_text_emptyval, cov_text_eqmulti);
+	printf("coverage: text nulls=%ld nobitmap=%ld ndict0=%ld unaligned=%ld "
+		   "outcap-truncated=%ld ord-reject=%ld offs-dec-reject=%ld\n",
+		   cov_text_nulls, cov_text_nobitmap, cov_text_ndict0, cov_text_unaligned,
+		   cov_text_trunc, cov_text_ordrej, cov_text_decrej);
 
 	/*
 	 * Assert the coverage rather than hoping for it (AGENTS.md hard rule 11).  A
@@ -1021,6 +1671,30 @@ main(void)
 			   cov_null_op[WEAVE_DV_LT], cov_null_op[WEAVE_DV_LE],
 			   cov_null_op[WEAVE_DV_EQ], cov_null_op[WEAVE_DV_GE],
 			   cov_null_op[WEAVE_DV_GT]);
+		failures++;
+	}
+
+	/*
+	 * prop_text / prop_text_reject coverage: every operator, a present and an
+	 * absent constant, one below and one above every entry, the empty string
+	 * matched as a real value, NULL and bitmapless stores, the ndict == 0 store,
+	 * an unaligned image, the outcap guard, and the two data-dependent
+	 * mutations -- else the text path is a green with a hole in it.
+	 */
+	if (text_cmp_calls == 0 ||
+		cov_text_op[WEAVE_DV_LT] == 0 || cov_text_op[WEAVE_DV_LE] == 0 ||
+		cov_text_op[WEAVE_DV_EQ] == 0 || cov_text_op[WEAVE_DV_GE] == 0 ||
+		cov_text_op[WEAVE_DV_GT] == 0 ||
+		cov_text_nonempty == 0 || cov_text_empty == 0 ||
+		cov_text_present == 0 || cov_text_absent == 0 ||
+		cov_text_below == 0 || cov_text_above == 0 ||
+		cov_text_emptyval == 0 || cov_text_eqmulti == 0 ||
+		cov_text_nulls == 0 || cov_text_nobitmap == 0 || cov_text_ndict0 == 0 ||
+		cov_text_unaligned == 0 || cov_text_trunc == 0 ||
+		cov_text_ordrej == 0 || cov_text_decrej == 0)
+	{
+		printf("COVERAGE FAIL: a text-path case never fired (see the coverage "
+			   "lines above), so it is untested\n");
 		failures++;
 	}
 

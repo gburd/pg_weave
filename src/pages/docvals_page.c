@@ -122,6 +122,7 @@ docvals_serialize(const int64 *vals, const uint64 *docids,
 	h.zonemap_off = 0;
 	h.values_off = voff;
 	h.docids_off = doff;
+	h.dict_off = 0;				/* v1/v2 shape: no dictionary (store v3 is text) */
 	memcpy(img, &h, sizeof(h));
 
 	if (n > 0)
@@ -316,7 +317,7 @@ docvals_walk(Relation index, BlockNumber root, uint8 *dst, Size cap,
 
 const void *
 weave_docvals_load(Relation index, BlockNumber root,
-				   MemoryContext cxt, uint32 *ndocs_out)
+				   MemoryContext cxt, uint32 *ndocs_out, int want_kind)
 {
 	const char *detail = NULL;
 	const char *why;
@@ -379,11 +380,21 @@ weave_docvals_load(Relation index, BlockNumber root,
 				 errhint("REINDEX the index to rebuild it.")));
 	}
 
-	if (ndocs_out != NULL)
+	memcpy(&h, img, sizeof(h));
+	if ((int) h.typid_kind != want_kind)
 	{
-		memcpy(&h, img, sizeof(h));
-		*ndocs_out = h.ndocs;
+		pfree(img);
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("corrupt docvalues store in index \"%s\"",
+						RelationGetRelationName(index)),
+				 errdetail("store value kind %u does not match the column's kind %d (block %u)",
+						   (unsigned) h.typid_kind, want_kind, root),
+				 errhint("REINDEX the index to rebuild it.")));
 	}
+
+	if (ndocs_out != NULL)
+		*ndocs_out = h.ndocs;
 	return (const void *) img;
 }
 
