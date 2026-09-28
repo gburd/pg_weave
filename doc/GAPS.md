@@ -4049,3 +4049,20 @@ nested-loop rescans in `sql/docvals.sql` §13 run that path. The loss: there is 
 memory assertion, so the test proves the frees don't break correctness but not that
 they bound memory. **OPEN:** the ordering route's `so->ordered` / `so->cand` arrays
 are still not freed on rescan.
+
+### G60 — `sql/vecindex.sql`'s delete-then-merge assertion read `live_lanes_dropped = 0` (expected 6) in one local full run — **SEEN ONCE 2026-09-28 on lpg; NOT REPRODUCED; OPEN (suspected VACUUM horizon flake)**
+
+In one full 20-test pg_regress run on the local cluster, the assertion after
+`DELETE ... ; VACUUM vw; ... weave_merge()` showed that no deleted document's lane had
+dropped. The next full run with the **same** binary passed, and so did `vecindex`
+alone and a hand replay (`VACUUM VERBOSE`: 6 removed, 0 dead-but-not-removable). The
+suspected cause is a snapshot in the same database (for example an autovacuum ANALYZE)
+holding the removable horizon back during that VACUUM. This is **not proven**: nothing
+from that run shows what held the horizon.
+
+**Retraction (hard rule 8):** commit 120a7fe's message says this "failed the same way at
+a4fa29c". It did not. The a4fa29c run and the `weave vecindex` subset runs failed only on
+a NOTICE line whose position depends on test order, not on this assertion. The one real
+observation was on the T4 binary. **Owed:** if it recurs, capture `VACUUM (VERBOSE)` and
+`pg_stat_activity.backend_xmin` at that statement, or make the test assert the heap
+tuples were removed before it asserts the lanes.
