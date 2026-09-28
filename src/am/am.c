@@ -4345,6 +4345,24 @@ weave_index_layout(Relation index, WeaveIndexLayout *out)
 				 errhint("Add a wdoc column with wdoc_lex_ops as the first index column.")));
 }
 
+/*
+ * Is the docvalues column TEXT?  See the declaration in weave/am.h.  From the
+ * index tuple descriptor, like weave_build_dvtype() in ambuild.c, so the
+ * pending readers and the writers agree on the column type by construction.
+ */
+bool
+weave_index_dv_is_text(Relation index)
+{
+	WeaveIndexLayout layout;
+
+	weave_index_layout(index, &layout);
+	if (layout.dvattno == 0)
+		return false;
+	return weave_dv_type_for_oid(
+		TupleDescAttr(RelationGetDescr(index), layout.dvattno - 1)->atttypid) ==
+		WEAVE_DV_T_TEXT;
+}
+
 Datum
 weave_handler(PG_FUNCTION_ARGS)
 {

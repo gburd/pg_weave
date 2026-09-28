@@ -1214,3 +1214,189 @@ SELECT count(*) FILTER (WHERE p20) AS heap_p20,
   FROM rk_h;
 DROP TABLE rk_vec, rk_ed, rk_fu, rk_cg, rk_bt, rk_bt2, rk_h;
 DROP TABLE rk, rkt, rkg;
+
+-- ---------------------------------------------------------------------------
+-- 15. text docvalues through the PENDING buffer, the FLUSH, and several bolts
+-- (doc/plans/2026-09-28-docvals-text-slice.md task 4).  A post-build INSERT on
+-- a text_docval_ops index carries its value in the pending item as
+-- `0x01 || bytes` (plan decision 5: '' is dvlen 1, NULL is dvlen 0), the scan
+-- compares it with the key under the column collation, and a VACUUM flushes it
+-- into a new bolt with its own dictionary.  The inserted values are new to the
+-- build's dictionary on purpose: one below every build value ('a'), one between
+-- two of them ('m05x'), '' (the build has none), NULL, one equal to a build
+-- value ('m10'), a 3000-byte value (still pending) and a 20000-byte value,
+-- which cannot fit a pending page once its docval trailer is counted and so
+-- takes the oversized path (a one-document bolt of its own).
+--
+-- Every agreement is the index answer against the heap answer as a SET, on
+-- the plain Index Scan AND the bitmap route, for all five strategies and
+-- constants below all (''/'A'), between ('m055'), equal to a pending value
+-- ('m05x'), equal to a build value ('m10'), between the two long values
+-- ('yz'), equal to the long pending value, and above all ('~').  It is checked
+-- three times: pending (+ the oversized bolt), after the flush, and after a
+-- second INSERT + flush, when four bolts hold four different dictionaries --
+-- the same string ('m10', '') has a different ordinal in each, so a bound
+-- computed once and reused across bolts disagrees with the heap.
+-- ---------------------------------------------------------------------------
+CREATE TABLE dvx (id int, body wdoc, cat text COLLATE "C")
+    WITH (autovacuum_enabled = off);
+INSERT INTO dvx
+SELECT g, to_wdoc('common doc ' || (g % 5)),
+       CASE WHEN g % 17 = 0 THEN NULL
+            ELSE 'm' || lpad((g % 30)::text, 2, '0') END
+FROM generate_series(1, 600) g;
+CREATE INDEX dvx_w ON dvx USING weave (body wdoc_lex_ops, cat text_docval_ops);
+ANALYZE dvx;
+SELECT weave_index_nsegments('dvx_w') = 1 AS one_build_segment;
+
+-- post-build INSERTs: all but the 20000-byte one are pending
+INSERT INTO dvx VALUES
+  (10001, to_wdoc('zebra special report'), 'a'),
+  (10002, to_wdoc('zebra special report'), 'm05x'),
+  (10003, to_wdoc('zebra special report'), ''),
+  (10004, to_wdoc('zebra special report'), NULL),
+  (10005, to_wdoc('zebra special report'), 'm10'),
+  (10006, to_wdoc('zebra special report'), repeat('z', 3000)),
+  (10007, to_wdoc('zebra special report'), repeat('y', 20000));
+-- POSITIVE CONTROL for the size routing: exactly one new bolt, the oversized
+-- row's; the other six are pending
+SELECT weave_index_nsegments('dvx_w') = 2 AS oversized_row_is_own_segment;
+
+CREATE OR REPLACE FUNCTION dvx_bad(pred text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+    n_bad bigint;
+BEGIN
+    EXECUTE 'SET LOCAL enable_seqscan = off';
+    EXECUTE 'SET LOCAL enable_bitmapscan = off';
+    EXECUTE 'SET LOCAL enable_indexscan = on';
+    EXECUTE format('CREATE TEMP TABLE dvx_i AS SELECT id FROM dvx WHERE %s', pred);
+    EXECUTE 'SET LOCAL enable_indexscan = off';
+    EXECUTE 'SET LOCAL enable_bitmapscan = on';
+    EXECUTE format('CREATE TEMP TABLE dvx_b AS SELECT id FROM dvx WHERE %s', pred);
+    EXECUTE 'SET LOCAL enable_bitmapscan = off';
+    EXECUTE 'SET LOCAL enable_seqscan = on';
+    EXECUTE format('CREATE TEMP TABLE dvx_s AS SELECT id FROM dvx WHERE %s', pred);
+    SELECT count(*) INTO n_bad FROM (
+        SELECT id FROM dvx_i EXCEPT SELECT id FROM dvx_s
+        UNION ALL
+        SELECT id FROM dvx_s EXCEPT SELECT id FROM dvx_i
+        UNION ALL
+        SELECT id FROM dvx_b EXCEPT SELECT id FROM dvx_s
+        UNION ALL
+        SELECT id FROM dvx_s EXCEPT SELECT id FROM dvx_b
+    ) d;
+    DROP TABLE dvx_i;
+    DROP TABLE dvx_b;
+    DROP TABLE dvx_s;
+    RETURN n_bad;
+END;
+$$;
+
+CREATE TEMP TABLE dvx_cases (pred text);
+INSERT INTO dvx_cases
+SELECT format('cat %s %L', o.op, k.k)
+  FROM (VALUES ('<'), ('<='), ('='), ('>='), ('>')) o(op),
+       (VALUES (''), ('A'), ('m055'), ('m05x'), ('m10'), ('yz'),
+               (repeat('z', 3000)), ('~')) k(k);
+-- the conjunction with the lexical channel, which matches the pending rows
+-- from the pending pages (the G52 shape)
+INSERT INTO dvx_cases VALUES
+  ($$body @@@ 'zebra'::wquery AND cat < 'm10'$$),
+  ($$body @@@ 'zebra'::wquery AND cat >= ''$$),
+  ($$body @@@ 'zebra'::wquery AND cat = 'm10'$$);
+
+-- plan shape: the index arm really runs the gate, on both routes
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM dvx WHERE cat < 'm10';
+SET enable_indexscan = off;
+RESET enable_bitmapscan;
+EXPLAIN (COSTS OFF) SELECT id FROM dvx WHERE cat < 'm10';
+RESET enable_indexscan;
+
+-- POSITIVE CONTROL: the pending rows ARE in the index answers (NULL in none of
+-- them, '' a real value below 'a'), and the long values are found by value
+SET enable_bitmapscan = off;
+SELECT (SELECT array_agg(id ORDER BY id) FROM dvx
+         WHERE cat <= 'm05x' AND id > 10000) AS pending_le_m05x,
+       (SELECT array_agg(id ORDER BY id) FROM dvx
+         WHERE cat = '' AND id > 10000) AS pending_eq_empty,
+       (SELECT array_agg(id ORDER BY id) FROM dvx
+         WHERE cat > 'x' AND id > 10000) AS inserted_gt_x,
+       (SELECT array_agg(id ORDER BY id) FROM dvx
+         WHERE cat = repeat('y', 20000)) AS oversized_eq,
+       (SELECT count(*) FROM dvx WHERE cat = 'm10') AS eq_m10;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+CREATE TEMP TABLE dvx_res AS
+SELECT 'pending' AS phase, pred, dvx_bad(pred) AS bad FROM dvx_cases;
+
+-- FLUSH: VACUUM drains the pending buffer into a new bolt whose dictionary is
+-- built from the pending items' bytes
+CREATE TEMP TABLE dvx_nseg AS SELECT weave_index_nsegments('dvx_w') AS n;
+VACUUM dvx;
+SELECT weave_index_nsegments('dvx_w') > (SELECT n FROM dvx_nseg)
+       AS flush_made_segment;
+INSERT INTO dvx_res
+SELECT 'flushed', pred, dvx_bad(pred) FROM dvx_cases;
+SELECT count(*) AS violations FROM weave_check('dvx_w', true) WHERE NOT ok;
+
+-- a SECOND flushed bolt with an overlapping but different value set, so 'm10'
+-- and '' sit at different ordinals in each of the four bolts
+INSERT INTO dvx
+SELECT 20000 + g, to_wdoc('zebra second batch'),
+       CASE WHEN g % 10 = 0 THEN NULL
+            WHEN g % 10 = 1 THEN ''
+            WHEN g % 10 = 2 THEN 'm10'
+            ELSE 'b' || lpad(g::text, 2, '0') END
+FROM generate_series(1, 40) g;
+UPDATE dvx_nseg SET n = weave_index_nsegments('dvx_w');
+VACUUM dvx;
+-- POSITIVE CONTROL: several bolts really coexist (build, oversized, two
+-- flushes), so the per-bolt bounds are exercised rather than one merged bolt
+SELECT weave_index_nsegments('dvx_w') > (SELECT n FROM dvx_nseg)
+       AS second_flush_made_segment,
+       weave_index_nsegments('dvx_w') = 4 AS four_bolts;
+INSERT INTO dvx_cases VALUES ('cat < ''b20'''), ('cat = ''b05''');
+INSERT INTO dvx_res
+SELECT 'multi', pred, dvx_bad(pred) FROM dvx_cases;
+SELECT count(*) AS violations FROM weave_check('dvx_w', true) WHERE NOT ok;
+
+SELECT phase, count(*) AS ncases, count(*) FILTER (WHERE bad <> 0) AS ndisagree
+  FROM dvx_res GROUP BY phase ORDER BY phase;
+SELECT phase, left(pred, 40) AS disagreeing_pred, bad
+  FROM dvx_res WHERE bad <> 0 ORDER BY phase, pred;
+
+DROP FUNCTION dvx_bad(text);
+DROP TABLE dvx_res, dvx_cases, dvx_nseg;
+DROP TABLE dvx;
+
+-- The other pending readers on a text docvalues index: the cgram (`@~`) and
+-- edit-distance (`<@>`) walks decode the same pending items, and each must
+-- be told the trailer is text -- told int8 instead, the 0x01 || bytes trailer
+-- fails the 8-byte length check and the walk stops reading the page, which
+-- would drop every pending row below.  All five inserted rows are pending.
+CREATE TABLE dvg (id int, body wdoc, cat text COLLATE "C", raw text)
+    WITH (autovacuum_enabled = off);
+INSERT INTO dvg
+SELECT g, to_wdoc('simple', 'common w' || g), 'm' || (g % 7), 'common w' || g
+FROM generate_series(1, 200) g;
+CREATE INDEX dvg_w ON dvg USING weave
+    (body wdoc_lex_ops, cat text_docval_ops, raw gram_ops);
+INSERT INTO dvg
+SELECT g, to_wdoc('simple', 'zebra w' || g), 'z' || g, 'zebra w' || g
+FROM generate_series(1001, 1005) g;
+SELECT weave_index_nsegments('dvg_w') = 1 AS pending_only;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) AS cgram_pending
+  FROM dvg WHERE raw @~ '%zebra%';
+SELECT count(*) AS cgram_pending_and_text
+  FROM dvg WHERE raw @~ '%zebra%' AND cat < 'z1003';
+SELECT count(*) FILTER (WHERE id > 1000) AS edist_pending
+  FROM (SELECT id FROM dvg ORDER BY body <@> 'zebra' LIMIT 20) t;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE dvg;

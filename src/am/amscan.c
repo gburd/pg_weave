@@ -4146,6 +4146,7 @@ collect_retry:
 	if (meta.pendinghead != InvalidBlockNumber)
 	{
 		BlockNumber blk = meta.pendinghead;
+		bool		dvtext = weave_index_dv_is_text(index);	/* trailer decode */
 
 		while (blk != InvalidBlockNumber)
 		{
@@ -4180,7 +4181,7 @@ collect_retry:
 			 * per-bolt shuttle and a pending document is in no bolt yet, which is
 			 * a recall gap of its own -- see doc/GAPS.md G29.
 			 */
-			weave_pending_iter_init(&it, page);
+			weave_pending_iter_init(&it, page, dvtext);
 			while (weave_pending_iter_next(&it, &rec))
 			{
 				/* A pending doc is raw page bytes; validate before the matcher
@@ -4837,6 +4838,7 @@ weave_cgram_collect(Relation index, const char *pat, int patlen, bool ci,
 	if (meta.pendinghead != InvalidBlockNumber)
 	{
 		BlockNumber blk = meta.pendinghead;
+		bool		dvtext = weave_index_dv_is_text(index);	/* trailer decode */
 
 		while (blk != InvalidBlockNumber)
 		{
@@ -4853,7 +4855,7 @@ weave_cgram_collect(Relation index, const char *pat, int patlen, bool ci,
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buffer);
 			next = WeavePageGetOpaque(page)->nextblk;
-			weave_pending_iter_init(&it, page);
+			weave_pending_iter_init(&it, page, dvtext);
 			while (weave_pending_iter_next(&it, &rec))
 			{
 				TidSet		one;
@@ -4942,6 +4944,31 @@ weave_dv_match_int8(WeaveDvStrat op, int64 v, int64 c)
 			return v >= c;
 		case WEAVE_DV_GT:
 			return v > c;
+	}
+	return false;
+}
+
+/*
+ * The text sibling: does a comparison result cmp = compare(value, key) satisfy
+ * `value <op> key`?  Used for a pending TEXT docval, which has no ordinal yet
+ * (the dictionary is built when the bolt is written) and so is compared with
+ * the key directly under the column collation.
+ */
+static inline bool
+weave_dv_match_cmp(WeaveDvStrat op, int cmp)
+{
+	switch (op)
+	{
+		case WEAVE_DV_LT:
+			return cmp < 0;
+		case WEAVE_DV_LE:
+			return cmp <= 0;
+		case WEAVE_DV_EQ:
+			return cmp == 0;
+		case WEAVE_DV_GE:
+			return cmp >= 0;
+		case WEAVE_DV_GT:
+			return cmp > 0;
 	}
 	return false;
 }
@@ -5119,7 +5146,7 @@ docvals_retry:
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buffer);
 			next = WeavePageGetOpaque(page)->nextblk;
-			weave_pending_iter_init(&it, page);
+			weave_pending_iter_init(&it, page, tkey != NULL);
 			while (weave_pending_iter_next(&it, &rec))
 			{
 				/* Excludes a present-value item that does not match, an index
@@ -5130,15 +5157,24 @@ docvals_retry:
 					continue;
 
 				/*
-				 * docvals text slice T4: a TEXT index cannot hold a pending item
-				 * carrying a docval yet (weave_insert refuses the INSERT), and
-				 * rec.docval is an int64 that means nothing for text -- its
-				 * trailer is `0x01 || bytes` (plan decision 5).  Refuse rather
-				 * than compare it as an integer.
+				 * TEXT: the trailer's bytes compared with the key under the
+				 * COLUMN collation -- the same comparator the writer sorted each
+				 * bolt's dictionary by, so a pending row and its flushed self
+				 * answer identically (plan decision 5).  rec.docval is never
+				 * read here: it means nothing for text.
 				 */
 				if (tkey != NULL)
-					elog(ERROR, "pg_weave: pending text docvalues are not handled yet");
-				if (!weave_dv_match_int8(op, rec.docval, c))
+				{
+					int			cmp;
+
+					cmp = weave_dv_varstr_cmp(&tcoll,
+											  rec.dvbytes, rec.dvbyteslen,
+											  VARDATA_ANY(tkey),
+											  (uint32) VARSIZE_ANY_EXHDR(tkey));
+					if (!weave_dv_match_cmp(op, cmp))
+						continue;
+				}
+				else if (!weave_dv_match_int8(op, rec.docval, c))
 					continue;
 				if (ntids + 1 > captids)
 				{
@@ -7831,6 +7867,7 @@ edist_collect_pending(Relation index, const WeaveMetaPageData *meta,
 					  WeaveScanOpaque so, EdistAcc *acc, int *nextthr)
 {
 	BlockNumber blk = meta->pendinghead;
+	bool		dvtext = weave_index_dv_is_text(index);	/* trailer decode */
 
 	while (blk != InvalidBlockNumber)
 	{
@@ -7847,7 +7884,7 @@ edist_collect_pending(Relation index, const WeaveMetaPageData *meta,
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
 		next = WeavePageGetOpaque(page)->nextblk;
-		weave_pending_iter_init(&it, page);
+		weave_pending_iter_init(&it, page, dvtext);
 		while (weave_pending_iter_next(&it, &rec))
 		{
 			int			d;

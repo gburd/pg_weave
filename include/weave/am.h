@@ -452,12 +452,22 @@ typedef struct WeavePendingItem
 								 * Backward-safe: before store v2 a NULL ERRORed at
 								 * INSERT, so no existing on-disk v11 item on a
 								 * docvals-bearing index uses the dvlen == 0
-								 * encoding, and the NULL meaning is unambiguous. */
+								 * encoding, and the NULL meaning is unambiguous.
+								 *
+								 * On a TEXT docvals index (text_docval_ops) a
+								 * present value is `0x01 || raw bytes` instead,
+								 * so dvlen == 1 + len (doc/plans/2026-09-28-
+								 * docvals-text-slice.md decision 5): the empty
+								 * string is dvlen == 1 and can never collide with
+								 * the NULL encoding.  Again the READER tells int8
+								 * from text by the column type, never by dvlen --
+								 * a 7-byte string is dvlen == 8 too. */
 	/*
 	 * char wdoc[doclen],
 	 * then at MAXALIGN(sizeof(hdr) + doclen):                    char wvec[veclen],
 	 * then + MAXALIGN(veclen):                                   char gram[gramlen],
 	 * then + MAXALIGN(gramlen):                                  int64 docval[dvlen==8?1:0]
+ *                                         (text index:        0x01, char text[dvlen-1])
 	 */
 } WeavePendingItem;
 
@@ -736,6 +746,11 @@ typedef struct WeavePendingIter
 	char	   *ptr;
 	char	   *end;
 	Size		hdrsz;			/* sizeof the item header on THIS page */
+	bool		dvtext;			/* the index's docvals column is TEXT, so a v11
+								 * trailer is `0x01 || bytes`, not an int64.  From
+								 * the INDEX LAYOUT, because the item cannot say
+								 * (plan decision 5); a parameter of init so no
+								 * reader can forget to state it. */
 } WeavePendingIter;
 
 typedef struct WeavePendingRec
@@ -756,9 +771,17 @@ typedef struct WeavePendingRec
 								 * RECOVERABLE", and a weft written over the second
 								 * case would be incomplete -- i.e. a false
 								 * negative (weave_flush_pending). */
-	int64		docval;			/* the int8 docvalues value, valid iff hasdv */
+	int64		docval;			/* the int8 docvalues value, valid iff hasdv on an
+								 * int8 layout; always 0 on a TEXT layout, whose
+								 * value is dvbytes -- never read it there */
+	const char *dvbytes;		/* TEXT layout only: the value's raw bytes (the
+								 * trailer after its 0x01 tag, no varlena header),
+								 * valid iff hasdv; may be dvbyteslen == 0 for ''.
+								 * Points into the page: copy before unlocking. */
+	uint32		dvbyteslen;
 	bool		hasdv;			/* does this item carry a PRESENT docvalues value
-								 * (dvlen == 8)?  False for an older layout, for an
+								 * (dvlen == 8, or dvlen >= 1 on a TEXT layout)?
+								 * False for an older layout, for an
 								 * item whose index has no docvalues column, AND for
 								 * a NULL docval on a docvals-bearing index (dvslot
 								 * && !hasdv; store v2 records NULLs as dvlen == 0).
@@ -783,7 +806,7 @@ typedef struct WeavePendingRec
 } WeavePendingRec;
 
 static inline void
-weave_pending_iter_init(WeavePendingIter *it, Page page)
+weave_pending_iter_init(WeavePendingIter *it, Page page, bool dvtext)
 {
 	WeavePageKind pk = WeavePageGetKind(page);	/* decoded ONCE: three
 												 * WeavePageHasKind() tests would
@@ -792,6 +815,7 @@ weave_pending_iter_init(WeavePendingIter *it, Page page)
 
 	it->ptr = (char *) PageGetContents(page);
 	it->end = weave_page_entry_end(page);
+	it->dvtext = dvtext;
 	if (pk == WEAVE_PK_PENDING_V11)
 		it->hdrsz = sizeof(WeavePendingItem);
 	else if (pk == WEAVE_PK_PENDING_V10)
@@ -845,6 +869,8 @@ weave_pending_iter_next(WeavePendingIter *it, WeavePendingRec *rec)
 	rec->gram = NULL;
 	rec->gramlen = 0;
 	rec->docval = 0;
+	rec->dvbytes = NULL;
+	rec->dvbyteslen = 0;
 	rec->hasdv = false;
 	rec->dvslot = false;		/* only the v11 layout has a dvlen field; set
 								 * true in that branch below */
@@ -874,7 +900,34 @@ weave_pending_iter_next(WeavePendingIter *it, WeavePendingRec *rec)
 		rec->dvslot = true;		/* v11 layout: a dvlen field is present, so a
 								 * dvlen == 0 here is a representable NULL, not an
 								 * unrepresentable older layout */
-		if (pi->dvlen == 8)
+		if (pi->dvlen == 0)
+		{
+			/* a NULL docval, or an index with no docvalues column */
+		}
+		else if (it->dvtext)
+		{
+			/*
+			 * TEXT: `0x01 || bytes` (plan decision 5).  The stride above already
+			 * bounded the whole trailer inside the item area, so only the tag is
+			 * left to check.  A wrong tag is handled like a bad length and for
+			 * the same reason (see the header comment): these pages are read
+			 * under SHARE while a flush can free and an insert recycle them, so
+			 * garbage here is what a recycled page looks like, and an ERROR
+			 * would fail a correct scan -- and every VACUUM, since
+			 * weave_flush_pending() runs this iterator from amvacuumcleanup.
+			 */
+			const char *dv = it->ptr + docoff + MAXALIGN((Size) pi->veclen) +
+				MAXALIGN((Size) pi->gramlen);
+
+			if ((uint8) dv[0] != 0x01)
+				return false;
+			rec->dvbytes = dv + 1;
+			rec->dvbyteslen = pi->dvlen - 1;
+			rec->hasdv = true;
+		}
+		else if (pi->dvlen != 8)
+			return false;		/* an int8 trailer is 0 or 8 bytes; as above */
+		else
 		{
 			/* copied out rather than dereferenced: the trailer is MAXALIGN'd
 			 * (8-byte aligned) on disk, but a memcpy keeps this correct even if
@@ -1933,6 +1986,14 @@ typedef struct WeaveIndexLayout
 } WeaveIndexLayout;
 
 extern void weave_index_layout(Relation index, WeaveIndexLayout *out);
+
+/*
+ * Is the index's docvalues column a TEXT (text_docval_ops) column?  False when
+ * it has none.  What every pending-page reader passes weave_pending_iter_init():
+ * a v11 item's docval trailer is an int64 or `0x01 || bytes` depending on the
+ * column type alone (doc/plans/2026-09-28-docvals-text-slice.md decision 5).
+ */
+extern bool weave_index_dv_is_text(Relation index);
 
 /*
  * src/am/ambuild.c -- ambuild/aminsert, the segment writers, and the size-tiered

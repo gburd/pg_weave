@@ -5939,19 +5939,28 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
  * other writer touches these bytes -- but this page image goes into a WAL
  * record, and a page image that depends on "nothing else happened to have
  * written here" is the kind of thing that holds until the day it does not.
+ *
+ * The docval trailer is one of three things, and dvlen says which only together
+ * with the index layout (doc/plans/2026-09-28-docvals-text-slice.md decision 5):
+ * an int64 (has_docval, dvlen 8), a text value `0x01 || dvtext` (has_dvtext,
+ * dvlen 1 + dvtextlen), or nothing (dvlen 0: NULL or no docvalues column).
  */
 static void
 weave_pending_item_write(WeavePendingItem *pi, ItemPointer tid,
 						 WeaveDoc doc, uint32 doclen,
 						 const void *vec, uint32 veclen,
 						 const void *gram, uint32 gramlen,
-						 int64 docval, bool has_docval)
+						 int64 docval, bool has_docval,
+						 const char *dvtext, uint32 dvtextlen, bool has_dvtext)
 {
 	Size		docend = sizeof(WeavePendingItem) + doclen;
 	Size		vecoff = MAXALIGN(docend);
 	Size		gramoff = vecoff + MAXALIGN(veclen);
 	Size		dvoff = gramoff + MAXALIGN(gramlen);
-	uint32		dvlen = has_docval ? (uint32) sizeof(int64) : 0;
+	uint32		dvlen = has_dvtext ? 1 + dvtextlen :
+		has_docval ? (uint32) sizeof(int64) : 0;
+
+	Assert(!(has_dvtext && has_docval));
 
 	pi->tid = *tid;
 	pi->doclen = doclen;
@@ -5974,7 +5983,15 @@ weave_pending_item_write(WeavePendingItem *pi, ItemPointer tid,
 			MemSet((char *) pi + gramoff + gramlen, 0,
 				   MAXALIGN(gramlen) - gramlen);
 	}
-	if (dvlen > 0)
+	if (has_dvtext)
+	{
+		*((char *) pi + dvoff) = 0x01;
+		if (dvtextlen > 0)
+			memcpy((char *) pi + dvoff + 1, dvtext, dvtextlen);
+		if (MAXALIGN(dvlen) > dvlen)
+			MemSet((char *) pi + dvoff + dvlen, 0, MAXALIGN(dvlen) - dvlen);
+	}
+	else if (dvlen > 0)
 		/* sizeof(int64) == 8 == MAXALIGN(8), so the trailer needs no pad. */
 		memcpy((char *) pi + dvoff, &docval, sizeof(int64));
 }
@@ -6014,7 +6031,9 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	uint32		gramlen = 0;
 	int64		docval = 0;
 	bool		has_docval = false;
-	bool		dvtext = false; /* docvals text slice T4 */
+	const char *dvtext = NULL;	/* TEXT docval payload, no varlena header */
+	uint32		dvtextlen = 0;
+	bool		has_dvtext = false;
 	WeavePageKind wantkind;
 
 	/*
@@ -6092,8 +6111,9 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	 * lexical channel already finds that row, so without this the AND of the two
 	 * gates silently drops it (the docvalues gate contributed the empty set).
 	 *
-	 * int8 is BY VALUE, so nothing is detoasted.  A NULL is RECORDED, not
-	 * refused (store v2): the item is written with dvlen == 0 (has_docval stays
+	 * int8 is BY VALUE, so nothing is detoasted (a text value is; see below).
+	 * A NULL is RECORDED, not refused (store v2): the item is written with
+	 * dvlen == 0 (has_docval stays
 	 * false), which on a docvals-bearing index the reader interprets as a NULL
 	 * docval -- masked out of every comparison gate, so a `col < x` gate never
 	 * emits it.  Backward-safe because a NULL formerly ERRORed here, so no
@@ -6108,36 +6128,34 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			TupleDescAttr(RelationGetDescr(index), dvidx)->atttypid);
 
 		/*
-		 * docvals text slice T4: a text docval has no int64 encoding and the
-		 * v11 pending trailer cannot carry its bytes yet, so it is never
-		 * encoded here; the INSERT is refused just below.  A NULL is refused
-		 * too: a pending NULL would reach the flush's int64 pair path on a text
-		 * accumulator.
+		 * TEXT (text_docval_ops): the trailer is `0x01 || raw bytes`, dvlen =
+		 * 1 + len (doc/plans/2026-09-28-docvals-text-slice.md decision 5), so
+		 * '' is dvlen == 1 and a NULL keeps dvlen == 0 -- the two can never be
+		 * confused.  The value is detoasted in packed form and read in place;
+		 * its bytes are counted in `need` below, so a long value routes the
+		 * whole row to the oversized path (whose build accumulator takes the
+		 * Datum in TEXT mode) rather than overflowing a pending page.
 		 */
 		if (dvtype == WEAVE_DV_T_TEXT)
-			dvtext = true;
+		{
+			if (!isnull[dvidx])
+			{
+				struct varlena *v = PG_DETOAST_DATUM_PACKED(values[dvidx]);
+
+				dvtext = VARDATA_ANY(v);
+				dvtextlen = (uint32) VARSIZE_ANY_EXHDR(v);
+				has_dvtext = true;
+			}
+		}
 		else if (!isnull[dvidx])
 		{
 			docval = weave_dv_encode_datum(dvtype, values[dvidx]);
 			has_docval = true;
 		}
-		/* else: NULL docval -> leave has_docval == false so the item is written
-		 * with dvlen == 0 (the NULL encoding); do NOT encode a null Datum. */
+		/* else: NULL docval -> leave has_docval/has_dvtext false so the item
+		 * is written with dvlen == 0 (the NULL encoding); do NOT encode a null
+		 * Datum. */
 	}
-
-	/*
-	 * docvals text slice T4: the pending buffer cannot carry a text docval yet.
-	 * Refused BEFORE the size test, so an oversized INSERT is refused too: the
-	 * oversized path's accumulator could take the bytes, but an INSERT whose
-	 * success depended on the document's size would be an inconsistent
-	 * interim contract, and T4 lifts both at once.
-	 */
-	if (dvtext)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("INSERT into an index with a text docvalues column is not supported yet"),
-				 errdetail("Index \"%s\" has a text_docval_ops column.",
-						   RelationGetRelationName(index))));
 
 	/*
 	 * ...and the page kind is the v11 layout either way, including for an index
@@ -6148,7 +6166,12 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	 */
 	wantkind = WEAVE_PK_PENDING_V11;
 
+	/*
+	 * The trailer length is the one weave_pending_item_write() will lay down.
+	 * 1 + dvtextlen cannot wrap: a varlena payload is below 1 GB.
+	 */
 	need = weave_pending_item_size(doclen, veclen, gramlen,
+								   has_dvtext ? 1 + dvtextlen :
 								   has_docval ? (uint32) sizeof(int64) : 0);
 
 	if (need > BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(WeavePageOpaqueData)))
@@ -6210,7 +6233,8 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			tailpage = GenericXLogRegisterBuffer(state, tailbuf, 0);
 			pi = (WeavePendingItem *) weave_page_entry_end(tailpage);
 			weave_pending_item_write(pi, ht_ctid, doc, doclen, vec, veclen,
-									 gram, gramlen, docval, has_docval);
+									 gram, gramlen, docval, has_docval,
+									 dvtext, dvtextlen, has_dvtext);
 			((PageHeader) tailpage)->pd_lower += need;
 			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
 			meta = WeavePageGetMeta(metapage);
@@ -6250,7 +6274,8 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			weave_init_page(np, wantkind);
 			pi = (WeavePendingItem *) weave_page_entry_end(np);
 			weave_pending_item_write(pi, ht_ctid, doc, doclen, vec, veclen,
-									 gram, gramlen, docval, has_docval);
+									 gram, gramlen, docval, has_docval,
+									 dvtext, dvtextlen, has_dvtext);
 			((PageHeader) np)->pd_lower += need;
 		}
 
@@ -6364,10 +6389,11 @@ weave_flush_pending(Relation index)
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
 	bs.dvattno = weave_build_dvattno(index);
 	/*
-	 * docvals text slice T4: a TEXT index's accumulator is initialised TEXT with
-	 * its collation, but no pending item can carry a text docval yet
-	 * (weave_insert refuses the pending write), so the loop below never feeds it
-	 * -- and add_pair/add_pair_null ERROR on a text accumulator if it ever did.
+	 * A TEXT index's accumulator is initialised TEXT with its collation: each
+	 * pending item's `0x01 || bytes` trailer is fed in as raw bytes below, and
+	 * the writer builds this bolt's own dictionary from them (plan decision 5).
+	 * bs.dv.dvtype is then also what tells the pending reader how to decode
+	 * the trailer.
 	 */
 	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index),
 							 weave_build_dvcollation(index));
@@ -6393,7 +6419,7 @@ weave_flush_pending(Relation index)
 
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
-		weave_pending_iter_init(&it, page);
+		weave_pending_iter_init(&it, page, bs.dv.dvtype == WEAVE_DV_T_TEXT);
 		next = WeavePageGetOpaque(page)->nextblk;
 		while (weave_pending_iter_next(&it, &rec))
 		{
@@ -6507,7 +6533,26 @@ weave_flush_pending(Relation index)
 			 * value only under-covers, it never wrong-answers.  Fed by docid so
 			 * the write_weft sort matches the build path.
 			 */
-			if (bs.dvattno != 0 && rec.hasdv)
+			if (bs.dvattno != 0 && bs.dv.dvtype == WEAVE_DV_T_TEXT)
+			{
+				/*
+				 * TEXT: the same three cases, with the value as the trailer's
+				 * bytes after its 0x01 tag (dvlen >= 1, so '' is a present
+				 * value of length 0 and never a NULL).  add_text copies the
+				 * bytes into the accumulator's arena, so nothing points into
+				 * this page once its lock is released.
+				 */
+				if (rec.hasdv)
+					weave_docvals_accum_add_text(&bs.dv,
+												 weave_tid_to_docid(rec.tid),
+												 rec.dvbytes, rec.dvbyteslen,
+												 false);
+				else if (rec.dvslot)
+					weave_docvals_accum_add_text(&bs.dv,
+												 weave_tid_to_docid(rec.tid),
+												 NULL, 0, true);
+			}
+			else if (bs.dvattno != 0 && rec.hasdv)
 				weave_docvals_accum_add_pair(&bs.dv,
 											 weave_tid_to_docid(rec.tid),
 											 rec.docval);
