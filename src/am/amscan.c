@@ -153,6 +153,32 @@ static int weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
 									  uint64 docid_lo, uint64 docid_hi,
 									  ScoredTid **out);
 
+/*
+ * One docvalues restriction scankey, as weave_rescan() captured it.  A scan
+ * carries an ARRAY of these (WeaveScanOpaqueData.dvkeys) because the planner
+ * hands a range `price > 10 AND price < 20` over as two keys on the one
+ * docvalues column; weave_docvals_gate() ANDs them (doc/GAPS.md G54).
+ *
+ * An int8-domain column (int8/int4/int2/float8/date/bool, all encoded to an
+ * order-preserving int64) uses `c`.  A TEXT column (text_docval_ops, store v3)
+ * has no int64 domain: each bolt stores dictionary ORDINALS whose meaning is
+ * private to that bolt, so the constant cannot be encoded once per scan.  It is
+ * kept as the key itself and resolved to [lo, hi) boundaries against every
+ * bolt's own dictionary in weave_docvals_collect().  `key` is a detoasted copy
+ * in the scan opaque's context -- sk_argument may point into executor-param
+ * memory that is reset between rescans.  `coll` is the COLUMN's collation, the
+ * one the dictionaries were sorted under (see the Assert in weave_rescan()).
+ */
+typedef struct WeaveDvKey
+{
+	WeaveDvStrat op;			/* comparison strategy 1..5 (< <= = >= >) */
+	int64		c;				/* int8 domain: the constant, widened to int64 */
+	bool		istext;			/* the docvalues column is WEAVE_DV_T_TEXT (not
+								 * `text`: that is the typedef the next member uses) */
+	text	   *key;			/* TEXT only: the comparison key (detoasted copy) */
+	Oid			coll;			/* TEXT only: the column's collation */
+} WeaveDvKey;
+
 typedef struct WeaveScanOpaqueData
 {
 	WeaveQuery	query;			/* copied into the scan's context */
@@ -274,6 +300,24 @@ typedef struct WeaveScanOpaqueData
 								 * amcanmulticol is true. */
 
 	/*
+	 * KEYS THE CHOSEN ROUTE DOES NOT HONOUR (doc/GAPS.md G56).  cgramLossy above
+	 * is read by the cgram route only, so a key that fell into weave_rescan()'s
+	 * generic `else` -- a SECOND `@@@` (`d @@@ 'a' AND d @@@ 'b'`), a second
+	 * `@~` -- or a cgram key on a route that is not the cgram one was dropped
+	 * with no recheck by every other route: measured, `@@@ 'alpha' AND @@@ 'w10'`
+	 * returned 1000 rows for a 1-row answer.  `unhonoured` is the route-neutral
+	 * flag: every route ORs it into the recheck it reports, so the executor
+	 * re-evaluates the whole qual and the answer is correct.
+	 *
+	 * ordSameQuery: the lexical ordering route's one exception to "a restriction
+	 * key beside an ORDER BY is rechecked".  The dispatch below REPLACES so->query
+	 * with the `<=>` argument, so the ranking pass honours the restriction only
+	 * when the two are the same query -- the flagship `WHERE d @@@ q ORDER BY
+	 * d <=> q`, whose pass already restricts itself to q's exact match set.
+	 */
+	bool		unhonoured;
+	bool		ordSameQuery;
+	/*
 	 * THE DOCVALUES RESTRICTION GATE (task Docvals).  A comparison on a docvalues
 	 * column (`price < 100`, strategy 1..5 on the int8_docval_ops column) is a
 	 * RESTRICTION scankey, dispatched by attribute channel exactly like the cgram
@@ -281,13 +325,27 @@ typedef struct WeaveScanOpaqueData
 	 * Datum as a varlena and segfaults (doc/GAPS.md G49).  Captured here and
 	 * honoured by evaluating the segment's docvalues store into a docid set: the
 	 * plain path emits the matching TIDs, the fused path feeds them to the gate
-	 * shuttle.  v1 honours ONE docvalues qual; the constant is widened to int64
-	 * from its scankey subtype so a cross-type int4/int2 constant compares exactly.
+	 * shuttle.  EVERY docvalues key is captured (dvkeys[0..ndv-1], all on the one
+	 * docvalues column the layout allows) and the gate is their conjunction
+	 * (doc/GAPS.md G54); each constant is widened to int64 from its scankey
+	 * subtype so a cross-type int4/int2 constant compares exactly.
+	 *
+	 * dvkeys has capacity scan->numberOfKeys, allocated once in the opaque's
+	 * context by the first rescan (numberOfKeys is fixed for the scan's life).
 	 */
-	bool		dvScan;			/* a docvalues restriction scankey was supplied */
+	bool		dvScan;			/* at least one docvalues restriction key */
 	AttrNumber	dvAttno;		/* 1-based index attnum of the docvalues column */
-	WeaveDvStrat dvOp;			/* comparison strategy 1..5 (< <= = >= >) */
-	int64		dvConst;		/* the comparison constant, widened to int64 */
+	int			ndv;			/* number of captured docvalues keys */
+	WeaveDvKey *dvkeys;			/* the captured keys, capacity numberOfKeys */
+
+	/*
+	 * dvVoid: the key was NULL (SK_ISNULL, a runtime parameter that evaluated to
+	 * NULL).  Every docvalues operator is strict, so the gate is empty; honoured
+	 * for every column type, because an int8 NULL Datum would otherwise decode as
+	 * 0 and a text one would be dereferenced.  A NULL key ANYWHERE in the
+	 * conjunction empties all of it.
+	 */
+	bool		dvVoid;			/* some key was NULL: the gate matches nothing */
 
 	/*
 	 * THE FUSED MULTI-CHANNEL ORDERING SCAN (task F2.2), which is a FOURTH
@@ -356,7 +414,8 @@ static bool weave_cgram_collect(Relation index, const char *pat, int patlen,
 /* the docvalues restriction gate (task Docvals); defined next to weave_cgram_collect,
  * declared here because weave_gettuple()/weave_getbitmap() above it consult it. */
 static void weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c,
-								  TidSet *out);
+								  const text *tkey, Oid tcoll, TidSet *out);
+static void weave_docvals_gate(Relation index, WeaveScanOpaque so, TidSet *out);
 
 /* ranked-scan growth (L14); defined next to the visibility machinery */
 static int weave_topk_candidates_guarded(Relation index, WeaveQuery q, int wantk,
@@ -2345,6 +2404,8 @@ weave_beginscan(Relation r, int nkeys, int norderbys)
 	so->cgramPatLen = 0;
 	so->cgramCI = false;
 	so->cgramLossy = false;
+	so->unhonoured = false;
+	so->ordSameQuery = false;
 	so->fuseScan = false;
 	so->fuseQ = NULL;
 	so->fuseW = NULL;
@@ -2377,10 +2438,24 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->cgramPatLen = 0;
 	so->cgramCI = false;
 	so->cgramLossy = false;
+	so->unhonoured = false;
+	so->ordSameQuery = false;
 	so->dvScan = false;
 	so->dvAttno = 0;
-	so->dvOp = WEAVE_DV_EQ;
-	so->dvConst = 0;
+	so->dvVoid = false;
+	{
+		int			i;
+
+		/* the previous rescan's text key copies (opaque context) */
+		for (i = 0; i < so->ndv; i++)
+			if (so->dvkeys[i].key != NULL)
+				pfree(so->dvkeys[i].key);
+	}
+	so->ndv = 0;
+	if (so->dvkeys == NULL && scan->numberOfKeys > 0)
+		so->dvkeys = (WeaveDvKey *)
+			MemoryContextAllocZero(GetMemoryChunkContext(so),
+								   scan->numberOfKeys * sizeof(WeaveDvKey));	/* alloc-ok: one per scankey, bounded by the query's WHERE clause */
 	if (scan->numberOfKeys >= 1)
 	{
 		/*
@@ -2432,7 +2507,7 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 				 */
 				MemoryContextSwitchTo(old);
 			}
-			else if (isdocval && !so->dvScan)
+			else if (isdocval)
 			{
 				/*
 				 * A docvalues comparison.  Dispatched by CHANNEL, not strategy --
@@ -2442,33 +2517,98 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 				 * the key's SUBTYPE so a cross-type int4/int2 constant (`price <
 				 * 100`, whose 100 is int4) compares exactly; a same-type int8
 				 * constant has sk_subtype 0/int8.
+				 *
+				 * EVERY docvalues key is captured, not just the first
+				 * (doc/GAPS.md G54).  A range `price > 10 AND price < 20` arrives
+				 * as two keys on this column, and this arm used to keep the first
+				 * and send the second to the `else` below -- which only sets
+				 * cgramLossy, a flag no docvalues route reads -- so the second
+				 * bound was dropped with no recheck and the scan returned
+				 * everything above 10.  weave_docvals_gate() ANDs them all.
 				 */
 				Oid			coloid = TupleDescAttr(RelationGetDescr(scan->indexRelation),
 													   att - 1)->atttypid;
 				WeaveDvType coltype = weave_dv_type_for_oid(coloid);
 				Oid			sub = scan->keyData[k].sk_subtype;
 				Datum		arg = scan->keyData[k].sk_argument;
+				WeaveDvKey *dk;
+
+				/* the layout admits one docvalues column per index (am.c) */
+				Assert(!so->dvScan || so->dvAttno == att);
+				Assert(so->ndv < scan->numberOfKeys);
+				so->dvAttno = att;
+				so->dvScan = true;
 
 				/*
-				 * docvals text slice T3: the text gate (per-segment dictionary
-				 * boundaries) is not wired yet.  The key cannot simply be left
-				 * unhonoured: outside the cgram route nothing marks the result
-				 * lossy (cgramLossy is read only by it), so a dropped Index Cond
-				 * would return rows that fail it with no executor recheck.
+				 * A NULL key (a runtime parameter that evaluated to NULL): every
+				 * docvalues operator is strict, so nothing matches -- and since
+				 * the keys are ANDed, neither does the conjunction.  Checked
+				 * BEFORE the argument is read -- the Datum is not a value.
 				 */
+				if (scan->keyData[k].sk_flags & SK_ISNULL)
+				{
+					so->dvVoid = true;
+					continue;
+				}
+
+				dk = &so->dvkeys[so->ndv++];
+				dk->op = (WeaveDvStrat) scan->keyData[k].sk_strategy;
+				dk->c = 0;
+				dk->istext = false;
+				dk->key = NULL;
+				dk->coll = InvalidOid;
+
 				if (coltype == WEAVE_DV_T_TEXT)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("text docvalues scan is not supported yet")));
+				{
+					/*
+					 * A text (or varchar, via binary coercion) column: keep the
+					 * key; weave_docvals_collect() resolves it against each
+					 * bolt's own dictionary.  Copied into the opaque's context
+					 * (the cgram arm above does the same for its pattern) so it
+					 * survives until the next rescan and never points into
+					 * executor-param memory.
+					 *
+					 * THE COLLATION IS THE COLUMN'S, and the Assert is why that
+					 * is sufficient: the dictionaries were sorted under the
+					 * column collation, so a key compared under any other would
+					 * pick wrong boundaries.  The planner never builds such a key
+					 * -- match_opclause_to_indexcol() in
+					 * src/backend/optimizer/path/indxpath.c accepts a clause only
+					 * if IndexCollMatchesExprColl(index->indexcollations[col],
+					 * clause's inputcollid), i.e. the clause's collation EQUALS the
+					 * index column's (a `cat < 'm' COLLATE "x"` with a different
+					 * x stays a Filter), and ExecIndexBuildScanKeys() copies that
+					 * inputcollid into sk_collation.  This is generic planner code,
+					 * not btree's, so it binds this AM too.
+					 */
+					MemoryContext old;
+
+					dk->coll = scan->indexRelation->rd_indcollation[att - 1];
+					/*
+					 * The planner matches a qual to this column only when the
+					 * collations agree (indxpath.c IndexCollMatchesExprColl);
+					 * ordinals ordered under one collation mean nothing under
+					 * another, so refuse loudly rather than trust that in a
+					 * release build.
+					 */
+					if (OidIsValid(scan->keyData[k].sk_collation) &&
+						scan->keyData[k].sk_collation != dk->coll)
+						elog(ERROR, "pg_weave: text docvalues key collation %u does not match column collation %u",
+							 scan->keyData[k].sk_collation, dk->coll);
+					if (!OidIsValid(dk->coll))
+						elog(ERROR, "pg_weave: text docvalues column has no collation");
+					old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+					dk->key = DatumGetTextPCopy(arg);
+					MemoryContextSwitchTo(old);
+					dk->istext = true;
+					continue;
+				}
 
 				/* a same-type operator has sk_subtype == 0; the constant is then
 				 * the column's own type. */
 				if (sub == InvalidOid)
 					sub = coloid;
-				so->dvAttno = att;
-				so->dvOp = (WeaveDvStrat) scan->keyData[k].sk_strategy;
-				so->dvConst = weave_dv_encode_const(coltype, sub, arg);
-				so->dvScan = true;
+				dk->c = weave_dv_encode_const(coltype, sub, arg);
 			}
 			else if (!iscgram && !isdocval && !so->queryValid)
 			{
@@ -2476,7 +2616,15 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 				so->queryValid = true;
 			}
 			else
-				so->cgramLossy = true;	/* a key this scan does not honour */
+			{
+				/*
+				 * A key this scan does not honour: a second `@@@` or a second
+				 * `@~`.  cgramLossy is read by the cgram route alone, so the
+				 * route-neutral flag is set too (doc/GAPS.md G56).
+				 */
+				so->cgramLossy = true;
+				so->unhonoured = true;
+			}
 		}
 
 		/*
@@ -2493,6 +2641,28 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 			so->query = NULL;
 			so->cgramLossy = true;
 		}
+
+		/*
+		 * The same for docvalues keys beside a cgram key: the cgram route
+		 * (weave_gettuple()/weave_getbitmap()) returns its own set and never
+		 * consults the docvalues gate, so a docvalues key there is one the scan
+		 * does not honour and must leave the result lossy.  Before G54 a SECOND
+		 * docvalues key reached the `else` above and set this by accident, while
+		 * a lone one was silently dropped; now the arm captures every docvalues
+		 * key, so the flag is set here, explicitly, for one or many.
+		 */
+		if (so->cgramScan && so->dvScan)
+			so->cgramLossy = true;
+
+		/*
+		 * The cgram route is the PLAIN one (weave_gettuple() with no ORDER BY,
+		 * weave_getbitmap()).  Beside an ORDER BY no ranking pass consults the
+		 * pattern -- and the lexical key the block above just discarded is
+		 * honoured by nothing either -- so both are the executor's business
+		 * (doc/GAPS.md G56).
+		 */
+		if (so->cgramScan && scan->numberOfOrderBys > 0)
+			so->unhonoured = true;
 	}
 
 	/* ordering scan: the query is the <=> operator's right operand */
@@ -2511,6 +2681,19 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->curk = 0;
 	so->maxhits = 0;
 	so->plainInit = false;
+
+	/*
+	 * The previous rescan's match set (doc/GAPS.md G59): a nested loop rescans
+	 * once per outer row, and dropping the pointer leaked a corpus-sized array
+	 * each time.  It is always a fresh allocation that nothing else aliases --
+	 * the plain route, weave_edist_pass() and weave_fuse_pass() each store a
+	 * collector's or tidset_and()'s own result, and the fused pass's gate
+	 * shuttle borrows it only for the length of one pass -- and it lives in the
+	 * executor's per-query context (plain route, edist pass) or the scan's own
+	 * (fused pass), both of which outlive every rescan.
+	 */
+	if (so->plainTids != NULL)
+		pfree(so->plainTids);
 	so->plainTids = NULL;
 	so->nplain = 0;
 	so->plainpos = 0;
@@ -2700,7 +2883,28 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		}
 		else if (scan->orderByData[0].sk_strategy == WEAVE_STRAT_DISTANCE)
 		{
-			so->query = DatumGetWQuery(scan->orderByData[0].sk_argument);
+			WeaveQuery	oq = DatumGetWQuery(scan->orderByData[0].sk_argument);
+
+			/*
+			 * THIS OVERWRITES THE RESTRICTION QUERY (doc/GAPS.md G56).  The
+			 * ranking pass runs over the `<=>` argument alone, so a `@@@` key
+			 * beside it is honoured only when it is the SAME query: then the
+			 * ranked set is exactly its match set, which is the flagship
+			 * `WHERE d @@@ q ORDER BY d <=> q` and needs no recheck.  Any other
+			 * restriction key -- a different query (`@@@ 'alpha' ORDER BY <=>
+			 * 'beta'`, measured returning 1000 rows every one of which failed
+			 * `@@@`), a docvalues or cgram key, a second `@@@` -- is rechecked
+			 * by weave_gettuple().  Compared byte-for-byte: a wquery is a
+			 * self-contained varlena, so equal bytes are the same query, and a
+			 * false "different" costs a recheck, never a wrong row.
+			 */
+			so->ordSameQuery = (scan->numberOfKeys == 1 &&
+								 so->queryValid && so->query != NULL &&
+								 !so->unhonoured && !so->cgramScan &&
+								 !so->dvScan &&
+								 VARSIZE_ANY(so->query) == VARSIZE_ANY(oq) &&
+								 memcmp(so->query, oq, VARSIZE_ANY(oq)) == 0);
+			so->query = oq;
 			so->queryValid = true;
 		}
 		else
@@ -2887,14 +3091,32 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 				{
 					TidSet		dvset;
 
-					weave_docvals_collect(scan->indexRelation, so->dvOp,
-										  so->dvConst, &dvset);
+					weave_docvals_gate(scan->indexRelation, so, &dvset);
 					if (haveLex)
-						m = tidset_and(m, dvset);
+					{
+						/* tidset_and() returns a fresh array and aliases
+						 * neither input; free both (doc/GAPS.md G59) */
+						TidSet		both = tidset_and(m, dvset);
+
+						if (m.tids != NULL)
+							pfree(m.tids);
+						if (dvset.tids != NULL)
+							pfree(dvset.tids);
+						m = both;
+					}
 					else
 						m = dvset;
 				}
 			}
+
+			/*
+			 * A key the route above did not honour (a second `@@@`, a second
+			 * `@~`) makes the set a superset: recheck (doc/GAPS.md G56).  The
+			 * cgram branch has already folded it in via cgramLossy; this is the
+			 * same flag for the lexical/docvalues branch, which never read it.
+			 */
+			if (so->unhonoured)
+				so->plainRecheck = true;
 			so->plainTids = m.tids;
 			so->nplain = m.n;
 			so->plainpos = 0;
@@ -3097,41 +3319,69 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 	}
 
 	scan->xs_heaptid = so->ordered[so->ordpos].tid;
-	scan->xs_recheck = false;	/* score computed exactly from the index */
-	if (so->edistScan && scan->numberOfKeys > 0)
+
+	/*
+	 * WHICH RESTRICTION KEYS DID THIS ORDERING PASS HONOUR?  An Index Scan does
+	 * not re-evaluate a pushed-down qual unless the AM asks, so every key a
+	 * pass did not apply must go out as a recheck.  The default is therefore
+	 * "any restriction key at all is rechecked", and each arm below is a pass
+	 * that PROVABLY applied what it was given.  doc/GAPS.md G55 and G56 are the
+	 * two wrong answers this replaces: a docvalues key beside `<=>` / `<->` /
+	 * `<@>` (3000 rows returned, 2400 violating, for a 600-row answer), and a
+	 * `@@@` key beside a DIFFERENT `<=>` query, which the rescan's ORDER BY
+	 * dispatch had silently overwritten (1000 rows, every one violating).
+	 *
+	 * Rechecking does not by itself make the answer incomplete: every ladder
+	 * widens when the executor drains what is materialized -- which is what
+	 * rows the recheck discards do -- until it can prove nothing further exists
+	 * (candfull / maxhits, vecDone / vecLanes, edistDone, fuseDone / maxhits).
+	 * Two limits remain, both in doc/GAPS.md: a ladder stops widening at
+	 * WEAVE_ORD_WIDTH_MAX candidates (and after repeated lost races with a
+	 * concurrent merge, G58), so more rejected rows than that go unreturned;
+	 * and the ordering scan's own contract is unchanged -- it emits only
+	 * documents the ORDER BY argument ranks (for `<=>`, those matching its
+	 * query), so `price < c ORDER BY d <=> q` returns the price < c rows that
+	 * ALSO match q, where a heap scan would return every price < c row (G56).
+	 */
+	if (scan->numberOfKeys == 0)
+		scan->xs_recheck = false;	/* score computed exactly from the index */
+	else if (so->fuseScan)
 		/*
-		 * A `WHERE d @@@ q ORDER BY d <@> p` scan pushed the @@@ key down, and
-		 * an Index Scan does not re-evaluate a pushed-down qual unless the AM
-		 * asks.  weave_edist_pass() restricted its hits to the @@@ match set,
-		 * which for a fuzzy/regex/NOT query is the OVER-generating set (the same
-		 * one amgetbitmap reports recheck for), so say so and let the executor
-		 * re-run the original qual against the heap tuple.
+		 * `WHERE d @@@ q [AND price < c] ORDER BY fuse(...)`: the fused pass DID
+		 * honour the first `@@@` key and every docvalues key -- as a REQUIRED
+		 * gate channel inside the run (weave_fuse_pass() intersects
+		 * weave_collect_matches() with weave_docvals_gate()), which is the whole
+		 * point of fusing a predicate with a ranking (include/weave/fuse.h note
+		 * 2).  So recheck carries what the gate set carries -- the lexical
+		 * collector OVER-generates for a fuzzy, regex or phrase query -- plus
+		 * any key the gate never saw: a second `@@@` or a cgram key
+		 * (so->unhonoured; src/am/fusepath.c borrows such a clause and relies
+		 * on this).
+		 */
+		scan->xs_recheck = so->plainRecheck || so->unhonoured;
+	else if (so->edistScan && scan->numberOfKeys == 1 &&
+			 so->queryValid && so->query != NULL &&
+			 !so->dvScan && !so->cgramScan && !so->unhonoured)
+		/*
+		 * `WHERE d @@@ q ORDER BY d <@> p` with that one key: weave_edist_pass()
+		 * restricted its hits to the @@@ match set, which for a fuzzy/regex/NOT
+		 * query is the OVER-generating set (the same one amgetbitmap reports
+		 * recheck for), so say exactly that.  Any other key it did not apply.
 		 */
 		scan->xs_recheck = so->plainRecheck;
-	if (so->fuseScan && scan->numberOfKeys > 0)
+	else if (!so->edistScan && !so->vecScan && so->ordSameQuery)
 		/*
-		 * `WHERE d @@@ q ORDER BY fuse(...)` pushed the @@@ key down, and unlike
-		 * the vector case below the fused pass DID honour it -- as a REQUIRED gate
-		 * channel inside the scan, which is the conjunctive-gate path and the whole
-		 * point of fusing a predicate with a ranking (include/weave/fuse.h note 2).
-		 * So recheck carries only what the gate's own key set carries: the set came
-		 * from weave_collect_matches(), which OVER-generates for a fuzzy, regex or
-		 * phrase query (the same set amgetbitmap reports recheck for), and an Index
-		 * Scan does not re-evaluate a pushed-down qual unless the AM asks.  Exactly
-		 * the `<@>` arrangement, deliberately: one flag, set by one collector.
+		 * `WHERE d @@@ q ORDER BY d <=> q`, the same q (weave_rescan()): the
+		 * ranking pass's set is q's exact match set, so the one key is honoured.
 		 */
-		scan->xs_recheck = so->plainRecheck;
-	if (so->vecScan && scan->numberOfKeys > 0)
+		scan->xs_recheck = false;
+	else
 		/*
-		 * `WHERE d @@@ q ORDER BY v <=> $1` pushed the @@@ key down and the vector
-		 * pass DID NOT HONOUR IT: fusing a lexical restriction into the vector
-		 * channel's top-k is the fused scorer, i.e. Phase F, and building a second
-		 * one here is what AGENTS.md hard rule 7 forbids.  So the returned set is an
-		 * admitted SUPERSET of the answer and recheck goes out as true, which makes
-		 * the executor re-evaluate the original qual against the heap tuple.  The
-		 * result is still COMPLETE rather than merely correct, because the executor
-		 * discarding rows drives the ladder on: weave_vec_grow() widens until it can
-		 * prove there is nothing further, not until it has produced k rows.
+		 * Everything else: the vector pass honours no restriction key (fusing
+		 * one into its top-k is the fused scorer's job, AGENTS.md hard rule 7),
+		 * the BM25 pass honours only its own query, the edit-distance pass only
+		 * a lone `@@@`, and none of them consults the docvalues gate or a cgram
+		 * pattern.  The returned set is an admitted SUPERSET of the answer.
 		 */
 		scan->xs_recheck = true;
 	weave_set_itup(scan, so);
@@ -4004,6 +4254,7 @@ weave_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
 	WeaveScanOpaque so = (WeaveScanOpaque) scan->opaque;
 	TidSet		matches;
+	int64		nmatches;
 	bool		recheck;
 
 	/*
@@ -4048,9 +4299,14 @@ weave_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		pgstat_count_index_scan(scan->indexRelation);
 		(void) weave_cgram_collect(scan->indexRelation, so->cgramPat,
 								   so->cgramPatLen, so->cgramCI, &matches);
+		nmatches = matches.n;
 		if (matches.n > 0)
-			tbm_add_tuples(tbm, matches.tids, matches.n, so->cgramLossy);
-		return matches.n;
+			tbm_add_tuples(tbm, matches.tids, matches.n,
+						   so->cgramLossy || so->unhonoured);
+		/* tbm_add_tuples() copied them; a rescan must not leak the set (G59) */
+		if (matches.tids != NULL)
+			pfree(matches.tids);
+		return nmatches;
 	}
 
 	/*
@@ -4059,7 +4315,8 @@ weave_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	 * would DatumGetWQuery() an int8 and crash (doc/GAPS.md G49).  The docvalues
 	 * set is EXACT, so a docvalues-only bitmap goes out non-lossy; with a lexical
 	 * key too, the two sorted sets are intersected and the lexical recheck flag
-	 * carries.
+	 * carries.  A key neither set covers (a second `@@@`) makes it lossy
+	 * (so->unhonoured, doc/GAPS.md G56).
 	 */
 	if (so->dvScan)
 	{
@@ -4068,18 +4325,27 @@ weave_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		bool		lossy = false;
 
 		pgstat_count_index_scan(scan->indexRelation);
-		weave_docvals_collect(scan->indexRelation, so->dvOp, so->dvConst, &dvset);
+		weave_docvals_gate(scan->indexRelation, so, &dvset);
 		matches = dvset;
 		if (haveLex)
 		{
 			TidSet		lexset;
 
 			weave_collect_matches(scan->indexRelation, so->query, &lexset, &lossy);
+			/* a fresh array aliasing neither input: free both (G59) */
 			matches = tidset_and(lexset, dvset);
+			if (lexset.tids != NULL)
+				pfree(lexset.tids);
+			if (dvset.tids != NULL)
+				pfree(dvset.tids);
 		}
+		nmatches = matches.n;
 		if (matches.n > 0)
-			tbm_add_tuples(tbm, matches.tids, matches.n, lossy);
-		return matches.n;
+			tbm_add_tuples(tbm, matches.tids, matches.n,
+						   lossy || so->unhonoured);
+		if (matches.tids != NULL)
+			pfree(matches.tids);
+		return nmatches;
 	}
 
 	if (!so->queryValid || so->query == NULL)
@@ -4088,9 +4354,13 @@ weave_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	 * added by index_getbitmap() from our return value. */
 	pgstat_count_index_scan(scan->indexRelation);
 	weave_collect_matches(scan->indexRelation, so->query, &matches, &recheck);
+	nmatches = matches.n;
 	if (matches.n > 0)
-		tbm_add_tuples(tbm, matches.tids, matches.n, recheck);
-	return matches.n;
+		tbm_add_tuples(tbm, matches.tids, matches.n,
+					   recheck || so->unhonoured);
+	if (matches.tids != NULL)
+		pfree(matches.tids);
+	return nmatches;
 }
 
 /*
@@ -4627,12 +4897,17 @@ weave_cgram_collect(Relation index, const char *pat, int patlen, bool ci,
  * weave_docvals_collect -- the docvalues restriction gate as a TID set.
  *
  * Evaluate `value op c` over every bolt's docvalues store and return the heap
- * TIDs of the matching documents.  This is the plain-path sibling of
+ * TIDs of the matching documents.  For a TEXT column (tkey != NULL) `c` is
+ * unused: the key tkey is resolved to ordinal boundaries against each bolt's own
+ * dictionary under tcoll (the column collation), and an int8 column passes
+ * tkey == NULL.  This is the plain-path sibling of
  * weave_collect_matches() (`@@@`) and weave_cgram_collect() (`@~`): the executor
- * receives the TIDs and applies MVCC visibility on the heap, so a value for a
- * since-deleted docid is harmless (its heap tuple is gone).  The set is EXACT --
- * the store maps each docid to its value with no over-generation -- so no recheck
- * is owed.
+ * receives the TIDs and applies MVCC visibility on the heap.  That alone does NOT
+ * make a since-deleted docid's value harmless -- once VACUUM frees the slot a new
+ * tuple can reuse its TID and inherit the stale value (doc/GAPS.md G57) -- so each
+ * segment's contribution is tombstone-filtered like the siblings'.  The set is
+ * EXACT -- the store maps each docid to its value with no over-generation -- so no
+ * recheck is owed.
  *
  * Per-bolt the store's docid array is strictly ascending, so weave_dv_eval_int8()
  * emits ascending global docids; across bolts the ranges can interleave, so the
@@ -4672,13 +4947,17 @@ weave_dv_match_int8(WeaveDvStrat op, int64 v, int64 c)
 }
 
 static void
-weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
+weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c,
+					  const text *tkey, Oid tcoll, TidSet *out)
 {
 	WeaveMetaPageData meta;
 	ItemPointerData *tids = NULL;
 	int			ntids = 0;
 	int			captids = 0;
 	uint32		s;
+	WeaveTombstones seg_tombs;
+	uint32		gen0;
+	int			gen_retries = 0;
 
 	out->tids = NULL;
 	out->n = 0;
@@ -4687,6 +4966,29 @@ weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
 		return;					/* buildempty(): no metapage, no bolts */
 
 	weave_read_meta(index, &meta);
+
+	/*
+	 * The same bounded generation re-check weave_collect_matches() makes: a
+	 * concurrent merge/vacuum can free and recycle the pages a stale segment
+	 * descriptor points at, and this set is EXACT (no recheck), so a stale read
+	 * would be a silent wrong answer rather than a superset.
+	 */
+docvals_retry:
+	gen0 = meta.generation;
+	ntids = 0;
+
+	/*
+	 * Per-segment tombstones (doc/GAPS.md G57), loaded once exactly as
+	 * weave_collect_matches() and weave_cgram_collect() do.  A docvalues store
+	 * is written at build/merge and never shrinks on DELETE, so without this a
+	 * deleted row's value stays in its bolt; once VACUUM frees the heap slot and
+	 * an INSERT reuses it, that stale value is reported for the NEW tuple under
+	 * the same TID, and the executor's MVCC check cannot tell -- the tuple IS
+	 * visible.  Measured: `price < 50` returned 932 rows for a 500-row answer
+	 * after DELETE / VACUUM / re-INSERT.  Filtered per segment, against THAT
+	 * segment's own map, for the reason weave_filter_tombstoned_seg() gives.
+	 */
+	weave_tombstones_load(index, &meta, &seg_tombs);
 
 	for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
 	{
@@ -4705,8 +5007,14 @@ weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
 		if (root == InvalidBlockNumber)
 			continue;			/* this bolt carries no docvalues weft */
 
+		/*
+		 * The kind the caller can interpret is enforced by the loader: a v1/v2
+		 * (int8) store under a text column, or the reverse, is impossible by
+		 * construction and is an ERROR there rather than a wrong answer here.
+		 */
 		img = weave_docvals_load(index, root, CurrentMemoryContext, &ndocs,
-								 WEAVE_DV_KIND_INT8);
+								 tkey != NULL ? WEAVE_DV_KIND_TEXT
+								 : WEAVE_DV_KIND_INT8);
 		if (ndocs == 0)
 		{
 			pfree((void *) img);
@@ -4715,7 +5023,28 @@ weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
 
 		/* corpus-scale: one docid per document in the bolt (check-alloc). */
 		docids = (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) ndocs * sizeof(uint64));
-		nmatch = weave_dv_eval_int8(img, op, c, docids, ndocs);
+		if (tkey != NULL)
+		{
+			/*
+			 * TEXT: resolve the key against THIS bolt's dictionary.  Ordinals
+			 * are private to a bolt (ordinal 3 is a different string in each),
+			 * so the boundaries are recomputed per segment and never reused.
+			 * Two O(log ndict) searches, then an ordinal-range pass that is the
+			 * int8 evaluator's shape exactly (weave/docvals.h).
+			 */
+			const char *kp = VARDATA_ANY(tkey);
+			uint32		kl = (uint32) VARSIZE_ANY_EXHDR(tkey);
+			uint32		lo;
+			uint32		hi;
+
+			lo = weave_dv_dict_lower_bound(img, kp, kl, weave_dv_varstr_cmp,
+										   &tcoll);
+			hi = weave_dv_dict_upper_bound(img, kp, kl, weave_dv_varstr_cmp,
+										   &tcoll);
+			nmatch = weave_dv_eval_ord(img, op, lo, hi, docids, ndocs);
+		}
+		else
+			nmatch = weave_dv_eval_int8(img, op, c, docids, ndocs);
 
 		if (nmatch > 0)
 		{
@@ -4728,11 +5057,27 @@ weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
 					 : WEAVE_ALLOC_MAYBE_HUGE((Size) captids * sizeof(ItemPointerData)));
 			}
 			for (i = 0; i < nmatch; i++)
-				weave_docid_to_tid(docids[i], &tids[ntids++]);
+				weave_docid_to_tid(docids[i], &tids[ntids + i]);
+
+			/*
+			 * Drop THIS segment's tombstoned docids from THIS segment's
+			 * contribution only, in place.  The evaluators emit ascending
+			 * global docids (weave/docvals.h), so the slice is TID-ascending,
+			 * which is the filter's precondition.
+			 */
+			{
+				TidSet		one;
+
+				one.tids = tids + ntids;
+				one.n = nmatch;
+				weave_filter_tombstoned_seg(&seg_tombs, s, &one);
+				ntids += one.n;
+			}
 		}
 		pfree(docids);
 		pfree((void *) img);
 	}
+	weave_tombstones_free(&seg_tombs);
 
 	/*
 	 * THE PENDING BUFFER (doc/GAPS.md G52).  Documents inserted since the last
@@ -4783,6 +5128,16 @@ weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
 				 * NULL is emitted for no comparison operator. */
 				if (!rec.hasdv)
 					continue;
+
+				/*
+				 * docvals text slice T4: a TEXT index cannot hold a pending item
+				 * carrying a docval yet (weave_insert refuses the INSERT), and
+				 * rec.docval is an int64 that means nothing for text -- its
+				 * trailer is `0x01 || bytes` (plan decision 5).  Refuse rather
+				 * than compare it as an integer.
+				 */
+				if (tkey != NULL)
+					elog(ERROR, "pg_weave: pending text docvalues are not handled yet");
 				if (!weave_dv_match_int8(op, rec.docval, c))
 					continue;
 				if (ntids + 1 > captids)
@@ -4800,11 +5155,71 @@ weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c, TidSet *out)
 		}
 	}
 
+	if (weave_read_meta_generation(index) != gen0 && gen_retries++ < 10)
+	{
+		weave_read_meta(index, &meta);
+		goto docvals_retry;		/* tids[] is reused: ntids restarts at 0 */
+	}
+
 	if (ntids > 1)
 		qsort(tids, ntids, sizeof(ItemPointerData), weave_docvals_cmp_tid);
 
 	out->tids = tids;
 	out->n = ntids;
+}
+
+/*
+ * The scan's docvalues gate: the CONJUNCTION of every docvalues key
+ * weave_rescan() captured (doc/specs/DOCVALS_CHANNEL.md sect. 5 step 3,
+ * doc/GAPS.md G54).  The one place the three consumers (plain gettuple,
+ * getbitmap, the fused pass) go through, so the NULL-key rule, the int8/text
+ * dispatch and the AND cannot drift apart between them.  A NULL key anywhere
+ * matches nothing (strict operators), and so neither does the conjunction.
+ *
+ * Each key is evaluated by weave_docvals_collect() into its own sorted set and
+ * the sets are intersected with tidset_and(), whose precondition (both inputs
+ * ascending) collect's final qsort guarantees.  That is one full pass over
+ * every bolt's store PER KEY; a range is two passes where one would do.
+ * Evaluating the conjunction in a single pass (intersect the [lo, hi) ordinal
+ * or value intervals first) is a later optimisation -- correctness first.
+ */
+static void
+weave_docvals_gate(Relation index, WeaveScanOpaque so, TidSet *out)
+{
+	TidSet		acc;
+	int			i;
+
+	Assert(so->dvScan);
+	out->tids = NULL;
+	out->n = 0;
+	if (so->dvVoid || so->ndv == 0)
+		return;
+
+	acc.tids = NULL;
+	acc.n = 0;
+	for (i = 0; i < so->ndv; i++)
+	{
+		const WeaveDvKey *dk = &so->dvkeys[i];
+		TidSet		one;
+		TidSet		both;
+
+		weave_docvals_collect(index, dk->op, dk->c,
+							  dk->istext ? dk->key : NULL, dk->coll, &one);
+		if (i == 0)
+		{
+			acc = one;
+			continue;
+		}
+		both = tidset_and(acc, one);
+		if (acc.tids != NULL)
+			pfree(acc.tids);
+		if (one.tids != NULL)
+			pfree(one.tids);
+		acc = both;
+		if (acc.n == 0)
+			break;				/* empty: the remaining keys cannot add rows */
+	}
+	*out = acc;
 }
 
 void
@@ -8095,9 +8510,18 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		{
 			TidSet		dvset;
 
-			weave_docvals_collect(index, so->dvOp, so->dvConst, &dvset);
+			weave_docvals_gate(index, so, &dvset);
 			if (haveLex)
-				m = tidset_and(m, dvset);
+			{
+				/* a fresh array aliasing neither input: free both (G59) */
+				TidSet		both = tidset_and(m, dvset);
+
+				if (m.tids != NULL)
+					pfree(m.tids);
+				if (dvset.tids != NULL)
+					pfree(dvset.tids);
+				m = both;
+			}
 			else
 				m = dvset;
 		}

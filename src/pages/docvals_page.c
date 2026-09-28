@@ -649,6 +649,19 @@ weave_dv_encode_const(WeaveDvType coltype, Oid consttype, Datum arg)
 	}
 }
 
+int
+weave_dv_varstr_cmp(void *ctx, const void *a, uint32 alen,
+					const void *b, uint32 blen)
+{
+	/*
+	 * Entries and keys are raw text payloads (no varlena header); a dictionary
+	 * entry is bounded by the store's validated length and a key by the query
+	 * text, both far below INT_MAX, which is varstr_cmp's length type.
+	 */
+	return varstr_cmp((const char *) a, (int) alen, (const char *) b, (int) blen,
+					  *(Oid *) ctx);
+}
+
 void
 weave_docvals_accum_init(WeaveDocvalsAccum *acc, MemoryContext ctx, bool active,
 						 WeaveDvType dvtype, Oid collation)

@@ -5556,8 +5556,18 @@ SELECT count(*) FROM psh WHERE d @@@ (SELECT 'term1'::wquery);
     50
 (1 row)
 
--- two @@@ quals -> more than one qual, no single-@@@ pushdown
+-- two @@@ quals -> more than one qual, no single-@@@ pushdown.  The english
+-- config stems `body` to `bodi`, so the unstemmed 'body' matches nothing and
+-- the conjunction is 0 on the heap too; this expected once read 50 because the
+-- second @@@ key was silently dropped (doc/GAPS.md G56).  The 'bodi' form is
+-- the positive control: both keys are honoured, 50 rows.
 SELECT count(*) FROM psh WHERE d @@@ 'term1'::wquery AND d @@@ 'body'::wquery;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM psh WHERE d @@@ 'term1'::wquery AND d @@@ 'bodi'::wquery;
  count 
 -------
     50

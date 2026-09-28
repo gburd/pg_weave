@@ -3935,3 +3935,117 @@ df≈1M–6M (the `bench/aws/run.sh` docvals instance reproduces it in one line)
 allocation, and bound it (stream the postings / cap the working set / spill) so a high-df
 term degrades to slower, not fatal. Until then, `bench/aws/docvals_scale.sql` and any
 scale benchmark must avoid near-universal `@@@` terms (it now uses `freq7`, df≈1%).
+
+### G54 — only the FIRST docvalues scankey was honoured: `price > 10 AND price < 20` answered as `price > 10` — **FOUND 2026-09-28 in the text-docvals T3 review; a G49-class silent wrong answer; FIXED 2026-09-28**
+
+`weave_rescan()` captured one docvalues key into scalar fields and dropped every
+later one without setting recheck, so any range (`BETWEEN`, `> a AND < b`) or
+two-predicate facet over the docvalues column lost all but the first predicate.
+Measured on a 3000-row int8 table: **2670 rows for a 270-row answer** (plain Index Scan).
+Every route was affected: plain gettuple, getbitmap, the fused pass.
+
+**Fix:** the scan keeps an array of keys (`so->dvkeys` / `so->ndv`, one `WeaveDvKey`
+each), and `weave_docvals_gate()` evaluates every key and ANDs the sorted sets with
+`tidset_and()`. All three consumers go through that one function, so they can't drift
+apart. **Pinned:** `sql/docvals.sql` §11 (int8, text, bitmap and fused, each against the
+heap). Cost, which is also a loss: each key is a full pass over every bolt's store, so a
+range costs two passes where one would do. Intersecting the ordinal/value intervals
+first is owed.
+
+### G55 — a docvalues key beside an ORDERING scan (`<=>`, `<->`, `<#>`, `<@>`) was ignored: `WHERE price < 20 ORDER BY body <=> q` returned rows with any price — **FOUND 2026-09-28; silent wrong answer; FIXED 2026-09-28**
+
+The BM25, vector and edit-distance ranking passes never consult the docvalues gate,
+and `weave_gettuple()` returned their rows with `xs_recheck = false`. Measured: **3000
+rows returned, 2400 of them violating `price < 20`**, for a 600-row answer.
+
+**Fix:** one per-route recheck rule in the ordering branch of `weave_gettuple()`. Recheck
+is off only where the pass provably applied every key it was given; otherwise it is on
+(the final arm). **Pinned:** `sql/docvals.sql` §12 (`<=>`, int8 and text) and §14 (`<#>`
+vector, `<@>` edit distance). **Ablation:** with the final arm forced to
+`xs_recheck = false`, §14 returns 2000 rows with 1600 violating (vector) and 1600
+violating (edit distance), and the G55 probe returns 3000/2400 again.
+
+### G56 — restriction keys no route honours were dropped with no recheck: a second `@@@`, `@@@ a` beside `ORDER BY <=> b`, and `@~` beside an ordering — **FOUND 2026-09-28; silent wrong answer, PRE-EXISTING (not docvals); FIXED 2026-09-28, with one CONTRACT limit left OPEN**
+
+Three shapes, all measured on 2000 rows (even ids hold `alpha`, odd hold `beta`):
+
+| shape | before | heap |
+|---|---|---|
+| `WHERE body @@@ 'alpha' ORDER BY body <=> 'beta'` | 1000 rows, **all 1000 violating** (the rescan's ORDER BY dispatch overwrote `so->query`) | 1000 |
+| `WHERE body @@@ 'alpha' AND body @@@ 'w10'` | **1000** (second key reached only a flag the lexical routes never read) | 1 |
+| `WHERE raw @~ '%alpha%' ORDER BY d <=> 'common'` | pattern ignored | 1000 |
+
+**Fix:** `so->unhonoured` (a key no route applies) and `so->ordSameQuery` (restriction
+and ORDER BY `<=>` carry the same query), computed in `weave_rescan()` and ORed into
+recheck on the plain, ordering and bitmap routes. `src/am/fusepath.c`, which borrows a
+second `@@@` clause into a fused scan, relies on this. **Pinned:** `sql/docvals.sql` §13
+(all three shapes plus nested-loop rescans) and §14 (two `@@@` under `fuse()`, two
+`@~`). **Ablation:** with `unhonoured` never set by the second-`@@@` site, §13 gives
+1000 for the 1-row answer and §14's fused case gives 1000 rows, 999 violating.
+
+**A test expected the bug.** `sql/weave.sql`'s count-pushdown block expected **50** for
+`psh WHERE d @@@ 'term1' AND d @@@ 'body'`. The english config stems `body` to `bodi`, so
+the second key matches nothing, and a Seq Scan returns **0**. The 50 was the dropped
+second key. The expected value is now 0, next to a `'bodi'` query (50) that shows
+nothing is over-restricted. This is a retraction (hard rule 8): the old expected output
+recorded a wrong answer as correct.
+
+**OPEN, a contract rather than a bug:** an ordering scan emits only the documents its
+ORDER BY argument ranks. For `<=>` that means documents matching the ORDER BY query, as
+`sql/orderby.sql` test (5) documents. So with recheck on, the answer has **no wrong
+rows but can be INCOMPLETE** relative to the heap:
+
+- `@@@ 'alpha' ORDER BY <=> 'beta'` returns **0 rows** where the heap has 1000;
+- `price < 20 ORDER BY body <=> 'alpha'` returns **200** where the heap has 400;
+- bare `ORDER BY body <=> 'alpha'` returns 1000 where the heap has 2000 (unchanged, and
+  the documented intent).
+
+A planner-level fix would refuse the index ordering, or pad with unranked rows, whenever
+the WHERE admits rows the ORDER BY query does not rank. It is owed and needs a decision.
+
+### G57 — the docvalues gate reported a DELETED row's value for the NEW tuple that reused its TID — **FOUND 2026-09-28; silent wrong answer; FIXED 2026-09-28**
+
+A bolt's docvalues store is written at build/merge and never shrinks. After DELETE,
+VACUUM tombstones the docid and frees the heap slot, and a later INSERT can reuse that
+TID. `weave_docvals_collect()` did not filter tombstones, so the stale value answered
+for the new, visible tuple, and MVCC can't catch it because the tuple *is* visible.
+Measured: after `DELETE` of half the rows, `VACUUM` and a re-`INSERT` with values no
+predicate admits, **`price < 50` returned 932 rows via the index vs 500 on the heap**.
+
+**Fix:** per-segment tombstone filtering in `weave_docvals_collect()`, against each
+segment's own map, the way `weave_collect_matches()` already did it. **Pinned:**
+`sql/docvals.sql` §13 (plain, lexical-AND, bitmap, heap). **Ablation:** with the filter
+call removed, the probe returns 932 again.
+
+The same review found that `weave_docvals_collect()` lacked the directory-generation
+re-check the lexical collector makes. The docvalues set is EXACT (no recheck), so a read
+torn by a concurrent merge would have been a silent wrong answer, not a superset. It now
+retries from a fresh snapshot, bounded at 10 attempts (see G58 for that bound). That race
+is fixed by construction, but no concurrent TAP test exercises it yet (T7 owes one).
+
+### G58 — every generation-guarded collector gives up after 10 lost races with a concurrent merge and returns a possibly-short answer with no error — **FOUND 2026-09-28 in review; PRE-EXISTING; OPEN**
+
+`weave_collect_matches()`, `weave_docvals_collect()` and `weave_vec_topk_guarded()`
+all redo their read when the directory generation moved, bounded at 10 attempts so a
+merge storm cannot spin a scan forever. On the 11th loss they go on anyway: the lexical
+and docvalues collectors keep the last (possibly stale) set, and the vector pass
+returns **no candidates**, after which the ordering ladder ends the scan with
+`candfull = false`. That is a short or stale answer with no error. It needs a merge
+storm to reach and has never been observed, but it is reachable. **Owed:** raise
+`ERROR` (SQLSTATE 40001, serialization failure, so a client retries) instead of
+returning, plus a TAP test that forces it with a small bound.
+
+A second completeness limit on the ordering route: a ladder stops widening at
+`WEAVE_ORD_WIDTH_MAX` (INT_MAX/32, ~67M) candidates. If more rows than that are rejected
+by a recheck (G55/G56), the missing rows go unreturned without an error. That needs a
+>67M-row index and a very unselective restriction key, and is **OPEN**.
+
+### G59 — rescan leaked the previous match set: a nested-loop inner index scan grew memory by one match set per outer row — **FOUND 2026-09-28; memory, not correctness; PARTLY FIXED 2026-09-28**
+
+`weave_rescan()` reset `so->plainInit` without freeing `so->plainTids`, and the new
+multi-key AND (G54) leaked both `tidset_and()` inputs. Both are freed now
+(`tidset_and()` always returns a fresh array, so neither input can be aliased). The
+nested-loop rescans in `sql/docvals.sql` §13 run that path. The loss: there is no
+memory assertion, so the test proves the frees don't break correctness but not that
+they bound memory. **OPEN:** the ordering route's `so->ordered` / `so->cand` arrays
+are still not freed on rescan.

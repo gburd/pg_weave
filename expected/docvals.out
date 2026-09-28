@@ -670,7 +670,8 @@ DROP TABLE dvn;
 -- per docid, the dictionary sorted under the column collation.  This step
 -- proves the build writes a store that the structural check accepts, and (10b)
 -- that a multi-segment build's collapse re-dictionaries every input; pushdown
--- (task 3) and pending INSERT/flush (task 4) follow.
+-- is proven index == heap in (10c) (task 3); pending INSERT/flush (task 4)
+-- follows.
 -- cat has exactly 40 distinct non-NULL values, one of them '' (a real entry,
 -- not NULL), and is NULL on every 19th row (~5%).
 -- ---------------------------------------------------------------------------
@@ -795,3 +796,1007 @@ SELECT count(*) AS violations FROM weave_check('dvtm_idx', true) WHERE NOT ok;
 RESET maintenance_work_mem;
 RESET max_parallel_maintenance_workers;
 DROP TABLE dvtm;
+-- ---------------------------------------------------------------------------
+-- 10c. TEXT PUSHDOWN: index == heap (task 3).  A text comparison is an Index
+-- Cond, and weave_docvals_collect() resolves the key to ordinal boundaries
+-- lo = #{D[i] < k}, hi = #{D[i] <= k} against EACH bolt's own dictionary.
+-- The proof is the int8 slice's: the index-forced answer equals the seqscan
+-- answer as a SET (dvs_agree), for every strategy and for constants that are
+-- present ('c10'), the empty string ('' -- a real entry, never NULL), absent
+-- between two entries ('c105' sorts between 'c10' and 'c11'), absent below
+-- every non-empty value but above '' (' '), and above everything ('zzz').
+-- '' itself is the minimum of text, so `< ''` must be empty and `>= ''` must
+-- be every non-NULL row.
+--
+-- Three column shapes: cat under COLLATE "C" (byte order), cat2 under the
+-- DATABASE DEFAULT collation with mixed case (under a linguistic collation
+-- 'B' < 'a' need not hold, so a byte-order boundary search would disagree with
+-- the heap), and a varchar(20) column (text_docval_ops by binary coercion).
+-- One docvalues column per index is a current limitation, hence three indexes.
+--
+-- The agreement is printed as ONE boolean per column shape plus the list of
+-- disagreeing cases (which must be empty), so a wrong gate shows the exact
+-- (column, operator, constant) rather than a bare `f`.  The EXPLAINs prove the
+-- index arm really ran the gate: an unindexable clause would be a (disabled)
+-- Seq Scan in both arms and agree vacuously.
+-- ---------------------------------------------------------------------------
+CREATE TABLE dvs (id int, body wdoc, cat text COLLATE "C", cat2 text,
+                  cv varchar(20));
+INSERT INTO dvs
+SELECT g, to_wdoc('common doc ' || (g % 5)),
+       CASE WHEN g % 19 = 0 THEN NULL
+            WHEN g % 40 = 0 THEN ''
+            ELSE 'c' || lpad((g % 40)::text, 2, '0') END,
+       CASE WHEN g % 23 = 0 THEN NULL
+            ELSE (ARRAY['Apple', 'apple', 'APPLE', 'Banana', 'banana', 'b',
+                        'B', '', 'a b', 'a-b', 'ab', 'Ab', 'zeta', 'Zeta',
+                        '10', '9'])[g % 16 + 1] END,
+       CASE WHEN g % 17 = 0 THEN NULL
+            ELSE 'v' || lpad((g % 30)::text, 2, '0') END
+FROM generate_series(1, 2000) g;
+CREATE INDEX dvs_cat ON dvs USING weave (body wdoc_lex_ops, cat text_docval_ops);
+CREATE INDEX dvs_cat2 ON dvs USING weave (body wdoc_lex_ops, cat2 text_docval_ops);
+CREATE INDEX dvs_cv ON dvs USING weave (body wdoc_lex_ops, cv text_docval_ops);
+ANALYZE dvs;
+CREATE OR REPLACE FUNCTION dvs_agree(tbl text, pred text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+    n_bad bigint;
+BEGIN
+    EXECUTE 'SET LOCAL enable_seqscan = off';
+    EXECUTE 'SET LOCAL enable_bitmapscan = off';
+    EXECUTE 'SET LOCAL enable_indexscan = on';
+    EXECUTE format('CREATE TEMP TABLE dvs_i AS SELECT id FROM %I WHERE %s', tbl, pred);
+    EXECUTE 'SET LOCAL enable_indexscan = off';
+    EXECUTE 'SET LOCAL enable_bitmapscan = off';
+    EXECUTE 'SET LOCAL enable_seqscan = on';
+    EXECUTE format('CREATE TEMP TABLE dvs_s AS SELECT id FROM %I WHERE %s', tbl, pred);
+    SELECT count(*) INTO n_bad FROM (
+        SELECT id FROM dvs_i EXCEPT SELECT id FROM dvs_s
+        UNION ALL
+        SELECT id FROM dvs_s EXCEPT SELECT id FROM dvs_i
+    ) d;
+    DROP TABLE dvs_i;
+    DROP TABLE dvs_s;
+    RETURN n_bad = 0;
+END;
+$$;
+-- plan shape: every strategy on cat is an Index Cond, and so is one on each of
+-- cat2 and cv
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM dvs WHERE cat < 'c10';
+            QUERY PLAN             
+-----------------------------------
+ Index Scan using dvs_cat on dvs
+   Index Cond: (cat < 'c10'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM dvs WHERE cat <= 'c10';
+             QUERY PLAN             
+------------------------------------
+ Index Scan using dvs_cat on dvs
+   Index Cond: (cat <= 'c10'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM dvs WHERE cat = 'c10';
+            QUERY PLAN             
+-----------------------------------
+ Index Scan using dvs_cat on dvs
+   Index Cond: (cat = 'c10'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM dvs WHERE cat >= 'c10';
+             QUERY PLAN             
+------------------------------------
+ Index Scan using dvs_cat on dvs
+   Index Cond: (cat >= 'c10'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM dvs WHERE cat > 'c10';
+            QUERY PLAN             
+-----------------------------------
+ Index Scan using dvs_cat on dvs
+   Index Cond: (cat > 'c10'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM dvs WHERE cat2 < 'apple';
+              QUERY PLAN              
+--------------------------------------
+ Index Scan using dvs_cat2 on dvs
+   Index Cond: (cat2 < 'apple'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM dvs WHERE cv < 'v15';
+                QUERY PLAN                
+------------------------------------------
+ Index Scan using dvs_cv on dvs
+   Index Cond: ((cv)::text < 'v15'::text)
+(2 rows)
+
+-- deterministic counts through the index (also checked against the heap below):
+-- '' is a real entry, ' ' sorts between '' and every 'cNN', 'c105' is absent,
+-- nothing is below ''
+SELECT count(*) AS eq_empty FROM dvs WHERE cat = '';
+ eq_empty 
+----------
+       48
+(1 row)
+
+SELECT count(*) AS lt_space FROM dvs WHERE cat < ' ';
+ lt_space 
+----------
+       48
+(1 row)
+
+SELECT count(*) AS eq_c10 FROM dvs WHERE cat = 'c10';
+ eq_c10 
+--------
+     48
+(1 row)
+
+SELECT count(*) AS eq_absent FROM dvs WHERE cat = 'c105';
+ eq_absent 
+-----------
+         0
+(1 row)
+
+SELECT count(*) AS lt_empty FROM dvs WHERE cat < '';
+ lt_empty 
+----------
+        0
+(1 row)
+
+SELECT count(*) AS ge_empty FROM dvs WHERE cat >= '';
+ ge_empty 
+----------
+     1895
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+CREATE TEMP TABLE dvs_cases (tbl text, col text, op text, k text);
+INSERT INTO dvs_cases
+SELECT 'dvs', c.col, o.op, k.k
+  FROM (VALUES ('cat'), ('cat2')) c(col),
+       (VALUES ('<'), ('<='), ('='), ('>='), ('>')) o(op),
+       (VALUES ('c10'), (''), ('c105'), (' '), ('zzz')) k(k);
+-- cat2's own present / case-variant / between values
+INSERT INTO dvs_cases
+SELECT 'dvs', 'cat2', o.op, k.k
+  FROM (VALUES ('<'), ('<='), ('='), ('>='), ('>')) o(op),
+       (VALUES ('apple'), ('Apple'), ('B'), ('b'), ('Apricot'), ('a b'),
+               ('10'), ('Zeta')) k(k);
+-- varchar: one strategy suffices for the coercion path, plus equality
+INSERT INTO dvs_cases VALUES
+  ('dvs', 'cv', '<', 'v15'), ('dvs', 'cv', '=', 'v15'),
+  ('dvs', 'cv', '>', 'v155'), ('dvs', 'cv', '<', '');
+CREATE TEMP TABLE dvs_res AS
+SELECT tbl, col, op, k, dvs_agree(tbl, format('%I %s %L', col, op, k)) AS ok
+  FROM dvs_cases;
+SELECT col, count(*) AS ncases, bool_and(ok) AS all_agree
+  FROM dvs_res GROUP BY col ORDER BY col;
+ col  | ncases | all_agree 
+------+--------+-----------
+ cat  |     25 | t
+ cat2 |     65 | t
+ cv   |      4 | t
+(3 rows)
+
+SELECT col, op, k AS disagreeing_constant
+  FROM dvs_res WHERE NOT ok ORDER BY col, op, k;
+ col | op | disagreeing_constant 
+-----+----+----------------------
+(0 rows)
+
+-- a conjunction with the lexical channel agrees too
+SELECT dvs_agree('dvs', $$body @@@ 'common'::wquery AND cat < 'c20'$$)
+       AS lex_and_text_agrees;
+ lex_and_text_agrees 
+---------------------
+ t
+(1 row)
+
+-- a clause whose collation differs from the column's is NOT an index clause
+-- (the planner's IndexCollMatchesExprColl); it stays a Filter and agrees
+SELECT dvs_agree('dvs', $$cat2 < 'apple' COLLATE "C"$$) AS other_collation_agrees;
+ other_collation_agrees 
+------------------------
+ t
+(1 row)
+
+-- a NULL runtime key (generic plan, $1 NULL): strict operators match nothing,
+-- and the scan must not read the NULL Datum as a text value
+SET plan_cache_mode = force_generic_plan;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+PREPARE dvs_null(text) AS SELECT count(*) FROM dvs WHERE cat = $1;
+EXECUTE dvs_null(NULL);
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE dvs_null('c10');
+ count 
+-------
+    48
+(1 row)
+
+DEALLOCATE dvs_null;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET plan_cache_mode;
+DROP TABLE dvs_res;
+DROP TABLE dvs;
+-- THE MULTI-SEGMENT COLLAPSE, SEMANTICALLY (10b showed the weft is there; this
+-- shows it is RIGHT).  The same corpus as 10b, so seven flushed bolts with
+-- DIFFERENT dictionaries ('k' || g/500 is disjoint per heap range) are
+-- re-dictionaried by the collapse.  A merge that concatenated ordinals instead
+-- would map 'k0003' and 'k0020' to other bolts' strings, and these would
+-- disagree with the heap.
+CREATE TABLE dvtm (id int, body wdoc, cat text COLLATE "C");
+INSERT INTO dvtm
+SELECT g, to_wdoc(array_to_string(ARRAY(SELECT 'id' || g || 'x' || k
+                                          FROM generate_series(1, 40) k), ' ')),
+       CASE WHEN g % 19 = 0 THEN NULL
+            WHEN g % 40 = 0 THEN ''
+            WHEN g % 3 = 0 THEN 'c' || lpad((g % 40)::text, 2, '0')
+            ELSE 'k' || lpad((g / 500)::text, 4, '0') END
+FROM generate_series(1, 12000) g;
+SET maintenance_work_mem = '1MB';
+SET max_parallel_maintenance_workers = 0;
+CREATE INDEX dvtm_idx ON dvtm USING weave (body wdoc_lex_ops, cat text_docval_ops);
+RESET maintenance_work_mem;
+RESET max_parallel_maintenance_workers;
+ANALYZE dvtm;
+SELECT weave_index_nsegments('dvtm_idx') = 1 AS collapsed_to_one_segment;
+ collapsed_to_one_segment 
+--------------------------
+ t
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM dvtm WHERE cat = 'k0003';
+             QUERY PLAN              
+-------------------------------------
+ Index Scan using dvtm_idx on dvtm
+   Index Cond: (cat = 'k0003'::text)
+(2 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DELETE FROM dvs_cases;
+INSERT INTO dvs_cases
+SELECT 'dvtm', 'cat', o.op, k.k
+  FROM (VALUES ('<'), ('<='), ('='), ('>='), ('>')) o(op),
+       (VALUES ('k0003'), ('k0020'), ('k0000'), ('k0024'), ('c10'), (''),
+               ('c105'), ('k00035'), (' '), ('zzz')) k(k);
+CREATE TEMP TABLE dvs_res AS
+SELECT tbl, col, op, k, dvs_agree(tbl, format('%I %s %L', col, op, k)) AS ok
+  FROM dvs_cases;
+SELECT count(*) AS ncases, bool_and(ok) AS collapsed_all_agree FROM dvs_res;
+ ncases | collapsed_all_agree 
+--------+---------------------
+     50 | t
+(1 row)
+
+SELECT op, k AS disagreeing_constant
+  FROM dvs_res WHERE NOT ok ORDER BY op, k;
+ op | disagreeing_constant 
+----+----------------------
+(0 rows)
+
+DROP TABLE dvs_res;
+DROP TABLE dvtm;
+-- A FUSED query narrowed by a text docvalues qual (the section (4) pattern):
+-- the qual is borrowed as the fused scan's gate (Index Cond, not Filter), every
+-- returned row satisfies it, and the narrowed answer is a subset of the
+-- unnarrowed one.
+CREATE TABLE dvf (id int, body wdoc, emb wvec(4), cat text COLLATE "C");
+INSERT INTO dvf
+SELECT g,
+       to_wdoc('common doc ' || (g % 5)),
+       ('[' || g || ',' || (g % 4) || ',' || (g % 7) || ',1]')::wvec,
+       'c' || lpad((g % 40)::text, 2, '0')
+FROM generate_series(1, 500) g;
+CREATE INDEX dvf_w ON dvf USING weave (body, emb, cat text_docval_ops)
+    WITH (metric = ip);
+ANALYZE dvf;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM dvf
+ WHERE cat < 'c08'
+ ORDER BY fuse(body <=> 'common'::wquery, emb <#> '[1,1,1,1]'::wvec) LIMIT 10;
+                                                     QUERY PLAN                                                     
+--------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using dvf_w on dvf
+         Index Cond: (cat < 'c08'::text)
+         Order By: ((body <=> '''common'''::wquery) AND (emb <#> '[1,1,1,1]'::wvec) AND (body <~> '{1,1}'::real[]))
+(4 rows)
+
+CREATE TEMP TABLE dvf_gated AS
+SELECT id FROM dvf
+ WHERE cat < 'c08'
+ ORDER BY fuse(body <=> 'common'::wquery, emb <#> '[1,1,1,1]'::wvec) LIMIT 10;
+CREATE TEMP TABLE dvf_ungated AS
+SELECT id FROM dvf
+ ORDER BY fuse(body <=> 'common'::wquery, emb <#> '[1,1,1,1]'::wvec) LIMIT 500;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*) AS gated_rows FROM dvf_gated;
+ gated_rows 
+------------
+         10
+(1 row)
+
+SELECT count(*) AS gated_rows_failing_qual
+  FROM dvf_gated JOIN dvf USING (id)
+ WHERE NOT (dvf.cat < 'c08');
+ gated_rows_failing_qual 
+-------------------------
+                       0
+(1 row)
+
+SELECT NOT EXISTS (SELECT 1 FROM dvf_gated
+                    WHERE id NOT IN (SELECT id FROM dvf_ungated))
+       AS gated_is_subset_of_ungated;
+ gated_is_subset_of_ungated 
+----------------------------
+ t
+(1 row)
+
+DROP TABLE dvf_gated, dvf_ungated;
+DROP TABLE dvf;
+DROP TABLE dvs_cases;
+-- ---------------------------------------------------------------------------
+-- 11. several docvalues keys on one scan AND (doc/GAPS.md G54).  A range
+-- `price > 10 AND price < 20` is TWO Index Cond keys on the one docvalues
+-- column.  weave_rescan() used to capture only the first and drop the second
+-- with no recheck, so the scan returned every row above 10 (2670 here instead
+-- of 270).  Every route that reaches weave_docvals_gate() is covered: the plain
+-- Index Scan (dvs_agree), the bitmap scan (getbitmap), and the fused pass; and
+-- both key domains, int8 and text.  Each agreement is index == heap as a SET.
+-- ---------------------------------------------------------------------------
+CREATE TABLE dvk (id int, body wdoc, emb wvec(4), price bigint);
+-- price = g % 100 over 3000 rows: each value 0..99 appears 30 times
+INSERT INTO dvk
+SELECT g,
+       to_wdoc('common w' || (g % 7)),
+       ('[' || g || ',' || (g % 4) || ',' || (g % 7) || ',1]')::wvec,
+       (g % 100)::bigint
+FROM generate_series(1, 3000) g;
+CREATE INDEX dvk_w ON dvk USING weave (body, emb, price int8_docval_ops)
+    WITH (metric = ip);
+ANALYZE dvk;
+-- plan shape: BOTH keys are in the Index Cond (neither is a Filter)
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM dvk WHERE price > 10::int8 AND price < 20::int8;
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Aggregate
+   ->  Index Scan using dvk_w on dvk
+         Index Cond: ((price > '10'::bigint) AND (price < '20'::bigint))
+(3 rows)
+
+-- the reported case, through the index: 9 values x 30 rows
+SELECT count(*) AS range_10_20 FROM dvk WHERE price > 10::int8 AND price < 20::int8;
+ range_10_20 
+-------------
+         270
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT dvs_agree('dvk', 'price > 10 AND price < 20')      AS open_range_agrees,
+       dvs_agree('dvk', 'price >= 10 AND price <= 10')    AS closed_point_agrees,
+       dvs_agree('dvk', 'price > 50 AND price < 40')      AS empty_range_agrees,
+       dvs_agree('dvk', 'price = 5 AND price = 6')        AS two_eq_agrees,
+       dvs_agree('dvk', 'price >= 0 AND price < 100 AND price > 98')
+                                                          AS three_keys_agree,
+       dvs_agree('dvk', $$body @@@ 'common'::wquery AND price > 10 AND price < 20$$)
+                                                          AS lex_and_range_agrees;
+ open_range_agrees | closed_point_agrees | empty_range_agrees | two_eq_agrees | three_keys_agree | lex_and_range_agrees 
+-------------------+---------------------+--------------------+---------------+------------------+----------------------
+ t                 | t                   | t                  | t             | t                | t
+(1 row)
+
+-- a NULL runtime key in the conjunction empties all of it
+SET plan_cache_mode = force_generic_plan;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+PREPARE dvk_null(bigint) AS
+    SELECT count(*) FROM dvk WHERE price > $1 AND price < 20;
+EXECUTE dvk_null(NULL);
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE dvk_null(10);
+ count 
+-------
+   270
+(1 row)
+
+DEALLOCATE dvk_null;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET plan_cache_mode;
+-- the BITMAP route (weave_getbitmap): a docvalues-only bitmap goes out
+-- non-lossy, so the executor does not recheck and a dropped key would show
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = on;
+EXPLAIN (COSTS OFF) SELECT id FROM dvk WHERE price > 10 AND price < 20;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Bitmap Heap Scan on dvk
+   Recheck Cond: ((price > 10) AND (price < 20))
+   ->  Bitmap Index Scan on dvk_w
+         Index Cond: ((price > 10) AND (price < 20))
+(4 rows)
+
+CREATE TEMP TABLE dvk_bm AS SELECT id FROM dvk WHERE price > 10 AND price < 20;
+RESET enable_seqscan;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE dvk_heap AS SELECT id FROM dvk WHERE price > 10 AND price < 20;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+SELECT (SELECT count(*) FROM dvk_bm) AS bitmap_rows,
+       NOT EXISTS (SELECT id FROM dvk_bm EXCEPT SELECT id FROM dvk_heap
+                   UNION ALL
+                   SELECT id FROM dvk_heap EXCEPT SELECT id FROM dvk_bm)
+       AS bitmap_agrees;
+ bitmap_rows | bitmap_agrees 
+-------------+---------------
+         270 | t
+(1 row)
+
+DROP TABLE dvk_bm, dvk_heap;
+-- the FUSED pass (the section (4) pattern): both keys are borrowed as the
+-- fused scan's gate, and no returned row violates either bound
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM dvk
+ WHERE body @@@ 'common'::wquery AND price > 10 AND price < 20
+ ORDER BY fuse(body <=> 'common'::wquery, emb <#> '[1,1,1,1]'::wvec) LIMIT 50;
+                                                     QUERY PLAN                                                     
+--------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using dvk_w on dvk
+         Index Cond: ((body @@@ '''common'''::wquery) AND (price > 10) AND (price < 20))
+         Order By: ((body <=> '''common'''::wquery) AND (emb <#> '[1,1,1,1]'::wvec) AND (body <~> '{1,1}'::real[]))
+(4 rows)
+
+CREATE TEMP TABLE dvk_gated AS
+SELECT id FROM dvk
+ WHERE body @@@ 'common'::wquery AND price > 10 AND price < 20
+ ORDER BY fuse(body <=> 'common'::wquery, emb <#> '[1,1,1,1]'::wvec) LIMIT 50;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*) AS fused_rows FROM dvk_gated;
+ fused_rows 
+------------
+         50
+(1 row)
+
+SELECT count(*) AS fused_rows_failing_range
+  FROM dvk_gated JOIN dvk USING (id)
+ WHERE NOT (dvk.price > 10 AND dvk.price < 20);
+ fused_rows_failing_range 
+--------------------------
+                        0
+(1 row)
+
+DROP TABLE dvk_gated;
+DROP TABLE dvk;
+-- the TEXT domain: a two-key range on a text_docval_ops column
+CREATE TABLE dvkt (id int, body wdoc, cat text COLLATE "C");
+INSERT INTO dvkt
+SELECT g, to_wdoc('common w' || (g % 7)),
+       CASE WHEN g % 19 = 0 THEN NULL
+            ELSE 'c' || lpad((g % 40)::text, 2, '0') END
+FROM generate_series(1, 2000) g;
+CREATE INDEX dvkt_w ON dvkt USING weave (body wdoc_lex_ops, cat text_docval_ops);
+ANALYZE dvkt;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM dvkt WHERE cat >= 'c10' AND cat < 'c20';
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Index Scan using dvkt_w on dvkt
+   Index Cond: ((cat >= 'c10'::text) AND (cat < 'c20'::text))
+(2 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT dvs_agree('dvkt', $$cat >= 'c10' AND cat < 'c20'$$)  AS text_range_agrees,
+       dvs_agree('dvkt', $$cat > 'c20' AND cat < 'c10'$$)   AS text_empty_agrees,
+       dvs_agree('dvkt', $$cat >= 'c10' AND cat <= 'c10'$$) AS text_point_agrees;
+ text_range_agrees | text_empty_agrees | text_point_agrees 
+-------------------+-------------------+-------------------
+ t                 | t                 | t
+(1 row)
+
+DROP TABLE dvkt;
+DROP FUNCTION dvs_agree(text, text);
+-- ---------------------------------------------------------------------------
+-- 12. a docvalues key on an ORDERING scan the gate does not feed
+-- (doc/GAPS.md G55).  `WHERE price < c ORDER BY body <=> q` plans as ONE Index
+-- Scan with the price key in the Index Cond, but the BM25 ranking pass never
+-- consults the docvalues gate; the executor re-evaluates an Index Cond only
+-- when the AM asks (xs_recheck), and before the fix this returned every row
+-- the ranking reached -- 2400 of 3000 violating the predicate.  The answer is
+-- the same SET as the heap's, and no returned row violates the predicate.
+-- ---------------------------------------------------------------------------
+CREATE TABLE dvo (id int, body wdoc, price int8, cat text COLLATE "C");
+INSERT INTO dvo
+SELECT g, to_wdoc('common w' || (g % 7)), g % 100, 'c' || lpad((g % 40)::text, 2, '0')
+FROM generate_series(1, 3000) g;
+CREATE INDEX dvo_p ON dvo USING weave (body wdoc_lex_ops, price int8_docval_ops);
+ANALYZE dvo;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM dvo WHERE price < 20 ORDER BY body <=> 'common'::wquery LIMIT 5000;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Limit
+   ->  Index Scan using dvo_p on dvo
+         Index Cond: (price < 20)
+         Order By: (body <=> '''common'''::wquery)
+(4 rows)
+
+CREATE TEMP TABLE dvo_r AS
+SELECT id, price FROM dvo WHERE price < 20 ORDER BY body <=> 'common'::wquery LIMIT 5000;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*) AS ordered_rows,
+       count(*) FILTER (WHERE price >= 20) AS ordered_rows_violating,
+       (SELECT count(*) FROM dvo WHERE price < 20) AS heap_rows
+  FROM dvo_r;
+ ordered_rows | ordered_rows_violating | heap_rows 
+--------------+------------------------+-----------
+          600 |                      0 |       600
+(1 row)
+
+DROP TABLE dvo_r;
+DROP INDEX dvo_p;
+-- the same on a text facet
+CREATE INDEX dvo_c ON dvo USING weave (body wdoc_lex_ops, cat text_docval_ops);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE dvo_r AS
+SELECT id, cat FROM dvo WHERE cat < 'c05' ORDER BY body <=> 'common'::wquery LIMIT 5000;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*) AS ordered_rows,
+       count(*) FILTER (WHERE cat >= 'c05') AS ordered_rows_violating,
+       (SELECT count(*) FROM dvo WHERE cat < 'c05') AS heap_rows
+  FROM dvo_r;
+ ordered_rows | ordered_rows_violating | heap_rows 
+--------------+------------------------+-----------
+          375 |                      0 |       375
+(1 row)
+
+DROP TABLE dvo_r;
+DROP TABLE dvo;
+-- ---------------------------------------------------------------------------
+-- 13. keys the scan does not honour are rechecked (doc/GAPS.md G56) and
+-- deleted docvalues do not leak (G57).
+--
+-- G56: an Index Scan re-evaluates an Index Cond only when the AM asks
+-- (xs_recheck).  Two shapes were dropped with no recheck: a restriction `@@@`
+-- beside a DIFFERENT `<=>` query (the ORDER BY dispatch overwrote the
+-- restriction query -- measured 1000 rows returned, every one violating), and
+-- a SECOND `@@@` key (it reached only a flag the lexical routes never read --
+-- measured 1000 rows for a 1-row answer).  Each answer below is compared with
+-- the heap's, and the violating count must be zero.  An `<=>` ordering scan
+-- emits only rows its ORDER BY query ranks, so `@@@ 'alpha' ORDER BY <=> 'beta'`
+-- (no row holds both) is correct at zero rows, and the ORDER BY 'common' form
+-- is the one whose count is the heap's.
+--
+-- G57: a bolt's docvalues store keeps a deleted row's value; after VACUUM frees
+-- the slot and an INSERT reuses the TID, the stale value was reported for the
+-- new tuple (measured: `price < 50` 932 rows via the index, 500 on the heap).
+-- The nested-loop rescans at the end also exercise the G59 frees: every outer
+-- row rescans the inner index scan, which releases the previous match set.
+-- Alpha rows are the even ids.
+-- ---------------------------------------------------------------------------
+CREATE TABLE pr (id int, body wdoc, price int8);
+INSERT INTO pr
+SELECT g,
+       to_wdoc(CASE WHEN g % 2 = 0 THEN 'alpha' ELSE 'beta' END || ' common w' || g),
+       g % 100
+FROM generate_series(1, 2000) g;
+CREATE INDEX pr_w ON pr USING weave (body wdoc_lex_ops, price int8_docval_ops);
+ANALYZE pr;
+-- G56a: a restriction `@@@` beside an ordering `<=>` over another query
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM pr WHERE body @@@ 'alpha'::wquery
+ORDER BY body <=> 'beta'::wquery LIMIT 5000;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Limit
+   ->  Index Scan using pr_w on pr
+         Index Cond: (body @@@ '''alpha'''::wquery)
+         Order By: (body <=> '''beta'''::wquery)
+(4 rows)
+
+CREATE TEMP TABLE pr_r AS
+SELECT id FROM pr WHERE body @@@ 'alpha'::wquery
+ORDER BY body <=> 'beta'::wquery LIMIT 5000;
+CREATE TEMP TABLE pr_c AS
+SELECT id FROM pr WHERE body @@@ 'alpha'::wquery
+ORDER BY body <=> 'common'::wquery LIMIT 5000;
+-- the flagship shape (the same query on both sides) keeps its answer
+CREATE TEMP TABLE pr_s AS
+SELECT id FROM pr WHERE body @@@ 'alpha'::wquery
+ORDER BY body <=> 'alpha'::wquery LIMIT 5000;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT (SELECT count(*) FROM pr_r) AS other_query_rows,
+       (SELECT count(*) FROM pr_r WHERE id % 2 = 1) AS other_query_violating,
+       (SELECT count(*) FROM pr_c) AS common_rows,
+       (SELECT count(*) FROM pr_c WHERE id % 2 = 1) AS common_violating,
+       (SELECT count(*) FROM pr_s) AS same_query_rows,
+       (SELECT count(*) FROM pr_s WHERE id % 2 = 1) AS same_query_violating,
+       (SELECT count(*) FROM pr WHERE id % 2 = 0) AS heap_rows;
+ other_query_rows | other_query_violating | common_rows | common_violating | same_query_rows | same_query_violating | heap_rows 
+------------------+-----------------------+-------------+------------------+-----------------+----------------------+-----------
+                0 |                     0 |        1000 |                0 |            1000 |                    0 |      1000
+(1 row)
+
+DROP TABLE pr_r, pr_c, pr_s;
+-- G56b: two `@@@` keys on one scan -- plain Index Scan, then bitmap
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM pr WHERE body @@@ 'alpha'::wquery AND body @@@ 'w10'::wquery;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Aggregate
+   ->  Index Scan using pr_w on pr
+         Index Cond: ((body @@@ '''alpha'''::wquery) AND (body @@@ '''w10'''::wquery))
+(3 rows)
+
+SELECT count(*) AS two_keys_index
+  FROM pr WHERE body @@@ 'alpha'::wquery AND body @@@ 'w10'::wquery;
+ two_keys_index 
+----------------
+              1
+(1 row)
+
+SELECT count(*) AS two_keys_and_price_index
+  FROM pr WHERE body @@@ 'alpha'::wquery AND body @@@ 'w10'::wquery AND price < 50;
+ two_keys_and_price_index 
+--------------------------
+                        1
+(1 row)
+
+SET enable_indexscan = off;
+RESET enable_bitmapscan;
+SELECT count(*) AS two_keys_bitmap
+  FROM pr WHERE body @@@ 'alpha'::wquery AND body @@@ 'w10'::wquery;
+ two_keys_bitmap 
+-----------------
+               1
+(1 row)
+
+RESET enable_seqscan;
+SET enable_bitmapscan = off;
+SELECT count(*) AS two_keys_heap
+  FROM pr WHERE body @@@ 'alpha'::wquery AND body @@@ 'w10'::wquery;
+ two_keys_heap 
+---------------
+             1
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+-- G57: delete half, VACUUM (tombstones the docids, frees the heap slots), and
+-- re-insert into the freed slots with a value no predicate below admits
+DELETE FROM pr WHERE id <= 1000;
+VACUUM pr;
+INSERT INTO pr
+SELECT g,
+       to_wdoc(CASE WHEN g % 2 = 0 THEN 'alpha' ELSE 'beta' END || ' common w' || g),
+       999
+FROM generate_series(2001, 3000) g;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM pr WHERE price < 50::int8;
+                 QUERY PLAN                 
+--------------------------------------------
+ Aggregate
+   ->  Index Scan using pr_w on pr
+         Index Cond: (price < '50'::bigint)
+(3 rows)
+
+SELECT count(*) AS after_reuse_index FROM pr WHERE price < 50::int8;
+ after_reuse_index 
+-------------------
+               500
+(1 row)
+
+SELECT count(*) AS after_reuse_lex_index
+  FROM pr WHERE body @@@ 'common'::wquery AND price < 50::int8;
+ after_reuse_lex_index 
+-----------------------
+                   500
+(1 row)
+
+SET enable_indexscan = off;
+RESET enable_bitmapscan;
+SELECT count(*) AS after_reuse_bitmap FROM pr WHERE price < 50::int8;
+ after_reuse_bitmap 
+--------------------
+                500
+(1 row)
+
+RESET enable_seqscan;
+SET enable_bitmapscan = off;
+SELECT count(*) AS after_reuse_heap FROM pr WHERE price < 50::int8;
+ after_reuse_heap 
+------------------
+              500
+(1 row)
+
+SELECT count(*) AS after_reuse_lex_heap
+  FROM pr WHERE body @@@ 'common'::wquery AND price < 50::int8;
+ after_reuse_lex_heap 
+----------------------
+                  500
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+-- nested-loop rescans with a docvalues key, alone and ANDed with `@@@`: the
+-- inner scan is rescanned once per k, and every k must agree with the heap
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT k, c.n FROM generate_series(1, 20) k,
+       LATERAL (SELECT count(*) AS n FROM pr WHERE price < k) c;
+                QUERY PLAN                
+------------------------------------------
+ Nested Loop
+   ->  Function Scan on generate_series k
+   ->  Aggregate
+         ->  Index Scan using pr_w on pr
+               Index Cond: (price < k.k)
+(5 rows)
+
+CREATE TEMP TABLE pr_ni AS
+SELECT k, c.n, c2.n AS n2 FROM generate_series(1, 20) k,
+       LATERAL (SELECT count(*) AS n FROM pr WHERE price < k) c,
+       LATERAL (SELECT count(*) AS n FROM pr
+                 WHERE body @@@ 'alpha'::wquery AND price < k) c2;
+SET enable_indexscan = off;
+RESET enable_bitmapscan;
+CREATE TEMP TABLE pr_nb AS
+SELECT k, c.n, c2.n AS n2 FROM generate_series(1, 20) k,
+       LATERAL (SELECT count(*) AS n FROM pr WHERE price < k) c,
+       LATERAL (SELECT count(*) AS n FROM pr
+                 WHERE body @@@ 'alpha'::wquery AND price < k) c2;
+RESET enable_seqscan;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE pr_nh AS
+SELECT k, c.n, c2.n AS n2 FROM generate_series(1, 20) k,
+       LATERAL (SELECT count(*) AS n FROM pr WHERE price < k) c,
+       LATERAL (SELECT count(*) AS n FROM pr
+                 WHERE body @@@ 'alpha'::wquery AND price < k) c2;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+SELECT (SELECT count(*) FROM pr_nh) AS outer_rows,
+       (SELECT count(*) FROM (SELECT * FROM pr_ni EXCEPT SELECT * FROM pr_nh) d)
+           AS index_disagreements,
+       (SELECT count(*) FROM (SELECT * FROM pr_nb EXCEPT SELECT * FROM pr_nh) d)
+           AS bitmap_disagreements,
+       (SELECT sum(n) FROM pr_nh) AS heap_total;
+ outer_rows | index_disagreements | bitmap_disagreements | heap_total 
+------------+---------------------+----------------------+------------
+         20 |                   0 |                    0 |       2100
+(1 row)
+
+DROP TABLE pr_ni, pr_nb, pr_nh;
+DROP TABLE pr;
+-- a cgram `@~` key beside an ordering `<=>`: no ranking pass consults the
+-- pattern, so it is rechecked (G56).  sql/cgram.sql's index shape.
+CREATE TABLE prg (id int, d wdoc, body text);
+INSERT INTO prg
+SELECT g, to_wdoc('simple', b), b
+FROM (SELECT g, CASE WHEN g % 2 = 0 THEN 'alpha' ELSE 'beta' END
+                || ' common w' || g AS b
+        FROM generate_series(1, 2000) g) s;
+CREATE INDEX prg_idx ON prg USING weave (d, body gram_ops);
+ANALYZE prg;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM prg WHERE body @~ '%alpha%'
+ORDER BY d <=> 'common'::wquery LIMIT 5000;
+                   QUERY PLAN                   
+------------------------------------------------
+ Limit
+   ->  Index Scan using prg_idx on prg
+         Index Cond: (body @~ '%alpha%'::text)
+         Order By: (d <=> '''common'''::wquery)
+(4 rows)
+
+CREATE TEMP TABLE prg_r AS
+SELECT id FROM prg WHERE body @~ '%alpha%'
+ORDER BY d <=> 'common'::wquery LIMIT 5000;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*) AS cgram_ordered_rows,
+       count(*) FILTER (WHERE id % 2 = 1) AS cgram_ordered_violating,
+       (SELECT count(*) FROM prg WHERE body LIKE '%alpha%') AS heap_rows
+  FROM prg_r;
+ cgram_ordered_rows | cgram_ordered_violating | heap_rows 
+--------------------+-------------------------+-----------
+               1000 |                       0 |      1000
+(1 row)
+
+DROP TABLE prg_r;
+DROP TABLE prg;
+-- ---------------------------------------------------------------------------
+-- 14. the remaining routes a restriction key reaches (review of G55/G56):
+-- a docvalues key beside a VECTOR `<#>` ordering and an EDIT-DISTANCE `<@>`
+-- ordering (the recheck chain's final arm), a TEXT docvalues key on the bitmap
+-- route, two `@@@` keys under a fused ORDER BY, and two `@~` keys.  Each is
+-- compared with the heap: index rows outside the heap answer must be zero,
+-- and where the ordering ranks every row the counts must match too.
+-- ---------------------------------------------------------------------------
+CREATE TABLE rk (id int, body wdoc, emb wvec(4), price int8, cat text, raw text);
+INSERT INTO rk
+SELECT g,
+       to_wdoc('simple', CASE WHEN g % 2 = 0 THEN 'alpha' ELSE 'beta' END
+                         || ' common w' || g),
+       ('[' || (g % 13) || ',' || (g % 7) || ',' || (g % 5) || ',1]')::wvec,
+       g % 100,
+       'c' || lpad((g % 40)::text, 2, '0'),
+       CASE WHEN g % 2 = 0 THEN 'alpha' ELSE 'beta' END || ' common w' || g
+FROM generate_series(1, 2000) g;
+-- one docvalues column per index in this version, and one weave index per
+-- table keeps the plan unambiguous: the text key and the cgram keys get their
+-- own copies of the same rows
+CREATE TABLE rkt AS SELECT id, body, cat FROM rk;
+CREATE TABLE rkg AS SELECT id, body, raw FROM rk;
+CREATE INDEX rk_w ON rk USING weave (body wdoc_lex_ops, emb, price int8_docval_ops)
+    WITH (metric = ip);
+CREATE INDEX rkt_w ON rkt USING weave (body wdoc_lex_ops, cat text_docval_ops);
+CREATE INDEX rkg_w ON rkg USING weave (body, raw gram_ops);
+ANALYZE rk;
+ANALYZE rkt;
+ANALYZE rkg;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- vector `<#>` ranks every row, so the answer is exactly the heap's
+EXPLAIN (COSTS OFF)
+SELECT id FROM rk WHERE price < 20 ORDER BY emb <#> '[1,1,1,1]'::wvec LIMIT 5000;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Limit
+   ->  Index Scan using rk_w on rk
+         Index Cond: (price < 20)
+         Order By: (emb <#> '[1,1,1,1]'::wvec)
+(4 rows)
+
+CREATE TEMP TABLE rk_vec AS
+SELECT id FROM rk WHERE price < 20 ORDER BY emb <#> '[1,1,1,1]'::wvec LIMIT 5000;
+-- edit-distance `<@>` beside a docvalues key
+EXPLAIN (COSTS OFF)
+SELECT id FROM rk WHERE price < 20 ORDER BY body <@> 'commn' LIMIT 5000;
+                 QUERY PLAN                 
+--------------------------------------------
+ Limit
+   ->  Index Scan using rk_w on rk
+         Index Cond: (price < 20)
+         Order By: (body <@> 'commn'::text)
+(4 rows)
+
+CREATE TEMP TABLE rk_ed AS
+SELECT id FROM rk WHERE price < 20 ORDER BY body <@> 'commn' LIMIT 5000;
+-- two `@@@` keys under a fused ORDER BY (fusepath borrows the second)
+EXPLAIN (COSTS OFF)
+SELECT id FROM rk WHERE body @@@ 'alpha'::wquery AND body @@@ 'w10'::wquery
+ ORDER BY fuse(body <=> 'common'::wquery, emb <#> '[1,1,1,1]'::wvec) LIMIT 5000;
+                                                     QUERY PLAN                                                     
+--------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using rk_w on rk
+         Index Cond: ((body @@@ '''alpha'''::wquery) AND (body @@@ '''w10'''::wquery))
+         Order By: ((body <=> '''common'''::wquery) AND (emb <#> '[1,1,1,1]'::wvec) AND (body <~> '{1,1}'::real[]))
+(4 rows)
+
+CREATE TEMP TABLE rk_fu AS
+SELECT id FROM rk WHERE body @@@ 'alpha'::wquery AND body @@@ 'w10'::wquery
+ ORDER BY fuse(body <=> 'common'::wquery, emb <#> '[1,1,1,1]'::wvec) LIMIT 5000;
+-- two `@~` keys, plain Index Scan
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rkg WHERE raw @~ '%alpha%' AND raw @~ '%w10%';
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Aggregate
+   ->  Index Scan using rkg_w on rkg
+         Index Cond: ((raw @~ '%alpha%'::text) AND (raw @~ '%w10%'::text))
+(3 rows)
+
+CREATE TEMP TABLE rk_cg AS
+SELECT id FROM rkg WHERE raw @~ '%alpha%' AND raw @~ '%w10%';
+-- TEXT docvalues key on the bitmap route, alone and beside `@@@`
+SET enable_indexscan = off;
+RESET enable_bitmapscan;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM rkt WHERE body @@@ 'alpha'::wquery AND cat < 'c10';
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on rkt
+         Recheck Cond: ((body @@@ '''alpha'''::wquery) AND (cat < 'c10'::text))
+         ->  Bitmap Index Scan on rkt_w
+               Index Cond: ((body @@@ '''alpha'''::wquery) AND (cat < 'c10'::text))
+(5 rows)
+
+CREATE TEMP TABLE rk_bt AS
+SELECT id FROM rkt WHERE body @@@ 'alpha'::wquery AND cat < 'c10';
+CREATE TEMP TABLE rk_bt2 AS
+SELECT id FROM rkt WHERE cat >= 'c10' AND cat <= 'c12';
+RESET enable_indexscan;
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE rk_h AS
+SELECT id,
+       price < 20 AS p20,
+       body @@@ 'alpha'::wquery AND body @@@ 'w10'::wquery AS two_lex,
+       raw LIKE '%alpha%' AND raw LIKE '%w10%' AS two_gram,
+       body @@@ 'alpha'::wquery AND cat < 'c10' AS lex_text,
+       cat >= 'c10' AND cat <= 'c12' AS text_range
+  FROM rk;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+SELECT (SELECT count(*) FROM rk_vec) AS vec_rows,
+       (SELECT count(*) FROM rk_vec JOIN rk_h USING (id) WHERE NOT p20) AS vec_violating,
+       (SELECT count(*) FROM rk_ed JOIN rk_h USING (id) WHERE NOT p20) AS ed_violating,
+       (SELECT count(*) FROM rk_ed) <= (SELECT count(*) FROM rk_h WHERE p20) AS ed_within,
+       (SELECT count(*) FROM rk_fu) AS fu_rows,
+       (SELECT count(*) FROM rk_fu JOIN rk_h USING (id) WHERE NOT two_lex) AS fu_violating,
+       (SELECT count(*) FROM rk_cg) AS cg_rows,
+       (SELECT count(*) FROM rk_cg JOIN rk_h USING (id) WHERE NOT two_gram) AS cg_violating,
+       (SELECT count(*) FROM rk_bt) AS bt_rows,
+       (SELECT count(*) FROM rk_bt JOIN rk_h USING (id) WHERE NOT lex_text) AS bt_violating,
+       (SELECT count(*) FROM rk_bt2) AS bt2_rows,
+       (SELECT count(*) FROM rk_bt2 JOIN rk_h USING (id) WHERE NOT text_range) AS bt2_violating;
+ vec_rows | vec_violating | ed_violating | ed_within | fu_rows | fu_violating | cg_rows | cg_violating | bt_rows | bt_violating | bt2_rows | bt2_violating 
+----------+---------------+--------------+-----------+---------+--------------+---------+--------------+---------+--------------+----------+---------------
+      400 |             0 |            0 | t         |       1 |            0 |      56 |            0 |     250 |            0 |      150 |             0
+(1 row)
+
+SELECT count(*) FILTER (WHERE p20) AS heap_p20,
+       count(*) FILTER (WHERE two_lex) AS heap_two_lex,
+       count(*) FILTER (WHERE two_gram) AS heap_two_gram,
+       count(*) FILTER (WHERE lex_text) AS heap_lex_text,
+       count(*) FILTER (WHERE text_range) AS heap_text_range
+  FROM rk_h;
+ heap_p20 | heap_two_lex | heap_two_gram | heap_lex_text | heap_text_range 
+----------+--------------+---------------+---------------+-----------------
+      400 |            1 |            56 |           250 |             150
+(1 row)
+
+DROP TABLE rk_vec, rk_ed, rk_fu, rk_cg, rk_bt, rk_bt2, rk_h;
+DROP TABLE rk, rkt, rkg;

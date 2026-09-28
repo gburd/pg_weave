@@ -650,6 +650,7 @@ typedef struct WeaveFusePathOids
 	Oid			dv_family;		/* int8_docval_ops, or InvalidOid on an extension
 								 * version that predates it -- then no docvalues
 								 * clause is borrowed and the qual stays a filter */
+	Oid			dv_text_family; /* text_docval_ops (0.27.0), InvalidOid before */
 } WeaveFusePathOids;
 
 static WeaveFusePathOids weave_fuse_path_oids = {InvalidOid};
@@ -731,6 +732,11 @@ weave_fuse_path_resolve(void)
 								   list_make2(makeString(nspname),
 											  makeString("int8_docval_ops")),
 								   true);
+	/* text_docval_ops arrived in 0.27.0: optional for the same reason. */
+	n.dv_text_family = get_opfamily_oid(n.amoid,
+										list_make2(makeString(nspname),
+												   makeString("text_docval_ops")),
+										true);
 
 	if (!OidIsValid(n.match_op) || !OidIsValid(n.lex_op) ||
 		!OidIsValid(n.lex_commop) || !OidIsValid(n.edist_op) ||
@@ -1124,7 +1130,8 @@ weave_fuse_weights_expr(FuncExpr *fcall, int nscores)
  *
  * ALL-OR-NOTHING, and only for clauses the fused pass HONOURS: `@@@` on the
  * lexical column, and a comparison on the docvalues column (any int8_docval_ops
- * strategy).  The fused pass turns both into the run's required gate set (the
+ * or text_docval_ops strategy).  The fused pass turns both into the run's
+ * required gate set (the
  * lexical match set intersected with the docvalues match set, weave_fuse_pass()).
  * A borrowed clause it does NOT honour would be a pushed-down qual nobody
  * evaluates -- an Index Scan does not re-check a pushed-down index qual, so rows
@@ -1132,6 +1139,17 @@ weave_fuse_weights_expr(FuncExpr *fcall, int nscores)
  * this refuse the whole list rather than filter it.  `dvcol` is -1 when the index
  * has no docvalues column (or the extension predates it), which reduces this to
  * the lexical-only rule it had before.
+ *
+ * MORE THAN ONE `@@@` CLAUSE IS BORROWED, and that is the one clause the fused
+ * pass does NOT honour: weave_rescan() keeps the first lexical key as the gate's
+ * query and routes every later one to its generic arm, which sets
+ * so->unhonoured (doc/GAPS.md G56).  weave_gettuple() ORs that flag into the
+ * fused route's xs_recheck, so the executor re-evaluates the whole qual and the
+ * answer is exact; the first `@@@` still drives the gate, so the scan stays
+ * accelerated.  Refusing the list instead would cost that acceleration for no
+ * correctness gain -- the recheck is what makes a borrowed-but-unhonoured clause
+ * safe, and it is set by the scan, the only party that knows which keys it
+ * applied.  (Before G56 the second key reached nothing and was silently dropped.)
  */
 static List *
 weave_fuse_borrow_indexclauses(RelOptInfo *rel, IndexOptInfo *index,
@@ -1181,10 +1199,13 @@ weave_fuse_borrow_indexclauses(RelOptInfo *rel, IndexOptInfo *index,
 			else if (dvcol >= 0 && ic->indexcol == dvcol)
 			{
 				/* a docvalues comparison.  Every operator core matches to this
-				 * column is an int8_docval_ops search strategy (1..5), all of
-				 * which weave_rescan()/weave_fuse_pass() honour, so the column
-				 * identity is sufficient -- there is no ordering operator on this
-				 * column to exclude, unlike the lexical one. */
+				 * column is a search strategy (1..5) of its int8_docval_ops or
+				 * text_docval_ops family, all of which weave_rescan()/
+				 * weave_fuse_pass() honour, so the column identity is sufficient
+				 * -- there is no ordering operator on this column to exclude,
+				 * unlike the lexical one.  A text clause's collation needs no
+				 * check here: core only made it an index clause because it equals
+				 * the column's (IndexCollMatchesExprColl, indxpath.c). */
 			}
 			else
 			{
@@ -1270,15 +1291,20 @@ weave_fuse_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		 * The docvalues column, if this index has one and the extension defines
 		 * the opfamily.  Optional: -1 leaves weave_fuse_borrow_indexclauses at its
 		 * lexical-only behaviour, so an index with no docvalues column is
-		 * unaffected.
+		 * unaffected.  int8 and text only: the other fixed-width docvals
+		 * families (int4/int2/float8/date/bool) are honoured by the scan but not
+		 * yet borrowed here, so on them the qual stays a filter -- slower, never
+		 * wrong.
 		 */
-		if (OidIsValid(weave_fuse_path_oids.dv_family))
-			for (col = 0; col < index->nkeycolumns; col++)
-				if (index->opfamily[col] == weave_fuse_path_oids.dv_family)
-				{
-					dvcol = col;
-					break;
-				}
+		for (col = 0; col < index->nkeycolumns; col++)
+			if ((OidIsValid(weave_fuse_path_oids.dv_family) &&
+				 index->opfamily[col] == weave_fuse_path_oids.dv_family) ||
+				(OidIsValid(weave_fuse_path_oids.dv_text_family) &&
+				 index->opfamily[col] == weave_fuse_path_oids.dv_text_family))
+			{
+				dvcol = col;
+				break;
+			}
 
 		req = (WeaveFuseChanReq *) palloc0(nscores * sizeof(WeaveFuseChanReq));	/* alloc-ok: one per fuse() score argument, and fuse() has at most eight */
 		for (i = 0; i < nscores && ok; i++)

@@ -1698,6 +1698,19 @@ extern int64 weave_dv_encode_datum(WeaveDvType dvtype, Datum value);
 extern int64 weave_dv_encode_const(WeaveDvType coltype, Oid consttype, Datum arg);
 
 /*
+ * The WeaveDvCmp (weave/docvals.h) the backend hands the pure dictionary
+ * searches: varstr_cmp() under the collation *(Oid *) ctx.  Declared here, not
+ * static in amscan.c, because a text docvalues dictionary is searched from more
+ * than the scan -- the pending path and the merge / amcheck order verification
+ * (docvals text slice T4/T5) must compare under EXACTLY this function, or the
+ * boundaries one computes disagree with the order the writer sorted by.  ctx
+ * must be the COLUMN's collation, the one the dictionary was built under.
+ * Defined in src/pages/docvals_page.c, next to the writer's sort comparator.
+ */
+extern int	weave_dv_varstr_cmp(void *ctx, const void *a, uint32 alen,
+								const void *b, uint32 blen);
+
+/*
  * Write the weft from the accumulator and return its WEAVE_PK_DOCVALS root, or
  * InvalidBlockNumber when the accumulator is inactive or empty (an absent weft
  * costs zero bytes, including its descriptor slot).  Sorts the (docid, value)

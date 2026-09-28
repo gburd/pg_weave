@@ -2866,8 +2866,13 @@ CREATE INDEX psh_txt ON psh (txt);   -- a NON-weave index on the same rel
 SET enable_seqscan = off;
 -- @@@ with a NON-constant RHS (a subquery-derived value) -> RHS not a plan Const
 SELECT count(*) FROM psh WHERE d @@@ (SELECT 'term1'::wquery);
--- two @@@ quals -> more than one qual, no single-@@@ pushdown
+-- two @@@ quals -> more than one qual, no single-@@@ pushdown.  The english
+-- config stems `body` to `bodi`, so the unstemmed 'body' matches nothing and
+-- the conjunction is 0 on the heap too; this expected once read 50 because the
+-- second @@@ key was silently dropped (doc/GAPS.md G56).  The 'bodi' form is
+-- the positive control: both keys are honoured, 50 rows.
 SELECT count(*) FROM psh WHERE d @@@ 'term1'::wquery AND d @@@ 'body'::wquery;
+SELECT count(*) FROM psh WHERE d @@@ 'term1'::wquery AND d @@@ 'bodi'::wquery;
 -- @@@ on a rel where the matched column also has a non-weave index (index-list walk)
 SELECT count(*) FROM psh WHERE d @@@ 'term1'::wquery;
 -- count over a rel with NO weave index at all (LHS has no matching weave index)
