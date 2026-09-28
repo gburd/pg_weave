@@ -146,9 +146,12 @@ contract, §9 build/flush/merge, §11 step 4/5).
   byte-identical layout).
 - Produces:
   - `WEAVE_DV_T_TEXT`; `weave_dv_type_for_oid(TEXTOID | VARCHAROID) → WEAVE_DV_T_TEXT`.
-  - `WeaveDocvalsAccum` gains `Oid collation`, `char *tbytes; Size tlen, tcap; uint32 *toff`
-    (per-row start offset into `tbytes`, parallel to the existing docid/isnull arrays; row i's
-    bytes are `tbytes[toff[i] .. toff[i+1]or tlen)`).
+  - `WeaveDocvalsAccum` gains `Oid collation`, `char *tbytes; Size tlen, tcap; uint64 *toff;
+    uint32 *tlenv` (per-row start offset into `tbytes` -- uint64 because the arena is
+    corpus-scale and may pass 4 GB -- and a parallel per-row byte length, both in lockstep with
+    the existing docid/value/isnull arrays; row i's bytes are
+    `tbytes[toff[i] .. toff[i] + tlenv[i])`, and a NULL row has `tlenv` 0 and is told from `''`
+    only by `isnull`).
   - `void weave_docvals_accum_init(WeaveDocvalsAccum *acc, MemoryContext ctx, bool active, WeaveDvType dvtype, Oid collation)` (new param; update all callers).
   - `void weave_docvals_accum_add_text(WeaveDocvalsAccum *acc, uint64 docid, const char *p, uint32 len, bool isnull)`; `weave_docvals_accum_add` dispatches to it for TEXT (detoast with `PG_DETOAST_DATUM_PACKED`, `VARDATA_ANY`/`VARSIZE_ANY_EXHDR`).
   - `weave_docvals_write_weft` for TEXT: sort rows by docid (carry isnull + byte span), then
@@ -235,6 +238,15 @@ fills `rec.hasdv/dvslot/docval` (grep `dvslot =`), `src/am/amscan.c` pending loo
   `add_text(docid, dict_entry(ord), isnull)`; the writer then builds the union dictionary. A v3
   input merged into an int8 accumulator (or vice versa) → `elog(ERROR)` (impossible by
   construction).
+
+> **Pulled forward into Task 2 (2026-09-28):** the `weave_docvals_merge_append` text mode and
+> the merge accumulator-init sites (TEXT + collation). Reason: the end of a multi-segment
+> CREATE INDEX collapses its segments through the merge (`weave_build_finalize` ->
+> `weave_merge_segments`), so an interim "don't carry text through the merge" guard silently
+> dropped the whole docvalues weft of any text index built as more than one segment. Task 5
+> keeps: the amcheck dictionary-order verification, the merge regression (Step 1), the shape
+> guard (Step 2), and the copy-the-ordinal mutation (Step 4).
+
 - `weave_check` deep: for a v3 store, `varstr_cmp(D[i], D[i+1]) < 0` for all i under the
   column collation; report "docvalues dictionary is not strictly ascending" otherwise.
 

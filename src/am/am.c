@@ -4165,6 +4165,13 @@ static const struct
 	{"int2_docval_ops", WEAVE_WK_DOCVALS},
 	{"date_docval_ops", WEAVE_WK_DOCVALS},
 	{"bool_docval_ops", WEAVE_WK_DOCVALS},
+	/*
+	 * Docvals text slice (doc/plans/2026-09-28-docvals-text-slice.md, ext
+	 * 0.27.0): the same channel for text/varchar, but NOT through the int64
+	 * encode -- a text column stores per-segment dictionary ordinals (store v3,
+	 * weave/docvals.h), which weave_dv_type_for_oid() routes by column type.
+	 */
+	{"text_docval_ops", WEAVE_WK_DOCVALS},
 };
 
 /*

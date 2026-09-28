@@ -1572,18 +1572,20 @@ extern const void *weave_docvals_load(Relation index, BlockNumber root,
 									  int want_kind);
 
 /*
- * Build-time accumulator for one int8 docvalues column, the mirror of
- * WeaveVecAccum (include/weave/vector.h): the build callback appends one
- * (docid, value) pair per indexed document in HEAP-SCAN order, and
- * weave_docvals_write_weft() sorts them into strictly-ascending docid order and
- * lays the store down.  It is by value in WeaveBuildState, so its footprint is
- * counted by the build's memory budget like the vector and cgram accumulators.
+ * Build-time accumulator for one docvalues column (an int8-encoded scalar, or
+ * text), the mirror of WeaveVecAccum (include/weave/vector.h): the build
+ * callback appends one (docid, value) pair per indexed document in HEAP-SCAN
+ * order -- for text, one (docid, bytes) row -- and weave_docvals_write_weft()
+ * sorts them into strictly-ascending docid order and lays the store down (for
+ * text, building the segment's dictionary first).  It is by value in
+ * WeaveBuildState, so its footprint is counted by the build's memory budget like
+ * the vector and cgram accumulators.
  *
  * INACTIVE (active == false) on every path that has no docvalues to collect: an
- * index with no docvalues column, and -- in this v1 slice -- the merge and the
- * post-build insert/pending-flush paths, whose rows therefore carry no docvalues
- * gate (the documented G29-class limitation, doc/specs/DOCVALS_CHANNEL.md sect.
- * 11).  A NULL value is RECORDED in a null bitmap (store v2): the pair still
+ * index with no docvalues column, and a merge none of whose inputs carries a
+ * docvalues weft.  A merge feeds it from the inputs' wefts
+ * (weave_docvals_merge_append); a text input is fed back as dictionary-entry
+ * bytes so the output is re-dictionaried.  A NULL value is RECORDED in a null bitmap (store v2): the pair still
  * occupies its dense docid slot with a placeholder value, and the bitmap masks
  * that docid out of every comparison gate.
  */
@@ -1593,10 +1595,17 @@ typedef struct WeaveDocvalsAccum
 	bool		active;			/* false when there is nothing to collect */
 	WeaveDvType dvtype;			/* the facet column's type; how a raw Datum is
 								 * encoded to the stored order-preserving int64 in
-								 * weave_docvals_accum_add (the merge/flush pair
-								 * path is already-encoded and ignores this) */
+								 * weave_docvals_accum_add (the int8 merge/flush
+								 * pair path is already-encoded and ignores it).
+								 * WEAVE_DV_T_TEXT selects TEXT mode below: rows
+								 * enter through add_text and the writer lays down
+								 * a v3 dictionary store. */
 	uint64	   *docid;			/* n; weave_tid_to_docid of the heap tuple */
-	int64	   *value;			/* n; the order-preserving int64 at that docid */
+	int64	   *value;			/* n; the order-preserving int64 at that docid.
+								 * In TEXT mode a placeholder 0 for every row: the
+								 * bytes live in tbytes/toff/tlenv, and the
+								 * ordinal exists only once the writer has built
+								 * the dictionary. */
 	uint8	   *isnull;			/* n; one byte per appended pair, nonzero == the
 								 * row's facet value is NULL.  A NULL pair still
 								 * occupies a dense docid slot so the docid space
@@ -1611,10 +1620,38 @@ typedef struct WeaveDocvalsAccum
 	uint32		cap;
 	uint32		nulls;			/* count of pairs with isnull != 0; write_weft
 								 * lays down a null bitmap iff this is > 0 */
+
+	/*
+	 * TEXT mode (dvtype == WEAVE_DV_T_TEXT) only; all NULL / 0 otherwise.  A
+	 * text row's ordinal cannot be known until every value of the segment has
+	 * been seen (the dictionary is per segment, sorted under `collation`), so
+	 * the RAW BYTES are accumulated and value[] holds a placeholder 0 until
+	 * weave_docvals_write_weft() builds the dictionary.  One arena, not a
+	 * palloc per row: a corpus-scale row count of small chunks would cost a
+	 * chunk header each.
+	 *
+	 * Row i's bytes are tbytes[toff[i] .. toff[i] + tlenv[i]).  The length is
+	 * stored explicitly rather than derived from toff[i+1], so the last row
+	 * needs no special case.  A NULL row (tlenv 0) differs from an empty
+	 * string ONLY by its isnull byte -- the store's own NULL-vs-'' rule, so
+	 * the writer must test isnull, never the length.  toff/tlenv
+	 * grow in lockstep with docid/value/isnull (same `cap`).
+	 */
+	Oid			collation;		/* the docvals column's (deterministic)
+								 * collation; InvalidOid unless TEXT */
+	char	   *tbytes;			/* raw text payload arena, no varlena headers */
+	Size		tlen;			/* bytes used in tbytes */
+	Size		tcap;			/* bytes allocated for tbytes */
+	uint64	   *toff;			/* n; row i's start offset in tbytes */
+	uint32	   *tlenv;			/* n; row i's byte length (0 for a NULL row) */
 } WeaveDocvalsAccum;
 
+/* `collation` is the docvals column's collation for a TEXT column (the caller
+ * has already refused a non-deterministic one) and InvalidOid for every other
+ * type and for an inactive accumulator. */
 extern void weave_docvals_accum_init(WeaveDocvalsAccum *acc, MemoryContext ctx,
-									 bool active, WeaveDvType dvtype);
+									 bool active, WeaveDvType dvtype,
+									 Oid collation);
 extern void weave_docvals_accum_reset(WeaveDocvalsAccum *acc);
 extern void weave_docvals_accum_add(WeaveDocvalsAccum *acc, ItemPointer tid,
 									Datum value, bool isnull);
@@ -1634,6 +1671,18 @@ extern void weave_docvals_accum_add_pair(WeaveDocvalsAccum *acc, uint64 docid,
 extern void weave_docvals_accum_add_pair_null(WeaveDocvalsAccum *acc,
 											  uint64 docid, int64 value,
 											  bool isnull);
+/*
+ * TEXT-mode append: the raw payload bytes of one row (no varlena header),
+ * copied into the accumulator's arena.  Separate from the Datum entry point
+ * because the flush and merge paths hold bytes, not a Datum -- a pending item's
+ * trailer and an input store's dictionary entry -- and must feed the SAME
+ * arena so the writer builds one fresh dictionary per output segment (a
+ * segment's ordinals mean nothing outside it).  A NULL row passes isnull (p
+ * and len are ignored; len 0 is recorded) and is masked by the null bitmap.
+ */
+extern void weave_docvals_accum_add_text(WeaveDocvalsAccum *acc, uint64 docid,
+										 const char *p, uint32 len,
+										 bool isnull);
 
 /* Map a facet column's type OID to its WeaveDvType, or ERROR if the type is not a
  * supported docvals type.  And encode one raw Datum of that type to the stored
@@ -1861,12 +1910,13 @@ typedef struct WeaveIndexLayout
 								 * comment gives: the discriminator is the opclass.
 								 * A text column is not by itself a cgram column --
 								 * `USING weave (sku gram_ops)` is the request. */
-	AttrNumber	dvattno;		/* 1-based index attnum of the int8 docvalues
-								 * (int8_docval_ops) column, or 0 if the index has
-								 * none.  Resolved by the opclass, not the column
-								 * TYPE, for the same reason vecattno/cgramattno are:
-								 * an int8 column is a docvals facet only when it
-								 * wears int8_docval_ops. */
+	AttrNumber	dvattno;		/* 1-based index attnum of the docvalues column
+								 * (any <type>_docval_ops, text_docval_ops
+								 * included), or 0 if the index has none.  Resolved
+								 * by the opclass, not the column TYPE, for the same
+								 * reason vecattno/cgramattno are: an int8 or text
+								 * column is a docvals facet only when it wears a
+								 * docval opclass. */
 } WeaveIndexLayout;
 
 extern void weave_index_layout(Relation index, WeaveIndexLayout *out);

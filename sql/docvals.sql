@@ -485,3 +485,72 @@ SELECT dvn_agree('price < 50')   AS vac_lt,
 
 DROP FUNCTION dvn_agree(text);
 DROP TABLE dvn;
+
+
+-- ---------------------------------------------------------------------------
+-- 10. text docvalues (store v3; doc/plans/2026-09-28-docvals-text-slice.md,
+-- task 2).  A text_docval_ops column stores a per-segment DICTIONARY ORDINAL
+-- per docid, the dictionary sorted under the column collation.  This step
+-- proves the build writes a store that the structural check accepts, and (10b)
+-- that a multi-segment build's collapse re-dictionaries every input; pushdown
+-- (task 3) and pending INSERT/flush (task 4) follow.
+-- cat has exactly 40 distinct non-NULL values, one of them '' (a real entry,
+-- not NULL), and is NULL on every 19th row (~5%).
+-- ---------------------------------------------------------------------------
+CREATE TABLE dvt (id int, body wdoc, cat text COLLATE "C");
+INSERT INTO dvt
+SELECT g, to_wdoc('common doc ' || (g % 5)),
+       CASE WHEN g % 19 = 0 THEN NULL
+            WHEN g % 40 = 0 THEN ''
+            ELSE 'c' || lpad((g % 40)::text, 2, '0') END
+FROM generate_series(1, 2000) g;
+SELECT count(*) AS n, count(cat) AS nonnull, count(DISTINCT cat) AS ndistinct,
+       count(*) FILTER (WHERE cat = '') AS nempty
+FROM dvt;
+CREATE INDEX dvt_idx ON dvt USING weave (body wdoc_lex_ops, cat text_docval_ops);
+SELECT invariant, ok FROM weave_check('dvt_idx', true) ORDER BY invariant;
+SELECT count(*) AS violations FROM weave_check('dvt_idx', true) WHERE NOT ok;
+DROP TABLE dvt;
+
+-- 10b. A MULTI-SEGMENT text build.  A serial build that flushes more than once
+-- ends by collapsing its segments through the MERGE (weave_build_finalize ->
+-- weave_merge_segments / weave_merge_all), and a text store cannot be carried
+-- through a merge by copying: its slots are ordinals into each input segment's
+-- own dictionary.  The merge re-dictionaries (feeds each row back as bytes), so
+-- the collapsed bolt must still carry a docvalues weft.
+--
+-- Corpus: sql/vecindex.sql's high-vocabulary shape (40 distinct terms per
+-- document) under maintenance_work_mem = '1MB', which flushes several bolts.
+-- cat mixes a value set that is DISJOINT per heap range ('k' || g/500, so each
+-- flushed bolt's dictionary holds different strings and the same string gets
+-- different ordinals in different bolts) with a shared one, '' and NULL.
+--
+-- POSITIVE CONTROL for "the collapse really carried every input": the build
+-- flushes seven bolts here (the per-flush LOG lines say so under
+-- client_min_messages = log) and the collapse merges them into one, so a merged
+-- store covering all 12000 docs needs at least ceil(12000 * 16 / 8160) = 24
+-- docvalues pages (an 8-byte ordinal + 8-byte docid per doc).  The interim guard
+-- that dropped text wefts in the merge gives 0; a merge that carried only one
+-- input bolt gives about 4.
+-- ---------------------------------------------------------------------------
+CREATE TABLE dvtm (id int, body wdoc, cat text COLLATE "C");
+INSERT INTO dvtm
+SELECT g, to_wdoc(array_to_string(ARRAY(SELECT 'id' || g || 'x' || k
+                                          FROM generate_series(1, 40) k), ' ')),
+       CASE WHEN g % 19 = 0 THEN NULL
+            WHEN g % 40 = 0 THEN ''
+            WHEN g % 3 = 0 THEN 'c' || lpad((g % 40)::text, 2, '0')
+            ELSE 'k' || lpad((g / 500)::text, 4, '0') END
+FROM generate_series(1, 12000) g;
+SET maintenance_work_mem = '1MB';
+SET max_parallel_maintenance_workers = 0;
+CREATE INDEX dvtm_idx ON dvtm USING weave (body wdoc_lex_ops, cat text_docval_ops);
+SELECT weave_index_nsegments('dvtm_idx') = 1 AS collapsed_to_one_segment;
+SELECT count(*) >= 24 AS docvalues_weft_covers_all_inputs
+  FROM weave_page_info('dvtm_idx')
+ WHERE kind = 'docvalues' AND reachable AND NOT freed;
+SELECT invariant, ok FROM weave_check('dvtm_idx', true) ORDER BY invariant;
+SELECT count(*) AS violations FROM weave_check('dvtm_idx', true) WHERE NOT ok;
+RESET maintenance_work_mem;
+RESET max_parallel_maintenance_workers;
+DROP TABLE dvtm;

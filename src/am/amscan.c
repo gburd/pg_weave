@@ -2449,6 +2449,18 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 				Oid			sub = scan->keyData[k].sk_subtype;
 				Datum		arg = scan->keyData[k].sk_argument;
 
+				/*
+				 * docvals text slice T3: the text gate (per-segment dictionary
+				 * boundaries) is not wired yet.  The key cannot simply be left
+				 * unhonoured: outside the cgram route nothing marks the result
+				 * lossy (cgramLossy is read only by it), so a dropped Index Cond
+				 * would return rows that fail it with no executor recheck.
+				 */
+				if (coltype == WEAVE_DV_T_TEXT)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("text docvalues scan is not supported yet")));
+
 				/* a same-type operator has sk_subtype == 0; the constant is then
 				 * the column's own type. */
 				if (sub == InvalidOid)

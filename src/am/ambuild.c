@@ -262,16 +262,19 @@ typedef struct WeaveBuildState
 								 * inserted row's vector since doc/GAPS.md G23
 								 * closed, so the flush is no longer one of
 								 * them. */
-	AttrNumber	dvattno;		/* 1-based index attnum of the int8 docvalues
-								 * column, or 0 when the index has none.  Same
-								 * resolve-once reasoning as vecattno above. */
+	AttrNumber	dvattno;		/* 1-based index attnum of the docvalues column
+								 * (any <type>_docval_ops type, text included),
+								 * or 0 when the index has none or the path has
+								 * no heap tuple (merge).  Same resolve-once
+								 * reasoning as vecattno above. */
 	WeaveDocvalsAccum dv;		/* the docvalues producer: one (docid, value)
-								 * pair per indexed document.  ACTIVE only on the
-								 * two CREATE INDEX heap-scan paths in this v1
-								 * slice; INACTIVE on merge, oversized-insert and
-								 * pending-flush, whose rows therefore carry no
-								 * docvalues gate until the post-build slice lands
-								 * (doc/specs/DOCVALS_CHANNEL.md sect. 11). */
+								 * pair per indexed document -- for a text
+								 * column, one (docid, bytes) row that the writer
+								 * turns into a dictionary ordinal.  Fed from the
+								 * heap on the build/oversized-insert paths, from
+								 * pending items on the flush, and from the
+								 * inputs' wefts on a merge
+								 * (weave_docvals_merge_append). */
 } WeaveBuildState;
 
 /*
@@ -327,13 +330,13 @@ weave_build_cgramattno(Relation index)
 }
 
 /*
- * Which values[] slot holds the int8 docvalues column, or 0 when the index has
- * none.  A fourth one-line wrapper, for the reason weave_build_vecattno() gives:
- * the WeaveBuildState initializers do not all want a docvalues producer.  In this
- * v1 slice only the two CREATE INDEX heap-scan paths do; the merge and the
- * post-build insert/flush paths pass 0 so their output bolts carry no docvalues
- * weft (the documented limitation, doc/specs/DOCVALS_CHANNEL.md sect. 11), which
- * a combined helper would make easy to get wrong.
+ * Which values[] slot holds the docvalues column (int8-encoded scalar or text),
+ * or 0 when the index has none.  A fourth one-line wrapper, for the reason
+ * weave_build_vecattno() gives: the WeaveBuildState initializers do not all want
+ * to read a docvalue from a Datum.  The heap-scan, oversized-insert and flush
+ * paths do; the merge sets bs.dvattno = 0 and carries its inputs' wefts instead
+ * (weave_docvals_merge_append), which a combined helper would make easy to get
+ * wrong.
  */
 static AttrNumber
 weave_build_dvattno(Relation index)
@@ -349,7 +352,9 @@ weave_build_dvattno(Relation index)
  * none (harmless then: the accumulator is inactive, or the merge/flush pair path
  * bypasses the encode).  Resolved from the index tuple descriptor -- no syscache.
  * This is how the build/insert value encode learns the facet's type without the
- * on-disk store ever recording it (the store stays int64; see weave/docvals.h).
+ * on-disk store recording it: an int8-encoded store (v1/v2) records only "int64",
+ * and WEAVE_DV_T_TEXT selects the dictionary-ordinal store (v3) instead of an
+ * int64 encoding (see weave/docvals.h).
  */
 static WeaveDvType
 weave_build_dvtype(Relation index)
@@ -360,6 +365,47 @@ weave_build_dvtype(Relation index)
 		return WEAVE_DV_T_INT8;
 	return weave_dv_type_for_oid(
 		TupleDescAttr(RelationGetDescr(index), dvattno - 1)->atttypid);
+}
+
+/*
+ * The collation a TEXT docvals column's dictionary is sorted under, checked;
+ * InvalidOid when the index has no docvals column or it is not text.
+ *
+ * Called by every path that initialises a docvalues accumulator -- serial build
+ * (before any worker is launched), parallel worker, oversized insert, flush,
+ * and the merges, which re-dictionary text -- so CREATE INDEX is where a bad
+ * collation is refused; on the later paths it cannot fire, because such an
+ * index could not have been built.  NON-DETERMINISTIC IS REFUSED, not
+ * tolerated: such a collation calls
+ * byte-distinct strings equal, so "the distinct values" of a segment is not
+ * well defined, and the scan answers `=` by comparing ORDINALS -- two values
+ * the collation equates but the dictionary keeps apart would make `=` drop one
+ * of them, a silent wrong answer (plan decision 4).
+ */
+static Oid
+weave_build_dvcollation(Relation index)
+{
+	AttrNumber	dvattno = weave_build_dvattno(index);
+	Oid			collation;
+
+	if (dvattno == 0 || weave_build_dvtype(index) != WEAVE_DV_T_TEXT)
+		return InvalidOid;
+
+	collation = index->rd_indcollation[dvattno - 1];
+	if (!OidIsValid(collation))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDETERMINATE_COLLATION),
+				 errmsg("could not determine which collation to use for docvalues column \"%s\"",
+						NameStr(TupleDescAttr(RelationGetDescr(index), dvattno - 1)->attname)),
+				 errhint("Use the COLLATE clause to set the collation explicitly.")));
+	if (!get_collation_isdeterministic(collation))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("text docvalues require a deterministic collation"),
+				 errdetail("Docvalues column \"%s\" of index \"%s\" uses a non-deterministic collation.",
+						   NameStr(TupleDescAttr(RelationGetDescr(index), dvattno - 1)->attname),
+						   RelationGetRelationName(index))));
+	return collation;
 }
 
 static int
@@ -820,7 +866,9 @@ weave_build_flush_segment(Relation index, WeaveBuildState *bs)
 	weave_cgram_accum_reset(&bs->cgram);	/* same reason: the reset below frees
 											 * its pair array and fold scratch */
 	weave_docvals_accum_reset(&bs->dv);		/* same reason: the reset below frees
-											 * its docid and value arrays */
+											 * its docid/value/isnull arrays and, in
+											 * text mode, the byte arena and its
+											 * toff/tlenv arrays */
 	MemoryContextReset(bs->ctx);
 	bs->terms = NULL;
 	bs->nterms = 0;
@@ -3383,12 +3431,13 @@ weave_docvals_merge_append(Relation index, const WeaveSegMeta *seg,
 	const void *img;
 	uint32		ndocs = 0;
 	uint32		i;
+	bool		text = (acc->dvtype == WEAVE_DV_T_TEXT);
 	MemoryContext old;
 
 	if (root == InvalidBlockNumber)
 		return;					/* this bolt carries no docvals weft */
 	img = weave_docvals_load(index, root, CurrentMemoryContext, &ndocs,
-							 WEAVE_DV_KIND_INT8);
+							 text ? WEAVE_DV_KIND_TEXT : WEAVE_DV_KIND_INT8);
 	if (ndocs == 0)
 	{
 		pfree((void *) img);
@@ -3404,6 +3453,30 @@ weave_docvals_merge_append(Relation index, const WeaveSegMeta *seg,
 		if (d < tombdense_n &&
 			(tombdense[d >> 3] & (uint8) (1u << (d & 7))) != 0)
 			continue;			/* tombstoned: physically drop */
+
+		/*
+		 * TEXT: the slot is an ordinal into THIS input's dictionary, which means
+		 * nothing in the output segment, so the row is fed back as the entry's
+		 * BYTES and the output writer re-dictionaries the union.  add_text copies
+		 * the bytes into the accumulator's arena (acc->ctx), so the image can be
+		 * freed below.  The loader validated every non-NULL ordinal against
+		 * ndict, so the lookup stays inside the image.
+		 */
+		if (text)
+		{
+			const unsigned char *p;
+			uint32		len = 0;
+
+			if (isnull)
+			{
+				weave_docvals_accum_add_text(acc, d, NULL, 0, true);
+				continue;
+			}
+			p = weave_docvals_dict_entry(img, (uint32) v, &len);
+			weave_docvals_accum_add_text(acc, d, (const char *) p, len, false);
+			continue;
+		}
+
 		/*
 		 * Carry the input store's null-ness forward: a NULL docid stays NULL in
 		 * the merged store (masked out of every comparison gate), a non-NULL
@@ -3533,6 +3606,17 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	 * carries cgram. Unlike cgram this never abandons the merge -- an input
 	 * without a docvals weft just contributes nothing (partial coverage is the
 	 * documented post-insert state), so there is no all-or-none precondition.
+	 *
+	 * A TEXT column is carried too, and cannot be carried by copying: its
+	 * slots are ordinals into each INPUT segment's own dictionary, so the same
+	 * ordinal names different values in different inputs, and copying them
+	 * would be a silent wrong answer.  weave_docvals_merge_append() therefore
+	 * feeds each surviving row back as its dictionary entry's bytes, and the
+	 * output weft is re-dictionaried from the union (bs->dv is a TEXT
+	 * accumulator with the column collation; the callers initialise it so).
+	 * This is also what keeps a multi-segment CREATE INDEX's docvalues: the
+	 * build-end collapse (weave_build_finalize -> weave_merge_segments) IS a
+	 * merge.
 	 */
 	bs->dv.active = (weave_build_dvattno(index) != 0);
 	if (bs->dv.active)
@@ -3609,8 +3693,13 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 		 * output term's postings. */
 		tbs.cgramattno = 0;
 		weave_cgram_accum_init(&tbs.cgram, termctx, false);
-		tbs.dvattno = 0;		/* v1: docvalues weft is not produced by merge */
-		weave_docvals_accum_init(&tbs.dv, termctx, false, WEAVE_DV_T_INT8);
+		/* No docvalues producer on the per-term state either: the merge carries
+		 * the docvals weft once, into bs->dv, above.  Inactive, but typed like
+		 * bs->dv (copied, not re-resolved per output term) so no state in a
+		 * text index's merge claims to be int8. */
+		tbs.dvattno = 0;
+		weave_docvals_accum_init(&tbs.dv, termctx, false, bs->dv.dvtype,
+								 bs->dv.collation);
 		/* Inactive (active = false), so no weft is written and this width is
 		 * never read -- it gets the reloption's real value anyway, because the
 		 * day doc/GAPS.md G23 closes is the day `active` flips to true on
@@ -3964,8 +4053,17 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 	 * refuses one -- the merged weft would not cover every document of the bolt. */
 	bs.cgramattno = 0;
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, ncgrambolts > 0);
-	bs.dvattno = 0;				/* v1: docvalues weft is not produced by merge */
-	weave_docvals_accum_init(&bs.dv, bs.ctx, false, WEAVE_DV_T_INT8);
+	/*
+	 * Docvalues: dvattno stays 0 (no heap tuple to read a value from); the
+	 * pairs come from the inputs' own wefts (weave_docvals_merge_append), and
+	 * weave_merge_segments_streaming() decides `active`.  Initialised inactive
+	 * here but with the column's REAL type and collation, which that function
+	 * relies on: a TEXT column is re-dictionaried, so the accumulator must be
+	 * a text one sorting under the column collation.
+	 */
+	bs.dvattno = 0;
+	weave_docvals_accum_init(&bs.dv, bs.ctx, false, weave_build_dvtype(index),
+							 weave_build_dvcollation(index));
 	weave_vec_accum_init(&bs.vec, bs.ctx, nvecbolts > 0, (int) vgeom.bits,
 						 (WeaveMetric) vgeom.metric);
 	if (nvecbolts > 0 &&
@@ -4198,8 +4296,17 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	 * (weave_cgram_merge_append). */
 	bs.cgramattno = 0;
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, ncgrambolts > 0);
-	bs.dvattno = 0;				/* v1: docvalues weft is not produced by merge */
-	weave_docvals_accum_init(&bs.dv, bs.ctx, false, WEAVE_DV_T_INT8);
+	/*
+	 * Docvalues: dvattno stays 0 (no heap tuple to read a value from); the
+	 * pairs come from the inputs' own wefts (weave_docvals_merge_append), and
+	 * weave_merge_segments_streaming() decides `active`.  Initialised inactive
+	 * here but with the column's REAL type and collation, which that function
+	 * relies on: a TEXT column is re-dictionaried, so the accumulator must be
+	 * a text one sorting under the column collation.
+	 */
+	bs.dvattno = 0;
+	weave_docvals_accum_init(&bs.dv, bs.ctx, false, weave_build_dvtype(index),
+							 weave_build_dvcollation(index));
 	/* PRODUCER 2: active exactly when an input carries a weft, and made ready for
 	 * pre-encoded lanes at the geometry the inputs agreed on -- not at the current
 	 * `bits` reloption, which may have changed since they were written. */
@@ -5161,7 +5268,8 @@ weave_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
 	bs.dvattno = weave_build_dvattno(index);
-	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index));
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index),
+							 weave_build_dvcollation(index));
 	/* The metric is only consulted when there IS a vector column: it is the one
 	 * reloption accessor that THROWS (cosine and l1 have no compressed-domain
 	 * bound -- src/am/am.c), and throwing over the metric of a channel this index
@@ -5419,6 +5527,7 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	WeaveBuildState bs;
 	double		reltuples;
 	WeaveLeader *weaveleader = NULL;
+	Oid			dvcollation;
 
 	/*
 	 * Before any page is written, and before any worker is launched: an
@@ -5427,6 +5536,14 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * indexes through this same callback.
 	 */
 	weave_reject_unlogged(index);
+
+	/*
+	 * Same placement, same reason: a text docvalues column under a
+	 * non-deterministic (or indeterminate) collation is refused HERE, before a
+	 * worker is launched to discover it independently.  InvalidOid when the
+	 * index has no text docvalues column.
+	 */
+	dvcollation = weave_build_dvcollation(index);
 
 	if (RelationGetNumberOfBlocks(index) != 0)
 		elog(ERROR, "index \"%s\" already contains data",
@@ -5453,7 +5570,8 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
 	bs.dvattno = weave_build_dvattno(index);
-	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index));
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index),
+							 dvcollation);
 	/* The metric is only consulted when there IS a vector column: it is the one
 	 * reloption accessor that THROWS (cosine and l1 have no compressed-domain
 	 * bound -- src/am/am.c), and throwing over the metric of a channel this index
@@ -5694,7 +5812,8 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 	 * does -- an oversized INSERT is no longer absent from a scalar gate.
 	 */
 	bs.dvattno = weave_build_dvattno(index);
-	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index));
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index),
+							 weave_build_dvcollation(index));
 	weave_vec_accum_init(&bs.vec, bs.ctx, bs.vecattno != 0,
 						 weave_index_vec_bits(index),
 						 (WeaveMetric) (bs.vecattno != 0 ?
@@ -5895,6 +6014,7 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	uint32		gramlen = 0;
 	int64		docval = 0;
 	bool		has_docval = false;
+	bool		dvtext = false; /* docvals text slice T4 */
 	WeavePageKind wantkind;
 
 	/*
@@ -5984,18 +6104,40 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	if (layout.dvattno != 0)
 	{
 		int			dvidx = layout.dvattno - 1;
+		WeaveDvType dvtype = weave_dv_type_for_oid(
+			TupleDescAttr(RelationGetDescr(index), dvidx)->atttypid);
 
-		if (!isnull[dvidx])
+		/*
+		 * docvals text slice T4: a text docval has no int64 encoding and the
+		 * v11 pending trailer cannot carry its bytes yet, so it is never
+		 * encoded here; the INSERT is refused just below.  A NULL is refused
+		 * too: a pending NULL would reach the flush's int64 pair path on a text
+		 * accumulator.
+		 */
+		if (dvtype == WEAVE_DV_T_TEXT)
+			dvtext = true;
+		else if (!isnull[dvidx])
 		{
-			docval = weave_dv_encode_datum(
-				weave_dv_type_for_oid(
-					TupleDescAttr(RelationGetDescr(index), dvidx)->atttypid),
-				values[dvidx]);
+			docval = weave_dv_encode_datum(dvtype, values[dvidx]);
 			has_docval = true;
 		}
 		/* else: NULL docval -> leave has_docval == false so the item is written
 		 * with dvlen == 0 (the NULL encoding); do NOT encode a null Datum. */
 	}
+
+	/*
+	 * docvals text slice T4: the pending buffer cannot carry a text docval yet.
+	 * Refused BEFORE the size test, so an oversized INSERT is refused too: the
+	 * oversized path's accumulator could take the bytes, but an INSERT whose
+	 * success depended on the document's size would be an inconsistent
+	 * interim contract, and T4 lifts both at once.
+	 */
+	if (dvtext)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("INSERT into an index with a text docvalues column is not supported yet"),
+				 errdetail("Index \"%s\" has a text_docval_ops column.",
+						   RelationGetRelationName(index))));
 
 	/*
 	 * ...and the page kind is the v11 layout either way, including for an index
@@ -6221,7 +6363,14 @@ weave_flush_pending(Relation index)
 	bs.cgramattno = weave_build_cgramattno(index);
 	weave_cgram_accum_init(&bs.cgram, bs.ctx, bs.cgramattno != 0);
 	bs.dvattno = weave_build_dvattno(index);
-	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index));
+	/*
+	 * docvals text slice T4: a TEXT index's accumulator is initialised TEXT with
+	 * its collation, but no pending item can carry a text docval yet
+	 * (weave_insert refuses the pending write), so the loop below never feeds it
+	 * -- and add_pair/add_pair_null ERROR on a text accumulator if it ever did.
+	 */
+	weave_docvals_accum_init(&bs.dv, bs.ctx, bs.dvattno != 0, weave_build_dvtype(index),
+							 weave_build_dvcollation(index));
 	bs.terms = NULL;
 	bs.nterms = 0;
 	bs.maxterms = 0;

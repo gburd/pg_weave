@@ -1,7 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * docvals.h
- *		Backend-independent scalar "docvalues" store for one int8 facet column.
+ *		Backend-independent scalar "docvalues" store for one facet column
+ *		(int8-encoded scalars, or dictionary-encoded text).
  *
  * A docvalues store maps every docid in a segment's dense [0,ndocs) id space to
  * one scalar value, so a scalar predicate (a WHERE clause over a facet column)
@@ -218,7 +219,16 @@ typedef enum
 	WEAVE_DV_T_INT2,
 	WEAVE_DV_T_BOOL,
 	WEAVE_DV_T_DATE,
-	WEAVE_DV_T_FLOAT8
+	WEAVE_DV_T_FLOAT8,
+
+	/*
+	 * text / varchar (text_docval_ops).  NOT an int64 encoding: a text value has
+	 * no order-preserving fixed-width image under a collation, so a text column
+	 * stores a per-segment DICTIONARY ORDINAL (store v3) and the query constant
+	 * is resolved to ordinal boundaries per segment (weave_dv_dict_lower_bound /
+	 * weave_dv_dict_upper_bound).  Appended last so no existing value moves.
+	 */
+	WEAVE_DV_T_TEXT
 } WeaveDvType;
 
 /*
