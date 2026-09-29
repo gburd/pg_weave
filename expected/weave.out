@@ -1,4 +1,21 @@
 CREATE EXTENSION pg_weave VERSION '0.1.0';
+-- doc/GAPS.md G60: a VACUUM only reclaims (tombstones) rows deleted before the
+-- oldest snapshot in this database; an autovacuum ANALYZE starting at the same
+-- moment can hold one.  Wait for every same-database snapshot older than now.
+CREATE FUNCTION pg_temp.wait_for_horizon() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE x xid := (txid_current() % 4294967296)::text::xid; i int;
+BEGIN
+  FOR i IN 1 .. 600 LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_stat_activity
+                    WHERE datname = current_database() AND pid <> pg_backend_pid()
+                      AND (age(backend_xmin) > age(x) OR age(backend_xid) > age(x))) THEN
+      RETURN;
+    END IF;
+    PERFORM pg_sleep(0.1);
+    PERFORM pg_stat_clear_snapshot();  -- else every pass re-reads the first
+  END LOOP;
+  RAISE NOTICE 'wait_for_horizon: an older snapshot was still held after 60 s';
+END $$;
 -- wdoc: analysis, output shows terms with term frequencies
 SELECT to_wdoc('The quick brown fox, the QUICK fox!');
                       to_wdoc                      
@@ -2245,6 +2262,7 @@ SELECT weave_merge('strm_bm25') IS NOT NULL AS strm_flushed;   -- create >1 segm
 (1 row)
 
 DELETE FROM strm WHERE id % 4 = 0;                            -- tombstones
+DO $$ BEGIN PERFORM pg_temp.wait_for_horizon(); END $$;   -- G60
 VACUUM strm;                                                 -- write tombstones into the segment(s)
 INSERT INTO strm(body) SELECT 'term'||(g%400)||' shared fresh'||g
   FROM generate_series(14001,18000) g;                       -- a fresh, un-tombstoned segment
@@ -2549,6 +2567,7 @@ SELECT count(*) AS c_before FROM tomb WHERE d @@@ 'alpha'::wquery;         -- 10
 (1 row)
 
 DELETE FROM tomb WHERE id <= 40;
+DO $$ BEGIN PERFORM pg_temp.wait_for_horizon(); END $$;   -- G60
 VACUUM tomb;
 SELECT count(*) AS c_after FROM tomb WHERE d @@@ 'alpha'::wquery;          -- 60
  c_after 
@@ -2564,6 +2583,7 @@ SELECT weave_count('tomb_bm25','alpha'::wquery) AS fc_after;                 -- 
 
 -- delete-all + vacuum + reuse: the reused slots must NOT match 'alpha'
 DELETE FROM tomb;
+DO $$ BEGIN PERFORM pg_temp.wait_for_horizon(); END $$;   -- G60
 VACUUM tomb;
 INSERT INTO tomb SELECT g, to_wdoc('beta doc'||g) FROM generate_series(1,60) g;
 VACUUM tomb;
@@ -3416,9 +3436,11 @@ FROM rt;
 (1 row)
 
 -- binary round-trip: send then recv (COPY binary) equals the original.
-COPY rt TO '/tmp/pg_weave_rt.bin' WITH (FORMAT binary);
+-- per-backend file name: parallel suites on one host share /tmp (doc/GAPS.md G60)
+SELECT '/tmp/pg_weave_rt_' || pg_backend_pid() || '.bin' AS rtfile \gset
+COPY rt TO :'rtfile' WITH (FORMAT binary);
 CREATE TEMP TABLE rt2 (id int, d wdoc);
-COPY rt2 FROM '/tmp/pg_weave_rt.bin' WITH (FORMAT binary);
+COPY rt2 FROM :'rtfile' WITH (FORMAT binary);
 SELECT bool_and(wdoc_send(a.d) = wdoc_send(b.d)) AS binary_roundtrip_ok
 FROM rt a JOIN rt2 b USING (id);
  binary_roundtrip_ok 
@@ -3576,9 +3598,10 @@ INSERT INTO qrt VALUES
   (3, '"quick brown fox"'::wquery),
   (4, 'NEAR(alpha beta, 3)'::wquery),
   (5, 'quick* & alpha'::wquery);
-COPY qrt TO '/tmp/pg_weave_qrt.bin' WITH (FORMAT binary);
+SELECT '/tmp/pg_weave_qrt_' || pg_backend_pid() || '.bin' AS qrtfile \gset
+COPY qrt TO :'qrtfile' WITH (FORMAT binary);
 CREATE TEMP TABLE qrt2 (id int, q wquery);
-COPY qrt2 FROM '/tmp/pg_weave_qrt.bin' WITH (FORMAT binary);
+COPY qrt2 FROM :'qrtfile' WITH (FORMAT binary);
 SELECT bool_and(wquery_send(a.q) = wquery_send(b.q)) AS wquery_binary_roundtrip_ok
 FROM qrt a JOIN qrt2 b USING (id);
  wquery_binary_roundtrip_ok 
@@ -3705,9 +3728,10 @@ DETAIL:  expected a position at " ".
 -- wdoc binary recv carrying positions (COPY BINARY of a positional doc).
 CREATE TEMP TABLE drt (id int, d wdoc);
 INSERT INTO drt VALUES (1, to_wdoc('alpha beta alpha gamma alpha')); -- alpha tf=3, positions
-COPY drt TO '/tmp/pg_weave_drt.bin' WITH (FORMAT binary);
+SELECT '/tmp/pg_weave_drt_' || pg_backend_pid() || '.bin' AS drtfile \gset
+COPY drt TO :'drtfile' WITH (FORMAT binary);
 CREATE TEMP TABLE drt2 (id int, d wdoc);
-COPY drt2 FROM '/tmp/pg_weave_drt.bin' WITH (FORMAT binary);
+COPY drt2 FROM :'drtfile' WITH (FORMAT binary);
 SELECT bool_and(wdoc_send(a.d) = wdoc_send(b.d)) AS doc_pos_binary_roundtrip_ok
 FROM drt a JOIN drt2 b USING (id);
  doc_pos_binary_roundtrip_ok 
@@ -3766,6 +3790,7 @@ SELECT weave_merge('segmerge_idx'::regclass) IS NOT NULL AS grouped;   -- size-t
 
 -- delete a chunk + vacuum: tombstones must be dropped by the next merge.
 DELETE FROM segmerge WHERE id % 3 = 0;
+DO $$ BEGIN PERFORM pg_temp.wait_for_horizon(); END $$;   -- G60
 VACUUM segmerge;
 SELECT weave_vacuum('segmerge_idx'::regclass) IS NOT NULL AS compacted;
  compacted 
@@ -4652,6 +4677,7 @@ CREATE TABLE tsrch (id serial, d wdoc);
 INSERT INTO tsrch(d) SELECT to_wdoc('english','apple w'||(g%20)||' body '||g) FROM generate_series(1,600) g;
 CREATE INDEX tsrch_idx ON tsrch USING weave (d);
 DELETE FROM tsrch WHERE id % 2 = 0;   -- tombstone half
+DO $$ BEGIN PERFORM pg_temp.wait_for_horizon(); END $$;   -- G60
 VACUUM tsrch;
 SET enable_seqscan = off;
 SELECT count(*) = 300 AS live_after_delete FROM tsrch WHERE d @@@ 'apple'::wquery;
@@ -5137,8 +5163,9 @@ INSERT INTO dvrt VALUES
 -- binary send/recv round-trip via COPY (FORMAT binary): send serializes each
 -- wdoc, recv (internal) re-derives nterms/doclen/has_pos and rebuilds it.
 CREATE TEMP TABLE dvrt_bin (LIKE dvrt INCLUDING ALL);
-COPY dvrt TO '/tmp/dvrt.bin' WITH (FORMAT binary);
-COPY dvrt_bin FROM '/tmp/dvrt.bin' WITH (FORMAT binary);
+SELECT '/tmp/dvrt_' || pg_backend_pid() || '.bin' AS dvrtfile \gset
+COPY dvrt TO :'dvrtfile' WITH (FORMAT binary);
+COPY dvrt_bin FROM :'dvrtfile' WITH (FORMAT binary);
 SELECT bool_and(a.d::text = b.d::text) AS dv_binary_roundtrip_ok
   FROM dvrt a JOIN dvrt_bin b USING (id);
  dv_binary_roundtrip_ok 

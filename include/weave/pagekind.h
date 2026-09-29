@@ -99,16 +99,21 @@
 										 * WEAVE_TRGM_DATA pages.  See
 										 * doc/specs/SEGMENT_FORMAT.md sect. 2. */
 #define WEAVE_DICTINDEX		(1 << 7)	/* sparse block index over dict pages */
-#define WEAVE_FREED			(1 << 8)	/* page freed & pending recycle: nextblk
-										 * holds the free-time TransactionId (see
-										 * weave_free_page / the recycle gate in
-										 * weave_new_buffer).  Reusing nextblk (dead
-										 * on an off-chain freed page) keeps the page
-										 * opaque layout unchanged -- no format
-										 * change, so existing indexes need no
-										 * REINDEX.  A page freed by an older version
-										 * lacks this flag and is treated as
-										 * immediately recyclable.
+#define WEAVE_FREED			(1 << 8)	/* page freed & pending recycle: the
+										 * free-time TransactionId is in the page
+										 * header's pd_prune_xid (unused on index
+										 * pages) and nextblk is InvalidBlockNumber
+										 * (see weave_free_page / the recycle gate in
+										 * weave_new_buffer).  It used to be stored in
+										 * nextblk, which a stale chain walker then
+										 * followed as a block number and looped
+										 * forever (doc/GAPS.md G62); a page freed
+										 * that way still reads correctly, because
+										 * the gate falls back to nextblk when
+										 * pd_prune_xid is 0.  No format change, so
+										 * existing indexes need no REINDEX.  A page
+										 * freed by an older version lacks this flag
+										 * and is treated as immediately recyclable.
 										 * A STATE, not a kind: it is set while
 										 * LEAVING the page's kind in place, and it is
 										 * the one flag valid under both encodings. */

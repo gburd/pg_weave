@@ -25,6 +25,11 @@
 # are alive at the same wall-clock time -- genuine overlap, not the serial
 # "concurrency" of doc/GAPS.md G28 / hard rule 11).
 #
+# RETRACTED 2026-09-29 (hard rule 13): the paragraph above was false until that
+# date.  The harness ran the three sessions ONE AFTER ANOTHER -- the very G28
+# serial "concurrency" it disclaims (see the FIX note at psql_proc below) -- so
+# every result this file reported before 2026-09-29 was from SERIAL runs.
+#
 # A wrong anchor count / error => the hazard is REAL (FAIL).  All-correct does
 # NOT prove safety (the window is narrow and timing-dependent) but is the
 # expected result if the null-bearing docvals gate is concurrency-safe.
@@ -100,7 +105,7 @@ my $conn = $node->connstr('postgres');
 my $writer_sql = q{
 SET enable_seqscan=off;
 DO $$
-DECLARE deadline timestamptz := clock_timestamp() + interval '10 seconds'; b int := 0;
+DECLARE t_start timestamptz := clock_timestamp(); deadline timestamptz := clock_timestamp() + interval '10 seconds'; b int := 0;
 BEGIN
   WHILE clock_timestamp() < deadline LOOP
     DELETE FROM docs WHERE kind='churn';
@@ -112,6 +117,8 @@ BEGIN
     PERFORM weave_vacuum('docs_dv');
     b := b + 1;
   END LOOP;
+  RAISE NOTICE 'SPAN kind=writer start=% end=% iters=%',
+    extract(epoch from t_start), extract(epoch from clock_timestamp()), b;
 END $$;
 \echo WRITER_DONE
 };
@@ -125,45 +132,138 @@ my $reader_sql = qq{
 SET enable_seqscan=off;
 SET enable_bitmapscan=off;
 DO \$\$
-DECLARE deadline timestamptz := clock_timestamp()+interval '10 seconds'; c bigint; bad int := 0; tot int := 0;
+DECLARE t_start timestamptz := clock_timestamp(); deadline timestamptz := clock_timestamp()+interval '10 seconds'; c bigint; bad int := 0; tot int := 0;
 BEGIN
   WHILE clock_timestamp() < deadline LOOP
     SELECT count(*) INTO c FROM docs WHERE price < 100;
     tot := tot + 1;
     IF c <> $anchor_expected THEN bad := bad + 1; RAISE WARNING 'ANCHOR_MISS count=%', c; END IF;
   END LOOP;
+  RAISE NOTICE 'SPAN kind=reader start=% end=% iters=%',
+    extract(epoch from t_start), extract(epoch from clock_timestamp()), tot;
   RAISE NOTICE 'READER_DONE reads=% wrong=%', tot, bad;
 END \$\$;
 };
 
+# FIX 2026-09-29 (found while writing t/026): THIS FILE WAS NOT CONCURRENT.
+# IPC::Run's start(..., '<', \$scalar) writes nothing to the child's stdin until
+# that harness is pumped, and finish($h) pumps only $h.  The old
+# `finish($r1h); finish($r2h); finish($wh);` therefore ran reader 1's 10 s loop
+# alone, then reader 2's, then the writer's: no read ever overlapped the churn.
+# t/007_segment_cap.pl had exactly this bug and fixed it under doc/GAPS.md G28
+# (see its comment above the peak bound); the fix was never propagated here or
+# to t/005, which this file was modelled on.  Every pass this file reported
+# before 2026-09-29 was a SERIAL run (hard rule 13).  Now: psql exits via \q,
+# pump_all pumps every handle with a deadline, and each session reports a
+# wall-clock SPAN so the overlap is asserted rather than assumed.
 sub psql_proc {
 	my ($sql) = @_;
+	# \q so psql exits and pumpable() goes false (t/007).
+	$sql .= "\n\\q\n" unless $sql =~ /\\q\s*$/;
 	my ($in, $out, $err) = ($sql, '', '');
 	my $h = start(['psql', '-X', '-v', 'ON_ERROR_STOP=0', '-d', $conn],
 				  '<', \$in, '>', \$out, '2>', \$err);
 	return ($h, \$out, \$err);
 }
 
-# start writer + two readers concurrently: all three loops are alive at the same
-# time, which is the overlap hard rule 11 / G28 demands (t/005's shape).
+# Pump EVERY handle each iteration, bounded by a deadline.  Returns 1 if hung.
+sub pump_all {
+	my ($handles, $secs) = @_;
+	my $deadline = time() + $secs;
+
+	while (time() < $deadline) {
+		my $live = 0;
+		for my $p (@$handles) {
+			next unless $p->{h}->pumpable;
+			$live++;
+			$p->{h}->pump_nb;
+		}
+		return 0 if $live == 0;
+		select(undef, undef, undef, 0.1);
+	}
+	return 1;
+}
+
+sub tail_of {
+	my ($s, $n) = @_;
+	my @l = split /\n/, $s;
+	@l = @l[-$n .. -1] if @l > $n;
+	return join("\n", @l);
+}
+
+# A hang is a failure with a diagnosis, not a CI timeout.
+sub finish_or_report {
+	my ($handles, $secs) = @_;
+	my $hung = pump_all($handles, $secs);
+
+	if ($hung) {
+		diag("HUNG: sessions did not finish in ${secs}s");
+		diag("$_->{name} stderr tail:\n" . tail_of(${ $_->{err} }, 8)) for @$handles;
+		diag($node->safe_psql('postgres',
+			q{SELECT pid, wait_event_type, wait_event, left(query, 40) FROM pg_stat_activity
+			   WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()}));
+		$_->{h}->kill_kill for @$handles;
+	} else {
+		finish($_->{h}) for @$handles;
+	}
+	ok(!$hung, scalar(@$handles) . " concurrent psql sessions all finished within ${secs}s");
+}
+
+# Parse a session's own "SPAN kind=... start=<epoch> end=<epoch> iters=<n>".
+sub span_of {
+	my ($err) = @_;
+	return ($err =~ /SPAN kind=\S+ start=([\d.]+) end=([\d.]+) iters=(\d+)/)
+		? { start => $1, end => $2, iters => $3 } : undef;
+}
+
+sub overlap_secs {
+	my ($x, $y) = @_;
+	my $lo = $x->{start} > $y->{start} ? $x->{start} : $y->{start};
+	my $hi = $x->{end} < $y->{end} ? $x->{end} : $y->{end};
+	return $hi - $lo;
+}
+
+# start writer + two readers, and pump them all at once
 my ($wh, $wout, $werr)    = psql_proc($writer_sql);
 my ($r1h, $r1out, $r1err) = psql_proc($reader_sql);
 my ($r2h, $r2out, $r2err) = psql_proc($reader_sql);
+my @readers = ({ name => 'reader r1', h => $r1h, err => $r1err },
+			   { name => 'reader r2', h => $r2h, err => $r2err });
+my $writer = { name => 'writer', h => $wh, err => $werr };
 
-finish($r1h);
-finish($r2h);
-finish($wh);
+finish_or_report([ $writer, @readers ], 120);
 
 my $all_err = "$$r1err\n$$r2err";
 my $reads_line = join("\n", grep { /READER_DONE/ } split /\n/, $all_err);
 diag("reader summary: $reads_line");
-# Evidence the readers actually ran their loop many times (not zero overlap).
+# Evidence the readers actually ran their loop (kept; NOT proof of overlap --
+# the SPAN assertions below are).
 my ($total_reads) = ($all_err =~ /READER_DONE reads=(\d+)/);
 cmp_ok($total_reads // 0, '>', 0,
 	'a reader completed at least one gated read concurrently with the writer');
 
+# POSITIVE CONTROL: the writer did work, and each reader's loop overlapped it.
+# Serial execution (the pre-2026-09-29 harness) gives ~0 s overlap.
+my $ws = span_of($$werr);
+diag("writer: no SPAN notice (aborted?)") unless $ws;
+cmp_ok($ws ? $ws->{iters} : 0, '>', 0,
+	'writer completed at least one churn iteration (b > 0)');
+for my $r (@readers) {
+	my $rs = span_of(${ $r->{err} });
+	diag("$r->{name}: no SPAN notice (aborted before its end?)") unless $rs;
+	my $ov = ($rs && $ws) ? overlap_secs($rs, $ws) : -1;
+	cmp_ok($ov, '>=', 5,
+		sprintf('%s and writer ran concurrently (overlap %.1fs)', $r->{name}, $ov));
+}
+
 my $misses = () = ($all_err =~ /ANCHOR_MISS/g);
 my $reader_errored = ($all_err =~ /\bERROR:/) ? 1 : 0;
+if ($reader_errored) {
+	my %seen;
+	my @e = grep { /\bERROR:/ && !$seen{$_}++ } split /\n/, $all_err;
+	diag("distinct reader ERROR lines (first 5):\n"
+		. join("\n", @e[0 .. ($#e < 4 ? $#e : 4)]));
+}
 
 is($misses, 0,
 	'no concurrent anchor read returned a wrong count (page-recycle miss or leaked NULL)');

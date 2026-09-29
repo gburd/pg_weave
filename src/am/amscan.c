@@ -540,6 +540,7 @@ weave_tombstones_free(WeaveTombstones *t)
 	pfree(t->blobs);
 	pfree(t->maps);
 	pfree(t->present);
+	t->hasany = false;			/* idempotent: the lexical retry path frees again */
 }
 
 /*
@@ -668,6 +669,47 @@ weave_read_meta_generation(Relation index)
 	}
 	UnlockReleaseBuffer(buffer);
 	return gen;
+}
+
+/*
+ * A scan that lost every race with a concurrent merge: raise, never degrade.
+ *
+ * Every generation-bracketed pass below (the lexical collector, the docvalues
+ * collector, the ranked, vector, edit-distance and fused passes) redoes itself
+ * from a fresh snapshot when the directory generation moves under it, up to
+ * pg_weave.scan_race_retries times.  What happens after the last retry is the
+ * point of doc/GAPS.md G58: each of them used to degrade SILENTLY -- keep the
+ * last, possibly stale, attempt; or return no candidates, which ends the scan
+ * with an answer that looks exactly like a real one.  None of these passes has
+ * an exact fallback (the cgram collector and the count fast path do, and they
+ * keep them), so the only correct outcome is an error the client can retry, and
+ * serialization_failure is the SQLSTATE every retry loop already handles.
+ *
+ * Reached from user scans only: all six callers are static to this file and
+ * are entered from amgettuple, amgetbitmap, weave_count() and weave_search(),
+ * never from VACUUM, merge, build or amcheck, so an ERROR here cannot make an
+ * index unvacuumable.
+ *
+ * PG18 replaced pg_attribute_noreturn() with a leading pg_noreturn; take
+ * whichever the server headers define.
+ */
+#ifdef pg_noreturn
+pg_noreturn static void weave_scan_raced_out(Relation index, const char *pass,
+											 int attempts);
+#else
+static void weave_scan_raced_out(Relation index, const char *pass,
+								 int attempts) pg_attribute_noreturn();
+#endif
+
+static void
+weave_scan_raced_out(Relation index, const char *pass, int attempts)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("pg_weave: index \"%s\" was reorganized by a concurrent merge or vacuum during every one of %d attempts to read it",
+					RelationGetRelationName(index), attempts),
+			 errdetail("The %s pass cannot return a partial answer.", pass),
+			 errhint("Retry the transaction, or raise pg_weave.scan_race_retries.")));
 }
 
 /*
@@ -1000,6 +1042,34 @@ tidset_or(TidSet a, TidSet b)
 		r.tids[k++] = b.tids[j++];
 	r.n = k;
 	return r;
+}
+
+/*
+ * Append one TID to an UNSORTED accumulator, growing it by doubling; the
+ * caller runs tidset_sort_uniq() once at the end.  The pending walks used to
+ * add each match with tidset_or(acc, one), which allocates a fresh n+1 array
+ * per match and never frees the old one: O(n^2) time AND memory in the
+ * pending-list length.  51,000 pending matches peaked at 7.3 GB RSS and a
+ * t/027 run was OOM-killed at 17.6 GB (doc/GAPS.md G64).
+ */
+static void
+tidset_append(TidSet *s, int *cap, ItemPointer t)
+{
+	if (s->n >= *cap)
+	{
+		int			newcap;
+
+		if (*cap >= TIDSET_MAX_N)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("pg_weave: too many pending-list matches to collect")));
+		newcap = (*cap > TIDSET_MAX_N / 2) ? TIDSET_MAX_N : Max(*cap * 2, 256);
+		s->tids = s->tids
+			? repalloc(s->tids, (Size) newcap * sizeof(ItemPointerData))	/* alloc-ok: newcap <= TIDSET_MAX_N, checked above */
+			: palloc((Size) newcap * sizeof(ItemPointerData));	/* alloc-ok: newcap <= TIDSET_MAX_N, checked above */
+		*cap = newcap;
+	}
+	s->tids[s->n++] = *t;
 }
 
 /* a AND NOT b (b subtracted from a) */
@@ -2434,6 +2504,9 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 
 	so->queryValid = false;
 	so->cgramScan = false;
+	/* the previous rescan's pattern copy (opaque context; G59) */
+	if (so->cgramPat != NULL)
+		pfree(so->cgramPat);
 	so->cgramPat = NULL;
 	so->cgramPatLen = 0;
 	so->cgramCI = false;
@@ -2670,10 +2743,25 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		memmove(scan->orderByData, orderbys,
 				scan->numberOfOrderBys * sizeof(ScanKeyData));
 	so->orderInit = false;
+
+	/*
+	 * The ordering route's two arrays, the rest of doc/GAPS.md G59.  Both are
+	 * standalone chunks nothing else aliases: ordered[] is palloc/repalloc'd by
+	 * weave_ord_probe() alone, and cand[] is the whole-array result of whichever
+	 * pass ran last (ranked, vector, edit-distance or fused), each of which
+	 * already pfree()s its predecessor before storing -- so freeing here is the
+	 * same operation one rescan later.  weave_endscan() frees nothing (the scan's
+	 * context goes), so this is the only free.  A nested-loop inner ORDER BY scan
+	 * dropped both pointers once per outer row.
+	 */
+	if (so->ordered != NULL)
+		pfree(so->ordered);
 	so->ordered = NULL;
 	so->nordered = 0;
 	so->maxordered = 0;
 	so->ordpos = 0;
+	if (so->cand != NULL)
+		pfree(so->cand);
 	so->cand = NULL;
 	so->ncand = 0;
 	so->candpos = 0;
@@ -2699,6 +2787,9 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->plainpos = 0;
 	so->plainRecheck = false;
 	so->edistScan = false;
+	/* the previous rescan's pattern copy (opaque context; G59) */
+	if (so->edistPat != NULL)
+		pfree(so->edistPat);
 	so->edistPat = NULL;
 	so->edistPatLen = 0;
 	so->edistThr = 0;
@@ -2713,6 +2804,9 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	 * correlated subquery for exactly this.
 	 */
 	so->vecScan = false;
+	/* the previous rescan's query-vector copy (opaque context; G59) */
+	if (so->vecQuery != NULL)
+		pfree(so->vecQuery);
 	so->vecQuery = NULL;
 	so->vecAttno = 0;
 	so->veck = 0;
@@ -2726,8 +2820,39 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	 * for exactly this.
 	 */
 	so->fuseScan = false;
+
+	/*
+	 * The previous rescan's fused copies (G59), all made by weave_fuse_rescan()
+	 * in the opaque's context: five nfuse-long arrays, plus one query or vector
+	 * copy per channel (the other slot of each pair is NULL, palloc0).  nfuse is
+	 * set only once all of them exist, so it is the right bound.
+	 */
+	{
+		int			i;
+
+		for (i = 0; i < so->nfuse; i++)
+		{
+			if (so->fuseQ != NULL && so->fuseQ[i] != NULL)
+				pfree(so->fuseQ[i]);
+			if (so->fuseV != NULL && so->fuseV[i] != NULL)
+				pfree(so->fuseV[i]);
+		}
+	}
+	if (so->fuseQ != NULL)
+		pfree(so->fuseQ);
+	if (so->fuseW != NULL)
+		pfree(so->fuseW);
+	if (so->fuseStrat != NULL)
+		pfree(so->fuseStrat);
+	if (so->fuseV != NULL)
+		pfree(so->fuseV);
+	if (so->fuseA != NULL)
+		pfree(so->fuseA);
 	so->fuseQ = NULL;
 	so->fuseW = NULL;
+	so->fuseStrat = NULL;
+	so->fuseV = NULL;
+	so->fuseA = NULL;
 	so->nfuse = 0;
 	so->fusek = 0;
 	so->fuseDone = false;
@@ -3336,8 +3461,9 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 	 * rows the recheck discards do -- until it can prove nothing further exists
 	 * (candfull / maxhits, vecDone / vecLanes, edistDone, fuseDone / maxhits).
 	 * Two limits remain, both in doc/GAPS.md: a ladder stops widening at
-	 * WEAVE_ORD_WIDTH_MAX candidates (and after repeated lost races with a
-	 * concurrent merge, G58), so more rejected rows than that go unreturned;
+	 * WEAVE_ORD_WIDTH_MAX candidates, so more rejected rows than that go
+	 * unreturned (a pass that loses every race with a concurrent merge no
+	 * longer ends a ladder short: it raises 40001, G58);
 	 * and the ordering scan's own contract is unchanged -- it emits only
 	 * documents the ORDER BY argument ranks (for `<=>`, those matching its
 	 * query), so `price < c ORDER BY d <=> q` returns the price < c rows that
@@ -3788,6 +3914,7 @@ weave_collect_matches(Relation index, WeaveQuery query, TidSet *out, bool *reche
 	WeaveMetaPageData meta;
 	TidSet		acc;
 	TidSet		pending_acc;
+	int			pending_cap;
 	WeaveTombstones seg_tombs;
 	bool		has_fuzzy_regex = false;
 	bool		has_not = false;
@@ -4143,6 +4270,7 @@ collect_retry:
 	 * previously deleted, tombstoned doc) would otherwise be wrongly dropped. */
 	pending_acc.tids = NULL;
 	pending_acc.n = 0;
+	pending_cap = 0;
 	if (meta.pendinghead != InvalidBlockNumber)
 	{
 		BlockNumber blk = meta.pendinghead;
@@ -4162,6 +4290,13 @@ collect_retry:
 				break;		/* block truncated by a concurrent weave_vacuum: end of chain */
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buffer);
+			if (!weave_page_is_live_pending(page))
+			{
+				/* freed or recycled under a stale head: stop; the generation
+				 * re-check restarts the read (doc/GAPS.md G62) */
+				UnlockReleaseBuffer(buffer);
+				break;
+			}
 			next = WeavePageGetOpaque(page)->nextblk;
 
 			/*
@@ -4194,13 +4329,7 @@ collect_retry:
 									RelationGetRelationName(index)),
 							 errhint("REINDEX the index to rebuild it from the heap.")));
 				else if (weave_doc_matches(rec.doc, query))
-				{
-					TidSet		one;
-
-					one.tids = rec.tid;
-					one.n = 1;
-					pending_acc = tidset_or(pending_acc, one);	/* exact per-doc match */
-				}
+					tidset_append(&pending_acc, &pending_cap, rec.tid);	/* exact per-doc match */
 			}
 			UnlockReleaseBuffer(buffer);
 			blk = next;
@@ -4217,6 +4346,7 @@ collect_retry:
 	/* fold in the (unfiltered) pending matches and re-uniq */
 	if (pending_acc.n > 0)
 	{
+		tidset_sort_uniq(&pending_acc);
 		acc = tidset_or(acc, pending_acc);
 		tidset_sort_uniq(&acc);
 	}
@@ -4224,13 +4354,18 @@ collect_retry:
 	 * Concurrency guard: if the segment directory changed while we were reading
 	 * (a concurrent merge/vacuum/bulkdelete may have freed + recycled pages we
 	 * read from a now-stale segment descriptor), our result may be a stale read.
-	 * Discard it and redo from a fresh snapshot.  Bounded so a pathological
-	 * merge storm can't spin forever; after the cap we proceed with the last
-	 * result (still no worse than the pre-fix behavior, and merges are rare
-	 * relative to a scan).
+	 * Discard it and redo from a fresh snapshot, up to
+	 * pg_weave.scan_race_retries times so a pathological merge storm cannot
+	 * spin forever.  Past the cap the scan raises 40001
+	 * (weave_scan_raced_out()): it used to proceed with the last, possibly
+	 * stale, result, which for an exact set is a silent wrong answer and not
+	 * "no worse than before"; doc/GAPS.md G58.
 	 */
-	if (weave_read_meta_generation(index) != gen0 && gen_retries++ < 10)
+	if (weave_read_meta_generation(index) != gen0)
 	{
+		if (gen_retries >= pg_weave_scan_race_retries)
+			weave_scan_raced_out(index, "lexical", gen_retries + 1);
+		gen_retries++;
 		if (acc.tids)
 			pfree(acc.tids);
 		if (pending_acc.tids)
@@ -4839,6 +4974,7 @@ weave_cgram_collect(Relation index, const char *pat, int patlen, bool ci,
 	{
 		BlockNumber blk = meta.pendinghead;
 		bool		dvtext = weave_index_dv_is_text(index);	/* trailer decode */
+		int			cap = acc.n;	/* acc.tids holds at least acc.n (tidset_or) */
 
 		while (blk != InvalidBlockNumber)
 		{
@@ -4854,16 +4990,17 @@ weave_cgram_collect(Relation index, const char *pat, int patlen, bool ci,
 				break;
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buffer);
+			if (!weave_page_is_live_pending(page))
+			{
+				/* freed or recycled under a stale head: stop; the generation
+				 * re-check restarts the read (doc/GAPS.md G62) */
+				UnlockReleaseBuffer(buffer);
+				break;
+			}
 			next = WeavePageGetOpaque(page)->nextblk;
 			weave_pending_iter_init(&it, page, dvtext);
 			while (weave_pending_iter_next(&it, &rec))
-			{
-				TidSet		one;
-
-				one.tids = rec.tid;
-				one.n = 1;
-				acc = tidset_or(acc, one);
-			}
+				tidset_append(&acc, &cap, rec.tid);	/* sorted below (G64) */
 			UnlockReleaseBuffer(buffer);
 			blk = next;
 		}
@@ -4998,7 +5135,9 @@ weave_docvals_collect(Relation index, WeaveDvStrat op, int64 c,
 	 * The same bounded generation re-check weave_collect_matches() makes: a
 	 * concurrent merge/vacuum can free and recycle the pages a stale segment
 	 * descriptor points at, and this set is EXACT (no recheck), so a stale read
-	 * would be a silent wrong answer rather than a superset.
+	 * would be a silent wrong answer rather than a superset -- which is also why
+	 * exhausting pg_weave.scan_race_retries raises 40001 rather than returning
+	 * the last attempt (doc/GAPS.md G58).
 	 */
 docvals_retry:
 	gen0 = meta.generation;
@@ -5145,6 +5284,13 @@ docvals_retry:
 				break;
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buffer);
+			if (!weave_page_is_live_pending(page))
+			{
+				/* freed or recycled under a stale head: stop; the generation
+				 * re-check restarts the read (doc/GAPS.md G62) */
+				UnlockReleaseBuffer(buffer);
+				break;
+			}
 			next = WeavePageGetOpaque(page)->nextblk;
 			weave_pending_iter_init(&it, page, tkey != NULL);
 			while (weave_pending_iter_next(&it, &rec))
@@ -5191,8 +5337,12 @@ docvals_retry:
 		}
 	}
 
-	if (weave_read_meta_generation(index) != gen0 && gen_retries++ < 10)
+	if (weave_read_meta_generation(index) != gen0)
 	{
+		/* exhausted: 40001, never the stale set (doc/GAPS.md G58) */
+		if (gen_retries >= pg_weave_scan_race_retries)
+			weave_scan_raced_out(index, "docvalues", gen_retries + 1);
+		gen_retries++;
 		weave_read_meta(index, &meta);
 		goto docvals_retry;		/* tids[] is reused: ntids restarts at 0 */
 	}
@@ -7579,17 +7729,20 @@ weave_ord_grow(Relation index, WeaveScanOpaque so)
  * metapage snapshot, so a concurrent merge or vacuum can free and recycle those
  * pages mid-pass and the scan would score bytes that are no longer the weft.
  * Re-read the directory generation afterwards and redo from a fresh snapshot if it
- * moved, bounded at 10 attempts -- exactly weave_topk_candidates_guarded()'s
- * contract, including its outcome on total failure: no candidates rather than a
- * nonzero count over an array that may be garbage.  (The weave_vec_scan() SRF does
- * NOT do this and never has; it is a diagnostic that reads what is there.)
+ * moved, up to pg_weave.scan_race_retries times -- exactly
+ * weave_topk_candidates_guarded()'s contract, including its outcome on total
+ * failure, which is ERROR 40001 (weave_scan_raced_out()).  It used to return NULL,
+ * which weave_vec_pass() read as "no candidates" and so ended the scan with an
+ * empty or short answer that looked like a real one; doc/GAPS.md G58.  (The
+ * weave_vec_scan() SRF does NOT do this and never has; it is a diagnostic that
+ * reads what is there.)  Never returns NULL.
  */
 static WeaveVecTopK *
 weave_vec_topk_guarded(Relation index, WeaveScanOpaque so)
 {
 	int			gen_retries = 0;
 
-	do
+	for (;;)
 	{
 		WeaveMetaPageData meta;
 		uint32		gen0 = weave_read_meta_generation(index);
@@ -7603,9 +7756,10 @@ weave_vec_topk_guarded(Relation index, WeaveScanOpaque so)
 		pfree(r->hit);
 		pfree(r->ctr);
 		pfree(r);
-	} while (gen_retries++ < 10);
-
-	return NULL;
+		if (gen_retries >= pg_weave_scan_race_retries)
+			weave_scan_raced_out(index, "vector", gen_retries + 1);
+		gen_retries++;
+	}
 }
 
 static void
@@ -7616,19 +7770,13 @@ weave_vec_pass(Relation index, WeaveScanOpaque so)
 	int			ncand;
 	int			i;
 
-	if (r == NULL)
-	{
-		/* every attempt raced a merge: no candidates, and the ladder stops */
-		if (so->cand)
-			pfree(so->cand);
-		so->cand = NULL;
-		so->ncand = 0;
-		so->candpos = 0;
-		so->candfull = false;
-		so->vecLanes = 0;
-		so->vecDone = true;
-		return;
-	}
+	/*
+	 * r is never NULL: a pass that loses every race with a merge raises 40001
+	 * inside weave_vec_topk_guarded() rather than returning an empty answer
+	 * (doc/GAPS.md G58), so the old "no candidates, the ladder stops" branch
+	 * that was here is gone.
+	 */
+	Assert(r != NULL);
 
 	so->vecLanes = r->nlane;
 	so->vecDone = (r->nhit < so->veck ||
@@ -7883,6 +8031,13 @@ edist_collect_pending(Relation index, const WeaveMetaPageData *meta,
 			break;				/* truncated by a concurrent weave_vacuum */
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
+		if (!weave_page_is_live_pending(page))
+		{
+			/* freed or recycled under a stale head: stop; the generation
+			 * re-check restarts the read (doc/GAPS.md G62) */
+			UnlockReleaseBuffer(buffer);
+			break;
+		}
 		next = WeavePageGetOpaque(page)->nextblk;
 		weave_pending_iter_init(&it, page, dvtext);
 		while (weave_pending_iter_next(&it, &rec))
@@ -7934,7 +8089,7 @@ weave_edist_pass(Relation index, WeaveScanOpaque so)
 	acc.n = 0;
 	acc.cap = 0;
 
-	for (attempt = 0; attempt < 10; attempt++)
+	for (attempt = 0;; attempt++)
 	{
 		WeaveMetaPageData meta;
 		WeaveTombstones seg_tombs;
@@ -8028,10 +8183,15 @@ weave_edist_pass(Relation index, WeaveScanOpaque so)
 		 * Concurrency guard, the same one weave_collect_matches applies: the
 		 * pages were read under per-page SHARE locks off a metapage snapshot, so
 		 * a concurrent merge/vacuum may have freed and recycled them.  If the
-		 * directory generation moved, redo from a fresh snapshot.
+		 * directory generation moved, redo from a fresh snapshot, up to
+		 * pg_weave.scan_race_retries times, and then raise 40001.  This loop
+		 * used to fall out after its tenth attempt KEEPING that attempt's
+		 * possibly-stale hits; doc/GAPS.md G58.
 		 */
 		if (weave_read_meta_generation(index) == gen0)
 			break;
+		if (attempt >= pg_weave_scan_race_retries)
+			weave_scan_raced_out(index, "edit-distance", attempt + 1);
 	}
 
 	/* One entry per document, carrying its MINIMUM distance. */
@@ -8504,7 +8664,6 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 	int			nacc = 0;
 	int			capacc = 0;
 	bool		complete = true;
-	bool		stable = false;
 	int			attempt;
 	int			i;
 	int			j;
@@ -8597,10 +8756,11 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 	 * weave_topk_candidates_guarded() do: the bolt loop reads dictionary and
 	 * posting pages under per-page SHARE locks off a metapage snapshot, so a
 	 * concurrent merge or vacuum can free and recycle them mid-pass.  Re-read the
-	 * directory generation and redo from a fresh snapshot if it moved, bounded at
-	 * 10 attempts.
+	 * directory generation and redo from a fresh snapshot if it moved, up to
+	 * pg_weave.scan_race_retries times; past that the pass raises 40001 (see the
+	 * end of the loop, and doc/GAPS.md G58).
 	 */
-	for (attempt = 0; attempt < 10; attempt++)
+	for (attempt = 0;; attempt++)
 	{
 		WeaveMetaPageData meta;
 		WeaveTombstones tombs;
@@ -9287,27 +9447,24 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		MemoryContextSwitchTo(old);
 
 		if (weave_read_meta_generation(index) == gen0)
-		{
-			stable = true;
 			break;
-		}
+
+		/*
+		 * EVERY ATTEMPT RACED A MERGE.  Then this attempt's hits may have come
+		 * off recycled pages, and there is no exact answer to fall back to, so
+		 * the pass raises 40001 (doc/GAPS.md G58).  It used to DISCARD them and
+		 * declare the pass complete, which ended the scan with zero rows that
+		 * looked like a real answer; weave_edist_pass() diverged the other way
+		 * and kept the stale attempt.  Both, and weave_vec_pass() and
+		 * weave_topk_candidates_guarded(), now go through the same
+		 * weave_scan_raced_out(), so that divergence is gone.  passctx is a
+		 * child of the scan's context and is released by the abort.
+		 */
+		if (attempt >= pg_weave_scan_race_retries)
+			weave_scan_raced_out(index, "fused", attempt + 1);
 	}
 
 	MemoryContextDelete(passctx);
-
-	/*
-	 * EVERY ATTEMPT RACED A MERGE.  Then the last attempt's hits may have come off
-	 * recycled pages, so they are DISCARDED rather than returned -- the outcome
-	 * weave_topk_candidates_guarded() and weave_vec_pass() both specify, and the
-	 * one weave_edist_pass() does not (it keeps the last attempt; that is a
-	 * pre-existing divergence, noted here rather than changed by this task).  The
-	 * ladder stops, because widening would only race again.
-	 */
-	if (!stable)
-	{
-		nacc = 0;
-		complete = true;
-	}
 
 	if (nacc > 1)
 		qsort(acc, nacc, sizeof(ScoredTid), cmp_fuse_cand);
@@ -9390,9 +9547,10 @@ weave_fuse_grow(Relation index, WeaveScanOpaque so)
  * metapage snapshot, so a concurrent merge/vacuum can free and recycle those
  * pages mid-scan.  Re-read the directory generation afterwards: if it moved the
  * candidates may have come off recycled pages, so discard them and redo from a
- * fresh snapshot, bounded at 10 attempts.  If every attempt races, return zero
- * candidates -- never a nonzero count with a NULL array, which is what the
- * inline copy of this loop this function replaced could do.
+ * fresh snapshot, up to pg_weave.scan_race_retries times.  If every attempt
+ * races, raise 40001 (weave_scan_raced_out()).  This used to return zero
+ * candidates, which both callers -- the ranked gettuple ladder and the
+ * weave_search() SRF -- reported as an empty answer; doc/GAPS.md G58.
  */
 static int
 weave_topk_candidates_guarded(Relation index, WeaveQuery q, int wantk,
@@ -9400,7 +9558,7 @@ weave_topk_candidates_guarded(Relation index, WeaveQuery q, int wantk,
 {
 	int			gen_retries = 0;
 
-	do
+	for (;;)
 	{
 		ScoredTid  *cand = NULL;
 		uint32		gen0 = weave_read_meta_generation(index);
@@ -9414,10 +9572,10 @@ weave_topk_candidates_guarded(Relation index, WeaveQuery q, int wantk,
 		}
 		if (cand)
 			pfree(cand);
-	} while (gen_retries++ < 10);
-
-	*out = NULL;
-	return 0;
+		if (gen_retries >= pg_weave_scan_race_retries)
+			weave_scan_raced_out(index, "ranked", gen_retries + 1);
+		gen_retries++;
+	}
 }
 
 /*

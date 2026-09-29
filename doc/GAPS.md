@@ -4023,46 +4023,202 @@ torn by a concurrent merge would have been a silent wrong answer, not a superset
 retries from a fresh snapshot, bounded at 10 attempts (see G58 for that bound). That race
 is fixed by construction, but no concurrent TAP test exercises it yet (T7 owes one).
 
-### G58 — every generation-guarded collector gives up after 10 lost races with a concurrent merge and returns a possibly-short answer with no error — **FOUND 2026-09-28 in review; PRE-EXISTING; OPEN**
+### G58 — every generation-guarded collector gives up after 10 lost races with a concurrent merge and returns a possibly-short answer with no error — **FOUND 2026-09-28 in review; PRE-EXISTING; FIXED 2026-09-29**
 
 `weave_collect_matches()`, `weave_docvals_collect()` and `weave_vec_topk_guarded()`
 all redo their read when the directory generation moved, bounded at 10 attempts so a
-merge storm cannot spin a scan forever. On the 11th loss they go on anyway: the lexical
-and docvalues collectors keep the last (possibly stale) set, and the vector pass
-returns **no candidates**, after which the ordering ladder ends the scan with
-`candfull = false`. That is a short or stale answer with no error. It needs a merge
-storm to reach and has never been observed, but it is reachable. **Owed:** raise
-`ERROR` (SQLSTATE 40001, serialization failure, so a client retries) instead of
-returning, plus a TAP test that forces it with a small bound.
+merge storm cannot spin a scan forever. On the 11th loss they went on anyway: the
+lexical and docvalues collectors kept the last (possibly stale) set, and the vector
+pass returned **no candidates**, after which the ordering ladder ended the scan with
+`candfull = false`. That was a short or stale answer with no error.
+
+**Fix.** The bound is now the GUC `pg_weave.scan_race_retries` (default 10, range
+0..1000, USERSET, defined outside `WEAVE_TEST_HOOKS`), and when it runs out,
+`weave_scan_raced_out()` (`src/am/amscan.c`) raises SQLSTATE 40001, so a client
+retries. The raise is at six sites: the lexical and docvalues collectors, the vector
+top-k, edit distance, the fused scorer, and `topk_candidates_guarded`.
+
+`t/026_scan_race_error.pl` covers it:
+- **GUC:** it is real (`short_desc` present, and an out-of-range `SET` is refused).
+- **Phase 1:** with retries = 0 against a flush/merge writer, a 40001 appears (the
+  positive control) and every count that succeeds is exact.
+- **Phase 2**, added after review: it runs with retries = 1000 against a
+  DELETE + VACUUM writer, so the segments carry tombstones.
+
+Phase 2 exists because review found that the retry branch **double-freed the tombstone
+maps**. `weave_tombstones_free()` did not reset `hasany`, and the retry freed again what
+the success path had already freed. Phase 1 could never reach this, because it never
+retries. The mutant with the reset removed **segfaults** in phase 2. **OPEN:** only the
+lexical site has a positive control. The docvalues, vector, edist, fused and ranked
+sites raise through the same function, but no test forces them to.
 
 A second completeness limit on the ordering route: a ladder stops widening at
 `WEAVE_ORD_WIDTH_MAX` (INT_MAX/32, ~67M) candidates. If more rows than that are rejected
 by a recheck (G55/G56), the missing rows go unreturned without an error. That needs a
 >67M-row index and a very unselective restriction key, and is **OPEN**.
 
-### G59 — rescan leaked the previous match set: a nested-loop inner index scan grew memory by one match set per outer row — **FOUND 2026-09-28; memory, not correctness; PARTLY FIXED 2026-09-28**
+### G59 — rescan leaked the previous match set: a nested-loop inner index scan grew memory by one match set per outer row — **FOUND 2026-09-28; memory, not correctness; FIXED 2026-09-29**
 
 `weave_rescan()` reset `so->plainInit` without freeing `so->plainTids`, and the new
 multi-key AND (G54) leaked both `tidset_and()` inputs. Both are freed now
-(`tidset_and()` always returns a fresh array, so neither input can be aliased). The
-nested-loop rescans in `sql/docvals.sql` §13 run that path. The loss: there is no
-memory assertion, so the test proves the frees don't break correctness but not that
-they bound memory. **OPEN:** the ordering route's `so->ordered` / `so->cand` arrays
-are still not freed on rescan.
+(`tidset_and()` always returns a fresh array, so neither input can be aliased). As of
+2026-09-29, the ordering route's `so->ordered` / `so->cand` arrays and the other
+per-scan arrays are freed on rescan too; review found no double free or aliasing. The
+nested-loop rescans in `sql/docvals.sql` §13 run that path. The loss still stands:
+there is no memory assertion, so the tests prove the frees don't break correctness,
+not that they bound memory.
 
-### G60 — `sql/vecindex.sql`'s delete-then-merge assertion read `live_lanes_dropped = 0` (expected 6) in one local full run — **SEEN ONCE 2026-09-28 on lpg; NOT REPRODUCED; OPEN (suspected VACUUM horizon flake)**
+### G60 — `sql/vecindex.sql`'s delete-then-merge assertion read `live_lanes_dropped = 0` (expected 6) in one local full run — **ROOT-CAUSED 2026-09-29 on EC2: a test bug (the VACUUM horizon); FIXED — and the hunt found G61**
 
 In one full 20-test pg_regress run on the local cluster, the assertion after
 `DELETE ... ; VACUUM vw; ... weave_merge()` showed that no deleted document's lane had
-dropped. The next full run with the **same** binary passed, and so did `vecindex`
-alone and a hand replay (`VACUUM VERBOSE`: 6 removed, 0 dead-but-not-removable). The
-suspected cause is a snapshot in the same database (for example an autovacuum ANALYZE)
-holding the removable horizon back during that VACUUM. This is **not proven**: nothing
-from that run shows what held the horizon.
+dropped.
 
 **Retraction (hard rule 8):** commit 120a7fe's message says this "failed the same way at
 a4fa29c". It did not. The a4fa29c run and the `weave vecindex` subset runs failed only on
-a NOTICE line whose position depends on test order, not on this assertion. The one real
-observation was on the T4 binary. **Owed:** if it recurs, capture `VACUUM (VERBOSE)` and
-`pg_stat_activity.backend_xmin` at that statement, or make the test assert the heap
-tuples were removed before it asserts the lanes.
+a NOTICE line whose position depends on test order, not on this assertion.
+
+**Reproduced 2026-09-29 on EC2.** `bench/aws/regress_loop.sh` ran the suite 180 times,
+split into three autovacuum arms on parallel clusters:
+
+| arm | autovacuum | red suites |
+|---|---|---|
+| off | off | 0 / 60 |
+| on | default | 1 / 60 |
+| fast | `autovacuum_naptime = 1s` | 9 / 60 |
+
+Every G60-shaped failure came from an autovacuum arm. In the failing run's server log,
+an autovacuum ANALYZE in the same database started in the same millisecond as
+`VACUUM vw` and held the horizon, so the deleted tuples were not yet removable and no
+lane could drop. That is a test bug, not an index bug. The loop also found parallel
+clusters colliding on the fixed `COPY` path `/tmp/pg_weave_rt.bin`.
+
+**Fix.**
+- `pg_temp.wait_for_horizon()` runs before each asserted VACUUM in `docvals`, `vecindex`
+  and `weave`. It waits until no other backend in the database holds an xmin or xid
+  older than its own.
+- `weave.sql`'s `COPY` paths are now per-backend.
+
+Review found two bugs in the helper's first version:
+- It read `pg_stat_activity` once per transaction, so its loop never saw an update. It
+  now calls `pg_stat_clear_snapshot()` on each pass.
+- It compared an epoch-extended `txid_current()` with a 32-bit `backend_xmin`. It now
+  compares with `age()`.
+
+**The fast arm's other red runs were not G60.** One was `weave.sql`'s vconv block
+counting 61,260 of 64,000 rows, which is **G61**.
+
+### G61 — a pending-list flush dropped every row a concurrent INSERT appended while it ran — **FOUND 2026-09-29 by the G60 EC2 loop; P0 silent wrong answer on ordinary INSERT + autovacuum; FIXED 2026-09-29**
+
+`weave_flush_pending()` walks the pending list, folds what it sees into a new segment,
+and then removed the **whole** list and freed every page on it. Nothing excludes a
+concurrent INSERT from that window:
+- `weave_insert()` holds only the metapage buffer lock.
+- Neither autovacuum's cleanup (the table's ShareUpdateExclusiveLock) nor
+  `weave_merge()` (the index's) conflicts with RowExclusiveLock.
+
+So every item appended between the walk and the clear vanished from the index while
+its heap row stayed. `weave_check()` stayed clean, because it checks structure, not
+coverage.
+
+**Measured.** `/scratch`-local repro (one 80,000-row INSERT racing `weave_merge()`):
+74,298, 75,207 and 76,294 of 81,000 rows indexed before the fix, and 81,000 in all six
+runs after it (three with each version of the fix, below). On EC2, the fast arm's
+`weave.sql` vconv block counted 61,260 of 64,000.
+
+**Fix.** The flush records its cut: the last page read, that page's item-area end when
+it was read, and the number of items consumed. The clear then takes the metapage
+EXCLUSIVE and then the cut page, the same order `weave_insert()` uses, and removes only
+that prefix:
+- **Nothing appended:** the list becomes empty, as before.
+- **Pages linked after the cut:** they become the list.
+- **Items appended on the cut page:** the page is compacted **in place** and kept as the
+  head. The first version copied them to a fresh page instead. Review pointed out that
+  the allocation can ERROR after the segment was added, leaving documents both in the
+  segment and on the list.
+
+The clear also bumps the directory generation (see below), and pages are freed only up
+to the cut.
+
+**Review found a concurrent miss the first version still had.** The segment add bumped
+the generation but the clear did not. A reader that read the metapage between the two
+held the new generation and the old head. When a freed page stopped its walk (G62), it
+dropped the kept rows and its generation re-check still passed. The clear now bumps the
+generation itself.
+
+**The mutant with that bump removed SURVIVED** t/027's concurrent reader: 2 runs,
+7 rounds, about 270 index-versus-heap checks per round, all equal. The window is a few
+microseconds and no hook widens it, so that part of the fix rests on the argument in
+`include/weave/am.h` (`weave_page_is_live_pending`), not on a test.
+
+`t/027_flush_insert_race.pl` covers the rest:
+- Three inserters (single-row and bulk), a flusher and a reader run with real overlap,
+  asserted from each session's own wall-clock SPAN.
+- Rounds repeat until both keep-shapes have fired, each proven by its own DEBUG1 line.
+- Coverage is checked per round, and again before and after a final flush, through
+  `weave_count`, a forced index scan and `weave_check`.
+
+### G62 — a freed page's `nextblk` held the free-time XID, and a stale chain walker followed it as a block number and looped forever — **FOUND 2026-09-29 (t/026 hang, gdb backtraces); P0 hang; FIXED 2026-09-29**
+
+`weave_free_page()` stored the free XID in `nextblk`, on the reasoning that a freed page
+is off every chain. Scans do not hold pins between pending pages, so a scan that
+snapshotted `pendinghead` before a flush could arrive on a freed page and follow its
+"next block". That meant walking a cycle of freed pages forever, on CPU, holding no
+lock. The backtraces showed it in the pending walk of `weave_collect_matches` and in
+`weave_dict_seek_at`. There are 28 chain-walk sites.
+
+**Fix.**
+- The XID now goes in `pd_prune_xid`, which PostgreSQL does not use on index pages, and
+  `nextblk` becomes `InvalidBlockNumber`.
+- `weave_page_recyclable()` reads `pd_prune_xid`. When that is 0, it falls back to
+  `nextblk`, so pages freed by older builds keep their gate. No format change.
+- All four pending walks stop on a page that is not a live pending page
+  (`weave_page_is_live_pending()`). The generation re-check then restarts them; G61's
+  clear bump makes that re-check sound.
+- t/026 was looped 8/8 afterwards without a hang.
+
+**OPEN:** the old-format fallback, a page freed with the XID still in `nextblk`, has no
+test.
+
+### G63 — t/005, t/006 and t/022 ran their "concurrent" sessions one after another — **FOUND 2026-09-29; harness; RETRACTS the concurrency claims those tests made; FIXED**
+
+This is the same bug G28 found and fixed in t/007, and the fix was never carried over.
+`IPC::Run` writes a scalar stdin only while **that** harness is pumped, so a session fed
+its SQL through `'<', \$sql` does not start until `finish()`. **RETRACTED:** every
+statement that t/005 (concurrency), t/006 (concurrent extend) or t/022 (docvals NULL
+concurrency) proved something about concurrent sessions. They proved it about serial
+ones.
+
+All three now pass their SQL with `-c`, pump every handle together, and assert the
+sessions overlapped in wall-clock time. They pass.
+
+### G64 — the pending-list collectors used O(n²) memory: 51,000 unflushed rows took 7.3 GB, and a t/027 backend was OOM-killed at 17.6 GB — **FOUND 2026-09-29; PRE-EXISTING; memory (host OOM); FIXED 2026-09-29**
+
+`weave_collect_matches()` and the cgram collector added each pending match with
+`acc = tidset_or(acc, one)`, which allocates a fresh (n+1)-entry array and never frees
+the old one. That is quadratic in both time and memory.
+
+**Measured:** 51,000 pending matches peaked at **7.3 GB RSS and 10 s**. After the fix:
+**16 MB and under 0.1 s**, the same count.
+
+**Retraction:** an earlier note in this session blamed a t/027 OOM kill on host memory
+pressure. The kernel log names the victim, a postgres backend running `weave_count` at
+17.6 GB anonymous RSS, and that was this bug. It was masked before G61, because the
+flush dropped most of the pending rows the collectors would have walked.
+
+**Fix:** `tidset_append()` (amortized doubling, capped at `TIDSET_MAX_N`), followed by
+one sort-and-dedup pass. t/027 inserts 50,000 unflushed rows, then asserts that the
+collecting backend's `VmHWM` stays under 1 GB. The unfixed build is OOM-killed in the
+same test, which is the positive control.
+
+### G65 — a flush's segment add and its pending clear are two WAL records, so a crash or ERROR between them leaves the folded documents in both places — **FOUND 2026-09-29 in review of G61; PRE-EXISTING; OPEN**
+
+`weave_add_segment_with_room()` commits the new segment. The clear, which drops the
+folded prefix from the pending list, is a separate GenericXLog record. If the backend
+crashes between the two, or the clear's `ReadBuffer` hits an I/O error, the documents
+are in the new segment **and** still on the list. The next flush folds them into a
+second segment, so each document gets two docids and corpus statistics count it twice.
+
+It has never been observed. Fixing it needs either one record that covers the metapage
+directory and the cut page, or an idempotence mark on the list, so that a re-flush
+skips docids already folded.

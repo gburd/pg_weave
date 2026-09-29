@@ -708,6 +708,12 @@ bool		pg_weave_fuse_check_bounds = false;
  * (doc/GAPS.md G44).  include/weave/weave.h says what off means. */
 bool		pg_weave_fuse_normalize = true;
 
+/* GUC: retries a scan pass makes when a concurrent merge reorganizes the index
+ * under it, before raising 40001 (doc/GAPS.md G58).  10 is the cap every one of
+ * those passes hard-coded before it became settable; include/weave/am.h says why
+ * the extern lives there.  Registered in _PG_init (src/am/customscan.c). */
+int			pg_weave_scan_race_retries = 10;
+
 static int
 cmp_blocknumber(const void *a, const void *b)
 {
@@ -3619,10 +3625,24 @@ weave_add_segment_with_room(Relation index, const WeaveSegMeta *seg)
  * it with the current next-XID and mark it WEAVE_FREED, then hand it to the FSM.
  * Before REUSING a free page, require that stamp to be "old enough" that no
  * snapshot which could still reference it remains (GlobalVisCheckRemovableXid);
- * otherwise skip the page and leave it in the FSM for later.  The XID lives in
- * the freed page's nextblk field (dead once the page is off every chain), so
- * the on-disk page layout is unchanged and existing indexes need no REINDEX; a
- * page freed by an older build lacks WEAVE_FREED and is recyclable at once.
+ * otherwise skip the page and leave it in the FSM for later.
+ *
+ * WHERE THE XID LIVES -- doc/GAPS.md G62.  It used to be stored in the freed
+ * page's nextblk ("dead once the page is off every chain").  That premise is
+ * false: a scan that snapshotted a chain before the free still WALKS it, reads
+ * pages under SHARE with no pin held between them, and followed that nextblk
+ * as a block number.  XIDs and block numbers share a range, so a walk could
+ * land on another freed page whose "next" pointed back, and loop forever on
+ * CPU holding no lock (t/026, backtraces in weave_collect_matches' pending
+ * walk and in weave_dict_seek_at).  Twenty-eight chain walkers followed
+ * nextblk; rather than guard each, the stamp now lives in the page header's
+ * pd_prune_xid -- which PostgreSQL uses only for heap pruning and never
+ * reads on an index page -- and nextblk is set to InvalidBlockNumber, so a
+ * stale walker arriving at a freed page ENDS its walk there and the caller's
+ * generation re-check restarts it.  No layout change: a page freed by an
+ * older build (pd_prune_xid == 0, the XID still in nextblk) is read the old
+ * way by weave_page_recyclable(), and a page freed by an older build that
+ * lacks WEAVE_FREED is recyclable at once, as before.
  */
 void
 weave_free_page(Relation index, BlockNumber blk)
@@ -3637,8 +3657,10 @@ weave_free_page(Relation index, BlockNumber blk)
 	page = GenericXLogRegisterBuffer(state, buf, 0);
 	op = WeavePageGetOpaque(page);
 	op->flags |= WEAVE_FREED;
-	/* reuse nextblk as the free-time XID horizon (page is now off all chains) */
-	op->nextblk = (BlockNumber) ReadNextTransactionId();
+	/* the recycle horizon goes in the header, and nextblk ENDS any stale walk
+	 * that arrives here (G62; see the function comment) */
+	((PageHeader) page)->pd_prune_xid = ReadNextTransactionId();
+	op->nextblk = InvalidBlockNumber;
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);
 	RecordFreeIndexPage(index, blk);
@@ -3711,7 +3733,14 @@ weave_page_recyclable(Relation index, Page page)
 	 * upper bound -- it may keep a page unrecyclable slightly longer than a
 	 * heap-scoped horizon would, never shorter -- so it is always safe here.
 	 */
-	return GlobalVisCheckRemovableXid(NULL, (TransactionId) op->nextblk);
+	{
+		TransactionId freexid = ((PageHeader) page)->pd_prune_xid;
+
+		/* a page freed before G62 kept its stamp in nextblk */
+		if (!TransactionIdIsValid(freexid))
+			freexid = (TransactionId) op->nextblk;
+		return GlobalVisCheckRemovableXid(NULL, freexid);
+	}
 }
 
 /* Recycle a chained page list (dict/trigram/posting/data) to the FSM. */

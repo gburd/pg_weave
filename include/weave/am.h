@@ -193,6 +193,39 @@ typedef WeavePageOpaqueData *WeavePageOpaque;
 #define WeavePageIsFreed(page) \
 	((WeavePageGetOpaque(page)->flags & WEAVE_FREED) != 0)
 
+/*
+ * May a pending-list walk follow this page's nextblk?  Only when the page is a
+ * LIVE pending page -- doc/GAPS.md G62.  A walk that snapshotted pendinghead
+ * before a concurrent flush freed the list reads pages under SHARE with no pin
+ * held between them, so it can arrive at a page that has been freed (whose
+ * nextblk weave_free_page() used to overwrite with the free-time XID, which is
+ * not a block number; it is now InvalidBlockNumber) or recycled as some other
+ * kind.  Following that nextblk walked
+ * the reader around a cycle of freed pages forever, on CPU, holding no lock:
+ * found by t/026, whose reader hung in weave_collect_matches' pending walk.
+ * Stopping is safe because the flush's CLEAR moves the directory generation
+ * after the pages are unlinked and before any is freed, so a walk that meets a
+ * freed page always fails the caller's generation re-check, which discards
+ * this read and restarts from a fresh head.  (The segment add bumping it is
+ * NOT enough: a reader can read the metapage between that bump and the clear,
+ * holding the new generation and the old head, and would then miss the items
+ * the clear keeps -- found in review of G61.)  The same re-check covers a walk
+ * that reaches the KEPT cut page: it is live, but the clear compacted it in
+ * place, so the walk reads a different item set than it would have and only
+ * the moved generation tells it to discard the read.
+ */
+static inline bool
+weave_page_is_live_pending(Page page)
+{
+	WeavePageKind k;
+
+	if (PageIsNew(page) || WeavePageIsFreed(page))
+		return false;
+	k = WeavePageGetKind(page);
+	return k == WEAVE_PK_PENDING_V11 || k == WEAVE_PK_PENDING_V10 ||
+		k == WEAVE_PK_PENDING_V9 || k == WEAVE_PK_PENDING;
+}
+
 extern const char *weave_page_kind_name(WeavePageKind kind);
 
 /*
@@ -626,6 +659,17 @@ extern int64 weave_getbitmap(IndexScanDesc scan, TIDBitmap *tbm);
 extern bool weave_gettuple(IndexScanDesc scan, ScanDirection dir);
 extern bool weave_canreturn(Relation index, int attno);
 extern void weave_endscan(IndexScanDesc scan);
+
+/*
+ * GUC pg_weave.scan_race_retries: how many times a generation-bracketed scan
+ * pass redoes itself when a concurrent merge/vacuum moves the segment directory
+ * under it, before it raises 40001 instead of returning a partial answer
+ * (doc/GAPS.md G58).  Declared here because it crosses a file boundary three
+ * ways: defined in src/am/am.c with the other GUC variables, registered in
+ * _PG_init (src/am/customscan.c), and read only by the scan passes in
+ * src/am/amscan.c.  0 means one attempt and no retry.
+ */
+extern int	pg_weave_scan_race_retries;
 
 /* ===========================================================================
  * The access method's cross-translation-unit interface (task L1).

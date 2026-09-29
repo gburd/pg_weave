@@ -605,6 +605,24 @@ _PG_init(void)
 							 true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 
+	/*
+	 * THE MERGE-RACE RETRY CAP, doc/GAPS.md G58.  Every generation-bracketed scan
+	 * pass in src/am/amscan.c redoes itself when a concurrent merge or vacuum moves
+	 * the segment directory, and used to degrade silently after a hard-coded 10;
+	 * now it raises serialization_failure instead.  PGC_USERSET because it bounds
+	 * one query's patience and changes nothing on disk.  0 = one attempt, which is
+	 * what t/026_scan_race_error.pl sets to make the error reachable at all.
+	 *
+	 * OUTSIDE the WEAVE_TEST_HOOKS block below for the reason spelled out at
+	 * pg_weave.fuse_check_bounds: a GUC inside it does not exist in any build.
+	 */
+	DefineCustomIntVariable("pg_weave.scan_race_retries",
+							"Retries a pg_weave scan makes when a concurrent merge reorganizes the index under it, before it raises a serialization failure.",
+							"Each retry re-reads the index from a fresh snapshot of its segment directory. When every attempt races a merge or vacuum the scan raises SQLSTATE 40001 rather than return a partial answer; 0 allows a single attempt.",
+							&pg_weave_scan_race_retries,
+							10, 0, 1000,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+
 #ifdef WEAVE_TEST_HOOKS
 	/*
 	 * TEST-ONLY build.  This GUC only exists when compiled with

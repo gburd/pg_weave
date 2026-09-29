@@ -20,6 +20,24 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 ALTER EXTENSION pg_weave UPDATE;
 
+-- doc/GAPS.md G60: a VACUUM only reclaims (tombstones) rows deleted before the
+-- oldest snapshot in this database; an autovacuum ANALYZE starting at the same
+-- moment can hold one.  Wait for every same-database snapshot older than now.
+CREATE FUNCTION pg_temp.wait_for_horizon() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE x xid := (txid_current() % 4294967296)::text::xid; i int;
+BEGIN
+  FOR i IN 1 .. 600 LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_stat_activity
+                    WHERE datname = current_database() AND pid <> pg_backend_pid()
+                      AND (age(backend_xmin) > age(x) OR age(backend_xid) > age(x))) THEN
+      RETURN;
+    END IF;
+    PERFORM pg_sleep(0.1);
+    PERFORM pg_stat_clear_snapshot();  -- else every pass re-reads the first
+  END LOOP;
+  RAISE NOTICE 'wait_for_horizon: an older snapshot was still held after 60 s';
+END $$;
+
 SET max_parallel_workers_per_gather = 0;
 
 CREATE TABLE dv (id int, body wdoc, emb wvec(4), price bigint);
@@ -478,6 +496,7 @@ SELECT dvn_agree('price < 50')   AS pend_lt,
 
 -- DELETE 40% then VACUUM (tombstone rewrite + merge): still index==heap.
 DELETE FROM dvn WHERE id % 5 = 1;
+DO $$ BEGIN PERFORM pg_temp.wait_for_horizon(); END $$;   -- G60
 VACUUM dvn;
 SELECT dvn_agree('price < 50')   AS vac_lt,
        dvn_agree('price >= 50')  AS vac_ge,
@@ -1026,6 +1045,7 @@ RESET enable_bitmapscan;
 -- G57: delete half, VACUUM (tombstones the docids, frees the heap slots), and
 -- re-insert into the freed slots with a value no predicate below admits
 DELETE FROM pr WHERE id <= 1000;
+DO $$ BEGIN PERFORM pg_temp.wait_for_horizon(); END $$;   -- G60
 VACUUM pr;
 INSERT INTO pr
 SELECT g,

@@ -6335,6 +6335,10 @@ weave_flush_pending(Relation index)
 	WeaveSegMeta seg;
 	BlockNumber blk;
 	bool		gramcomplete = true;
+	BlockNumber cut_blk = InvalidBlockNumber;	/* last pending page folded */
+	Size		cut_lower = 0;	/* its item-area end when it was read */
+	uint32		cut_nitems = 0; /* items folded (or skipped as malformed) */
+	bool		cut_kept = false;	/* items appended to the cut page were kept on it */
 
 	{
 		Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
@@ -6406,7 +6410,20 @@ weave_flush_pending(Relation index)
 	bs.flush_budget = 0;
 	weave_build_ht_init(&bs);
 
-	/* fold only the pending documents into the build state */
+	/*
+	 * Fold only the pending documents into the build state, and record the CUT:
+	 * the last page read, its item-area end at the moment it was read, and how
+	 * many items were consumed.  The clear below must remove exactly this prefix
+	 * and nothing else, because a concurrent INSERT is NOT excluded here --
+	 * weave_insert() appends under the metapage buffer lock only, and neither
+	 * autovacuum's cleanup (the table's ShareUpdateExclusiveLock) nor
+	 * weave_merge() (the index's) conflicts with RowExclusiveLock.  Only the tail
+	 * page ever grows (weave_insert appends to meta->pendingtail and links a new
+	 * tail otherwise), so a page whose nextblk was already set when it was read
+	 * is complete, and the one that was the tail is complete up to cut_lower.
+	 * doc/GAPS.md G61: the clear used to drop the whole list, and every item
+	 * appended between this walk and that clear vanished from the index.
+	 */
 	blk = meta.pendinghead;
 	while (blk != InvalidBlockNumber)
 	{
@@ -6421,10 +6438,14 @@ weave_flush_pending(Relation index)
 		page = BufferGetPage(buffer);
 		weave_pending_iter_init(&it, page, bs.dv.dvtype == WEAVE_DV_T_TEXT);
 		next = WeavePageGetOpaque(page)->nextblk;
+		cut_blk = blk;
+		cut_lower = (Size) (it.end - (char *) page);
 		while (weave_pending_iter_next(&it, &rec))
 		{
 			WeaveTermEntry *entries;
 			uint32		j;
+
+			cut_nitems++;
 
 			/* Never trust raw pending-page bytes: a torn page or any producing
 			 * bug could give a bad nterms/len/posoff that turns into a wild
@@ -6604,41 +6625,121 @@ weave_flush_pending(Relation index)
 	weave_add_segment_with_room(index, &seg);
 
 	/*
-	 * Clear the pending list.  Pending docs were already counted into the
-	 * corpus totals at insert time; add_segment counted them again, so subtract
-	 * the segment's contribution to avoid a double count.
+	 * Remove exactly the folded prefix from the pending list -- doc/GAPS.md G61.
+	 *
+	 * Pending docs were already counted into the corpus totals at insert time;
+	 * add_segment counted them again, so the segment's contribution is
+	 * subtracted to avoid a double count.
+	 *
+	 * The metapage is locked EXCLUSIVE before the cut page, the order
+	 * weave_insert() takes them in, so an insert is either entirely before this
+	 * block (its item is on the chain and is judged below) or entirely after it
+	 * (it sees the new head/tail).  Three shapes, told apart by the live chain:
+	 *
+	 *	 nothing appended since the walk: the list becomes empty, as it always did;
+	 *	 whole new pages linked after the cut page: they become the list;
+	 *	 items appended ON the cut page (it was the tail and had room): the page
+	 *	 is compacted IN PLACE -- the unfolded items are moved to the start of
+	 *	 its item area -- and it stays on the list as the head.  Item strides are
+	 *	 MAXALIGN'd and the item area starts at a MAXALIGN'd offset, so the move
+	 *	 keeps every item aligned.  (This used to copy them to a fresh page; an
+	 *	 allocation here can ERROR -- ENOSPC on extend -- AFTER the segment was
+	 *	 added, which would leave the folded documents both in the segment and on
+	 *	 the list.  Nothing below allocates.  It can still fail -- ReadBuffer of
+	 *	 the cut page is I/O -- and a crash between the two records has the same
+	 *	 effect; that window predates G61 and is doc/GAPS.md G65.)
+	 *
+	 * The generation is bumped as well.  add_segment already bumped it, but a
+	 * scan that read the metapage between that bump and this clear holds the
+	 * NEW generation and the OLD head; when the pages freed below stop its walk
+	 * (weave_page_is_live_pending, G62) it would otherwise miss the items kept
+	 * here with nothing to tell it so.
+	 *
+	 * Only pages before the cut -- and the cut page itself unless it was kept --
+	 * are recycled afterwards; the loop used to follow nextblk to the END of the
+	 * chain and free pages holding items that nothing had folded.
 	 */
 	{
 		Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
+		Buffer		cb = InvalidBuffer;
 		GenericXLogState *state;
 		Page		mp;
 		WeaveMetaPageData *m;
+		BlockNumber cut_next = InvalidBlockNumber;
+		Size		cut_now = cut_lower;
 
 		LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
+		if (cut_blk != InvalidBlockNumber)
+		{
+			Page		cp;
+
+			cb = ReadBuffer(index, cut_blk);
+			LockBuffer(cb, BUFFER_LOCK_EXCLUSIVE);
+			cp = BufferGetPage(cb);
+			cut_next = WeavePageGetOpaque(cp)->nextblk;
+			cut_now = (Size) (weave_page_entry_end(cp) - (char *) cp);
+		}
+		cut_kept = (cut_now > cut_lower);
+
 		state = GenericXLogStart(index);
 		mp = GenericXLogRegisterBuffer(state, mb, 0);
 		weave_meta_upcast_page(mp);	/* v3 -> v4 before struct write */
 		m = WeavePageGetMeta(mp);
 		m->ndocs -= seg.ndocs;
 		m->sumdoclen -= seg.sumdoclen;
-		m->pendinghead = InvalidBlockNumber;
-		m->pendingtail = InvalidBlockNumber;
-		m->npending = 0;
+		if (cut_kept)
+		{
+			Page		cp = GenericXLogRegisterBuffer(state, cb, 0);
+			char	   *start = (char *) PageGetContents(cp);
+			Size		n = cut_now - cut_lower;
+
+			memmove(start, (char *) cp + cut_lower, n);
+			((PageHeader) cp)->pd_lower = (LocationIndex) ((start - (char *) cp) + n);
+			m->pendinghead = cut_blk;	/* the tail, if it was, stays */
+		}
+		else if (cut_next != InvalidBlockNumber)
+			m->pendinghead = cut_next;	/* the tail stays where inserts put it */
+		else
+		{
+			m->pendinghead = InvalidBlockNumber;
+			m->pendingtail = InvalidBlockNumber;
+		}
+		if (m->pendinghead == InvalidBlockNumber)
+			m->npending = 0;
+		else
+			m->npending = (m->npending > cut_nitems) ? m->npending - cut_nitems : 1;
+		m->generation++;		/* head moved: invalidate concurrent scan snapshots */
 		GenericXLogFinish(state);
+		/* the positive control t/027 greps for: each keep-shape has fired */
+		if (cut_kept)
+			elog(DEBUG1, "pg_weave flush: index \"%s\": kept %zu bytes appended to the cut page during the flush",
+				 RelationGetRelationName(index), cut_now - cut_lower);
+		else if (cut_next != InvalidBlockNumber)
+			elog(DEBUG1, "pg_weave flush: index \"%s\": kept pending pages linked after the cut during the flush",
+				 RelationGetRelationName(index));
+		if (cb != InvalidBuffer)
+			UnlockReleaseBuffer(cb);
 		UnlockReleaseBuffer(mb);
 	}
 
-	/* recycle the old pending pages */
+	/* recycle the folded pending pages: from the old head up to the cut page,
+	 * and the cut page itself only if nothing on it was kept -- never past it
+	 * (G61) */
 	blk = meta.pendinghead;
 	while (blk != InvalidBlockNumber)
 	{
-		Buffer		buf = ReadBuffer(index, blk);
+		Buffer		buf;
 		BlockNumber next;
 
+		if (blk == cut_blk && cut_kept)
+			break;
+		buf = ReadBuffer(index, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		next = WeavePageGetOpaque(BufferGetPage(buf))->nextblk;
 		UnlockReleaseBuffer(buf);
 		weave_free_page(index, blk);
+		if (blk == cut_blk)
+			break;
 		blk = next;
 	}
 	IndexFreeSpaceMapVacuum(index);

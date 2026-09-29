@@ -15,6 +15,24 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 ALTER EXTENSION pg_weave UPDATE;
 
+-- doc/GAPS.md G60: a VACUUM only reclaims (tombstones) rows deleted before the
+-- oldest snapshot in this database; an autovacuum ANALYZE starting at the same
+-- moment can hold one.  Wait for every same-database snapshot older than now.
+CREATE FUNCTION pg_temp.wait_for_horizon() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE x xid := (txid_current() % 4294967296)::text::xid; i int;
+BEGIN
+  FOR i IN 1 .. 600 LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_stat_activity
+                    WHERE datname = current_database() AND pid <> pg_backend_pid()
+                      AND (age(backend_xmin) > age(x) OR age(backend_xid) > age(x))) THEN
+      RETURN;
+    END IF;
+    PERFORM pg_sleep(0.1);
+    PERFORM pg_stat_clear_snapshot();  -- else every pass re-reads the first
+  END LOOP;
+  RAISE NOTICE 'wait_for_horizon: an older snapshot was still held after 60 s';
+END $$;
+
 CREATE TABLE vi (id serial, d wdoc, v wvec(4), v2 wvec(4));
 INSERT INTO vi(d, v, v2)
   SELECT to_wdoc('shared common' || (g % 7) || ' rare' || g),
@@ -335,6 +353,7 @@ CREATE TEMP TABLE vw_lanes_live AS
   SELECT docid, code FROM weave_vec_lanes('vw_weave') WHERE live;
 SELECT count(*) AS deleted_with_a_vector FROM vw WHERE id % 50 = 0 AND v IS NOT NULL;
 DELETE FROM vw WHERE id % 50 = 0;
+DO $$ BEGIN PERFORM pg_temp.wait_for_horizon(); END $$;   -- G60
 VACUUM vw;                       -- writes the tombstones into the bolt
 INSERT INTO vw(d, v) SELECT to_wdoc('third bolt tag' || g), NULL
   FROM generate_series(2001, 2005) g;
@@ -582,6 +601,7 @@ SELECT count(*) AS blocks_the_two_readers_disagree_about
 -- A VACUUM that rewrites the weft recycles pages, which is the case arithmetic
 -- cannot survive.  The invariant must still hold, and the scan must still answer.
 DELETE FROM vwg27 WHERE id % 3 = 0;
+DO $$ BEGIN PERFORM pg_temp.wait_for_horizon(); END $$;   -- G60
 VACUUM vwg27;
 SELECT count(*) AS violations_after_rewrite
   FROM weave_check('vwg27_weave', true) WHERE NOT ok;
