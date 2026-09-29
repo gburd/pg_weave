@@ -140,8 +140,13 @@ BEGIN
   PERFORM set_config('enable_seqscan', 'off', false);
   PERFORM set_config('pg_weave.scan_race_retries', '1000', false);
   WHILE clock_timestamp() < t0 + interval '8 seconds' LOOP
+    -- The heap side is a TID Range Scan, not a bare count(*): with
+    -- enable_seqscan off, PostgreSQL 18 compares DISABLED-node counts before
+    -- costs, so a bare count(*) planned the keyless weave path (priced at
+    -- 1e12 but not disabled) and raised "a weave index scan requires a query"
+    -- -- CI's pg18 leg, 2026-09-29.  The TID range covers every block.
     SELECT (SELECT count(*) FROM race WHERE d @@@ 'shared'::wquery),
-           (SELECT count(*) FROM race) INTO ix, hp;
+           (SELECT count(*) FROM race WHERE ctid >= '(0,0)'::tid) INTO ix, hp;
     IF ix <> hp THEN
       bad := bad + 1;
       RAISE WARNING 'READER_MISMATCH index=% heap=%', ix, hp;

@@ -4208,6 +4208,11 @@ microseconds and no hook widens it, so that part of the fix rests on the argumen
 `t/027_flush_insert_race.pl` covers the rest:
 - Three inserters (single-row and bulk), a flusher and a reader run with real overlap,
   asserted from each session's own wall-clock SPAN.
+  - The reader's heap count first ran as a bare `count(*)` under
+    `enable_seqscan = off`. On PostgreSQL 18, which compares disabled-node counts before
+    costs, that planned the keyless weave path and raised "a weave index scan requires a
+    query". CI's pg18 leg failed on 1a226b5 because of it. The count now uses a TID
+    Range Scan, and the whole TAP suite was run locally on 18 before the fix was pushed.
 - Rounds repeat until both keep-shapes have fired, each proven by its own DEBUG1 line.
 - Coverage is checked per round, and again before and after a final flush, through
   `weave_count`, a forced index scan and `weave_check`.
