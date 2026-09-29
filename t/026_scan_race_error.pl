@@ -249,6 +249,7 @@ sub phase2
     my $h = start(['psql', '-X', '-v', 'ON_ERROR_STOP=1', '-d', $conn, '-c', $sql],
                   '<', \$in, '>', \$out, '2>', \$err);
     my $b = 0;
+    my $maxdel = 0;
     while ($h->pumpable)
     {
         $h->pump_nb;
@@ -259,6 +260,11 @@ sub phase2
         $node->safe_psql('postgres', qq{
             DELETE FROM docs WHERE body LIKE 'hay %' AND id % 7 = $b % 7});
         $node->safe_psql('postgres', 'VACUUM docs');
+        # sampled HERE, while the reader runs: a later merge folds tombstones
+        # away, so a reading taken after the phase can be 0 (seen once)
+        my $nd = $node->safe_psql('postgres',
+            q{SELECT ndeleted FROM weave_index_stats('docs_w')});
+        $maxdel = $nd if $nd > $maxdel;
         $b++;
     }
     finish($h);
@@ -267,17 +273,17 @@ sub phase2
     my $r = $node->safe_psql('postgres',
         q{SELECT ok || '|' || errs || '|' || wrong || '|' || other || '|' || lastother FROM race_result});
     my @r = split /\|/, $r, 5;
-    note("phase 2 retries=$retries: ok=$r[0] errors_40001=$r[1] wrong=$r[2] other=$r[3]; writer rounds=$b");
-    return @r;
+    note("phase 2 retries=$retries: ok=$r[0] errors_40001=$r[1] wrong=$r[2] other=$r[3]; writer rounds=$b; max ndeleted=$maxdel");
+    return (@r[0 .. 4], $maxdel);
 }
 
 my @p0 = phase2(0);
 cmp_ok($p0[1] // 0, '>=', 1,
        'phase 2 positive control: races against the tombstone writer happen (40001 with retries = 0)');
-my $tomb = $node->safe_psql('postgres', q{SELECT ndeleted FROM weave_index_stats('docs_w')});
-cmp_ok($tomb, '>', 0, "segments carry tombstones during phase 2 (ndeleted = $tomb)");
+cmp_ok($p0[5], '>', 0, "segments carried tombstones during phase 2 (max ndeleted = $p0[5])");
 my @p1 = phase2(1000);
 cmp_ok($p1[0] // 0, '>', 0, 'phase 2 (retries = 1000): counts succeeded');
+cmp_ok($p1[5], '>', 0, "phase 2 (retries = 1000) ran over tombstones too (max ndeleted = $p1[5])");
 is($p1[2] // -1, 0, "phase 2 (retries = 1000): every count was exactly $N");
 is($p1[3] // -1, 0, 'phase 2 (retries = 1000): no error of any kind')
   or diag("last other error: " . ($p1[4] // ''));

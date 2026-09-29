@@ -3965,7 +3965,7 @@ vector, `<@>` edit distance). **Ablation:** with the final arm forced to
 `xs_recheck = false`, §14 returns 2000 rows with 1600 violating (vector) and 1600
 violating (edit distance), and the G55 probe returns 3000/2400 again.
 
-### G56 — restriction keys no route honours were dropped with no recheck: a second `@@@`, `@@@ a` beside `ORDER BY <=> b`, and `@~` beside an ordering — **FOUND 2026-09-28; silent wrong answer, PRE-EXISTING (not docvals); FIXED 2026-09-28, with one CONTRACT limit left OPEN**
+### G56 — restriction keys no route honours were dropped with no recheck: a second `@@@`, `@@@ a` beside `ORDER BY <=> b`, and `@~` beside an ordering — **FOUND 2026-09-28; silent wrong answer, PRE-EXISTING (not docvals); FIXED 2026-09-28; the contract limit (incomplete ordering answers) FIXED 2026-09-29 on the lexical route, OPEN on vector/edist/fused**
 
 Three shapes, all measured on 2000 rows (even ids hold `alpha`, odd hold `beta`):
 
@@ -3990,18 +3990,69 @@ second key. The expected value is now 0, next to a `'bodi'` query (50) that show
 nothing is over-restricted. This is a retraction (hard rule 8): the old expected output
 recorded a wrong answer as correct.
 
-**OPEN, a contract rather than a bug:** an ordering scan emits only the documents its
-ORDER BY argument ranks. For `<=>` that means documents matching the ORDER BY query, as
-`sql/orderby.sql` test (5) documents. So with recheck on, the answer has **no wrong
-rows but can be INCOMPLETE** relative to the heap:
+**The contract limit, CLOSED 2026-09-29 on the lexical route (decision: pad).** An
+ordering scan used to emit only the documents its ORDER BY argument ranks. For `<=>`,
+that meant only documents matching its query, as `sql/orderby.sql` test (5) used to
+assert. So with recheck on, the answer had **no wrong rows but could be INCOMPLETE**
+relative to the heap:
 
-- `@@@ 'alpha' ORDER BY <=> 'beta'` returns **0 rows** where the heap has 1000;
-- `price < 20 ORDER BY body <=> 'alpha'` returns **200** where the heap has 400;
-- bare `ORDER BY body <=> 'alpha'` returns 1000 where the heap has 2000 (unchanged, and
-  the documented intent).
+| shape | before (2,000 rows) | now (same 2,000 + one NULL doc + one empty doc) | heap, same table |
+|---|---|---|---|
+| `@@@ 'alpha' ORDER BY <=> 'beta'` | 0 of 1000 | 1000 | 1000 |
+| `price < 20 ORDER BY body <=> 'alpha'` | 200 of 400 | 402 | 402 |
+| bare `ORDER BY body <=> 'alpha'` | 1000 of 2000 | 2002, the NULL doc last | 2002 |
 
-A planner-level fix would refuse the index ordering, or pad with unranked rows, whenever
-the WHERE admits rows the ORDER BY query does not rank. It is owed and needs a decision.
+The decision rests on the fact that **SQL's ORDER BY never filters**. The heap operator
+returns 1.0 for a document the query does not match, and a KNN scan in PostgreSQL returns
+every row: pg_trgm, PostGIS and btree_gist all do. pgvector is the approximate exception,
+and its iterative scan exists to close exactly this gap. Elasticsearch's `filter` +
+`should` scores non-matches 0.
+
+**Fix.** After the ranked phase is exhausted, `weave_pad_gettuple()`
+(`src/am/amscan.c`) walks the heap under the scan's snapshot. It emits every visible row
+the ranked phase did not emit, by its **HOT-chain root TID**:
+- Rows with a document come out at distance 1.0.
+- NULL-document rows are held back and come out last, at a NULL distance, which is where
+  ASC puts NULLs.
+- Each padding row carries `xs_recheck`, so the WHERE clause is applied to it.
+- A partial index's predicate is evaluated by the walk itself, because the planner drops a
+  WHERE clause the predicate implies.
+- The walk is skipped when a restriction key IS the ORDER BY query (`ordSameQuery`),
+  because no padding row could pass it.
+
+**`xs_recheckorderby` was tried first and REFUSED by the executor.** The heap operator
+scores a boolean query's positive terms and ignores its structure, so
+`d <=> 'alpha & !beta'` is below 1.0 on a document holding both terms. The ranked phase
+rightly never emits that document, and the executor raised "index returned tuples in
+wrong order" (test 6). The padding therefore extends the index's own ordering and does
+not re-derive the heap's.
+
+**Pinned** by `sql/orderby.sql` tests (5)–(7), rewritten with a retraction note, and by
+its new G56 section:
+- a Filter above the ordering scan, bare, a LIMIT inside the padding, and nested-loop
+  rescans;
+- a partial index;
+- NULL docs, empty docs and HOT-updated rows, each case compared with the heap's answer
+  and checked for class order (matches, then documents, then NULLs).
+
+**Mutants, all killed:**
+
+| mutant | result |
+|---|---|
+| predicate not applied | 300 rows vs 200, 100 outside the predicate |
+| physical rather than root TID | rows vanish (296 of 300) |
+| NULLs not held back | 1430 class inversions |
+
+The G56 section also exposed **G66**.
+
+**Cost, a loss recorded as such:** a query whose LIMIT exceeds its match count now pays a
+full heap scan for the tail, as a Seq Scan + Sort would. A LIMIT inside the match set is
+unchanged.
+
+**Still OPEN:** the vector (`<->`, `<#>`), edit-distance (`<@>`) and fused routes do not
+pad. The vector route misses rows with a NULL vector, which the heap puts last. The
+edit-distance route misses term-free documents (+Infinity on the heap) and NULL
+documents. `doc/specs/FUSED_TOPK.md` rejects padding for the fused route.
 
 ### G57 — the docvalues gate reported a DELETED row's value for the NEW tuple that reused its TID — **FOUND 2026-09-28; silent wrong answer; FIXED 2026-09-28**
 
@@ -4048,7 +4099,10 @@ top-k, edit distance, the fused scorer, and `topk_candidates_guarded`.
 Phase 2 exists because review found that the retry branch **double-freed the tombstone
 maps**. `weave_tombstones_free()` did not reset `hasany`, and the retry freed again what
 the success path had already freed. Phase 1 could never reach this, because it never
-retries. The mutant with the reset removed **segfaults** in phase 2. **OPEN:** only the
+retries. The mutant with the reset removed **segfaults** in phase 2. (Phase 2's "segments
+carry tombstones" check samples `ndeleted` after each writer VACUUM. A reading taken
+after the phase, when a merge had already folded the tombstones away, was 0 once and
+failed a full run.) **OPEN:** only the
 lexical site has a positive control. The docvalues, vector, edist, fused and ranked
 sites raise through the same function, but no test forces them to.
 
@@ -4222,3 +4276,49 @@ second segment, so each document gets two docids and corpus statistics count it 
 It has never been observed. Fixing it needs either one record that covers the metapage
 directory and the cut page, or an idempotence mark on the list, so that a re-flush
 skips docids already folded.
+
+### G66 — the ranked pass ignored the pending list: `WHERE d @@@ q ORDER BY d <=> q` returned 60 of 120 matching rows when the other 60 had been UPDATEd since the last flush — **FOUND 2026-09-29 by the G56 padding test; PRE-EXISTING, and documented in code as intentional; silent wrong answer on the flagship query; FIXED 2026-09-29 for the lexical ranked route and `weave_search()`**
+
+`weave_topk_candidates_range()` carried the note: "ranked results cover the merged
+SEGMENTS only ... deferred intentionally, since pending is transient and bounded".
+Pending is neither transient nor bounded: G64 measured thousands of pages under load. A
+row inserted, or UPDATEd without HOT, lives on the pending list until autovacuum or
+`weave_merge()` flushes it. Until then it was missing from every ranked answer. It could
+not reach a `LIMIT 10` first page, and a LIMIT-less `WHERE d @@@ q ORDER BY d <=> q`
+returned only the flushed matches. The padding test's first run showed it: 60 matches
+ranked, the other 60 emitted as unranked padding after 150 non-matches.
+
+**Fix.** `weave_pending_ranked()` scores every matching pending document with the
+segment pass's own BM25:
+- the same k1, b, N and avgdl;
+- idf from the df summed over segments, with df = 1 for a term no segment holds;
+- `bm25bound.h`'s contribution;
+- the **quantized** document length a flushed copy would carry. An exact length put the
+  pending population on its own scale, systematically below the flushed one; the first
+  cut's test showed a first page of only flushed documents.
+
+`weave_topk_candidates_guarded()` merges these into the segment top-k inside the same
+generation bracket. The union's top-k is exact, because any member of it is either in
+the segments' top-k or pending. `weave_query_maxhits()` now adds `npending`. Without
+that, the ladder's `curk >= maxhits` stop truncated a mostly-pending scan at its first
+rung: **64 of 250**, the mutant `sql/orderby.sql` pins.
+
+**Pinned** by `sql/orderby.sql`'s G66 section:
+- Half the corpus is pending, and every document has a length the quantizer stores
+  exactly, so score is a strict function of tf.
+- The test asserts all 240 are ranked, with k non-increasing across the interleaved
+  populations; that the first page is all top-level; and that `weave_search()` returns
+  240.
+- A 50-flushed / 200-pending table asserts 250.
+
+**Mutants killed:** no pending merge (120 of 240, 0 pending ranked) and no `npending` in
+maxhits (64 of 250).
+
+**Not pinned:** the quantized-versus-exact length choice. At the test's lengths, which
+are 7 or less, the two are identical, so no test fails if it regresses. The first cut's
+evidence is the measurement recorded above, not a test.
+
+**Still OPEN:** the fused route (`weave_fuse_pass()`) does not read the pending list
+either. Its lexical channels are segment shuttles, so a fused answer misses pending
+documents exactly as the ranked one did. The vector channel's version of the same gap is
+G29.

@@ -58,23 +58,49 @@ SELECT count(*) AS bare_nonmatching
   FROM (SELECT d FROM ob ORDER BY d <=> 'alpha'::wquery LIMIT 20) s
  WHERE NOT (s.d @@@ 'alpha'::wquery);
 
--- (5) LIMIT larger than the match set must terminate and return exactly the
--- matches, not pad with non-matching rows.  Only 55 docs contain 'alpha'.
-SELECT count(*) AS bare_all_matches
-  FROM (SELECT id FROM ob ORDER BY d <=> 'alpha'::wquery LIMIT 500) s;
+-- (5) LIMIT larger than the match set.  RETRACTED CONTRACT (doc/GAPS.md G56,
+-- 2026-09-29): this test used to assert that the scan returns exactly the 55
+-- matches and does NOT pad.  But SQL's ORDER BY never filters -- a heap scan +
+-- sort of the same query returns 500 rows, the non-matches at distance 1 --
+-- so returning 55 was an incomplete answer, and a WHERE clause beside the
+-- ordering (price < c ORDER BY d <=> q) inherited it.  The scan now emits its
+-- ranked matches FIRST, then the rest of the table at distance 1.  All three
+-- halves are asserted: the count, that the first 55 rows are the matches, and
+-- that nothing after them matches.
+CREATE TEMP TABLE ob5 AS
+  SELECT row_number() OVER () AS pos, id, d
+    FROM (SELECT id, d FROM ob ORDER BY d <=> 'alpha'::wquery LIMIT 500) s;
+SELECT count(*) AS bare_rows,                                          -- 500
+       count(*) FILTER (WHERE pos <= 55 AND NOT d @@@ 'alpha'::wquery)
+         AS ranked_nonmatching,                                        -- 0
+       count(*) FILTER (WHERE pos > 55 AND d @@@ 'alpha'::wquery)
+         AS padded_matching                                            -- 0
+  FROM ob5;
+DROP TABLE ob5;
 
--- (6) Boolean structure must be honoured without a WHERE clause too.
+-- (6) Boolean structure must be honoured without a WHERE clause too: the
+-- RANKED rows are exactly the query's matches.  'alpha & beta' has 50 matches,
+-- so LIMIT 20 is all ranked; 'alpha & !beta' has 5, so the other 15 rows are
+-- padding (G56) and must come after all 5.
 SELECT count(*) AS bare_and_nonmatching
   FROM (SELECT d FROM ob ORDER BY d <=> 'alpha & beta'::wquery LIMIT 20) s
  WHERE NOT (s.d @@@ 'alpha & beta'::wquery);
-SELECT count(*) AS bare_not_nonmatching
-  FROM (SELECT d FROM ob ORDER BY d <=> 'alpha & !beta'::wquery LIMIT 20) s
- WHERE NOT (s.d @@@ 'alpha & !beta'::wquery);
+SELECT count(*) AS bare_not_rows,                                      -- 20
+       count(*) FILTER (WHERE pos <= 5 AND NOT d @@@ 'alpha & !beta'::wquery)
+         AS bare_not_ranked_nonmatching,                               -- 0
+       count(*) FILTER (WHERE pos > 5 AND d @@@ 'alpha & !beta'::wquery)
+         AS bare_not_padded_matching                                   -- 0
+  FROM (SELECT row_number() OVER () AS pos, d
+          FROM (SELECT d FROM ob ORDER BY d <=> 'alpha & !beta'::wquery
+                 LIMIT 20) s) t;
 
--- (7) A query matching nothing must return nothing, not the whole table ordered
--- by an arbitrary score.
-SELECT count(*) AS bare_nomatch FROM (
-  SELECT id FROM ob ORDER BY d <=> 'zzznotpresent'::wquery LIMIT 10) s;
+-- (7) A query matching nothing ranks nothing, so every row is padding.  This
+-- used to assert 0 rows ("not the whole table ordered by an arbitrary score");
+-- the whole table is exactly what a heap sort returns (G56).  None of the
+-- rows may match.
+SELECT count(*) AS bare_nomatch,                                       -- 10
+       count(*) FILTER (WHERE d @@@ 'zzznotpresent'::wquery) AS bare_nomatch_matching
+  FROM (SELECT d FROM ob ORDER BY d <=> 'zzznotpresent'::wquery LIMIT 10) s;
 
 -- (8) Scores must be identical between the two forms.  A keyless scan that
 -- computed BM25 against different corpus statistics would rank plausibly and
@@ -439,3 +465,169 @@ SELECT scores - vec_scores - gate_scores >= 130 AS lexical_channels_not_truncate
   FROM weave_fuse_stats();
 
 DROP TABLE mblk;
+
+-- ============================================================================
+-- G56: the padding phase, compared with the heap's own answer.
+--
+-- SQL's ORDER BY never filters, so `WHERE <anything> ORDER BY d <=> q` must
+-- return every row the WHERE admits.  The ordering scan ranks q's matches and
+-- then walks the heap for the rest (weave_pad_gettuple in src/am/amscan.c).
+-- Each case below is checked against a query the index cannot answer, and the
+-- ORDER is checked by class: q's matches, then rows with a document, then
+-- NULL documents -- NULLs last, where ASC puts them.
+--
+-- The corpus deliberately holds what a posting list cannot see: NULL documents
+-- (never indexed), empty documents (indexed, no postings), and rows moved by a
+-- HOT update, whose physical TID is not the chain root an access method must
+-- return -- a physical TID resolves to no tuple and the row silently vanishes
+-- (AGENTS.md, the Z8 fallback's lesson).
+CREATE TABLE pad (id int, d wdoc, tag text);
+INSERT INTO pad
+SELECT g,
+       CASE WHEN g % 10 = 0 THEN NULL
+            WHEN g % 10 = 1 THEN to_wdoc('')
+            WHEN g % 2 = 0 THEN to_wdoc('alpha w' || g)
+            ELSE to_wdoc('beta w' || g) END,
+       CASE WHEN g % 3 = 0 THEN 'x' ELSE 'y' END
+  FROM generate_series(1, 300) g;
+CREATE INDEX pad_w ON pad USING weave (d);
+UPDATE pad SET tag = tag WHERE id % 4 = 0;     -- HOT: tag is not indexed
+ANALYZE pad;
+-- the HOT case must actually exist, or the root-TID mapping is untested
+SELECT pg_stat_force_next_flush();
+SELECT n_tup_hot_upd > 0 AS some_updates_were_hot
+  FROM pg_stat_user_tables WHERE relname = 'pad';
+SELECT count(*) FILTER (WHERE d IS NULL) AS null_docs,
+       count(*) FILTER (WHERE d @@@ 'alpha'::wquery) AS alpha_docs,
+       count(*) AS all_rows
+  FROM pad;
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- a WHERE clause the index does not see: a Filter above the ordering scan
+EXPLAIN (COSTS OFF)
+SELECT id FROM pad WHERE tag = 'x' ORDER BY d <=> 'alpha'::wquery;
+CREATE TEMP TABLE pad_ix AS
+  SELECT row_number() OVER () AS pos, id,
+         CASE WHEN d @@@ 'alpha'::wquery THEN 0 WHEN d IS NOT NULL THEN 1 ELSE 2 END AS cls
+    FROM (SELECT id, d FROM pad WHERE tag = 'x' ORDER BY d <=> 'alpha'::wquery) s;
+-- bare, and a LIMIT that stops inside the padding
+CREATE TEMP TABLE pad_bare AS
+  SELECT row_number() OVER () AS pos, id,
+         CASE WHEN d @@@ 'alpha'::wquery THEN 0 WHEN d IS NOT NULL THEN 1 ELSE 2 END AS cls
+    FROM (SELECT id, d FROM pad ORDER BY d <=> 'alpha'::wquery) s;
+SELECT count(*) AS bare_limit_rows
+  FROM (SELECT id FROM pad ORDER BY d <=> 'alpha'::wquery LIMIT 200) s;   -- 200
+-- a nested loop rescans the ordering scan once per outer row; each rescan
+-- must restart the ranked phase AND the padding walk.  Correlated on t.v so
+-- the inner side cannot be materialized once; the plan is asserted.
+EXPLAIN (COSTS OFF)
+SELECT count(*)
+  FROM (VALUES (1), (2), (3)) t(v),
+       LATERAL (SELECT id FROM pad WHERE id > t.v
+                 ORDER BY d <=> 'alpha'::wquery LIMIT 250) s;
+SELECT count(*) AS rescanned_rows, count(DISTINCT (v, id)) AS rescanned_distinct
+  FROM (VALUES (1), (2), (3)) t(v),
+       LATERAL (SELECT id FROM pad WHERE id > t.v
+                 ORDER BY d <=> 'alpha'::wquery LIMIT 250) s;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+SELECT (SELECT count(*) FROM pad_ix) AS filtered_rows,
+       (SELECT count(*) FROM pad WHERE tag = 'x') AS filtered_heap_rows,
+       (SELECT count(*) FROM (SELECT id FROM pad_ix
+                              EXCEPT SELECT id FROM pad WHERE tag = 'x') z) AS index_only,
+       (SELECT count(*) FROM (SELECT id FROM pad WHERE tag = 'x'
+                              EXCEPT SELECT id FROM pad_ix) z) AS heap_only,
+       (SELECT count(*) - count(DISTINCT id) FROM pad_ix) AS duplicates,
+       (SELECT count(*) FROM pad_ix a JOIN pad_ix b ON a.pos < b.pos
+         WHERE a.cls > b.cls) AS class_inversions;
+SELECT (SELECT count(*) FROM pad_bare) AS bare_rows,
+       (SELECT count(DISTINCT id) FROM pad_bare) AS bare_distinct,
+       (SELECT count(*) FROM pad_bare a JOIN pad_bare b ON a.pos < b.pos
+         WHERE a.cls > b.cls) AS bare_class_inversions;
+
+-- A PARTIAL index: the planner drops the WHERE clause its predicate implies,
+-- so the padding walk must apply the predicate itself or it returns rows the
+-- query excluded.
+DROP INDEX pad_w;
+CREATE INDEX pad_wp ON pad USING weave (d) WHERE tag = 'y';
+ANALYZE pad;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM pad WHERE tag = 'y' ORDER BY d <=> 'alpha'::wquery;
+CREATE TEMP TABLE pad_p AS
+  SELECT id FROM pad WHERE tag = 'y' ORDER BY d <=> 'alpha'::wquery;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT (SELECT count(*) FROM pad_p) AS partial_rows,
+       (SELECT count(*) FROM pad WHERE tag = 'y') AS partial_heap_rows,
+       (SELECT count(*) FROM pad_p JOIN pad USING (id) WHERE pad.tag <> 'y') AS outside_predicate;
+
+DROP TABLE pad_ix, pad_bare, pad_p;
+DROP TABLE pad;
+
+-- ============================================================================
+-- G66: the ranked pass must rank the PENDING list too.  It used to cover the
+-- merged segments only, so a row inserted or UPDATEd since the last flush was
+-- missing from `WHERE d @@@ q ORDER BY d <=> q` altogether (60 of 120 in the
+-- padding test above, before this fix).  Scores must be on ONE scale: odd ids
+-- are in a segment, even ids are pending, and every document is 7 tokens long
+-- -- a length the doclen quantizer stores exactly (include/weave/for.h), so
+-- score is a strict function of k, the tf of 'alpha', with no quantization
+-- tie-shuffling -- and the only correct order is k descending, the two
+-- populations interleaved at every level.
+CREATE TABLE pr66 (id int, k int, d wdoc);
+INSERT INTO pr66 SELECT g, g % 6 + 1,
+       to_wdoc(repeat('alpha ', g % 6 + 1) || repeat('filler ', 6 - g % 6))
+  FROM generate_series(1, 239, 2) g;
+CREATE INDEX pr66_w ON pr66 USING weave (d);
+INSERT INTO pr66 SELECT g, g % 6 + 1,
+       to_wdoc(repeat('alpha ', g % 6 + 1) || repeat('filler ', 6 - g % 6))
+  FROM generate_series(2, 240, 2) g;
+SELECT count(*) > 0 AS has_pending
+  FROM weave_page_info('pr66_w') WHERE kind LIKE 'pending%' AND NOT freed;
+SELECT min(wdoc_length(d)) AS min_len, max(wdoc_length(d)) AS max_len FROM pr66;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_weave.wand_initial_k = 1;    -- force the ladder to widen across pending
+CREATE TEMP TABLE pr66_o AS
+  SELECT row_number() OVER () AS pos, id, k
+    FROM (SELECT id, k FROM pr66 WHERE d @@@ 'alpha'::wquery
+           ORDER BY d <=> 'alpha'::wquery) s;
+CREATE TEMP TABLE pr66_top AS
+  SELECT row_number() OVER () AS pos, id, k
+    FROM (SELECT id, k FROM pr66 ORDER BY d <=> 'alpha'::wquery LIMIT 20) s;
+RESET pg_weave.wand_initial_k;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT (SELECT count(*) FROM pr66_o) AS ranked_rows,                          -- 240
+       (SELECT count(*) FROM pr66_o WHERE id % 2 = 0) AS ranked_pending_rows, -- 120
+       (SELECT count(*) FROM pr66_o a JOIN pr66_o b ON a.pos + 1 = b.pos
+         WHERE a.k < b.k) AS order_violations,                               -- 0
+       (SELECT count(*) FROM pr66_top WHERE k <> 6) AS first_page_not_best,  -- 0
+       (SELECT count(*) FROM pr66 WHERE k = 6) AS best_rows;                -- 40
+SELECT count(*) AS weave_search_rows
+  FROM weave_search('pr66_w', 'alpha'::wquery, 1000);                        -- 240
+DROP TABLE pr66_o, pr66_top;
+DROP TABLE pr66;
+
+-- The ladder's `curk >= maxhits` stop used a match bound computed from segment
+-- df alone.  With 50 matches in a segment and 200 pending, the first rung (64)
+-- fills from the union and already exceeds that bound of 50, so the scan
+-- stopped at 64 rows.  maxhits now counts the pending list.
+CREATE TABLE pr66b (id int, d wdoc);
+INSERT INTO pr66b SELECT g, to_wdoc('alpha w' || g) FROM generate_series(1, 50) g;
+CREATE INDEX pr66b_w ON pr66b USING weave (d);
+INSERT INTO pr66b SELECT g, to_wdoc('alpha w' || g) FROM generate_series(51, 250) g;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_weave.wand_initial_k = 1;
+SELECT count(*) AS mostly_pending_rows                                       -- 250
+  FROM (SELECT id FROM pr66b WHERE d @@@ 'alpha'::wquery
+         ORDER BY d <=> 'alpha'::wquery) s;
+RESET pg_weave.wand_initial_k;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE pr66b;

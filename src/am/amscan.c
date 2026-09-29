@@ -317,6 +317,7 @@ typedef struct WeaveScanOpaqueData
 	 */
 	bool		unhonoured;
 	bool		ordSameQuery;
+	bool		ordQueryRestricts;	/* some @@@ key is the ORDER BY query (G56) */
 	/*
 	 * THE DOCVALUES RESTRICTION GATE (task Docvals).  A comparison on a docvalues
 	 * column (`price < 100`, strategy 1..5 on the int8_docval_ops column) is a
@@ -401,9 +402,48 @@ typedef struct WeaveScanOpaqueData
 	int			nfuse;
 	int			fusek;			/* candidate width of the current fused pass */
 	bool		fuseDone;
+
+	/*
+	 * doc/GAPS.md G56: the PADDING phase of a lexical `<=>` ordering scan.  SQL's
+	 * ORDER BY never filters -- a heap scan + sort of `ORDER BY d <=> q` returns
+	 * every row -- so once the ranked matches are exhausted the scan walks the
+	 * heap and emits every visible row it has not already emitted: first each
+	 * row with a document, at distance 1.0 (the heap operator's value for a
+	 * document q does not rank, rank.c), then each NULL document -- which the
+	 * index never holds -- at a NULL distance, last, where ASC puts NULLs.
+	 *
+	 * NOT xs_recheckorderby, though the executor would then reorder for us: the
+	 * heap operator scores a boolean query's positive terms and ignores its
+	 * structure, so `d <=> 'alpha & !beta'` is below 1.0 on a document holding
+	 * both terms, which the ranked phase rightly never emits.  The first cut
+	 * set the flag and that row raised "index returned tuples in wrong order"
+	 * (sql/orderby.sql test 6).  The ordering this scan defines is the index's
+	 * own -- ranked matches by BM25 with corpus statistics, which the operator
+	 * evaluated on a heap row does not have either (orderby.sql section L14) --
+	 * and the padding extends that ordering; it does not re-derive the heap's.
+	 */
+	bool		padActive;
+	bool		padDone;		/* the heap walk finished: never restart it */
+	TableScanDesc padScan;
+	TupleTableSlot *padSlot;
+	Relation	padHeap;		/* opened here; closed by weave_pad_end */
+	IndexInfo  *padInfo;		/* FormIndexDatum: is this row's document NULL? */
+	int			padAttIdx;		/* 0-based index column of the ORDER BY key */
+	EState	   *padEstate;		/* index expressions + partial-index predicate */
+	ExprState  *padPred;		/* NULL when the index is not partial */
+	ItemPointerData *padSeen;	/* sorted TIDs the ranked phase emitted */
+	int			npadSeen;
+	OffsetNumber *padRoots;		/* heap_get_root_tuples of padRootBlk */
+	BlockNumber padRootBlk;
+	ItemPointerData *padNulls;	/* NULL-document rows, emitted after the walk */
+	int			npadNulls;
+	int			capPadNulls;
+	int			padNullPos;
 } WeaveScanOpaqueData;
 
 typedef WeaveScanOpaqueData *WeaveScanOpaque;
+
+static void weave_pad_end(WeaveScanOpaque so);
 
 /* The cgram route (task Z8).  Defined near the bottom, next to the recheck and
  * the fallback heap pass it composes; declared here because weave_getbitmap()
@@ -2476,6 +2516,7 @@ weave_beginscan(Relation r, int nkeys, int norderbys)
 	so->cgramLossy = false;
 	so->unhonoured = false;
 	so->ordSameQuery = false;
+	so->ordQueryRestricts = false;
 	so->fuseScan = false;
 	so->fuseQ = NULL;
 	so->fuseW = NULL;
@@ -2513,6 +2554,7 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->cgramLossy = false;
 	so->unhonoured = false;
 	so->ordSameQuery = false;
+	so->ordQueryRestricts = false;
 	so->dvScan = false;
 	so->dvAttno = 0;
 	so->dvVoid = false;
@@ -2760,6 +2802,7 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->nordered = 0;
 	so->maxordered = 0;
 	so->ordpos = 0;
+	weave_pad_end(so);			/* G56: a rescan starts a new ranked phase */
 	if (so->cand != NULL)
 		pfree(so->cand);
 	so->cand = NULL;
@@ -3029,6 +3072,15 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 								 !so->dvScan &&
 								 VARSIZE_ANY(so->query) == VARSIZE_ANY(oq) &&
 								 memcmp(so->query, oq, VARSIZE_ANY(oq)) == 0);
+			/*
+			 * The weaker fact the G56 padding needs: SOME `@@@` key (the first,
+			 * the one so->query held) is the ORDER BY query, whatever else is
+			 * beside it.  Keys are ANDed, so no row that query does not match
+			 * can qualify, and a padding walk would return nothing.
+			 */
+			so->ordQueryRestricts = (so->queryValid && so->query != NULL &&
+									 VARSIZE_ANY(so->query) == VARSIZE_ANY(oq) &&
+									 memcmp(so->query, oq, VARSIZE_ANY(oq)) == 0);
 			so->query = oq;
 			so->queryValid = true;
 		}
@@ -3087,6 +3139,238 @@ weave_set_itup(IndexScanDesc scan, WeaveScanOpaque so)
 	}
 	scan->xs_itup = so->plainItup;
 	scan->xs_itupdesc = so->plainItupDesc;
+}
+
+/*
+ * The G56 padding phase -- see the padActive fields in WeaveScanOpaqueData.
+ *
+ * Wanted only on the lexical `<=>` route (the vector, edit-distance and fused
+ * routes are recorded as open in doc/GAPS.md G56), and not when a restriction
+ * key IS the ORDER BY query (ordQueryRestricts, whatever keys are beside it):
+ * every key is ANDed, so a row q does not match fails that key and the heap
+ * walk would return nothing -- once per rescan, under a nested loop.
+ */
+static bool
+weave_pad_wanted(IndexScanDesc scan, WeaveScanOpaque so)
+{
+	return scan->numberOfOrderBys == 1 && !so->fuseScan && !so->vecScan &&
+		!so->edistScan && !so->ordSameQuery && !so->ordQueryRestricts;
+}
+
+static void
+weave_pad_begin(IndexScanDesc scan, WeaveScanOpaque so)
+{
+	Relation	index = scan->indexRelation;
+	int			i;
+
+	so->padActive = true;
+	so->padHeap = table_open(index->rd_index->indrelid, AccessShareLock);
+	so->padSlot = table_slot_create(so->padHeap, NULL);
+	so->padRoots = (OffsetNumber *) palloc(MaxHeapTuplesPerPage * sizeof(OffsetNumber));	/* alloc-ok: one heap page's line pointers, a compile-time bound */
+	so->padRootBlk = InvalidBlockNumber;
+
+	/*
+	 * The index expressions tell a NULL document from a present one, and a
+	 * PARTIAL index's predicate must be applied here: the planner drops a WHERE
+	 * clause the predicate implies, so a heap row outside the predicate would
+	 * otherwise be returned with nothing to reject it.
+	 */
+	/* built once per scan, not per rescan: a nested loop rescans per outer row */
+	if (so->padInfo == NULL)
+		so->padInfo = BuildIndexInfo(index);
+	so->padAttIdx = scan->orderByData[0].sk_attno - 1;
+	so->padEstate = CreateExecutorState();
+	so->padPred = so->padInfo->ii_Predicate != NIL
+		? ExecPrepareQual(so->padInfo->ii_Predicate, so->padEstate) : NULL;
+
+	/* what the ranked phase already emitted, sorted for bsearch */
+	so->npadSeen = so->nordered;
+	so->padSeen = NULL;
+	if (so->nordered > 0)
+	{
+		so->padSeen = (ItemPointerData *)
+			WEAVE_ALLOC_MAYBE_HUGE((Size) so->nordered * sizeof(ItemPointerData));
+		for (i = 0; i < so->nordered; i++)
+			so->padSeen[i] = so->ordered[i].tid;
+		qsort(so->padSeen, so->npadSeen, sizeof(ItemPointerData), cmp_tid);
+	}
+	so->padNulls = NULL;
+	so->npadNulls = 0;
+	so->capPadNulls = 0;
+	so->padNullPos = 0;
+	so->padScan = table_beginscan(so->padHeap, scan->xs_snapshot, 0, NULL);
+}
+
+/* the heap-walk half of weave_pad_end: everything but the NULL-row list */
+static void
+weave_pad_end_walk(WeaveScanOpaque so)
+{
+	if (so->padScan != NULL)
+		table_endscan(so->padScan);
+	if (so->padSlot != NULL)
+		ExecDropSingleTupleTableSlot(so->padSlot);
+	if (so->padEstate != NULL)
+		FreeExecutorState(so->padEstate);
+	if (so->padHeap != NULL)
+		table_close(so->padHeap, AccessShareLock);
+	if (so->padSeen != NULL)
+		pfree(so->padSeen);
+	if (so->padRoots != NULL)
+		pfree(so->padRoots);
+	so->padScan = NULL;
+	so->padSlot = NULL;
+	so->padEstate = NULL;
+	so->padPred = NULL;
+	if (so->padInfo != NULL)
+	{
+		/* its expression state lived in the EState just freed */
+		so->padInfo->ii_ExpressionsState = NIL;
+		so->padInfo->ii_PredicateState = NULL;
+	}
+	so->padHeap = NULL;
+	so->padSeen = NULL;
+	so->npadSeen = 0;
+	so->padRoots = NULL;
+	so->padRootBlk = InvalidBlockNumber;
+}
+
+/* release everything weave_pad_begin took; idempotent (rescan and endscan) */
+static void
+weave_pad_end(WeaveScanOpaque so)
+{
+	weave_pad_end_walk(so);
+	if (so->padNulls != NULL)
+		pfree(so->padNulls);
+	so->padNulls = NULL;
+	so->npadNulls = 0;
+	so->capPadNulls = 0;
+	so->padNullPos = 0;
+	so->padActive = false;
+	so->padDone = false;
+}
+
+/* hand one padding row to the executor at distance 1.0, or NULL */
+static void
+weave_pad_emit(IndexScanDesc scan, WeaveScanOpaque so, ItemPointer tid,
+			   bool nulldist)
+{
+	IndexOrderByDistance dist[1];
+	Oid			typ[1];
+
+	scan->xs_heaptid = *tid;
+	/* the WHERE clause was applied to none of these rows */
+	scan->xs_recheck = (scan->numberOfKeys > 0);
+	weave_set_itup(scan, so);
+	/*
+	 * 1.0 is >= every ranked distance, 1/(1+score) with score >= 0, so the
+	 * stream stays ascending; NULL follows it.  recheckOrderBy stays false --
+	 * see the padActive comment in WeaveScanOpaqueData for why the heap
+	 * operator's value cannot be used here.
+	 */
+	typ[0] = FLOAT8OID;
+	dist[0].value = nulldist ? 0.0 : 1.0;
+	dist[0].isnull = nulldist;
+	index_store_float8_orderby_distances(scan, typ, dist, false);
+}
+
+/*
+ * Next padding row: a visible heap row the ranked phase did not emit, by its
+ * HOT-chain ROOT TID -- the only TID an access method may return (AGENTS.md;
+ * weave_cgram_heapscan has the paragraph).  One visible version per chain
+ * under one snapshot, so no root is produced twice.  Rows whose document is
+ * NULL are held back and emitted after the walk.
+ */
+static bool
+weave_pad_gettuple(IndexScanDesc scan, WeaveScanOpaque so)
+{
+	if (so->padScan != NULL)
+	{
+		ExprContext *econtext = GetPerTupleExprContext(so->padEstate);
+
+		while (table_scan_getnextslot(so->padScan, ForwardScanDirection, so->padSlot))
+		{
+			ItemPointerData rtid = so->padSlot->tts_tid;
+			BlockNumber blk = ItemPointerGetBlockNumber(&rtid);
+			OffsetNumber off = ItemPointerGetOffsetNumber(&rtid);
+			Datum		values[INDEX_MAX_KEYS];
+			bool		isnull[INDEX_MAX_KEYS];
+			bool		keep = true;
+
+			CHECK_FOR_INTERRUPTS();
+			econtext->ecxt_scantuple = so->padSlot;
+			if (so->padPred != NULL)
+				keep = ExecQual(so->padPred, econtext);
+			if (keep)
+				FormIndexDatum(so->padInfo, so->padSlot, so->padEstate,
+							   values, isnull);
+			ResetExprContext(econtext);
+			if (!keep)
+				continue;
+
+			if (blk != so->padRootBlk)
+			{
+				Buffer		rb = ReadBuffer(so->padHeap, blk);
+
+				LockBuffer(rb, BUFFER_LOCK_SHARE);
+				heap_get_root_tuples(BufferGetPage(rb), so->padRoots);
+				UnlockReleaseBuffer(rb);
+				so->padRootBlk = blk;
+			}
+			/*
+			 * No root means a heap-only tuple whose chain start the page did
+			 * not show when re-read.  For a visible tuple that should not
+			 * happen -- pruning leaves a redirect, which heap_get_root_tuples
+			 * follows -- and PostgreSQL's own index build ERRORs on it.  The
+			 * physical TID would resolve to nothing, so returning it loses the
+			 * row exactly as skipping does; skipping at least hands the
+			 * executor no TID that is not a chain root.
+			 */
+			if (off < 1 || off > MaxHeapTuplesPerPage ||
+				so->padRoots[off - 1] == InvalidOffsetNumber)
+				continue;
+			ItemPointerSetOffsetNumber(&rtid, so->padRoots[off - 1]);
+
+			if (isnull[so->padAttIdx])
+			{
+				/* never indexed, so never ranked: emitted last, at NULL */
+				if (so->npadNulls >= so->capPadNulls)
+				{
+					/* relation-scale: every row's document can be NULL */
+					so->capPadNulls = so->capPadNulls ? so->capPadNulls * 2 : 64;
+					so->padNulls = (ItemPointerData *)
+						(so->padNulls
+						 ? WEAVE_REALLOC_MAYBE_HUGE(so->padNulls, (Size) so->capPadNulls * sizeof(ItemPointerData))
+						 : WEAVE_ALLOC_MAYBE_HUGE((Size) so->capPadNulls * sizeof(ItemPointerData)));
+				}
+				so->padNulls[so->npadNulls++] = rtid;
+				continue;
+			}
+			if (so->npadSeen > 0 &&
+				bsearch(&rtid, so->padSeen, so->npadSeen, sizeof(ItemPointerData),
+						cmp_tid) != NULL)
+				continue;		/* ranked already */
+
+			weave_pad_emit(scan, so, &rtid, false);
+			return true;
+		}
+
+		/*
+		 * Walk finished.  A heap scan called again after its end RESTARTS from
+		 * the first block, so its resources go now.
+		 */
+		weave_pad_end_walk(so);
+	}
+
+	if (so->padNullPos < so->npadNulls)
+	{
+		weave_pad_emit(scan, so, &so->padNulls[so->padNullPos++], true);
+		return true;
+	}
+
+	/* padDone stops any later call from beginning a second walk */
+	weave_pad_end(so);
+	so->padDone = true;
+	return false;
 }
 
 /*
@@ -3417,6 +3701,10 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 	 * (3) EXTENDS the scan rather than repeating it: ordered[] survives, so the
 	 * rows already handed out are neither re-probed nor re-emitted.
 	 */
+	if (so->padDone)
+		return false;
+	if (so->padActive)
+		return weave_pad_gettuple(scan, so);
 	while (so->ordpos >= so->nordered)
 	{
 		if (so->candpos < so->ncand)
@@ -3435,12 +3723,18 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 			if (so->ordpos < so->nordered)
 				break;
 		}
-		/* candidates exhausted: widen the pass, or the scan is complete */
+		/* candidates exhausted: widen the pass, or the ranked phase is complete */
 		if (!(so->fuseScan ? weave_fuse_grow(scan->indexRelation, so)
 			  : so->vecScan ? weave_vec_grow(scan->indexRelation, so)
 			  : so->edistScan ? weave_edist_grow(scan->indexRelation, so)
 			  : weave_ord_grow(scan->indexRelation, so)))
-			return false;
+		{
+			/* every ranked row is out: the unranked rest (G56), or done */
+			if (!weave_pad_wanted(scan, so))
+				return false;
+			weave_pad_begin(scan, so);
+			return weave_pad_gettuple(scan, so);
+		}
 	}
 
 	scan->xs_heaptid = so->ordered[so->ordpos].tid;
@@ -3464,10 +3758,12 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 	 * WEAVE_ORD_WIDTH_MAX candidates, so more rejected rows than that go
 	 * unreturned (a pass that loses every race with a concurrent merge no
 	 * longer ends a ladder short: it raises 40001, G58);
-	 * and the ordering scan's own contract is unchanged -- it emits only
-	 * documents the ORDER BY argument ranks (for `<=>`, those matching its
-	 * query), so `price < c ORDER BY d <=> q` returns the price < c rows that
-	 * ALSO match q, where a heap scan would return every price < c row (G56).
+	 * and the ranked phase emits only documents the ORDER BY argument ranks
+	 * (for `<=>`, those matching its query).  On the lexical `<=>` route the
+	 * padding phase (weave_pad_gettuple) then emits the rest of the table, so
+	 * `price < c ORDER BY d <=> q` returns every price < c row, as a heap
+	 * scan would; the vector, edit-distance and fused routes do not pad yet
+	 * (G56).
 	 */
 	if (scan->numberOfKeys == 0)
 		scan->xs_recheck = false;	/* score computed exactly from the index */
@@ -5411,7 +5707,11 @@ weave_docvals_gate(Relation index, WeaveScanOpaque so, TidSet *out)
 void
 weave_endscan(IndexScanDesc scan)
 {
-	/* memory is freed with the scan's context */
+	/*
+	 * Memory is freed with the scan's context, but a G56 padding walk holds a
+	 * heap scan (buffer pins), a slot, an EState and a relation reference.
+	 */
+	weave_pad_end((WeaveScanOpaque) scan->opaque);
 }
 
 /* ----- index-maintained corpus statistics (stage 5) ----- */
@@ -7083,6 +7383,13 @@ weave_query_maxhits(Relation index, WeaveQuery q, double N)
 	}
 	result = (top >= 1) ? stack[top - 1] : N;
 	pfree(stack);
+	/*
+	 * Segment df sees no pending document, and the ranked pass ranks those too
+	 * (G66), so every one of them is a possible match: without this, the
+	 * ladder's `curk >= maxhits` stop truncated a scan whose pending matches
+	 * pushed it past the segment count.
+	 */
+	result += (double) meta.npending;
 	return Min(result, N);
 }
 
@@ -7097,12 +7404,11 @@ weave_query_maxhits(Relation index, WeaveQuery q, double N)
  * base table is opened here for the visibility check.  Returns the number of
  * visible results.
  *
- * NOTE: ranked results cover the merged SEGMENTS only; documents still in the
- * pending write buffer (inserted since the last flush) are searchable by @@@
- * and counted by weave_count(), but are not ranked here until a flush folds them
- * into a segment (automatic on VACUUM, or immediate via weave_merge()).  Ranking
- * pending docs would require per-doc scoring outside the WAND cursors; deferred
- * intentionally, since pending is transient and bounded.
+ * NOTE: this pass covers the merged SEGMENTS only.  Documents still in the
+ * pending write buffer are ranked by weave_pending_ranked() on the same scale
+ * and merged in by weave_topk_candidates_guarded(), the one caller; they used to
+ * be left out entirely ("deferred intentionally, since pending is transient and
+ * bounded"), which doc/GAPS.md G66 records as the wrong answer it was.
  */
 static int
 weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
@@ -9540,6 +9846,239 @@ weave_fuse_grow(Relation index, WeaveScanOpaque so)
 }
 
 /*
+ * weave_pending_ranked: score every pending-list document that matches q, with
+ * the SAME BM25 the segment pass uses (weave_topk_candidates_range: k1 = 1.2,
+ * b = 0.75, N = meta.ndocs, avgdl = sumdoclen / ndocs, idf from the df summed
+ * over segments, bm25bound.h's contribution), so a pending document and a
+ * flushed one are ordered by one scale.  A term no segment holds takes its df
+ * from the pending list (pass 0 below).
+ *
+ * doc/GAPS.md G66: ranked results used to cover the merged segments only --
+ * "deferred intentionally, since pending is transient and bounded" -- so
+ * `WHERE d @@@ q ORDER BY d <=> q` returned 60 of 120 matching rows on a table
+ * whose other 60 had been UPDATEd since the last flush, and a fresh document
+ * could not reach a LIMIT 10 first page until autovacuum ran.  Pending is
+ * neither transient nor bounded under load (G64 measured thousands of pages).
+ *
+ * Reads the pending pages under the caller's generation bracket; returns the
+ * number of entries in *out (unsorted), NULL when none.
+ */
+static int
+weave_pending_ranked(Relation index, WeaveQuery q, ScoredTid **out)
+{
+	WeaveMetaPageData meta;
+	const char **terms;
+	int		   *lens;
+	int			nterms;
+	WeaveBm25Factors *fac;
+	bool		dvtext;
+	BlockNumber blk;
+	ScoredTid  *res = NULL;
+	int			n = 0;
+	int			cap = 0;
+	double		N;
+	double		avgdl;
+	int			t;
+	uint64	   *gdfs;
+	uint64	   *pdf;
+	bool		need_pdf = false;
+	int			pass;
+
+	*out = NULL;
+	weave_read_meta(index, &meta);
+	if (meta.pendinghead == InvalidBlockNumber || q == NULL)
+		return 0;
+
+	N = meta.ndocs < 1.0 ? 1.0 : meta.ndocs;
+	avgdl = meta.ndocs > 0 ? meta.sumdoclen / meta.ndocs : 1.0;
+	nterms = weave_query_terms(q, &terms, &lens);
+	fac = (WeaveBm25Factors *) palloc(Max(nterms, 1) * sizeof(WeaveBm25Factors));	/* alloc-ok: one per query term */
+	pdf = (uint64 *) palloc0(Max(nterms, 1) * sizeof(uint64));	/* alloc-ok: one per query term */
+	gdfs = (uint64 *) palloc0(Max(nterms, 1) * sizeof(uint64));	/* alloc-ok: one per query term */
+	for (t = 0; t < nterms; t++)
+	{
+		uint32		s;
+
+		for (s = 0; s < meta.nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+		{
+			uint32		df,
+						max_tf;
+			BlockNumber firstblk;
+			uint32		firstoff;
+
+			if (meta.segs[s].dictstart != InvalidBlockNumber &&
+				weave_lookup_dict(index, &meta.segs[s], terms[t], lens[t],
+								  &df, &max_tf, &firstblk, &firstoff))
+				gdfs[t] += df;
+		}
+		if (gdfs[t] == 0)
+			need_pdf = true;
+	}
+
+	/*
+	 * Pass 0, only when some query term is in no segment: its df is then the
+	 * number of PENDING documents holding it -- what it will be once they are
+	 * flushed.  A flat df = 1 would give it the idf of a unique term however
+	 * many pending documents share it.  No segment document holds such a term,
+	 * so either choice is consistent between the two populations; this one is
+	 * the one that survives the flush.  Pass 1 scores.
+	 */
+	dvtext = weave_index_dv_is_text(index);
+	for (pass = need_pdf ? 0 : 1; pass < 2; pass++)
+	{
+		if (pass == 1)
+			for (t = 0; t < nterms; t++)
+			{
+				double		df = (double) Max(gdfs[t], (uint64) 1);
+				double		idf = log(1.0 + (N - df + 0.5) / (df + 0.5));
+
+				weave_bm25_factors_init(&fac[t], idf, 1.2, 0.75, avgdl);
+			}
+		blk = meta.pendinghead;
+		while (blk != InvalidBlockNumber)
+		{
+			Buffer		buffer;
+			Page		page;
+			WeavePendingIter it;
+			WeavePendingRec rec;
+			BlockNumber next;
+
+			CHECK_FOR_INTERRUPTS();
+			buffer = weave_scan_readbuf(index, blk);
+			if (buffer == InvalidBuffer)
+				break;
+			LockBuffer(buffer, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buffer);
+			if (!weave_page_is_live_pending(page))
+			{
+				/* freed under a stale head: the caller's generation check retries */
+				UnlockReleaseBuffer(buffer);
+				break;
+			}
+			next = WeavePageGetOpaque(page)->nextblk;
+			weave_pending_iter_init(&it, page, dvtext);
+			while (weave_pending_iter_next(&it, &rec))
+			{
+				double		score = 0.0;
+				double		qdl;
+
+				if (!weave_doc_is_valid(rec.doc, rec.doclen))
+					continue;	/* weave_collect_matches warns about these */
+				if (pass == 0)
+				{
+					for (t = 0; t < nterms; t++)
+						if (gdfs[t] == 0 &&
+							weave_doc_lookup(rec.doc, terms[t], lens[t]) != NULL)
+							pdf[t]++;
+					continue;
+				}
+				if (!weave_doc_matches(rec.doc, q))
+					continue;
+
+				/*
+				 * The length a flushed copy of this document would be scored
+				 * with: the v4+ sidecar stores one quantized byte per document
+				 * (include/weave/for.h), so an exact length here would put the
+				 * two populations on different scales by up to the quantizer's
+				 * 1/8 step -- measured: a first page holding only flushed rows.
+				 */
+				qdl = (double) weave_byte_to_doclen(weave_doclen_to_byte(rec.doc->doclen));
+				for (t = 0; t < nterms; t++)
+				{
+					WeaveTermEntry *e = weave_doc_lookup(rec.doc, terms[t], lens[t]);
+
+					if (e != NULL)
+						score += weave_bm25_contrib(&fac[t], (double) e->tf, qdl);
+				}
+				if (n >= cap)
+				{
+					/* relation-scale: every pending document can match */
+					cap = cap ? cap * 2 : 64;
+					res = (ScoredTid *) (res
+										 ? WEAVE_REALLOC_MAYBE_HUGE(res, (Size) cap * sizeof(ScoredTid))
+										 : WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(ScoredTid)));
+				}
+				res[n].tid = *rec.tid;
+				res[n].score = score;
+				n++;
+			}
+			UnlockReleaseBuffer(buffer);
+			blk = next;
+		}
+		if (pass == 0)
+			for (t = 0; t < nterms; t++)
+				if (gdfs[t] == 0)
+					gdfs[t] = pdf[t];
+	}
+	pfree(fac);
+	pfree(gdfs);
+	pfree(pdf);
+	*out = res;
+	return n;
+}
+
+/*
+ * The union of a segment top-k and the scored pending documents, truncated to
+ * the best wantk: exact, because any member of the union's top-k is either in
+ * the segments' own top-k or pending.  Consumes both inputs.
+ *
+ * DEDUPLICATED BY TID.  A flush writes the metapage twice -- the segment add,
+ * then the clear that moves pendinghead -- and bumps the generation at each; a
+ * pass that runs entirely between the two sees the folded documents both in
+ * the new segment and still on the list, and its generation check passes.
+ * A crash between the two records leaves the same state until the next flush
+ * (doc/GAPS.md G65).  Without this the ordering scan emitted such a row twice.
+ */
+static int
+cmp_scoredtid_tid(const void *a, const void *b)
+{
+	return ItemPointerCompare((ItemPointer) &((const ScoredTid *) a)->tid,
+							  (ItemPointer) &((const ScoredTid *) b)->tid);
+}
+
+static int
+weave_topk_merge_pending(ScoredTid *cand, int ncand, ScoredTid *pend, int npend,
+						 int wantk, ScoredTid **out)
+{
+	ScoredTid  *all;
+	int			nall;
+	int			i,
+				j;
+
+	if (npend == 0)
+	{
+		*out = cand;
+		return ncand;
+	}
+	nall = ncand + npend;
+	all = (ScoredTid *) WEAVE_ALLOC_MAYBE_HUGE((Size) nall * sizeof(ScoredTid));
+	if (ncand > 0)
+		memcpy(all, cand, (Size) ncand * sizeof(ScoredTid));
+	memcpy(all + ncand, pend, (Size) npend * sizeof(ScoredTid));
+	if (cand)
+		pfree(cand);
+	pfree(pend);
+
+	/* keep the best-scored copy of each TID */
+	qsort(all, nall, sizeof(ScoredTid), cmp_scoredtid_tid);
+	for (i = 0, j = 0; i < nall; i++)
+	{
+		if (j > 0 && ItemPointerEquals(&all[j - 1].tid, &all[i].tid))
+		{
+			if (all[i].score > all[j - 1].score)
+				all[j - 1].score = all[i].score;
+			continue;
+		}
+		all[j++] = all[i];
+	}
+	nall = j;
+
+	qsort(all, nall, sizeof(ScoredTid), cmp_scored_desc);
+	*out = all;
+	return Min(nall, Max(wantk, 1));
+}
+
+/*
  * weave_topk_candidates_guarded: weave_topk_candidates_range over the whole
  * corpus, bracketed against the A1 race.
  *
@@ -9561,17 +10100,22 @@ weave_topk_candidates_guarded(Relation index, WeaveQuery q, int wantk,
 	for (;;)
 	{
 		ScoredTid  *cand = NULL;
+		ScoredTid  *pend = NULL;
 		uint32		gen0 = weave_read_meta_generation(index);
 		int			ncand = weave_topk_candidates_range(index, q, wantk, 0,
 														UINT64_MAX, &cand);
+		/* G66: the pending list, ranked on the same scale, inside the bracket */
+		int			npend = weave_pending_ranked(index, q, &pend);
 
 		if (weave_read_meta_generation(index) == gen0)
 		{
-			*out = cand;
+			ncand = weave_topk_merge_pending(cand, ncand, pend, npend, wantk, out);
 			return ncand;
 		}
 		if (cand)
 			pfree(cand);
+		if (pend)
+			pfree(pend);
 		if (gen_retries >= pg_weave_scan_race_retries)
 			weave_scan_raced_out(index, "ranked", gen_retries + 1);
 		gen_retries++;

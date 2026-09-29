@@ -995,7 +995,11 @@ FROM generate_series(1, 2000) g;
 CREATE INDEX pr_w ON pr USING weave (body wdoc_lex_ops, price int8_docval_ops);
 ANALYZE pr;
 
--- G56a: a restriction `@@@` beside an ordering `<=>` over another query
+-- G56a: a restriction `@@@` beside an ordering `<=>` over another query.
+-- other_query_rows used to be 0 against heap_rows 1000: no 'alpha' row
+-- matches 'beta', and the ordering scan emitted only rows its ORDER BY query
+-- ranks.  Since the G56 padding phase it emits the rest of the table after the
+-- ranked rows, so the answer equals the heap's.
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 EXPLAIN (COSTS OFF)
