@@ -1224,6 +1224,92 @@ wvck_vector(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 }
 
 /*
+ * Text docvalues: every segment's dictionary is STRICTLY ascending under the
+ * column's collation (include/weave/docvals.h, store v3).  The pure validator
+ * cannot check this -- it has no collation-aware comparator -- so a dictionary
+ * that is internally consistent but out of order passes weave_docvals_load() and
+ * then gives WRONG answers, not errors: the ordinal-range resolution
+ * (weave_dv_dict_lower_bound / _upper_bound) is a binary search that assumes the
+ * order.  The two producers are the build/flush writer and the merge's union
+ * dictionary, so this is the invariant that says whether the merge
+ * re-dictionaried or carried input ordinals across bolts.
+ *
+ * Compared with weave_dv_varstr_cmp(), the one comparator the writer sorts with
+ * and the scan searches with; any other would verify a different order.  Behind
+ * `deep` because it reassembles every store.  A structurally corrupt store
+ * ERRORs from weave_docvals_load() (ERRCODE_INDEX_CORRUPTED), the same trust
+ * boundary every reader goes through.
+ */
+static void
+wvck_docvals(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
+{
+	uint32		s;
+	int64		nstores = 0;
+	int64		nentries = 0;
+	int			badseg = -1;
+	uint32		badord = 0;
+	StringInfoData d;
+
+	for (s = 0; s < meta->nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		const WeaveSegMeta *seg = &meta->segs[s];
+		AttrNumber	attno = 0;
+		BlockNumber root;
+		Form_pg_attribute att;
+		Oid			coll;
+		const void *img;
+		uint32		ndocs = 0;
+		uint32		ndict;
+		uint32		i;
+
+		CHECK_FOR_INTERRUPTS();
+		if (seg->dictstart == InvalidBlockNumber ||
+			seg->chandesc == InvalidBlockNumber)
+			continue;			/* consumed slot, or a bolt with no descriptor */
+		root = weave_docvals_root_for_segment(cx->index, seg, &attno);
+		if (root == InvalidBlockNumber || attno < 1 ||
+			attno > RelationGetDescr(cx->index)->natts)
+			continue;
+		att = TupleDescAttr(RelationGetDescr(cx->index), attno - 1);
+		if (weave_dv_type_for_oid(att->atttypid) != WEAVE_DV_T_TEXT)
+			continue;
+		coll = cx->index->rd_indcollation[attno - 1];
+
+		img = weave_docvals_load(cx->index, root, CurrentMemoryContext, &ndocs,
+								 WEAVE_DV_KIND_TEXT);
+		nstores++;
+		ndict = weave_docvals_ndict(img);
+		nentries += ndict;
+		for (i = 1; i < ndict && badseg < 0; i++)
+		{
+			uint32		alen;
+			uint32		blen;
+			const char *a = weave_docvals_dict_entry(img, i - 1, &alen);
+			const char *b = weave_docvals_dict_entry(img, i, &blen);
+
+			if (weave_dv_varstr_cmp(&coll, a, alen, b, blen) >= 0)
+			{
+				badseg = (int) s;
+				badord = i;
+			}
+		}
+		pfree((void *) img);
+		if (badseg >= 0)
+			break;				/* one offending pair is what the row can carry */
+	}
+
+	initStringInfo(&d);
+	if (badseg >= 0)
+		appendStringInfo(&d, "docvalues dictionary is not strictly ascending: segment %d, ordinals %u and %u (%lld store(s) checked)",
+						 badseg, badord - 1, badord, (long long) nstores);
+	else
+		appendStringInfo(&d, "%lld text store(s), %lld dictionary entries",
+						 (long long) nstores, (long long) nentries);
+	wvck_emit(cx, "docvals_dictionary_ascending", badseg < 0, d.data);
+	pfree(d.data);
+}
+
+/*
  * Bolt-directory invariants: every root block is in bounds and has the kind the
  * directory says it has.  This is the sect. 9 line "every segs[i] root block is
  * within relation bounds and has the expected kind", and walking the chains (not
@@ -1671,6 +1757,7 @@ weave_check(PG_FUNCTION_ARGS)
 		wvck_reachable(&cx, &meta);
 		pfree(cx.mark);
 		cx.mark = NULL;
+		wvck_docvals(&cx, &meta);
 	}
 
 	index_close(cx.index, AccessShareLock);

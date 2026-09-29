@@ -712,6 +712,15 @@ RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET plan_cache_mode;
 
+-- the dictionary-order invariant under the DATABASE DEFAULT collation (cat2,
+-- mixed case) and on a varchar column (cv): the deep check must compare with
+-- the column's collation, the one the writer sorted by, or it would report a
+-- linguistically sorted dictionary as out of order (or miss a real disorder)
+SELECT count(*) AS dvs_cat2_violations
+  FROM weave_check('dvs_cat2', true) WHERE NOT ok;
+SELECT count(*) AS dvs_cv_violations
+  FROM weave_check('dvs_cv', true) WHERE NOT ok;
+
 DROP TABLE dvs_res;
 DROP TABLE dvs;
 
@@ -1388,6 +1397,109 @@ INSERT INTO dvx_res
 SELECT 'multi', pred, dvx_bad(pred) FROM dvx_cases;
 SELECT count(*) AS violations FROM weave_check('dvx_w', true) WHERE NOT ok;
 
+-- MERGE (task 5).  DELETE rows from every bolt -- the build, the oversized
+-- bolt, both flushes -- then VACUUM (tombstones) and weave_merge(), which
+-- collapses the four bolts into one whose dictionary is the UNION of four.
+-- Every surviving string gets a NEW ordinal there, so a merge that carried an
+-- input's ordinal instead of its bytes answers against the wrong strings.
+-- POSITIVE CONTROL: the bolt count really drops to one, and the deep check's
+-- dictionary-order row names the one merged store and its entry count.
+DELETE FROM dvx WHERE id % 7 = 3 OR id IN (10002, 10007, 20012);
+VACUUM dvx;
+UPDATE dvx_nseg SET n = weave_index_nsegments('dvx_w');
+SELECT weave_merge('dvx_w') AS merged;
+SELECT (SELECT n FROM dvx_nseg) > 1 AS several_bolts_before_merge,
+       weave_index_nsegments('dvx_w') = 1 AS one_bolt_after_merge;
+INSERT INTO dvx_res
+SELECT 'merged', pred, dvx_bad(pred) FROM dvx_cases;
+SELECT count(*) AS violations FROM weave_check('dvx_w', true) WHERE NOT ok;
+SELECT detail FROM weave_check('dvx_w', true)
+ WHERE invariant = 'docvals_dictionary_ascending';
+
+SELECT phase, count(*) AS ncases, count(*) FILTER (WHERE bad <> 0) AS ndisagree
+  FROM dvx_res GROUP BY phase ORDER BY phase;
+SELECT phase, left(pred, 40) AS disagreeing_pred, bad
+  FROM dvx_res WHERE bad <> 0 ORDER BY phase, pred;
+DROP TABLE dvx;
+
+-- ---------------------------------------------------------------------------
+-- 16. the text merge under two SEGMENT SHAPES (AGENTS.md hard rule 16).  The
+-- merged dictionary depends on which strings live in which bolt, so the merge
+-- is exercised with the two extremes: every value in the inserted bolts NEW
+-- (interleaved between the build's values, so every build string's ordinal
+-- shifts in the union), and every value SHARED with the build (the same
+-- strings, held by each bolt as a different subset, so they sit at different
+-- ordinals in each input and at yet another in the union).  Both must agree
+-- with the heap for every strategy, on both routes, after the merge.
+-- ---------------------------------------------------------------------------
+TRUNCATE dvx_res;
+DELETE FROM dvx_cases;
+INSERT INTO dvx_cases
+SELECT format('cat %s %L', o.op, k.k)
+  FROM (VALUES ('<'), ('<='), ('='), ('>='), ('>')) o(op),
+       (VALUES (''), ('m00'), ('m03'), ('m03a'), ('m045'), ('m10'), ('m10b'),
+               ('m27'), ('m29b'), ('n'), ('~')) k(k);
+
+-- shape A: all-new values
+CREATE TABLE dvx (id int, body wdoc, cat text COLLATE "C")
+    WITH (autovacuum_enabled = off);
+INSERT INTO dvx
+SELECT g, to_wdoc('common doc ' || (g % 5)),
+       CASE WHEN g % 13 = 0 THEN NULL
+            ELSE 'm' || lpad((g % 30)::text, 2, '0') END
+FROM generate_series(1, 300) g;
+CREATE INDEX dvx_w ON dvx USING weave (body wdoc_lex_ops, cat text_docval_ops);
+INSERT INTO dvx
+SELECT 1000 + g, to_wdoc('zebra second'),
+       'm' || lpad((g % 30)::text, 2, '0') || 'a'
+FROM generate_series(1, 60) g;
+VACUUM dvx;
+INSERT INTO dvx
+SELECT 2000 + g, to_wdoc('zebra third'),
+       CASE WHEN g % 11 = 0 THEN NULL
+            ELSE 'm' || lpad((g % 30)::text, 2, '0') || 'b' END
+FROM generate_series(1, 60) g;
+VACUUM dvx;
+SELECT weave_index_nsegments('dvx_w') = 3 AS new_three_bolts;
+DELETE FROM dvx WHERE id % 7 = 3;
+VACUUM dvx;
+SELECT weave_merge('dvx_w') AS new_merged;
+SELECT weave_index_nsegments('dvx_w') = 1 AS new_one_bolt;
+INSERT INTO dvx_res
+SELECT 'shape_new', pred, dvx_bad(pred) FROM dvx_cases;
+SELECT count(*) AS new_violations FROM weave_check('dvx_w', true) WHERE NOT ok;
+DROP TABLE dvx;
+
+-- shape B: all-shared values
+CREATE TABLE dvx (id int, body wdoc, cat text COLLATE "C")
+    WITH (autovacuum_enabled = off);
+INSERT INTO dvx
+SELECT g, to_wdoc('common doc ' || (g % 5)),
+       CASE WHEN g % 13 = 0 THEN NULL
+            ELSE 'm' || lpad((g % 30)::text, 2, '0') END
+FROM generate_series(1, 300) g;
+CREATE INDEX dvx_w ON dvx USING weave (body wdoc_lex_ops, cat text_docval_ops);
+INSERT INTO dvx
+SELECT 1000 + g, to_wdoc('zebra second'),
+       'm' || lpad(((g % 10) * 3)::text, 2, '0')
+FROM generate_series(1, 60) g;
+VACUUM dvx;
+INSERT INTO dvx
+SELECT 2000 + g, to_wdoc('zebra third'),
+       CASE WHEN g % 11 = 0 THEN NULL
+            ELSE 'm' || lpad(((g % 15) * 2)::text, 2, '0') END
+FROM generate_series(1, 60) g;
+VACUUM dvx;
+SELECT weave_index_nsegments('dvx_w') = 3 AS shared_three_bolts;
+DELETE FROM dvx WHERE id % 7 = 3;
+VACUUM dvx;
+SELECT weave_merge('dvx_w') AS shared_merged;
+SELECT weave_index_nsegments('dvx_w') = 1 AS shared_one_bolt;
+INSERT INTO dvx_res
+SELECT 'shape_shared', pred, dvx_bad(pred) FROM dvx_cases;
+SELECT count(*) AS shared_violations FROM weave_check('dvx_w', true) WHERE NOT ok;
+DROP TABLE dvx;
+
 SELECT phase, count(*) AS ncases, count(*) FILTER (WHERE bad <> 0) AS ndisagree
   FROM dvx_res GROUP BY phase ORDER BY phase;
 SELECT phase, left(pred, 40) AS disagreeing_pred, bad
@@ -1395,7 +1507,6 @@ SELECT phase, left(pred, 40) AS disagreeing_pred, bad
 
 DROP FUNCTION dvx_bad(text);
 DROP TABLE dvx_res, dvx_cases, dvx_nseg;
-DROP TABLE dvx;
 
 -- The other pending readers on a text docvalues index: the cgram (`@~`) and
 -- edit-distance (`<@>`) walks decode the same pending items, and each must

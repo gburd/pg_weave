@@ -250,17 +250,27 @@ fills `rec.hasdv/dvslot/docval` (grep `dvslot =`), `src/am/amscan.c` pending loo
 - `weave_check` deep: for a v3 store, `varstr_cmp(D[i], D[i+1]) < 0` for all i under the
   column collation; report "docvalues dictionary is not strictly ascending" otherwise.
 
-- [ ] **Step 1: Failing regression:** produce ≥3 bolts with overlapping and disjoint value sets
+- [x] **Step 1: Failing regression:** produce ≥3 bolts with overlapping and disjoint value sets
   (build, then two INSERT+flush rounds with values chosen so the same string has different
   ordinals in different bolts), DELETE some rows, VACUUM so the merge runs (§9's idiom), assert
   `nsegments` dropped (merge actually ran — positive control) and index==heap for all 5 ops
   and the Review-Focus constants; `weave_check` deep clean.
-- [ ] **Step 2: Shape guard (hard rule 16).** The merged output depends on segment shape
+- [x] **Step 2: Shape guard (hard rule 16).** The merged output depends on segment shape
   (which strings live in which bolt). Run the §10 merge assertion for two shapes: all-new
   values in the inserted bolts vs. all-shared values — both must agree with heap.
-- [ ] **Step 3: Implement. Step 4: Gate** installcheck pg17+pg18; mutation: make merge copy the
+- [x] **Step 3: Implement. Step 4: Gate** installcheck pg17+pg18; mutation: make merge copy the
   input ordinal instead of the entry bytes → §10 must go red; revert.
-- [ ] **Step 5: Commit** `docvals: merge re-dictionaries text stores`.
+- [x] **Step 5: Commit** `docvals: merge re-dictionaries text stores`.
+
+> **Done 2026-09-29.** `wvck_docvals()` (src/am/amcheck.c) emits
+> `docvals_dictionary_ascending` under `weave_check(deep)`; `sql/docvals.sql` sect. 15 gained
+> the merged phase (4 bolts -> 1) and sect. 16 the two-shape guard (all-new / all-shared). The
+> mutation (merge feeds the input ordinal's 8 bytes instead of the entry) turned the merged phase
+> 13/45 red and the shapes 22/55 and 18/55 red; the positive control for the invariant (writer
+> sorts descending) made it report `f` on every text index in the file. Caveat: every text store
+> the invariant is exercised on in installcheck is effectively byte-ordered unless the test
+> database's default collation is linguistic, so a check that compared bytes instead of the
+> column collation would pass there too.
 
 ### Task 6: Fuzz the v3 dictionary region
 

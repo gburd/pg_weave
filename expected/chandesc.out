@@ -57,6 +57,7 @@ SELECT invariant, ok FROM weave_check('cd_weave', true) ORDER BY invariant;
  chandesc_reachable               | t
  chandesc_roots_agree             | t
  chandesc_version_consistent      | t
+ docvals_dictionary_ascending     | t
  metapage_version_recognized      | t
  nsegments_bound                  | t
  page_kinds_decodable             | t
@@ -68,7 +69,7 @@ SELECT invariant, ok FROM weave_check('cd_weave', true) ORDER BY invariant;
  vector_block_stats_match_codes   | t
  vector_coverage                  | t
  vector_warp_map_ascending        | t
-(16 rows)
+(17 rows)
 
 -- The only assertion that matters: nothing is violated.
 SELECT count(*) AS violations FROM weave_check('cd_weave', true) WHERE NOT ok;
