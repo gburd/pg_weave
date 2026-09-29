@@ -189,8 +189,25 @@ SGID=$(aws ec2 create-security-group --profile "$PROFILE" \
 	--vpc-id "$VPC" --query GroupId --output text) || die "create-security-group"
 # SSH from this host only.  Never 0.0.0.0/0: a benchmark box with an open port is
 # a liability, and the run is short enough that a single-IP rule is no burden.
+#
+# SSH_CIDR overrides the /32, for a workstation behind carrier-grade NAT whose
+# egress address changes from one connection to the next (hit 2026-09-29: two
+# probes seconds apart came back from 172.56.216.x and 172.56.219.x, so the
+# probed /32 admitted none of the SSH attempts and the run died "ssh never came
+# up" on an instance that had booted fine).  It must be given explicitly and is
+# refused if it is wider than a /16; authentication stays key-only either way.
+if [ -n "${SSH_CIDR:-}" ]; then
+	case "$SSH_CIDR" in
+		*/1[6-9]|*/2[0-9]|*/3[0-2]) : ;;
+		*) die "SSH_CIDR=$SSH_CIDR is wider than a /16 (or not a CIDR); refusing" ;;
+	esac
+	INGRESS=$SSH_CIDR
+else
+	INGRESS=$MYIP/32
+fi
+say "ssh ingress $INGRESS"
 aws ec2 authorize-security-group-ingress --profile "$PROFILE" --group-id "$SGID" \
-	--protocol tcp --port 22 --cidr "$MYIP/32" >/dev/null || die "authorize-ingress"
+	--protocol tcp --port 22 --cidr "$INGRESS" >/dev/null || die "authorize-ingress"
 
 # Ubuntu 24.04 LTS amd64, resolved from SSM so the AMI id is never hardcoded.
 AMI=$(aws ssm get-parameters --profile "$PROFILE" \
