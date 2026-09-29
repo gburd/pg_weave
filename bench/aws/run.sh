@@ -45,6 +45,9 @@
 #					  hnswbase   the pgvector HNSW baseline: bytes/vector,
 #							     recall@10 vs ef, warm+cold p50. SEPARATE HOST
 #							     from rerankcold -- one engine per host.
+#					  regressloop  smoke, then the full regression suite RLK (15)
+#							     clusters x RLITERS (12) times, three autovacuum
+#							     arms (doc/GAPS.md G60, bench/aws/regress_loop.sh)
 #					  fuse	   the fused-retrieval benchmark (doc/specs/FUSED_TOPK.md):
 #							     CPU-embeds each dataset with sentence-transformers
 #							     (bench/prepdata.py), then bench/fuse.sh over it.
@@ -1508,9 +1511,47 @@ run_docvals() {
 	$SSH 'psql -q -f /tmp/docvals_prize.sql 2>&1' | tee "$OUT/docvals_prize.log" || true
 }
 
+run_regressloop() {
+	# doc/GAPS.md G60: run the full regression suite RLK clusters x RLITERS times
+	# on one host (bench/aws/regress_loop.sh, which arrived with the git archive),
+	# three autovacuum arms, every failing run's evidence kept.  Pulled
+	# INCREMENTALLY every poll (AGENTS.md hard rule 14): an instance lost mid-run
+	# costs the instance, not the data.
+	local k=${RLK:-15} iters=${RLITERS:-12} deadline=$(( $(date +%s) + ${RLTIMEOUT:-14400} ))
+	local runs fails
+	say "regressloop: $k clusters x $iters full suites"
+	# the tuned main cluster holds 40% of RAM and is not used past smoke
+	$SSH "sudo pg_ctlcluster 17 main stop; sudo install -d -o \$(whoami) /scratch
+		setsid nohup bash pg_weave/bench/aws/regress_loop.sh $k $iters \
+			>/scratch/rl_driver.log 2>&1 < /dev/null & disown
+		sleep 30; cat /scratch/rl_driver.log" 2>&1 | tee "$OUT/regressloop_start.log"
+	grep -q "^cluster $k port" "$OUT/regressloop_start.log" \
+		|| { sleep 60; $SSH 'cat /scratch/rl_driver.log' > "$OUT/regressloop_start.log"; }
+	grep -q "^cluster $k port" "$OUT/regressloop_start.log" \
+		|| die "regressloop: clusters did not all come up (see $OUT/regressloop_start.log)"
+	while :; do
+		sleep 120
+		$SSH 'cd /scratch && tar -cf - rl rl_driver.log 2>/dev/null' \
+			| tar -xf - -C "$OUT" 2>/dev/null || say "  (pull failed; retrying next poll)"
+		runs=$(cat "$OUT"/rl/c*/summary.tsv 2>/dev/null | wc -l)
+		fails=$(cat "$OUT"/rl/c*/summary.tsv 2>/dev/null | awk -F'\t' '$4 != 0' | wc -l)
+		say "  $runs suites done, $fails red"
+		[ -e "$OUT/rl/ALLDONE" ] && break
+		[ "$(date +%s)" -lt "$deadline" ] || { say "regressloop: RLTIMEOUT reached"; break; }
+	done
+	cat "$OUT"/rl/c*/summary.tsv > "$OUT/regressloop_summary.tsv" 2>/dev/null
+	say "regressloop: per arm (runs, red, g60 value other than 0|6):"
+	awk -F'\t' '{ n[$2]++; if ($4 != 0) r[$2]++; if ($6 != "0|6") g[$2]++ }
+		END { for (a in n) printf "  %-5s runs=%d red=%d g60_bad=%d\n", a, n[a], r[a], g[a] }' \
+		"$OUT/regressloop_summary.tsv" | tee "$OUT/regressloop_arms.txt"
+}
+
 case "$JOB" in
 	smoke)   run_smoke ;;
 	bound)   run_bound ;;
+	# regressloop: a red smoke is the phenomenon this job hunts (G60), so it
+	# tolerates one by construction rather than by a flag the caller must pass.
+	regressloop) SMOKE_TOLERATE_RED=1 run_smoke; run_regressloop ;;
 	docvals) run_smoke; run_docvals ;;
 	lexical) run_smoke; run_lexical ;;
 	fuzzy)   run_smoke; run_fuzzy ;;
