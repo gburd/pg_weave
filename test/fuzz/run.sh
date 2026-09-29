@@ -48,6 +48,11 @@ $CC $CFLAGS -DFUZZ_NO_ARRAY_GUARD=1 "$here/fuzz_chandesc.c" -o "$out/fuzz_chande
 # ndocs is then accepted and the read-all-values postcondition overruns the
 # exact buffer.  MUST abort under ASan.
 $CC $CFLAGS -DPLANT_BUG=1 "$here/fuzz_docvals.c" -o "$out/fuzz_docvals_noguard"
+# the v3 (text) teeth: the validator's "every non-NULL ordinal is in [0, ndict)"
+# guard removed IN THE REAL HEADER (-DPLANT_BUG_DICT -> WEAVE_DV_PLANT_NO_ORD_GUARD).
+# An out-of-range ordinal is then accepted and the harness's independent ordinal
+# check aborts.  MUST abort.
+$CC $CFLAGS -DPLANT_BUG_DICT=1 "$here/fuzz_docvals.c" -o "$out/fuzz_docvals_noord"
 # planted-bug binaries for the Z3 surf trie.  Unlike the ones above these are
 # compile-time removals in the REAL validator (-DWEAVE_SURF_PLANT_*) rather than a
 # weakened transcription of it, because a transcribed copy drifts out of step with
@@ -148,6 +153,16 @@ if "$out/fuzz_docvals_noguard" >/dev/null 2>&1; then
     rc=1
 else
     echo "PASS: fuzz_docvals_noguard aborted as expected (image-length teeth)"
+fi
+
+# The docvals no-ordinal-guard build accepts a v3 store whose non-NULL ordinal
+# names no dictionary entry -- a wrong answer in weave_dv_eval_ord() and an
+# overread in any reader that looks the entry up (the merge re-dictionary).
+if "$out/fuzz_docvals_noord" >/dev/null 2>&1; then
+    echo "FAIL: fuzz_docvals_noord exited 0 -- harness did NOT catch the missing ordinal guard!"
+    rc=1
+else
+    echo "PASS: fuzz_docvals_noord aborted as expected (dictionary-ordinal teeth)"
 fi
 
 # The surf-trie no-size-guard build lets a corrupt count put a whole section past

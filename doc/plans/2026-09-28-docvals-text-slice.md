@@ -276,13 +276,18 @@ fills `rec.hasdv/dvslot/docval` (grep `dvslot =`), `src/am/amscan.c` pending loo
 
 **Files:** `test/fuzz/fuzz_docvals.c`.
 
-- [ ] Add v3 seed images (with/without null bitmap, `ndict` 0/1/many, empty entries) and
+- [x] Add v3 seed images (with/without null bitmap, `ndict` 0/1/many, empty entries) and
   mutations targeting `dict_off`, `ndict`, `offs[]`, and ordinals. After a successful validate,
   call every reader (`ndict`, `dict_entry` for all ords, both bounds with a memcmp comparator,
   `eval_ord` all ops) under ASan/UBSan. Planted bug (`-DPLANT_BUG_DICT`): drop the
   "ordinal < ndict" check → must abort. Coordinator runs the clean corpus locally with the
   project's standalone sanitizer build; `check-fuzz` relies on CI (local clang lacks libc
   headers). Commit `docvals: fuzz the v3 dictionary region`.
+
+> **Done 2026-09-29.** Sections 6-9 of `test/fuzz/fuzz_docvals.c`; the teeth are a compile-time
+> removal in the real validator (`WEAVE_DV_PLANT_NO_ORD_GUARD`), not a transcription, and
+> `test/fuzz/run.sh` builds and requires the abort (`fuzz_docvals_noord`). Local run under gcc
+> ASan+UBSan: 687,947 cases clean, both docvals teeth builds abort at their intended assertion.
 
 ### Task 7: TAP — crash recovery, torn write, concurrency, non-deterministic collation
 

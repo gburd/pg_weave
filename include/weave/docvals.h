@@ -452,8 +452,13 @@ weave_docvals_validate(const void *img, size_t len)
 				((base[h.null_off + (size_t) (i >> 3)] >> (i & 7u)) & 1))
 				continue;
 			memcpy(&v, base + h.values_off + (size_t) i * 8u, sizeof(v));
+#ifndef WEAVE_DV_PLANT_NO_ORD_GUARD
 			if (v < 0 || (uint64) v >= (uint64) ndict)
 				return "dictionary ordinal out of range";
+#else
+			/* test/fuzz/run.sh teeth build only: the guard above removed */
+			(void) v;
+#endif
 		}
 	}
 

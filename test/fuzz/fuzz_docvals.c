@@ -46,6 +46,23 @@
  * proving the harness detects the bug class instead of passing vacuously.  See
  * run.sh.
  *
+ * v3 (TEXT) STORES, sections 6-9.  A v3 store adds a dictionary region --
+ * dict_off, ndict, offs[ndict + 1], the entry blob -- and per-doc values that
+ * are ORDINALS into it.  Every one of those comes off disk.  Sections 6-9 build
+ * well-formed v3 images (with/without a null bitmap; ndict 0, 1, many, and many
+ * with '' as an entry), truncate them to every length, apply targeted mutations
+ * to dict_off / ndict / offs[] / the ordinals, and smash them at random; every
+ * accepted image is handed to verify_accepted_text(), which re-derives the
+ * region bounds independently and then drives EVERY reader (ndict, dict_entry
+ * for every ordinal and every byte, both boundary searches under a memcmp
+ * comparator -- exact against a linear recount when the dictionary is known
+ * sorted -- and weave_dv_eval_ord for all five strategies).
+ *
+ * TEETH (PLANT_BUG_DICT=1): removes the "every non-NULL ordinal is in
+ * [0, ndict)" guard from the REAL validator (WEAVE_DV_PLANT_NO_ORD_GUARD in
+ * include/weave/docvals.h), so an out-of-range ordinal is accepted; the
+ * harness's own ordinal check must abort.
+ *
  * No hegel/cmocka: deterministic PRNG loop, fixed seed, reproducible, zero deps.
  */
 #include <assert.h>
@@ -54,6 +71,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef PLANT_BUG_DICT
+/* The v3 teeth: remove the "every non-NULL ordinal is in [0, ndict)" guard from
+ * the REAL validator (a compile-time removal in include/weave/docvals.h, the
+ * surftrie/pagebound pattern -- a weakened transcription would drift).  An
+ * out-of-range ordinal is then accepted, and verify_accepted_text()'s own
+ * ordinal check aborts; without that check, the reader's dict_entry() lookup
+ * reads past the dictionary. */
+#define WEAVE_DV_PLANT_NO_ORD_GUARD 1
+#endif
 #define WEAVE_DOCVALS_TEST_HELPERS	/* weave_docvals_build / _store_len */
 #include "weave/docvals.h"
 
@@ -175,6 +201,288 @@ weak_validate(const void *img, size_t len)
 #define VALIDATE(img, len)	weave_docvals_validate((img), (len))
 #endif
 
+/* ---------------------------------------------------------------------------
+ * v3 (text) stores: the dictionary region.
+ * ---------------------------------------------------------------------------
+ */
+static void verify_accepted(const unsigned char *img, size_t len);
+
+/* memcmp order, the comparator the property tests use in place of varstr_cmp
+ * (include/weave/docvals.h WeaveDvCmp). */
+static int
+memcmp_cmp(void *ctx, const void *a, uint32_t alen, const void *b, uint32_t blen)
+{
+	uint32_t	m = alen < blen ? alen : blen;
+	int			r = m ? memcmp(a, b, m) : 0;
+
+	(void) ctx;
+	if (r != 0)
+		return r;
+	return (alen > blen) - (alen < blen);
+}
+
+/*
+ * Independently re-verify an accepted v3 image, then drive EVERY reader over
+ * it: ndict, dict_entry for every ordinal (touching every byte), both boundary
+ * searches for keys drawn from the dictionary and between its entries, and
+ * weave_dv_eval_ord for all five strategies.  Each of those indexes the image
+ * with a field that came off disk; under ASan an image the validator should
+ * have refused turns into an overread here.
+ *
+ * `sorted` says the dictionary is KNOWN strictly ascending under memcmp (a
+ * well-formed image this harness built): then the binary searches must equal a
+ * linear count exactly.  A mutated image the validator accepted need not be
+ * sorted -- order under the collation is weave_check(deep)'s invariant, not the
+ * pure validator's -- so for those only the range of lo/hi is asserted.
+ */
+static void
+verify_accepted_text(const unsigned char *img, size_t len, int sorted)
+{
+	WeaveDocvalsHeader h;
+	uint64_t	docids_end;
+	uint64_t	region_end;
+	uint64_t	offs_base;
+	uint32_t	ndict;
+	uint32_t	i;
+	uint32_t	sum = 0;
+	uint64_t   *out;
+	int			op;
+	int			k;
+
+	memcpy(&h, img, sizeof(h));
+	assert(h.magic == WEAVE_DOCVALS_MAGIC);
+	assert(h.version == 3);
+	assert(h.typid_kind == WEAVE_DV_KIND_TEXT);
+	assert(h.values_off == (uint32) WEAVE_DV_MAXALIGN(sizeof(WeaveDocvalsHeader)));
+	docids_end = (uint64_t) h.docids_off + (uint64_t) h.ndocs * 8u;
+	assert((uint64_t) len >= docids_end);
+	region_end = docids_end;
+	if (h.null_off != 0)
+	{
+		region_end = (uint64_t) h.null_off + ((uint64_t) h.ndocs + 7u) / 8u;
+		assert((uint64_t) len >= region_end);
+	}
+	assert((uint64_t) h.dict_off == WEAVE_DV_MAXALIGN(region_end));
+	offs_base = (uint64_t) h.dict_off + 4u;
+	assert((uint64_t) len >= offs_base);
+
+	ndict = weave_docvals_ndict(img);
+	assert((uint64_t) len >= offs_base + ((uint64_t) ndict + 1u) * 4u);
+
+	/* every entry, every byte: the blob bound is what dict_entry trusts */
+	for (i = 0; i < ndict; i++)
+	{
+		uint32_t	elen;
+		const unsigned char *e = weave_docvals_dict_entry(img, i, &elen);
+		uint32_t	j;
+
+		assert(e >= img && (uint64_t) (e - img) + elen <= (uint64_t) len);
+		for (j = 0; j < elen; j++)
+			sum += e[j];
+	}
+
+	/* every non-NULL ordinal names an entry that exists -- the claim the
+	 * PLANT_BUG_DICT build breaks; checked HERE, independently, before any
+	 * reader is handed the ordinal */
+	for (i = 0; i < h.ndocs; i++)
+	{
+		int64_t		o;
+		uint32_t	elen;
+
+		(void) weave_docvals_docid(img, i);
+		if (weave_docvals_isnull(img, i))
+			continue;
+		o = weave_docvals_int8(img, i);
+		assert(o >= 0 && (uint64_t) o < (uint64_t) ndict);
+		(void) weave_docvals_dict_entry(img, (uint32_t) o, &elen);
+	}
+
+	/* boundary searches: every entry as a key, plus keys between/around them */
+	for (k = 0; k < (int) ndict + 3 && k < 48; k++)
+	{
+		unsigned char kbuf[16];
+		const unsigned char *key;
+		uint32_t	klen;
+		uint32_t	lo;
+		uint32_t	hi;
+
+		if (k < (int) ndict)
+		{
+			uint32_t	ord = (uint32_t) ((uint64_t) k * ndict / (ndict < 45 ? ndict : 45));
+
+			if (ord >= ndict)
+				ord = ndict - 1;
+			key = weave_docvals_dict_entry(img, ord, &klen);
+			if (klen > 0 && (k & 1) && klen <= sizeof(kbuf) - 1)
+			{
+				/* just past an entry: the entry's bytes with a 0x00 appended */
+				memcpy(kbuf, key, klen);
+				kbuf[klen] = 0;
+				key = kbuf;
+				klen++;
+			}
+		}
+		else
+		{
+			klen = (uint32_t) (rnd() % 5u);
+			for (i = 0; i < klen; i++)
+				kbuf[i] = (unsigned char) rnd();
+			key = kbuf;
+		}
+		lo = weave_dv_dict_lower_bound(img, key, klen, memcmp_cmp, NULL);
+		hi = weave_dv_dict_upper_bound(img, key, klen, memcmp_cmp, NULL);
+		assert(lo <= ndict && hi <= ndict);
+		if (sorted)
+		{
+			uint32_t	blo = 0;
+			uint32_t	bhi = 0;
+
+			for (i = 0; i < ndict; i++)
+			{
+				uint32_t	elen;
+				const unsigned char *e = weave_docvals_dict_entry(img, i, &elen);
+				int			c = memcmp_cmp(NULL, e, elen, key, klen);
+
+				blo += (c < 0);
+				bhi += (c <= 0);
+			}
+			assert(lo == blo && hi == bhi);
+			assert(hi - lo <= 1u);
+		}
+
+		out = (uint64_t *) malloc(((size_t) h.ndocs + 1u) * sizeof(uint64_t));
+		for (op = WEAVE_DV_LT; op <= WEAVE_DV_GT; op++)
+		{
+			int			cnt = weave_dv_eval_ord(img, (WeaveDvStrat) op, lo,
+												 lo <= hi ? hi : lo, out,
+												 h.ndocs);
+			int			c;
+
+			assert(cnt >= 0 && (uint32_t) cnt <= h.ndocs);
+			for (c = 1; c < cnt; c++)
+				assert(out[c] > out[c - 1]);
+		}
+		free(out);
+	}
+	(void) sum;
+}
+
+/*
+ * Build a well-formed v3 image into a fresh exact-size buffer.  dshape picks
+ * the dictionary: 0 = empty (every doc NULL), 1 = one entry, 2 = many, 3 = many
+ * with the empty string as entry 0.  Entries are strictly ascending under
+ * memcmp by construction: entry i (i >= the empty one) starts with the two
+ * big-endian bytes of i, then a random tail of 0..6 bytes.
+ */
+static unsigned char *
+build_text(uint32_t n, int has_nulls, int dshape, size_t *lenp)
+{
+	uint32_t	ndict;
+	uint32_t   *offs;
+	unsigned char *blob;
+	size_t		bloblen = 0;
+	int64_t    *ords = (int64_t *) malloc((n ? n : 1) * sizeof(int64_t));
+	uint64_t   *docids = (uint64_t *) malloc((n ? n : 1) * sizeof(uint64_t));
+	uint8_t    *nullbits = (uint8_t *) malloc(n ? n : 1);
+	unsigned char *img;
+	uint32_t	i;
+	uint32_t	first = 0;
+
+	switch (dshape)
+	{
+		case 0:
+			ndict = 0;
+			break;
+		case 1:
+			ndict = 1;
+			break;
+		default:
+			ndict = 2u + rnd() % 200u;
+			break;
+	}
+	offs = (uint32_t *) malloc(((size_t) ndict + 1u) * sizeof(uint32_t));
+	blob = (unsigned char *) malloc((size_t) ndict * 8u + 1u);
+	offs[0] = 0;
+	if (dshape == 3)
+	{
+		offs[1] = 0;			/* entry 0 is '' */
+		first = 1;
+	}
+	for (i = first; i < ndict; i++)
+	{
+		uint32_t	tail = rnd() % 7u;
+		uint32_t	t;
+
+		blob[bloblen++] = (unsigned char) (i >> 8);
+		blob[bloblen++] = (unsigned char) i;
+		for (t = 0; t < tail && bloblen < (size_t) ndict * 8u; t++)
+			blob[bloblen++] = (unsigned char) rnd();
+		offs[i + 1] = (uint32_t) bloblen;
+	}
+
+	fill_docids(docids, n);
+	for (i = 0; i < n; i++)
+	{
+		/* an empty dictionary admits only NULL docs */
+		nullbits[i] = (ndict == 0) ? 1 : (has_nulls ? (uint8_t) ((rnd() % 5u) == 0) : 0);
+		ords[i] = ndict ? (int64_t) (rnd() % ndict) : (int64_t) rnd();
+	}
+	if (ndict == 0)
+		has_nulls = 1;
+	*lenp = weave_docvals_store_len_text(n, has_nulls, ndict, bloblen);
+	img = (unsigned char *) malloc(*lenp ? *lenp : 1);
+	weave_docvals_build_text(img, ords, docids, has_nulls ? nullbits : NULL, n,
+							 offs, ndict, blob);
+	free(offs);
+	free(blob);
+	free(ords);
+	free(docids);
+	free(nullbits);
+	return img;
+}
+
+/* offset of the dictionary's ndict word / offs[] / blob in a built image */
+static void
+text_regions(const unsigned char *img, uint64_t *dictoff, uint64_t *offsbase,
+			 uint64_t *blobbase, uint32_t *ndict)
+{
+	WeaveDocvalsHeader h;
+
+	memcpy(&h, img, sizeof(h));
+	*dictoff = h.dict_off;
+	memcpy(ndict, img + h.dict_off, sizeof(*ndict));
+	*offsbase = (uint64_t) h.dict_off + 4u;
+	*blobbase = *offsbase + ((uint64_t) *ndict + 1u) * 4u;
+}
+
+/* validate a copy of img[0..len) in an EXACT-size buffer; verify on accept */
+static int
+check_copy(const unsigned char *img, size_t len, int sorted,
+		   unsigned long *accepted, unsigned long *rejected)
+{
+	unsigned char *exact = (unsigned char *) malloc(len ? len : 1);
+	const char *why;
+
+	memcpy(exact, img, len);
+	why = VALIDATE(exact, len);
+	if (why == NULL)
+	{
+		WeaveDocvalsHeader h;
+
+		/* a smash can rewrite the version too, so dispatch on what is there */
+		memcpy(&h, exact, sizeof(h));
+		if (h.version == 3)
+			verify_accepted_text(exact, len, sorted);
+		else
+			verify_accepted(exact, len);
+		(*accepted)++;
+	}
+	else
+		(*rejected)++;
+	free(exact);
+	return why == NULL;
+}
+
 /*
  * Independently re-verify what acceptance CLAIMS, WITHOUT reusing the validator:
  * every header field is in its accepted domain, the image is long enough for its
@@ -195,6 +503,11 @@ verify_accepted(const unsigned char *img, size_t len)
 
 	assert(len >= sizeof(WeaveDocvalsHeader));
 	memcpy(&h, img, sizeof(h));
+	if (h.version == 3)
+	{
+		verify_accepted_text(img, len, 0);
+		return;
+	}
 	assert(h.magic == WEAVE_DOCVALS_MAGIC);
 	assert(h.version == 1 || h.version == 2);
 	assert(h.typid_kind == 1);
@@ -647,6 +960,220 @@ main(void)
 		free(vals);
 		free(docids);
 		free(nullbits);
+	}
+
+	/* 6. every well-formed v3 (text) store is accepted and every reader over it
+	 * agrees with a linear recount: n from 0, with and without a null bitmap,
+	 * ndict 0 / 1 / many / many-with-'' (empty entries are real entries). */
+	for (trial = 0; trial < 1200; trial++)
+	{
+		uint32_t	n = (uint32_t) (trial % 150);
+		int			dshape = (trial / 2) % 4;
+		size_t		len;
+		unsigned char *img = build_text(n, trial & 1, dshape, &len);
+		const char *why = VALIDATE(img, len);
+
+#ifndef PLANT_BUG
+		if (why != NULL)
+		{
+			fprintf(stderr, "well-formed v3 image (n=%u, dict shape %d) rejected: %s\n",
+					n, dshape, why);
+			free(img);
+			return 1;
+		}
+		verify_accepted_text(img, len, 1);
+		accepted++;
+#else
+		(void) why;
+#endif
+		free(img);
+		iters++;
+	}
+
+	/* 7. a well-formed v3 store truncated to every length: the dictionary blob
+	 * ends the image, so EVERY proper prefix must be refused, and none may be
+	 * read past (each cut is handed over in an exact-size buffer). */
+	for (trial = 0; trial < 96; trial++)
+	{
+		uint32_t	n = (uint32_t) (trial % 24);
+		size_t		len;
+		unsigned char *img = build_text(n, trial & 1, (trial / 2) % 4, &len);
+		size_t		cut;
+
+		for (cut = 0; cut < len; cut++)
+		{
+			int			ok = check_copy(img, cut, 1, &accepted, &rejected);
+
+#ifndef PLANT_BUG
+			assert(!ok);
+#else
+			(void) ok;
+#endif
+			iters++;
+		}
+		free(img);
+	}
+
+	/* 8. targeted mutations of the dictionary region on a valid base: dict_off,
+	 * ndict, offs[], and the per-doc ordinals.  Every variant below is a
+	 * store no writer produces and must be REFUSED; the ordinal variants are the
+	 * PLANT_BUG_DICT teeth (accepted there, and verify_accepted_text aborts). */
+	for (trial = 0; trial < 256; trial++)
+	{
+		uint32_t	n = 1u + (uint32_t) (trial % 64);
+		size_t		len;
+		unsigned char *base = build_text(n, trial & 1, 2 + (trial / 2) % 2, &len);
+		unsigned char *m = (unsigned char *) malloc(len);
+		WeaveDocvalsHeader h;
+		uint64_t	dictoff;
+		uint64_t	offsbase;
+		uint64_t	blobbase;
+		uint32_t	ndict;
+		uint32_t	u;
+		uint32_t	v;
+		uint32_t	j;
+		int64_t		o;
+		int			variant;
+
+#ifndef PLANT_BUG
+		assert(VALIDATE(base, len) == NULL);
+#endif
+		text_regions(base, &dictoff, &offsbase, &blobbase, &ndict);
+		assert(ndict >= 2);
+
+		for (variant = 0; variant < 12; variant++)
+		{
+			int			ordvariant = 0;
+			int			ok;
+
+			memcpy(m, base, len);
+			memcpy(&h, m, sizeof(h));
+			switch (variant)
+			{
+				case 0:		/* dict_off one slot late */
+					h.dict_off += 8u;
+					break;
+				case 1:		/* dict_off one slot early (into the docids/bitmap) */
+					h.dict_off -= 8u;
+					break;
+				case 2:		/* dict_off misaligned */
+					h.dict_off += 1u;
+					break;
+				case 3:		/* v3 with no dictionary */
+					h.dict_off = 0;
+					break;
+				case 4:		/* dict_off far past the image */
+					h.dict_off = 0xFFFFFFF0u;
+					break;
+				case 5:		/* ndict huge: ndict + 1 must not wrap to 0 */
+					u = 0xFFFFFFFFu;
+					memcpy(m + dictoff, &u, 4);
+					break;
+				case 6:		/* offs[0] != 0 */
+					u = 1;
+					memcpy(m + offsbase, &u, 4);
+					break;
+				case 7:		/* a decreasing pair: offs[j] < offs[j-1] */
+					j = 2u + rnd() % (ndict - 1u);
+					memcpy(&u, m + offsbase + (size_t) (j - 1u) * 4u, 4);
+					memcpy(&v, m + offsbase + (size_t) j * 4u, 4);
+					if (u == 0)
+					{
+						/* make offs[j-1] positive first, then undercut it */
+						u = v + 1u;
+						memcpy(m + offsbase + (size_t) (j - 1u) * 4u, &u, 4);
+					}
+					else
+					{
+						v = u - 1u;
+						memcpy(m + offsbase + (size_t) j * 4u, &v, 4);
+					}
+					break;
+				case 8:		/* the blob claims one byte more than is there */
+					memcpy(&u, m + offsbase + (size_t) ndict * 4u, 4);
+					u += 1u;
+					memcpy(m + offsbase + (size_t) ndict * 4u, &u, 4);
+					break;
+				case 9:		/* ordinal == ndict on a non-NULL doc */
+				case 10:	/* ordinal == -1 */
+				case 11:	/* ndict == 0 while a non-NULL doc exists */
+					ordvariant = 1;
+					for (j = 0; j < n; j++)
+						if (!weave_docvals_isnull(base, j))
+							break;
+					if (j == n)
+					{
+						ordvariant = -1;	/* every doc NULL: nothing to aim at */
+						break;
+					}
+					if (variant == 11)
+					{
+						/* shrink to ndict 0 with an intact (empty) offs/blob:
+						 * offs[0] = 0 is already in place, and the image is
+						 * cut to exactly the region an empty dictionary spans */
+						u = 0;
+						memcpy(m + dictoff, &u, 4);
+						break;
+					}
+					o = (variant == 9) ? (int64_t) ndict : -1;
+					memcpy(m + h.values_off + (size_t) j * 8u, &o, 8);
+					break;
+			}
+			if (ordvariant < 0)
+				continue;
+			if (variant <= 4)
+				memcpy(m, &h, sizeof(h));
+			ok = check_copy(m, variant == 11 ? (size_t) offsbase + 4u : len, 0,
+							&accepted, &rejected);
+#ifdef PLANT_BUG_DICT
+			if (!ordvariant)
+				assert(!ok);
+#elif !defined(PLANT_BUG)
+			if (ok)
+			{
+				fprintf(stderr, "v3 mutation %d (n=%u) was ACCEPTED\n", variant, n);
+				return 1;
+			}
+#else
+			(void) ok;
+#endif
+			iters++;
+		}
+		free(m);
+		free(base);
+	}
+
+	/* 9. random smashes of v3 images, half of them aimed at the dictionary
+	 * region, plus a torn length; whatever is accepted must be readable by
+	 * every reader without leaving the buffer */
+	for (trial = 0; trial < 150000; trial++)
+	{
+		uint32_t	n = rnd() % 130u;
+		size_t		len;
+		unsigned char *img = build_text(n, (int) (rnd() & 1u), (int) (rnd() % 4u), &len);
+		int			nsmash = 1 + (int) (rnd() % 6);
+		uint64_t	dictoff;
+		uint64_t	offsbase;
+		uint64_t	blobbase;
+		uint32_t	ndict;
+		size_t		avail;
+		int			k;
+
+		text_regions(img, &dictoff, &offsbase, &blobbase, &ndict);
+		for (k = 0; k < nsmash; k++)
+		{
+			size_t		at;
+
+			if ((rnd() & 1u) && len > dictoff)
+				at = (size_t) dictoff + rnd() % (len - (size_t) dictoff);
+			else
+				at = rnd() % len;
+			img[at] = (unsigned char) rnd();
+		}
+		avail = (rnd() % 4 == 0) ? (rnd() % (len + 1)) : len;
+		(void) check_copy(img, avail, 0, &accepted, &rejected);
+		free(img);
+		iters++;
 	}
 
 	printf("fuzz_docvals: %lu cases, %lu accepted, %lu rejected -- no overread, no UB\n",
