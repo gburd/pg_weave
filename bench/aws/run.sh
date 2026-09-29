@@ -177,6 +177,9 @@ aws ec2 create-key-pair --profile "$PROFILE" --key-name "$KEYNAME" \
 chmod 600 "$KEYFILE"
 
 MYIP=$(curl -s --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')
+# checkip.amazonaws.com has timed out from this workstation's network while other
+# services answered (2026-09-29); a second, independent service is the fallback.
+[ -n "$MYIP" ] || MYIP=$(curl -s --max-time 10 https://api.ipify.org | tr -d '[:space:]')
 [ -n "$MYIP" ] || die "could not determine this host's public IP"
 
 VPC=$(aws ec2 describe-vpcs --profile "$PROFILE" --filters Name=isDefault,Values=true \
