@@ -245,11 +245,24 @@ sub phase2
     $sql =~ s/interval '60 seconds'/interval '30 seconds'/;
     $sql =~ s/NOT \(errs >= 3 AND ok >= 3\)/NOT (errs >= 3 AND ok >= 3) AND ok < 400/;
     $node->safe_psql('postgres', 'TRUNCATE race_result');
+
+    # Tombstones BEFORE the reader starts.  The reader's DO block is one
+    # transaction, so its snapshot can hold back the horizon for its whole
+    # run, and on a fast host (CI's pg18 leg, 2026-09-29) the retries = 0
+    # reader finished inside the writer's first round: no VACUUM in the phase
+    # removed anything and the in-phase maximum read 0.  Deleting and
+    # vacuuming here, with nothing else running, makes the precondition
+    # deterministic; the writer below keeps adding more.
+    $node->safe_psql('postgres', qq{
+        DELETE FROM docs WHERE body LIKE 'hay %' AND id % 13 = $retries % 13});
+    $node->safe_psql('postgres', 'VACUUM docs');
+    my $maxdel = $node->safe_psql('postgres',
+        q{SELECT ndeleted FROM weave_index_stats('docs_w')});
+
     my ($in, $out, $err) = ('', '', '');
     my $h = start(['psql', '-X', '-v', 'ON_ERROR_STOP=1', '-d', $conn, '-c', $sql],
                   '<', \$in, '>', \$out, '2>', \$err);
     my $b = 0;
-    my $maxdel = 0;
     while ($h->pumpable)
     {
         $h->pump_nb;
