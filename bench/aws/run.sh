@@ -1547,8 +1547,17 @@ run_regressloop() {
 		sleep 30; cat /scratch/rl_driver.log" 2>&1 | tee "$OUT/regressloop_start.log"
 	grep -q "^cluster $k port" "$OUT/regressloop_start.log" \
 		|| { sleep 60; $SSH 'cat /scratch/rl_driver.log' > "$OUT/regressloop_start.log"; }
-	grep -q "^cluster $k port" "$OUT/regressloop_start.log" \
-		|| die "regressloop: clusters did not all come up (see $OUT/regressloop_start.log)"
+	if ! grep -q "^cluster $k port" "$OUT/regressloop_start.log"; then
+		# RLKEEP=1 leaves the host up to diagnose a launch that printed nothing
+		# (2026-09-29: an empty driver log twice, cause not visible from here).
+		if [ "${RLKEEP:-0}" = 1 ]; then
+			say "RLKEEP=1: NOT terminating.  ssh with: $SSH"
+			say "instance $IID stays up -- terminate it yourself when done."
+			trap - EXIT
+			exit 1
+		fi
+		die "regressloop: clusters did not all come up (see $OUT/regressloop_start.log)"
+	fi
 	while :; do
 		sleep 120
 		$SSH 'cd /scratch && tar -cf - rl rl_driver.log 2>/dev/null' \
