@@ -65,6 +65,28 @@ BEGIN
 END;
 $fn$;
 
+-- weave_check(deep) must report zero violations, incl. the v3 text invariant
+-- docvals_dictionary_ascending, or RAISE.  Also RAISEs if that invariant is
+-- absent from the report: a deep check that did not examine the dictionary is
+-- not evidence the dictionary is sound.
+CREATE OR REPLACE FUNCTION dvs_assert_deep(idx text) RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    nbad bigint;
+    ndict bigint;
+BEGIN
+    SELECT count(*) FILTER (WHERE NOT ok),
+           count(*) FILTER (WHERE invariant = 'docvals_dictionary_ascending')
+      INTO nbad, ndict
+      FROM weave_check(idx::regclass, true);
+    RAISE NOTICE 'DEEP  idx=%  violations=%  dict_checks=%', idx, nbad, ndict;
+    IF nbad <> 0 OR ndict = 0 THEN
+        RAISE EXCEPTION 'DOCVALS DEEP CHECK FAILED AT SCALE: idx=% violations=% dict_checks=%',
+            idx, nbad, ndict;
+    END IF;
+END;
+$fn$;
+
 -- ===========================================================================
 -- PHASE 1 -- BUILD.  10M rows force the build over the 32MB flush budget into
 -- many segments and then a MERGE, which is exactly the G51 path (a merge must
@@ -86,9 +108,20 @@ CREATE TABLE dvs AS
          -- oracle excludes it -- disagreements=0 on nprice proves the v2 null
          -- bitmap excludes it too, at 10M, through build/insert/vacuum/merge.
          CASE WHEN (((hashint8(id) % 10) + 10) % 10) = 0 THEN NULL
-              ELSE (((hashint8(id) % 1000) + 1000) % 1000)::bigint END AS nprice
+              ELSE (((hashint8(id) % 1000) + 1000) % 1000)::bigint END AS nprice,
+         -- TEXT facet (docvals v3 dictionary), COLLATE "C", on an INDEPENDENT hash
+         -- (id+17) so it is not correlated with price/nprice.  Shape: ~5% NULL,
+         -- ~1% empty string, else 'catNNN' or 'catNNNx' -- 1000 distinct values
+         -- where every 'catNNNx' shares its whole prefix with 'catNNN', the
+         -- dictionary-order edge a byte-length or prefix bug gets wrong.
+         (CASE WHEN r2 < 100 THEN NULL
+               WHEN r2 < 120 THEN ''
+               ELSE 'cat' || lpad((r2 % 500)::text, 3, '0')
+                    || CASE WHEN r2 % 3 = 0 THEN 'x' ELSE '' END
+          END) COLLATE "C" AS tcat
     FROM (SELECT i AS id,
-                 'common doc ' || (i % 5) || ' t' || (i % 100000) || ' freq' || (i % 100) AS body
+                 'common doc ' || (i % 5) || ' t' || (i % 100000) || ' freq' || (i % 100) AS body,
+                 (((hashint8(i + 17) % 2000) + 2000) % 2000)::int AS r2
             FROM generate_series(1, 10000000) i) s;
 
 -- shape assertions BEFORE spending a build: the facet must be scattered (many
@@ -96,7 +129,10 @@ CREATE TABLE dvs AS
 -- pct_null confirms the nullable facet actually carries NULLs (~10%).
 SELECT count(*) AS nrows, count(DISTINCT price) AS distinct_price,
        round(100.0 * count(*) FILTER (WHERE price < 100) / count(*), 2) AS pct_lt100,
-       round(100.0 * count(*) FILTER (WHERE nprice IS NULL) / count(*), 2) AS pct_null
+       round(100.0 * count(*) FILTER (WHERE nprice IS NULL) / count(*), 2) AS pct_null,
+       count(DISTINCT tcat) AS distinct_tcat,
+       round(100.0 * count(*) FILTER (WHERE tcat IS NULL) / count(*), 2) AS pct_tcat_null,
+       round(100.0 * count(*) FILTER (WHERE tcat = '') / count(*), 2) AS pct_tcat_empty
   FROM dvs;
 
 -- NO vector column here: the 10M vector-weft build/merge is the bottleneck
@@ -113,12 +149,16 @@ CREATE INDEX dvs_f8 ON dvs USING weave (d, fprice float8_docval_ops);
 -- NULLs from a comparison gate through a real 10M build/merge/delete/pending
 -- (its own index because the layout resolves ONE docvals weft per index).
 CREATE INDEX dvs_np ON dvs USING weave (d, nprice int8_docval_ops);
+-- a TEXT facet (v3 sorted dictionary + ordinals): proves the dictionary merge
+-- (union + ordinal remap) and pending-buffer text compare hold at 10M.
+CREATE INDEX dvs_t ON dvs USING weave (d, tcat text_docval_ops);
 ANALYZE dvs;
 SELECT weave_index_nsegments('dvs_w') AS nsegments_after_build;
 
 -- one EXPLAIN to the log: the docvals qual must be an Index Cond, not a Filter.
 SET enable_seqscan = off; SET enable_bitmapscan = off;
 EXPLAIN (COSTS OFF) SELECT id FROM dvs WHERE price < 100;
+EXPLAIN (COSTS OFF) SELECT id FROM dvs WHERE tcat < 'cat050';
 RESET enable_seqscan; RESET enable_bitmapscan;
 
 \echo ==== PHASE 2: gate == heap after build (G51: merge carried the weft) ====
@@ -133,6 +173,14 @@ SELECT dvs_assert_agree($p$fprice < 4.5::float4$p$);            -- float8 cross-
 SELECT dvs_assert_agree('nprice < 100');                        -- NULLABLE facet, NULLs excluded
 SELECT dvs_assert_agree('nprice IS NOT NULL AND nprice < 100'); -- same set (redundant IS NOT NULL)
 SELECT dvs_assert_agree('nprice >= 990');                       -- nullable high end
+SELECT dvs_assert_agree($p$tcat < 'cat050'$p$);                -- TEXT ~10%, includes ''
+SELECT dvs_assert_agree($p$tcat = 'cat123'$p$);                 -- TEXT point, prefix of cat123x
+SELECT dvs_assert_agree($p$tcat = 'cat123x'$p$);                -- TEXT point, extends cat123
+SELECT dvs_assert_agree($p$tcat > 'cat123' AND tcat <= 'cat124'$p$); -- TEXT range across the prefix edge
+SELECT dvs_assert_agree($p$tcat = ''$p$);                       -- TEXT empty string (not NULL)
+SELECT dvs_assert_agree($p$tcat >= 'cat490'$p$);                -- TEXT high end
+SELECT dvs_assert_agree($p$d @@@ 'freq7' AND tcat < 'cat050'$p$); -- lexical AND text facet
+SELECT dvs_assert_deep('dvs_t');
 
 -- ===========================================================================
 -- PHASE 3 -- DELETE-HEAVY + VACUUM.  Delete ~40% spread across the whole docid
@@ -150,14 +198,24 @@ SELECT dvs_assert_agree('price < 1');
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);
 SELECT dvs_assert_agree('fprice < 10.0');
 SELECT dvs_assert_agree('nprice < 100');                        -- nullable, after tombstone-drop VACUUM
+SELECT dvs_assert_agree($p$tcat < 'cat050'$p$);
+SELECT dvs_assert_agree($p$tcat = 'cat123x'$p$);
+SELECT dvs_assert_agree($p$d @@@ 'freq7' AND tcat < 'cat050'$p$);
+SELECT dvs_assert_deep('dvs_t');
 
 \echo ==== PHASE 4: explicit full merge, gate still == heap ====
 SELECT weave_merge('dvs_w') IS NOT NULL AS merged;
 SELECT weave_merge('dvs_np') IS NOT NULL AS merged_np;
+SELECT weave_merge('dvs_t') IS NOT NULL AS merged_t;
 SELECT weave_index_nsegments('dvs_w') AS nsegments_after_merge;
+SELECT weave_index_nsegments('dvs_t') AS nsegments_t_after_merge;
 SELECT dvs_assert_agree('price < 100');
 SELECT dvs_assert_agree('price < 10');
 SELECT dvs_assert_agree('nprice < 100');                        -- nullable, after explicit merge
+SELECT dvs_assert_agree($p$tcat < 'cat050'$p$);
+SELECT dvs_assert_agree($p$tcat = 'cat123x'$p$);
+SELECT dvs_assert_agree($p$d @@@ 'freq7' AND tcat < 'cat050'$p$);
+SELECT dvs_assert_deep('dvs_t');
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);
 
 -- ===========================================================================
@@ -173,19 +231,43 @@ INSERT INTO dvs
          (((hashint8(id) % 1000) + 1000) % 1000)::bigint,
          ((((hashint8(id) % 1000) + 1000) % 1000)::float8 / 7.0),
          CASE WHEN (((hashint8(id) % 10) + 10) % 10) = 0 THEN NULL
-              ELSE (((hashint8(id) % 1000) + 1000) % 1000)::bigint END
+              ELSE (((hashint8(id) % 1000) + 1000) % 1000)::bigint END,
+         -- pending text: ~1/3 are NEW values 'catNNNm' that sort BETWEEN the
+         -- segment dictionary's 'catNNN' and 'catNNNx', so the flush/merge must
+         -- interleave them into the union dictionary and remap every ordinal.
+         CASE WHEN r2 < 100 THEN NULL
+              WHEN r2 < 120 THEN ''
+              ELSE 'cat' || lpad((r2 % 500)::text, 3, '0')
+                   || CASE r2 % 3 WHEN 0 THEN 'x' WHEN 1 THEN 'm' ELSE '' END
+         END
     FROM (SELECT i AS id,
-                 'common doc ' || (i % 5) || ' t' || (i % 100000) || ' freq' || (i % 100) AS body
+                 'common doc ' || (i % 5) || ' t' || (i % 100000) || ' freq' || (i % 100) AS body,
+                 (((hashint8(i + 17) % 2000) + 2000) % 2000)::int AS r2
             FROM generate_series(10000001, 10200000) i) s;
 SELECT weave_index_nsegments('dvs_w') AS nsegments_after_insert;
 SELECT dvs_assert_agree('price < 10');                          -- includes pending rows
 SELECT dvs_assert_agree('nprice < 10');                         -- nullable, pending rows incl. NULLs
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);   -- AND over pending
+-- the pending-only text values must actually exist, or the two asserts below
+-- agree vacuously on an empty set.
+DO $$
+DECLARE n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM dvs WHERE tcat > 'cat123' AND tcat < 'cat123x';
+    RAISE NOTICE 'SHAPE  pending-only text rows=%', n;
+    IF n = 0 THEN
+        RAISE EXCEPTION 'SHAPE: no pending-only text values; the interleave asserts would be vacuous';
+    END IF;
+END $$;
+SELECT dvs_assert_agree($p$tcat = 'cat123m'$p$);                -- TEXT value ONLY in pending
+SELECT dvs_assert_agree($p$tcat > 'cat123' AND tcat < 'cat123x'$p$); -- TEXT: exactly the new pending values
+SELECT dvs_assert_agree($p$tcat < 'cat050'$p$);                 -- TEXT over segments + pending
 
 \echo ==== PHASE 6: flush pending (VACUUM) + merge, gate still == heap ====
 VACUUM dvs;
 SELECT weave_merge('dvs_w') IS NOT NULL AS merged2;
 SELECT weave_merge('dvs_np') IS NOT NULL AS merged2_np;
+SELECT weave_merge('dvs_t') IS NOT NULL AS merged2_t;
 SELECT weave_index_nsegments('dvs_w') AS nsegments_final;
 SELECT dvs_assert_agree('price < 10');
 SELECT dvs_assert_agree('price < 100');
@@ -193,8 +275,15 @@ SELECT dvs_assert_agree('fprice < 10.0');
 SELECT dvs_assert_agree('nprice < 10');                         -- nullable, after flush+merge
 SELECT dvs_assert_agree('nprice < 100');
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);
+SELECT dvs_assert_agree($p$tcat = 'cat123m'$p$);                -- TEXT: pending value now in the merged dictionary
+SELECT dvs_assert_agree($p$tcat > 'cat123' AND tcat < 'cat123x'$p$);
+SELECT dvs_assert_agree($p$tcat < 'cat050'$p$);
+SELECT dvs_assert_agree($p$tcat = ''$p$);
+SELECT dvs_assert_agree($p$d @@@ 'freq7' AND tcat < 'cat050'$p$);
+SELECT dvs_assert_deep('dvs_t');
 
 SELECT pg_size_pretty(pg_relation_size('dvs_w')) AS index_size,
+       pg_size_pretty(pg_relation_size('dvs_t')) AS text_index_size,
        pg_size_pretty(pg_relation_size('dvs'))   AS heap_size;
 
 \echo ==== ALL DOCVALS SCALE ASSERTIONS PASSED (index == heap at every phase) ====
