@@ -4309,7 +4309,7 @@ one sort-and-dedup pass. t/027 inserts 50,000 unflushed rows, then asserts that 
 collecting backend's `VmHWM` stays under 1 GB. The unfixed build is OOM-killed in the
 same test, which is the positive control.
 
-### G65 — a flush's segment add and its pending clear are two WAL records, so a crash or ERROR between them leaves the folded documents in both places — **FOUND 2026-09-29 in review of G61; PRE-EXISTING; OPEN**
+### G65 — a flush's segment add and its pending clear are two WAL records, so a crash or ERROR between them leaves the folded documents in both places — **FOUND 2026-09-29 in review of G61; PRE-EXISTING; FIXED 2026-09-30**
 
 `weave_add_segment_with_room()` commits the new segment. The clear, which drops the
 folded prefix from the pending list, is a separate GenericXLog record. If the backend
@@ -4320,6 +4320,26 @@ second segment, so each document gets two docids and corpus statistics count it 
 It has never been observed. Fixing it needs either one record that covers the metapage
 directory and the cut page, or an idempotence mark on the list, so that a re-flush
 skips docids already folded.
+
+**Fixed 2026-09-30 by the first option: one record.** `weave_flush_add_and_cut()` in
+`src/am/ambuild.c` appends the segment and moves the pending head in a single
+GenericXLog record over the metapage and the cut page (two of the four buffers a record
+may carry). It goes through `weave_add_segment_with_room_ex()`, so a full directory still
+merges and retries. A refused attempt writes nothing, and each retry re-reads the cut
+against the live chain. So G61's three keep-shapes are judged at the moment of the write,
+as before, and t/027 still proves each one fires. The corpus totals no longer do an
+add-then-subtract: the pending documents were counted at insert time and are now never
+counted twice, even transiently. The cut page is pinned before the metapage lock is taken,
+so the one I/O that could fail does so before anything is locked or logged.
+
+**Pinned by `t/029_flush_atomic.pl`**, with `pg_walinspect`: a VACUUM flush writes exactly
+**one** record touching the metapage. **Positive control:** the same test on the pre-fix
+code reported `{0} {0}`, two records, and failed on exactly that assertion (1 of 7). The
+test also stops the server immediately after a flush, with no XID anchor, and checks that
+`ndocs` equals the heap and every row answers once. That holds on both sides of the flush,
+which the atomic record now guarantees rather than hopes for. What it cannot do is land a
+crash *between* the two old records: pg_weave's test hooks are in no shipped build. The
+record count is the structural claim that makes that window not exist.
 
 ### G66 — the ranked pass ignored the pending list: `WHERE d @@@ q ORDER BY d <=> q` returned 60 of 120 matching rows when the other 60 had been UPDATEd since the last flush — **FOUND 2026-09-29 by the G56 padding test; PRE-EXISTING, and documented in code as intentional; silent wrong answer on the flagship query; FIXED 2026-09-29 for the lexical ranked route and `weave_search()`**
 

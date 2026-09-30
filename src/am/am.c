@@ -3564,9 +3564,31 @@ weave_meta_add_segment(Relation index, const WeaveSegMeta *seg)
 void
 weave_add_segment_with_room(Relation index, const WeaveSegMeta *seg)
 {
+	weave_add_segment_with_room_ex(index, seg, NULL, NULL);
+}
+
+/*
+ * The same, with the directory write supplied by the caller.  `add` must behave
+ * like weave_meta_add_segment() -- one GenericXLog record, false and nothing
+ * written when the directory is full -- and may put more into that record.  The
+ * pending flush uses it to clear the folded prefix in the SAME record as the
+ * segment add (doc/GAPS.md G65).  NULL means weave_meta_add_segment().
+ */
+static bool
+weave_meta_add_segment_cb(Relation index, const WeaveSegMeta *seg, void *arg)
+{
+	return weave_meta_add_segment(index, seg);
+}
+
+void
+weave_add_segment_with_room_ex(Relation index, const WeaveSegMeta *seg,
+							   WeaveSegAdder add, void *arg)
+{
 	int			try;
 
-	if (weave_meta_add_segment(index, seg))
+	if (add == NULL)
+		add = weave_meta_add_segment_cb;
+	if (add(index, seg, arg))
 		return;
 
 	for (try = 0; try < WEAVE_MAX_SEGMENTS; try++)
@@ -3591,7 +3613,7 @@ weave_add_segment_with_room(Relation index, const WeaveSegMeta *seg)
 			weave_maintenance_unlock(index);
 		}
 		PG_END_TRY();
-		if (weave_meta_add_segment(index, seg))
+		if (add(index, seg, arg))
 			return;
 	}
 

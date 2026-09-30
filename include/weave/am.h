@@ -1450,6 +1450,12 @@ extern void weave_init_metapage(Relation index);
 extern void weave_meta_upcast_page(Page page);
 extern bool weave_meta_add_segment(Relation index, const WeaveSegMeta *seg);
 extern void weave_add_segment_with_room(Relation index, const WeaveSegMeta *seg);
+/* directory write for weave_add_segment_with_room_ex(): one GenericXLog record,
+ * false with nothing written if the directory is full.  Exported so the pending
+ * flush can fold its clear into the segment add's record (doc/GAPS.md G65). */
+typedef bool (*WeaveSegAdder) (Relation index, const WeaveSegMeta *seg, void *arg);
+extern void weave_add_segment_with_room_ex(Relation index, const WeaveSegMeta *seg,
+										   WeaveSegAdder add, void *arg);
 
 /*
  * Attach a descriptor page to a just-written bolt.  Call AFTER every other chain
