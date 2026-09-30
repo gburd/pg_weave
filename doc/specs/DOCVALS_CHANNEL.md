@@ -93,6 +93,23 @@ compare ordinals). The sorted dictionary is the same structure SuRF (Z3) and the
 zone-map want, and it makes the low-cardinality facet case (category, status, country —
 the normal one) small. High-cardinality text degrades gracefully to a larger dictionary.
 
+**DONE as store v3 (`doc/plans/2026-09-28-docvals-text-slice.md`, ext 0.27.0).** The v2
+skeleton is reused unchanged: the int64 value array holds a per-segment dictionary ordinal,
+and the header's former alignment padding (bytes 28..31) carries `dict_off`, read **only**
+when `version == 3` (so v1/v2 images are byte-identical and still validate). The dictionary
+region sits at `MAXALIGN(end of docids / null bitmap)`: `uint32 ndict`, `uint32
+offs[ndict+1]`, then the packed raw bytes. The pure validator checks structure and that
+every non-NULL ordinal is `< ndict`; it cannot check collation order, which
+`weave_check(deep)` does as invariant `docvals_dictionary_ascending`. The constant resolves
+to two boundaries `lo = #{D[i] < k}`, `hi = #{D[i] <= k}` (`weave_dv_dict_lower_bound` /
+`_upper_bound`, injected comparator, property-tested with `memcmp`); then `<` is `ord < lo`,
+`<=` is `ord < hi`, `=` is `lo <= ord < hi`, `>=` is `ord >= lo`, `>` is `ord >= hi`.
+**Only deterministic collations**: a non-deterministic one makes byte-distinct values
+compare equal, which breaks both "distinct values" and equality-as-ordinal-compare, so
+CREATE INDEX ERRORs on it. **Collation drift** (a libc/ICU upgrade reordering strings)
+invalidates the dictionary exactly as it invalidates a btree; the remedy is REINDEX, and
+`weave_check(deep)` is how you notice.
+
 On-disk bytes are not trusted (`CONVENTIONS.md`): every field is validated by a pure
 `include/weave/docvals.h` validator with a planted-bug fuzz target (§9). A corrupt store
 `ERROR`s, never crashes, never returns a wrong gate set.
@@ -198,6 +215,11 @@ and `enable_bitmapscan` off in the test, and the plan checked for the index cond
 - **Merge:** concatenate value arrays in docid order; **re-dictionary** text (union the
   input dictionaries, re-sort, remap ordinals) — the merge producer-2 pattern
   (`v7-merge-producer2`). `check-alloc`/`check-pdlower` apply to every new reader.
+  **DONE for text:** `weave_docvals_merge_append` reads each input's entry BYTES for its
+  surviving docids and the output writer builds a fresh dictionary from the union, so no
+  ordinal ever crosses a segment boundary. A pending text item is `0x01` + raw bytes
+  (`dvlen = 1 + len`), so `''` (`dvlen == 1`) never collides with NULL (`dvlen == 0`); the
+  reader tells int8 from text by the index layout, never by the item.
 - **Vacuum:** values for tombstoned docids are dropped on the rewrite like any weft; the
   store participates in the one vacuum, one WAL stream (100 % GenericXLog, hard rule 2).
 - **NULLs through all of these (DONE, `doc/plans/2026-09-27-docvals-nulls-slice.md`).**
@@ -261,7 +283,17 @@ half-built store:
    `bench/aws/docvals_scale.sql`.
 4. Text: dictionary encoding, collation-sorted, ordinal-boundary resolution + its exactness
    test — the highest-risk piece, done last against a store the rest of the stack trusts.
-5. Merge (re-dictionary), then multiple docvals columns (AND intersection).
+   **DONE 2026-09-29 (`doc/plans/2026-09-28-docvals-text-slice.md`, ext 0.27.0, store v3).**
+   Gates: `prop_text` boundary exactness; `sql/docvals.sql` §10/10b/10c, §15, §16 (index==heap on `C` and
+   database-default collations, `''`, absent constants, pending, flush, 4→1 merge, shape guard with
+   all-new and all-shared values, deep check); `fuzz_docvals` v3 with the planted
+   no-ordinal-guard variant required to abort; `t/023`–`t/025` (crash recovery + ICU
+   refusal, corruption, concurrency) on pg17 and pg18; 10M scale run with a text facet
+   (`bench/RESULTS_DOCVALS_SCALE.md`, text section).
+5. Merge (re-dictionary), then multiple docvals columns (AND intersection). **Merge
+   re-dictionary DONE with step 4.** Multiple docvals columns per index are still
+   **deferred**: the layout resolves ONE docvals weft per index, so today two facets need
+   two indexes.
 
 Each step is a `doc/PHASES.md` task with its gate; steps 1–3 are provisional until step 5's
 scale run (hard rule 12 territory for the merge/vacuum parts).

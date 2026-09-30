@@ -128,6 +128,41 @@ crash-recovery / torn-write / concurrency TAP are the local half. Index 456 MB /
 (Xeon Platinum 8488C, 30 GB), commit `5635689`.
 
 
+### TEXT (store v3, dictionary) validated at 10M (added 2026-09-30, ext 0.27.0)
+
+Same 10M workload plus `tcat text COLLATE "C"` on an independent hash (~5% NULL, ~1% `''`,
+1000 values where every `catNNNx` extends `catNNN`) and its own index
+`dvs_t (d, tcat text_docval_ops)`. Each phase asserts index == seqscan on text `<`, `=`,
+a range across the prefix edge, `= ''`, and lexical-AND-text, plus `weave_check(deep)`
+with the `docvals_dictionary_ascending` invariant **required to be present**. Phase 5
+inserts pending-only values `catNNNm`, which sort between the segment dictionary's
+`catNNN` and `catNNNx`, so flush and merge must interleave them into a union dictionary
+and remap every ordinal. A shape guard fails the run if that set is empty; it was at 1k
+pending rows in the local smoke run, which is why the guard exists.
+
+**Result: ALL assertions passed**, `ON_ERROR_STOP` on, terminal marker printed. Host
+c7i.4xlarge, commit `9a8afa5`, run `pgweave-20260930-010101`. The host gate before it:
+build, lints, codec, installcheck (empty `regression.diffs`) and 28 TAP files / 1039 tests
+all green.
+
+| phase | text assertion (final phase, the only one whose counts survived) | `disagreements` |
+|---|---|---|
+| flush + merge | `tcat = 'cat123m'` (pending-only value, now in the merged dictionary) = 90; `tcat > 'cat123' AND tcat < 'cat123x'` = 90 (exactly the interleaved values); `tcat < 'cat050'` = 527,014; `tcat = ''` = 62,013; `@@@'freq7' AND tcat<'cat050'` = 8,702 | 0 |
+| flush + merge | `weave_check('dvs_t', deep)`: 0 violations, 1 dictionary check | — |
+
+Index `dvs_t` 460 MB vs int8 `dvs_w` 458 MB, heap 2366 MB. The dictionary costs ~2 MB
+here because the facet has 1000 distinct values; high-cardinality text will cost more and
+is **unmeasured**.
+
+**LOSS, stated: the per-phase counts for phases 1–5 were not captured.** The harness pulls
+the full psql log after the run, and that pull returned an empty file: a transient ssh drop
+hidden behind `|| true`. Only the 80-line tail survived. Every phase's assertions still
+**ran and passed**. Each `RAISE`s on a mismatch, `ON_ERROR_STOP` aborts on the first
+one, and the terminal marker can only print after the last. So the correctness verdict
+stands, but the intermediate counts and the `dvs_t` build time are not on record. Commit
+`759b925` makes the pull retry and warn when empty. A rerun to fill the table was blocked
+by the same workstation network flapping (empty build log), then by expired AWS
+credentials.
 ## What this does NOT tell us (and one thing it surfaced)
 
 - **No vector column in the 10M correctness run**, on purpose: a first attempt with

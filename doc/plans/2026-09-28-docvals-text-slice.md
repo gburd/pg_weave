@@ -320,9 +320,16 @@ fills `rec.hasdv/dvslot/docval` (grep `dvslot =`), `src/am/amscan.c` pending loo
 distinct values Zipf-ish + 5% NULL, its own index since one docvals column per index), 
 `bench/RESULTS_DOCVALS_SCALE.md` (TEXT section).
 
-- [ ] Add the text facet to the 10M workload with the same self-checking `dvs_assert_agree`
-  across build / DELETE+VACUUM / merge / pending / flush, ON_ERROR_STOP fatal.
-- [ ] EC2 run via `bench/aws/run.sh` docvals job on `hotdog` (us-east-2), commit first (source
+- [x] Add the text facet to the 10M workload with the same self-checking `dvs_assert_agree`
+  across build / DELETE+VACUUM / merge / pending / flush, ON_ERROR_STOP fatal. (commit
+  `9a8afa5`; also a deep check per phase and a non-empty guard on the pending-only values.)
+- [x] EC2 run via `bench/aws/run.sh` docvals job on `hotdog` (us-east-2), commit first (source
   arrives by `git archive HEAD`); `disagreements=0` every phase; record sizes and the tooth
   (`tcat < k` == `tcat IS NOT NULL AND tcat < k`). Sweep only `pgweave-*` resources after.
-- [ ] Docs + memory; CI full matrix green on the final commit.
+  **Passed** (`pgweave-20260930-010101`), but only the final phase's counts were captured;
+  see `bench/RESULTS_DOCVALS_SCALE.md` TEXT section. The `IS NOT NULL` tooth was **not
+  added** for text; the NULL bitmap is shared with v2 and that tooth is already recorded at
+  10M on `nprice`. A rerun for the full per-phase table is **owed**.
+- [x] Docs + memory. (`PHASES.md` / `PRODUCTION_READINESS.md` were not edited: no earlier
+  docvals slice is tracked there, so the spec §11, this plan and the RESULTS file are the
+  record.) CI on the final commit: see the push.
