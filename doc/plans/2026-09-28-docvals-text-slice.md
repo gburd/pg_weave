@@ -294,16 +294,23 @@ fills `rec.hasdv/dvslot/docval` (grep `dvslot =`), `src/am/amscan.c` pending loo
 **Files:** `t/023_docvals_text_recovery.pl`, `t/024_docvals_text_corruption.pl`,
 `t/025_docvals_text_concurrent.pl`, `flake.nix` PROVE_TESTS. Model each on `t/020`–`t/022`.
 
-- [ ] 023: build + INSERT text rows, `immediate` stop without checkpoint, restart, index==heap
+- [x] 023: build + INSERT text rows, `immediate` stop without checkpoint, restart, index==heap
   for all ops + EXPLAIN Index-Scan positive control.
-- [ ] 024 (`no_data_checksums => 1`): corrupt `dict_off`, an `offs[]` entry, and an ordinal on
+- [x] 024 (`no_data_checksums => 1`): corrupt `dict_off`, an `offs[]` entry, and an ordinal on
   disk → query ERRORs "corrupt docvalues store", postmaster alive.
-- [ ] 025: concurrent INSERTers of text values + a reader asserting a fixed anchor predicate's
+- [x] 025: concurrent INSERTers of text values + a reader asserting a fixed anchor predicate's
   count is monotone and == heap at the end; reads > 0 asserted.
-- [ ] Non-deterministic collation: if `CREATE COLLATION … (provider = icu, deterministic =
+- [x] Non-deterministic collation: if `CREATE COLLATION … (provider = icu, deterministic =
   false)` succeeds, CREATE INDEX with `text_docval_ops` on it must fail with the T2 message;
   else `note` the skip and assert the skip reason is "ICU unavailable" (in 023 or its own test).
-- [ ] Gate: tap-pg17 + tap-pg18 green, new files' markers present in the log. Commit.
+- [x] Gate: tap-pg17 + tap-pg18 green, new files' markers present in the log. Commit.
+
+> **Done 2026-09-29.** All three files pass on pg17 and pg18; 023 exercised the ICU branch (the
+> refusal, not the skip). **025 found two P0s that were not text-specific at all** -- plain
+> VACUUM truncating the index under concurrent INSERTs (doc/GAPS.md G67) and, once that was
+> fixed, a dead pending row surviving VACUUM (G69), plus G68 and G70 -- and they were fixed
+> first, with their own test (`t/028_vacuum_truncate_race.pl`), because 025 cannot pass without
+> them. 025 caught G67 in 1 of 12 runs; 028 was built to catch it in every run.
 
 ### Task 8: Docs, scale run, closure
 
