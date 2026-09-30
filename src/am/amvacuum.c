@@ -101,8 +101,9 @@
  * is what reclaims the physical bloat left by ordinary merges (which recycle
  * freed pages to the FSM for later reuse but never shrink the relation).
  *
- * Single-writer only (holds a lock that excludes concurrent writers, e.g.
- * VACUUM's ShareUpdateExclusiveLock or CIC's AccessExclusiveLock).
+ * Runs beside concurrent INSERTs under VACUUM's ShareUpdateExclusiveLock; the
+ * tail truncation alone needs AccessExclusiveLock and takes it conditionally
+ * (weave_truncate_tail_above, doc/GAPS.md G67).
  */
 
 /*
@@ -182,22 +183,108 @@ weave_compact_to_one(Relation index, bool extend_only)
 	return didwork;
 }
 
-/* Truncate the contiguous run of free blocks at the end of the file back to
- * the OS.  Returns the new block count.  Scan is cancel-safe (no lock held). */
-BlockNumber
-weave_truncate_free_tail(Relation index)
-{
-	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
-	BlockNumber truncpoint = nblocks;
-	BlockNumber blk;
+/*
+ * Truncate the run of free blocks at the end of the file, down to no lower
+ * than `floor`, back to the OS.  Returns the block count afterwards.
+ *
+ * ONLY UNDER AccessExclusiveLock (doc/GAPS.md G67).  This used to run under
+ * whatever lock the caller held -- VACUUM's cleanup holds only
+ * ShareUpdateExclusiveLock on the heap and RowExclusiveLock on the index, and
+ * neither excludes INSERT -- and it read the free-space map with no lock at
+ * all.  Two failures follow, and t/025 hit both on PG18:
+ *
+ *   - ROW LOSS.  The tail scan sees block B free; a concurrent inserter is then
+ *     handed B (GetFreeIndexPage, or an extension that lands on it) and links
+ *     pending items onto it; RelationTruncate() drops B's buffer -- dirty or
+ *     not -- and the file end.  The committed rows on B are gone, and the
+ *     pending chain now names a block past EOF.
+ *   - "unexpected data beyond EOF".  RelationTruncate() drops the buffers
+ *     before it truncates the file, so a backend that reads B in that window
+ *     leaves a VALID buffer past the new end, and the next extension to B
+ *     refuses it.
+ *
+ * Heap truncation has the same hazard and the same answer (lazy_truncate_heap):
+ * take AccessExclusiveLock CONDITIONALLY, skip if anyone else is using the
+ * relation, and truncate only while holding it.  A skipped truncation costs
+ * disk space until a quieter VACUUM; a racing one costs rows.  Three details
+ * from review, each of which heap truncation also has:
+ *
+ *   - NOT IN PARALLEL MODE.  Acquiring AccessExclusiveLock on a relation logs
+ *     it for hot standby, which assigns an xid BEFORE the conflict check -- and
+ *     assigning an xid in parallel mode is an ERROR.  weave is
+ *     VACUUM_OPTION_NO_PARALLEL, so a parallel VACUUM runs its cleanup in the
+ *     LEADER, still inside parallel mode; heap truncates only after leaving it.
+ *     Without this check a manual VACUUM of a table with a weave index and two
+ *     parallel-capable btrees aborted outright.
+ *   - A CHEAP PRECHECK.  The lock is requested only if the last block is free
+ *     in the FSM, so a pass with nothing to truncate costs no xid.
+ *   - YIELD TO WAITERS.  The tail is verified page by page under the lock; every
+ *     WEAVE_TRUNC_CHECK_EVERY blocks, if another backend is queued on the index
+ *     (LockHasWaitersRelation), stop and truncate what is verified so far.
+ *
+ * `sole_writer` (weave_truncate_sole_writer) is the one case that needs no lock:
+ * ambuild, where the index is not yet visible to any other backend (indisready
+ * is false, even under CONCURRENTLY, whose build holds only RowExclusiveLock --
+ * so the conditional lock would usually FAIL there and the post-build shrink of
+ * G6/L8 would silently stop happening).
+ *
+ * Under the lock the FSM is still not trusted: it is not crash-safe, so it can
+ * claim a live page is free.  A tail block is truncated only if the FSM says
+ * free AND the page itself is new or flagged WEAVE_FREED.  (A page freed by a
+ * build older than the flag is therefore never truncated; REINDEX reclaims it.)
+ */
+#define WEAVE_TRUNC_CHECK_EVERY 32
 
-	for (blk = nblocks; blk > 1; blk--)
+bool		weave_truncate_sole_writer = false;
+
+static BlockNumber
+weave_truncate_tail_above(Relation index, BlockNumber minblk)
+{
+	bool		locked_here = false;
+	BlockNumber nblocks;
+	BlockNumber truncpoint;
+	BlockNumber blk;
+	uint32		nchecked = 0;
+
+	if (minblk < 1)
+		minblk = 1;				/* never the metapage */
+
+	nblocks = RelationGetNumberOfBlocks(index);
+	if (nblocks <= minblk ||
+		GetRecordedFreeSpace(index, nblocks - 1) < BLCKSZ / 2)
+		return nblocks;			/* nothing to truncate: no lock, no xid */
+
+	if (!weave_truncate_sole_writer &&
+		!CheckRelationLockedByMe(index, AccessExclusiveLock, true))
 	{
-		CHECK_FOR_INTERRUPTS();		/* scan-only, no lock held */
-		if (GetRecordedFreeSpace(index, blk - 1) >= BLCKSZ / 2)
-			truncpoint = blk - 1;	/* free -> part of the truncatable tail */
-		else
+		if (IsInParallelMode() ||
+			!ConditionalLockRelation(index, AccessExclusiveLock))
+			return nblocks;		/* parallel mode, or in use: a later VACUUM */
+		locked_here = true;
+	}
+
+	nblocks = RelationGetNumberOfBlocks(index);
+	truncpoint = nblocks;
+	for (blk = nblocks; blk > minblk; blk--)
+	{
+		Buffer		buf;
+		Page		page;
+		bool		isfree;
+
+		CHECK_FOR_INTERRUPTS();
+		if (locked_here && ++nchecked % WEAVE_TRUNC_CHECK_EVERY == 0 &&
+			LockHasWaitersRelation(index, AccessExclusiveLock))
+			break;				/* someone is queued: truncate what we have */
+		if (GetRecordedFreeSpace(index, blk - 1) < BLCKSZ / 2)
 			break;				/* first live block from the end; stop */
+		buf = ReadBuffer(index, blk - 1);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		isfree = PageIsNew(page) || WeavePageIsFreed(page);
+		UnlockReleaseBuffer(buf);
+		if (!isfree)
+			break;				/* the FSM is stale about this page: keep it */
+		truncpoint = blk - 1;
 	}
 	if (truncpoint < nblocks)
 	{
@@ -205,7 +292,19 @@ weave_truncate_free_tail(Relation index)
 		RelationTruncate(index, truncpoint);
 		nblocks = truncpoint;
 	}
+
+	if (locked_here)
+		UnlockRelation(index, AccessExclusiveLock);
 	return nblocks;
+}
+
+/* Truncate the contiguous run of free blocks at the end of the file back to
+ * the OS.  Returns the new block count; unchanged when the truncation was
+ * skipped (see weave_truncate_tail_above). */
+BlockNumber
+weave_truncate_free_tail(Relation index)
+{
+	return weave_truncate_tail_above(index, 1);
 }
 
 /*
@@ -582,11 +681,14 @@ weave_vacuum_compact(Relation index)
 	 *
 	 * One vacate+pass reaches the floor in the common single-segment case; the
 	 * loop re-checks and stops as soon as a pass stops shrinking, bounded by
-	 * WEAVE_VACUUM_MAX_PASSES.  A final backstop guarantees we never return above
-	 * the pre-call size even if the cap is hit mid-vacate.
+	 * WEAVE_VACUUM_MAX_PASSES.  A final backstop truncates back to at most
+	 * the pre-call size even if the cap is hit mid-vacate -- when it can take
+	 * the lock the truncation needs (doc/GAPS.md G67).
 	 *
-	 * Single-writer only (holds a lock that excludes concurrent writers, e.g.
-	 * VACUUM's ShareUpdateExclusiveLock or CIC's AccessExclusiveLock).
+	 * Concurrency: VACUUM's ShareUpdateExclusiveLock does NOT exclude INSERT
+	 * (RowExclusiveLock), so this runs beside writers.  The relocation is
+	 * built for that; the truncation is not, and takes AccessExclusiveLock
+	 * conditionally for itself (weave_truncate_tail_above, doc/GAPS.md G67).
 	 */
 	startblocks = RelationGetNumberOfBlocks(index);
 	prevblocks = startblocks;
@@ -735,32 +837,19 @@ weave_vacuum_compact(Relation index)
 	}
 
 	/*
-	 * Backstop: never return larger than we started.  Phase 1 grows the file
-	 * transiently; if the pass cap were somehow hit right after a vacate, the
-	 * pack phase would still have run, but guard anyway by truncating any free
-	 * tail down to at most the pre-call size.
+	 * Backstop: never return larger than we started -- WHEN the truncation can
+	 * run.  Phase 1 grows the file transiently; if the pass cap were somehow hit
+	 * right after a vacate, the pack phase would still have run, but guard
+	 * anyway by truncating any free tail down to at most the pre-call size.
+	 * Since doc/GAPS.md G67 the truncation is skipped when another backend is in
+	 * the index (or in parallel mode), so under load the file can end a pass
+	 * larger than it began; the free pages are reused and a later quiet VACUUM
+	 * truncates them.
 	 */
 	nblocks = RelationGetNumberOfBlocks(index);
-	if (nblocks > startblocks)
-	{
-		BlockNumber truncpoint = nblocks;
-		BlockNumber blk;
-
-		for (blk = nblocks; blk > startblocks; blk--)
-		{
-			CHECK_FOR_INTERRUPTS();		/* scan-only, no lock held */
-			if (GetRecordedFreeSpace(index, blk - 1) >= BLCKSZ / 2)
-				truncpoint = blk - 1;
-			else
-				break;
-		}
-		if (truncpoint < nblocks)
-		{
-			FreeSpaceMapVacuumRange(index, truncpoint, nblocks);
-			RelationTruncate(index, truncpoint);
-			didwork = true;
-		}
-	}
+	if (nblocks > startblocks &&
+		weave_truncate_tail_above(index, startblocks) < nblocks)
+		didwork = true;
 
 	return didwork;
 }
@@ -919,6 +1008,27 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	weave_maintenance_lock(index);
 	PG_TRY();
 	{
+	/*
+	 * FLUSH FIRST (doc/GAPS.md G69).  The loop below tombstones docids it finds
+	 * in SEGMENTS; a dead row still in the pending list is in none, so it used to
+	 * survive this pass untouched, and the flush in vacuumcleanup then folded it
+	 * into a new bolt -- a live index entry for a heap slot VACUUM had just
+	 * freed.  Once the heap truncated that page, every index scan that reached
+	 * the entry failed with "could not read blocks ... read only 0 of 8192
+	 * bytes", the heap's own next extension failed with "page N ... should be
+	 * empty but is not", and the fast count paths returned the dead rows.
+	 * Reproduced in one statement sequence: 2000 post-build INSERTs, DELETE
+	 * them, VACUUM.
+	 *
+	 * GIN has the same shape and the same answer: ginbulkdelete() runs
+	 * ginInsertCleanup() before it looks at the posting tree.  Every TID in this
+	 * batch's dead set was seen by the heap scan before this call, hence
+	 * inserted before it, hence is in the list this flush folds; a row appended
+	 * during the flush (the G61 cut) was inserted after the scan and cannot be
+	 * in this batch.
+	 */
+	(void) weave_flush_pending(index);
+
 	{
 		Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
 

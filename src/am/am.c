@@ -3700,9 +3700,9 @@ weave_page_recyclable(Relation index, Page page)
 	 * project, 1.8.3).
 	 *
 	 * Cost of the stricter rule: a page freed by a build older than the flag is no
-	 * longer reusable through the free list.  It is still reclaimed by
-	 * weave_truncate_free_tail() when it sits in the tail, which is where old
-	 * frees accumulate.  Safety over that corner.
+	 * longer reusable through the free list, and since doc/GAPS.md G67 it is not
+	 * truncated either (the tail truncation now requires the flag too, because
+	 * the FSM is not crash-safe).  REINDEX reclaims it.  Safety over that corner.
 	 */
 	if ((op->flags & WEAVE_FREED) == 0)
 		return false;

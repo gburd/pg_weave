@@ -436,9 +436,20 @@ docvals_walk(Relation index, BlockNumber root, uint8 *dst, Size cap,
 	return total;
 }
 
+/*
+ * The loader without the ereport: returns the validated image, or NULL with
+ * *errmsg_out ("page chain" or "store" -- which of the two messages the throwing
+ * loader raises) and *detail_out set.  Exists for the SCAN (doc/GAPS.md G68): a
+ * scan reads the chain named by a directory snapshot, and a concurrent merge can
+ * free and recycle those pages under it, so a scan that meets an unsound chain
+ * must first ask whether the directory generation moved -- a race, which it
+ * retries -- before calling it corruption.  Everything the throwing loader
+ * trusts, this checks identically; only the reporting differs.
+ */
 const void *
-weave_docvals_load(Relation index, BlockNumber root,
-				   MemoryContext cxt, uint32 *ndocs_out, int want_kind)
+weave_docvals_try_load(Relation index, BlockNumber root, MemoryContext cxt,
+					   uint32 *ndocs_out, int want_kind,
+					   const char **errmsg_out, char **detail_out)
 {
 	const char *detail = NULL;
 	const char *why;
@@ -449,16 +460,17 @@ weave_docvals_load(Relation index, BlockNumber root,
 
 	if (ndocs_out != NULL)
 		*ndocs_out = 0;
+	*errmsg_out = NULL;
+	*detail_out = NULL;
 
 	/* Measure pass: page-level soundness only, no allocation yet. */
 	len = docvals_walk(index, root, NULL, 0, &detail);
 	if (len < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("corrupt docvalues page chain in index \"%s\"",
-						RelationGetRelationName(index)),
-				 errdetail("%s (block %u)", detail, root),
-				 errhint("REINDEX the index to rebuild it.")));
+	{
+		*errmsg_out = "page chain";
+		*detail_out = psprintf("%s (block %u)", detail, root);
+		return NULL;
+	}
 
 	/*
 	 * check-alloc: bounded by pages that actually exist rather than a count read
@@ -476,12 +488,9 @@ weave_docvals_load(Relation index, BlockNumber root,
 		pfree(img);
 		if (detail == NULL)
 			detail = "docvalues chain length changed between passes";
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("corrupt docvalues page chain in index \"%s\"",
-						RelationGetRelationName(index)),
-				 errdetail("%s (block %u)", detail, root),
-				 errhint("REINDEX the index to rebuild it.")));
+		*errmsg_out = "page chain";
+		*detail_out = psprintf("%s (block %u)", detail, root);
+		return NULL;
 	}
 
 	/*
@@ -493,30 +502,59 @@ weave_docvals_load(Relation index, BlockNumber root,
 	if (why != NULL)
 	{
 		pfree(img);
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("corrupt docvalues store in index \"%s\"",
-						RelationGetRelationName(index)),
-				 errdetail("%s (block %u)", why, root),
-				 errhint("REINDEX the index to rebuild it.")));
+		*errmsg_out = "store";
+		*detail_out = psprintf("%s (block %u)", why, root);
+		return NULL;
 	}
 
 	memcpy(&h, img, sizeof(h));
 	if ((int) h.typid_kind != want_kind)
 	{
 		pfree(img);
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("corrupt docvalues store in index \"%s\"",
-						RelationGetRelationName(index)),
-				 errdetail("store value kind %u does not match the column's kind %d (block %u)",
-						   (unsigned) h.typid_kind, want_kind, root),
-				 errhint("REINDEX the index to rebuild it.")));
+		*errmsg_out = "store";
+		*detail_out = psprintf("store value kind %u does not match the column's kind %d (block %u)",
+							   (unsigned) h.typid_kind, want_kind, root);
+		return NULL;
 	}
 
 	if (ndocs_out != NULL)
 		*ndocs_out = h.ndocs;
 	return (const void *) img;
+}
+
+/* Report a failed weave_docvals_try_load() as the corruption it is.  Two full
+ * messages rather than one assembled from `what`, so each stays translatable. */
+void
+weave_docvals_report_corrupt(Relation index, const char *what, const char *detail)
+{
+	if (strcmp(what, "store") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("corrupt docvalues store in index \"%s\"",
+						RelationGetRelationName(index)),
+				 errdetail("%s", detail),
+				 errhint("REINDEX the index to rebuild it.")));
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("corrupt docvalues page chain in index \"%s\"",
+					RelationGetRelationName(index)),
+			 errdetail("%s", detail),
+			 errhint("REINDEX the index to rebuild it.")));
+}
+
+const void *
+weave_docvals_load(Relation index, BlockNumber root,
+				   MemoryContext cxt, uint32 *ndocs_out, int want_kind)
+{
+	const char *what;
+	char	   *detail;
+	const void *img;
+
+	img = weave_docvals_try_load(index, root, cxt, ndocs_out, want_kind,
+								 &what, &detail);
+	if (img == NULL)
+		weave_docvals_report_corrupt(index, what, detail);
+	return img;
 }
 
 /* ---------------------------------------------------------------------------

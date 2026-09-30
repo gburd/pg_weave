@@ -1669,6 +1669,28 @@ extern const void *weave_docvals_load(Relation index, BlockNumber root,
 									  int want_kind);
 
 /*
+ * weave_docvals_load() without the ereport, for a SCAN (doc/GAPS.md G68).  A
+ * scan loads the chain its directory snapshot names, and a concurrent merge may
+ * have freed and recycled those pages, so an unsound chain is a race until the
+ * directory generation says otherwise: the scan re-checks the generation, and
+ * retries if it moved, before calling weave_docvals_report_corrupt().  Returns
+ * NULL with *errmsg_out ("store" or "page chain") and a palloc'd *detail_out on
+ * any failure the throwing loader would have raised; checks are identical.
+ */
+extern const void *weave_docvals_try_load(Relation index, BlockNumber root,
+										  MemoryContext cxt, uint32 *ndocs_out,
+										  int want_kind, const char **errmsg_out,
+										  char **detail_out);
+#ifdef pg_noreturn
+pg_noreturn extern void weave_docvals_report_corrupt(Relation index,
+													 const char *what,
+													 const char *detail);
+#else
+extern void weave_docvals_report_corrupt(Relation index, const char *what,
+										 const char *detail) pg_attribute_noreturn();
+#endif
+
+/*
  * Build-time accumulator for one docvalues column (an int8-encoded scalar, or
  * text), the mirror of WeaveVecAccum (include/weave/vector.h): the build
  * callback appends one (docid, value) pair per indexed document in HEAP-SCAN
@@ -2078,6 +2100,14 @@ extern IndexBulkDeleteResult *weave_vacuumcleanup(IndexVacuumInfo *info,
 												  IndexBulkDeleteResult *stats);
 extern bool weave_vacuum_compact(Relation index);
 extern BlockNumber weave_truncate_free_tail(Relation index);
+
+/*
+ * Set by ambuild (src/am/ambuild.c) around its post-build compaction: the index
+ * is not yet visible to any other backend, so the tail truncation may run
+ * without the AccessExclusiveLock it otherwise requires (doc/GAPS.md G67).  A
+ * process-wide mode flag like weave_alloc_extend_only, reset in PG_FINALLY.
+ */
+extern bool weave_truncate_sole_writer;
 
 /*
  * src/pages/trgm_page.c -- the blob writer/reader (also used for the livedocs

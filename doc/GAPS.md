@@ -4327,3 +4327,138 @@ evidence is the measurement recorded above, not a test.
 either. Its lexical channels are segment shuttles, so a fused answer misses pending
 documents exactly as the ranked one did. The vector channel's version of the same gap is
 G29.
+
+### G67 — plain VACUUM truncated the index under concurrent INSERTs: committed rows lost, then every extension failed "unexpected data beyond EOF" — **FOUND 2026-09-29 by t/025 on PG18; PRE-EXISTING; P0 silent row loss on ordinary INSERT + VACUUM; FIXED 2026-09-29**
+
+`weave_vacuum_compact()` runs from `amvacuumcleanup` when a quarter of the file is free,
+and it ended with `RelationTruncate()` on a tail it judged free from an **unlocked** read
+of the free-space map. VACUUM holds ShareUpdateExclusiveLock on the heap and
+RowExclusiveLock on the index, and neither excludes INSERT. The code comment said the
+opposite ("single-writer only (holds a lock that excludes concurrent writers, e.g.
+VACUUM's ShareUpdateExclusiveLock)"), and that wrong claim is the root cause. Two
+failures follow from it:
+
+- **Row loss.** The tail scan sees block B as free. An inserter is then handed B and
+  links pending items onto it. `RelationTruncate()` drops B's buffer, dirty or not, and
+  cuts the file. The committed rows are gone and the pending chain names a block past
+  EOF. t/025's reader showed the index count frozen at 7476 while the heap grew past 9348.
+- **"unexpected data beyond EOF in block N".** `RelationTruncate()` drops buffers before
+  it truncates the file. A backend that reads B in that window leaves a valid buffer past
+  the new end, and every later extension to B refuses it. All four inserters and the
+  VACUUM itself failed this way about 90 ms after the rows went missing.
+
+**Fix** (`weave_truncate_tail_above()`, `src/am/amvacuum.c`): the same answer heap
+truncation uses. Take AccessExclusiveLock on the index **conditionally**, skip the
+truncation if anyone else is in the index, and truncate only while holding the lock.
+Under the lock the FSM is still not trusted, because it is not crash-safe: a tail block
+is cut only if the FSM calls it free **and** the page is new or flagged `WEAVE_FREED`.
+Both truncation sites (the pass loop and the backstop) go through the helper.
+
+**Evidence.**
+- **Stress script** (`/scratch/pg_weave/stress025.sh` shape: 4 inserters, VACUUM every
+  50 ms from a fresh backend, and a reader; 10 s rounds):
+  - unfixed: 6 of 12 rounds ended with index < heap and `weave_check` failing;
+  - fixed: 0 of 30 rounds.
+- **t/028_vacuum_truncate_race.pl**, 8 rounds of 5 s each:
+  - unfixed: failed 4 of 4 runs across pg17 and pg18;
+  - fixed: 0 of 12 runs (96 rounds), 6 per major, plus the full TAP suite green on both.
+- **The t/028 harness itself needed two corrections before it could fail:**
+  - with every VACUUM in one session it caught the bug in only about half of the runs;
+  - a quoting slip once made its VACUUM loop exit on its first test, so every round
+    "passed" with no VACUUM at all.
+
+  It now asserts its own loop ran at least 10 VACUUMs per round.
+- **Positive control that truncation still happens:** after a quiet
+  DELETE-then-VACUUM, t/028 requires the index file to shrink (1462 → 376 blocks
+  measured).
+
+**The first version of the fix was itself wrong, and review found it before it
+shipped.** Acquiring AccessExclusiveLock on a relation assigns an xid for the
+hot-standby lock record *before* the conflict check, and assigning an xid in parallel
+mode is an ERROR. weave is `VACUUM_OPTION_NO_PARALLEL`, so a parallel VACUUM runs
+weave's cleanup in the leader while still in parallel mode. Heap truncation escapes this
+because it runs after the leader leaves parallel mode. A table with a weave index and
+two btrees above `min_parallel_index_scan_size` then failed **every** VACUUM with
+`cannot assign transaction IDs during a parallel operation`. Plain `VACUUM` is parallel
+by default, so this included it. The consequence would have been worse than G67: an
+index that can never be vacuumed, so `relfrozenxid` never advances.
+
+It is now skipped in parallel mode. The same review added three more changes:
+- **Cheap precheck:** the lock is requested only when the last block is free, so a pass
+  with nothing to truncate costs no xid.
+- **Yield to waiters:** the tail scan checks `LockHasWaitersRelation()` every 32 blocks
+  and stops if another backend is waiting.
+- **Sole writer:** `weave_truncate_sole_writer` covers ambuild. CREATE INDEX
+  CONCURRENTLY holds only RowExclusiveLock on the new index, so without the flag the
+  conditional lock would usually fail there, and G6/L8's post-build shrink would
+  silently stop.
+
+t/028's last section pins the parallel case. Its shape is 60,000 pending rows, then a
+90% DELETE. On the pre-fix build both `VACUUM (PARALLEL 2)` passes raise the ERROR. Its
+positive controls:
+- the VACUUMs launched parallel workers;
+- the weave index was more than a quarter free, so the compaction trigger was reached;
+- the node runs `wal_level = replica`. Under the TAP default of minimal, the lock is not
+  logged and the bug cannot occur.
+
+### G68 — a scan's docvalues gate raised "corrupt docvalues store" when a concurrent merge replaced the store it was reading — **FOUND 2026-09-29 by t/028 (after G67's fix); PRE-EXISTING; spurious ERROR under concurrency; FIXED 2026-09-29**
+
+`weave_docvals_collect()` loads each bolt's store from the root its directory snapshot
+names, inside the generation re-check loop every other channel uses. But
+`weave_docvals_load()` **throws** on an unsound chain. A merge that had freed and
+recycled that chain therefore surfaced as `ERROR: corrupt docvalues store ... image too
+short for stated ndocs` with a REINDEX hint, before the generation re-check could call
+it a race. That told the user to REINDEX a healthy index.
+
+**Fix.** `weave_docvals_try_load()` performs the same checks without the ereport.
+When it fails, the scan re-reads the generation:
+- **moved**: the failure was a race, so the scan retries the pass, bounded by
+  `pg_weave.scan_race_retries` and then 40001, exactly as for the other channels;
+- **unmoved**: `weave_docvals_report_corrupt()` raises the same two messages as
+  before, so t/024's corruption cases are unchanged.
+
+The merge and amcheck keep the throwing loader, because they run under the maintenance
+lock, where the chain cannot move.
+
+### G69 — a row DELETEd while still pending survived VACUUM into a bolt: reads past heap EOF, a failing heap INSERT, and dead rows counted — **FOUND 2026-09-29 by t/028's quiet phase; PRE-EXISTING; P0, deterministic, reachable by INSERT + DELETE + VACUUM; FIXED 2026-09-29**
+
+`weave_bulkdelete()` tombstoned docids it found in **segments**, and never looked at the
+pending list. A dead row still pending passed through untouched, and the flush in
+`vacuumcleanup` then folded it into a new bolt. The result is a live index entry for a
+heap slot VACUUM had just freed. The deterministic reproduction (`sql/docvals.sql` sect.
+17) is 200 built rows, 2000 post-build INSERTs, a DELETE of those 2000, and a VACUUM that
+truncates the heap. Then:
+- `cat < 'b'` failed with `could not read blocks 3..3 ... read only 0 of 8192 bytes`;
+- the lexical count and `weave_count()` returned **2200 for 200**, because the fast
+  count path trusts the index;
+- the next heap INSERT failed with `page 3 of relation "g69" should be empty but is
+  not`, so the TABLE was unwritable until the index was rebuilt.
+
+Before G67's fix, t/028's rounds masked this with the truncation race.
+
+**Fix.** Bulkdelete flushes the pending list first, which is GIN's shape
+(`ginbulkdelete()` → `ginInsertCleanup()`). This is sound for this batch:
+- every TID in its dead set was seen by the heap scan before the call, so it was
+  inserted before the flush and is in the list the flush folds;
+- a row appended during the flush (the G61 cut) was inserted after the scan, so it
+  cannot be dead in this batch.
+
+**Pinned** by sect. 17, whose positive control asserts the heap really truncated. On the
+unfixed build the section's index queries error, and the corresponding regression-run
+output is recorded in this entry's commit message.
+
+### G70 — the docvalues gate returned a row twice during a flush: a plain Index Scan counted 2098 rows where the heap had 1593 — **FOUND 2026-09-29 by t/028's reader; PRE-EXISTING; transient silent wrong answer under concurrent INSERT + VACUUM; FIXED 2026-09-29**
+
+A flush adds its bolt and clears the pending items it folded as two steps (G65). A scan
+between them reads a consistent directory: the generation it re-checks has not moved
+again. It sees the same row in the new bolt **and** in the pending list.
+`weave_docvals_collect()` concatenated the segment pass and the pending pass and sorted
+them without deduplicating, so a plain Index Scan returned the row twice. A bitmap scan
+collapses duplicates in its bitmap and was unaffected. The reader in t/028 compares the
+index count with a heap count taken in the same snapshot, and measured
+index=2098 against heap=1593.
+
+**Fix.** Deduplicate by TID after the final sort. Two things remain open:
+- **The lexical path's own collection** was not observed to duplicate in these runs, and
+  has not been audited for the same window.
+- **G65** remains open for the crash case. G70 is its visible symptom without a crash.

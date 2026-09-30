@@ -5473,10 +5473,36 @@ docvals_retry:
 		 * The kind the caller can interpret is enforced by the loader: a v1/v2
 		 * (int8) store under a text column, or the reverse, is impossible by
 		 * construction and is an ERROR there rather than a wrong answer here.
+		 *
+		 * Loaded WITHOUT the throw (doc/GAPS.md G68): `root` came from a
+		 * directory snapshot, and a concurrent merge may have freed and recycled
+		 * that chain since -- measured in t/028, where the reader hit "image too
+		 * short for stated ndocs" on a store the merge had just replaced.  So an
+		 * unsound chain is a race until the generation says it is not: moved ->
+		 * retry the whole pass, unmoved -> the store really is corrupt.
 		 */
-		img = weave_docvals_load(index, root, CurrentMemoryContext, &ndocs,
-								 tkey != NULL ? WEAVE_DV_KIND_TEXT
-								 : WEAVE_DV_KIND_INT8);
+		{
+			const char *what;
+			char	   *detail;
+
+			img = weave_docvals_try_load(index, root, CurrentMemoryContext,
+										 &ndocs,
+										 tkey != NULL ? WEAVE_DV_KIND_TEXT
+										 : WEAVE_DV_KIND_INT8,
+										 &what, &detail);
+			if (img == NULL)
+			{
+				if (weave_read_meta_generation(index) == gen0)
+					weave_docvals_report_corrupt(index, what, detail);
+				pfree(detail);
+				weave_tombstones_free(&seg_tombs);
+				if (gen_retries >= pg_weave_scan_race_retries)
+					weave_scan_raced_out(index, "docvalues", gen_retries + 1);
+				gen_retries++;
+				weave_read_meta(index, &meta);
+				goto docvals_retry;
+			}
+		}
 		if (ndocs == 0)
 		{
 			pfree((void *) img);
@@ -5644,7 +5670,25 @@ docvals_retry:
 	}
 
 	if (ntids > 1)
+	{
+		int			w = 1;
+		int			r;
+
 		qsort(tids, ntids, sizeof(ItemPointerData), weave_docvals_cmp_tid);
+
+		/*
+		 * Deduplicate (doc/GAPS.md G70).  A flush adds its bolt and clears the
+		 * pending items it folded as two steps (G65), and a scan between them
+		 * sees the same row in the new bolt AND in the pending list -- a
+		 * consistent directory, so the generation re-check accepts it.  Emitted
+		 * twice, a plain Index Scan returned the row twice: t/028's reader
+		 * measured index=2098 against heap=1593 in one snapshot.
+		 */
+		for (r = 1; r < ntids; r++)
+			if (!ItemPointerEquals(&tids[r], &tids[w - 1]))
+				tids[w++] = tids[r];
+		ntids = w;
+	}
 
 	out->tids = tids;
 	out->n = ntids;

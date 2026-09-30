@@ -1535,3 +1535,40 @@ SELECT count(*) FILTER (WHERE id > 1000) AS edist_pending
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 DROP TABLE dvg;
+
+-- ---------------------------------------------------------------------------
+-- 17. a row DELETEd while still PENDING must not survive VACUUM (doc/GAPS.md
+-- G69).  bulkdelete tombstoned docids only in segments, so a dead pending row
+-- was left alone and vacuumcleanup's flush then folded it into a new bolt: a
+-- live index entry for a heap slot VACUUM had freed.  With the heap tail
+-- truncated, the index scans below failed with "could not read blocks ...
+-- read only 0 of 8192 bytes", the INSERT failed with "page N of relation ...
+-- should be empty but is not", and the lexical count returned 2200 for 200.
+-- POSITIVE CONTROL that the scenario is the one described: the heap really was
+-- truncated (heap_truncated), so a surviving entry would point past EOF.
+-- ---------------------------------------------------------------------------
+CREATE TABLE dvq (id int, body wdoc, cat text COLLATE "C")
+    WITH (autovacuum_enabled = off);
+INSERT INTO dvq SELECT g, to_wdoc('common w' || g), 'b' || (g % 10)
+  FROM generate_series(1, 200) g;
+CREATE INDEX dvq_w ON dvq USING weave (body wdoc_lex_ops, cat text_docval_ops);
+INSERT INTO dvq SELECT g, to_wdoc('common w' || g), 'a' || (g % 10)
+  FROM generate_series(1001, 3000) g;
+CREATE TEMP TABLE dvq_sz AS SELECT pg_relation_size('dvq') / 8192 AS heap_blocks;
+DELETE FROM dvq WHERE id > 1000;
+VACUUM dvq;
+SELECT pg_relation_size('dvq') / 8192 < (SELECT heap_blocks FROM dvq_sz)
+       AS heap_truncated;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT count(*) AS dead_pending_docvals FROM dvq WHERE cat < 'b';
+SELECT count(*) AS lex_common FROM dvq WHERE body @@@ 'common'::wquery;
+SELECT weave_count('dvq_w', 'common') AS weave_count_common;
+INSERT INTO dvq SELECT g, to_wdoc('zebra w' || g), 'z' || (g % 10)
+  FROM generate_series(5001, 5100) g;
+SELECT count(*) AS docvals_after_reuse FROM dvq WHERE cat < 'b';
+SELECT count(*) AS zebra_after_reuse FROM dvq WHERE body @@@ 'zebra'::wquery;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT count(*) AS violations FROM weave_check('dvq_w', true) WHERE NOT ok;
+DROP TABLE dvq, dvq_sz;

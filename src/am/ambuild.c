@@ -5652,17 +5652,29 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * maintenance call to reach the natural size is a defect, not a tuning knob.
 	 * Gap G6 / task L8 in doc/GAPS.md.
 	 *
-	 * Safe here for the reasons the free-tail truncation was: we hold the index
-	 * AccessExclusiveLock, parallel workers are already torn down
-	 * (weave_end_parallel), and during ambuild the index is not yet visible to
-	 * other backends (indisready=false, even under CONCURRENTLY), so this backend
-	 * is the sole writer and the page-recycle gate's exclusive-lock precondition
-	 * holds.  The vacate phase grows the file transiently before truncating; that
+	 * Safe here for the reasons the free-tail truncation was: parallel workers
+	 * are already torn down (weave_end_parallel), and during ambuild the index
+	 * is not yet visible to other backends (indisready=false, even under
+	 * CONCURRENTLY), so this backend is the sole writer.  It does NOT
+	 * necessarily hold AccessExclusiveLock -- CREATE INDEX CONCURRENTLY holds
+	 * only RowExclusiveLock on the new index -- which is why the truncation is
+	 * told so explicitly (weave_truncate_sole_writer, doc/GAPS.md G67) rather
+	 * than asking for the lock a concurrent query on the table would deny.
+	 * The vacate phase grows the file transiently before truncating; that
 	 * is the price of a single-pass in-place shrink and is bounded by the live
 	 * index size.
 	 */
-	if (!weave_vacuum_compact(index))
-		weave_truncate_free_tail(index);
+	weave_truncate_sole_writer = true;
+	PG_TRY();
+	{
+		if (!weave_vacuum_compact(index))
+			weave_truncate_free_tail(index);
+	}
+	PG_FINALLY();
+	{
+		weave_truncate_sole_writer = false;
+	}
+	PG_END_TRY();
 
 	MemoryContextDelete(bs.ctx);
 
