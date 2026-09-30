@@ -1507,7 +1507,16 @@ run_docvals() {
 	# instance is gone, the PostgreSQL server log and dmesg (OOM vs signal) -- before
 	# any die().  A backend crash at scale is exactly what rule 12 is meant to catch,
 	# and it is worthless if the evidence dies with the instance.
-	$SSH 'cat /tmp/dvs.log' > "$OUT/docvals_dvs_full.log" 2>/dev/null || true
+	# Retried and CHECKED: on 2026-09-30 this pull came back EMPTY (a transient ssh
+	# failure swallowed by `|| true`), so the run passed with only the 80-line tail
+	# on disk and the per-phase counts were lost with the instance.
+	for try in 1 2 3; do
+		$SSH 'cat /tmp/dvs.log' > "$OUT/docvals_dvs_full.log" 2>/dev/null && \
+			[ -s "$OUT/docvals_dvs_full.log" ] && break
+		sleep 5
+	done
+	[ -s "$OUT/docvals_dvs_full.log" ] || \
+		say "WARNING: docvals_dvs_full.log is EMPTY after 3 pulls; only the tail survives"
 	$SSH 'echo "=== postgresql-17-main.log tail ==="; sudo tail -300 /var/log/postgresql/postgresql-17-main.log 2>/dev/null
 		  echo "=== dmesg tail (OOM killer leaves a record here) ==="; sudo dmesg 2>/dev/null | tail -40
 		  echo "=== any core files ==="; ls -la /tmp/core.* /var/lib/postgresql/17/main/core* 2>/dev/null || echo none' \
