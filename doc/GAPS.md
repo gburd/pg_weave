@@ -3909,7 +3909,7 @@ then folded into a segment by the flush (G52). The prize was also re-confirmed a
 (`vec_blocks` falls ~30× as the facet tightens 100×), so Task 8 is no longer single-scale.
 `int8_docval_ops` is now release-eligible on the correctness axis.
 
-### G53 — `@@@` on a very-high-df term uses memory SUPER-LINEAR in df: a term matching ~100% of a 6.2M-row corpus OOM-kills the backend at 60 GB — **FOUND 2026-09-27 by the G51/G52 10M scale run; PRE-EXISTING lexical channel, NOT docvals; OPEN**
+### G53 — `@@@` on a very-high-df term uses memory SUPER-LINEAR in df: a term matching ~100% of a 6.2M-row corpus OOM-kills the backend at 60 GB — **FOUND 2026-09-27 by the G51/G52 10M scale run; PRE-EXISTING lexical channel, NOT docvals; CLOSED 2026-09-30 as a DUPLICATE of G64, already fixed**
 
 The docvals 10M scale run (`bench/RESULTS_DOCVALS_SCALE.md`) first used `@@@ 'common'`, a
 term present in every row, and the backend was OOM-killed (signal 9, dmesg `Out of memory`)
@@ -3935,6 +3935,45 @@ df≈1M–6M (the `bench/aws/run.sh` docvals instance reproduces it in one line)
 allocation, and bound it (stream the postings / cap the working set / spill) so a high-df
 term degrades to slower, not fatal. Until then, `bench/aws/docvals_scale.sql` and any
 scale benchmark must avoid near-universal `@@@` terms (it now uses `freq7`, df≈1%).
+
+**CLOSED 2026-09-30: this was G64, not a posting-list problem, and it was fixed on 2026-09-29
+(`1a226b5`) before anyone knew the two were one bug.** The segment path was never
+super-linear. What grew quadratically was the **pending list**: the run's phase 5 left
+**200,000 unflushed rows**, and the pre-G64 collector added each pending match with
+`acc = tidset_or(acc, one)`, allocating an (n+1)-entry array per match and freeing none,
+so about n^2/2 x 6 bytes. The arithmetic reproduces both recorded figures:
+
+| term | segment matches | pending matches | predicted n^2/2 x 6 B | recorded |
+|---|---|---|---|---|
+| `'3'` (id % 5 = 3) | 2,000,000 | 40,000 | **4.8 GB** | ~4.6 GB |
+| `'common'` | 6,000,000 | 200,000 | **~120 GB** | > 60 GB, OOM |
+
+"2.04M matches" is exactly 2.0M in the segment plus 40k pending, and "6.2M" is 6.0M plus 200k.
+The df was a proxy for the pending count because both came from the same generator.
+
+**Evidence, on the local cluster (`/scratch/pg_weave/g53.sh`, peak `RssAnon`):**
+
+- Segment path, no pending rows: 1M matches **3 MB**, 3M matches **2 MB** (count fast path),
+  and **65 MB** through the collector (`'common | nosuchterm'`, forcing the full
+  collect). That is linear, so there is no high-df problem.
+- 100k + 200k unflushed pending rows, all matching: **7 MB** on the current tree.
+- **Positive control:** G64's one-line fix reverted (`tidset_append` swapped back to
+  `tidset_or(pending_acc, one)`) on the same table: the backend was **OOM-killed at 16.7 GB**
+  on a 30 GB host. So the guard is known to fail when the bug is present, and the fixed
+  tree's 7 MB is evidence.
+- A trap worth recording: `VmRSS` read 150-180 MB for the segment path, which looked like
+  ~160 B per match. It was shared-buffer pages the backend touched. `RssAnon` is the
+  private figure; any memory claim about a backend should quote that one.
+
+`t/027` already pins the fix: 50k unflushed rows, collecting backend `VmHWM` < 1 GB.
+**Fixed alongside it, since it was a neighbour and not this bug:** the per-segment folds in
+`weave_collect_matches()` and the cgram collector did `acc = tidset_or(acc, result)` and freed
+neither input, so a collect held O(nsegments x matches). `tidset_or_into()` frees both.
+Peak `RssAnon` for `'common | nosuchterm'` dropped from 56 to 42 MB (2.4M rows over 2
+segments) and from 65 to 52 MB (3M rows, 1 segment, where the freed input is the lookup
+result). Tiered merging keeps the live segment count at 8 or fewer per level, so this was a
+constant factor and never the OOM.
+`bench/aws/docvals_scale.sql` may go back to `@@@ 'common'`.
 
 ### G54 — only the FIRST docvalues scankey was honoured: `price > 10 AND price < 20` answered as `price > 10` — **FOUND 2026-09-28 in the text-docvals T3 review; a G49-class silent wrong answer; FIXED 2026-09-28**
 

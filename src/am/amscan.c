@@ -1085,6 +1085,23 @@ tidset_or(TidSet a, TidSet b)
 }
 
 /*
+ * acc |= b, freeing both inputs.  The per-segment folds in the collectors used
+ * `acc = tidset_or(acc, b)` and kept every intermediate acc alive until the
+ * query's context reset, so a collect held O(nsegments x matches).
+ */
+static void
+tidset_or_into(TidSet *acc, TidSet b)
+{
+	TidSet		r = tidset_or(*acc, b);
+
+	if (acc->tids)
+		pfree(acc->tids);
+	if (b.tids)
+		pfree(b.tids);
+	*acc = r;
+}
+
+/*
  * Append one TID to an UNSORTED accumulator, growing it by doubling; the
  * caller runs tidset_sort_uniq() once at the end.  The pending walks used to
  * add each match with tidset_or(acc, one), which allocates a fresh n+1 array
@@ -4423,7 +4440,7 @@ collect_retry:
 				{
 					weave_filter_tombstoned_seg(&seg_tombs, s, &cands);
 					if (cands.n > 0)
-						acc = tidset_or(acc, cands);
+						tidset_or_into(&acc, cands);
 				}
 			}
 			else
@@ -4448,7 +4465,7 @@ collect_retry:
 				{
 					weave_filter_tombstoned_seg(&seg_tombs, s, &universe);
 					if (universe.n > 0)
-						acc = tidset_or(acc, universe);
+						tidset_or_into(&acc, universe);
 				}
 			}
 			continue;
@@ -4537,7 +4554,7 @@ collect_retry:
 					 * so a heap recheck of @@@ enforces adjacency exactly. */
 					if (has_phrase)
 						need_recheck = true;
-					acc = tidset_or(acc, result);
+					tidset_or_into(&acc, result);
 				}
 			}
 		}
@@ -5252,7 +5269,7 @@ weave_cgram_collect(Relation index, const char *pat, int patlen, bool ci,
 		{
 			weave_filter_tombstoned_seg(&seg_tombs, s, &cands);
 			if (cands.n > 0)
-				acc = tidset_or(acc, cands);
+				tidset_or_into(&acc, cands);
 		}
 	}
 

@@ -177,7 +177,7 @@ credentials.
   would exercise a merge of >2 inputs and is worth adding.
 - **Latencies are indicative only** (shared burner). The wall-clock column is for order
   of magnitude, not comparison.
-- **SURFACED — a lexical-channel memory blowup, NOT docvals (doc/GAPS.md G53).** The
+- **SURFACED — a memory blowup, NOT docvals (doc/GAPS.md G53; CLOSED 2026-09-30 as G64, the O(n²) pending-list collect, fixed in `1a226b5`: the 200k phase-5 pending rows, not the df, drove it).** The
   first workload used `@@@ 'common'`, a term matching ~100% of the corpus, and the
   backend was OOM-killed (signal 9) at **60 GB anon-rss**. Isolated on the kept
   instance: `@@@` memory scales **super-linearly with df** — a 20%-df term (2.04M
