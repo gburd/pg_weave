@@ -234,6 +234,12 @@ say "host $HOST"
 # -F /dev/null is load-bearing, not defensive.  A developer's ~/.ssh/config
 # commonly has a `Host *` block, and this one sets ControlMaster auto with a
 # shared ControlPath, an explicit IdentityFile, and a 5-second ConnectTimeout.
+#
+# ConnectionAttempts retries the TCP connect itself.  Added 2026-10-01 after two
+# runs in a row died on ONE mid-run "connect ... Connection timed out" from a
+# stable egress address: the first lost installcheck's output and reported an
+# empty failure, the second lost MEMKB below and started the server with
+# shared_buffers = 0MB.  Neither was about the code.
 # Any of those breaks a fresh-instance connection: the mux socket can collide,
 # and the global IdentityFile is offered ahead of ours so authentication fails
 # before the launch key is ever tried.  The first version of this script did not
@@ -246,7 +252,9 @@ say "host $HOST"
 SSH="ssh -F /dev/null -i $KEYFILE -o IdentitiesOnly=yes \
 	-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
 	-o ControlMaster=no -o ControlPath=none \
-	-o ConnectTimeout=15 -o LogLevel=ERROR ubuntu@$HOST"
+	-o ConnectTimeout=15 -o ConnectionAttempts=6 \
+	-o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
+	-o LogLevel=ERROR ubuntu@$HOST"
 for i in $(seq 1 40); do
 	$SSH true 2>/dev/null && break
 	if [ "$i" = 40 ]; then
@@ -301,6 +309,7 @@ grep -q 'pg_config: PostgreSQL 17' "$OUT/provision.log" \
 # result unusable (.agent/skills/weave-bench).
 say "tuning postgresql"
 MEMKB=$($SSH "awk '/MemTotal/{print \$2}' /proc/meminfo")
+case "$MEMKB" in ''|*[!0-9]*) die "could not read MemTotal from the host (got '$MEMKB')" ;; esac
 # 40% of RAM, in MB.  MEMKB is KILOBYTES, so ONE division by 1024 gives MB.
 # This line used to divide twice and then label the result MB, so every tuned
 # run this harness ever produced had shared_buffers set to 24 MB on a 61 GB box
