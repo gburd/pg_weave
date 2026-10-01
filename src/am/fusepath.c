@@ -1326,8 +1326,21 @@ weave_fuse_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		 * WEAVE_FUSE_MAX_CHAN channels, and an AM that refuses at rescan time a
 		 * path the planner offered is doc/GAPS.md G39.
 		 */
-		if (ok && totchan + 1 > WEAVE_FUSE_MAX_CHAN)
-			ok = false;
+		/*
+		 * And one more when a vector key is present: a bolt with a NULL-vector
+		 * row gets a REQUIRED "has a live lane" gate (doc/GAPS.md G71).
+		 */
+		if (ok)
+		{
+			bool		anyvec = false;
+
+			for (i = 0; i < nscores; i++)
+				if (req[i].strategy == WEAVE_STRAT_VEC_L2 ||
+					req[i].strategy == WEAVE_STRAT_VEC_IP)
+					anyvec = true;
+			if (totchan + 1 + (anyvec ? 1 : 0) > WEAVE_FUSE_MAX_CHAN)
+				ok = false;
+		}
 		if (!ok)
 		{
 			pfree(req);

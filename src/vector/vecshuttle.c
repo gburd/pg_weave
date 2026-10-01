@@ -198,6 +198,37 @@ dir_cur_next(VecDirCursor *c, WeaveVecDirRec *out, const char **why)
 	return true;
 }
 
+bool
+weave_vec_weft_clear_dead(const WeaveVecWeft *w, uint64 *allow, const char **why)
+{
+	VecDirCursor dc;
+	uint32		b;
+	bool		ok = true;
+
+	dir_cur_begin(&dc, w);
+	for (b = 0; b < w->geom.nblocks; b++)
+	{
+		WeaveVecDirRec rec;
+		int			nl = weave_vecweft_block_lanes(&w->geom, b);
+		int			s;
+
+		if (!dir_cur_next(&dc, &rec, why))
+		{
+			ok = false;
+			break;
+		}
+		for (s = 0; s < nl; s++)
+		{
+			uint32		lane = b * WEAVE_VEC_BLOCK + (uint32) s;
+
+			if ((rec.livemask & (1u << s)) == 0)
+				allow[lane / 64] &= ~(UINT64CONST(1) << (lane % 64));
+		}
+	}
+	dir_cur_end(&dc);
+	return ok;
+}
+
 /*
  * The record for block `target`, skipping the ones between.  Forward-only:
  * skipping within the buffered page is free and skipping past it reads the pages

@@ -826,6 +826,17 @@ extern bool weave_vec_weft_maxscore(const WeaveVecWeft *w, const float *query,
 									int qdim, float *out, const char **why);
 
 /*
+ * Clear, in `allow` (a lane bitmap of ceil(nvec/64) words), every lane the
+ * weft's directory marks DEAD -- a row whose vector was NULL, or a lane vacuum
+ * zeroed.  One forward pass of the directory chain.  doc/GAPS.md G71: the fused
+ * pass needs the set of documents that HAVE a vector, and the warp map alone
+ * lists every document of the bolt, dead lanes included.  Returns false and sets
+ * *why on a structural problem.
+ */
+extern bool weave_vec_weft_clear_dead(const WeaveVecWeft *w, uint64 *allow,
+									  const char **why);
+
+/*
  * The driver's current top-k floor, handed to the decision core so that
  * WEAVE_VSCAN_SKIP_BOUND is reachable at all.
  *

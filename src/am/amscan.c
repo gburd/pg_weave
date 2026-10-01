@@ -3174,17 +3174,21 @@ weave_set_itup(IndexScanDesc scan, WeaveScanOpaque so)
 /*
  * The G56 padding phase -- see the padActive fields in WeaveScanOpaqueData.
  *
- * Wanted on the lexical `<=>`, vector (`<->`, `<#>`) and edit-distance (`<@>`)
- * routes -- not the fused one, which doc/specs/FUSED_TOPK.md keeps exact over
- * its gate -- and not when a restriction key IS the ORDER BY query
- * (ordQueryRestricts, whatever keys are beside it):
+ * Wanted on every ordering route: lexical `<=>`, vector (`<->`, `<#>`),
+ * edit-distance (`<@>`) and, since doc/GAPS.md G71, fused -- whose ranked phase
+ * is exact over its gate, which is now also why it must pad: rows the gate
+ * excludes (a NULL vector) are still rows of the table.  Not when a single-key
+ * restriction IS the ORDER BY query (ordQueryRestricts, whatever keys are beside
+ * it):
  * every key is ANDed, so a row q does not match fails that key and the heap
  * walk would return nothing -- once per rescan, under a nested loop.
  */
 static bool
 weave_pad_wanted(IndexScanDesc scan, WeaveScanOpaque so)
 {
-	return scan->numberOfOrderBys == 1 && !so->fuseScan &&
+	if (so->fuseScan)
+		return true;			/* G71: see weave_pad_emit for the distance */
+	return scan->numberOfOrderBys == 1 &&
 		!so->ordSameQuery && !so->ordQueryRestricts;
 }
 
@@ -3280,13 +3284,31 @@ weave_pad_end(WeaveScanOpaque so)
 	so->padDone = false;
 }
 
+/* Does a fused scan carry a vector key? */
+static bool
+weave_fuse_has_vec(WeaveScanOpaque so)
+{
+	int			j;
+
+	for (j = 0; j < so->nfuse; j++)
+		if (so->fuseStrat[j] != WEAVE_STRAT_DISTANCE)
+			return true;
+	return false;
+}
+
 /* hand one padding row to the executor at distance 1.0, or NULL */
 static void
 weave_pad_emit(IndexScanDesc scan, WeaveScanOpaque so, ItemPointer tid,
 			   bool nulldist)
 {
-	IndexOrderByDistance dist[1];
-	Oid			typ[1];
+	/*
+	 * ONE ENTRY PER ORDER-BY KEY: index_store_float8_orderby_distances() reads
+	 * numberOfOrderBys of them, and a fused scan has several (see the same note
+	 * in weave_gettuple).  The value is slot 0's; the rest are NULL.
+	 */
+	IndexOrderByDistance dist[INDEX_MAX_KEYS];
+	Oid			typ[INDEX_MAX_KEYS];
+	int			k;
 
 	scan->xs_heaptid = *tid;
 	/* the WHERE clause was applied to none of these rows */
@@ -3298,7 +3320,6 @@ weave_pad_emit(IndexScanDesc scan, WeaveScanOpaque so, ItemPointer tid,
 	 * see the padActive comment in WeaveScanOpaqueData for why the heap
 	 * operator's value cannot be used here.
 	 */
-	typ[0] = FLOAT8OID;
 	/*
 	 * The vector and edit-distance routes pad at +Infinity.  For `<@>` that is
 	 * exactly the heap operator's value: the ranked phase is complete only once
@@ -3308,10 +3329,42 @@ weave_pad_emit(IndexScanDesc scan, WeaveScanOpaque so, ItemPointer tid,
 	 * vector the flush would also drop (corrupt, or the wrong dimension); it is
 	 * still a row of the table, so it comes out, after every ranked one.
 	 */
+	for (k = 0; k < scan->numberOfOrderBys; k++)
+	{
+		typ[k] = FLOAT8OID;
+		dist[k].value = 0.0;
+		dist[k].isnull = true;
+	}
+	/*
+	 * A fused row reaching here with every column present is a document no
+	 * scored channel reached: without a vector key every channel is lexical and
+	 * fuse() is exactly -0, at or after every ranked -S (S > 0); with one, every
+	 * row with a live lane was ranked, so only a vector the flush also drops
+	 * (corrupt, wrong dimension) arrives, at +Infinity like the vector route.
+	 */
 	dist[0].value = nulldist ? 0.0
-		: (so->vecScan || so->edistScan) ? (double) INFINITY : 1.0;
+		: (so->vecScan || so->edistScan) ? (double) INFINITY
+		: so->fuseScan ? (weave_fuse_has_vec(so) ? (double) INFINITY : 0.0)
+		: 1.0;
 	dist[0].isnull = nulldist;
 	index_store_float8_orderby_distances(scan, typ, dist, false);
+}
+
+/*
+ * A fused row's fuse() value is NULL when ANY channel's column is NULL (fuse()
+ * is NULL on a NULL argument), so it pads last, at NULL, like a NULL document.
+ */
+static bool
+weave_pad_fuse_null(WeaveScanOpaque so, const bool *isnull)
+{
+	int			j;
+
+	if (!so->fuseScan)
+		return false;
+	for (j = 0; j < so->nfuse; j++)
+		if (so->fuseA[j] >= 1 && isnull[so->fuseA[j] - 1])
+			return true;
+	return false;
 }
 
 /*
@@ -3371,7 +3424,7 @@ weave_pad_gettuple(IndexScanDesc scan, WeaveScanOpaque so)
 				continue;
 			ItemPointerSetOffsetNumber(&rtid, so->padRoots[off - 1]);
 
-			if (isnull[so->padAttIdx])
+			if (isnull[so->padAttIdx] || weave_pad_fuse_null(so, isnull))
 			{
 				/* never indexed, so never ranked: emitted last, at NULL */
 				if (so->npadNulls >= so->capPadNulls)
@@ -9544,6 +9597,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 			int			nscored = 0;
 			int			nvc = 0;
 			int			nh;
+			bool		novector = false;	/* G71: a vector key with no live lane here */
 
 			if (sg->dictstart == InvalidBlockNumber)
 				continue;
@@ -9672,7 +9726,16 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 
 				root = weave_vec_weft_locate(index, sg, &wattnum);
 				if (root == InvalidBlockNumber)
-					continue;	/* this bolt carries no vector weft */
+				{
+					/*
+					 * No weft: no document of this bolt has a vector for this key,
+					 * so every one of them has a NULL fuse() value and none is a
+					 * ranked candidate (doc/GAPS.md G71).  They come out of the
+					 * padding phase, last, at a NULL distance.
+					 */
+					novector = true;
+					break;
+				}
 
 				/* ROUTE BY ATTRIBUTE.  An index may carry more than one wvec
 				 * column, and scoring the weft of a different column is a wrong
@@ -9691,7 +9754,10 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 							 errdetail("%s.", why != NULL ? why : "unknown reason")));
 
 				if (w.meta.nvec == 0)
-					continue;	/* nothing to publish; see vecdocmap.h's refusals */
+				{
+					novector = true;	/* G71, as above */
+					break;
+				}
 
 				if (nch >= WEAVE_FUSE_MAX_CHAN - 1)
 					ereport(ERROR,
@@ -9703,7 +9769,65 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 				nlane = weave_fuse_vec_warpmap(index, &w, (int) s, &tombs,
 											   &dmap, &allow);
 				if (nlane == 0)
-					continue;	/* every document of this bolt is tombstoned */
+				{
+					novector = true;	/* every document here is tombstoned */
+					break;
+				}
+
+				/*
+				 * doc/GAPS.md G71: A ROW WHOSE VECTOR IS NULL MUST NOT BE A RANKED
+				 * CANDIDATE.  The vector shuttle never publishes a dead lane, so
+				 * such a row is reached only by the other channels, and the core
+				 * scores an unreached scored channel as 0 (fuse.h note 2).  With
+				 * l2 scores <= 0 that 0 is the BEST vector score there is, so the
+				 * row went to the top of the ranking, where `fuse()` itself is
+				 * NULL and the fallback Sort puts it last.  So the documents that
+				 * do have a live lane become a REQUIRED gate, the rest are left to
+				 * the padding phase, and the gate is only built when the bolt has
+				 * a dead lane at all -- a fully-populated column pays nothing.
+				 */
+				{
+					const char *dwhy = NULL;
+					uint32		nword = ((uint32) w.meta.nvec + 63) / 64;
+					uint32		nalive = 0;
+					uint32		wi;
+
+					if (!weave_vec_weft_clear_dead(&w, allow, &dwhy))
+						ereport(ERROR,
+								(errcode(ERRCODE_INDEX_CORRUPTED),
+								 errmsg("bolt %u of index \"%s\" has an unreadable vector directory",
+										s, RelationGetRelationName(index)),
+								 errdetail("%s.", dwhy != NULL ? dwhy : "unknown reason")));
+					for (wi = 0; wi < nword; wi++)
+						nalive += (uint32) pg_popcount64(allow[wi]);
+					if (nalive == 0)
+					{
+						novector = true;
+						break;
+					}
+					if (nalive < nlane)
+					{
+						uint64	   *keys;
+						uint32		li;
+						int			nk = 0;
+
+						if (nch >= WEAVE_FUSE_MAX_CHAN - 2)
+							ereport(ERROR,
+									(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+									 errmsg("a fused weave index scan needs more than %d channels",
+											WEAVE_FUSE_MAX_CHAN)));
+						/* bolt-scale, one entry per live lane */
+						keys = (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) nalive * sizeof(uint64));
+						for (li = 0; li < (uint32) w.meta.nvec; li++)
+							if (allow[li / 64] & (UINT64CONST(1) << (li % 64)))
+								keys[nk++] = dmap[li];
+						/* WEAVE_CH_DOCVALS is a reporting kind, as for the @@@
+						 * gate below: what it walks is a set of document ids */
+						ss[nch++] = weave_gate_shuttle_begin(WEAVE_CH_DOCVALS,
+															 keys, nk, segctx);
+						pfree(keys);
+					}
+				}
 
 				/*
 				 * The allowlist is the shuttle's, not the core's: `live` stays NULL
@@ -9734,6 +9858,15 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 			 * with documents containing none of the query.  `complete` is untouched
 			 * -- there was nothing here to prune.
 			 */
+			if (novector)
+			{
+				/* G71: nothing in this bolt can be ranked; free what was begun */
+				for (i = 0; i < nch; i++)
+					ss[i]->ops->end(ss[i]);
+				MemoryContextSwitchTo(segold);
+				continue;
+			}
+
 			if (nscored > 0)
 			{
 				if (so->plainInit)

@@ -4620,3 +4620,35 @@ the cause; `pg_weave.fuse_normalize = off` gives the same order.
 
 Row 301 (NULL document) is missing for the second reason alone. Until this is fixed,
 `fuse()` with a vector channel is safe only on a column declared `NOT NULL`.
+
+**Fixed 2026-10-01, both halves as proposed.**
+- **The gate.** In each bolt, `weave_fuse_vec_warpmap()`'s allowlist is narrowed by the
+  new `weave_vec_weft_clear_dead()`, one forward pass of the vector directory, to the
+  lanes the weft marks live. When any lane is dead, the documents that do have one
+  become a REQUIRED gate shuttle. A bolt with no live lane, or with no weft for the key,
+  contributes no ranked candidate. A fully-populated column builds no gate and pays only
+  the directory pass. `src/am/fusepath.c` reserves the extra channel at plan time, so the
+  cap cannot become a rescan refusal (G39).
+- **The padding.** `weave_pad_wanted()` admits the fused route. A row is padded at NULL
+  when **any** fused key's column is NULL, because that is when `fuse()` is NULL.
+  `weave_pad_emit()` now fills one distance per ORDER BY key, since a fused scan has
+  several. A non-NULL row no channel reached pads at +Infinity when a vector key is
+  present, and at 0 otherwise, where `fuse()` is -0.
+
+**Pinned** by `sql/fuse_pushdown.sql` section (G71), against the heap:
+- every row once;
+- `fused_tail` = `heap_null_fuse` = `{101,102,103,301,402}`;
+- the first three ranked rows are `{1,201,2}`;
+- a pending row with a vector comes before the NULL tail.
+
+**Mutants, each built first:**
+
+| mutant | result |
+|---|---|
+| gate off | 8-row tail including 29, 30, 401 |
+| fused padding off | 0-row tail, `fused_every_row` false |
+| per-key NULL test off | 101 escapes the tail |
+
+**Not fixed here, and recorded where it already was:** the fused shuttles do not read
+pending documents (G66's open note). Row 401, pending with a vector, therefore pads at
++Infinity instead of being ranked at its real position.

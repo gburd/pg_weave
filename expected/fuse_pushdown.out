@@ -873,6 +873,83 @@ SELECT vec_lanes > 0 AS the_fused_path_harvested_lanes_too,
 RESET enable_seqscan;
 DROP TABLE p_pushdown, p_fallback, p_oracle_scores, p_oracle, p_gated, p_ungated, p_lat, p_solo;
 DROP TABLE fpmap, pv_pushdown, pv_oracle_scores, pv_oracle;
+-- ---------------------------------------------------------------------------
+-- (G71) A ROW WITH A NULL VECTOR IS NOT A RANKED CANDIDATE.  doc/GAPS.md G71.
+--
+-- fuse() is NULL when an argument is NULL, and ascending ORDER BY puts it LAST.
+-- The fused core scores a scored channel that does not reach a document as 0,
+-- which for l2 (scores <= 0) is the best vector score there is -- so before the fix
+-- the three NULL-vector rows came FIRST from the index and last from a Sort.  The
+-- fix gates the vector key on "has a live lane" and pads the rest at NULL.
+--
+-- The assertion is the set of rows in the NULL-fused TAIL, plus every row once:
+-- the ORDER of rows inside the ranked head is not compared against the fallback,
+-- for sect. 7a (1)'s reason (the fallback's `<=>` approximates BM25).  Rows 101-103
+-- have a NULL vector, 301 a NULL document, 401/402 are pending (one with a vector).
+-- ---------------------------------------------------------------------------
+CREATE TABLE fnv (id int, body wdoc, emb wvec(4));
+INSERT INTO fnv SELECT g, to_wdoc('simple', 'alpha w' || g), ('[' || g || ',0,0,0]')::wvec
+  FROM generate_series(1, 30) g;
+INSERT INTO fnv SELECT g, to_wdoc('simple', 'alpha w' || g), NULL FROM generate_series(101, 103) g;
+INSERT INTO fnv SELECT g, to_wdoc('simple', 'beta w' || g), ('[' || (g - 200) || ',0,0,0]')::wvec
+  FROM generate_series(201, 203) g;
+INSERT INTO fnv VALUES (301, NULL, '[0.5,0,0,0]');
+CREATE INDEX fnv_weave ON fnv USING weave (body, emb);
+INSERT INTO fnv VALUES (401, to_wdoc('simple', 'alpha pendingrow'), '[0.1,0,0,0]'),
+                       (402, to_wdoc('simple', 'alpha pendnull'), NULL);
+ANALYZE fnv;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM fnv ORDER BY fuse(body <=> 'alpha'::wquery, emb <-> '[0,0,0,0]'::wvec);
+                                                 QUERY PLAN                                                  
+-------------------------------------------------------------------------------------------------------------
+ Index Scan using fnv_weave on fnv
+   Order By: ((body <=> '''alpha'''::wquery) AND (emb <-> '[0,0,0,0]'::wvec) AND (body <~> '{1,1}'::real[]))
+(2 rows)
+
+CREATE TEMP TABLE fnv_p AS
+  SELECT row_number() OVER () AS rn, id
+    FROM (SELECT id FROM fnv
+           ORDER BY fuse(body <=> 'alpha'::wquery, emb <-> '[0,0,0,0]'::wvec)) s;
+SELECT array_agg(id ORDER BY rn) FILTER (WHERE rn <= 3) AS fused_first3
+  FROM fnv_p;
+ fused_first3 
+--------------
+ {1,201,2}
+(1 row)
+
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+CREATE TEMP TABLE fnv_f AS
+  SELECT id, fuse(body <=> 'alpha'::wquery, emb <-> '[0,0,0,0]'::wvec) AS v FROM fnv;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+SELECT (SELECT count(*) FROM fnv_p) = (SELECT count(*) FROM fnv) AS fused_every_row,
+       (SELECT count(DISTINCT id) FROM fnv_p) = (SELECT count(*) FROM fnv) AS fused_no_row_twice,
+       (SELECT array_agg(id ORDER BY id) FROM fnv_p
+         WHERE rn > (SELECT count(*) FROM fnv_f WHERE v IS NOT NULL)) AS fused_tail,
+       (SELECT array_agg(id ORDER BY id) FROM fnv_f WHERE v IS NULL) AS heap_null_fuse;
+ fused_every_row | fused_no_row_twice |      fused_tail       |    heap_null_fuse     
+-----------------+--------------------+-----------------------+-----------------------
+ t               | t                  | {101,102,103,301,402} | {101,102,103,301,402}
+(1 row)
+
+-- Row 401 is PENDING and has a vector.  The fused shuttles read bolts only (the
+-- open note under doc/GAPS.md G66), so it is not ranked; the padding emits it at
+-- +Infinity, which still puts it ahead of every NULL-fused row.  That relative
+-- position is what G71 is about; ranking pending rows is G66's open half.
+SELECT (SELECT rn FROM fnv_p WHERE id = 401)
+       < (SELECT min(rn) FROM fnv_p WHERE id IN (101, 102, 103, 301, 402))
+       AS pending_vector_row_before_null_tail;
+ pending_vector_row_before_null_tail 
+-------------------------------------
+ t
+(1 row)
+
+DROP TABLE fnv_p;
+DROP TABLE fnv_f;
+DROP TABLE fnv;
 DROP TABLE fp_nb;
 DROP TABLE fp_l2b;
 DROP TABLE fp_ip;
