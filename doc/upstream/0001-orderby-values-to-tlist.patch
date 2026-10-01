@@ -1,0 +1,438 @@
+From b6577e1dd22ba2ab281505926cd2619d6cedd017 Mon Sep 17 00:00:00 2001
+From: Greg Burd <greg@burd.me>
+Date: Thu, 1 Oct 2026 00:44:47 -0400
+Subject: [PATCH] Let an ordering index scan hand its ORDER BY values to the
+ target list
+
+An Index Scan that orders by an operator computes each row's ORDER BY
+value in the index AM (xs_orderbyvals), and the executor then evaluates
+the same expression again in the scan's projection.  For an expensive
+operator (pgvector distances) that is wasted work; for an AM whose value
+depends on index-wide state (BM25 corpus statistics) the displayed value
+is a different number from the one the rows were ordered by.
+
+Add IndexAmRoutine.amorderbyvalsexact.  When it is set, setrefs.c
+replaces a top-level target-list expression equal() to an
+indexorderbyorig expression with Var(INNER_VAR, i), and nodeIndexscan.c
+stores each returned row's ORDER BY values in a virtual slot it installs
+as the projection's inner tuple: the AM's values for an exact row, the
+recomputed values for a rechecked row, a reorder-queue entry's copy for a
+queued row.  A lossy AM's lower bound is never displayed.  EXPLAIN
+VERBOSE reports 'Order By Values Used: N'.  GiST and SP-GiST set the
+flag; their exact distances equal the operator's result.
+
+Design sketch for discussion; no new regression tests yet.  The core
+suite's only change is two EXPLAIN deparses that gain a parenthesis
+pair above a rewritten scan (box, polygon).
+---
+ src/backend/access/gist/gist.c          |  1 +
+ src/backend/access/spgist/spgutils.c    |  1 +
+ src/backend/commands/explain.c          |  4 ++
+ src/backend/executor/nodeIndexscan.c    | 74 ++++++++++++++++++++++++-
+ src/backend/optimizer/plan/createplan.c |  4 ++
+ src/backend/optimizer/plan/setrefs.c    | 56 +++++++++++++++++++
+ src/backend/optimizer/util/plancat.c    |  2 +
+ src/backend/utils/adt/ruleutils.c       | 31 +++++++++++
+ src/include/access/amapi.h              |  9 +++
+ src/include/nodes/execnodes.h           |  7 +++
+ src/include/nodes/pathnodes.h           |  1 +
+ src/include/nodes/plannodes.h           |  9 +++
+ 12 files changed, 198 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/access/gist/gist.c b/src/backend/access/gist/gist.c
+index 8565e225be7..1a43314aaf7 100644
+--- a/src/backend/access/gist/gist.c
++++ b/src/backend/access/gist/gist.c
+@@ -65,6 +65,7 @@ gisthandler(PG_FUNCTION_ARGS)
+ 		.amoptsprocnum = GIST_OPTIONS_PROC,
+ 		.amcanorder = false,
+ 		.amcanorderbyop = true,
++		.amorderbyvalsexact = true,
+ 		.amcanhash = false,
+ 		.amconsistentequality = false,
+ 		.amconsistentordering = false,
+diff --git a/src/backend/access/spgist/spgutils.c b/src/backend/access/spgist/spgutils.c
+index f2ee333f60d..1d8f0cffec0 100644
+--- a/src/backend/access/spgist/spgutils.c
++++ b/src/backend/access/spgist/spgutils.c
+@@ -50,6 +50,7 @@ spghandler(PG_FUNCTION_ARGS)
+ 		.amoptsprocnum = SPGIST_OPTIONS_PROC,
+ 		.amcanorder = false,
+ 		.amcanorderbyop = true,
++		.amorderbyvalsexact = true,
+ 		.amcanhash = false,
+ 		.amconsistentequality = false,
+ 		.amconsistentordering = false,
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index 96f2f0e2e74..924f70af2e4 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -1974,6 +1974,10 @@ ExplainNode(PlanState *planstate, List *ancestors,
+ 										   planstate, es);
+ 			show_scan_qual(((IndexScan *) plan)->indexorderbyorig,
+ 						   "Order By", planstate, ancestors, es);
++			if (es->verbose && ((IndexScan *) plan)->indexorderbytlist > 0)
++				ExplainPropertyInteger("Order By Values Used", NULL,
++									   ((IndexScan *) plan)->indexorderbytlist,
++									   es);
+ 			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
+ 			if (plan->qual)
+ 				show_instrumentation_count("Rows Removed by Filter", 1,
+diff --git a/src/backend/executor/nodeIndexscan.c b/src/backend/executor/nodeIndexscan.c
+index 129d005f187..10daf4523cc 100644
+--- a/src/backend/executor/nodeIndexscan.c
++++ b/src/backend/executor/nodeIndexscan.c
+@@ -163,6 +163,33 @@ IndexNext(IndexScanState *node)
+ 	return ExecClearTuple(slot);
+ }
+ 
++/*
++ * Hand the ORDER BY values of the row about to be returned to the projection,
++ * when the targetlist asks for them (indexorderbytlist > 0, set by setrefs.c
++ * only for an AM with amorderbyvalsexact).  `vals`/`nulls` are what the
++ * caller established as this row's ordering values: the AM's when it reported
++ * them exact, the recomputed ones when it asked for a recheck, or a reorder
++ * queue entry's copy.  Never a lossy AM's lower bound.
++ */
++static inline void
++IndexStoreOrderByValues(IndexScanState *node, const Datum *vals,
++						const bool *nulls)
++{
++	TupleTableSlot *oslot = node->iss_OrderBySlot;
++	int			i;
++
++	if (oslot == NULL)
++		return;
++	ExecClearTuple(oslot);
++	for (i = 0; i < node->iss_NumOrderByKeys; i++)
++	{
++		oslot->tts_values[i] = vals[i];
++		oslot->tts_isnull[i] = nulls[i];
++	}
++	ExecStoreVirtualTuple(oslot);
++	node->ss.ps.ps_ExprContext->ecxt_innertuple = oslot;
++}
++
+ /* ----------------------------------------------------------------
+  *		IndexNextWithReorder
+  *
+@@ -251,6 +278,9 @@ IndexNextWithReorder(IndexScanState *node)
+ 			{
+ 				HeapTuple	tuple;
+ 
++				/* before the pop frees the entry's copies */
++				IndexStoreOrderByValues(node, topmost->orderbyvals,
++										topmost->orderbynulls);
+ 				tuple = reorderqueue_pop(node);
+ 
+ 				/* Pass 'true', as the tuple in the queue is a palloc'd copy */
+@@ -352,6 +382,7 @@ next_indextuple:
+ 		else
+ 		{
+ 			/* Can return this tuple immediately. */
++			IndexStoreOrderByValues(node, lastfetched_vals, lastfetched_nulls);
+ 			return slot;
+ 		}
+ 	}
+@@ -954,7 +985,24 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
+ 	 * Initialize result type and projection.
+ 	 */
+ 	ExecInitResultTypeTL(&indexstate->ss.ps);
+-	ExecAssignScanProjectionInfo(&indexstate->ss);
++
++	/*
++	 * A targetlist that reads the ORDER BY values (INNER_VAR Vars, see
++	 * setrefs.c) is never the scan tuple's physical layout, so it always
++	 * projects; ExecConditionalAssignProjectionInfo would assert on the
++	 * INNER_VAR while testing whether it can skip projection.
++	 */
++	if (node->indexorderbytlist > 0)
++	{
++		ExecInitResultSlot(&indexstate->ss.ps, &TTSOpsVirtual);
++		indexstate->ss.ps.resultops = &TTSOpsVirtual;
++		indexstate->ss.ps.resultopsfixed = true;
++		indexstate->ss.ps.resultopsset = true;
++		ExecAssignProjectionInfo(&indexstate->ss.ps,
++								 indexstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor);
++	}
++	else
++		ExecAssignScanProjectionInfo(&indexstate->ss);
+ 
+ 	/*
+ 	 * initialize child expressions
+@@ -1024,6 +1072,30 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
+ 						   NULL,	/* no ArrayKeys */
+ 						   NULL);
+ 
++	/*
++	 * A targetlist that reads the ORDER BY values needs a slot to read them
++	 * from, typed as the ORDER BY expressions (setrefs.c built it so).
++	 */
++	if (node->indexorderbytlist > 0)
++	{
++		TupleDesc	odesc;
++		ListCell   *lc;
++		AttrNumber	attno = 0;
++
++		odesc = CreateTemplateTupleDesc(list_length(node->indexorderbyorig));
++		foreach(lc, node->indexorderbyorig)
++		{
++			Node	   *expr = (Node *) lfirst(lc);
++
++			attno++;
++			TupleDescInitEntry(odesc, attno, NULL, exprType(expr),
++							   exprTypmod(expr), 0);
++		}
++		TupleDescFinalize(odesc);
++		indexstate->iss_OrderBySlot =
++			ExecAllocTableSlot(&estate->es_tupleTable, odesc, &TTSOpsVirtual, 0);
++	}
++
+ 	/* Initialize sort support, if we need to re-check ORDER BY exprs */
+ 	if (indexstate->iss_NumOrderByKeys > 0)
+ 	{
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index 2f8a08ad78e..7635707d300 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -3033,6 +3033,10 @@ create_indexscan_plan(PlannerInfo *root,
+ 											indexorderbyops,
+ 											best_path->indexscandir);
+ 
++	if (!indexonly && indexorderbys != NIL)
++		((IndexScan *) scan_plan)->indexorderbyexact =
++			indexinfo->amorderbyvalsexact;
++
+ 	copy_generic_path_info(&scan_plan->plan, &best_path->path);
+ 
+ 	return scan_plan;
+diff --git a/src/backend/optimizer/plan/setrefs.c b/src/backend/optimizer/plan/setrefs.c
+index 8a641402a96..3ecea955800 100644
+--- a/src/backend/optimizer/plan/setrefs.c
++++ b/src/backend/optimizer/plan/setrefs.c
+@@ -134,6 +134,7 @@ static bool flatten_rtes_walker(Node *node, flatten_rtes_walker_context *cxt);
+ static void add_rte_to_flat_rtable(PlannerGlobal *glob, List *rteperminfos,
+ 								   RangeTblEntry *rte);
+ static Plan *set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset);
++static void replace_orderby_tlist_refs(IndexScan *splan);
+ static Plan *set_indexonlyscan_references(PlannerInfo *root,
+ 										  IndexOnlyScan *plan,
+ 										  int rtoffset);
+@@ -701,6 +702,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
+ 				splan->indexorderbyorig =
+ 					fix_scan_list(root, splan->indexorderbyorig,
+ 								  rtoffset, NUM_EXEC_QUAL(plan));
++				/* after both are fixed, so equal() compares like with like */
++				replace_orderby_tlist_refs(splan);
+ 			}
+ 			break;
+ 		case T_IndexOnlyScan:
+@@ -1360,6 +1363,59 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
+ 	return plan;
+ }
+ 
++/*
++ * replace_orderby_tlist_refs
++ *		Let an ordering IndexScan hand its ORDER BY values to its targetlist.
++ *
++ * If the index AM promises that the ORDER BY values it reports for an exact
++ * (non-rechecked) row are the values the query should see
++ * (amorderbyvalsexact), replace each top-level targetlist expression that is
++ * equal() to the i'th indexorderbyorig expression with
++ * Var(INNER_VAR, i + 1).  nodeIndexscan.c then fills a virtual slot with the
++ * ORDER BY values of every returned row -- the AM's for an exact row, the
++ * recomputed ones for a rechecked row -- and installs it as the projection's
++ * inner tuple.  A scan node has no inner plan, so INNER_VAR is otherwise
++ * unused here.
++ *
++ * Only float8/float4 expressions qualify: those are the only types
++ * index_store_float8_orderby_distances() can deliver.
++ */
++static void
++replace_orderby_tlist_refs(IndexScan *splan)
++{
++	ListCell   *lc;
++	int			nrepl = 0;
++
++	if (!splan->indexorderbyexact || splan->indexorderbyorig == NIL)
++		return;
++
++	foreach(lc, splan->scan.plan.targetlist)
++	{
++		TargetEntry *tle = lfirst_node(TargetEntry, lc);
++		ListCell   *lo;
++		int			i = 0;
++
++		foreach(lo, splan->indexorderbyorig)
++		{
++			Expr	   *orig = (Expr *) lfirst(lo);
++			Oid			typ = exprType((Node *) orig);
++
++			i++;
++			if ((typ == FLOAT8OID || typ == FLOAT4OID) &&
++				equal(tle->expr, orig))
++			{
++				tle->expr = (Expr *) makeVar(INNER_VAR, i, typ,
++											 exprTypmod((Node *) orig),
++											 exprCollation((Node *) orig),
++											 0);
++				nrepl++;
++				break;
++			}
++		}
++	}
++	splan->indexorderbytlist = nrepl;
++}
++
+ /*
+  * set_indexonlyscan_references
+  *		Do set_plan_references processing on an IndexOnlyScan
+diff --git a/src/backend/optimizer/util/plancat.c b/src/backend/optimizer/util/plancat.c
+index 4c9c5e9fc33..148dc29c1a6 100644
+--- a/src/backend/optimizer/util/plancat.c
++++ b/src/backend/optimizer/util/plancat.c
+@@ -304,6 +304,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
+ 				/* We copy just the fields we need, not all of rd_indam */
+ 				amroutine = indexRelation->rd_indam;
+ 				info->amcanorderbyop = amroutine->amcanorderbyop;
++				info->amorderbyvalsexact = amroutine->amorderbyvalsexact;
+ 				info->amoptionalkey = amroutine->amoptionalkey;
+ 				info->amsearcharray = amroutine->amsearcharray;
+ 				info->amsearchnulls = amroutine->amsearchnulls;
+@@ -405,6 +406,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
+ 			else
+ 			{
+ 				info->amcanorderbyop = false;
++				info->amorderbyvalsexact = false;
+ 				info->amoptionalkey = false;
+ 				info->amsearcharray = false;
+ 				info->amsearchnulls = false;
+diff --git a/src/backend/utils/adt/ruleutils.c b/src/backend/utils/adt/ruleutils.c
+index 5e8e1683db0..dca0d43e9ce 100644
+--- a/src/backend/utils/adt/ruleutils.c
++++ b/src/backend/utils/adt/ruleutils.c
+@@ -180,6 +180,8 @@ typedef struct
+ 	List	   *outer_tlist;	/* referent for OUTER_VAR Vars */
+ 	List	   *inner_tlist;	/* referent for INNER_VAR Vars */
+ 	List	   *index_tlist;	/* referent for INDEX_VAR Vars */
++	List	   *orderby_tlist;	/* IndexScan: referent for INNER_VAR Vars that
++								 * stand for its ORDER BY values */
+ 	/* Special namespace representing a function signature: */
+ 	char	   *funcname;
+ 	int			numargs;
+@@ -5227,6 +5229,23 @@ set_deparse_plan(deparse_namespace *dpns, Plan *plan)
+ 		dpns->index_tlist = ((CustomScan *) plan)->custom_scan_tlist;
+ 	else
+ 		dpns->index_tlist = NIL;
++
++	/*
++	 * An IndexScan whose targetlist reads its own ORDER BY values (see
++	 * replace_orderby_tlist_refs in setrefs.c) uses INNER_VAR Vars numbered
++	 * by ORDER BY key; they deparse as the ORDER BY expressions.
++	 */
++	dpns->orderby_tlist = NIL;
++	if (IsA(plan, IndexScan) && ((IndexScan *) plan)->indexorderbytlist > 0)
++	{
++		ListCell   *lc;
++		AttrNumber	i = 0;
++
++		foreach(lc, ((IndexScan *) plan)->indexorderbyorig)
++			dpns->orderby_tlist = lappend(dpns->orderby_tlist,
++										  makeTargetEntry((Expr *) lfirst(lc),
++														  ++i, NULL, false));
++	}
+ }
+ 
+ /*
+@@ -7988,6 +8007,18 @@ resolve_special_varno(Node *node, deparse_context *context,
+ 		context->appendparents = save_appendparents;
+ 		return;
+ 	}
++	else if (var->varno == INNER_VAR && dpns->orderby_tlist)
++	{
++		TargetEntry *tle;
++
++		tle = get_tle_by_resno(dpns->orderby_tlist, var->varattno);
++		if (!tle)
++			elog(ERROR, "bogus varattno for ORDER BY value var: %d", var->varattno);
++
++		resolve_special_varno((Node *) tle->expr, context,
++							  callback, callback_arg);
++		return;
++	}
+ 	else if (var->varno == INNER_VAR && dpns->inner_tlist)
+ 	{
+ 		TargetEntry *tle;
+diff --git a/src/include/access/amapi.h b/src/include/access/amapi.h
+index 79240333530..e19f7df2454 100644
+--- a/src/include/access/amapi.h
++++ b/src/include/access/amapi.h
+@@ -247,6 +247,15 @@ typedef struct IndexAmRoutine
+ 	bool		amcanorder;
+ 	/* does AM support ORDER BY result of an operator on indexed column? */
+ 	bool		amcanorderbyop;
++
++	/*
++	 * When an ordering scan reports xs_recheckorderby = false, may the
++	 * executor substitute the AM's xs_orderbyvals for an identical ORDER BY
++	 * expression in the scan's target list, rather than re-evaluating it?
++	 * Setting this asserts that the value the AM reports IS the value the
++	 * query should display.  See nodeIndexscan.c.
++	 */
++	bool		amorderbyvalsexact;
+ 	/* does AM support hashing using API consistent with the hash AM? */
+ 	bool		amcanhash;
+ 	/* do operators within an opfamily have consistent equality semantics? */
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index 91bb0bd2e13..07a404e665b 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -1751,6 +1751,13 @@ typedef struct IndexScanState
+ 	bool	   *iss_OrderByTypByVals;
+ 	int16	   *iss_OrderByTypLens;
+ 	Size		iss_PscanLen;
++
++	/*
++	 * When the plan's targetlist reads the ORDER BY values (indexorderbytlist
++	 * > 0), the values of the row being returned, as a virtual slot installed
++	 * as the projection's inner tuple.
++	 */
++	TupleTableSlot *iss_OrderBySlot;
+ } IndexScanState;
+ 
+ /* ----------------
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index 1c6d1fe3d04..1e4f2bd64e7 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -1434,6 +1434,7 @@ typedef struct IndexOptInfo
+ 	 * (IndexAmRoutine).  These fields are not set for partitioned indexes.
+ 	 */
+ 	bool		amcanorderbyop;
++	bool		amorderbyvalsexact;
+ 	bool		amoptionalkey;
+ 	bool		amsearcharray;
+ 	bool		amsearchnulls;
+diff --git a/src/include/nodes/plannodes.h b/src/include/nodes/plannodes.h
+index 09a1ec73180..295d2b9db69 100644
+--- a/src/include/nodes/plannodes.h
++++ b/src/include/nodes/plannodes.h
+@@ -616,6 +616,15 @@ typedef struct IndexScan
+ 	List	   *indexorderbyops;
+ 	/* forward or backward or don't care */
+ 	ScanDirection indexorderdir;
++
++	/*
++	 * May setrefs.c replace target-list occurrences of an indexorderbyorig
++	 * expression with INNER_VAR references to the scan's ORDER BY values?
++	 * Copied from the AM's amorderbyvalsexact.  indexorderbytlist counts the
++	 * replacements actually made (0 if none), for EXPLAIN.
++	 */
++	bool		indexorderbyexact;
++	int			indexorderbytlist;
+ } IndexScan;
+ 
+ /* ----------------
+-- 
+2.54.0
+
