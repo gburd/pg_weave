@@ -689,6 +689,64 @@ so the two arms answered different questions; and a slack `block_max` needs the
 channel's `maxscore` to cover the slack, or the core's suffix arithmetic is unsound
 and the fused answer legitimately differs from the reference.
 
+## 7d. F9's design: `<@>` as a fused channel (2026-10-01, before code)
+
+`bench/RESULTS_F9_FANOUT.md` measured the merge: at the k = 10 threshold on scifact it
+is 0.03-0.86 % of postings, under 4,200 documents in every case. It grows about 10x per
+extra edit. Cost is not the obstacle. The obstacle is the arithmetic, and it is the one
+G71 just fixed for the vector channel.
+
+**What `fuse()` computes for `<@>`.** `weave_edistscore(d) = -d`, and the heap operator
+returns +Infinity for a term-free document. So, measured:
+
+| row | `<=>` 'alpha' | `<@>` 'protien' | `fuse(...)` |
+|---|---|---|---|
+| beta protien | 1 (no match) | 0 | **-0** (best) |
+| alpha protein | 0.78 | 2 | 1.71 |
+| alpha zzzzzzzzzzzz | 0.78 | 7 | 6.71 |
+| (empty) | 1 | Infinity | Infinity |
+| NULL | | | NULL |
+
+Every non-NULL document has a finite `<@>` distance as long as it has any term at all,
+so under the fallback **every document is a candidate on the `<@>` channel**, at a score
+that can be arbitrarily negative. Three consequences for a pushdown that must agree:
+
+1. **The channel cannot "contribute 0" to a document it did not reach.** 0 is the best
+   `<@>` score there is (d = 0), so an unreached document would outrank every real near
+   match. This is G71 in a third channel. The scored-channel-absent-is-0 rule in
+   `include/weave/fuse.h` note 2 is sound only for a channel whose scores are all
+   >= 0, which today means lexical alone.
+2. **A threshold-gated channel is not the same objective.** A channel that publishes
+   only documents within `d <= t` and gates the rest out returns a *different set*
+   than the fallback whenever a document's best term is beyond `t`. That is a correct
+   answer only if a ladder widens `t` until the k-th result is proven. A fused
+   document's rank depends on all channels together, so the proof needs a bound on
+   what a document beyond `t` can still score: `-(t + 1)` on this channel plus the
+   other channels' ceilings. The core has exactly that machinery, the global ceiling
+   test, if the channel declares `maxscore` correctly.
+3. **So the channel's honest contract is: every document is reachable, its score is
+   `-d(doc)`, and its ceiling over unvisited documents is `-(t + 1)`.** That is not a
+   shuttle the core can drive today. A shuttle publishes the positions it scores, and
+   publishing every document of the bolt to score most of them at "about -t" is the
+   O(corpus) merge the measurement said we can avoid.
+
+**Decision, recorded rather than taken (maintainer call):**
+
+- **(a) Shift the channel's scores.** Score a document with best distance `d <= t` as
+  `t + 1 - d` (>= 1) and an unreached one as 0. The fused order then equals the
+  fallback's only when every candidate's `d` is within `t`, i.e. after the ladder has
+  widened `t` past the k-th answer's distance. It needs a `fuse()`-level redefinition
+  of `weave_edistscore`, a catalog change to the fallback's arithmetic, so that both
+  arms share one objective. The fanout table bounds the cost.
+- **(b) `<@>` in `fuse()` only as a GATE** (`WHERE body <@> p <= t` plus a ranking
+  without it). Cheap, needs no new arithmetic, and is what most hybrid-search users
+  mean by "fuzzy match plus relevance". Not what `fuse(..., body <@> p)` says.
+- **(c) Leave `<@>` unfused.** The fallback is already correct for small result
+  sets, and the plan refuses the pushdown today (`req->servable = false`).
+
+Until one is chosen F9 stays open, and `fusepath.c`'s refusal stands: correct, and
+slower than a pushdown would be.
+
 ## 8. What must be benchmarked before this is called a win
 
 The claim being made is "no over-fetch, better quality, lower latency". All
