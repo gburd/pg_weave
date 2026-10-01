@@ -248,6 +248,12 @@ SELECT weave_index_nsegments('dvs_w') AS nsegments_after_insert;
 SELECT dvs_assert_agree('price < 10');                          -- includes pending rows
 SELECT dvs_assert_agree('nprice < 10');                         -- nullable, pending rows incl. NULLs
 SELECT dvs_assert_agree($p$d @@@ 'freq7' AND price < 100$p$);   -- AND over pending
+-- doc/GAPS.md G53, closed as G64: with these 200k rows still PENDING, a term in every
+-- row made the pre-G64 collector allocate n^2/2 x 6 B -- ~120 GB -- and the run's
+-- first attempt was OOM-killed here at 60 GB.  It must now complete AND agree with
+-- the heap.  'common' is in all 10.2M rows, so this is also the high-df case.
+SELECT dvs_assert_agree($p$d @@@ 'common'$p$);
+SELECT dvs_assert_agree($p$d @@@ 'common' AND price < 10$p$);
 -- the pending-only text values must actually exist, or the two asserts below
 -- agree vacuously on an empty set.
 DO $$
