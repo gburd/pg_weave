@@ -1527,8 +1527,8 @@ safe, applied to the second source.
 `linked-pages=0` over its 5 rounds on PG18 and failed "a flush kept pages linked after its
 cut". The same test reports 1–3 such firings in every other recorded run (nine logs), and a
 re-run on the same tree passed. The test stops at 5 rounds, so an unlucky run never fires
-the shape. Noted as a flake to fix by letting the loop run until both shapes fire, with a
-time cap.
+the shape. Fixed in the same session: the loop now runs up to 12 rounds, about 2 minutes
+in the worst case, and still stops as soon as both shapes have fired.
 
 Against the full separate-extension stack it is not yet a comparison: there is no
 vector index and no fuzzy channel.

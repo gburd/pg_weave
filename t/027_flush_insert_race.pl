@@ -259,10 +259,13 @@ sub race_round
 
 # Which keep-shape a flush meets is timing-dependent (the linked-pages shape
 # needs a bulk INSERT to link a page after the cut inside one flush's window),
-# so rounds repeat, up to five, until BOTH have fired.  Every round is a full
-# race with its own overlap assertions; coverage is asserted over all of them.
+# so rounds repeat until BOTH have fired, up to 12 rounds (~2 minutes).  Five was
+# not enough: one PG18 run on 2026-09-30 fired the cut-page shape 43 times and the
+# linked-pages shape never, and failed; nine other recorded runs fired it 1-3 times
+# within five.  Every round is a full race with its own overlap assertions;
+# coverage is asserted over all of them.
 my ($kept_cut, $kept_pages) = (0, 0);
-for my $round (1 .. 5)
+for my $round (1 .. 12)
 {
     my ($kc, $kp) = race_round($round);
     $kept_cut += $kc;
