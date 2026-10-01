@@ -52,7 +52,10 @@ mkdir -p "$OUT"
 say() { printf '\033[1m[%s] %s\033[0m\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { printf '\033[31mFATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 
-aws sts get-caller-identity --profile "$PROFILE" >"$OUT/identity.json" \
+# Only the profile and user NAME are recorded: an account id must not reach a
+# tracked results directory (AGENTS.md hard rule 14).
+aws sts get-caller-identity --profile "$PROFILE" --query Arn --output text \
+    | sed -E 's/::[0-9]{12}:/::<account>:/' >"$OUT/identity.txt" \
     || die "profile $PROFILE cannot authenticate"
 
 # ---------------------------------------------------------------------------

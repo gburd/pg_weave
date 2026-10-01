@@ -86,10 +86,8 @@ months into implementation.
 ## EC2, with the burner profile
 
 **The profile is a burner and it changes.** As of 2026-09-18 it is `hotdog`
-(account ACCOUNT_REDACTED, `us-east-2`; note it has **no region configured**, so pass
-`--region us-east-2` explicitly). Before that it was `lava`
-(account ACCOUNT_REDACTED) and before that `bene`
-(account ACCOUNT_REDACTED), which **expired with its credentials already dead** — a
+(`us-east-2`; note it has **no region configured**, so pass `--region us-east-2`
+explicitly). Before that it was `lava` and before that `bene`, which **expired with its credentials already dead** — a
 `describe-instances` at transition time returned `InvalidClientTokenId`, so
 nothing in it could be enumerated or terminated any more.
 
