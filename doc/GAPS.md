@@ -4584,3 +4584,39 @@ index=2098 against heap=1593.
 - **The lexical path's own collection** was not observed to duplicate in these runs, and
   has not been audited for the same window.
 - **G65** remains open for the crash case. G70 is its visible symptom without a crash.
+
+### G71 — a fused `<->`/`<#>` pushdown ranks rows with a NULL vector FIRST: `fuse(...)` is NULL for them, and the index treats a missing channel as contributing 0 — **FOUND 2026-10-01 while designing F9; silent wrong answer in a shipped plan; OPEN**
+
+`fuse()` is NULL when any argument is NULL (`weave_fuse()`, `src/am/fusepath.c`; asserted
+by `sql/fuse_fallback.sql`), and ascending ORDER BY puts NULLs last. The fused core uses a
+different rule for a scored channel that does not reach a position: it contributes 0 there
+(`include/weave/fuse.h` note 2). That rule is right for a lexical term the document lacks,
+because `weave_lexscore(1.0)` is 0 and the fallback agrees. It is wrong for a row whose
+vector is NULL, because the vector channel has no lane for it.
+
+`fuse()` returns the *negated* sum, so a row that "contributes 0" on a channel whose
+scores are all negative (l2 is `-||q-v||^2`) outranks every row that has a vector.
+Measured, 37 rows (30 `alpha` + vector, 3 `alpha` with a NULL vector, 3 `beta` + vector,
+1 NULL document):
+
+| plan | order |
+|---|---|
+| fused pushdown | `{101,102,103,1,201,2,...}`: the three NULL-vector rows are **first**, and row 301 is missing |
+| fallback (Sort) | `{1,201,2,...,30,103,102,101,301}`: the NULL-fused rows come **last** |
+
+So `ORDER BY fuse(body <=> q, emb <-> v) LIMIT k` hands the top of the ranking to rows that
+have no vector. No test covers it, because every row of every fused test fixture has a
+vector (`sql/fuse_pushdown.sql` says so in its row/docid comment). The normalizer is not
+the cause; `pg_weave.fuse_normalize = off` gives the same order.
+
+**Fix, owed:**
+1. When a fused scan has a vector key, add a REQUIRED gate channel over "this document
+   has a live lane". The bolt's warp map already enumerates that set, so this is a
+   `weave_gate_shuttle_from_tidset()` over it.
+2. Pad the rows the gate removes after the ranked phase, at a NULL distance, as G56 does
+   for the other routes. Today `weave_pad_wanted()` refuses the fused route, on
+   FUSED_TOPK.md's argument that it is exact over its gate, which is now the reason
+   padding is needed.
+
+Row 301 (NULL document) is missing for the second reason alone. Until this is fixed,
+`fuse()` with a vector channel is safe only on a column declared `NOT NULL`.
