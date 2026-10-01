@@ -4002,7 +4002,9 @@ Peak `RssAnon` for `'common | nosuchterm'` dropped from 56 to 42 MB (2.4M rows o
 segments) and from 65 to 52 MB (3M rows, 1 segment, where the freed input is the lookup
 result). Tiered merging keeps the live segment count at 8 or fewer per level, so this was a
 constant factor and never the OOM.
-`bench/aws/docvals_scale.sql` may go back to `@@@ 'common'`.
+**Confirmed at 10M on 2026-10-01** (`pgweave-20261001-022058`): `@@@ 'common'` with 200k
+rows pending, the query and phase that were OOM-killed, completed in 472 ms with
+index == heap and no OOM. `bench/RESULTS_DOCVALS_SCALE.md`.
 
 ### G54 — only the FIRST docvalues scankey was honoured: `price > 10 AND price < 20` answered as `price > 10` — **FOUND 2026-09-28 in the text-docvals T3 review; a G49-class silent wrong answer; FIXED 2026-09-28**
 

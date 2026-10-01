@@ -163,6 +163,90 @@ stands, but the intermediate counts and the `dvs_t` build time are not on record
 `759b925` makes the pull retry and warn when empty. A rerun to fill the table was blocked
 by the same workstation network flapping (empty build log), then by expired AWS
 credentials.
+### Full per-phase table, and G53's query (added 2026-10-01, run `pgweave-20261001-022058`)
+
+The re-run owed by the text slice (only the final phase's counts had been captured), at
+commit `b9d99af`, which carries G53/G64, G65 (one-record flush), G56/G29 (vector and
+edit-distance padding, pending vectors) and the 12-round t/027. c7i.4xlarge (Xeon 8488C,
+30 GB), PG 17.11, `shared_buffers` 12619 MB. The host passed lint, the codec test and
+`make installcheck` (regression + isolation + TAP, `Result: PASS`) before the workload ran.
+
+**53 assertions, 53 with `disagreements=0`**, every phase. `nsegments` was 1 at every
+observable point, as before.
+
+| phase | predicate | index rows (== heap) | disagreements |
+|---|---|---|---|
+| 2 | `price < 100` | 998,991 | 0 |
+| 2 | `price < 10` | 99,698 | 0 |
+| 2 | `price < 1` | 10,067 | 0 |
+| 2 | `price = 500` | 10,003 | 0 |
+| 2 | `price >= 990` | 100,118 | 0 |
+| 2 | `d @@@ 'freq7' AND price < 100` | 10,046 | 0 |
+| 2 | `fprice < 10.0` | 699,066 | 0 |
+| 2 | `fprice < 4.5::float4` | 319,008 | 0 |
+| 2 | `nprice < 100` | 899,173 | 0 |
+| 2 | `nprice IS NOT NULL AND nprice < 100` | 899,173 | 0 |
+| 2 | `nprice >= 990` | 90,058 | 0 |
+| 2 | `tcat < 'cat050'` | 849,870 | 0 |
+| 2 | `tcat = 'cat123'` | 10,049 | 0 |
+| 2 | `tcat = 'cat123x'` | 9,876 | 0 |
+| 2 | `tcat > 'cat123' AND tcat <= 'cat124'` | 24,917 | 0 |
+| 2 | `tcat = ''` | 100,152 | 0 |
+| 2 | `tcat >= 'cat490'` | 199,525 | 0 |
+| 2 | `d @@@ 'freq7' AND tcat < 'cat050'` | 8,528 | 0 |
+| 3 | `price < 100` | 599,976 | 0 |
+| 3 | `price < 10` | 59,921 | 0 |
+| 3 | `price < 1` | 6,074 | 0 |
+| 3 | `d @@@ 'freq7' AND price < 100` | 10,046 | 0 |
+| 3 | `fprice < 10.0` | 420,098 | 0 |
+| 3 | `nprice < 100` | 540,224 | 0 |
+| 3 | `tcat < 'cat050'` | 510,255 | 0 |
+| 3 | `tcat = 'cat123x'` | 5,931 | 0 |
+| 3 | `d @@@ 'freq7' AND tcat < 'cat050'` | 8,528 | 0 |
+| 4 | `price < 100` | 599,976 | 0 |
+| 4 | `price < 10` | 59,921 | 0 |
+| 4 | `nprice < 100` | 540,224 | 0 |
+| 4 | `tcat < 'cat050'` | 510,255 | 0 |
+| 4 | `tcat = 'cat123x'` | 5,931 | 0 |
+| 4 | `d @@@ 'freq7' AND tcat < 'cat050'` | 8,528 | 0 |
+| 4 | `d @@@ 'freq7' AND price < 100` | 10,046 | 0 |
+| 5 | `price < 10` | 61,891 | 0 |
+| 5 | `nprice < 10` | 55,627 | 0 |
+| 5 | `d @@@ 'freq7' AND price < 100` | 10,251 | 0 |
+| 5 | `d @@@ 'common'` | 6,200,000 | 0 |
+| 5 | `d @@@ 'common' AND price < 10` | 61,891 | 0 |
+| 5 | `tcat = 'cat123m'` | 90 | 0 |
+| 5 | `tcat > 'cat123' AND tcat < 'cat123x'` | 90 | 0 |
+| 5 | `tcat < 'cat050'` | 527,014 | 0 |
+| 6 | `price < 10` | 61,891 | 0 |
+| 6 | `price < 100` | 619,952 | 0 |
+| 6 | `fprice < 10.0` | 433,996 | 0 |
+| 6 | `nprice < 10` | 55,627 | 0 |
+| 6 | `nprice < 100` | 558,297 | 0 |
+| 6 | `d @@@ 'freq7' AND price < 100` | 10,251 | 0 |
+| 6 | `tcat = 'cat123m'` | 90 | 0 |
+| 6 | `tcat > 'cat123' AND tcat < 'cat123x'` | 90 | 0 |
+| 6 | `tcat < 'cat050'` | 527,014 | 0 |
+| 6 | `tcat = ''` | 62,013 | 0 |
+| 6 | `d @@@ 'freq7' AND tcat < 'cat050'` | 8,702 | 0 |
+
+**G53's query, at the phase it was OOM-killed in.** `d @@@ 'common'` matches all 6.2M live
+rows while **200,000 rows are still pending**. It completed in **472 ms**, index == heap,
+and the server log has no OOM or signal. The run that filed G53 was OOM-killed at 60 GB on
+this exact query. That is the at-scale confirmation that G53 was G64, and that G64's fix
+holds at the size it failed at. The latency is indicative only (shared burner).
+
+**The prize reproduced exactly** on the same run's 1M vector table: `vec_blocks`
+150,890 / 42,525 / 5,030, identical to the table above. The counters are deterministic, so
+this checks that today's scan changes did not move them, and it is not a second scale.
+
+**Two earlier attempts that day are not results:** `pgweave-20261001-015758` and
+`-020456` each died on one transient ssh connect timeout before any test or workload ran.
+The first left an empty installcheck log behind a FATAL; the second read an empty MemTotal
+and started the server with `shared_buffers = 0MB`. Fixed in `bench/aws/run.sh`
+(`ConnectionAttempts=6`, ServerAlive, and a refusal of an empty MemTotal), and the third
+attempt is this run.
+
 ## What this does NOT tell us (and one thing it surfaced)
 
 - **No vector column in the 10M correctness run**, on purpose: a first attempt with
@@ -183,5 +267,5 @@ credentials.
   instance: `@@@` memory scales **super-linearly with df** — a 20%-df term (2.04M
   matches) peaks at **4.6 GB**, a ~100%-df term (6.2M) exceeds 60 GB. This is
   pre-existing in the lexical collect (nothing to do with docvals — `@@@ 'common'` alone
-  crashes) and would bite real corpora with common terms. The docvals workload now uses
-  `freq7` (df≈1%); the lexical issue is filed separately as G53.
+  crashes) and would bite real corpora with common terms. The docvals workload used
+  `freq7` (df≈1%) after this; since 2026-10-01 it asserts `@@@ 'common'` again (above).

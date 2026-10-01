@@ -329,7 +329,8 @@ distinct values Zipf-ish + 5% NULL, its own index since one docvals column per i
   **Passed** (`pgweave-20260930-010101`), but only the final phase's counts were captured;
   see `bench/RESULTS_DOCVALS_SCALE.md` TEXT section. The `IS NOT NULL` tooth was **not
   added** for text; the NULL bitmap is shared with v2 and that tooth is already recorded at
-  10M on `nprice`. A rerun for the full per-phase table is **owed**.
+  10M on `nprice`. The full per-phase table was re-run on 2026-10-01
+  (`pgweave-20261001-022058`, 53/53 agree); see the RESULTS file.
 - [x] Docs + memory. (`PHASES.md` / `PRODUCTION_READINESS.md` were not edited: no earlier
   docvals slice is tracked there, so the spec §11, this plan and the RESULTS file are the
   record.) CI on the final commit: see the push.
