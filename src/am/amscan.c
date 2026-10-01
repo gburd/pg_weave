@@ -272,6 +272,10 @@ typedef struct WeaveScanOpaqueData
 	int			veck;			/* candidate width of the current vector pass */
 	uint64		vecLanes;		/* lanes the last pass saw, live or not */
 	bool		vecDone;
+	bool		vecIP;			/* `<#>` (inner product); else `<->` (l2) */
+	ScoredTid  *vecPend;		/* the pending list's vectors, scored exactly
+								 * by the last pass, as distances (G29) */
+	int			nvecPend;
 
 	/*
 	 * `@~` / `@~*` corpus-trigram restriction (task Z8).  A RESTRICTION key, not
@@ -2526,6 +2530,9 @@ weave_beginscan(Relation r, int nkeys, int norderbys)
 	so->veck = 0;
 	so->vecLanes = 0;
 	so->vecDone = false;
+	so->vecIP = false;
+	so->vecPend = NULL;
+	so->nvecPend = 0;
 	so->cgramScan = false;
 	so->cgramPat = NULL;
 	so->cgramPatLen = 0;
@@ -2872,6 +2879,11 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->veck = 0;
 	so->vecLanes = 0;
 	so->vecDone = false;
+	so->vecIP = false;
+	if (so->vecPend != NULL)
+		pfree(so->vecPend);		/* one per rescan under a nested loop (G59) */
+	so->vecPend = NULL;
+	so->nvecPend = 0;
 	/*
 	 * F2.2's per-rescan state, reset HERE with all the rest and for the reason the
 	 * paragraph above gives: a nested loop whose inner scan kept the previous
@@ -3041,6 +3053,7 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 			so->vecQuery = (WVec *) palloc(VARSIZE_ANY(q));	/* alloc-ok: one query vector, bounded by WVEC_MAX_DIM */
 			memcpy(so->vecQuery, q, VARSIZE_ANY(q));
 			so->vecAttno = scan->orderByData[0].sk_attno;
+			so->vecIP = wantip;
 			so->vecScan = true;
 			/*
 			 * The vector IS the query on this path; so->query stays NULL and
@@ -3161,17 +3174,18 @@ weave_set_itup(IndexScanDesc scan, WeaveScanOpaque so)
 /*
  * The G56 padding phase -- see the padActive fields in WeaveScanOpaqueData.
  *
- * Wanted only on the lexical `<=>` route (the vector, edit-distance and fused
- * routes are recorded as open in doc/GAPS.md G56), and not when a restriction
- * key IS the ORDER BY query (ordQueryRestricts, whatever keys are beside it):
+ * Wanted on the lexical `<=>`, vector (`<->`, `<#>`) and edit-distance (`<@>`)
+ * routes -- not the fused one, which doc/specs/FUSED_TOPK.md keeps exact over
+ * its gate -- and not when a restriction key IS the ORDER BY query
+ * (ordQueryRestricts, whatever keys are beside it):
  * every key is ANDed, so a row q does not match fails that key and the heap
  * walk would return nothing -- once per rescan, under a nested loop.
  */
 static bool
 weave_pad_wanted(IndexScanDesc scan, WeaveScanOpaque so)
 {
-	return scan->numberOfOrderBys == 1 && !so->fuseScan && !so->vecScan &&
-		!so->edistScan && !so->ordSameQuery && !so->ordQueryRestricts;
+	return scan->numberOfOrderBys == 1 && !so->fuseScan &&
+		!so->ordSameQuery && !so->ordQueryRestricts;
 }
 
 static void
@@ -3285,7 +3299,17 @@ weave_pad_emit(IndexScanDesc scan, WeaveScanOpaque so, ItemPointer tid,
 	 * operator's value cannot be used here.
 	 */
 	typ[0] = FLOAT8OID;
-	dist[0].value = nulldist ? 0.0 : 1.0;
+	/*
+	 * The vector and edit-distance routes pad at +Infinity.  For `<@>` that is
+	 * exactly the heap operator's value: the ranked phase is complete only once
+	 * every document with a term was emitted, so what is left is term-free.  For
+	 * the vector route a complete ranked phase has emitted every live lane and
+	 * every pending vector (G29), so a non-NULL row reaches here only through a
+	 * vector the flush would also drop (corrupt, or the wrong dimension); it is
+	 * still a row of the table, so it comes out, after every ranked one.
+	 */
+	dist[0].value = nulldist ? 0.0
+		: (so->vecScan || so->edistScan) ? (double) INFINITY : 1.0;
 	dist[0].isnull = nulldist;
 	index_store_float8_orderby_distances(scan, typ, dist, false);
 }
@@ -4625,9 +4649,8 @@ collect_retry:
 			 * generation re-check detects the stale read and restarts.
 			 *
 			 * The VECTOR half of an item is not read here.  This is the lexical
-			 * match over not-yet-flushed documents; the vector channel's scan is a
-			 * per-bolt shuttle and a pending document is in no bolt yet, which is
-			 * a recall gap of its own -- see doc/GAPS.md G29.
+			 * match over not-yet-flushed documents; the vector ordering scan reads
+			 * pending vectors itself (weave_vec_collect_pending, doc/GAPS.md G29).
 			 */
 			weave_pending_iter_init(&it, page, dvtext);
 			while (weave_pending_iter_next(&it, &rec))
@@ -8090,6 +8113,114 @@ weave_ord_grow(Relation index, WeaveScanOpaque so)
  * ------------------------------------------------------------------------- */
 
 /*
+ * The pending list's vectors, scored EXACTLY against the query -- doc/GAPS.md G29.
+ *
+ * A pending document is in no bolt, so the lane scan cannot see it; between an
+ * INSERT and the next flush its row used to be in lexical answers and absent from
+ * vector ones.  The vector is on the pending page, so it is scored here in float,
+ * in the same units weave_vec_pass() hands the executor: the NEGATED channel
+ * score, i.e. ||q-v||^2 for l2 and -<q,v> for ip.  The bolt lanes are scored on
+ * quantized codes and these are not, which is the one place the two disagree; an
+ * ANN ordering already admits that (see the WHAT THE DISTANCE IS note above), and
+ * the flush that later moves the row into a bolt will quantize it.
+ *
+ * Called inside weave_vec_topk_guarded()'s generation bracket, so the pending
+ * read and the bolt read describe the same directory: a flush between them bumps
+ * the generation (one record since G65) and the whole pass is redone.  Sorted
+ * ascending distance, ties by TID, so a pass can take a prefix of it.
+ *
+ * ponytail: re-walked on every widening of the ladder; the list is bounded by
+ * the flush cadence, so this is cheap until someone runs with autovacuum off and
+ * millions of unflushed rows -- then cache it per generation.
+ */
+static int
+cmp_scored_asc_tid(const void *a, const void *b)
+{
+	const ScoredTid *x = (const ScoredTid *) a;
+	const ScoredTid *y = (const ScoredTid *) b;
+
+	if (x->score != y->score)
+		return x->score < y->score ? -1 : 1;
+	return ItemPointerCompare((ItemPointer) &x->tid, (ItemPointer) &y->tid);
+}
+
+static void
+weave_vec_collect_pending(Relation index, const WeaveMetaPageData *meta,
+						  WeaveScanOpaque so)
+{
+	BlockNumber blk = meta->pendinghead;
+	bool		dvtext = weave_index_dv_is_text(index);
+	const WVec *q = so->vecQuery;
+	int			cap = 0;
+
+	if (so->vecPend != NULL)
+		pfree(so->vecPend);
+	so->vecPend = NULL;
+	so->nvecPend = 0;
+
+	while (blk != InvalidBlockNumber)
+	{
+		Buffer		buffer;
+		Page		page;
+		WeavePendingIter it;
+		WeavePendingRec rec;
+		BlockNumber next;
+
+		CHECK_FOR_INTERRUPTS();	/* between pages, no buffer lock held */
+		buffer = weave_scan_readbuf(index, blk);
+		if (buffer == InvalidBuffer)
+			break;				/* truncated by a concurrent weave_vacuum */
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buffer);
+		if (!weave_page_is_live_pending(page))
+		{
+			/* freed under a stale head: the generation re-check redoes the pass */
+			UnlockReleaseBuffer(buffer);
+			break;
+		}
+		next = WeavePageGetOpaque(page)->nextblk;
+		weave_pending_iter_init(&it, page, dvtext);
+		while (weave_pending_iter_next(&it, &rec))
+		{
+			const WVec *v = (const WVec *) rec.vec;
+			double		acc = 0.0;
+			int			i;
+
+			/* the same three cases the flush turns into a dead lane */
+			if (v == NULL || !weave_wvec_is_valid(v, rec.veclen) || v->dim != q->dim)
+				continue;
+			for (i = 0; i < q->dim; i++)
+			{
+				if (so->vecIP)
+					acc += (double) q->x[i] * (double) v->x[i];
+				else
+				{
+					double		d = (double) q->x[i] - (double) v->x[i];
+
+					acc += d * d;
+				}
+			}
+			if (so->nvecPend >= cap)
+			{
+				/* bounded by the pending list, which is relation-scale when no
+				 * flush has run */
+				cap = cap ? cap * 2 : 64;
+				so->vecPend = (ScoredTid *) (so->vecPend
+											 ? WEAVE_REALLOC_MAYBE_HUGE(so->vecPend, (Size) cap * sizeof(ScoredTid))
+											 : WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(ScoredTid)));
+			}
+			so->vecPend[so->nvecPend].tid = *rec.tid;
+			so->vecPend[so->nvecPend].score = so->vecIP ? -acc : acc;
+			so->nvecPend++;
+		}
+		UnlockReleaseBuffer(buffer);
+		blk = next;
+	}
+	if (so->nvecPend > 1)
+		qsort(so->vecPend, so->nvecPend, sizeof(ScoredTid), cmp_scored_asc_tid);
+}
+
+/*
  * One pass, bracketed against the A1 race.
  *
  * The bolt loop reads VDIR/VCODES/VWARP pages under per-page SHARE locks off a
@@ -8118,6 +8249,7 @@ weave_vec_topk_guarded(Relation index, WeaveScanOpaque so)
 		weave_read_meta(index, &meta);
 		r = weave_vec_topk_run(index, &meta, so->vecQuery, so->veck,
 							   (uint16) so->vecAttno, NULL, 0, false);
+		weave_vec_collect_pending(index, &meta, so);
 		if (weave_read_meta_generation(index) == gen0)
 			return r;
 		pfree(r->hit);
@@ -8148,14 +8280,48 @@ weave_vec_pass(Relation index, WeaveScanOpaque so)
 	so->vecLanes = r->nlane;
 	so->vecDone = (r->nhit < so->veck ||
 				   (uint64) so->veck >= r->nlane);
-	ncand = r->nhit;
 
-	cand = (ScoredTid *) WEAVE_ALLOC_MAYBE_HUGE((Size) Max(ncand, 1) *
-												sizeof(ScoredTid));
-	for (i = 0; i < ncand; i++)
+	/*
+	 * The pending vectors (G29) this pass may emit: every one when the lane
+	 * phase is complete, else only those no farther than the pass's last lane.
+	 * A pending row beyond that frontier could be outranked by a lane only a
+	 * wider pass finds, so it waits for that pass -- the same argument that
+	 * makes a widening safe for lanes, applied to the second source.
+	 */
 	{
-		weave_docid_to_tid(r->hit[i].docid, &cand[i].tid);
-		cand[i].score = -(double) r->hit[i].score;
+		int			npend = so->nvecPend;
+
+		if (!so->vecDone && r->nhit > 0)
+		{
+			double		frontier = -(double) r->hit[r->nhit - 1].score;
+
+			npend = 0;
+			while (npend < so->nvecPend && so->vecPend[npend].score <= frontier)
+				npend++;
+		}
+		ncand = r->nhit + npend;
+		cand = (ScoredTid *) WEAVE_ALLOC_MAYBE_HUGE((Size) Max(ncand, 1) *
+													sizeof(ScoredTid));
+		/* merge two ascending lists: lanes (best first) and pending */
+		{
+			int			a = 0,
+						b = 0,
+						o = 0;
+
+			while (a < r->nhit || b < npend)
+			{
+				double		da = a < r->nhit ? -(double) r->hit[a].score : 0.0;
+
+				if (b >= npend || (a < r->nhit && da <= so->vecPend[b].score))
+				{
+					weave_docid_to_tid(r->hit[a].docid, &cand[o].tid);
+					cand[o++].score = da;
+					a++;
+				}
+				else
+					cand[o++] = so->vecPend[b++];
+			}
+		}
 	}
 	pfree(r->hit);
 	pfree(r->ctr);

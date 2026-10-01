@@ -61,10 +61,10 @@ SELECT count(*) AS lexical_sees_pending FROM pv WHERE d @@@ 'tag';
                     3
 (1 row)
 
--- ...and NOT yet visible to the vector channel, which is a SEPARATE, SMALLER gap
--- that this change does not close: the shuttle scans bolts, and a pending document
--- is in no bolt yet.  doc/GAPS.md G29.  Asserted rather than left unsaid so that
--- closing G29 shows up here as a diff.
+-- ...and in NO weft yet: the shuttle scans bolts, and a pending document is in no
+-- bolt until a flush.  The vector ORDER BY scan answers it anyway since G29 closed,
+-- by scoring the pending page's vector directly (sql/vecorderby.sql section 7);
+-- this lane count is about the weft, and stays 0 until the flush.
 SELECT sum(nvec) AS lanes_before_flush FROM weave_vec_meta('pv_idx');
  lanes_before_flush 
 --------------------

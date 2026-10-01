@@ -509,22 +509,19 @@ SELECT (SELECT id FROM vo ORDER BY v <-> '[800,800,800,800,800,800,800,800]'::wv
 (1 row)
 
 -- ============================================================================
--- (7) AN INSERT THAT LANDS IN THE PENDING BUFFER.  doc/GAPS.md G29.
+-- (7) AN INSERT THAT LANDS IN THE PENDING BUFFER.  doc/GAPS.md G29, CLOSED
+-- 2026-09-30.
 --
--- WHAT THE BEHAVIOUR IS TODAY, stated rather than wished for: the vector channel
--- does NOT scan the pending buffer.  The shuttle is a per-bolt cursor over
--- VDIR/VCODES/VWARP and a pending document is in no bolt, so between an INSERT and
--- the next flush the row is in LEXICAL answers and absent from VECTOR ones.  G29
--- records why closing it is held for the fused scorer -- the pending vector would
--- need a scoring path that is not a bolt cursor, and its results would have to enter
--- the same top-k as the bolts', and building a second parallel top-k merge before
--- Phase F exists is how two scorers that disagree get written.
+-- The vector ordering scan now reads the pending list's vectors and scores them
+-- exactly, inside the same generation bracket as the bolt pass, and merges them
+-- into the lane ranking (weave_vec_collect_pending).  Until then a row was in
+-- LEXICAL answers and absent from VECTOR ones between its INSERT and the next
+-- flush, and this section asserted that absence as 301 rows / 0, "so that closing
+-- it shows up here as a diff rather than as nothing".  It did: 302 / 1.
 --
 -- Asserted as a ROW COUNT rather than as a ranking, because a count is exact and
--- pins the mechanism: the vector ordering scan returns one row per live lane that
--- resolves to a visible tuple, so "the row is not in the weft" is directly
--- observable and does not bet on the quantizer placing an exact match first.
--- Closing G29 therefore shows up here as a diff rather than as nothing.
+-- pins the mechanism: the vector ordering scan returns one row per live lane or
+-- pending vector that resolves to a visible tuple.
 -- ============================================================================
 INSERT INTO vo(d, v)
   VALUES (to_wdoc('order pendingtoken'), '[7,7,7,7,7,7,7,7]');
@@ -546,7 +543,7 @@ SELECT sum(nvec) AS lanes_before_flush FROM weave_vec_meta('vo_weave');
 (1 row)
 
 -- The lexical channel sees it immediately: weave_collect_matches() walks the
--- pending page itself.  This asymmetry is the whole of G29.
+-- pending page itself; until G29 closed, this was the only channel that did.
 SELECT count(*) AS lexical_sees_the_pending_row
   FROM vo WHERE d @@@ 'pendingtoken'::wquery;
  lexical_sees_the_pending_row 
@@ -554,11 +551,9 @@ SELECT count(*) AS lexical_sees_the_pending_row
                             1
 (1 row)
 
--- The vector ordering scan does not: one fewer row than the table has, and the
--- inserted row is not among them even though its vector IS the query.  The EXPLAIN
--- is load-bearing here and not decoration: the COUNT is the discriminator, so a Seq
--- Scan answering this query would report 302 and the file would be asserting the
--- opposite of what it claims.
+-- The vector ordering scan sees it too: every row of the table, the inserted one
+-- among them.  The EXPLAIN is load-bearing and not decoration: a Seq Scan would
+-- also report 302, so without it this would not show the INDEX answered.
 EXPLAIN (COSTS OFF)
 SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec;
                   QUERY PLAN                   
@@ -571,7 +566,7 @@ SELECT count(*) AS vec_rows_before_flush
   FROM (SELECT id FROM vo ORDER BY v <-> '[7,7,7,7,7,7,7,7]'::wvec) s;
  vec_rows_before_flush 
 -----------------------
-                   301
+                   302
 (1 row)
 
 SELECT count(*) AS pending_row_in_vec_answer_before_flush
@@ -579,7 +574,7 @@ SELECT count(*) AS pending_row_in_vec_answer_before_flush
  WHERE s.id = (SELECT max(id) FROM vo);
  pending_row_in_vec_answer_before_flush 
 ----------------------------------------
-                                      0
+                                      1
 (1 row)
 
 -- After a flush the row is in a real weft (G23 is closed at the segment) and the
@@ -704,9 +699,10 @@ SELECT bool_and(ok) AS all_invariants_hold FROM weave_check('vo_weave');
 -- (9) AN INDEX WITH NO VECTOR CHANNEL falls through cleanly.  The operator is on
 -- wvec, so it can only be matched to a wvec index column; what this asserts is the
 -- other half -- a wvec COLUMN whose weft is not there.  A table whose every vector
--- is NULL has a weft with no live lane, and the ordering must return no rows rather
--- than erroring, because an ordering path over an empty channel is a legitimate
--- plan.
+-- is NULL has a weft with no live lane, and the ordering must not error, because an
+-- ordering path over an empty channel is a legitimate plan.  It returns the rows,
+-- at a NULL distance, as the heap does: SQL's ORDER BY never filters, and NULLs
+-- sort last (doc/GAPS.md G56).  It returned 0 before the vector route padded.
 -- ============================================================================
 CREATE TABLE voe (id serial, d wdoc, v wvec(8));
 INSERT INTO voe(d, v) SELECT to_wdoc('empty tag' || g), NULL FROM generate_series(1, 20) g;
@@ -732,7 +728,7 @@ SELECT count(*) AS rows_from_an_all_null_vector_column
   FROM (SELECT id FROM voe ORDER BY v <-> '[1,1,1,1,1,1,1,1]'::wvec LIMIT 5) s;
  rows_from_an_all_null_vector_column 
 -------------------------------------
-                                   0
+                                   5
 (1 row)
 
 -- And an index with NO wvec column at all: the operator cannot be matched to any of
@@ -869,6 +865,141 @@ SELECT count(*) AS rows_from_the_cosine_sort
 (1 row)
 
 SET enable_seqscan = off;
+-- ============================================================================
+-- (12) EVERY ROW, AS THE HEAP ORDERS IT -- doc/GAPS.md G56 on the vector and
+-- edit-distance routes, and G29 for the pending rows.
+--
+-- SQL's ORDER BY never filters, so an ordering scan must return what a Seq Scan +
+-- Sort would: rows whose vector is NULL come out LAST (at a NULL distance), and for
+-- `<@>` a document with no term is +Infinity and a NULL document is NULL.  Until
+-- these routes padded, the vector scan dropped NULL-vector rows and `<@>` dropped
+-- both.  Rows inserted after the build sit in the pending list, and the vector scan
+-- must find them too -- here they are the NEAREST rows, so they come first.
+-- Compared against the heap as sets, plus the class order, plus the distinct-id
+-- count (a row emitted twice would pass the set comparison).
+-- ============================================================================
+CREATE TABLE vg (id serial, d wdoc, v wvec(4));
+INSERT INTO vg(d, v) SELECT to_wdoc('simple', 'tag' || g), ('[' || g || ',1,1,1]')::wvec
+  FROM generate_series(1, 300) g;
+INSERT INTO vg(d, v) SELECT to_wdoc('simple', 'nullvec' || g), NULL FROM generate_series(1, 20) g;
+INSERT INTO vg(d, v) SELECT NULL, ('[' || g || ',2,2,2]')::wvec FROM generate_series(1, 10) g;
+INSERT INTO vg(d, v) SELECT to_wdoc('simple', ''), '[5,5,5,5]'::wvec FROM generate_series(1, 5) g;
+CREATE INDEX vg_weave ON vg USING weave (d, v);
+INSERT INTO vg(d, v) SELECT to_wdoc('simple', 'pend' || g), ('[0,0,0,' || g || ']')::wvec
+  FROM generate_series(1, 7) g;
+INSERT INTO vg(d, v) VALUES (to_wdoc('simple', 'pendnull'), NULL);
+SELECT npending > 0 AS rows_are_pending FROM (SELECT count(*) AS npending FROM vg WHERE id > 335) s;
+ rows_are_pending 
+------------------
+ t
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT id FROM vg ORDER BY v <-> '[0,0,0,0]'::wvec;
+              QUERY PLAN               
+---------------------------------------
+ Index Scan using vg_weave on vg
+   Order By: (v <-> '[0,0,0,0]'::wvec)
+(2 rows)
+
+CREATE TEMP TABLE vgi AS
+  SELECT row_number() OVER () AS rn, id FROM (SELECT id FROM vg ORDER BY v <-> '[0,0,0,0]'::wvec) s;
+SET enable_seqscan = on;
+SELECT (SELECT count(*) FROM vgi) = (SELECT count(*) FROM vg) AS vec_every_row,
+       (SELECT count(DISTINCT id) FROM vgi) = (SELECT count(*) FROM vg) AS vec_no_row_twice,
+       (SELECT array_agg(id ORDER BY rn) FROM vgi WHERE rn <= 3) AS vec_first3,
+       (SELECT bool_and(rn > (SELECT count(*) FROM vg WHERE v IS NOT NULL))
+          FROM vgi JOIN vg USING (id) WHERE vg.v IS NULL) AS vec_nulls_last,
+       (SELECT count(*) FROM vgi WHERE id BETWEEN 336 AND 342) AS vec_pending_rows_answered;
+ vec_every_row | vec_no_row_twice | vec_first3  | vec_nulls_last | vec_pending_rows_answered 
+---------------+------------------+-------------+----------------+---------------------------
+ t             | t                | {336,1,337} | t              |                         7
+(1 row)
+
+SET enable_seqscan = off;
+-- a restriction the ranked phase does not apply: every heap row that passes it
+SELECT count(*) AS vec_filtered
+  FROM (SELECT id FROM vg WHERE d @@@ 'tag5 | nullvec3 | pend2'
+         ORDER BY v <-> '[0,0,0,0]'::wvec) s;
+ vec_filtered 
+--------------
+            3
+(1 row)
+
+-- THE FRONTIER.  A narrow first pass (wand_initial_k = 1) sees only the nearest lanes,
+-- so a pending row FARTHER than every lane must wait for the pass that has seen them
+-- all: emitted with the first pass it would come out ahead of nearer lanes.  The row
+-- below is the farthest vector in the table by orders of magnitude, so it is last
+-- among every row that HAS A LANE OR A PENDING ITEM whatever the quantizer does.
+-- Killed the mutant that drops the frontier (it put this row at rank 5).
+--
+-- The ten NULL-DOCUMENT rows are excluded from that rank, and they are a loss
+-- recorded here rather than a pass: the build skips a row whose wdoc is NULL, so its
+-- vector is in no weft, and it comes out of the padding at +Infinity -- AFTER this
+-- row, where a heap sort would put it by its real distance.  Scoring padded rows
+-- exactly would mean emitting a distance below ones already handed out, which the
+-- executor refuses ("index returned tuples in wrong order").  doc/GAPS.md G56.
+INSERT INTO vg(d, v) VALUES (to_wdoc('simple', 'farpend'), '[1000,1000,1000,1000]');
+SET pg_weave.wand_initial_k = 1;
+CREATE TEMP TABLE vgf AS
+  SELECT row_number() OVER () AS rn, id FROM (SELECT id FROM vg ORDER BY v <-> '[0,0,0,0]'::wvec) s;
+RESET pg_weave.wand_initial_k;
+SET enable_seqscan = on;
+SELECT (SELECT rn FROM vgf WHERE id = (SELECT max(id) FROM vg))
+       = (SELECT count(*) FROM vg WHERE v IS NOT NULL AND d IS NOT NULL) AS far_pending_row_is_last_indexed,
+       (SELECT min(rn) FROM vgf JOIN vg USING (id) WHERE vg.d IS NULL AND vg.v IS NOT NULL)
+       > (SELECT rn FROM vgf WHERE id = (SELECT max(id) FROM vg)) AS null_doc_vectors_come_after,
+       (SELECT count(*) FROM vgf) = (SELECT count(*) FROM vg) AS narrow_every_row;
+ far_pending_row_is_last_indexed | null_doc_vectors_come_after | narrow_every_row 
+---------------------------------+-----------------------------+------------------
+ t                               | t                           | t
+(1 row)
+
+SET enable_seqscan = off;
+DROP TABLE vgf;
+-- nested-loop rescans: three outer rows, each the whole table
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+-- the table size is taken FIRST, with the seq scan on: a query-less count is the
+-- G39 shape PostgreSQL 18 sends to the refused index path when the seq scan is off
+SET enable_seqscan = on;
+SELECT count(*) AS vg_rows FROM vg \gset
+SET enable_seqscan = off;
+SELECT count(*) = 3 * :vg_rows AS vec_rescans_every_row
+  FROM generate_series(1, 3) o,
+       LATERAL (SELECT id FROM vg ORDER BY v <-> ('[' || o || ',0,0,0]')::wvec) s;
+ vec_rescans_every_row 
+-----------------------
+ t
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+EXPLAIN (COSTS OFF) SELECT id FROM vg ORDER BY d <@> 'tag1';
+            QUERY PLAN            
+----------------------------------
+ Index Scan using vg_weave on vg
+   Order By: (d <@> 'tag1'::text)
+(2 rows)
+
+CREATE TEMP TABLE vge AS
+  SELECT row_number() OVER () AS rn, id, d <@> 'tag1' AS dist
+    FROM (SELECT id, d FROM vg ORDER BY d <@> 'tag1') s;
+SET enable_seqscan = on;
+SELECT (SELECT count(*) FROM vge) = (SELECT count(*) FROM vg) AS edist_every_row,
+       (SELECT count(DISTINCT id) FROM vge) = (SELECT count(*) FROM vg) AS edist_no_row_twice,
+       (SELECT count(*) FROM vge WHERE dist = 'Infinity') AS edist_term_free_rows,
+       (SELECT count(*) FROM vge WHERE dist IS NULL) AS edist_null_docs,
+       (SELECT bool_and(a.dist <= b.dist OR b.dist IS NULL)
+          FROM vge a JOIN vge b ON b.rn = a.rn + 1 WHERE a.dist IS NOT NULL) AS edist_ascending;
+ edist_every_row | edist_no_row_twice | edist_term_free_rows | edist_null_docs | edist_ascending 
+-----------------+--------------------+----------------------+-----------------+-----------------
+ t               | t                  |                    5 |              10 | t
+(1 row)
+
+SET enable_seqscan = off;
+DROP TABLE vgi;
+DROP TABLE vge;
+DROP TABLE vg;
 DROP TABLE voip;
 DROP TABLE vol;
 DROP TABLE voe;

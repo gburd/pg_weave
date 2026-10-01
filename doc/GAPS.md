@@ -1461,7 +1461,7 @@ cursor: ~72% of a ranked mid k=10 scan, re-pinning the page and re-walking its
 block headers on every 128-docid block change. Recorded rather than deleted
 because it is the third hypothesis in this file that a profile overturned.
 
-### G29 — the vector channel does not scan the pending buffer, so an inserted row is absent from vector answers until a flush — **OPEN 2026-09-19, found by closing G23**
+### G29 — the vector channel does not scan the pending buffer, so an inserted row is absent from vector answers until a flush — **OPEN 2026-09-19, found by closing G23; CLOSED 2026-09-30**
 
 G23 is closed at the SEGMENT: a flush now folds the pending vectors into a real weft.
 The window before that flush is a second, much smaller version of the same
@@ -1500,6 +1500,35 @@ of the same gap than a lane count was.
 dictionary is also not updated until a merge, which is documented as matching GIN
 fastupdate's staleness. The difference is that stale `df` perturbs a *score* while
 this omits a *row*.
+
+**CLOSED 2026-09-30, without waiting for Phase F.** The objection above was to a *second
+top-k merge*, and what landed is not one: `weave_vec_collect_pending()` reads the pending
+list's vectors inside `weave_vec_topk_guarded()`'s generation bracket and scores them
+exactly, in float, in the units `weave_vec_pass()` already emits (||q-v||^2 for l2,
+-<q,v> for ip). The pass merges them into its lane list. A narrow pass emits a pending
+row only when it is no farther than the pass's last lane, because a farther one could be
+outranked by a lane only a wider pass finds. That is the same argument that makes widening
+safe, applied to the second source.
+- The one disagreement: lanes are scored on quantized codes and pending vectors are not.
+  An ANN ordering already admits that, and the flush quantizes the row.
+- Since G65, a flush moves a row from the pending list to a bolt in one record, so no
+  generation can show a row in both places or in neither.
+- `sql/vecorderby.sql` section (7) now reads 302 / 1 where it read 301 / 0, the diff it was
+  written to produce.
+- Section (12) asserts that the nearest pending rows come first, that a far pending row
+  waits for the pass that has seen every lane, and that each row comes out once.
+- Mutants: `vec_first3` `{1,2,3}` with the pending merge off, and the far row emitted early
+  with the frontier off.
+- `ponytail:` the pending list is re-walked on every widening of the ladder. That is cheap at
+  the flush cadence; cache it per generation if a workload runs with millions of unflushed
+  rows.
+
+**Seen once while running the gate, and NOT this change:** `t/027` round-robin reported
+`linked-pages=0` over its 5 rounds on PG18 and failed "a flush kept pages linked after its
+cut". The same test reports 1–3 such firings in every other recorded run (nine logs), and a
+re-run on the same tree passed. The test stops at 5 rounds, so an unlucky run never fires
+the shape. Noted as a flake to fix by letting the loop run until both shapes fire, with a
+time cap.
 
 Against the full separate-extension stack it is not yet a comparison: there is no
 vector index and no fuzzy channel.
@@ -4004,7 +4033,7 @@ vector, `<@>` edit distance). **Ablation:** with the final arm forced to
 `xs_recheck = false`, §14 returns 2000 rows with 1600 violating (vector) and 1600
 violating (edit distance), and the G55 probe returns 3000/2400 again.
 
-### G56 — restriction keys no route honours were dropped with no recheck: a second `@@@`, `@@@ a` beside `ORDER BY <=> b`, and `@~` beside an ordering — **FOUND 2026-09-28; silent wrong answer, PRE-EXISTING (not docvals); FIXED 2026-09-28; the contract limit (incomplete ordering answers) FIXED 2026-09-29 on the lexical route, OPEN on vector/edist/fused**
+### G56 — restriction keys no route honours were dropped with no recheck: a second `@@@`, `@@@ a` beside `ORDER BY <=> b`, and `@~` beside an ordering — **FOUND 2026-09-28; silent wrong answer, PRE-EXISTING (not docvals); FIXED 2026-09-28; the contract limit (incomplete ordering answers) FIXED 2026-09-29 on the lexical route, 2026-09-30 on the vector and edit-distance routes; the fused route is out of scope by design**
 
 Three shapes, all measured on 2000 rows (even ids hold `alpha`, odd hold `beta`):
 
@@ -4088,10 +4117,42 @@ The G56 section also exposed **G66**.
 full heap scan for the tail, as a Seq Scan + Sort would. A LIMIT inside the match set is
 unchanged.
 
-**Still OPEN:** the vector (`<->`, `<#>`), edit-distance (`<@>`) and fused routes do not
-pad. The vector route misses rows with a NULL vector, which the heap puts last. The
-edit-distance route misses term-free documents (+Infinity on the heap) and NULL
-documents. `doc/specs/FUSED_TOPK.md` rejects padding for the fused route.
+**Vector and edit-distance routes: CLOSED 2026-09-30.** `weave_pad_wanted()` now admits
+both, and `weave_pad_emit()` pads them at **+Infinity** rather than 1.0, because a 1.0 would
+sort ahead of real vector and edit distances.
+- For `<@>`, +Infinity is exactly the heap operator's value: the ranked phase is complete
+  only once it has emitted every document with a term, so what is left is term-free, plus
+  the NULL documents, which come out last at NULL.
+- For the vector route, the ranked phase emits every live lane plus, since G29, every
+  pending vector. What is left is NULL-vector rows, which go last at NULL, and NULL-document
+  rows.
+
+**Pinned:** `sql/vecorderby.sql` section (12) checks, against the heap:
+- every row is returned once;
+- NULL vectors come last;
+- for `<@>`, 5 term-free rows at Infinity and 10 NULL documents at NULL, in ascending order;
+- a filter the ranked phase does not apply;
+- nested-loop rescans;
+- the frontier (below).
+
+Section (9) now returns 5 rows for an all-NULL vector column where it used to return 0.
+
+**Mutants, each confirmed to BUILD before its check counted:**
+
+| mutant | result |
+|---|---|
+| vector padding off | 0 rows for a 5-row answer; `vec_every_row` false; 2 of 3 filtered rows |
+| pending merge off | `vec_first3` `{1,2,3}` instead of `{336,1,337}`, the pending rows absent from the top |
+| frontier off | the far pending row comes out early (`far_pending_row_is_last_indexed` false) |
+
+**A loss, recorded:** a row whose **document** is NULL is skipped by the build, so its
+vector is in no weft. It comes out of the padding at +Infinity, after rows a heap sort would
+put behind it. Scoring padded rows exactly would emit a distance below ones already handed
+out, which the executor refuses ("index returned tuples in wrong order").
+`null_doc_vectors_come_after` asserts the current behaviour so that a change shows up.
+
+**Fused route:** still does not pad, by design. `doc/specs/FUSED_TOPK.md` keeps it exact
+over its gate.
 
 ### G57 — the docvalues gate reported a DELETED row's value for the NEW tuple that reused its TID — **FOUND 2026-09-28; silent wrong answer; FIXED 2026-09-28**
 
