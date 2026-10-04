@@ -1268,7 +1268,7 @@ chosen here** — the choice is the maintainer's:
     honest only if the restated gate is stated before it is measured against.
   - **(b) A second, vector-major copy of the codes**, so a single lane can be scored
     without touching its 31 neighbours. This forfeits the storage gate — a second copy of
-    the code weft — and `include/weave/vecpage.h:24-26` refuses `WEAVE_PACK_VECMAJOR` on
+    the code weft — [**MEASURED 2026-10-04, `bench/RESULTS_VECMAJOR.md`:** the copy, measured on top of the built index, gives 0.356× / 0.288× / 0.159× / 0.194× HNSW at 384 / 768 / 960 / 1,024-d. The cheapest variant is dense with no centroid, sharing the directory's per-lane scale/norm. It fits only at 960-d, and only after the centroid strip is moved off its own page (0.128×). At 384/768-d no layout fits] and `include/weave/vecpage.h:24-26` refuses `WEAVE_PACK_VECMAJOR` on
     the coordinate-split page layout, so it is a new on-disk shape, not a reloption.
   - **(c) Cluster-order the weft** so a query's candidates are contiguous and a block probe
     is not wasted. This **CONTRADICTS the strictly-ascending-docid requirement the fused

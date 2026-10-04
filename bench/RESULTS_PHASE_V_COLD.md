@@ -67,6 +67,17 @@ times. Measured, m=16, ef_construction=64, `vector_cosine_ops`, 999,990 × 960-d
 **So the 0.15× budget is ~1,208 B/vector, not ~855.** Re-pricing the frontier at
 1024-d, where index bytes are `bits × 128`:
 
+> **CORRECTED 2026-10-04 (`bench/RESULTS_VECMAJOR.md`).** `bits × 128` is the code
+> bytes from arithmetic. The table below divides that by a measured HNSW, so its
+> numerator and denominator are different kinds of number. Measured, a 4-bit weave
+> index is **1,045 B/vector at 1,024-d (0.130× of 8,056)** and **789 B/vector at
+> 960-d (0.098×)**, the dimension this corpus actually has. Each 32-lane block's
+> centroid strip gets its own page (256 B/vector), and coordinate-split strips waste
+> more at 1,024-d. Both widths still pass 0.15× at 4 bits. **Rows of the table
+> other than 4 bits were not measured and should not be read as index sizes.** At
+> 384-d and 768-d the shipped index fails the gate (0.261× / 0.193× against same-run
+> HNSW).
+
 | bits | index B/vector | × HNSW | window @ 0.99 (n=1M) | SIMD kernel |
 |---|---:|---:|---|---|
 | 3 | 384 | 0.048 | 50 | yes |
@@ -86,7 +97,8 @@ was leaning on a guess.
 
 The recommended shape is unchanged and now has more margin: **4 bits plus an exact
 rerank of a top-25 window** — 0.9920 recall at n=1M, 512 B/vector = **0.064×
-HNSW**, and the widest width that keeps the SIMD code-scan kernel.
+HNSW** (**CORRECTED 2026-10-04:** code bytes; the built index is 789 B/vector = 0.098× at
+960-d, see the note above), and the widest width that keeps the SIMD code-scan kernel.
 
 ## 3. pgvector HNSW never reaches recall@10 0.99 on this corpus
 

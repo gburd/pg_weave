@@ -468,7 +468,7 @@ Four things, and it should claim exactly four things:
    claimed on **work saved for the vector channel** — not pending a tighter bound, which is
    what the earlier notes implied, but pending a maintainer decision among: restating §8's
    row in **blocks or bytes** rather than lanes; a second **vector-major** copy of the codes,
-   forfeiting the storage gate; or a **cluster-ordered weft**, which contradicts the
+   forfeiting the storage gate [**MEASURED 2026-10-04, `bench/RESULTS_VECMAJOR.md`:** true at every dim measured, from 0.159× HNSW at 960-d to 0.356× at 384-d. At 384/768-d no layout fits, because two 4-bit copies exceed the whole budget]; or a **cluster-ordered weft**, which contradicts the
    strictly-ascending-docid requirement the fused vector channel depends on
    (`include/weave/vecdocmap.h:35,105,122`) — i.e. **claim 3's clustering lever and this
    claim's docid adapter are not independent**, which nothing in the tree had recorded before
