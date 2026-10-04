@@ -36,7 +36,7 @@ case "$ver" in 17*) ;; *) echo "expected PG17, got $ver" >&2; exit 1 ;; esac
 say "installing pgvector"
 sudo apt-get -qq install -y postgresql-17-pgvector >/dev/null
 ls -l /usr/lib/postgresql/17/lib/vector.so
-$PSQL -c "CREATE EXTENSION IF NOT EXISTS pg_weave" -c "CREATE EXTENSION IF NOT EXISTS vector"
+$PSQL -c "CREATE EXTENSION IF NOT EXISTS pg_weave" -c "CREATE EXTENSION IF NOT EXISTS vector" -c "CREATE EXTENSION IF NOT EXISTS pageinspect"
 $PSQL -tA -F$'\t' -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_weave','vector') ORDER BY 1" \
 	| tee "$OUT/versions.tsv"
 echo "nproc=$(nproc) mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)" | tee -a "$OUT/versions.tsv"
@@ -73,6 +73,24 @@ int main(int argc, char **argv) {
 }
 C
 gcc -O2 -o /tmp/gen /tmp/gen.c -lm
+
+# Elements per HNSW page, from the page headers.  pgvector writes each element
+# as two items (the element tuple and its neighbour tuple, on the same page when
+# they fit), so elements = items / 2 over all non-meta pages.  Reported so the
+# denominator is explained, not just quoted: pages/vector is a step function of
+# how many (element + neighbours) pairs fit in 8 KB.
+hnsw_census() {
+	local idx=$1 tag=$2 rows=$3
+	$PSQL -tA -F$'\t' -c "
+		WITH p AS (SELECT (lower - 24) / 4 AS items
+		             FROM generate_series(1, pg_relation_size('$idx') / 8192 - 1) b,
+		                  LATERAL page_header(get_raw_page('$idx', b::int)))
+		SELECT '$tag', $rows, pg_relation_size('$idx') / 8192 AS pages,
+		       sum(items) / 2 AS elements, min(items), max(items),
+		       round(avg(items), 3), pg_relation_size('$idx')
+		  FROM p" | tee -a "$OUT/hnsw_census.tsv"
+}
+printf 'tag\trows\tpages\telements\tmin_items\tmax_items\tavg_items\tbytes\n' > "$OUT/hnsw_census.tsv"
 
 printf 'dim\tkind\tnpages\tbytes\tfree_bytes\n' > "$OUT/vmajor_raw.tsv"
 printf 'dim\tn\tsegs\tnblocks\tweave_B\tcodes_pages\tlane_pages\tcen_pages\tcodes_B\tdir_B\twarp_B\tvmeta_B\tlexical_B\thnsw_B\tweave_Bpv\tcodes_Bpv\tlane_Bpv\tcen_Bpv\tdir_Bpv\twarp_Bpv\thnsw_Bpv\n' \
@@ -145,10 +163,65 @@ for D in $DIMS; do
 		  FROM r
 	SQL
 	tail -1 "$OUT/vmajor_bytes.tsv"
+	hnsw_census tp_hnsw "$D" "$N"
 	$PSQL -c "DROP TABLE tw, tp"
 done
+
+# Duplicate control for the HNSW denominator.  pgvector's build stores a vector
+# equal to one already in the graph as an extra heap TID on the existing element
+# rather than as a new element, so an HNSW over a corpus with duplicates is
+# smaller per ROW than one over unique vectors.  If that is why the recorded
+# GIST-1M figure (8,056 B/row) is below 8,192, this arm shows it directly:
+# DUPN unique vectors plus DUPX exact copies of some of them must build
+# DUPN elements, not DUPN + DUPX.
+DUPN=${DUPN:-20000}
+DUPX=${DUPX:-2000}
+say "duplicate control: $DUPN unique + $DUPX copies, 960-d"
+$PSQL -c "DROP TABLE IF EXISTS tp" -c "CREATE TABLE tp (id int, v vector(960))"
+/tmp/gen "$DUPN" 960 4242 | $PSQL -c "COPY tp (id, v) FROM STDIN"
+$PSQL -c "INSERT INTO tp SELECT id + $DUPN, v FROM tp WHERE id <= $DUPX"
+$PSQL -c "SET maintenance_work_mem = '4GB'" -c "SET max_parallel_maintenance_workers = 7" \
+      -c "CREATE INDEX tp_hnsw ON tp USING hnsw (v vector_cosine_ops) WITH (m = 16, ef_construction = 64)"
+hnsw_census tp_hnsw dup960 $((DUPN + DUPX))
+$PSQL -c "DROP TABLE tp"
+
+# Optional: count exact duplicates in GIST-1M itself, which is what would make
+# the duplicate arm's mechanism the explanation of the recorded figure rather
+# than merely a candidate.  Raw records are hashed, so no 11 GB text dump.
+if [ "${GIST_DUPS:-0}" = 1 ]; then
+	say "GIST-1M duplicate count"
+	mkdir -p /scratch/corpus && cd /scratch/corpus
+	if [ ! -f gist/gist_base.fvecs ]; then
+		timeout 1500 curl -sS --connect-timeout 30 -O ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz \
+			&& tar xzf gist.tar.gz && rm -f gist.tar.gz || echo "GIST fetch failed; skipping"
+	fi
+	if [ -f gist/gist_base.fvecs ]; then
+		python3 - gist/gist_base.fvecs <<-'PY' | tee "$OUT/gist_dups.txt"
+			import hashlib, struct, sys
+			f = open(sys.argv[1], 'rb')
+			dim = struct.unpack('<i', f.read(4))[0]; f.seek(0)
+			rec = 4 + 4 * dim; seen = set(); n = zero = 0
+			z = bytes(4 * dim)
+			while True:
+			    b = f.read(rec)
+			    if len(b) < rec:
+			        break
+			    n += 1
+			    if b[4:] == z:
+			        zero += 1
+			        continue
+			    seen.add(hashlib.blake2b(b[4:], digest_size=16).digest())
+			print(f"gist rows={n} zero={zero} nonzero={n - zero} distinct={len(seen)} dup_rows={n - zero - len(seen)}")
+		PY
+	fi
+	cd - >/dev/null
+fi
 
 say "done"
 cat "$OUT/vmajor_raw.tsv"
 echo
 cat "$OUT/vmajor_bytes.tsv"
+echo
+cat "$OUT/hnsw_census.tsv"
+[ -f "$OUT/gist_dups.txt" ] && cat "$OUT/gist_dups.txt"
+ls -la "$OUT"
