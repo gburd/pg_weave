@@ -4664,7 +4664,7 @@ index=2098 against heap=1593.
   has not been audited for the same window.
 - **G65** remains open for the crash case. G70 is its visible symptom without a crash.
 
-### G71 — a fused `<->`/`<#>` pushdown ranks rows with a NULL vector FIRST: `fuse(...)` is NULL for them, and the index treats a missing channel as contributing 0 — **FOUND 2026-10-01 while designing F9; silent wrong answer in a shipped plan; OPEN**
+### G71 — a fused `<->`/`<#>` pushdown ranks rows with a NULL vector FIRST: `fuse(...)` is NULL for them, and the index treats a missing channel as contributing 0 — **FOUND 2026-10-01 while designing F9; silent wrong answer in a shipped plan; FIXED 2026-10-01 (`3d8dddc`); pending rows ranked since G66's fused fix, 2026-10-04**
 
 `fuse()` is NULL when any argument is NULL (`weave_fuse()`, `src/am/fusepath.c`; asserted
 by `sql/fuse_fallback.sql`), and ascending ORDER BY puts NULLs last. The fused core uses a
