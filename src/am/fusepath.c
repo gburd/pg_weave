@@ -874,7 +874,9 @@ weave_fuse_rhs_ok(PlannerInfo *root, RelOptInfo *rel, Expr *rhs)
  *	 - The `<@>` shuttle's warp is a position in the DICTIONARY, not in any
  *	   document space at all (src/query/edist.c; see weave_edist_pass()).  No
  *	   relabelling exists, because a document's `<@>` distance is a MINIMUM over
- *	   its terms; that needs a document-space shuttle, which is task F9.
+ *	   its terms; that needs a document-space shuttle.  Task F9 measured one and
+ *	   the maintainer decided against it (FUSED_TOPK.md sect. 7d, option (b),
+ *	   2026-10-04): fuzziness is a WHERE gate on a fused scan, not a channel.
  *
  * include/weave/gate.h states this as "reconciling them is Phase F's decision,
  * not this task's".  F2.2 decided the docid space and served what already lived
@@ -991,9 +993,21 @@ weave_fuse_attribute(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *index,
 	}
 	else if (op->opno == weave_fuse_path_oids.edist_op)
 	{
+		/*
+		 * `<@>` IS REFUSED AS A SCORED CHANNEL, BY DECISION, NOT FOR WANT OF
+		 * CODE.  The maintainer chose doc/specs/FUSED_TOPK.md sect. 7d option (b)
+		 * on 2026-10-04: fuzziness joins a fused ranking as a GATE -- `WHERE body
+		 * @@@ 'term~k' ORDER BY fuse(...)`, which this hook already serves as one
+		 * fused Index Scan with the fuzzy term as an Index Cond -- and not as a
+		 * channel scored inside fuse().  So this stays unservable and the Sort
+		 * over the fallback stands, which is correct (sql/fuse_gate.sql section
+		 * (4) asserts it).  Making it servable is sect. 7d option (a), a change
+		 * to the fallback's arithmetic and not just a shuttle; see the long
+		 * comment above for why the warp is the dictionary's.
+		 */
 		req->strategy = WEAVE_STRAT_EDIST;
 		wantfamily = weave_fuse_path_oids.lex_family;
-		req->servable = false;	/* dictionary-space warp; see above */
+		req->servable = false;
 	}
 	else if (op->opno == weave_fuse_path_oids.vec_l2_op)
 	{
