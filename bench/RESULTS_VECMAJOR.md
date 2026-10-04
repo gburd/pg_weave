@@ -14,7 +14,7 @@ asked:
   384-d and 768-d**. It passes at 960-d and 1,024-d, with less margin than claimed. The
   cause is in the layout: the writer emits **one page per strip**, so each 32-lane
   block's centroid strip (dim/2 bytes) takes a **whole 8 KB page**. That is **256 B per
-  vector at every dimension**, which is 33–48 % of the index.
+  vector at every dimension**, which is 24–48 % of the index (48 % at 384-d).
 - **(B) A second vector-major copy fails the gate at all four dimensions.** Measured
   on top of today's layout, the cheapest copy (dense, no centroid, sharing the
   directory's scale/norm) gives **0.356× / 0.288× / 0.159× / 0.194×**. Even the
