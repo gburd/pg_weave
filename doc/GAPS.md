@@ -4717,8 +4717,13 @@ it has just updated. Record 10 is deleted. Why each record is now self-consisten
 **Pinned by `t/030_bulkdelete_atomic.pl`.** It uses point-in-time recovery to stop
 *after each* VACUUM record that touches the metapage, and checks
 `ndocs + ndeleted == C` at every stop (C is constant across a VACUUM that does not merge;
-the test keeps the cleanup from merging). See the test file for the positive control on
-the pre-fix code.
+the test keeps the cleanup from merging). **Not yet run, positive control included:** as
+of 2026-10-04 every EC2 launch failed with `VcpuLimitExceeded`, because the account limit
+was full of other projects' instances. Branch `wt/g65sib-ctl` is this test over the pre-fix
+`amvacuum.c`. The predicted control output: 4 metapage records where the test wants 3;
+`ndocs + ndeleted` = 2800 / 2830 / 2860 at points 1–3 where it wants 2600; and a sticky
+`ndocs` of 2600 against a heap of 2340 after the re-VACUUM. Until both runs are recorded
+here, the fix has been compiled and reasoned through, not tested.
 
 **Two adjacent defects, found while reading, NOT fixed here.**
 
