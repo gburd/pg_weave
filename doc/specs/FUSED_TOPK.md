@@ -738,9 +738,13 @@ that can be arbitrarily negative. Three consequences for a pushdown that must ag
   widened `t` past the k-th answer's distance. It needs a `fuse()`-level redefinition
   of `weave_edistscore`, a catalog change to the fallback's arithmetic, so that both
   arms share one objective. The fanout table bounds the cost.
-- **(b) `<@>` in `fuse()` only as a GATE** (`WHERE body <@> p <= t` plus a ranking
-  without it). Cheap, needs no new arithmetic, and is what most hybrid-search users
-  mean by "fuzzy match plus relevance". Not what `fuse(..., body <@> p)` says.
+- **(b) Fuzzy as a GATE, not a channel.** **This already works today**, checked
+  2026-10-01: `WHERE body @@@ 'protien~2' ORDER BY fuse(body <=> 'alpha', emb <-> v)` is
+  served by one fused Index Scan, with the fuzzy term as `Index Cond`, and returns
+  exactly the heap's rows (40 of 40, set difference 0). So (b) costs documentation and
+  a regression case, not code. The limit: fuzziness filters and does not rank, so a
+  closer spelling does not score higher. That is not what `fuse(..., body <@> p)` says,
+  and that spelling keeps falling back to a Sort.
 - **(c) Leave `<@>` unfused.** The fallback is already correct for small result
   sets, and the plan refuses the pushdown today (`req->servable = false`).
 
