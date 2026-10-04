@@ -4717,13 +4717,9 @@ it has just updated. Record 10 is deleted. Why each record is now self-consisten
 **Pinned by `t/030_bulkdelete_atomic.pl`.** It uses point-in-time recovery to stop
 *after each* VACUUM record that touches the metapage, and checks
 `ndocs + ndeleted == C` at every stop (C is constant across a VACUUM that does not merge;
-the test keeps the cleanup from merging). **Not yet run, positive control included:** as
-of 2026-10-04 every EC2 launch failed with `VcpuLimitExceeded`, because the account limit
-was full of other projects' instances. Branch `wt/g65sib-ctl` is this test over the pre-fix
-`amvacuum.c`. The predicted control output: 4 metapage records where the test wants 3;
-`ndocs + ndeleted` = 2800 / 2830 / 2860 at points 1–3 where it wants 2600; and a sticky
-`ndocs` of 2600 against a heap of 2340 after the re-VACUUM. Until both runs are recorded
-here, the fix has been compiled and reasoned through, not tested.
+the test keeps the cleanup from merging). **Both arms were run on 2026-10-04**; the
+results are at the end of this entry, and the control printed exactly what had been
+predicted (4 records; 2800 / 2830 / 2860; sticky 2600 vs 2340).
 
 **Two adjacent defects, found while reading, NOT fixed here.**
 
@@ -4771,3 +4767,15 @@ so a concurrent walk would see them as unreachable and free them. A sound versio
 run only under `AccessExclusiveLock` (`weave_vacuum()`), and would need a mutation-tested
 proof that the walk names every page kind the free paths name. **Until then: REINDEX
 reclaims, and `weave_check(deep)` is how to tell that one is due.**
+
+**RUN 2026-10-04, both arms on EC2 Debian 13 (c7i.2xlarge, PG 17.11).**
+- **Fix** (`6c6a09e`, run `pgweave-20261004-200656`): full `make installcheck`
+  `Result: PASS`, 30 TAP files. t/030 passed 14 of 14: `ONE METAPAGE RECORD PER SEGMENT
+  (got 3)`; the three recovery points have ndocs/ndeleted of 2400/200, 2370/230 and
+  2340/260, so `ndocs + ndeleted = 2600` at each; `STICKY: ... (2340 vs 2340)`.
+- **Positive control** (pre-fix `amvacuum.c`, run `pgweave-20261004-200847`): t/030
+  FAILED 5 of 16, and it is the only red file (t/029: 7 ok, 0 not ok). `got 4`
+  metapage records; points 1-3 have `ndocs = 2600` with `ndeleted` 200/230/260, so
+  `ndocs + ndeleted` = 2800/2830/2860; point 4 (the separate refresh) is consistent;
+  `STICKY ... (2600 vs 2340)`. That is exactly the predicted failure, so the test
+  measures the window.

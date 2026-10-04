@@ -19,11 +19,10 @@
 # which is ndocs == sum(segs.ndocs - segs.ndeleted) + npending with npending = 0
 # and no merge in the window (both asserted as preconditions).
 #
-# POSITIVE CONTROL, PREDICTED AND NOT YET RUN (branch wt/g65sib-ctl carries the
-# pre-fix amvacuum.c under this test): the record count should be nsegments + 1,
-# every swap point should fail the invariant (ndocs still C while ndeleted > 0),
-# and the re-VACUUM at the last swap point should leave ndocs above the heap
-# count.  doc/GAPS.md G72 records what the run actually printed.
+# POSITIVE CONTROL, RUN 2026-10-04 on the pre-fix amvacuum.c: 5 of 16 failed --
+# 4 metapage records, ndocs + ndeleted = 2800/2830/2860 at the swap points, and
+# ndocs stuck at 2600 against a heap of 2340 after the re-VACUUM.  doc/GAPS.md G72
+# has the run ids.
 
 use strict;
 use warnings FATAL => 'all';
