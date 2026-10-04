@@ -4898,3 +4898,28 @@ whether `weave_search()` should do the same (a behaviour change to a 0.1.0 SQL f
 or document that its `ctid` column is the root and give the join the
 `heap_get_root_tuples()`-equivalent it needs. The same audit is due for `weave_vec_scan()`,
 which returns docids.
+
+### G75 — t/029's "weave_check(deep) is clean after recovery" failed once: one violated invariant after an immediate stop right after a VACUUM flush — **FOUND 2026-10-04 by the g46 agent's smoke (`pgweave-20261004-221406`, branch at main 89d7dcf + 3 commits touching no C); NOT YET REPRODUCED; OPEN**
+
+t/029 (G65's test) crashes the server immediately after a VACUUM that flushes the pending
+list, restarts it, and asserts `weave_check(fa_w, deep)` has zero violated rows. Once, it
+had **one**. The run kept only the installcheck tail, and the test printed only the count,
+so which invariant failed is not known. That is the G21 mistake, repeated: the same
+symptom shape, "one leaked page after crash recovery, once", is still OPEN for t/014.
+
+**Done:** t/029 now prints, on failure, every violated invariant with its detail and every
+unreachable unflagged page with its kind, flags, nextblk and LSN. A recurrence will name
+the write path.
+
+**Hunted, 2026-10-04:** t/029 alone, 40 runs, 0 failures (`pgweave-20261004-222827-e5b4`);
+the full TAP sequence, 8 runs (see below for the result).
+
+**The leading hypothesis is a leak, not double counting.** G72 recorded the leak class:
+pages freed after an operation's last record, or written before being linked. The flush's
+pending-page recycling runs AFTER the one atomic record (`weave_free_page()` per page, one
+record each). An immediate stop between the atomic record and the last free leaves pages
+that are unreachable and not flagged freed, which is exactly what
+`pages_reachable_or_freed` reports. A VACUUM issues no XLogFlush unless the transaction
+has an XID, so the free records may simply not be on disk at the stop. If so, this is not a
+new defect but G72's leak class, observed: harmless to answers, reclaimable only by REINDEX.
+The diagnostic above will confirm or refute it.
