@@ -4404,7 +4404,7 @@ which the atomic record now guarantees rather than hopes for. What it cannot do 
 crash *between* the two old records: pg_weave's test hooks are in no shipped build. The
 record count is the structural claim that makes that window not exist.
 
-### G66 — the ranked pass ignored the pending list: `WHERE d @@@ q ORDER BY d <=> q` returned 60 of 120 matching rows when the other 60 had been UPDATEd since the last flush — **FOUND 2026-09-29 by the G56 padding test; PRE-EXISTING, and documented in code as intentional; silent wrong answer on the flagship query; FIXED 2026-09-29 for the lexical ranked route and `weave_search()`**
+### G66 — the ranked pass ignored the pending list: `WHERE d @@@ q ORDER BY d <=> q` returned 60 of 120 matching rows when the other 60 had been UPDATEd since the last flush — **FOUND 2026-09-29 by the G56 padding test; PRE-EXISTING, and documented in code as intentional; silent wrong answer on the flagship query; FIXED 2026-09-29 for the lexical ranked route and `weave_search()`; FUSED ROUTE FIXED 2026-10-04**
 
 `weave_topk_candidates_range()` carried the note: "ranked results cover the merged
 SEGMENTS only ... deferred intentionally, since pending is transient and bounded".
@@ -4445,10 +4445,89 @@ maxhits (64 of 250).
 are 7 or less, the two are identical, so no test fails if it regresses. The first cut's
 evidence is the measurement recorded above, not a test.
 
-**Still OPEN:** the fused route (`weave_fuse_pass()`) does not read the pending list
-either. Its lexical channels are segment shuttles, so a fused answer misses pending
-documents exactly as the ranked one did. The vector channel's version of the same gap is
-G29.
+**Was OPEN until 2026-10-04:** the fused route (`weave_fuse_pass()`) did not read the
+pending list either. Its lexical channels are segment shuttles, so a fused answer missed
+pending documents exactly as the ranked one did. Since G71 such a row was padded after the
+ranked rows (at +Infinity with a vector key, at 0 without), so it appeared in the wrong
+place. The vector channel's version of the same gap is G29.
+
+**Fused route fixed 2026-10-04.** `weave_fuse_collect_pending()` walks the pending list
+once per attempt, **inside the pass's generation bracket**, so a flush between the walk and
+the bolt loop makes the attempt retry. Four rules:
+- **Same objective.** Each pending document gets S = sum of `fw[key]` x channel score.
+  The lexical score is BM25 per term at the pass's own (idf, k1, b, avgdl) over the
+  quantized length, as `weave_pending_ranked()` computes it. The vector score is
+  **exact**, -||q-v||^2 or <q,v>, as `weave_vec_collect_pending()` computes it on the vector
+  route.
+- **Same candidate set.** A pending document is admitted if the gate set (`plainTids`)
+  holds it. With a vector key it must also carry a vector the flush would keep: a NULL
+  vector makes `fuse()` NULL, and G71 pads such a row. Without a vector key it must have
+  some query term, because the candidate set is the union of the scored channels.
+- **The normalizer counts them** (decided: folded in, the more correct choice). Per key:
+  a term no segment holds takes its df from the pending list, and the largest pending tf
+  enters the term's ceiling. For a vector key, the (B2) ceiling ||v||.||q|| of every
+  pending vector (in the metric's domain, exact norm) enters the maximum over the bolts.
+  If they are left out, the ceiling covers the bolts only and a pending document can exceed
+  it, so **the normalized ranking changes when a flush runs**. That is what the test pins.
+- **A frontier.** A pass that pruned (`!complete`) is the exact top-`fusek` of the flushed
+  documents. A pending document goes in only if its -S is no worse than the k-th row kept;
+  otherwise it waits for a wider pass. This mirrors `weave_vec_pass()`. A complete pass
+  emits every pending document, and so does the ladder's last rung (`fusek >= maxhits`
+  or `WEAVE_ORD_WIDTH_MAX`), because nothing wider will run. The merge deduplicates by TID
+  and keeps the better score (the flush window, G65). A pending row that was ranked is in
+  `so->ordered`, and `weave_pad_begin()` builds `padSeen` from that, so padding cannot emit
+  it again. The per-pass `so->ordered` TID filter already stopped a wider pass from
+  repeating it.
+
+**Pinned** by `sql/fuse_pushdown.sql`, in the G71 section and the three (G66) sections
+after it. Every one is checked against the heap or an exact oracle:
+- **G71's `fnv`, `fuse_normalize` off.** The oracle is `weave_search()` BM25 plus the
+  heap's exact `-(emb <-> 0)^2`. With q = 0 the lanes' quantized l2 score equals the exact
+  one, so the oracle is exact for flushed and pending rows alike. The ranked head equals
+  the oracle, pending row 401 ranks **1** (`fused_first3` is now `{401,1,201}`, where it
+  was `{1,201,2}`), and every row appears once.
+- **`fpf`, under `wand_initial_k = 1`.** 200 flushed rows plus four pending ones. The
+  first rung is 64 wide, so it prunes. 504 is the best candidate (a `beta` row the vector
+  channel reaches) and 501 the best `alpha` one: ranks 1 and 2. 502 lies between flushed
+  rows 100 and 101, beyond the first rung's frontier, and lands at **103**. 503 is the
+  worst, at **204**. The whole order equals the oracle, every row appears once, and the
+  gated `WHERE body @@@ 'alpha'` first page is `{501,1,2}`.
+- **`fpe`, all pending** (index built empty). Ordered `{A,B,C}` = oracle. This needs the
+  pending df for a term no segment holds.
+- **`fpn` (lexical) and `fpi` (vector, ip).** Flush-invariance under the normalizer: the
+  order before `weave_merge()` equals the order after, `{P,Y,X}` and `{P,X,Y}`.
+
+**Mutants.** Each was BUILT and installed before it ran, the solo-run diff was compared
+with the full-suite output, and the control diff is only the `already exists` NOTICE (run
+`pgweave-20261004-201641`):
+
+| mutant | killed by |
+|---|---|
+| pending not merged | `fused_first3` `{1,201,2}`; fnv oracle **f**, 401 at rank 34; fpf oracle **f**; both flush-invariance **f** |
+| frontier ignored | fpf oracle **f**: 502 and 503 at ranks 67 and 68, handed out by the 64-wide rung ahead of rows it had not found |
+| lexical normalizer excludes pending | `lexical_flush_invariant` **f** (`{P,X,Y}` before, `{P,Y,X}` after) |
+| vector normalizer excludes pending | `vector_flush_invariant` **f** (`{P,Y,X}` / `{P,X,Y}`) |
+| gate not applied to pending | gated first page `{504,501,1}`: the `beta` row passes `@@@ 'alpha'` |
+| G71 exclusion dropped | 402 (NULL vector) ranked 2nd and also padded; `fused_every_row` **f** |
+| no pending df | `fpe` `{B,A,C}`, oracle **f** |
+
+**Limits, recorded rather than fixed:**
+- **Two vector scales.** A pending vector is scored exactly and a flushed one in quantized
+  form, as on the vector route (G29). After a flush, a row's position can shift by the
+  quantizer's error. The tests stay exact by using q = 0, where the two coincide.
+- **The vector ceiling is approximately flush-invariant, not exactly.** The pending
+  ceiling uses the exact norm; once the vector is flushed, the bolt's uses the
+  reconstructed norm. `fpi` keeps its margin wide (the order holds for any ceiling up to
+  8.3 against a true 5) so that this difference cannot decide the test. Two scores closer
+  than the quantizer's norm error could still swap at a flush.
+- **Float summation order.** `src/am/fuse.c` sums channels in descending-ceiling order and
+  the pending sum goes in key order. Both are float, so two scores within an ulp can order
+  differently. A pending row that exactly ties a flushed one is ordered by that sum,
+  then by TID.
+- **Cost, unmeasured.** Every fused pass walks the whole pending list again: every ladder
+  rung and every race retry. It holds n x (terms + vector keys) doubles for the pass, the
+  same per-pass pattern as `weave_pending_ranked()` and `weave_vec_collect_pending()`.
+  No benchmark has measured a fused query over a large pending list.
 
 ### G67 — plain VACUUM truncated the index under concurrent INSERTs: committed rows lost, then every extension failed "unexpected data beyond EOF" — **FOUND 2026-09-29 by t/025 on PG18; PRE-EXISTING; P0 silent row loss on ordinary INSERT + VACUUM; FIXED 2026-09-29**
 
@@ -4585,7 +4664,7 @@ index=2098 against heap=1593.
   has not been audited for the same window.
 - **G65** remains open for the crash case. G70 is its visible symptom without a crash.
 
-### G71 — a fused `<->`/`<#>` pushdown ranks rows with a NULL vector FIRST: `fuse(...)` is NULL for them, and the index treats a missing channel as contributing 0 — **FOUND 2026-10-01 while designing F9; silent wrong answer in a shipped plan; OPEN**
+### G71 — a fused `<->`/`<#>` pushdown ranks rows with a NULL vector FIRST: `fuse(...)` is NULL for them, and the index treats a missing channel as contributing 0 — **FOUND 2026-10-01 while designing F9; silent wrong answer in a shipped plan; FIXED 2026-10-01 (`3d8dddc`); pending rows ranked since G66's fused fix, 2026-10-04**
 
 `fuse()` is NULL when any argument is NULL (`weave_fuse()`, `src/am/fusepath.c`; asserted
 by `sql/fuse_fallback.sql`), and ascending ORDER BY puts NULLs last. The fused core uses a
@@ -4652,3 +4731,134 @@ Row 301 (NULL document) is missing for the second reason alone. Until this is fi
 **Not fixed here, and recorded where it already was:** the fused shuttles do not read
 pending documents (G66's open note). Row 401, pending with a vector, therefore pads at
 +Infinity instead of being ranked at its real position.
+**SUPERSEDED 2026-10-04 by G66's fused fix:** row 401 is now RANKED, first (`fused_first3`
+is `{401,1,201}`), at the position an exact oracle gives. Pending row 402 has a NULL vector
+and is still padded at NULL, as G71 requires. The mutant that drops that exclusion ranks it
+and pads it, so it appears twice.
+
+### G72 — VACUUM's tombstone swap and its corpus-`ndocs` refresh were two WAL records, so a crash or ERROR between them left BM25's N counting deleted rows; and pages a crash strands between write and link are reclaimed only by REINDEX — **FOUND 2026-10-04 by an audit of every metapage writer, prompted by G65; PRE-EXISTING; the two-record window FIXED 2026-10-04; the leak class OPEN**
+
+G65 was one operation written as two GenericXLog records, with recovery able to land
+between them. This entry is the audit that asked where else that happens. It covers every
+record that writes the metapage (block 0) and every multi-record operation that has to
+keep the metapage consistent with pages it names.
+
+**The metapage writers.** There are ten GenericXLog records in seven functions. "Dependent
+record" means a later record the operation needs before the metapage is consistent again.
+
+| # | site | what the record writes | crash or ERROR before the dependent record | verdict |
+|---|---|---|---|---|
+| 1 | `weave_init_metapage()`, `src/am/am.c:1763` | block 0, `FULL_IMAGE`: a fresh metapage | runs inside `ambuild`/`ambuildempty`; an incomplete build is never a valid index | SAFE |
+| 2 | `weave_meta_add_segment()`, `am.c:3508` | `segs[n]`, `nsegments`, `generation`, `ndocs += seg.ndocs`, `sumdoclen += seg.sumdoclen` | the segment's pages are written *before* this record (write-before-link). A crash before it leaves them unreachable; see the leak class below | SAFE for the metapage; LEAK |
+| 3 | `weave_merge_selected()` commit, `src/am/ambuild.c:4366` | replaces the inputs with the output, bumps `generation`; corpus totals unchanged (same live docs) | output written before the commit (LEAK if a crash comes first); inputs freed **after** it by `weave_free_segment()`, one record per page (free-after-unlink, LEAK if interrupted) | SAFE; LEAK both sides |
+| 4 | `weave_merge_all_parallel()` commit, `ambuild.c:4692` | the same for W groups in one record | the same; an abandoned group leaks its output by design (comment at the site) | SAFE; LEAK |
+| 5–7 | `weave_insert()` pending append, `ambuild.c:6251` (tail), `6303` (new page linked from old tail), `6314` (first page) | the item, the `pendingtail`/`pendinghead` link and `ndocs += 1`, `sumdoclen += doclen`, `npending += 1`, all in one record with the data page(s) | no dependent record: one record is the whole operation | SAFE |
+| 8 | `weave_flush_add_and_cut()`, `ambuild.c:6402` | segment add and pending-head move, in one record with the cut page (G65's fix) | folded pending pages freed **after** it, one record each | SAFE; LEAK (free-after-unlink) |
+| 9 | `weave_bulkdelete()` per-segment swap, `src/am/amvacuum.c:1194` | `segs[s].livedocs`, `livedocslen`, `ndeleted`, `generation` | **record 10** recomputes `ndocs` from the `ndeleted` this record wrote | **UNSAFE (below)**; the new tombstone blob is written before it and the old one freed after it, so LEAK both sides |
+| 10 | `weave_bulkdelete()` final refresh, `amvacuum.c:1226` (only when `tuples_removed > 0`) | `ndocs = Σ(segs[i].ndocs − segs[i].ndeleted) + npending` | — | the record #9 depends on |
+
+The audit's predecessor counted "nine sites" by treating the three insert records as one
+site. The table lists each record.
+
+**UNSAFE: records 9 and 10.** Record 9 commits segment `s`'s new tombstone count. `ndocs`,
+which is BM25's corpus N and the denominator of avgdl, is corrected only by record 10,
+after every segment. An ERROR between them (OOM in the next segment's tombstone set, a
+corrupt page in its dictionary, a cancel) or a crash leaves the committed `ndeleted`
+already subtracted out of the live count, but `ndocs` still counting those rows.
+
+Whether the next VACUUM repairs it depends on where the interruption landed, and the worst
+case is the common one.
+
+- *Before the last segment's swap:* the next VACUUM finds the later segments' dead rows
+  still untombstoned, so `tuples_removed > 0`, so record 10 runs and recomputes `ndocs`
+  from every segment. Self-healing.
+- *After the last segment's swap* (a single-segment index, which is what CREATE INDEX
+  leaves by default, has only this case): every heap item the next VACUUM is shown is
+  already carried in a tombstone set, so `tuples_removed` stays 0 and record 10 does not
+  run. `ndocs` stays high until a VACUUM tombstones a newly dead row. On a table that
+  takes one large DELETE and is then append-only, that never happens, and every BM25 score
+  uses an N inflated by the deleted rows.
+
+Impact: wrong IDF and avgdl, so ranking is skewed but match sets are unaffected.
+`weave_index_stats()` reports the wrong `ndocs`. Never observed in the field.
+
+**Fixed 2026-10-04: record 9 now writes `ndocs` itself.** Under the lock of the swap, it
+recomputes `m->ndocs = Σ(segs[i].ndocs − segs[i].ndeleted) + npending` over the directory
+it has just updated. Record 10 is deleted. Why each record is now self-consistent:
+
+- The formula is the one record 10 used, evaluated over the very bytes this record
+  writes, under the metapage's exclusive buffer lock. No other writer can interleave, so
+  after replay of *any prefix* of a VACUUM's records, `ndocs` agrees with the directory
+  those records left.
+- Every other term in the sum is unchanged by this record. Other segments' `ndeleted` are
+  committed (by an earlier swap, or by an earlier VACUUM). `npending` changes only in
+  records 5–8, each of which adjusts `ndocs` by the same amount in the same record.
+- It runs on every swap, not only when this pass tombstoned something. A swap that adds
+  nothing writes the value the formula already had, and an index damaged by the old
+  window is repaired by its next VACUUM.
+
+**Pinned by `t/030_bulkdelete_atomic.pl`.** It uses point-in-time recovery to stop
+*after each* VACUUM record that touches the metapage, and checks
+`ndocs + ndeleted == C` at every stop (C is constant across a VACUUM that does not merge;
+the test keeps the cleanup from merging). **Both arms were run on 2026-10-04**; the
+results are at the end of this entry, and the control printed exactly what had been
+predicted (4 records; 2800 / 2830 / 2860; sticky 2600 vs 2340).
+
+**Two adjacent defects, found while reading, NOT fixed here.**
+
+- `sumdoclen` is never decreased. Inserts and segment adds increase it, merges carry it
+  unchanged, and bulkdelete does not touch it. After deletes, avgdl = `sumdoclen / ndocs`
+  counts deleted documents' lengths over a live-only N, so it is biased upward. This has
+  nothing to do with crashes. Fixing it needs each segment's dead length, which the
+  tombstone pass does not compute.
+- The build counts only `tupleIsAlive` rows in `seg.ndocs` (`ambuild.c:1017`) but indexes
+  recently-dead ones, and bulkdelete then tombstones them and subtracts them in `ndeleted`
+  as well. So `Σ(ndocs − ndeleted)` under-counts by the recently-dead rows present at
+  build time. That is rare (it needs a pinned horizon during CREATE INDEX), and the result
+  is off by that count until a merge rewrites the segment.
+
+**OPEN: the leak class.** Every multi-page structure is written *before* the record that
+links it (a segment, a merge output, a tombstone blob). Every replaced structure is
+freed *after* the record that unlinks it (merge inputs, folded pending pages, the old
+tombstone blob). Freeing is one record per page (`weave_free_page()`, `am.c:3670`). A crash, or
+an ERROR such as autovacuum's lock-conflict cancel hitting the merge's per-term
+`CHECK_FOR_INTERRUPTS()` (`ambuild.c:3647`), strands those pages. They are unreachable
+from the metapage and **not** flagged `WEAVE_FREED`, so they never enter the FSM.
+`weave_check(deep)`'s `pages_reachable_or_freed` reports them. **Nothing reclaims them
+except REINDEX:** VACUUM's truncation and compaction (`amvacuum.c:283`,
+`weave_vacuum_compact()`) treat an unflagged page as live, and merge frees only its own
+inputs.
+
+The cost per event is bounded by the operation that was interrupted:
+
+- an interrupted merge leaks its partial output, up to the size of the merged segments
+  (a full `weave_merge()` of a large index can leak an index-sized chain);
+- a crash after a merge commit leaks the inputs not yet freed, up to the same size;
+- a flush or swap leaks pending pages or one tombstone blob.
+
+None of this causes a wrong answer or affects the WAL. The cost is disk space and a
+`weave_check` failure.
+
+Not fixed now, because the reclaim is not a contained change. VACUUM would have to walk
+every reachable page and free the rest. That is the same walk as
+`wvck_mark_reachable()`, but now a bug in it frees live pages: data loss where amcheck's
+version only produces a false report. And under plain VACUUM's
+`ShareUpdateExclusiveLock` the walk races with a writer that holds neither the maintenance
+lock nor anything VACUUM conflicts with. An oversized INSERT
+(`weave_insert_oversized_as_segment()`) writes its segment's pages before it links them,
+so a concurrent walk would see them as unreachable and free them. A sound version would
+run only under `AccessExclusiveLock` (`weave_vacuum()`), and would need a mutation-tested
+proof that the walk names every page kind the free paths name. **Until then: REINDEX
+reclaims, and `weave_check(deep)` is how to tell that one is due.**
+
+**RUN 2026-10-04, both arms on EC2 Debian 13 (c7i.2xlarge, PG 17.11).**
+- **Fix** (`6c6a09e`, run `pgweave-20261004-200656`): full `make installcheck`
+  `Result: PASS`, 30 TAP files. t/030 passed 14 of 14: `ONE METAPAGE RECORD PER SEGMENT
+  (got 3)`; the three recovery points have ndocs/ndeleted of 2400/200, 2370/230 and
+  2340/260, so `ndocs + ndeleted = 2600` at each; `STICKY: ... (2340 vs 2340)`.
+- **Positive control** (pre-fix `amvacuum.c`, run `pgweave-20261004-200847`): t/030
+  FAILED 5 of 16, and it is the only red file (t/029: 7 ok, 0 not ok). `got 4`
+  metapage records; points 1-3 have `ndocs = 2600` with `ndeleted` 200/230/260, so
+  `ndocs + ndeleted` = 2800/2830/2860; point 4 (the separate refresh) is consistent;
+  `STICKY ... (2600 vs 2340)`. That is exactly the predicted failure, so the test
+  measures the window.
