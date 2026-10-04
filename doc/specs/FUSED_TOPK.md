@@ -799,6 +799,58 @@ matching the gate with a NULL vector come after every ranked row (G71). The `<@>
 case turns up, option (a) above is the design, and `bench/RESULTS_F9_FANOUT.md` bounds
 its merge cost.
 
+## 7e. `weave_fuse_search()`: the fused scores, as a workaround (F3, 2026-10-04)
+
+Sect. 7's `SELECT id, score() FROM ...` cannot be built: a function in the SELECT list
+has no handle on the scan that produced the row, and PostgreSQL discards an index scan's
+ORDER BY values unless a reorder queue consumes them, so `SELECT fuse(...)` beside
+`ORDER BY fuse(...)` re-evaluates the fallback arithmetic (sect. 7a (1)) instead of
+reading the score the fused pass computed. The maintainer's decision (2026-10-04) is an
+SRF:
+
+```sql
+SELECT * FROM weave_fuse_search('t_weave',
+         lex => ARRAY['postgres index'::wquery],
+         vec => ARRAY[$1::wvec],
+         weights => '{0.4,0.6}', k => 10);   -- (ctid tid, score float8, parts float4[])
+```
+
+Channels are every `lex` entry, then every `vec` entry; `weights` has one entry per
+channel in that order, NULL meaning 1.0 each. It builds the same scan keys
+`src/am/fusepath.c` builds (one ORDER BY key per channel, plus the
+`WEAVE_STRAT_FUSE_WEIGHTS` transport key on the lexical column) and drives a real index
+scan with them. So the fused pass, MVCC, G66's pending ranking and G71's gating all apply
+unchanged. `score` is the negation of the scan's slot-0 order-by value. The result ends
+at the first row the fused pass did not rank, i.e. a NULL or +Infinity padding value.
+`sql/fusesearch.sql` holds it to the `ORDER BY fuse(...)` index path's row order in both
+`fuse_normalize` modes, and, with normalization off, to an exact oracle score within 1e-4.
+
+**IT IS A WORKAROUND FOR A POSTGRESQL CORE LIMITATION.** An index scan cannot hand its
+ORDER BY value to the SELECT list. `doc/upstream/ORDERBY_VALUES_TO_TLIST.md` proposes the
+core change. If it ever lands, `SELECT fuse(...) ... ORDER BY fuse(...)` becomes the
+intended surface and this SRF is optional. The build assumes it will not land
+(maintainer direction 2026-10-01).
+
+**`ctid` is the row's LIVE ctid, unlike `weave_search()`'s.** The SRF reads it from the
+heap fetch, so a HOT-updated row comes back where `SELECT ctid` finds it.
+`weave_search()` returns the index's HOT-chain root TID, so `JOIN t ON t.ctid = s.ctid`
+silently drops HOT-updated rows. `sql/fusesearch.sql`'s first oracle lost row 3's
+lexical score exactly that way (EC2 run `pgweave-20261004-214115`), and the test now maps
+root TIDs to rows through ctids taken before the update.
+
+**Visibility has two layers, and only the SRF's is observable.** The fused pass's
+`weave_ord_probe()` drops dead candidates, and `index_getnext_slot()` drops them again. A
+mutant that disables only the first survives (equivalent). A mutant that disables only the
+second (`index_getnext_tid()`) is caught, by the HOT row.
+
+Two limits, both recorded in `doc/PHASES.md` F3:
+
+- **`parts` is always NULL.** The per-channel breakdown is owed.
+- **Lexical-only fusion pads unranked documents at score -0.** With no vector key, a
+  document no channel reached gets the padding value 0.0 (not +Infinity), so it comes
+  back with score `-0` until `k` is reached. That is fuse()'s own value for the
+  document, not an error, but it is not a ranked row either.
+
 ## 8. What must be benchmarked before this is called a win
 
 The claim being made is "no over-fetch, better quality, lower latency". All
