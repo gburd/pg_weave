@@ -11343,7 +11343,10 @@ weave_fuse_search(PG_FUNCTION_ARGS)
 							   InvalidOid, islex ? lexd[i] : vecd[i - nlex]);
 	}
 
-	/* the transport key; weave_fuse_rescan() checks its length against nchan */
+	/*
+	 * The transport key, on the lexical column as src/am/fusepath.c hangs it;
+	 * weave_fuse_rescan() checks its length against nchan.
+	 */
 	if (PG_ARGISNULL(3))
 	{
 		Datum	   *ones = palloc(nchan * sizeof(Datum));	/* alloc-ok: nchan < INDEX_MAX_KEYS */
@@ -11355,7 +11358,7 @@ weave_fuse_search(PG_FUNCTION_ARGS)
 	}
 	else
 		wdatum = PointerGetDatum(PG_GETARG_ARRAYTYPE_P(3));
-	ScanKeyEntryInitialize(&orderbys[nchan], SK_ORDER_BY, orderbys[0].sk_attno,
+	ScanKeyEntryInitialize(&orderbys[nchan], SK_ORDER_BY, lay.lexattno,
 						   WEAVE_STRAT_FUSE_WEIGHTS, InvalidOid, InvalidOid,
 						   InvalidOid, wdatum);
 
