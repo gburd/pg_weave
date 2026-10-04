@@ -11193,6 +11193,205 @@ weave_search(PG_FUNCTION_ARGS)
 	SRF_RETURN_DONE(funcctx);
 }
 
+/*
+ * weave_fuse_search(index regclass, lex wquery[], vec wvec[], weights float4[],
+ *                   k int) -> setof (ctid tid, score float8, parts float4[])
+ *
+ * A fused top-k (doc/specs/FUSED_TOPK.md sect. 7e, task F3) that returns each
+ * row's fused SCORE.  The channels are every lex entry, then every vec entry;
+ * weights has one entry per channel in that order, NULL meaning 1.0 each.
+ *
+ * A WORKAROUND FOR A POSTGRESQL CORE LIMITATION, and only that: an index scan
+ * cannot hand its ORDER BY value to the SELECT list, so in
+ * `SELECT fuse(...) ... ORDER BY fuse(...)` the fused pass computes every score
+ * and the executor throws them away and re-evaluates fuse() per row.
+ * doc/upstream/ORDERBY_VALUES_TO_TLIST.md proposes that core change.  If it ever
+ * lands, `SELECT fuse(...) ... ORDER BY fuse(...)` becomes the intended surface
+ * and this function optional.
+ *
+ * IT DRIVES A REAL INDEX SCAN rather than a private top-k, so the fused pass,
+ * MVCC (index_getnext_slot() fetches under the active snapshot), the pending
+ * ranking of doc/GAPS.md G66 and the gating of G71 all apply unchanged: the scan
+ * keys are exactly the ones src/am/fusepath.c builds -- one ORDER BY key per
+ * channel and one WEAVE_STRAT_FUSE_WEIGHTS transport key -- and
+ * weave_fuse_rescan() validates them as it validates the planner's.  The score
+ * is the negation of the scan's slot-0 order-by value, which the fused pass
+ * stores as -S; a +Inf or NULL value is a row the fused pass did not rank, and
+ * ends the result.
+ *
+ * `parts` (per-channel contributions) is NOT YET RETURNED: always NULL, owed by
+ * doc/PHASES.md F3.
+ */
+PG_FUNCTION_INFO_V1(weave_fuse_search);
+
+static void
+weave_fuse_search_unpack(ArrayType *arr, Datum **elems, int *n)
+{
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	bool	   *nulls;
+	int			i;
+
+	if (ARR_NDIM(arr) > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("weave_fuse_search channel arrays must be one-dimensional")));
+	get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval, &typalign);
+	deconstruct_array(arr, ARR_ELEMTYPE(arr), typlen, typbyval, typalign,
+					  elems, &nulls, n);
+	for (i = 0; i < *n; i++)
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("weave_fuse_search channel arrays must not contain NULLs")));
+}
+
+Datum
+weave_fuse_search(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			indexoid;
+	Oid			heapoid;
+	Relation	heap;
+	Relation	index;
+	WeaveIndexLayout lay;
+	Datum	   *lexd = NULL;
+	Datum	   *vecd = NULL;
+	int			nlex = 0;
+	int			nvec = 0;
+	int			nchan;
+	int			k;
+	int			vecstrat = 0;
+	Datum		wdatum;
+	ScanKeyData orderbys[INDEX_MAX_KEYS];
+	IndexScanDesc scan;
+	TupleTableSlot *slot;
+	AclResult	aclresult;
+	int			i;
+	int			got;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(4))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("weave_fuse_search index and k must not be NULL")));
+	indexoid = PG_GETARG_OID(0);
+	k = PG_GETARG_INT32(4);
+	if (!PG_ARGISNULL(1))
+		weave_fuse_search_unpack(PG_GETARG_ARRAYTYPE_P(1), &lexd, &nlex);
+	if (!PG_ARGISNULL(2))
+		weave_fuse_search_unpack(PG_GETARG_ARRAYTYPE_P(2), &vecd, &nvec);
+	nchan = nlex + nvec;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	/* the fused pass refuses fewer than two; its stack arrays cap the top */
+	if (nchan < 2 || nchan + 1 > INDEX_MAX_KEYS)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("weave_fuse_search needs between 2 and %d channels, got %d",
+						INDEX_MAX_KEYS - 1, nchan)));
+	if (k <= 0)
+		return (Datum) 0;
+
+	heapoid = IndexGetRelation(indexoid, true);
+	if (!OidIsValid(heapoid))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not an index", get_rel_name(indexoid))));
+	aclresult = pg_class_aclcheck(heapoid, GetUserId(), ACL_SELECT);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(heapoid));
+
+	/* the executor's order: table, then index */
+	heap = table_open(heapoid, AccessShareLock);
+	index = index_open(indexoid, AccessShareLock);
+	if (index->rd_rel->relam != get_index_am_oid("weave", true))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a weave index",
+						RelationGetRelationName(index))));
+
+	weave_index_layout(index, &lay);	/* throws when there is no lexical column */
+	if (nvec > 0)
+	{
+		int			metric = weave_index_vec_metric_raw(index);
+
+		if (lay.vecattno == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("weave index \"%s\" has no vector column",
+							RelationGetRelationName(index))));
+		if (metric == WEAVE_METRIC_L2)
+			vecstrat = WEAVE_STRAT_VEC_L2;
+		else if (metric == WEAVE_METRIC_IP)
+			vecstrat = WEAVE_STRAT_VEC_IP;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("weave_fuse_search supports only the l2 and ip vector metrics")));
+	}
+
+	for (i = 0; i < nchan; i++)
+	{
+		bool		islex = (i < nlex);
+		AttrNumber	attno = islex ? lay.lexattno : lay.vecattno;
+
+		ScanKeyEntryInitialize(&orderbys[i], SK_ORDER_BY, attno,
+							   islex ? WEAVE_STRAT_DISTANCE : vecstrat,
+							   InvalidOid, index->rd_indcollation[attno - 1],
+							   InvalidOid, islex ? lexd[i] : vecd[i - nlex]);
+	}
+
+	/* the transport key; weave_fuse_rescan() checks its length against nchan */
+	if (PG_ARGISNULL(3))
+	{
+		Datum	   *ones = palloc(nchan * sizeof(Datum));	/* alloc-ok: nchan < INDEX_MAX_KEYS */
+
+		for (i = 0; i < nchan; i++)
+			ones[i] = Float4GetDatum(1.0f);
+		wdatum = PointerGetDatum(construct_array(ones, nchan, FLOAT4OID,
+												 sizeof(float4), true, TYPALIGN_INT));
+	}
+	else
+		wdatum = PointerGetDatum(PG_GETARG_ARRAYTYPE_P(3));
+	ScanKeyEntryInitialize(&orderbys[nchan], SK_ORDER_BY, orderbys[0].sk_attno,
+						   WEAVE_STRAT_FUSE_WEIGHTS, InvalidOid, InvalidOid,
+						   InvalidOid, wdatum);
+
+#if PG_VERSION_NUM >= 180000
+	scan = index_beginscan(heap, index, GetActiveSnapshot(), NULL, 0, nchan + 1);
+#else
+	scan = index_beginscan(heap, index, GetActiveSnapshot(), 0, nchan + 1);
+#endif
+	index_rescan(scan, NULL, 0, orderbys, nchan + 1);
+	slot = table_slot_create(heap, NULL);
+
+	for (got = 0; got < k && index_getnext_slot(scan, ForwardScanDirection, slot); got++)
+	{
+		Datum		values[3];
+		bool		nulls[3] = {false, false, true};
+		double		v;
+
+		if (scan->xs_orderbynulls[0])
+			break;
+		v = DatumGetFloat8(scan->xs_orderbyvals[0]);
+		if (isinf(v) && v > 0)
+			break;				/* padding: a row the fused pass did not rank */
+		values[0] = ItemPointerGetDatum(&slot->tts_tid);
+		values[1] = Float8GetDatum(-v);
+		values[2] = (Datum) 0;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+	index_endscan(scan);
+	index_close(index, AccessShareLock);
+	table_close(heap, AccessShareLock);
+	return (Datum) 0;
+}
+
 /* ----- lexical anomaly detection: rare-term (low-df) dictionary tail ----- */
 
 /* term-df hash key width; matches the build side's WEAVE_TERMKEYLEN ceiling */
