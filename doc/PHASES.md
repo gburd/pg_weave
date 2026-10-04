@@ -503,8 +503,10 @@ than float32") required. The result:
   | 5 | 20 | 640 | 0.079 | no |
   | 8 | — (0.9860 ceiling) | 1024 | 0.127 | no |
 
+  > **CORRECTED 2026-10-04:** "index B/vec" above is CODE BYTES (`bits × dim / 8`), not the built index; built at 4 bits it measures 1,045 B/vector at 1,024-d (0.130×), 789 at 960-d (0.098×), and FAILS 0.15× at 384-d and 768-d. `bench/RESULTS_VECMAJOR.md`.
+
 - **RECOMMENDED SHAPE: 4 bits + exact rerank of a top-25 window.** recall@10
-  **0.9920** at n = 1M; index **0.064× HNSW**; widest width that keeps the SIMD
+  **0.9920** at n = 1M; index **0.064× HNSW** (code bytes; built index 0.130× at 1,024-d, corrected 2026-10-04); widest width that keeps the SIMD
   code-scan kernel.
 - **The window grows with n, by ~+25% per decade, uniformly across widths** (40→50,
   20→25, 15→20). The flagged risk was real and is now bounded. Two controls make it
