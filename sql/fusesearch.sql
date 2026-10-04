@@ -27,6 +27,7 @@ SET max_parallel_workers_per_gather = 0;
 -- 30 flushed rows with tf of `alpha` = g % 5 + 1 and vector [0.1 g, 0, 0, 0], so the
 -- two channels pull in different directions; three `beta` rows only the vector
 -- channel reaches; 101 has a NULL vector, 301 a NULL document; 401 is PENDING (G66);
+-- 501 matches neither lexical query, so only a vector channel ranks it;
 -- 7 and 12 are deleted after the build and never vacuumed, so the index still
 -- carries them.
 CREATE TABLE fs (id int, body wdoc, emb wvec(4));
@@ -37,7 +38,8 @@ INSERT INTO fs SELECT g, to_wdoc('simple', 'beta w' || g),
                       ('[' || ((g - 200) * 0.15) || ',0,0,0]')::wvec
   FROM generate_series(201, 203) g;
 INSERT INTO fs VALUES (101, to_wdoc('simple', 'alpha alpha alpha w101'), NULL),
-                      (301, NULL, '[0.05,0,0,0]');
+                      (301, NULL, '[0.05,0,0,0]'),
+                      (501, to_wdoc('simple', 'gamma w501'), '[0.35,0,0,0]');
 CREATE INDEX fs_weave ON fs USING weave (body, emb);
 INSERT INTO fs VALUES (401, to_wdoc('simple', 'alpha alpha pendingrow'), '[0.25,0,0,0]');
 CREATE TEMP TABLE fs_dead AS SELECT ctid AS rowtid FROM fs WHERE id IN (7, 12);
@@ -171,6 +173,12 @@ SELECT (SELECT array_agg(rowtid ORDER BY rn) FROM fs_srfl)
        = (SELECT array_agg(rowtid ORDER BY rn) FROM fs_ordl
            WHERE rn <= (SELECT count(*) FROM fs_srfl)) AS lex_only_order_matches_index_path,
        (SELECT count(*) FROM fs_srfl s JOIN fs_dead d USING (rowtid)) AS lex_only_dead_rows_returned;
+-- With no vector key, a document neither lexical channel reaches is PADDED at the
+-- value fuse() gives it, -0, after every ranked row (doc/specs/FUSED_TOPK.md 7e).
+SELECT s.rn = (SELECT max(rn) FROM fs_srfl) AS lex_only_unreached_row_is_last,
+       s.score = 0 AS lex_only_unreached_score_is_zero,
+       (SELECT min(score) > 0 FROM fs_srfl WHERE rn < s.rn) AS lex_only_ranked_rows_positive
+  FROM fs_srfl s JOIN fs f ON f.ctid = s.rowtid WHERE f.id = 501;
 
 -- ---------------------------------------------------------------------------
 -- (3) Refusals.
