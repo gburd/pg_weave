@@ -3017,7 +3017,7 @@ skipped for a tied oracle / 0 mismatched, fiqa 100 of 100 compared / 0 mismatche
 fallback differed on 100 / 85 / 100 queries, which is `FUSED_TOPK.md` §7a's documented
 divergence and not a defect. Index build 6.6 MB / 0.8 s, 4.9 MB / 0.3 s, 45.4 MB / 6.2 s.
 
-**GATE STATE: 2 of 5.** recall **PASS** (raw objective — G46), nDCG@10 **MET**, p50 / p99 /
+**GATE STATE: 2 of 5.** recall **PASS** (raw objective — G46; both objectives since 2026-10-04, G46 closed), nDCG@10 **MET**, p50 / p99 /
 `score()` **FAIL**. Before the normalizer it was also 2 of 5 (recall, p99). **THIS ENTRY'S FIX
 TRADED p99 FOR nDCG**, and that sentence is the honest summary of G44 as a whole.
 
@@ -3263,7 +3263,7 @@ the raw arm alone could never have caught any of the three.
 
 **Limits.** The mutation gate figures come from a hash-embedded corpus, which is enough to
 show the gate can fail but says nothing about quality. Installcheck (2c) ran on PG17 only.
-The corpus-scale numbers are in `bench/RESULTS_FUSE.md` "Fifth measurement".
+The corpus-scale gate is in `bench/RESULTS_FUSE.md` "Sixth measurement".
 
 
 ### G47 — with a vector weft, `weave_vacuum_compact()` has no fixed point: every other VACUUM rewrites the live segment, extends the relation, truncates nothing, and achieves no net change — **OPEN 2026-09-24**

@@ -824,7 +824,7 @@ state whether it was cleared:
 
 | row | gate | scifact | nfcorpus | fiqa | |
 |---|---|---|---|---|---|
-| recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | **PASS**, and for the **raw** objective only — the oracle cannot express the normalized one (`doc/GAPS.md` G46) |
+| recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | **PASS** — ~~for the **raw** objective only; the oracle cannot express the normalized one~~ **CORRECTED 2026-10-04:** for both objectives, both ceilings recomputed independently (`doc/GAPS.md` G46, closed; `bench/RESULTS_FUSE.md` "Sixth measurement") |
 | nDCG@10, normalizer **on** (the default since 2026-09-22) | ≥ RRF | 1.053× | 1.010× | 1.114× | **MET** |
 | p99 latency, normalizer **on** | ≤ 0.70× | 0.710× | 0.612× | **1.000×** | **FAIL on two of three — measured 2026-09-22 (night), run `pgweave-20260922-224507`** |
 | p50 latency, normalizer **on** | ≤ 0.50× | 0.710× | 0.827× | **1.172×** | **FAIL**, and on fiqa the fused arm is **slower than the RRF control it replaces** |

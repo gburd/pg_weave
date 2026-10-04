@@ -22,7 +22,7 @@ decisions do not move the gate: it is still **2 of 5**.
 
 | `FUSED_TOPK.md` §8 row | Gate | scifact | nfcorpus | fiqa | |
 |---|---|---|---|---|---|
-| recall vs exhaustive fused scan | 1.000 | **1.000** | **1.000** | **1.000** | **PASS** — for the **raw** objective, which is the only one the oracle can express (`doc/GAPS.md` G46) |
+| recall vs exhaustive fused scan | 1.000 | **1.000** | **1.000** | **1.000** | **PASS** — ~~for the **raw** objective, which is the only one the oracle can express~~ **CORRECTED 2026-10-04:** for BOTH objectives. The normalized (shipping) one has been checked since `681f9c4`, and with both ceilings recomputed and the raw check restored since `wt/g46`. See "Sixth measurement" (`doc/GAPS.md` G46, closed) |
 | nDCG@10, normalizer **on** (the default) | ≥ RRF | **1.053×** | **1.010×** | **1.114×** | **MET** |
 | p50 latency, k=10 | ≤ 0.50× RRF | 0.710× | 0.827× | **1.172×** | **FAIL**, and on fiqa the fused arm is **SLOWER than the control it is supposed to replace** |
 | p99 latency, k=10 | ≤ 0.70× RRF | 0.710× | 0.612× | 1.000× | **FAIL on two of three — a REGRESSION caused by the normalizer, not a stale number** |
@@ -40,7 +40,7 @@ decisions do not move the gate: it is still **2 of 5**.
 | nDCG@10, raw sum | 0.982× / 0.924× / 0.687× — FAIL | **SUPERSEDED 2026-09-22** by the per-key ceiling normalizer; see "Second measurement" |
 | `score()` calls | 0.648× / 0.903× / 0.541× — FAIL | those are the **raw** arm's; the shipping arm is 0.571× / 0.875× / 0.513×, measured in "Third measurement", **still FAIL** |
 
-**So the gate stands at 2 of 5**: recall **PASS** (raw objective) and nDCG@10 **MET**; p50, p99
+**So the gate stands at 2 of 5**: recall **PASS** (raw objective; both objectives since 2026-10-04, "Sixth measurement") and nDCG@10 **MET**; p50, p99
 and the work row **FAIL**. Before the normalizer it was also **2 of 5** — recall and p99. **THE
 CHANGE TRADED p99 FOR nDCG.** Neither half of that trade is allowed to hide: the fused
 ranking now beats RRF on three corpora *and* the fused scan is no longer reliably faster than
@@ -548,7 +548,7 @@ Index build: **6.6 MB / 0.8 s** (scifact), **4.9 MB / 0.3 s** (nfcorpus), **45.4
 
 | row | gate | state after this run |
 |---|---|---|
-| recall vs exhaustive fused scan | 1.000 | **PASS** — for the raw objective, the only one the oracle expresses (G46) |
+| recall vs exhaustive fused scan | 1.000 | **PASS** — for the raw objective, the only one the oracle expressed on this date (G46). **CORRECTED 2026-10-04:** both objectives pass in the "Sixth measurement" |
 | nDCG@10 | ≥ RRF | **MET** — 1.053× / 1.010× / 1.114× |
 | p50 latency | ≤ 0.50× | **FAIL** — 0.710× / 0.827× / 1.172× |
 | p99 latency | ≤ 0.70× | **FAIL** — 0.710× / 0.612× / 1.000×; **was PASS before the normalizer** |
@@ -682,6 +682,62 @@ measuring the wrong thing; what tracks the clock is the **pivot count** (fiqa pi
 **Decision 2 takes option (a) of §8d as a MEASUREMENT decision only. It explicitly does not
 claim the row:** in blocks the vector ratio is 1.000×, exactly as it was in lanes, so the gate
 is still failed — 2 of 5, unchanged by either decision.
+
+## Sixth measurement, 2026-10-04: the recall row checked for the SHIPPING objective, with both ceilings recomputed (G46 closed)
+
+Run **`pgweave-20261004-225530`**: EC2 `c7i.8xlarge`, us-east-2, Debian 13, PostgreSQL 17,
+extension **0.27.0**, commit **ae81fd0** (branch `wt/g46`). Same three BEIR corpora,
+`all-MiniLM-L6-v2` computed on the instance, `LATN=50` × `REPS=7`, arms alternated, with an
+A/A leg. The smoke step before it was a full installcheck, `Result: PASS`, all 30 TAP files.
+Instance terminated by the harness.
+
+**What the gate checks now** (`bench/fuse.sh`, `doc/GAPS.md` G46): on every query, the
+default-configuration pushdown against the **normalized** oracle and the
+`fuse_normalize = off` pushdown against the **raw** one. N_L and N_V are recomputed in SQL
+from published statistics, with N_V from `weave_vec_blocks().maxrecnorm` × ‖q‖ rather than
+the scan's own fold. Both are compared with the N the scan itself used (read from its
+`fuse_check_bounds` NOTICE). A cut inside 1e-5 of the top |score| counts as **tied**, not
+as a pass.
+
+| dataset | normalized: compared / mismatched / tied | raw: compared / mismatched / tied | N_key NOTICE disagreed | N_V vs `weave_vec_scan_stats` | `fuse()` fallback differed |
+|---|---|---|---|---|---|
+| scifact | 100 / **0** / 0 | 100 / **0** / 0 | 0 | 0 | 100 |
+| nfcorpus | 100 / **0** / 0 | 99 / **0** / 1 | 0 | 0 | 73 |
+| fiqa | 98 / **0** / 2 | 100 / **0** / 0 | 0 | 0 | 100 |
+
+**So the recall row is PASS for the objective that ships**, on 298 of 300 comparable
+queries, and the raw arm still holds as well (299 of 300). The gate's ability to fail was
+shown on a build, not argued. Run `pgweave-20261004-223426` has the four mutants (`GATE_PRE`,
+M1–M3), each confirmed built and each caught; the table is in `doc/GAPS.md` G46. One of them
+(M2, a wrong shared vector fold) **passes the gate this one replaces**.
+
+**The tolerance changed what counts as tied.** fiqa had 0 tied in the fourth measurement under
+exact equality and has 2 now; nfcorpus moved from 1 to 0 on the normalized side. A 1-ulp
+gap used to count as a clean cut, and it no longer does. This is the denominator becoming
+honest, not a regression.
+
+**Reproduced, and one figure moved that this run cannot explain.** The fused / raw nDCG@10 and
+recall@100 match the fourth measurement to four decimals on all three corpora (0.7212 / 0.6720,
+0.3455 / 0.3161, 0.3878 / 0.2393, and so on), as do scifact's and fiqa's RRF. **nfcorpus's RRF
+control did not reproduce:** nDCG@10 0.3352 (was 0.3422) and recall@100 0.3140 (was 0.3251)
+over the same 323 queries. The fused arm, on the same index, did reproduce, so the change is
+in the RRF arm's single-channel ordering (`ORDER BY body <=> q` / `emb <#> v`, `k' = 100`),
+between 0.19.0 and 0.27.0. This change does not touch it. It does flip one recorded loss:
+nfcorpus recall@100 is now fused 0.3206 vs RRF 0.3140, **ahead** where it was behind. That
+is not a win to claim until the RRF shift is explained. **UNEXPLAINED, recorded, not
+investigated here.**
+
+Latency, for the record. These rows are unchanged in verdict:
+
+| dataset | p50 fused / RRF | p99 fused / RRF | A/A (fused vs fused) p50 / p99 |
+|---|---|---|---|
+| scifact | 0.763× | 0.755× | 1.000 / 0.984 |
+| nfcorpus | 0.659× | 0.671× | 0.998 / 0.987 |
+| fiqa | **1.226×** | **1.062×** | 0.994 / 0.993 |
+
+p50 still fails the 0.50× gate everywhere, and fiqa is still slower than its control. p99
+passes 0.70× on nfcorpus only. This is one run per arm, and the within-arm A/A spread is
+under 2 %.
 
 ## Latency: a real win, and the A/A leg says so — **SUPERSEDED 2026-09-22 (night) BY THE RE-RUN IT ASKED FOR, WHICH DID NOT REPRODUCE IT FOR THE SHIPPING SCORER**
 
