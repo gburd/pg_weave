@@ -1196,10 +1196,29 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				m = WeavePageGetMeta(mp);
 				if (s < m->nsegments)
 				{
+					uint32		i;
+					double		nd = 0;
+
 					m->segs[s].livedocs = newblk;
 					m->segs[s].livedocslen = newlen;
 					m->segs[s].ndeleted = ndead;
 					m->generation++;	/* livedocs blob pages freed: invalidate scan snapshots */
+
+					/*
+					 * Corpus N, in THIS record (doc/GAPS.md G72).  It used to be
+					 * refreshed by a separate record after the last segment, so a
+					 * crash or ERROR in between left ndeleted committed and ndocs
+					 * still counting those rows -- and once every dead row was
+					 * carried, no later VACUUM had tuples_removed > 0 to refresh
+					 * it.  Recomputed over the directory just written, under its
+					 * exclusive lock, so every prefix of a VACUUM's records
+					 * leaves ndocs agreeing with segs[].  Unconditional: a swap
+					 * that tombstoned nothing writes the value already there, and
+					 * an index the old window damaged is repaired here.
+					 */
+					for (i = 0; i < m->nsegments; i++)
+						nd += m->segs[i].ndocs - m->segs[i].ndeleted;
+					m->ndocs = nd + m->npending;
 				}
 				GenericXLogFinish(st);
 				UnlockReleaseBuffer(mb);
@@ -1211,27 +1230,7 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			weave_free_chain(index, oldlivedocs);
 	}
 
-	/* refresh corpus N so IDF/avgdl reflect the deletions */
-	if (tuples_removed > 0)
-	{
-		Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
-		GenericXLogState *st;
-		Page		mp;
-		WeaveMetaPageData *m;
-		uint32		i;
-		double		nd = 0;
-
-		LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
-		st = GenericXLogStart(index);
-		mp = GenericXLogRegisterBuffer(st, mb, 0);
-		weave_meta_upcast_page(mp);	/* v3 -> v4 before reading segs[] and writing */
-		m = WeavePageGetMeta(mp);
-		for (i = 0; i < m->nsegments; i++)
-			nd += m->segs[i].ndocs - m->segs[i].ndeleted;
-		m->ndocs = nd + m->npending;
-		GenericXLogFinish(st);
-		UnlockReleaseBuffer(mb);
-	}
+	/* corpus N is refreshed inside each swap record above (G72) */
 	}
 	PG_FINALLY();
 	{
