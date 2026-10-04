@@ -209,17 +209,34 @@ say "ssh ingress $INGRESS"
 aws ec2 authorize-security-group-ingress --profile "$PROFILE" --group-id "$SGID" \
 	--protocol tcp --port 22 --cidr "$INGRESS" >/dev/null || die "authorize-ingress"
 
-# Ubuntu 24.04 LTS amd64, resolved from SSM so the AMI id is never hardcoded.
-AMI=$(aws ssm get-parameters --profile "$PROFILE" \
-	--names /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+# The OS, resolved from SSM so the AMI id is never hardcoded.  DISTRO=debian (the
+# default since 2026-10-01, maintainer decision) is Debian 13 "trixie"; DISTRO=ubuntu
+# is Ubuntu 24.04 LTS, what every run before that date used.  The two differ in
+# three ways this script has to know: the SSM path, the login user, and the root
+# device name the block-device mapping must use (Debian's is /dev/xvda; a mapping
+# for /dev/sda1 on it silently ADDS a second volume and leaves the root at 8 GB).
+DISTRO=${DISTRO:-debian}
+case "$DISTRO" in
+	debian)
+		AMI_PARAM=/aws/service/debian/release/trixie/latest/amd64
+		SSHUSER=admin ;;
+	ubuntu)
+		AMI_PARAM=/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+		SSHUSER=ubuntu ;;
+	*) die "DISTRO must be debian or ubuntu, not '$DISTRO'" ;;
+esac
+AMI=$(aws ssm get-parameters --profile "$PROFILE" --names "$AMI_PARAM" \
 	--query 'Parameters[0].Value' --output text)
-[ "$AMI" != None ] || die "could not resolve Ubuntu 24.04 AMI"
-say "ami $AMI"
+[ -n "$AMI" ] && [ "$AMI" != None ] || die "could not resolve the $DISTRO AMI from $AMI_PARAM"
+ROOTDEV=$(aws ec2 describe-images --profile "$PROFILE" --image-ids "$AMI" \
+	--query 'Images[0].RootDeviceName' --output text)
+[ -n "$ROOTDEV" ] && [ "$ROOTDEV" != None ] || die "could not read the root device of $AMI"
+say "ami $AMI ($DISTRO, root $ROOTDEV, user $SSHUSER)"
 
 IID=$(aws ec2 run-instances --profile "$PROFILE" \
 	--image-id "$AMI" --instance-type "$ITYPE" --key-name "$KEYNAME" \
 	--security-group-ids "$SGID" --count 1 \
-	--block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$VOLGB,VolumeType=gp3,Iops=8000,Throughput=500,DeleteOnTermination=true}" \
+	--block-device-mappings "DeviceName=$ROOTDEV,Ebs={VolumeSize=$VOLGB,VolumeType=gp3,Iops=8000,Throughput=500,DeleteOnTermination=true}" \
 	--instance-initiated-shutdown-behavior terminate \
 	--tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$RUN},{Key=Project,Value=pg_weave}]" \
 	--query 'Instances[0].InstanceId' --output text) || die "run-instances"
@@ -254,7 +271,7 @@ SSH="ssh -F /dev/null -i $KEYFILE -o IdentitiesOnly=yes \
 	-o ControlMaster=no -o ControlPath=none \
 	-o ConnectTimeout=15 -o ConnectionAttempts=6 \
 	-o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-	-o LogLevel=ERROR ubuntu@$HOST"
+	-o LogLevel=ERROR $SSHUSER@$HOST"
 for i in $(seq 1 40); do
 	$SSH true 2>/dev/null && break
 	if [ "$i" = 40 ]; then
@@ -426,7 +443,7 @@ run_smoke() {
 	# tail is printed, and the status is re-raised.
 	$SSH 'cd pg_weave && sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
 		  sudo -u postgres pg_ctlcluster 17 main start 2>/dev/null || true
-		  sudo -u postgres createuser -s ubuntu 2>/dev/null || true
+		  sudo -u postgres createuser -s $(whoami) 2>/dev/null || true
 		  make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/tmp/ic.log 2>&1
 		  rc=$?; tail -30 /tmp/ic.log; exit $rc' \
 		| tee "$OUT/installcheck.log"
@@ -506,7 +523,7 @@ run_lexical() {
 	# inherited number from an earned one.  Correctness is gated before any timing.
 	upload_pgfts || say "continuing with two arms; the results file must say so"
 	say "lexical benchmark vs tsvector+GIN and pg_fts"
-	$SSH "cd pg_weave && sudo -u postgres createuser -s ubuntu 2>/dev/null; \
+	$SSH "cd pg_weave && sudo -u postgres createuser -s \$(whoami) 2>/dev/null; \
 		  export PATH=/usr/lib/postgresql/17/bin:\$PATH PGDATABASE=weavebench; \
 		  bash bench/lexical.sh ${NDOCS:-1000000} ${VOCAB:-200000} 7" \
 		2>&1 | tee "$OUT/lexical.log"
@@ -620,7 +637,7 @@ run_fuzzy() {
 	# only on a dev box -- no bench/aws/run.sh run behind them, so no
 	# commit-tied number.  Correctness is gated before any timing.
 	say "fuzzy/regex benchmark: Z5 and Z6 gates"
-	$SSH "cd pg_weave && sudo -u postgres createuser -s ubuntu 2>/dev/null; \
+	$SSH "cd pg_weave && sudo -u postgres createuser -s \$(whoami) 2>/dev/null; \
 		  export PATH=/usr/lib/postgresql/17/bin:\$PATH PGDATABASE=weavebench; \
 		  bash bench/fuzzy.sh ${NDOCS:-1000000} ${REPS:-7}" \
 		2>&1 | tee "$OUT/fuzzy.log"
