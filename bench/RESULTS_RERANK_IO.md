@@ -11,7 +11,7 @@
 >   the measured cold p50 at n = 1M is **86 ms**, about 7×.
 > - **The shape has moved on.** The 3-bit/top-100 framing below was the
 >   maximum-recall shape. The ratified shape is **4 bits with a top-25 window**
->   (0.064× HNSW, recall@10 0.9920 at n = 1M), and the HNSW denominator every ×
+>   (0.064× HNSW [**CORRECTED 2026-10-04:** 0.064× is code bytes (`bits × dim / 8`); the built index measures 0.098× at 960-d and 0.130× at 1,024-d against the recorded 8,056 B/vector, and FAILS 0.15× at 384-d (0.261×) and 768-d (0.193×). `bench/RESULTS_VECMAJOR.md`.], recall@10 0.9920 at n = 1M), and the HNSW denominator every ×
 >   figure below divides by has since been measured at 8,056 B/vector rather than
 >   estimated at ~5,700.
 >

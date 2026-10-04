@@ -96,6 +96,25 @@ is($second, '300', 'every row of the crashed flush is answerable exactly once');
 is($ndocs, $heap, "ndocs equals the heap after recovery ($ndocs vs $heap): no double count");
 my $bad = $node->safe_psql('postgres',
 	q{SELECT count(*) FROM weave_check('fa_w', true) WHERE NOT ok});
+# A count alone is undiagnosable after the fact (doc/GAPS.md G21's lesson): when
+# this fails, print WHICH invariant and, for a leak, what the orphaned pages are --
+# a leaked page's kind names the write path that left it.
+if ($bad ne '0')
+{
+	diag("G75 weave_check violations:\n" . $node->safe_psql('postgres',
+		q{SELECT string_agg(invariant || ': ' || coalesce(detail, ''), E'\n')
+		    FROM weave_check('fa_w', true) WHERE NOT ok}));
+	diag("G75 unreachable unflagged pages:\n" . $node->safe_psql('postgres',
+		q{SELECT string_agg(blkno || ' kind=' || coalesce(kind, '(none)')
+		                    || ' flags=0x' || coalesce(to_hex(flags), '?')
+		                    || ' nextblk=' || coalesce(nextblk::text, 'none')
+		                    || ' lsn=' || lsn, E'\n' ORDER BY blkno)
+		    FROM weave_page_info('fa_w')
+		   WHERE NOT reachable AND coalesce(freed, false) = false
+		     AND NOT uninitialized}));
+	diag("G75 relation pages: " . $node->safe_psql('postgres',
+		q{SELECT pg_relation_size('fa_w') / current_setting('block_size')::int}));
+}
 is($bad, '0', 'weave_check(deep) is clean after recovery');
 
 # and the NEXT flush, which is where a doubly-held document used to become two

@@ -412,7 +412,7 @@ tightening the bound.** Three options, with what each costs:
 | option | what it costs |
 |---|---|
 | **(a)** restate the row in the unit the layout actually has — **blocks or bytes** rather than lanes | changes a published gate's definition; needs the §8 row rewritten and every earlier lane-unit figure re-read |
-| **(b)** a second, **vector-major** copy of the codes so a lane can be read without its block | **forfeits the storage gate** — one index smaller than the stack it replaces is a product claim |
+| **(b)** a second, **vector-major** copy of the codes so a lane can be read without its block | **forfeits the storage gate** — one index smaller than the stack it replaces is a product claim. **MEASURED 2026-10-04, `bench/RESULTS_VECMAJOR.md`:** confirmed, 0.159×–0.356× HNSW across 960–384-d |
 | **(c)** **cluster-order the weft** so candidates are contiguous | contradicts the **strictly-ascending-docid** requirement the fused vector channel depends on (`include/weave/vecdocmap.h:35,105,122`) — a conflict **nothing in the tree had recorded before today** |
 
 Option (c)'s conflict is the genuinely new fact: V13-style cluster ordering and F8's docid
@@ -565,7 +565,7 @@ about, and this project has no evidence about which of the two its users would c
 |---|---|---|
 | **on** (today's default) | the fused ranking **beats RRF on all three corpora** (1.053× / 1.010× / 1.114×), with recall@100 up on two of three | **slower than RRF on the largest corpus** (p50 1.172×, p99 1.000×), p99 fails on two of three, and the p50 row is further from its gate than it was |
 | **off** | fast — p50 2.144 / 1.533 / 10.889 ms, p99 0.609× / 0.560× / 0.633× of the control, i.e. the p99 row **passes** | **ranks worse than RRF on all three corpora** (0.982× / 0.924× / 0.687×), which is the state that made `doc/ARCHITECTURE.md` §9 claim 2 unsupported in the first place |
-| **neither** | both rows at once | make the **vector channel's candidate set smaller**, which `doc/specs/FUSED_TOPK.md` §8d shows needs a **restated unit**, a **second vector-major copy** of the codes (forfeits the storage gate), or a **cluster-ordered weft** (contradicts the strictly-ascending-docid requirement F8 depends on) |
+| **neither** | both rows at once | make the **vector channel's candidate set smaller**, which `doc/specs/FUSED_TOPK.md` §8d shows needs a **restated unit**, a **second vector-major copy** of the codes (forfeits the storage gate; **measured 2026-10-04**, `bench/RESULTS_VECMAJOR.md`), or a **cluster-ordered weft** (contradicts the strictly-ascending-docid requirement F8 depends on) |
 
 Three things belong with that table. **A user can already choose per query:** the GUC is
 `PGC_USERSET`, so `SET pg_weave.fuse_normalize` picks a ranking-versus-latency point per

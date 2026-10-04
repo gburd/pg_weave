@@ -377,7 +377,7 @@ reading one lane touches every byte of its block, so scoring 1 lane costs the sa
 traffic as scoring 32 (`bench/RESULTS_CODE_SCAN.md:330,417`). So the blocker list above is
 refined rather than replaced: **this row needs either (a) §8's row restated in blocks or
 bytes rather than lanes, or (b) a second vector-major copy of the codes — forfeiting the
-storage gate — or (c) a cluster-ordered weft, which contradicts the strictly-ascending-docid
+storage gate [**MEASURED 2026-10-04, `bench/RESULTS_VECMAJOR.md`:** confirmed at 384/768/960/1,024-d. The shipped index already fails 0.15× below 960-d] — or (c) a cluster-ordered weft, which contradicts the strictly-ascending-docid
 requirement the fused vector channel depends on** (`include/weave/vecdocmap.h:35,105,122`).
 All three are maintainer decisions, ~~presented and not taken~~ **— (a) was TAKEN 2026-09-22 as
 a MEASUREMENT decision and did not rescue the row (in blocks the vector ratio is 1.000×,
@@ -802,7 +802,7 @@ places are corrected; §2.1 now derives it.
    pgvector HNSW measures **8,056 B/vector** (m=16, ef_construction=64, 999,990 ×
    960-d, `bench/RESULTS_PHASE_V_COLD.md`) rather than the ~5,700 B/vector the
    `0.15×` budget had been priced from. The ratified shape is **4 bits + a top-25
-   heap rerank: recall@10 0.9920 at n=1M, 0.064× HNSW.** Both gates met on one
+   heap rerank: recall@10 0.9920 at n=1M, 0.064× HNSW.** [**CORRECTED 2026-10-04:** 0.064× is code bytes (`bits × dim / 8`); the built index measures 0.098× at 960-d and 0.130× at 1,024-d against the recorded 8,056 B/vector, and FAILS 0.15× at 384-d (0.261×) and 768-d (0.193×). `bench/RESULTS_VECMAJOR.md`.] Both gates met on one
    corpus. The three-resolution framing is resolved and closed.
 3. **TQ+ affine calibration is not the fix.** It moved recall the wrong way at 3 of 4
    measured points.

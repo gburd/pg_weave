@@ -124,7 +124,8 @@ is sound.
 ## Consequence for the remaining structural option
 
 Before this run the option list for §8's vector work row was: (b) a second **vector-major**
-copy of the codes, forfeiting the storage gate, or narrow claim 3. This measurement
+copy of the codes, forfeiting the storage gate (**MEASURED 2026-10-04, `bench/RESULTS_VECMAJOR.md`:** confirmed at every
+dim measured), or narrow claim 3. This measurement
 replaces both with something cheaper and better targeted.
 
 | | what it fixes | cost per document | fixes scattered candidates? |

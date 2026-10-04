@@ -125,6 +125,14 @@ Rerank I/O comes from `bench/RESULTS_RERANK_IO.md`: **2.388 page reads per
 candidate** at 1024-d out of line, measured. Index bytes are `bits * 128` per
 vector at 1024-d, against the ~855 B that 0.15x of pgvector HNSW allows.
 
+> **CORRECTED 2026-10-04 (`bench/RESULTS_VECMAJOR.md`).** `bits * 128` is the code
+> bytes, not the index. A built 4-bit weave index measures **1,045 B/vector at
+> 1,024-d** and **789 B/vector at 960-d** (0.130× / 0.098× of the measured 8,056).
+> The "index B/vector" and "x HNSW" columns below are code bytes over an
+> estimated denominator: neither half is a measured index ratio. The 4-bit
+> recommendation still passes the storage gate at these widths, with less margin.
+> Below 960-d it does not (`bench/RESULTS_VECMAJOR.md`).
+
 | bits | window @ 0.99 | index B/vector | x HNSW | page reads/query | SIMD kernel |
 |---|---|---:|---:|---:|---|
 | 2 | > 75 | 256 | 0.045 | > 179 | yes |

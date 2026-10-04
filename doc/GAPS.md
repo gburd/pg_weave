@@ -4916,3 +4916,74 @@ reclaims, and `weave_check(deep)` is how to tell that one is due.**
   `ndocs + ndeleted` = 2800/2830/2860; point 4 (the separate refresh) is consistent;
   `STICKY ... (2600 vs 2340)`. That is exactly the predicted failure, so the test
   measures the window.
+
+### G73 — t/028's "quiet plain VACUUM still truncates the index" control failed once on a tree that does not touch VACUUM — **FOUND 2026-10-04; flake in a test's positive control, not a product defect so far; OPEN**
+
+The full gate on `wt/f9b` (`eb28db7`, run `pgweave-20261004-210709`) failed exactly one
+TAP assertion out of 1,100: t/028 test 113, `quiet plain VACUUM still truncates the index
+(4143 -> 4213 blocks)`. The relation **grew** across three plain VACUUMs after the
+DELETE. That branch changes no C code on the VACUUM path; it adds a regression file and
+docs, and a comment in `fusepath.c`. Re-run in isolation on the same commit five times
+(`pgweave-20261004-212408`): 5 of 5 pass. Nine other recorded full runs pass t/028.
+
+**What it might be, unproven:** truncation takes AccessExclusiveLock **conditionally**
+(`weave_truncate_tail_above()`, G67) and skips it if anyone else holds a lock. A leftover
+backend from t/028's own concurrent rounds, or autovacuum on another table, could make
+all three conditional attempts skip. Growth rather than no change needs a second
+explanation: the cleanup's merge writing new pages before it frees old ones, which the
+skipped truncation then cannot return. The control should either retry until truncation
+is observed with a time cap (as t/027's rounds do) or assert "not larger than before plus
+the merge's output" instead of "smaller". **Owed:** reproduce with `log_lock_waits` and a
+NOTICE on the skipped conditional lock before changing the assertion; a test that relaxes
+its assertion without knowing why it failed is the eleventh-member mistake.
+
+### G74 — `weave_search()` returns a HOT-chain ROOT TID, so `JOIN t ON t.ctid = s.ctid` silently drops every HOT-updated row — **FOUND 2026-10-04 by the F3 agent while building `weave_fuse_search()`'s oracle; PRE-EXISTING; OPEN**
+
+An access method must hand the executor HOT-chain root TIDs (AGENTS.md), and
+`weave_search()` returns the TID the index holds, which is the root. Joining that to the
+heap's `ctid`, which is the live tuple's TID, matches nothing for a row that has been
+HOT-updated since it was indexed. The row disappears from the join with no error. Every
+oracle in `sql/fuse_pushdown.sql` (2)/(2b) and `bench/fuse.sh` joins this way; they are
+correct only because their fixtures have no HOT updates.
+
+`weave_fuse_search()` (F3, 2026-10-04) returns the live ctid, read from the slot after
+the heap fetch, and `sql/fusesearch.sql` pins it with a HOT-updated row. **Owed:** decide
+whether `weave_search()` should do the same (a behaviour change to a 0.1.0 SQL function),
+or document that its `ctid` column is the root and give the join the
+`heap_get_root_tuples()`-equivalent it needs. The same audit is due for `weave_vec_scan()`,
+which returns docids.
+
+### G75 — t/029's "weave_check(deep) is clean after recovery" failed once: one violated invariant after an immediate stop right after a VACUUM flush — **FOUND 2026-10-04 by the g46 agent's smoke (`pgweave-20261004-221406`, branch at main 89d7dcf + 3 commits touching no C); NOT YET REPRODUCED; OPEN**
+
+t/029 (G65's test) crashes the server immediately after a VACUUM that flushes the pending
+list, restarts it, and asserts `weave_check(fa_w, deep)` has zero violated rows. Once, it
+had **one**. The run kept only the installcheck tail, and the test printed only the count,
+so which invariant failed is not known. That is the G21 mistake, repeated: the same
+symptom shape, "one leaked page after crash recovery, once", is still OPEN for t/014.
+
+**Done:** t/029 now prints, on failure, every violated invariant with its detail and every
+unreachable unflagged page with its kind, flags, nextblk and LSN. A recurrence will name
+the write path.
+
+**Hunted, 2026-10-04:** t/029 alone, 40 runs, 0 failures (`pgweave-20261004-222827-e5b4`);
+the full TAP sequence, 8 runs, 0 failures (`pgweave-20261004-224037-52a8`); and a
+direct probe of the leak hypothesis, 20 trials of the exact shape (12 pending pages, VACUUM
+flush, immediate stop, deep check), 0 orphaned pages and 0 violations
+(`pgweave-20261004-224958-f801`). So 68 attempts at a 1-in-1 rate; the 95 % upper bound on
+the per-run rate is now about 4 %.
+
+**The leading hypothesis is a leak, not double counting.** G72 recorded the leak class:
+pages freed after an operation's last record, or written before being linked. The flush's
+pending-page recycling runs AFTER the one atomic record (`weave_free_page()` per page, one
+record each). An immediate stop between the atomic record and the last free leaves pages
+that are unreachable and not flagged freed, which is exactly what
+`pages_reachable_or_freed` reports. A VACUUM issues no XLogFlush unless the transaction
+has an XID, so the free records may simply not be on disk at the stop. If so, this is not a
+new defect but G72's leak class, observed: harmless to answers, reclaimable only by REINDEX.
+The diagnostic above will confirm or refute it. The probe weakens it: if every
+immediate stop after a flush lost the trailing free records, 20 of 20 trials would have
+leaked, and none did. The free records are on disk by the stop, which is what an
+`fsync = off` cluster with a clean-exit `pg_ctl stop -m immediate` would be expected to
+show. So the one failure is either a rarer interleaving or something else entirely.
+**Disposition, G21's: not hunted further until it recurs**, and when it does, the test now
+prints what failed.
