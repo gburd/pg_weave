@@ -4882,3 +4882,19 @@ is observed with a time cap (as t/027's rounds do) or assert "not larger than be
 the merge's output" instead of "smaller". **Owed:** reproduce with `log_lock_waits` and a
 NOTICE on the skipped conditional lock before changing the assertion; a test that relaxes
 its assertion without knowing why it failed is the eleventh-member mistake.
+
+### G74 — `weave_search()` returns a HOT-chain ROOT TID, so `JOIN t ON t.ctid = s.ctid` silently drops every HOT-updated row — **FOUND 2026-10-04 by the F3 agent while building `weave_fuse_search()`'s oracle; PRE-EXISTING; OPEN**
+
+An access method must hand the executor HOT-chain root TIDs (AGENTS.md), and
+`weave_search()` returns the TID the index holds, which is the root. Joining that to the
+heap's `ctid`, which is the live tuple's TID, matches nothing for a row that has been
+HOT-updated since it was indexed. The row disappears from the join with no error. Every
+oracle in `sql/fuse_pushdown.sql` (2)/(2b) and `bench/fuse.sh` joins this way; they are
+correct only because their fixtures have no HOT updates.
+
+`weave_fuse_search()` (F3, 2026-10-04) returns the live ctid, read from the slot after
+the heap fetch, and `sql/fusesearch.sql` pins it with a HOT-updated row. **Owed:** decide
+whether `weave_search()` should do the same (a behaviour change to a 0.1.0 SQL function),
+or document that its `ctid` column is the root and give the join the
+`heap_get_root_tuples()`-equivalent it needs. The same audit is due for `weave_vec_scan()`,
+which returns docids.
