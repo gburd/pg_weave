@@ -162,6 +162,8 @@ of 0.00 %.
 The remaining options are unchanged in kind and now one shorter:
 
 1. **Vector-major second copy** — forfeits the storage gate, which is a stated claim.
+   **MEASURED 2026-10-04, `bench/RESULTS_VECMAJOR.md`:** confirmed at every dim measured (best case 0.159× at 960-d). The
+   bytes are now priced. Whether the copy would make the scan faster is not.
    Untested; it attacks *bytes touched per lane* rather than *lanes touched*, so the
    0.00 % above does not bear on it.
 2. **Narrow claim 3's scope** to the channels where selectivity demonstrably helps, and

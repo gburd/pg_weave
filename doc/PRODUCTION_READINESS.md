@@ -377,7 +377,7 @@ reading one lane touches every byte of its block, so scoring 1 lane costs the sa
 traffic as scoring 32 (`bench/RESULTS_CODE_SCAN.md:330,417`). So the blocker list above is
 refined rather than replaced: **this row needs either (a) §8's row restated in blocks or
 bytes rather than lanes, or (b) a second vector-major copy of the codes — forfeiting the
-storage gate — or (c) a cluster-ordered weft, which contradicts the strictly-ascending-docid
+storage gate [**MEASURED 2026-10-04, `bench/RESULTS_VECMAJOR.md`:** confirmed at 384/768/960/1,024-d. The shipped index already fails 0.15× below 960-d] — or (c) a cluster-ordered weft, which contradicts the strictly-ascending-docid
 requirement the fused vector channel depends on** (`include/weave/vecdocmap.h:35,105,122`).
 All three are maintainer decisions, ~~presented and not taken~~ **— (a) was TAKEN 2026-09-22 as
 a MEASUREMENT decision and did not rescue the row (in blocks the vector ratio is 1.000×,
