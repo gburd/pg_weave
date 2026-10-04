@@ -364,7 +364,7 @@ corpus — the original named Cohere-wiki), all of:
 
 **Where the shape stands against it today:** (1) met on GIST-960d at n=1M (0.9920),
 second corpus outstanding; (2) met with margin (0.064× against a measured 8,056
-B/vector); (3) **MET 2026-09-13, warm and cold, at iso-recall.**
+B/vector) — **CORRECTED 2026-10-04:** 0.064× is code bytes; the built index is 0.098× at 960-d and fails below 960-d (`bench/RESULTS_VECMAJOR.md`); (3) **MET 2026-09-13, warm and cold, at iso-recall.**
 
 Term 3 took two attempts to measure honestly, and the first was wrong in our
 favour's opposite direction. `R* = min(0.99, the comparator's best) = 0.9760`,
@@ -428,6 +428,7 @@ them published in between. See V15's row and `bench/RESULTS_CODE_SCAN.md`.
 
 - recall@10 **0.9920** at n = 1M on GIST-960d, full probe, self-check PASS;
 - index **512 B/vector at 1024-d = 0.064× pgvector HNSW** (measured denominator);
+  **CORRECTED 2026-10-04 (`bench/RESULTS_VECMAJOR.md`): 512 B/vector is the CODE BYTES (`bits × dim / 8`), not the built index.** Built with `CREATE INDEX ... USING weave` at 4 bits, the index measures **534 / 789 / 789 / 1,045 B/vector at 384 / 768 / 960 / 1,024-d**. That is **0.096× at 960-d and 0.128× at 1,024-d** against same-run HNSW (0.098× / 0.130× against 8,056). **It fails the 0.15× gate at 384-d (0.261×) and 768-d (0.193×).** The cause is in the layout, not the data: the writer puts each block's centroid strip (dim/2 bytes) on a page of its own, which is 256 B/vector at every dim. Fixing that is a format change and is the maintainer's call.
 - the widest width that keeps the SIMD code-scan kernel — 5–8 bits fall back to the
   scalar oracle (`KERNEL_GROUP_BITS_MAX`), and the code scan touches every vector
   while the rerank touches twenty-five, so trading vectorized scoring for five
@@ -831,7 +832,7 @@ TAKEN 2026-09-23 and WITHDRAWN THE SAME DAY BY MEASUREMENT
 (`bench/RESULTS_CLUSTER_ORDER.md`); (b) remains open; see the dated decisions below:**
 (a) restate §8's row in the unit the layout has, **blocks or
 bytes** rather than lanes; (b) a second **vector-major** copy of the codes, forfeiting the
-storage gate; (c) **cluster-order the weft** so candidates are contiguous, which contradicts
+storage gate [**MEASURED 2026-10-04, `bench/RESULTS_VECMAJOR.md`:** it does forfeit it, at every dim measured (0.159× at 960-d is the best case, 0.356× at 384-d). The reason is not the one stated here: at 384/768-d two 4-bit copies are dim bytes/vector, more than the whole 0.15× budget, so no layout fits. At 960-d a copy fits only if the centroid strip is first moved off its own page]; (c) **cluster-order the weft** so candidates are contiguous, which contradicts
 the strictly-ascending-docid requirement the fused vector channel depends on
 (`include/weave/vecdocmap.h:35,105,122`) — meaning **V13 and F8 are not independent**, a
 conflict nothing in the tree had recorded before today. `doc/GAPS.md` **G46**,
