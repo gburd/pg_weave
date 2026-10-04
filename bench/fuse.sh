@@ -333,41 +333,79 @@ SQL
 MAPOK=$($PSQL -t -A -c "SELECT count(*) = (SELECT count(*) FROM fd) FROM fdmap;")
 [ "$MAPOK" = "t" ] || die "the docid map does not cover every row: weave_vec_lanes() and ctid order disagree"
 
-# THE GATE RUNS AGAINST THE SHIPPING OBJECTIVE, WHICH IT COULD NOT DO FOR ONE DAY.
+# THE GATE CHECKS BOTH OBJECTIVES, AND RECOMPUTES BOTH CEILINGS.  doc/GAPS.md G46.
 #
-# From the morning of 2026-09-22 the scorer divided each fuse() KEY by its own pre-scan
-# ceiling (doc/specs/FUSED_TOPK.md sect. 8d) while this oracle still computed
-# `0.5*lex + 0.5*vec`, so the gate had to be run with `pg_weave.fuse_normalize = off` --
-# a gate testing a non-default configuration, which is one configuration change away
-# from testing nothing.  doc/GAPS.md G46 is that gap; 0.20.0's `weave_index_max_tf()`
-# closes it, and the oracle below now builds the same objective the scan does.
+# pg_weave.fuse_normalize (default on) divides each fuse() key's weight by that key's
+# pre-scan ceiling N_key (src/am/amscan.c, "w_key / N_key").  Until 2026-09-22 this
+# oracle computed only the raw sum, so the gate had to run with the normalizer OFF --
+# a gate testing a non-default configuration.  681f9c4 moved it to the normalized
+# objective and dropped the raw one; 2026-10-04 restores the raw check beside it, so
+# a run now checks:
 #
-# THE ORACLE RECOMPUTES THE CEILING RATHER THAN ASKING FOR IT, which is the whole point
-# of exposing max tf instead of a normalizer accessor: the BM25 term bound
-# `idf * mtf * (k1+1) / (mtf + k1*(1-b))` is written out HERE, in SQL, from three
-# statistics the index publishes (df, max tf, ndocs).  An accessor would have returned
-# the scan's own number and the comparison would have shared code with the thing it
-# checks.  k1 = 1.2 and b = 0.75 are the scan's hardcoded constants
-# (src/am/amscan.c, weave_bm25_factors_init call sites); a term absent everywhere has
-# mtf = 0 and contributes 0, which is what the scan gives it too.
+#   * NORMALIZED: the default-configuration pushdown against
+#     0.5 * lex / N_L + 0.5 * vec / N_V;
+#   * RAW: the same pushdown under `SET pg_weave.fuse_normalize = off` against
+#     0.5 * lex + 0.5 * vec.
 #
-# The vector key's normalizer is the max over segments of the shuttle's own (B2) fold,
-# which weave_vec_scan_stats() reports per bolt.  k = 1 because only `maxscore` is read;
-# the row count is irrelevant.
-# GATE_PRE exists for ONE purpose: the positive control for this gate.  Setting it to
-# `SET pg_weave.fuse_normalize = off;` makes the pushdown compute a DIFFERENT objective
-# from the oracle, and the gate must then report mismatches -- measured on nfcorpus,
-# 2026-09-23 on 25 queries: 25 of 25 AGREE with it unset, and 14 of 25 MISMATCH with it
-# set, which fails the run.  A gate that
-# cannot be made to fail has not been shown to work (AGENTS.md, eleventh member).
+# BOTH CEILINGS ARE RECOMPUTED HERE, IN SQL, rather than asked for, because an
+# accessor that returned the scan's own number would share code with the thing it
+# checks:
+#
+#   * N_L = sum over terms of idf(df, ndocs) * mtf * (k1+1) / (mtf + k1*(1-b)), from
+#     weave_index_df(), weave_index_max_tf() and weave_index_stats(); k1 = 1.2 and
+#     b = 0.75 are the scan's hardcoded constants (weave_bm25_factors_init call sites)
+#     and the expression is weave_bm25_term_bound() at the max tf.
+#   * N_V = max over directory records of maxrecnorm, from weave_vec_blocks(), times
+#     ||q||, from the query's own real[] -- bound (B2) in the ip domain.  Until
+#     2026-10-04 this came from weave_vec_scan_stats().maxscore, which is produced by
+#     the SAME fold (weave_vec_scan_maxscore()) the scan uses, so a defect in that
+#     fold moved the oracle with the scan and was invisible.  The stats number is now
+#     a CROSS-CHECK against the recompute, not the oracle's input.
+#
+# AND THE SCAN'S OWN N_key, under pg_weave.fuse_check_bounds: its per-channel NOTICE
+# prints the effective weight w = w_key / N_key (amscan.c, "chan %d kind=%s ... w=%g"),
+# so 0.5 / w must equal the recomputed N for every lexical and every vector channel.
+# The NOTICE has to FIRE on every query before its agreement counts -- a GUC that does
+# not exist is accepted as a placeholder and is silent (AGENTS.md, twelfth member).
+#
+# A TIE IS A TOLERANCE, NOT AN EQUALITY.  The scan sums in float4 and the oracle in
+# float8, so "the top-10 set is unique" means the score gap between ranks 10 and 11
+# exceeds FUSE_TIE_TOL (default 1e-5) times the largest |score|.  A query whose cut
+# is inside the tolerance is reported as TIED for that objective -- neither a pass
+# nor a fail.  Before 2026-10-04 the test was exact float equality, which counted a
+# 1-ulp gap as a clean cut.
+#
+# GATE_PRE exists for ONE purpose: the positive control.  `SET pg_weave.fuse_normalize
+# = off;` makes the default-configuration pushdown compute the raw objective, so the
+# normalized comparison and the NOTICE check must both report mismatches -- measured on
+# nfcorpus, 2026-09-23 on 25 queries: 25 of 25 AGREE with it unset, and 14 of 25
+# MISMATCH with it set.  The raw arm SETs the GUC itself and is unaffected.  The
+# mutants M1-M3 of doc/GAPS.md G46 are the stronger control: each perturbs one ceiling
+# in the build, and each must fail this gate.
+TOL=${FUSE_TIE_TOL:-1e-5}
+MAXREC=$($PSQL -t -A -c "SELECT max(maxrecnorm)::float8 FROM weave_vec_blocks('fd_weave');")
+[ -n "$MAXREC" ] || die "weave_vec_blocks('fd_weave') returned no directory records"
 GATESET="$SETUP ${GATE_PRE:-}"
-say "$DS: correctness gate on $CHECKN queries (pushdown vs exhaustive per-channel oracle, normalizer ON -- the shipping objective)"
-BAD=0
-TIED=0
-FBDIFF=0
+say "$DS: correctness gate on $CHECKN queries (pushdown vs exhaustive per-channel oracle, normalized AND raw objectives, N_key recomputed)"
+
+# nkey_ok <expected N> <w values, one per line>: 0 agree, 1 disagree, 2 no values.
+# A non-positive N leaves the weight alone in the scan, which is a divisor of 1.
+nkey_ok() {
+    printf '%s\n' "$2" | awk -v n="$1" 'BEGIN { d = (n > 0) ? n : 1 }
+        NF { c++; g = 0.5 / $1; if (g - d > 1e-4 * d || d - g > 1e-4 * d) bad = 1 }
+        END { exit (c == 0) ? 2 : bad }'
+}
+
+BAD=0; TIED=0; BADR=0; TIEDR=0; NKBAD=0; NVDIFF=0; FBDIFF=0
 while IFS=$'\t' read -r qid wq qv; do
     got=$( { echo "$GATESET SET enable_seqscan = off;"; fused_sql "$wq" "$qv" 10; } \
            | psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A | sort -n | tr '\n' ' ')
+    gotr=$( { echo "$GATESET SET enable_seqscan = off; SET pg_weave.fuse_normalize = off;"; fused_sql "$wq" "$qv" 10; } \
+           | psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A | sort -n | tr '\n' ' ')
+    # stderr only: the NOTICE lines.  A (C2) violation raises here too, and fails the run.
+    nt=$( { echo "$GATESET SET enable_seqscan = off; SET pg_weave.fuse_check_bounds = on;"; fused_sql "$wq" "$qv" 10; } \
+          | psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A 2>&1 >/dev/null) \
+        || die "qid=$qid: the fused scan raised under fuse_check_bounds: $nt"
 
     # The fallback, kept as a DIAGNOSTIC rather than a gate: the size of the
     # disagreement is sect. 7a (1) measured at corpus scale, which no test has done.
@@ -375,77 +413,121 @@ while IFS=$'\t' read -r qid wq qv; do
           | psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A | sort -n | tr '\n' ' ')
     [ "$got" = "$fb" ] || FBDIFF=$((FBDIFF + 1))
 
-    read -r tiefree want < <(psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A -F $'\t' <<SQL
+    IFS=$'\t' read -r nl nv nvs clean_n want clean_r wantr < <(psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A -F $'\t' <<SQL
 WITH t AS (
     SELECT df, mtf
       FROM unnest(weave_index_df('fd_weave', $wq::wquery),
                   weave_index_max_tf('fd_weave', $wq::wquery)) AS u(df, mtf)
-), nrm AS (
-    SELECT GREATEST((SELECT sum(CASE WHEN t.mtf = 0 THEN 0::float8
+), k AS (
+    SELECT COALESCE((SELECT sum(CASE WHEN t.mtf = 0 THEN 0::float8
                                      ELSE ln(1.0 + ((SELECT ndocs FROM weave_index_stats('fd_weave'))
                                                     - t.df + 0.5) / (t.df + 0.5))
                                           * t.mtf * 2.2 / (t.mtf + 1.2 * (1.0 - 0.75))
-                                END) FROM t), 1e-9) AS nl,
-           GREATEST((SELECT max(maxscore)::float8
-                       FROM weave_vec_scan_stats('fd_weave', $qv::wvec, 1)), 1e-9) AS nv
+                                END) FROM t), 0) AS nl,
+           $MAXREC::float8 * (SELECT sqrt(sum(x::float8 * x::float8))
+                                FROM unnest($qv::wvec::real[]) x) AS nv,
+           COALESCE((SELECT max(maxscore)::float8
+                       FROM weave_vec_scan_stats('fd_weave', $qv::wvec, 1)), -1) AS nvs
+), d AS (
+    SELECT CASE WHEN nl > 0 THEN nl ELSE 1 END AS dl,
+           CASE WHEN nv > 0 THEN nv ELSE 1 END AS dv FROM k
 ), s AS (
-    SELECT m.id,
-           (0.5::float8 / nrm.nl) * COALESCE(a.score, 0::float8)
-           + (0.5::float8 / nrm.nv) * COALESCE(v.score::float8, 0::float8) AS score
+    SELECT m.id, COALESCE(a.score, 0::float8) AS l, COALESCE(v.score::float8, 0::float8) AS v
       FROM fdmap m
-      CROSS JOIN nrm
       LEFT JOIN weave_search('fd_weave', $wq::wquery, $NDOCS) a ON a.ctid = m.rowtid
       LEFT JOIN weave_vec_scan('fd_weave', $qv::wvec, $NDOCS) v ON v.docid = m.docid
+), o AS (
+    SELECT 'n'::text AS obj, s.id, 0.5 * s.l / d.dl + 0.5 * s.v / d.dv AS score FROM s, d
+    UNION ALL
+    SELECT 'r', s.id, 0.5 * s.l + 0.5 * s.v FROM s
 ), r AS (
-    SELECT id, score, row_number() OVER (ORDER BY score DESC, id) AS rn FROM s
+    SELECT obj, id, score,
+           row_number() OVER (PARTITION BY obj ORDER BY score DESC, id) AS rn,
+           max(abs(score)) OVER (PARTITION BY obj) AS top
+      FROM o
 )
--- TIE-FREE MEANS "THE TOP-10 SET IS UNIQUE", WHICH IS ONLY ABOUT RANKS 10 AND 11.
---
--- This used to be \`count(*) = count(DISTINCT score)\` over the WHOLE corpus, which
--- demanded that no two documents anywhere share a score -- and a tie a thousand
--- ranks down cannot affect a top-10 SET comparison.  On scifact (5,183 docs) that
--- held for 98 of 100 queries and looked fine.  On nfcorpus (3,633) and fiqa
--- (57,638) it held for ZERO of 100, so every query was skipped, \`BAD\` stayed 0,
--- and the gate reported "passed" having compared NOTHING.  It is the recall row of
--- FUSED_TOPK.md sect. 8 -- the one that table calls its most valuable -- and it was
--- vacuous on two of three datasets while printing a pass.  Same family as G42:
--- a gate that cannot fail.
---
--- Ties WITHIN the top 10 are harmless here because the comparison is a SET: if
--- ranks 5 through 10 all share a score the set is still determined.  Only a tie
--- across the CUT leaves two different, equally correct answers.  NOT EXISTS also
--- gives the right answer when the corpus has fewer than 11 rows.
-SELECT NOT EXISTS (SELECT 1 FROM r x JOIN r y ON y.rn = 11
-                    WHERE x.rn = 10 AND x.score = y.score),
-       (SELECT string_agg(id::text, ' ' ORDER BY id) FROM r WHERE rn <= 10);
+-- CLEAN means the top-10 SET is unique: only ranks 10 and 11 matter, ties inside the
+-- top 10 cannot change a set (the 2026-09 lesson: a whole-corpus distinctness test
+-- skipped 100 of 100 queries on two datasets).  No rank 11 is clean.
+SELECT k.nl, k.nv, k.nvs,
+       COALESCE((SELECT x.score - y.score > $TOL * x.top
+                   FROM r x JOIN r y ON y.obj = x.obj AND y.rn = 11
+                  WHERE x.obj = 'n' AND x.rn = 10), true),
+       (SELECT string_agg(id::text, ' ' ORDER BY id) FROM r WHERE obj = 'n' AND rn <= 10),
+       COALESCE((SELECT x.score - y.score > $TOL * x.top
+                   FROM r x JOIN r y ON y.obj = x.obj AND y.rn = 11
+                  WHERE x.obj = 'r' AND x.rn = 10), true),
+       (SELECT string_agg(id::text, ' ' ORDER BY id) FROM r WHERE obj = 'r' AND rn <= 10)
+  FROM k;
 SQL
 )
-    if [ "$tiefree" != "t" ]; then
-        TIED=$((TIED + 1))
-        continue
+    [ -n "$want" ] || die "qid=$qid: the oracle returned nothing"
+
+    # The vector ceiling, recomputed vs the shuttle's fold.
+    if ! awk -v a="$nv" -v b="$nvs" 'BEGIN { e = a - b; if (e < 0) e = -e; exit !(e <= 1e-4 * (a < 0 ? -a : a)) }'; then
+        printf 'NKEY qid=%s: vector ceiling recomputed %s, weave_vec_scan_stats %s\n' "$qid" "$nv" "$nvs" >&2
+        NVDIFF=$((NVDIFF + 1))
     fi
-    if [ "$(echo $got)" != "$(echo $want)" ]; then
-        printf 'MISMATCH qid=%s\n  pushdown: %s\n  oracle  : %s\n' "$qid" "$got" "$want" >&2
+
+    # The scan's own N_key, read off its NOTICE.
+    wl=$(printf '%s\n' "$nt" | sed -n 's/.* kind=lexical .* w=\([^ ]*\).*/\1/p' | sort -u)
+    wv=$(printf '%s\n' "$nt" | sed -n 's/.* kind=vector-scan .* w=\([^ ]*\).*/\1/p' | sort -u)
+    [ -n "$wv" ] || die "qid=$qid: no vector-scan NOTICE under pg_weave.fuse_check_bounds -- \
+the check did not run, so its silence is not evidence (is the GUC real in this build?)"
+    rc=0; nkey_ok "$nv" "$wv" || rc=$?
+    if [ "$rc" != 0 ]; then
+        printf 'NKEY qid=%s: vector N from the scan %s, recomputed %s\n' "$qid" \
+            "$(printf '%s ' $wv | awk '{for(i=1;i<=NF;i++) printf "%g ", 0.5/$i}')" "$nv" >&2
+        NKBAD=$((NKBAD + 1))
+    fi
+    if awk -v n="$nl" 'BEGIN { exit !(n > 0) }'; then
+        [ -n "$wl" ] || die "qid=$qid: N_L = $nl > 0 but no lexical NOTICE fired"
+        rc=0; nkey_ok "$nl" "$wl" || rc=$?
+        if [ "$rc" != 0 ]; then
+            printf 'NKEY qid=%s: lexical N from the scan %s, recomputed %s\n' "$qid" \
+                "$(printf '%s ' $wl | awk '{for(i=1;i<=NF;i++) printf "%g ", 0.5/$i}')" "$nl" >&2
+            NKBAD=$((NKBAD + 1))
+        fi
+    fi
+
+    if [ "$clean_n" != "t" ]; then
+        TIED=$((TIED + 1))
+    elif [ "$(echo $got)" != "$(echo $want)" ]; then
+        printf 'MISMATCH qid=%s (normalized)\n  pushdown: %s\n  oracle  : %s\n' "$qid" "$got" "$want" >&2
         BAD=$((BAD + 1))
     fi
+    if [ "$clean_r" != "t" ]; then
+        TIEDR=$((TIEDR + 1))
+    elif [ "$(echo $gotr)" != "$(echo $wantr)" ]; then
+        printf 'MISMATCH qid=%s (raw)\n  pushdown: %s\n  oracle  : %s\n' "$qid" "$gotr" "$wantr" >&2
+        BADR=$((BADR + 1))
+    fi
 done < <(head -n "$CHECKN" "$QLIT")
-[ "$BAD" -eq 0 ] || die "$BAD of $CHECKN queries disagree with the exhaustive per-channel oracle"
+CHECKED=$((CHECKN - TIED))
+CHECKEDR=$((CHECKN - TIEDR))
+say "$DS: gate tally: normalized $BAD mismatched / $CHECKED compared / $TIED tied; raw $BADR / $CHECKEDR / $TIEDR; N_key NOTICE disagreed on $NKBAD, vector ceiling vs stats on $NVDIFF"
+[ "$BAD" -eq 0 ] || die "$BAD of $CHECKN queries disagree with the exhaustive per-channel oracle (normalized objective)"
+[ "$BADR" -eq 0 ] || die "$BADR of $CHECKN queries disagree with the exhaustive per-channel oracle (raw objective)"
+[ "$NKBAD" -eq 0 ] || die "the scan's N_key disagrees with the SQL recompute on $NKBAD channel-queries"
+[ "$NVDIFF" -eq 0 ] || die "weave_vec_scan_stats().maxscore disagrees with the recomputed vector ceiling on $NVDIFF queries"
 # A GATE THAT COMPARED NOTHING DID NOT PASS.  `BAD` is 0 both when every query
 # agreed and when every query was skipped, and those two states printed the same
 # line until nfcorpus and fiqa skipped 100 of 100 and still said "gate passed".
-# Refuse the run instead: an ambiguous oracle on EVERY query means the oracle is
-# wrong for this corpus, not that the scorer is right.
-CHECKED=$((CHECKN - TIED))
-[ "$CHECKED" -gt 0 ] || die "the correctness gate compared 0 of $CHECKN queries \
-(all skipped for a tied oracle) -- it has proved nothing; fix the oracle before \
+[ "$CHECKED" -gt 0 ] || die "the normalized gate compared 0 of $CHECKN queries \
+(all tied at the cut) -- it has proved nothing; fix the oracle before \
 believing any number from this dataset"
+[ "$CHECKEDR" -gt 0 ] || die "the raw gate compared 0 of $CHECKN queries (all tied at the cut)"
 # And a mostly-skipped gate is weak evidence even when it is not vacuous, so the
 # threshold is loud rather than silent.
-if [ "$CHECKED" -lt $(( CHECKN / 2 )) ]; then
-    printf 'WARNING: the correctness gate compared only %s of %s queries (%s skipped for a tied oracle)\n' \
-        "$CHECKED" "$CHECKN" "$TIED" >&2
+if [ "$CHECKED" -lt $(( CHECKN / 2 )) ] || [ "$CHECKEDR" -lt $(( CHECKN / 2 )) ]; then
+    printf 'WARNING: the correctness gate compared only %s (normalized) / %s (raw) of %s queries\n' \
+        "$CHECKED" "$CHECKEDR" "$CHECKN" >&2
 fi
-say "$DS: gate passed ($CHECKED of $CHECKN queries COMPARED, $TIED skipped for a tied oracle; the fuse() fallback differed on $FBDIFF)"
+say "$DS: gate passed (normalized: $CHECKED of $CHECKN COMPARED, $TIED tied; raw: $CHECKEDR COMPARED, $TIEDR tied; N_key checked on every query; the fuse() fallback differed on $FBDIFF)"
+if [ "${FUSE_GATE_ONLY:-0}" = 1 ]; then
+    say "FUSE_GATE_ONLY=1: stopping after the gate"
+    exit 0
+fi
 
 # The plan is asserted, not hoped for: if the pushdown was not chosen, every latency
 # number below is measuring the fallback and the comparison is meaningless.
@@ -623,8 +705,10 @@ printf '\n### fuse_correctness\n'
 # `compared` is the load-bearing column, not `attempted`: the recall row of sect. 8
 # is only as strong as the number of queries whose oracle was unambiguous, and
 # reporting only the attempt count is what let a 0-of-100 gate read as a pass.
-printf 'attempted\tcompared\tmismatched_vs_oracle\tskipped_tied_oracle\tfallback_differed\n'
-printf '%s\t%s\t%s\t%s\t%s\n' "$CHECKN" "$CHECKED" "$BAD" "$TIED" "$FBDIFF"
+# The raw columns and the N_key columns since 2026-10-04 (doc/GAPS.md G46); the
+# tolerance is the one the tie test used.
+printf 'attempted\tcompared\tmismatched_vs_oracle\tskipped_tied_oracle\traw_compared\traw_mismatched\traw_tied\tnkey_notice_disagreed\tvec_ceiling_vs_stats_disagreed\ttie_tol\tfallback_differed\n'
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$CHECKN" "$CHECKED" "$BAD" "$TIED" "$CHECKEDR" "$BADR" "$TIEDR" "$NKBAD" "$NVDIFF" "$TOL" "$FBDIFF"
 
 printf '\n### fuse_quality\n'
 # Five columns, matching what bench/ndcg.py's data line actually emits.  The
