@@ -9127,7 +9127,30 @@ typedef struct FuseKeyTerms
 	int		   *lens;
 	int			nterms;
 	double	   *idf;
+	int			off;			/* first slot of this key in FusePending.val: one
+								 * per term for a lexical key, one for a vector key */
 } FuseKeyTerms;
+
+/*
+ * The pending-list documents a fused pass can rank (doc/GAPS.md G66), read once
+ * per attempt inside the pass's generation bracket.  `val` is n x nslot: the tf of
+ * each lexical term, and the EXACT vector score of each vector key -- -||q-v||^2
+ * for l2, <q,v> for ip, the numbers weave_vec_collect_pending() ranks the vector
+ * route's pending rows by.  pdf, pmtf and pvmax are over EVERY valid pending
+ * document, admitted or not, because they stand in for what the flush would put
+ * in the dictionary and the weft directory: a term's df where no segment holds
+ * it, its largest tf, and the key's (B2)-shaped ceiling.
+ */
+typedef struct FusePending
+{
+	int			n;
+	ItemPointerData *tid;
+	double	   *qdl;			/* the quantized length a flushed copy would carry */
+	double	   *val;
+	uint64	   *pdf;			/* per slot */
+	uint32	   *pmtf;			/* per slot */
+	double	   *pvmax;			/* per key; -INFINITY when none */
+} FusePending;
 
 /*
  * One VECTOR channel of one bolt (task F8).
@@ -9225,6 +9248,175 @@ weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
 	return nlive;
 }
 
+/*
+ * Walk the pending list for the fused pass (doc/GAPS.md G66).  A document is
+ * ADMITTED -- becomes a candidate -- when it is one the bolt loop would have
+ * generated had it been flushed: it is in the gate set (so->plainTids, when there
+ * is one); when the scan has a vector key it carries a vector the flush would
+ * keep, because a row whose fuse() is NULL is padded, not ranked (G71); and when
+ * it has none, some lexical term reaches it, because the candidate set is the
+ * union of the scored channels' positions (include/weave/fuse.h).
+ *
+ * A page that is no longer a live pending page ends the walk: the caller's
+ * generation re-check then redoes the pass, as for weave_vec_collect_pending().
+ */
+static void
+weave_fuse_collect_pending(Relation index, const WeaveMetaPageData *meta,
+						   WeaveScanOpaque so, const FuseKeyTerms *kt,
+						   int nslot, FusePending *p)
+{
+	BlockNumber blk = meta->pendinghead;
+	bool		dvtext;
+	bool		hasvec = weave_fuse_has_vec(so);
+	double	   *vals;
+	int			cap = 0;
+	int			qi;
+
+	p->n = 0;
+	p->tid = NULL;
+	p->qdl = NULL;
+	p->val = NULL;
+	p->pdf = (uint64 *) palloc0(Max(nslot, 1) * sizeof(uint64));	/* alloc-ok: one per query term or vector key */
+	p->pmtf = (uint32 *) palloc0(Max(nslot, 1) * sizeof(uint32));	/* alloc-ok: as above */
+	p->pvmax = (double *) palloc(so->nfuse * sizeof(double));	/* alloc-ok: one per fuse() score argument */
+	for (qi = 0; qi < so->nfuse; qi++)
+		p->pvmax[qi] = -INFINITY;
+	if (blk == InvalidBlockNumber)
+		return;
+
+	dvtext = weave_index_dv_is_text(index);
+	vals = (double *) palloc(Max(nslot, 1) * sizeof(double));	/* alloc-ok: as above */
+	while (blk != InvalidBlockNumber)
+	{
+		Buffer		buffer;
+		Page		page;
+		WeavePendingIter it;
+		WeavePendingRec rec;
+		BlockNumber next;
+
+		CHECK_FOR_INTERRUPTS();	/* between pages, no buffer lock held */
+		buffer = weave_scan_readbuf(index, blk);
+		if (buffer == InvalidBuffer)
+			break;				/* truncated by a concurrent weave_vacuum */
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buffer);
+		if (!weave_page_is_live_pending(page))
+		{
+			UnlockReleaseBuffer(buffer);
+			break;
+		}
+		next = WeavePageGetOpaque(page)->nextblk;
+		weave_pending_iter_init(&it, page, dvtext);
+		while (weave_pending_iter_next(&it, &rec))
+		{
+			bool		hasallvec = true;
+			bool		anylex = false;
+			int			t;
+			int			i;
+
+			if (!weave_doc_is_valid(rec.doc, rec.doclen))
+				continue;	/* weave_collect_matches warns about these */
+
+			for (qi = 0; qi < so->nfuse; qi++)
+			{
+				if (so->fuseStrat[qi] == WEAVE_STRAT_DISTANCE)
+				{
+					for (t = 0; t < kt[qi].nterms; t++)
+					{
+						WeaveTermEntry *e = weave_doc_lookup(rec.doc, kt[qi].terms[t],
+															 kt[qi].lens[t]);
+						int			sl = kt[qi].off + t;
+
+						vals[sl] = e != NULL ? (double) e->tf : 0.0;
+						if (e != NULL && e->tf > 0)
+						{
+							p->pdf[sl]++;
+							if (e->tf > p->pmtf[sl])
+								p->pmtf[sl] = e->tf;
+							anylex = true;
+						}
+					}
+				}
+				else
+				{
+					const WVec *v = (const WVec *) rec.vec;
+					const WVec *q = so->fuseV[qi];
+					bool		ip = so->fuseStrat[qi] == WEAVE_STRAT_VEC_IP;
+					double		dot = 0.0;
+					double		d2 = 0.0;
+					double		vn2 = 0.0;
+					double		qn2 = 0.0;
+					double		ceil;
+
+					/* the three cases the flush turns into a dead lane */
+					if (v == NULL || !weave_wvec_is_valid(v, rec.veclen) ||
+						v->dim != q->dim)
+					{
+						hasallvec = false;
+						continue;
+					}
+					for (i = 0; i < q->dim; i++)
+					{
+						double		qx = (double) q->x[i];
+						double		vx = (double) v->x[i];
+
+						dot += qx * vx;
+						d2 += (qx - vx) * (qx - vx);
+						vn2 += vx * vx;
+						qn2 += qx * qx;
+					}
+					vals[kt[qi].off] = ip ? dot : -d2;
+
+					/*
+					 * The ceiling the bolts' maxscore would carry once this vector
+					 * is flushed -- bound (B2), ||v||.||q||, in the metric's domain
+					 * (weave_vec_scan_maxscore()) -- with the exact norm standing in
+					 * for the reconstructed one.  >= the exact score by
+					 * Cauchy-Schwarz, so keynorm stays a ceiling over everything
+					 * the pass scores.
+					 */
+					ceil = sqrt(vn2) * sqrt(qn2);
+					if (!ip)
+						ceil = -qn2 + 2.0 * ceil;
+					if (ceil > p->pvmax[qi])
+						p->pvmax[qi] = ceil;
+				}
+			}
+
+			if (!hasallvec || (!hasvec && !anylex))
+				continue;
+			if (so->plainInit &&
+				bsearch(rec.tid, so->plainTids, so->nplain,
+						sizeof(ItemPointerData), cmp_tid) == NULL)
+				continue;
+
+			if (p->n >= cap)
+			{
+				/* relation-scale: every pending document can be admitted */
+				cap = cap ? cap * 2 : 64;
+				p->tid = (ItemPointerData *) (p->tid
+											  ? WEAVE_REALLOC_MAYBE_HUGE(p->tid, (Size) cap * sizeof(ItemPointerData))
+											  : WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(ItemPointerData)));
+				p->qdl = (double *) (p->qdl
+									 ? WEAVE_REALLOC_MAYBE_HUGE(p->qdl, (Size) cap * sizeof(double))
+									 : WEAVE_ALLOC_MAYBE_HUGE((Size) cap * sizeof(double)));
+				p->val = (double *) (p->val
+									 ? WEAVE_REALLOC_MAYBE_HUGE(p->val, (Size) cap * Max(nslot, 1) * sizeof(double))
+									 : WEAVE_ALLOC_MAYBE_HUGE((Size) cap * Max(nslot, 1) * sizeof(double)));
+			}
+			p->tid[p->n] = *rec.tid;
+			p->qdl[p->n] = (double)
+				weave_byte_to_doclen(weave_doclen_to_byte(rec.doc->doclen));
+			memcpy(&p->val[(Size) p->n * Max(nslot, 1)], vals,
+				   Max(nslot, 1) * sizeof(double));
+			p->n++;
+		}
+		UnlockReleaseBuffer(buffer);
+		blk = next;
+	}
+	pfree(vals);
+}
+
 /* (ascending distance, ascending TID): the fused candidate list's total order.
  * The TID tie-break is not cosmetic, it is what makes a LIMIT that cuts inside a
  * run of equal fused scores cut at the same place every time -- the argument
@@ -9247,6 +9439,8 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 	MemoryContext socxt = GetMemoryChunkContext(so);
 	MemoryContext passctx;
 	ScoredTid  *acc = NULL;
+	ScoredTid  *pend = NULL;	/* in passctx: the last attempt's pending docs */
+	int			npend = 0;
 	int			nacc = 0;
 	int			capacc = 0;
 	bool		complete = true;
@@ -9369,6 +9563,8 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		FuseVecChan *vc;
 		WeaveFuseHit *heap;
 		MemoryContext segctx;
+		FusePending pd;
+		int			nslot;
 
 		MemoryContextReset(passctx);
 		old = MemoryContextSwitchTo(passctx);
@@ -9402,6 +9598,25 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		kt = (FuseKeyTerms *) palloc0(so->nfuse * sizeof(FuseKeyTerms));	/* alloc-ok: one per fuse() score argument, at most WEAVE_FUSE_MAX_CHAN */
 		keynorm = (double *) palloc0(so->nfuse * sizeof(double));	/* alloc-ok: as above */
 		fw = (float4 *) palloc(so->nfuse * sizeof(float4));	/* alloc-ok: as above */
+
+		/*
+		 * THE PENDING LIST, read here -- inside this attempt's generation bracket,
+		 * so a flush that moves documents from the list into a bolt between this
+		 * read and the bolt loop's makes the attempt retry rather than count them
+		 * twice or not at all -- and before the normalizers, because what it holds
+		 * feeds them (doc/GAPS.md G66).  Needs every key's terms first.
+		 */
+		nslot = 0;
+		for (qi = 0; qi < so->nfuse; qi++)
+		{
+			kt[qi].off = nslot;
+			if (so->fuseStrat[qi] == WEAVE_STRAT_DISTANCE)
+				kt[qi].nterms = weave_query_terms(so->fuseQ[qi], &kt[qi].terms,
+												  &kt[qi].lens);
+			nslot += (so->fuseStrat[qi] == WEAVE_STRAT_DISTANCE) ? kt[qi].nterms : 1;
+		}
+		weave_fuse_collect_pending(index, &meta, so, kt, nslot, &pd);
+
 		for (qi = 0; qi < so->nfuse; qi++)
 		{
 			uint32	   *mtf;
@@ -9414,8 +9629,6 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 			if (so->fuseStrat[qi] != WEAVE_STRAT_DISTANCE)
 				continue;
 
-			kt[qi].nterms = weave_query_terms(so->fuseQ[qi], &kt[qi].terms,
-											  &kt[qi].lens);
 			kt[qi].idf = (double *)
 				palloc(Max(kt[qi].nterms, 1) * sizeof(double));	/* alloc-ok: one per query term */
 			mtf = (uint32 *)
@@ -9450,6 +9663,19 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 							mtf[t] = max_tf;
 					}
 				}
+
+				/*
+				 * PENDING DOCUMENTS, ON THE SCALE THEY WILL HAVE ONCE FLUSHED --
+				 * weave_pending_ranked()'s rules: a term no segment holds takes
+				 * its df from the pending list, and the largest pending tf enters
+				 * the key's ceiling exactly as a flushed one's would.  Leaving
+				 * them out made keynorm a ceiling over the bolts only, so the
+				 * normalized ranking changed when a flush ran.
+				 */
+				if (gdf == 0)
+					gdf = pd.pdf[kt[qi].off + t];
+				if (pd.pmtf[kt[qi].off + t] > mtf[t])
+					mtf[t] = pd.pmtf[kt[qi].off + t];
 				kt[qi].idf[t] = (gdf == 0) ? -1.0
 					: log(1.0 + (N - (double) gdf + 0.5) / ((double) gdf + 0.5));
 			}
@@ -9519,6 +9745,10 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 					(double) ms > keynorm[qi])
 					keynorm[qi] = (double) ms;
 			}
+
+			/* and the pending vectors' ceiling, by the same rule (G66) */
+			if (pd.pvmax[qi] > keynorm[qi])
+				keynorm[qi] = pd.pvmax[qi];
 		}
 
 		/*
@@ -9555,6 +9785,42 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 			fw[qi] = (float4) eff;
 			if (!(fw[qi] > 0.0f) || isinf(fw[qi]))
 				fw[qi] = so->fuseW[qi];
+		}
+
+		/*
+		 * THE PENDING DOCUMENTS' FUSED SCORES, S = sum of fw x channel score, in
+		 * float as src/am/fuse.c sums them.  The lexical channel is BM25 at this
+		 * pass's (idf, k1, b, avgdl) over the quantized length; the vector one is
+		 * EXACT, as on the vector route (weave_vec_collect_pending()).  Stored as
+		 * -S, the candidate list's order.  Merged after the bolt loop.
+		 */
+		npend = pd.n;
+		pend = (ScoredTid *) WEAVE_ALLOC_MAYBE_HUGE((Size) Max(npend, 1) * sizeof(ScoredTid));
+		for (i = 0; i < npend; i++)
+		{
+			const double *v = &pd.val[(Size) i * Max(nslot, 1)];
+			float		S = 0.0f;
+
+			for (qi = 0; qi < so->nfuse; qi++)
+			{
+				if (so->fuseStrat[qi] != WEAVE_STRAT_DISTANCE)
+				{
+					S += fw[qi] * (float) v[kt[qi].off];
+					continue;
+				}
+				for (t = 0; t < kt[qi].nterms; t++)
+				{
+					WeaveBm25Factors bm;
+
+					if (kt[qi].idf[t] < 0.0 || v[kt[qi].off + t] <= 0.0)
+						continue;
+					weave_bm25_factors_init(&bm, kt[qi].idf[t], 1.2, 0.75, avgdl);
+					S += fw[qi] * (float) weave_bm25_contrib(&bm, v[kt[qi].off + t],
+															 pd.qdl[i]);
+				}
+			}
+			pend[i].tid = pd.tid[i];
+			pend[i].score = -(double) S;
 		}
 
 		/*
@@ -10130,8 +10396,6 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 			weave_scan_raced_out(index, "fused", attempt + 1);
 	}
 
-	MemoryContextDelete(passctx);
-
 	if (nacc > 1)
 		qsort(acc, nacc, sizeof(ScoredTid), cmp_fuse_cand);
 
@@ -10144,6 +10408,63 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 	 */
 	if (!complete && nacc > so->fusek)
 		nacc = so->fusek;
+
+	/*
+	 * THE PENDING DOCUMENTS (doc/GAPS.md G66), merged at their own fused score,
+	 * behind a FRONTIER -- weave_vec_pass()'s rule for its pending vectors.  A
+	 * pass that pruned is the exact top-fusek of the flushed documents, so a
+	 * pending one scoring at least the k-th kept is correctly placed among them;
+	 * one scoring less could be outranked by a flushed document only a wider pass
+	 * finds, so it waits for that pass (and the TID filter below keeps an earlier
+	 * pass's emission from repeating).  A complete pass emits every one, and so
+	 * does the last rung the ladder can reach, because nothing wider is coming
+	 * and the alternative is the padding's +Infinity.
+	 *
+	 * DEDUPLICATED BY TID, keeping the better score: a pass that runs between a
+	 * flush's segment add and its list clear sees a document in both places, and
+	 * its generation check passes (weave_topk_merge_pending(), G65).
+	 */
+	if (npend > 0)
+	{
+		bool		last = complete ||
+			(double) so->fusek >= so->maxhits ||
+			so->fusek >= WEAVE_ORD_WIDTH_MAX;
+		double		frontier = (last || nacc == 0) ? (double) INFINITY
+			: acc[nacc - 1].score;
+		int			nadd = 0;
+
+		for (i = 0; i < npend; i++)
+			if (pend[i].score <= frontier)
+				pend[nadd++] = pend[i];
+		if (nadd > 0)
+		{
+			/* one entry per merged candidate: corpus-scale (make check-alloc) */
+			if (acc == NULL)
+				acc = (ScoredTid *)
+					MemoryContextAllocHuge(socxt, (Size) nadd * sizeof(ScoredTid));
+			else if (nacc + nadd > capacc)
+				acc = (ScoredTid *)
+					WEAVE_REALLOC_MAYBE_HUGE(acc, (Size) (nacc + nadd) * sizeof(ScoredTid));
+			memcpy(acc + nacc, pend, (Size) nadd * sizeof(ScoredTid));
+			nacc += nadd;
+
+			/* ScoredTid begins with its TID, so cmp_tid orders it by TID */
+			qsort(acc, nacc, sizeof(ScoredTid), cmp_tid);
+			for (i = 0, j = 0; i < nacc; i++)
+			{
+				if (j > 0 && ItemPointerEquals(&acc[j - 1].tid, &acc[i].tid))
+				{
+					if (acc[i].score < acc[j - 1].score)
+						acc[j - 1].score = acc[i].score;
+					continue;
+				}
+				acc[j++] = acc[i];
+			}
+			nacc = j;
+			qsort(acc, nacc, sizeof(ScoredTid), cmp_fuse_cand);
+		}
+	}
+	MemoryContextDelete(passctx);
 
 	/*
 	 * Rows an earlier, narrower pass already materialized are removed by TID, so a

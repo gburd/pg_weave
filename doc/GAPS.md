@@ -4404,7 +4404,7 @@ which the atomic record now guarantees rather than hopes for. What it cannot do 
 crash *between* the two old records: pg_weave's test hooks are in no shipped build. The
 record count is the structural claim that makes that window not exist.
 
-### G66 — the ranked pass ignored the pending list: `WHERE d @@@ q ORDER BY d <=> q` returned 60 of 120 matching rows when the other 60 had been UPDATEd since the last flush — **FOUND 2026-09-29 by the G56 padding test; PRE-EXISTING, and documented in code as intentional; silent wrong answer on the flagship query; FIXED 2026-09-29 for the lexical ranked route and `weave_search()`**
+### G66 — the ranked pass ignored the pending list: `WHERE d @@@ q ORDER BY d <=> q` returned 60 of 120 matching rows when the other 60 had been UPDATEd since the last flush — **FOUND 2026-09-29 by the G56 padding test; PRE-EXISTING, and documented in code as intentional; silent wrong answer on the flagship query; FIXED 2026-09-29 for the lexical ranked route and `weave_search()`; FUSED ROUTE FIXED 2026-10-04**
 
 `weave_topk_candidates_range()` carried the note: "ranked results cover the merged
 SEGMENTS only ... deferred intentionally, since pending is transient and bounded".
@@ -4445,10 +4445,89 @@ maxhits (64 of 250).
 are 7 or less, the two are identical, so no test fails if it regresses. The first cut's
 evidence is the measurement recorded above, not a test.
 
-**Still OPEN:** the fused route (`weave_fuse_pass()`) does not read the pending list
-either. Its lexical channels are segment shuttles, so a fused answer misses pending
-documents exactly as the ranked one did. The vector channel's version of the same gap is
-G29.
+**Was OPEN until 2026-10-04:** the fused route (`weave_fuse_pass()`) did not read the
+pending list either. Its lexical channels are segment shuttles, so a fused answer missed
+pending documents exactly as the ranked one did. Since G71 such a row was padded after the
+ranked rows (at +Infinity with a vector key, at 0 without), so it appeared in the wrong
+place. The vector channel's version of the same gap is G29.
+
+**Fused route fixed 2026-10-04.** `weave_fuse_collect_pending()` walks the pending list
+once per attempt, **inside the pass's generation bracket**, so a flush between the walk and
+the bolt loop makes the attempt retry. Four rules:
+- **Same objective.** Each pending document gets S = sum of `fw[key]` x channel score.
+  The lexical score is BM25 per term at the pass's own (idf, k1, b, avgdl) over the
+  quantized length, as `weave_pending_ranked()` computes it. The vector score is
+  **exact**, -||q-v||^2 or <q,v>, as `weave_vec_collect_pending()` computes it on the vector
+  route.
+- **Same candidate set.** A pending document is admitted if the gate set (`plainTids`)
+  holds it. With a vector key it must also carry a vector the flush would keep: a NULL
+  vector makes `fuse()` NULL, and G71 pads such a row. Without a vector key it must have
+  some query term, because the candidate set is the union of the scored channels.
+- **The normalizer counts them** (decided: folded in, the more correct choice). Per key:
+  a term no segment holds takes its df from the pending list, and the largest pending tf
+  enters the term's ceiling. For a vector key, the (B2) ceiling ||v||.||q|| of every
+  pending vector (in the metric's domain, exact norm) enters the maximum over the bolts.
+  If they are left out, the ceiling covers the bolts only and a pending document can exceed
+  it, so **the normalized ranking changes when a flush runs**. That is what the test pins.
+- **A frontier.** A pass that pruned (`!complete`) is the exact top-`fusek` of the flushed
+  documents. A pending document goes in only if its -S is no worse than the k-th row kept;
+  otherwise it waits for a wider pass. This mirrors `weave_vec_pass()`. A complete pass
+  emits every pending document, and so does the ladder's last rung (`fusek >= maxhits`
+  or `WEAVE_ORD_WIDTH_MAX`), because nothing wider will run. The merge deduplicates by TID
+  and keeps the better score (the flush window, G65). A pending row that was ranked is in
+  `so->ordered`, and `weave_pad_begin()` builds `padSeen` from that, so padding cannot emit
+  it again. The per-pass `so->ordered` TID filter already stopped a wider pass from
+  repeating it.
+
+**Pinned** by `sql/fuse_pushdown.sql`, in the G71 section and the three (G66) sections
+after it. Every one is checked against the heap or an exact oracle:
+- **G71's `fnv`, `fuse_normalize` off.** The oracle is `weave_search()` BM25 plus the
+  heap's exact `-(emb <-> 0)^2`. With q = 0 the lanes' quantized l2 score equals the exact
+  one, so the oracle is exact for flushed and pending rows alike. The ranked head equals
+  the oracle, pending row 401 ranks **1** (`fused_first3` is now `{401,1,201}`, where it
+  was `{1,201,2}`), and every row appears once.
+- **`fpf`, under `wand_initial_k = 1`.** 200 flushed rows plus four pending ones. The
+  first rung is 64 wide, so it prunes. 504 is the best candidate (a `beta` row the vector
+  channel reaches) and 501 the best `alpha` one: ranks 1 and 2. 502 lies between flushed
+  rows 100 and 101, beyond the first rung's frontier, and lands at **103**. 503 is the
+  worst, at **204**. The whole order equals the oracle, every row appears once, and the
+  gated `WHERE body @@@ 'alpha'` first page is `{501,1,2}`.
+- **`fpe`, all pending** (index built empty). Ordered `{A,B,C}` = oracle. This needs the
+  pending df for a term no segment holds.
+- **`fpn` (lexical) and `fpi` (vector, ip).** Flush-invariance under the normalizer: the
+  order before `weave_merge()` equals the order after, `{P,Y,X}` and `{P,X,Y}`.
+
+**Mutants.** Each was BUILT and installed before it ran, the solo-run diff was compared
+with the full-suite output, and the control diff is only the `already exists` NOTICE (run
+`pgweave-20261004-201641`):
+
+| mutant | killed by |
+|---|---|
+| pending not merged | `fused_first3` `{1,201,2}`; fnv oracle **f**, 401 at rank 34; fpf oracle **f**; both flush-invariance **f** |
+| frontier ignored | fpf oracle **f**: 502 and 503 at ranks 67 and 68, handed out by the 64-wide rung ahead of rows it had not found |
+| lexical normalizer excludes pending | `lexical_flush_invariant` **f** (`{P,X,Y}` before, `{P,Y,X}` after) |
+| vector normalizer excludes pending | `vector_flush_invariant` **f** (`{P,Y,X}` / `{P,X,Y}`) |
+| gate not applied to pending | gated first page `{504,501,1}`: the `beta` row passes `@@@ 'alpha'` |
+| G71 exclusion dropped | 402 (NULL vector) ranked 2nd and also padded; `fused_every_row` **f** |
+| no pending df | `fpe` `{B,A,C}`, oracle **f** |
+
+**Limits, recorded rather than fixed:**
+- **Two vector scales.** A pending vector is scored exactly and a flushed one in quantized
+  form, as on the vector route (G29). After a flush, a row's position can shift by the
+  quantizer's error. The tests stay exact by using q = 0, where the two coincide.
+- **The vector ceiling is approximately flush-invariant, not exactly.** The pending
+  ceiling uses the exact norm; once the vector is flushed, the bolt's uses the
+  reconstructed norm. `fpi` keeps its margin wide (the order holds for any ceiling up to
+  8.3 against a true 5) so that this difference cannot decide the test. Two scores closer
+  than the quantizer's norm error could still swap at a flush.
+- **Float summation order.** `src/am/fuse.c` sums channels in descending-ceiling order and
+  the pending sum goes in key order. Both are float, so two scores within an ulp can order
+  differently. A pending row that exactly ties a flushed one is ordered by that sum,
+  then by TID.
+- **Cost, unmeasured.** Every fused pass walks the whole pending list again: every ladder
+  rung and every race retry. It holds n x (terms + vector keys) doubles for the pass, the
+  same per-pass pattern as `weave_pending_ranked()` and `weave_vec_collect_pending()`.
+  No benchmark has measured a fused query over a large pending list.
 
 ### G67 — plain VACUUM truncated the index under concurrent INSERTs: committed rows lost, then every extension failed "unexpected data beyond EOF" — **FOUND 2026-09-29 by t/025 on PG18; PRE-EXISTING; P0 silent row loss on ordinary INSERT + VACUUM; FIXED 2026-09-29**
 
@@ -4585,7 +4664,7 @@ index=2098 against heap=1593.
   has not been audited for the same window.
 - **G65** remains open for the crash case. G70 is its visible symptom without a crash.
 
-### G71 — a fused `<->`/`<#>` pushdown ranks rows with a NULL vector FIRST: `fuse(...)` is NULL for them, and the index treats a missing channel as contributing 0 — **FOUND 2026-10-01 while designing F9; silent wrong answer in a shipped plan; OPEN**
+### G71 — a fused `<->`/`<#>` pushdown ranks rows with a NULL vector FIRST: `fuse(...)` is NULL for them, and the index treats a missing channel as contributing 0 — **FOUND 2026-10-01 while designing F9; silent wrong answer in a shipped plan; FIXED 2026-10-01 (`3d8dddc`); pending rows ranked since G66's fused fix, 2026-10-04**
 
 `fuse()` is NULL when any argument is NULL (`weave_fuse()`, `src/am/fusepath.c`; asserted
 by `sql/fuse_fallback.sql`), and ascending ORDER BY puts NULLs last. The fused core uses a
@@ -4652,6 +4731,10 @@ Row 301 (NULL document) is missing for the second reason alone. Until this is fi
 **Not fixed here, and recorded where it already was:** the fused shuttles do not read
 pending documents (G66's open note). Row 401, pending with a vector, therefore pads at
 +Infinity instead of being ranked at its real position.
+**SUPERSEDED 2026-10-04 by G66's fused fix:** row 401 is now RANKED, first (`fused_first3`
+is `{401,1,201}`), at the position an exact oracle gives. Pending row 402 has a NULL vector
+and is still padded at NULL, as G71 requires. The mutant that drops that exclusion ranks it
+and pads it, so it appears twice.
 
 ### G72 — VACUUM's tombstone swap and its corpus-`ndocs` refresh were two WAL records, so a crash or ERROR between them left BM25's N counting deleted rows; and pages a crash strands between write and link are reclaimed only by REINDEX — **FOUND 2026-10-04 by an audit of every metapage writer, prompted by G65; PRE-EXISTING; the two-record window FIXED 2026-10-04; the leak class OPEN**
 
