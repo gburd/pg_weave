@@ -791,7 +791,7 @@ same rows), so the top-k comparison is exact rather than §7a (1)'s approximatio
 matching the gate with a NULL vector come after every ranked row (G71). The `<@>`-in-
 `fuse()` spelling plans as a Sort with no `<~>` key and returns the heap's rows.
 **Mutation-tested**: with the fused pass's gate shuttle removed (`weave_fuse_pass()` in
-`src/am/amscan.c`), the file goes red; `doc/PHASES.md` F9 has the run.
+`src/am/amscan.c`), the file goes red, returning 61-62 rows for an 18-46-row answer; with `<@>` made servable, the plan becomes a fused Index Scan. Both mutants BUILT first (run `pgweave-20261004-205010`).
 
 **The limit, recorded as a loss (hard rule 8):** a user who wants a closer spelling to
 *score higher inside* a fused ranking has no fused plan for it. They get either a filter
