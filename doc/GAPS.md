@@ -4652,3 +4652,130 @@ Row 301 (NULL document) is missing for the second reason alone. Until this is fi
 **Not fixed here, and recorded where it already was:** the fused shuttles do not read
 pending documents (G66's open note). Row 401, pending with a vector, therefore pads at
 +Infinity instead of being ranked at its real position.
+
+### G72 — VACUUM's tombstone swap and its corpus-`ndocs` refresh were two WAL records, so a crash or ERROR between them left BM25's N counting deleted rows; and pages a crash strands between write and link are reclaimed only by REINDEX — **FOUND 2026-10-04 by an audit of every metapage writer, prompted by G65; PRE-EXISTING; the two-record window FIXED 2026-10-04; the leak class OPEN**
+
+G65 was one operation written as two GenericXLog records, with recovery able to land
+between them. This entry is the audit that asked where else that happens. It covers every
+record that writes the metapage (block 0) and every multi-record operation that has to
+keep the metapage consistent with pages it names.
+
+**The metapage writers.** There are ten GenericXLog records in seven functions. "Dependent
+record" means a later record the operation needs before the metapage is consistent again.
+
+| # | site | what the record writes | crash or ERROR before the dependent record | verdict |
+|---|---|---|---|---|
+| 1 | `weave_init_metapage()`, `src/am/am.c:1763` | block 0, `FULL_IMAGE`: a fresh metapage | runs inside `ambuild`/`ambuildempty`; an incomplete build is never a valid index | SAFE |
+| 2 | `weave_meta_add_segment()`, `am.c:3508` | `segs[n]`, `nsegments`, `generation`, `ndocs += seg.ndocs`, `sumdoclen += seg.sumdoclen` | the segment's pages are written *before* this record (write-before-link). A crash before it leaves them unreachable; see the leak class below | SAFE for the metapage; LEAK |
+| 3 | `weave_merge_selected()` commit, `src/am/ambuild.c:4366` | replaces the inputs with the output, bumps `generation`; corpus totals unchanged (same live docs) | output written before the commit (LEAK if a crash comes first); inputs freed **after** it by `weave_free_segment()`, one record per page (free-after-unlink, LEAK if interrupted) | SAFE; LEAK both sides |
+| 4 | `weave_merge_all_parallel()` commit, `ambuild.c:4692` | the same for W groups in one record | the same; an abandoned group leaks its output by design (comment at the site) | SAFE; LEAK |
+| 5–7 | `weave_insert()` pending append, `ambuild.c:6251` (tail), `6303` (new page linked from old tail), `6314` (first page) | the item, the `pendingtail`/`pendinghead` link and `ndocs += 1`, `sumdoclen += doclen`, `npending += 1`, all in one record with the data page(s) | no dependent record: one record is the whole operation | SAFE |
+| 8 | `weave_flush_add_and_cut()`, `ambuild.c:6402` | segment add and pending-head move, in one record with the cut page (G65's fix) | folded pending pages freed **after** it, one record each | SAFE; LEAK (free-after-unlink) |
+| 9 | `weave_bulkdelete()` per-segment swap, `src/am/amvacuum.c:1194` | `segs[s].livedocs`, `livedocslen`, `ndeleted`, `generation` | **record 10** recomputes `ndocs` from the `ndeleted` this record wrote | **UNSAFE (below)**; the new tombstone blob is written before it and the old one freed after it, so LEAK both sides |
+| 10 | `weave_bulkdelete()` final refresh, `amvacuum.c:1226` (only when `tuples_removed > 0`) | `ndocs = Σ(segs[i].ndocs − segs[i].ndeleted) + npending` | — | the record #9 depends on |
+
+The audit's predecessor counted "nine sites" by treating the three insert records as one
+site. The table lists each record.
+
+**UNSAFE: records 9 and 10.** Record 9 commits segment `s`'s new tombstone count. `ndocs`,
+which is BM25's corpus N and the denominator of avgdl, is corrected only by record 10,
+after every segment. An ERROR between them (OOM in the next segment's tombstone set, a
+corrupt page in its dictionary, a cancel) or a crash leaves the committed `ndeleted`
+already subtracted out of the live count, but `ndocs` still counting those rows.
+
+Whether the next VACUUM repairs it depends on where the interruption landed, and the worst
+case is the common one.
+
+- *Before the last segment's swap:* the next VACUUM finds the later segments' dead rows
+  still untombstoned, so `tuples_removed > 0`, so record 10 runs and recomputes `ndocs`
+  from every segment. Self-healing.
+- *After the last segment's swap* (a single-segment index, which is what CREATE INDEX
+  leaves by default, has only this case): every heap item the next VACUUM is shown is
+  already carried in a tombstone set, so `tuples_removed` stays 0 and record 10 does not
+  run. `ndocs` stays high until a VACUUM tombstones a newly dead row. On a table that
+  takes one large DELETE and is then append-only, that never happens, and every BM25 score
+  uses an N inflated by the deleted rows.
+
+Impact: wrong IDF and avgdl, so ranking is skewed but match sets are unaffected.
+`weave_index_stats()` reports the wrong `ndocs`. Never observed in the field.
+
+**Fixed 2026-10-04: record 9 now writes `ndocs` itself.** Under the lock of the swap, it
+recomputes `m->ndocs = Σ(segs[i].ndocs − segs[i].ndeleted) + npending` over the directory
+it has just updated. Record 10 is deleted. Why each record is now self-consistent:
+
+- The formula is the one record 10 used, evaluated over the very bytes this record
+  writes, under the metapage's exclusive buffer lock. No other writer can interleave, so
+  after replay of *any prefix* of a VACUUM's records, `ndocs` agrees with the directory
+  those records left.
+- Every other term in the sum is unchanged by this record. Other segments' `ndeleted` are
+  committed (by an earlier swap, or by an earlier VACUUM). `npending` changes only in
+  records 5–8, each of which adjusts `ndocs` by the same amount in the same record.
+- It runs on every swap, not only when this pass tombstoned something. A swap that adds
+  nothing writes the value the formula already had, and an index damaged by the old
+  window is repaired by its next VACUUM.
+
+**Pinned by `t/030_bulkdelete_atomic.pl`.** It uses point-in-time recovery to stop
+*after each* VACUUM record that touches the metapage, and checks
+`ndocs + ndeleted == C` at every stop (C is constant across a VACUUM that does not merge;
+the test keeps the cleanup from merging). **Both arms were run on 2026-10-04**; the
+results are at the end of this entry, and the control printed exactly what had been
+predicted (4 records; 2800 / 2830 / 2860; sticky 2600 vs 2340).
+
+**Two adjacent defects, found while reading, NOT fixed here.**
+
+- `sumdoclen` is never decreased. Inserts and segment adds increase it, merges carry it
+  unchanged, and bulkdelete does not touch it. After deletes, avgdl = `sumdoclen / ndocs`
+  counts deleted documents' lengths over a live-only N, so it is biased upward. This has
+  nothing to do with crashes. Fixing it needs each segment's dead length, which the
+  tombstone pass does not compute.
+- The build counts only `tupleIsAlive` rows in `seg.ndocs` (`ambuild.c:1017`) but indexes
+  recently-dead ones, and bulkdelete then tombstones them and subtracts them in `ndeleted`
+  as well. So `Σ(ndocs − ndeleted)` under-counts by the recently-dead rows present at
+  build time. That is rare (it needs a pinned horizon during CREATE INDEX), and the result
+  is off by that count until a merge rewrites the segment.
+
+**OPEN: the leak class.** Every multi-page structure is written *before* the record that
+links it (a segment, a merge output, a tombstone blob). Every replaced structure is
+freed *after* the record that unlinks it (merge inputs, folded pending pages, the old
+tombstone blob). Freeing is one record per page (`weave_free_page()`, `am.c:3670`). A crash, or
+an ERROR such as autovacuum's lock-conflict cancel hitting the merge's per-term
+`CHECK_FOR_INTERRUPTS()` (`ambuild.c:3647`), strands those pages. They are unreachable
+from the metapage and **not** flagged `WEAVE_FREED`, so they never enter the FSM.
+`weave_check(deep)`'s `pages_reachable_or_freed` reports them. **Nothing reclaims them
+except REINDEX:** VACUUM's truncation and compaction (`amvacuum.c:283`,
+`weave_vacuum_compact()`) treat an unflagged page as live, and merge frees only its own
+inputs.
+
+The cost per event is bounded by the operation that was interrupted:
+
+- an interrupted merge leaks its partial output, up to the size of the merged segments
+  (a full `weave_merge()` of a large index can leak an index-sized chain);
+- a crash after a merge commit leaks the inputs not yet freed, up to the same size;
+- a flush or swap leaks pending pages or one tombstone blob.
+
+None of this causes a wrong answer or affects the WAL. The cost is disk space and a
+`weave_check` failure.
+
+Not fixed now, because the reclaim is not a contained change. VACUUM would have to walk
+every reachable page and free the rest. That is the same walk as
+`wvck_mark_reachable()`, but now a bug in it frees live pages: data loss where amcheck's
+version only produces a false report. And under plain VACUUM's
+`ShareUpdateExclusiveLock` the walk races with a writer that holds neither the maintenance
+lock nor anything VACUUM conflicts with. An oversized INSERT
+(`weave_insert_oversized_as_segment()`) writes its segment's pages before it links them,
+so a concurrent walk would see them as unreachable and free them. A sound version would
+run only under `AccessExclusiveLock` (`weave_vacuum()`), and would need a mutation-tested
+proof that the walk names every page kind the free paths name. **Until then: REINDEX
+reclaims, and `weave_check(deep)` is how to tell that one is due.**
+
+**RUN 2026-10-04, both arms on EC2 Debian 13 (c7i.2xlarge, PG 17.11).**
+- **Fix** (`6c6a09e`, run `pgweave-20261004-200656`): full `make installcheck`
+  `Result: PASS`, 30 TAP files. t/030 passed 14 of 14: `ONE METAPAGE RECORD PER SEGMENT
+  (got 3)`; the three recovery points have ndocs/ndeleted of 2400/200, 2370/230 and
+  2340/260, so `ndocs + ndeleted = 2600` at each; `STICKY: ... (2340 vs 2340)`.
+- **Positive control** (pre-fix `amvacuum.c`, run `pgweave-20261004-200847`): t/030
+  FAILED 5 of 16, and it is the only red file (t/029: 7 ok, 0 not ok). `got 4`
+  metapage records; points 1-3 have `ndocs = 2600` with `ndeleted` 200/230/260, so
+  `ndocs + ndeleted` = 2800/2830/2860; point 4 (the separate refresh) is consistent;
+  `STICKY ... (2600 vs 2340)`. That is exactly the predicted failure, so the test
+  measures the window.
