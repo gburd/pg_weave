@@ -783,6 +783,18 @@ core change. If it ever lands, `SELECT fuse(...) ... ORDER BY fuse(...)` becomes
 intended surface and this SRF is optional. The build assumes it will not land
 (maintainer direction 2026-10-01).
 
+**`ctid` is the row's LIVE ctid, unlike `weave_search()`'s.** The SRF reads it from the
+heap fetch, so a HOT-updated row comes back where `SELECT ctid` finds it.
+`weave_search()` returns the index's HOT-chain root TID, so `JOIN t ON t.ctid = s.ctid`
+silently drops HOT-updated rows. `sql/fusesearch.sql`'s first oracle lost row 3's
+lexical score exactly that way (EC2 run `pgweave-20261004-214115`), and the test now maps
+root TIDs to rows through ctids taken before the update.
+
+**Visibility has two layers, and only the SRF's is observable.** The fused pass's
+`weave_ord_probe()` drops dead candidates, and `index_getnext_slot()` drops them again. A
+mutant that disables only the first survives (equivalent). A mutant that disables only the
+second (`index_getnext_tid()`) is caught, by the HOT row.
+
 Two limits, both recorded in `doc/PHASES.md` F3:
 
 - **`parts` is always NULL.** The per-channel breakdown is owed.
