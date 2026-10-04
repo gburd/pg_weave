@@ -748,8 +748,56 @@ that can be arbitrarily negative. Three consequences for a pushdown that must ag
 - **(c) Leave `<@>` unfused.** The fallback is already correct for small result
   sets, and the plan refuses the pushdown today (`req->servable = false`).
 
-Until one is chosen F9 stays open, and `fusepath.c`'s refusal stands: correct, and
-slower than a pushdown would be.
+~~Until one is chosen F9 stays open, and `fusepath.c`'s refusal stands: correct, and
+slower than a pushdown would be.~~ **SUPERSEDED 2026-10-04: one was chosen. See below.**
+
+### 7d-decision. (b) was chosen — maintainer, 2026-10-04
+
+**Fuzzy matching joins a fused ranking as a GATE, a `WHERE` restriction, and not as a
+scored channel inside `fuse()`.** Options (a) and (c) are not taken; (c)'s refusal
+survives only as the *consequence* of (b) for the one spelling (b) does not serve.
+
+What that means for a user, stated so it can be copied into a reference:
+
+- **Fuzziness filters; it does not rank.** `WHERE body @@@ 'protien~2'` admits every
+  document with a term within two edits of `protien`, and `ORDER BY fuse(...)` then
+  ranks the admitted documents by the channels inside `fuse()` alone. A document
+  spelling it `protien` exactly and one spelling it `protean` are admitted equally;
+  neither outranks the other for being closer. This is one fused Index Scan, with the
+  fuzzy term as `Index Cond` beside any docvalues predicate, and it is the same for a
+  prefix (`'prot*'`) and a regex (`'/^prot[a-z]*n$/'`) gate, which the same `@@@`
+  grammar carries.
+- **To rank by spelling closeness, do it without fusion:** `ORDER BY body <@> 'protien'`
+  on its own is an ordering Index Scan (task Z9), nearest spelling first.
+- **`fuse(..., body <@> p)` still runs, and is not fused.** `src/am/fusepath.c` refuses
+  the `<@>` channel (`req->servable = false`, with a comment pointing here), so the
+  planner keeps the Sort over the executable fallback, whose arithmetic is correct
+  (`weave_edistscore(d) = -d`, G41) and whose cost is a full evaluation of the match
+  set. That is the price of writing the spelling (b) does not serve, and it is a
+  correct answer, not an error.
+
+**Why (b) and not (a), in one sentence:** (a) needs a widening-threshold ladder and a
+catalog change to `weave_edistscore`, so that the pushdown and the fallback share one
+objective, and the use case most hybrid-search users mean by "fuzzy match plus
+relevance" is a filter, which (b) serves with no code.
+
+**Evidence** (`sql/fuse_gate.sql`, in the regression suite): for `~1`, `~2`, prefix,
+regex, `~1`/`~2` beside `price < 2`, and a fuzzy gate matching nothing, each at a LIMIT
+inside the match set and one beyond the table, the plan is one Index Scan with the gate
+as `Index Cond` and the `<~>` transport key in `Order By`, no Sort and no Filter; every
+row is returned once, inside the gate, and the set equals a Seq Scan + Sort of the same
+query. The corpus is built so the two arms agree on *order* (both channels prefer the
+same rows), so the top-k comparison is exact rather than §7a (1)'s approximation. Rows
+matching the gate with a NULL vector come after every ranked row (G71). The `<@>`-in-
+`fuse()` spelling plans as a Sort with no `<~>` key and returns the heap's rows.
+**Mutation-tested**: with the fused pass's gate shuttle removed (`weave_fuse_pass()` in
+`src/am/amscan.c`), the file goes red; `doc/PHASES.md` F9 has the run.
+
+**The limit, recorded as a loss (hard rule 8):** a user who wants a closer spelling to
+*score higher inside* a fused ranking has no fused plan for it. They get either a filter
+(fused, fast) or a Sort over `fuse(..., body <@> p)` (correct, O(match set)). If that use
+case turns up, option (a) above is the design, and `bench/RESULTS_F9_FANOUT.md` bounds
+its merge cost.
 
 ## 8. What must be benchmarked before this is called a win
 
