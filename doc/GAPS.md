@@ -4912,7 +4912,11 @@ unreachable unflagged page with its kind, flags, nextblk and LSN. A recurrence w
 the write path.
 
 **Hunted, 2026-10-04:** t/029 alone, 40 runs, 0 failures (`pgweave-20261004-222827-e5b4`);
-the full TAP sequence, 8 runs (see below for the result).
+the full TAP sequence, 8 runs, 0 failures (`pgweave-20261004-224037-52a8`); and a
+direct probe of the leak hypothesis, 20 trials of the exact shape (12 pending pages, VACUUM
+flush, immediate stop, deep check), 0 orphaned pages and 0 violations
+(`pgweave-20261004-224958-f801`). So 68 attempts at a 1-in-1 rate; the 95 % upper bound on
+the per-run rate is now about 4 %.
 
 **The leading hypothesis is a leak, not double counting.** G72 recorded the leak class:
 pages freed after an operation's last record, or written before being linked. The flush's
@@ -4922,4 +4926,10 @@ that are unreachable and not flagged freed, which is exactly what
 `pages_reachable_or_freed` reports. A VACUUM issues no XLogFlush unless the transaction
 has an XID, so the free records may simply not be on disk at the stop. If so, this is not a
 new defect but G72's leak class, observed: harmless to answers, reclaimable only by REINDEX.
-The diagnostic above will confirm or refute it.
+The diagnostic above will confirm or refute it. The probe weakens it: if every
+immediate stop after a flush lost the trailing free records, 20 of 20 trials would have
+leaked, and none did. The free records are on disk by the stop, which is what an
+`fsync = off` cluster with a clean-exit `pg_ctl stop -m immediate` would be expected to
+show. So the one failure is either a rarer interleaving or something else entirely.
+**Disposition, G21's: not hunted further until it recurs**, and when it does, the test now
+prints what failed.
