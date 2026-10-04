@@ -47,6 +47,9 @@ DELETE FROM fs WHERE id IN (7, 12);
 -- 3 is HOT-updated: the index keeps the chain ROOT's TID, and the row's ctid is
 -- now the new tuple's.  The SRF must return the latter (the heap fetch resolves the
 -- chain), which is what `ORDER BY ... ctid` returns.
+-- weave_search(), the oracle's lexical half, reports the ROOT TID too, so the
+-- oracle maps it to a row through the ctids taken before the update.
+CREATE TEMP TABLE fs_root AS SELECT ctid AS rowtid, id FROM fs;
 BEGIN;
 UPDATE fs SET id = 3 WHERE id = 3;
 SELECT pg_stat_get_xact_tuples_hot_updated('fs'::regclass) AS hot_updates;
@@ -96,7 +99,9 @@ CREATE TEMP TABLE fs_orc AS
          COALESCE(s.score, 0::float8)
          - (f.emb <-> '[0,0,0,0]'::wvec)::float8 ^ 2 AS score1
     FROM fs f
-    LEFT JOIN weave_search('fs_weave', 'alpha'::wquery, 1000) s ON s.ctid = f.ctid
+    LEFT JOIN (SELECT r.id, w.score
+                 FROM weave_search('fs_weave', 'alpha'::wquery, 1000) w
+                 JOIN fs_root r ON r.rowtid = w.ctid) s ON s.id = f.id
    WHERE f.body IS NOT NULL AND f.emb IS NOT NULL;
 
 -- Tie-freeness first: a tie would make "the" order ambiguous however the scan behaves.
@@ -197,5 +202,5 @@ SELECT * FROM weave_fuse_search('fs_weave', ARRAY['alpha'::wquery],
                                 ARRAY['[0,0,0,0]'::wvec], '{1,1,1}');
 SELECT * FROM weave_fuse_search('fs_weave', ARRAY['alpha'::wquery, NULL]);
 
-DROP TABLE fs_ord, fs_ord1, fs_srf, fs_srf1, fs_orc, fs_ordn, fs_ordl, fs_srfn, fs_srfl, fs_dead;
+DROP TABLE fs_ord, fs_ord1, fs_srf, fs_srf1, fs_orc, fs_ordn, fs_ordl, fs_srfn, fs_srfl, fs_dead, fs_root;
 DROP TABLE fs;
