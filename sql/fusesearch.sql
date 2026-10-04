@@ -44,6 +44,13 @@ CREATE INDEX fs_weave ON fs USING weave (body, emb);
 INSERT INTO fs VALUES (401, to_wdoc('simple', 'alpha alpha pendingrow'), '[0.25,0,0,0]');
 CREATE TEMP TABLE fs_dead AS SELECT ctid AS rowtid FROM fs WHERE id IN (7, 12);
 DELETE FROM fs WHERE id IN (7, 12);
+-- 3 is HOT-updated: the index keeps the chain ROOT's TID, and the row's ctid is
+-- now the new tuple's.  The SRF must return the latter (the heap fetch resolves the
+-- chain), which is what `ORDER BY ... ctid` returns.
+BEGIN;
+UPDATE fs SET id = 3 WHERE id = 3;
+SELECT pg_stat_get_xact_tuples_hot_updated('fs'::regclass) AS hot_updates;
+COMMIT;
 ANALYZE fs;
 
 -- The arm the SRF is compared against IS the fused index path.
@@ -109,7 +116,9 @@ SELECT (SELECT count(*) FROM fs_srf s JOIN fs f ON f.ctid = s.rowtid
          WHERE f.id IN (101, 301)) AS null_fused_rows_returned,
        (SELECT count(*) FROM fs_srf s JOIN fs_dead d USING (rowtid)) AS dead_rows_returned,
        (SELECT count(*) FROM fs_srf s JOIN fs f ON f.ctid = s.rowtid
-         WHERE f.id = 401) AS pending_row_returned;
+         WHERE f.id = 401) AS pending_row_returned,
+       (SELECT count(*) FROM fs_srf s JOIN fs f ON f.ctid = s.rowtid
+         WHERE f.id = 3) AS hot_row_returned_at_its_live_ctid;
 
 -- ORDER: the SRF's rows are the index path's head, in its order.
 SELECT (SELECT array_agg(rowtid ORDER BY rn) FROM fs_srf)
