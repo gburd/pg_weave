@@ -56,7 +56,7 @@
 #   PREP=beir  DB=<db fuse.sh loaded with FUSE_LOAD_ONLY=1>   bench/v17_crossover.sh
 #   PREP=synth DB=<new db> N=1000000 DIM=384                  bench/v17_crossover.sh
 #   PREP=none  DB=<db already prepared by this script>        bench/v17_crossover.sh
-# env: LATN=25 (queries) REPS=6 K=10 W='{0.5,0.5}' OUT=/tmp/out TAG=<db>
+# env: LATN=25 (queries) REPS=6 K=10 W='{0.5,0.5}' OUT=/tmp/out TAG=<db> MATNONE=1
 #
 # Copyright (c) 2025-2026, Gregory Burd
 
@@ -72,6 +72,11 @@ K=${K:-10}
 W=${W:-'{0.5,0.5}'}
 OUT=${OUT:-/tmp/out}
 TAG=${TAG:-$DB}
+# MATNONE=0 skips TIMING the three materializing arms at the no-predicate point (they
+# are still correctness-checked there).  At 1M rows each of them scores the whole
+# corpus per run -- seconds per statement, ~half an hour per arm at the protocol's
+# rep count -- to measure a regime no switch would ever choose.
+MATNONE=${MATNONE:-1}
 
 W1=$(printf '%s' "$W" | tr -d '{}' | cut -d, -f1)
 W2=$(printf '%s' "$W" | tr -d '{}' | cut -d, -f2)
@@ -325,6 +330,7 @@ while IFS=$'\t' read -r qid wq qv nd adl dfs; do
             [ "$kind" = kind ] && continue
     [ "$pred" = - ] && pred=
             for arm in $ARMS; do
+                [ "$kind" = none ] && [ "$arm" != A ] && [ "$MATNONE" = 0 ] && continue
                 med=$( { echo "$SETUP $(arm_gucs "$arm" "$pred")"
                          for _ in $(seq 1 "$REPS"); do
                              echo "EXPLAIN (ANALYZE, TIMING OFF, SUMMARY ON)"
