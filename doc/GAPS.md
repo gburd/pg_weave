@@ -3177,7 +3177,7 @@ silently; the first evidence was a 404 on a paid instance. A harness that downlo
 anything should fetch the smallest file first and fail fast, which is what happened here
 by luck of ordering rather than design.
 
-### G46 — `bench/fuse.sh`'s exhaustive oracle cannot express the shipping objective, so the correctness gate runs with `pg_weave.fuse_normalize = off` — **OPEN 2026-09-22**
+### G46 — `bench/fuse.sh`'s exhaustive oracle cannot express the shipping objective, so the correctness gate runs with `pg_weave.fuse_normalize = off` — **OPEN 2026-09-22, CLOSED 2026-10-04**
 
 The gate compares the fused pushdown against `0.5*lex + 0.5*vec` computed from
 `weave_search()` and `weave_vec_scan()`. Since 2026-09-22 the shipping scorer divides each
@@ -3210,6 +3210,60 @@ per-key normalizer directly as an accessor so the oracle divides by the same con
 scan does. The second is less surface and more coupling: it makes the oracle agree with the
 scan **by construction**, which is exactly what an oracle must not do if the constant itself
 can be wrong. Prefer max tf, and let the oracle recompute the normalizer from it.
+
+**CLOSED 2026-10-04 (branch `wt/g46`).** The paragraphs above are the 2026-09-22 state, left
+as written. Two steps closed it, the first of which landed before this entry was updated:
+
+1. **`681f9c4` (2026-09-22)** shipped the max-tf form of the fix recommended above,
+   `weave_index_max_tf()` (0.20.0), and switched `bench/fuse.sh`'s oracle to the normalized
+   objective, with N_L recomputed in SQL from df, max tf and ndocs. That left four gaps:
+   the raw check was **dropped** rather than kept alongside; N_V still came from
+   `weave_vec_scan_stats().maxscore`, which is **produced by the scan's own fold**
+   (`weave_vec_scan_maxscore()`, `src/vector/vecscan.c`), so a wrong fold moved the oracle
+   with the scan; the tie test was exact float equality; and **nothing in installcheck**
+   checked the normalized objective.
+2. **`wt/g46`** closes those gaps without adding SQL objects or bumping the version:
+   - **`sql/fuse_pushdown.sql` (2c)** pins the normalized objective on an ip fixture
+     **where it and the raw one pick different top-5s** (normalized {6..10}, raw {1..5}).
+     Both ceilings are recomputed in SQL, N_V from `weave_vec_blocks().maxrecnorm` × ‖q‖
+     and cross-checked against the shuttle's fold. The cut is a tolerance, and the
+     section asserts on the oracle that each wrong ceiling (M1–M3 below) picks a
+     different top 5, so the fixture's power to catch them is itself pinned.
+   - **(2b) was comparing a normalized scan against a raw oracle.** Its "exact oracle"
+     sums `0.5*lex + 0.5*vec` while the pushdown it compared ran with `fuse_normalize`
+     at its default (on). It passed only because that L2 fixture is vector-dominated
+     under both objectives. **(2b) now runs with `fuse_normalize = off`** and checks the
+     raw objective; (2c) checks the normalized one.
+   - **`bench/fuse.sh`'s gate** checks **both** objectives on every query. N_V is
+     recomputed from `maxrecnorm` × ‖q‖, and the stats number is now a cross-check.
+     Both keys' N are also read off the scan itself (the `fuse_check_bounds` NOTICE prints
+     w = w_key / N_key), the NOTICE is required to fire, and the cut must clear a tolerance
+     (`FUSE_TIE_TOL`, 1e-5 of the top |score|) or the query is counted as **tied**, which is
+     neither a pass nor a fail.
+
+**Mutation evidence**, EC2 run `pgweave-20261004-223426` (c7i.2xlarge, PG17; the smoke step
+before it, the full installcheck with all 30 TAP files, was `Result: PASS`). Each mutant was
+confirmed BUILT and installed: `pg_weave.so` md5 differs from the baseline, and the site
+matched exactly once. The gate figures are scifact, `--embed hash`, 30 queries,
+`FUSE_GATE_ONLY=1`:
+
+| arm | mutation | installcheck (2c) | new gate (normalized) | N_key NOTICE | old gate |
+|---|---|---|---|---|---|
+| baseline | none | matches expected | 0 / 30 mismatched, 0 tied; raw 0 / 30 | 0 disagree | passes |
+| control | `GATE_PRE` = `fuse_normalize = off` | — | **30 / 30** mismatched | 60 disagree | — |
+| M1 | lexical keynorm ×2 (`amscan.c`) | **caught**: pushdown {11..15} | **29 / 30** | 30 | — |
+| M2 | `weave_vec_scan_maxscore` ip ×1.5 (`vecscan.c`) | **caught**: fold cross-check `f`, pushdown {1..5} | **21 / 30**, vector ceiling vs stats 30 | 60 | **PASSES: blind** |
+| M3 | vector keynorm ×2 (`amscan.c`) | **caught**: pushdown {1..5} | **25 / 30** | 30 | — |
+
+**M2 is the one that justifies step 2.** It corrupts the shared fold, so the scan and
+`weave_vec_scan_stats()` move together. The 681f9c4 gate, run on the same build against the
+same 30 queries, **passed with 0 mismatches**. The raw arm shows 0 mismatches under every
+mutant, which is correct, because N_key is unused when the normalizer is off. It also means
+the raw arm alone could never have caught any of the three.
+
+**Limits.** The mutation gate figures come from a hash-embedded corpus, which is enough to
+show the gate can fail but says nothing about quality. Installcheck (2c) ran on PG17 only.
+The corpus-scale numbers are in `bench/RESULTS_FUSE.md` "Fifth measurement".
 
 
 ### G47 — with a vector weft, `weave_vacuum_compact()` has no fixed point: every other VACUUM rewrites the live segment, extends the relation, truncates nothing, and achieves no net change — **OPEN 2026-09-24**
