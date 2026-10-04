@@ -874,7 +874,7 @@ verified, no orphaned volumes, keys or security groups.
 
 | row | gate | scifact | nfcorpus | fiqa | before the normalizer | |
 |---|---|---|---|---|---|---|
-| recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | — | **PASS** (raw objective only — G46) |
+| recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | — | **PASS** (raw objective only — G46; **CORRECTED 2026-10-04:** both objectives, `bench/RESULTS_FUSE.md` "Sixth measurement", G46 closed) |
 | nDCG@10 | ≥ RRF | 1.053× | 1.010× | 1.114× | 0.982× / 0.924× / 0.687× | **MET** |
 | p99 latency | ≤ 0.70× | 0.710× | 0.612× | **1.000×** | 0.609× / 0.560× / 0.633× | **FAIL on two of three — WAS PASS** |
 | p50 latency | ≤ 0.50× | 0.710× | 0.827× | **1.172×** | 0.582× / 0.795× / 0.578× | **FAIL**, fiqa slower than the control |

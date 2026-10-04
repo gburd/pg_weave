@@ -250,11 +250,19 @@ SELECT id FROM fp
          Order By: ((body <=> '''alpha'''::wquery) AND (emb <-> '[1,0,0,1]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
 (3 rows)
 
+-- RUN WITH THE NORMALIZER OFF, because the oracle below computes the RAW sum
+-- 0.5 * lex + 0.5 * vec.  Until 2026-10-04 this ran with fuse_normalize at its
+-- default (on) and therefore compared a normalized scan against a raw oracle; it
+-- passed only because this L2 fixture's vector term dominates under both objectives
+-- (doc/GAPS.md G46).  The raw objective is what this arm checks; the NORMALIZED
+-- objective is pinned by section (2c), on a fixture where the two disagree.
+SET pg_weave.fuse_normalize = off;
 CREATE TEMP TABLE pv_pushdown AS
 SELECT id FROM fp
  ORDER BY fuse(body <=> 'alpha'::wquery,
                emb <-> '[1,0,0,1]'::wvec,
                weights => '{0.5,0.5}') LIMIT 10;
+RESET pg_weave.fuse_normalize;
 RESET enable_seqscan;
 -- THE EXACT ORACLE, one call per channel at k = 40 (every document).  Each SRF
 -- enters the scan machinery directly and reports the INDEX's own per-channel score:
@@ -326,6 +334,175 @@ SELECT id FROM fp_ip
 (3 rows)
 
 RESET enable_seqscan;
+-- ---------------------------------------------------------------------------
+-- (2c) THE NORMALIZED OBJECTIVE, on a fixture where it and the raw one DISAGREE.
+-- doc/GAPS.md G46.
+--
+-- pg_weave.fuse_normalize (default on) divides each fuse() key's weight by that
+-- key's pre-scan ceiling N_key (src/am/amscan.c, "w_key / N_key").  Section (2b)
+-- checks the raw sum, so until this section nothing in installcheck checked the
+-- objective that ships.  The oracle recomputes both ceilings HERE, in SQL, from
+-- statistics the index publishes, rather than asking the scan for them:
+--
+--   lexical  N_L = sum over terms of idf(df, ndocs) * mtf * (k1+1) / (mtf + k1*(1-b)),
+--            k1 = 1.2, b = 0.75 -- weave_bm25_term_bound() at the max tf;
+--   vector   N_V = max over blocks of maxrecnorm * ||q||  (ip; bound (B2)).
+--
+-- N_V is also cross-checked against weave_vec_scan_stats().maxscore, which is the
+-- shuttle's own fold (weave_vec_scan_maxscore()).  The SQL recompute is the
+-- independent half: a defect in that shared fold moves both the scan and the stats
+-- function, and only the recompute notices.
+--
+-- THE FIXTURE.  ip, q = [1.5,0,0,0], every document four tokens, every vector on the
+-- first axis (an axis vector's 4-bit code reconstructs it up to a common scale, so
+-- the quantized inner product is ordered as the true one).  With equal weights the
+-- ranking depends only on the RATIO of the two ceilings, and the four groups are
+-- placed so that each plausible wrong ratio picks a different top 5:
+--
+--   ids  1-5   'alpha alpha alpha one'   x = 0.2      lexically best
+--   ids  6-10  'alpha two three four'    x = 0.6      the balanced group
+--   ids 11-15  'beta two three four'     x = 1.0      vector best, no 'alpha'
+--   ids 16-40  'gamma two three four'    x = 0.01     filler, so 'alpha' has a real idf
+--
+--   normalized          -> 6-10
+--   raw (normalize off) -> 1-5    (BM25 near 2.7 swamps an inner product near 1.5)
+--   N_L doubled         -> 11-15
+--   N_V x 1.5 or x 2    -> 1-5
+--
+-- The last three are computed below from the same oracle as a property of the
+-- FIXTURE: if a future change to the corpus or the codec collapsed them onto the
+-- correct answer, this section would stop being able to see a wrong ceiling, and it
+-- says so rather than passing.
+-- ---------------------------------------------------------------------------
+CREATE TABLE fpc (id int, body wdoc, emb wvec(4));
+INSERT INTO fpc
+SELECT g,
+       to_wdoc('simple', CASE WHEN g <= 5  THEN 'alpha alpha alpha one'
+                              WHEN g <= 10 THEN 'alpha two three four'
+                              WHEN g <= 15 THEN 'beta two three four'
+                              ELSE 'gamma two three four' END),
+       ('[' || CASE WHEN g <= 5  THEN 0.2 + 0.002 * g
+                    WHEN g <= 10 THEN 0.6 + 0.002 * (g - 5)
+                    WHEN g <= 15 THEN 1.0 + 0.002 * (g - 10)
+                    ELSE 0.01 + 0.0001 * (g - 15) END || ',0,0,0]')::wvec
+FROM generate_series(1, 40) g;
+CREATE INDEX fpc_weave ON fpc USING weave (body, emb) WITH (metric = 'ip');
+ANALYZE fpc;
+-- The row <-> docid map, as in (2b).
+CREATE TEMP TABLE fpcmap AS
+  SELECT t.id, t.rowtid, l.docid
+    FROM (SELECT id, ctid AS rowtid, row_number() OVER (ORDER BY ctid) AS rn
+            FROM fpc) t
+    JOIN (SELECT docid, row_number() OVER (ORDER BY docid) AS rn
+            FROM weave_vec_lanes('fpc_weave')) l USING (rn);
+SELECT count(*) = (SELECT count(*) FROM fpc) AS fpc_map_covers_every_row FROM fpcmap;
+ fpc_map_covers_every_row 
+--------------------------
+ t
+(1 row)
+
+-- The two ceilings, recomputed.
+CREATE TEMP TABLE fpc_n AS
+SELECT (SELECT sum(CASE WHEN u.mtf = 0 THEN 0::float8
+                        ELSE ln(1.0 + (st.ndocs - u.df + 0.5) / (u.df + 0.5))
+                             * u.mtf * 2.2 / (u.mtf + 1.2 * (1.0 - 0.75)) END)
+          FROM unnest(weave_index_df('fpc_weave', 'alpha'::wquery),
+                      weave_index_max_tf('fpc_weave', 'alpha'::wquery)) AS u(df, mtf),
+               weave_index_stats('fpc_weave') st) AS nl,
+       (SELECT max(maxrecnorm)::float8 FROM weave_vec_blocks('fpc_weave'))
+       * (SELECT sqrt(sum(x::float8 * x::float8))
+            FROM unnest('[1.5,0,0,0]'::wvec::real[]) x) AS nv;
+SELECT nl > 0 AND nv > 0 AS fpc_ceilings_positive,
+       abs(nv - (SELECT max(maxscore)::float8
+                   FROM weave_vec_scan_stats('fpc_weave', '[1.5,0,0,0]'::wvec, 1)))
+       <= 1e-5 * nv AS vector_ceiling_matches_the_shuttle_fold
+  FROM fpc_n;
+ fpc_ceilings_positive | vector_ceiling_matches_the_shuttle_fold 
+-----------------------+-----------------------------------------
+ t                     | t
+(1 row)
+
+-- Per-document channel scores, from the index's own SRFs (exact BM25; quantized ip).
+CREATE TEMP TABLE fpc_s AS
+SELECT m.id, COALESCE(a.score, 0::float8) AS l, COALESCE(v.score::float8, 0::float8) AS v
+  FROM fpcmap m
+  LEFT JOIN weave_search('fpc_weave', 'alpha'::wquery, 40) a ON a.ctid = m.rowtid
+  LEFT JOIN weave_vec_scan('fpc_weave', '[1.5,0,0,0]'::wvec, 40) v ON v.docid = m.docid;
+-- The oracle's top 5 under a given pair of divisors, and whether its cut is CLEAN:
+-- the gap between ranks 5 and 6 must exceed a tolerance of 1e-4 of the top score,
+-- which covers the scan's float4 summation.  A cut inside the tolerance is a TIE, and
+-- a tie is reported as such -- it is neither a pass nor a fail.
+CREATE FUNCTION pg_temp.fpc_top5(dl float8, dv float8, OUT ids int[], OUT clean bool)
+LANGUAGE sql AS $$
+  WITH r AS (SELECT id, 0.5 * l / dl + 0.5 * v / dv AS s,
+                    row_number() OVER (ORDER BY 0.5 * l / dl + 0.5 * v / dv DESC, id) AS rn
+               FROM fpc_s)
+  SELECT (SELECT array_agg(id ORDER BY id) FROM r WHERE rn <= 5),
+         (SELECT x.s - y.s > 1e-4 * (SELECT max(abs(s)) FROM r)
+            FROM r x, r y WHERE x.rn = 5 AND y.rn = 6)
+$$;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM fpc
+ ORDER BY fuse(body <=> 'alpha'::wquery, emb <#> '[1.5,0,0,0]'::wvec,
+               weights => '{0.5,0.5}') LIMIT 5;
+                                                       QUERY PLAN                                                        
+-------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using fpc_weave on fpc
+         Order By: ((body <=> '''alpha'''::wquery) AND (emb <#> '[1.5,0,0,0]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+(3 rows)
+
+CREATE TEMP TABLE fpc_pn AS
+SELECT array_agg(id ORDER BY id) AS ids FROM (
+  SELECT id FROM fpc
+   ORDER BY fuse(body <=> 'alpha'::wquery, emb <#> '[1.5,0,0,0]'::wvec,
+                 weights => '{0.5,0.5}') LIMIT 5) s;
+SET pg_weave.fuse_normalize = off;
+CREATE TEMP TABLE fpc_pr AS
+SELECT array_agg(id ORDER BY id) AS ids FROM (
+  SELECT id FROM fpc
+   ORDER BY fuse(body <=> 'alpha'::wquery, emb <#> '[1.5,0,0,0]'::wvec,
+                 weights => '{0.5,0.5}') LIMIT 5) s;
+RESET pg_weave.fuse_normalize;
+RESET enable_seqscan;
+SELECT pn.ids AS normalized_pushdown, (o).ids AS normalized_oracle,
+       (o).clean AS normalized_cut_clean, pn.ids = (o).ids AS normalized_pushdown_matches_oracle
+  FROM fpc_pn pn, fpc_n n, LATERAL pg_temp.fpc_top5(n.nl, n.nv) o;
+ normalized_pushdown | normalized_oracle | normalized_cut_clean | normalized_pushdown_matches_oracle 
+---------------------+-------------------+----------------------+------------------------------------
+ {6,7,8,9,10}        | {6,7,8,9,10}      | t                    | t
+(1 row)
+
+SELECT pr.ids AS raw_pushdown, (o).ids AS raw_oracle,
+       (o).clean AS raw_cut_clean, pr.ids = (o).ids AS raw_pushdown_matches_oracle
+  FROM fpc_pr pr, LATERAL pg_temp.fpc_top5(1, 1) o;
+ raw_pushdown | raw_oracle  | raw_cut_clean | raw_pushdown_matches_oracle 
+--------------+-------------+---------------+-----------------------------
+ {1,2,3,4,5}  | {1,2,3,4,5} | t             | t
+(1 row)
+
+-- THE FIXTURE CAN SEE A WRONG CEILING: each wrong divisor picks a different top 5
+-- from the correct one, with a clean cut.  These are the mutants M1-M3 of
+-- doc/GAPS.md G46, evaluated on the oracle rather than on a build.
+SELECT (r).ids <> (c).ids AND (r).clean AS raw_differs,
+       (m1).ids <> (c).ids AND (m1).clean AS lexical_ceiling_x2_differs,
+       (m2).ids <> (c).ids AND (m2).clean AS vector_ceiling_x1_5_differs,
+       (m3).ids <> (c).ids AND (m3).clean AS vector_ceiling_x2_differs
+  FROM fpc_n n,
+       LATERAL pg_temp.fpc_top5(n.nl, n.nv) c,
+       LATERAL pg_temp.fpc_top5(1, 1) r,
+       LATERAL pg_temp.fpc_top5(2 * n.nl, n.nv) m1,
+       LATERAL pg_temp.fpc_top5(n.nl, 1.5 * n.nv) m2,
+       LATERAL pg_temp.fpc_top5(n.nl, 2 * n.nv) m3;
+ raw_differs | lexical_ceiling_x2_differs | vector_ceiling_x1_5_differs | vector_ceiling_x2_differs 
+-------------+----------------------------+-----------------------------+---------------------------
+ t           | t                          | t                           | t
+(1 row)
+
+DROP FUNCTION pg_temp.fpc_top5(float8, float8);
+DROP TABLE fpcmap, fpc_n, fpc_s, fpc_pn, fpc_pr;
+DROP TABLE fpc;
 -- ---------------------------------------------------------------------------
 -- (3) THE REFUSALS.  Each must be a Sort, and none may raise.
 --

@@ -589,6 +589,8 @@ run_fuse() {
 
 	local datasets=${FUSE_DATASETS:-"scifact nfcorpus fiqa"}
 	local limit=${FUSE_LIMIT:-0}
+	# 0 means "no limit": prepdata.py refuses --limit 0, so omit the flag.
+	local limarg=""; [ "$limit" -gt 0 ] && limarg="--limit $limit"
 	# /scratch, not /mnt/data.  /mnt/data is not mounted and not writable on this
 	# image -- `mkdir -p /mnt/data/bench` fails for an unprivileged user -- while
 	# /scratch is created with the right ownership during provisioning and is what
@@ -599,7 +601,7 @@ run_fuse() {
 		say "fuse: preparing $D (embed=minilm, limit=$limit)"
 		$SSH "cd pg_weave && mkdir -p $bench && \
 			  /scratch/venv/bin/python3 bench/prepdata.py --dataset $D \
-				--out $bench --embed minilm --limit \"$limit\"" \
+				--out $bench --embed minilm $limarg" \
 			2>&1 | tee "$OUT/fuse-$D-prep.log" \
 			|| die "prepdata.py failed for $D (see $OUT/fuse-$D-prep.log)"
 
@@ -1293,13 +1295,15 @@ run_gatesweep() {
 
 	local datasets=${FUSE_DATASETS:-"scifact nfcorpus fiqa"}
 	local limit=${FUSE_LIMIT:-0}
+	# 0 means "no limit": prepdata.py refuses --limit 0, so omit the flag.
+	local limarg=""; [ "$limit" -gt 0 ] && limarg="--limit $limit"
 	local bench=/scratch/bench
 
 	for D in $datasets; do
 		say "gatesweep: preparing $D (embed=minilm, limit=$limit)"
 		$SSH "cd pg_weave && mkdir -p $bench && \
 			  /scratch/venv/bin/python3 bench/prepdata.py --dataset $D \
-				--out $bench --embed minilm --limit \"$limit\"" \
+				--out $bench --embed minilm $limarg" \
 			2>&1 | tee "$OUT/gs-$D-prep.log" \
 			|| die "prepdata.py failed for $D (see $OUT/gs-$D-prep.log)"
 
