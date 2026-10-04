@@ -1,0 +1,10 @@
+kind	target	pred	rows	sel
+none	1	-	57600	1.000000
+dv	0.1	price < 5760	5760	0.100000
+dv	0.01	price < 576	576	0.010000
+dv	0.001	price < 58	58	0.001007
+dv	0.0001	price < 6	6	0.000104
+lex	0.1	body @@@ 'long'::wquery	5711	0.099149
+lex	0.01	body @@@ 'alternative'::wquery	576	0.010000
+lex	0.001	body @@@ 'abstract'::wquery	58	0.001007
+lex	0.0001	body @@@ 'aaron'::wquery	6	0.000104
