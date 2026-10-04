@@ -4862,3 +4862,23 @@ reclaims, and `weave_check(deep)` is how to tell that one is due.**
   `ndocs + ndeleted` = 2800/2830/2860; point 4 (the separate refresh) is consistent;
   `STICKY ... (2600 vs 2340)`. That is exactly the predicted failure, so the test
   measures the window.
+
+### G73 — t/028's "quiet plain VACUUM still truncates the index" control failed once on a tree that does not touch VACUUM — **FOUND 2026-10-04; flake in a test's positive control, not a product defect so far; OPEN**
+
+The full gate on `wt/f9b` (`eb28db7`, run `pgweave-20261004-210709`) failed exactly one
+TAP assertion out of 1,100: t/028 test 113, `quiet plain VACUUM still truncates the index
+(4143 -> 4213 blocks)`. The relation **grew** across three plain VACUUMs after the
+DELETE. That branch changes no C code on the VACUUM path; it adds a regression file and
+docs, and a comment in `fusepath.c`. Re-run in isolation on the same commit five times
+(`pgweave-20261004-212408`): 5 of 5 pass. Nine other recorded full runs pass t/028.
+
+**What it might be, unproven:** truncation takes AccessExclusiveLock **conditionally**
+(`weave_truncate_tail_above()`, G67) and skips it if anyone else holds a lock. A leftover
+backend from t/028's own concurrent rounds, or autovacuum on another table, could make
+all three conditional attempts skip. Growth rather than no change needs a second
+explanation: the cleanup's merge writing new pages before it frees old ones, which the
+skipped truncation then cannot return. The control should either retry until truncation
+is observed with a time cap (as t/027's rounds do) or assert "not larger than before plus
+the merge's output" instead of "smaller". **Owed:** reproduce with `log_lock_waits` and a
+NOTICE on the skipped conditional lock before changing the assertion; a test that relaxes
+its assertion without knowing why it failed is the eleventh-member mistake.
