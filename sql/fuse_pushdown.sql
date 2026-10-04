@@ -810,6 +810,37 @@ DROP TABLE fpf_p;
 DROP TABLE fpf_o;
 DROP TABLE fpf;
 
+-- EVERYTHING PENDING: an index built on an empty table, then filled.  No segment
+-- holds any query term, so the lexical key's idf must come from the pending list
+-- (weave_pending_ranked()'s pass 0); without it the lexical channel contributes
+-- nothing and the order is the vector's alone (B, A, C instead of A, B, C).
+CREATE TABLE fpe (id text, body wdoc, emb wvec(4));
+CREATE INDEX fpe_weave ON fpe USING weave (body, emb);
+INSERT INTO fpe VALUES ('A', to_wdoc('simple', 'alpha alpha alpha alpha wa'), '[1.2,0,0,0]'),
+                       ('B', to_wdoc('simple', 'beta wb'), '[1,0,0,0]'),
+                       ('C', to_wdoc('simple', 'gamma wc'), '[3,0,0,0]');
+ANALYZE fpe;
+SET pg_weave.fuse_normalize = off;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM fpe ORDER BY fuse(body <=> 'alpha'::wquery, emb <-> '[0,0,0,0]'::wvec);
+CREATE TEMP TABLE fpe_p AS
+  SELECT array_agg(id) AS o
+    FROM (SELECT id FROM fpe
+           ORDER BY fuse(body <=> 'alpha'::wquery, emb <-> '[0,0,0,0]'::wvec)) s;
+RESET enable_seqscan;
+SELECT p.o AS all_pending_order,
+       p.o = (SELECT array_agg(id ORDER BY score DESC)
+                FROM (SELECT f.id, COALESCE(s.score, 0::float8)
+                             - (f.emb <-> '[0,0,0,0]'::wvec)::float8 ^ 2 AS score
+                        FROM fpe f
+                        LEFT JOIN weave_search('fpe_weave', 'alpha'::wquery, 1000) s
+                               ON s.ctid = f.ctid) o) AS all_pending_matches_exact_oracle
+  FROM fpe_p p;
+RESET pg_weave.fuse_normalize;
+DROP TABLE fpe_p;
+DROP TABLE fpe;
+
 -- ---------------------------------------------------------------------------
 -- (G66) THE NORMALIZER COUNTS PENDING DOCUMENTS.  doc/GAPS.md G66.
 --
@@ -848,15 +879,17 @@ DROP TABLE fpn_before;
 DROP TABLE fpn_after;
 DROP TABLE fpn;
 
--- Vector, on an ip index: X `alpha` at 0.1 and Y `beta` at 1 are flushed, P `gamma`
--- at 10 is pending, q = [1,0,0,0].  The vector key's ceiling is P's 10 once P is
--- counted (X's lexical half then outweighs Y's tenth: P, X, Y); bolts-only it is
--- about 1, and Y's whole 1.0 beats X (P, Y, X).
+-- Vector, on an ip index: X `alpha` at 0.1 and Y `beta` at 5 are flushed, P `gamma`
+-- at 100 is pending, q = [1,0,0,0].  The vector key's ceiling is P's 100 once P is
+-- counted, and X's lexical half (0.59 of its ceiling) then outweighs Y's 0.05:
+-- P, X, Y.  Bolts-only the ceiling is about 5, Y's vector half is then about 1,
+-- and Y beats X: P, Y, X.  The margin survives a ceiling up to 8.3, so a loose
+-- (B2) bound cannot hide the difference.
 CREATE TABLE fpi (id text, body wdoc, emb wvec(4));
 INSERT INTO fpi VALUES ('X', to_wdoc('simple', 'alpha wx'), '[0.1,0,0,0]'),
-                       ('Y', to_wdoc('simple', 'beta wy'), '[1,0,0,0]');
+                       ('Y', to_wdoc('simple', 'beta wy'), '[5,0,0,0]');
 CREATE INDEX fpi_weave ON fpi USING weave (body, emb) WITH (metric = 'ip');
-INSERT INTO fpi VALUES ('P', to_wdoc('simple', 'gamma wp'), '[10,0,0,0]');
+INSERT INTO fpi VALUES ('P', to_wdoc('simple', 'gamma wp'), '[100,0,0,0]');
 ANALYZE fpi;
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF)
