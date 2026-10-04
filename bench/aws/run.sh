@@ -13,6 +13,7 @@
 #					5-way, i4i.8xlarge for at-scale stress.
 #	 job			 default `smoke`.  One of:
 #					  smoke	   build + regression + isolation + TAP + codec test
+#					  script	   smoke, then SCRIPT=<file> run on the host; /tmp/out pulled
 #					  bound	   the block-bound pruning sweep (bench/bound_pruning.c)
 #					  lexical  smoke, then pg_weave vs tsvector+GIN on a real corpus
 #					  fuzzy	   smoke, then the Z5 (fuzzy term~1/term~2) and Z6
@@ -1610,8 +1611,47 @@ run_regressloop() {
 		"$OUT/regressloop_summary.tsv" | tee "$OUT/regressloop_arms.txt"
 }
 
+# A caller-supplied script, run on the host after the smoke gate passes.  For
+# agents and one-off investigations that need EC2 but no new named job:
+# SCRIPT=<path> is uploaded verbatim as /tmp/job.sh and run from ~/pg_weave as the
+# login user (a PostgreSQL superuser, with the extension built and installed).
+# Its stdout+stderr go to $OUT/script.log; anything it writes under /tmp/out/ is
+# pulled to $OUT/remote/ INCREMENTALLY, every SCRIPT_PULL seconds (hard rule 14's
+# pull-as-you-go), so an instance lost mid-run still leaves data behind.  The
+# script's exit status is the job's.  with_llvm=no on the reinstall, for AGENTS.md's
+# tenth member (mismatched JIT bitcode); find -delete rather than rm -rf because
+# this repository's harness refuses the latter.
+run_script() {
+	[ -n "${SCRIPT:-}" ] && [ -f "$SCRIPT" ] || die "job script needs SCRIPT=<path to a local file>"
+	say "script: uploading $SCRIPT"
+	$SSH 'cat > /tmp/job.sh; chmod +x /tmp/job.sh; mkdir -p /tmp/out' < "$SCRIPT" \
+		|| die "script upload failed"
+	$SSH 'cd pg_weave && make -s PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1 &&
+		  sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config with_llvm=no >/dev/null 2>&1 &&
+		  { sudo find /usr/lib/postgresql/17/lib/bitcode -maxdepth 1 -name "pg_weave*" -exec find {} -depth -delete \; 2>/dev/null; true; }' \
+		|| die "reinstall before the script failed"
+	mkdir -p "$OUT/remote"
+	(
+		while sleep "${SCRIPT_PULL:-120}"; do
+			$SSH 'cd /tmp/out && tar cf - . 2>/dev/null' 2>/dev/null \
+				| tar xf - -C "$OUT/remote" 2>/dev/null || true
+		done
+	) &
+	pullpid=$!
+	say "script: running (log -> $OUT/script.log)"
+	$SSH 'cd pg_weave && bash /tmp/job.sh' > "$OUT/script.log" 2>&1
+	src=$?
+	kill "$pullpid" 2>/dev/null
+	wait "$pullpid" 2>/dev/null
+	$SSH 'cd /tmp/out && tar cf - . 2>/dev/null' 2>/dev/null | tar xf - -C "$OUT/remote" 2>/dev/null || true
+	tail -20 "$OUT/script.log"
+	[ "$src" = 0 ] || die "job script exited $src (see $OUT/script.log)"
+	say "script: done, exit 0"
+}
+
 case "$JOB" in
 	smoke)   run_smoke ;;
+	script)  run_smoke; run_script ;;
 	bound)   run_bound ;;
 	# regressloop: a red smoke is the phenomenon this job hunts (G60), so it
 	# tolerates one by construction rather than by a flag the caller must pass.
