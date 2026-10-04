@@ -714,16 +714,168 @@ SELECT (SELECT count(*) FROM fnv_p) = (SELECT count(*) FROM fnv) AS fused_every_
        (SELECT array_agg(id ORDER BY id) FROM fnv_p
          WHERE rn > (SELECT count(*) FROM fnv_f WHERE v IS NOT NULL)) AS fused_tail,
        (SELECT array_agg(id ORDER BY id) FROM fnv_f WHERE v IS NULL) AS heap_null_fuse;
--- Row 401 is PENDING and has a vector.  The fused shuttles read bolts only (the
--- open note under doc/GAPS.md G66), so it is not ranked; the padding emits it at
--- +Infinity, which still puts it ahead of every NULL-fused row.  That relative
--- position is what G71 is about; ranking pending rows is G66's open half.
+-- Row 401 is PENDING and has a vector.  Since doc/GAPS.md G66's fused half was
+-- closed, the fused pass reads the pending list and RANKS it -- vector 0.1 from the
+-- query, so it is first (fused_first3 above) -- and it still comes before every
+-- NULL-fused row, which is what G71 asserts here.
 SELECT (SELECT rn FROM fnv_p WHERE id = 401)
        < (SELECT min(rn) FROM fnv_p WHERE id IN (101, 102, 103, 301, 402))
        AS pending_vector_row_before_null_tail;
+
+-- (G66) THE RANKED HEAD AGAINST AN EXACT ORACLE, pending row included.  With
+-- fuse_normalize off the fused score is the raw sum: the index's own BM25 for the
+-- lexical key -- weave_search(), which scores pending documents on the segment
+-- scale (G66) -- plus -||q - v||^2 for the vector one.  With q = 0 the lanes'
+-- quantized score is exact (-qnorm^2 + 2<q,v> - ||v||^2 with the stored norm), so
+-- the heap's exact distance is the index's number for flushed and pending rows
+-- alike.  The oracle covers the rows whose fuse() is not NULL.
+SET pg_weave.fuse_normalize = off;
+SET enable_seqscan = off;
+CREATE TEMP TABLE fnv_p2 AS
+  SELECT row_number() OVER () AS rn, id
+    FROM (SELECT id FROM fnv
+           ORDER BY fuse(body <=> 'alpha'::wquery, emb <-> '[0,0,0,0]'::wvec)) s;
+RESET enable_seqscan;
+CREATE TEMP TABLE fnv_o AS
+  SELECT f.id, COALESCE(s.score, 0::float8) - (f.emb <-> '[0,0,0,0]'::wvec)::float8 ^ 2 AS score
+    FROM fnv f LEFT JOIN weave_search('fnv_weave', 'alpha'::wquery, 1000) s ON s.ctid = f.ctid
+   WHERE f.body IS NOT NULL AND f.emb IS NOT NULL;
+SELECT count(*) = count(DISTINCT score) AS fnv_oracle_tie_free FROM fnv_o;
+SELECT (SELECT array_agg(id ORDER BY rn) FROM fnv_p2 WHERE rn <= (SELECT count(*) FROM fnv_o))
+       = (SELECT array_agg(id ORDER BY score DESC) FROM fnv_o) AS fused_head_matches_exact_oracle,
+       (SELECT rn FROM fnv_p2 WHERE id = 401) AS pending_row_rank,
+       (SELECT count(*) FROM fnv_p2) = (SELECT count(*) FROM fnv) AS fnv2_every_row,
+       (SELECT count(DISTINCT id) FROM fnv_p2) = (SELECT count(*) FROM fnv) AS fnv2_no_row_twice;
+RESET pg_weave.fuse_normalize;
+DROP TABLE fnv_p2;
+DROP TABLE fnv_o;
 DROP TABLE fnv_p;
 DROP TABLE fnv_f;
 DROP TABLE fnv;
+
+-- ---------------------------------------------------------------------------
+-- (G66) A PENDING ROW ACROSS THE WIDENING LADDER.  doc/GAPS.md G66.
+--
+-- 200 flushed rows `alpha wN` at [N,0,0,0], so with q = 0 the fused score is
+-- B - N^2 (one BM25 B for every row: same tf, same length) and the order is N.
+-- Four pending rows: 501 at 0.5 (best of the alpha rows), 502 at 100.5 (between
+-- 100 and 101), 503 at 300 (worst), and 504 `beta` at 0.2, which no lexical term
+-- reaches but the vector channel does (best of all, ungated).  wand_initial_k = 1
+-- makes the first rung 64 wide, so that pass PRUNES: 501 and 504 score above its
+-- 64th row and are emitted by it; 502 and 503 are below that frontier and must
+-- wait for the wider pass, or they would be handed out ahead of rows 65..100 that
+-- only the wider pass finds.  The assertion is the whole order against the exact
+-- oracle, plus every row once.
+-- ---------------------------------------------------------------------------
+CREATE TABLE fpf (id int, body wdoc, emb wvec(4));
+INSERT INTO fpf SELECT g, to_wdoc('simple', 'alpha w' || g), ('[' || g || ',0,0,0]')::wvec
+  FROM generate_series(1, 200) g;
+CREATE INDEX fpf_weave ON fpf USING weave (body, emb);
+INSERT INTO fpf VALUES (501, to_wdoc('simple', 'alpha best'), '[0.5,0,0,0]'),
+                       (502, to_wdoc('simple', 'alpha mid'), '[100.5,0,0,0]'),
+                       (503, to_wdoc('simple', 'alpha worst'), '[300,0,0,0]'),
+                       (504, to_wdoc('simple', 'beta near'), '[0.2,0,0,0]');
+ANALYZE fpf;
+SET pg_weave.fuse_normalize = off;
+SET pg_weave.wand_initial_k = 1;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM fpf ORDER BY fuse(body <=> 'alpha'::wquery, emb <-> '[0,0,0,0]'::wvec);
+CREATE TEMP TABLE fpf_p AS
+  SELECT row_number() OVER () AS rn, id
+    FROM (SELECT id FROM fpf
+           ORDER BY fuse(body <=> 'alpha'::wquery, emb <-> '[0,0,0,0]'::wvec)) s;
+-- the first page, gated: the pending row is the best alpha candidate
+EXPLAIN (COSTS OFF)
+SELECT id FROM fpf WHERE body @@@ 'alpha'::wquery
+ ORDER BY fuse(body <=> 'alpha'::wquery, emb <-> '[0,0,0,0]'::wvec) LIMIT 3;
+SELECT array_agg(id) AS gated_first3
+  FROM (SELECT id FROM fpf WHERE body @@@ 'alpha'::wquery
+         ORDER BY fuse(body <=> 'alpha'::wquery, emb <-> '[0,0,0,0]'::wvec) LIMIT 3) s;
+RESET enable_seqscan;
+CREATE TEMP TABLE fpf_o AS
+  SELECT f.id, COALESCE(s.score, 0::float8) - (f.emb <-> '[0,0,0,0]'::wvec)::float8 ^ 2 AS score
+    FROM fpf f LEFT JOIN weave_search('fpf_weave', 'alpha'::wquery, 1000) s ON s.ctid = f.ctid;
+SELECT count(*) = count(DISTINCT score) AS fpf_oracle_tie_free FROM fpf_o;
+SELECT (SELECT array_agg(id ORDER BY rn) FROM fpf_p)
+       = (SELECT array_agg(id ORDER BY score DESC) FROM fpf_o) AS fpf_order_matches_exact_oracle,
+       (SELECT array_agg(id ORDER BY rn) FILTER (WHERE rn <= 3) FROM fpf_p) AS fpf_first3,
+       (SELECT rn FROM fpf_p WHERE id = 502) AS mid_pending_rank,
+       (SELECT rn FROM fpf_p WHERE id = 503) AS worst_pending_rank,
+       (SELECT count(*) FROM fpf_p) = (SELECT count(*) FROM fpf) AS fpf_every_row,
+       (SELECT count(DISTINCT id) FROM fpf_p) = (SELECT count(*) FROM fpf) AS fpf_no_row_twice;
+RESET pg_weave.wand_initial_k;
+RESET pg_weave.fuse_normalize;
+DROP TABLE fpf_p;
+DROP TABLE fpf_o;
+DROP TABLE fpf;
+
+-- ---------------------------------------------------------------------------
+-- (G66) THE NORMALIZER COUNTS PENDING DOCUMENTS.  doc/GAPS.md G66.
+--
+-- pg_weave.fuse_normalize divides each key by its ceiling.  If the ceiling is
+-- taken over the bolts only, a pending document can exceed it, and the ranking
+-- then CHANGES WHEN A FLUSH RUNS -- the same rows, the same query, a different
+-- order.  So the assertion is flush-invariance: the order before weave_merge()
+-- equals the order after.  Each key here has one term, so its idf cancels in the
+-- normalization and the only thing a flush moves is the ceiling.
+--
+-- Lexical: X `alpha wx` and Y `beta wy` are flushed, P (alpha x 8) is pending, and
+-- the alpha key's ceiling is set by P's tf of 8.  Counted: P, Y, X.  Bolts-only
+-- (ceiling at tf 1): P, X, Y.
+-- ---------------------------------------------------------------------------
+CREATE TABLE fpn (id text, body wdoc);
+INSERT INTO fpn VALUES ('X', to_wdoc('simple', 'alpha wx')), ('Y', to_wdoc('simple', 'beta wy'));
+CREATE INDEX fpn_weave ON fpn USING weave (body);
+INSERT INTO fpn VALUES ('P', to_wdoc('simple', 'alpha alpha alpha alpha alpha alpha alpha alpha'));
+ANALYZE fpn;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM fpn ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'beta'::wquery, weights => '{1.1,1}');
+CREATE TEMP TABLE fpn_before AS
+  SELECT array_agg(id) AS o
+    FROM (SELECT id FROM fpn
+           ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'beta'::wquery, weights => '{1.1,1}')) s;
+SELECT weave_merge('fpn_weave') IS NOT NULL AS fpn_flushed;
+CREATE TEMP TABLE fpn_after AS
+  SELECT array_agg(id) AS o
+    FROM (SELECT id FROM fpn
+           ORDER BY fuse(body <=> 'alpha'::wquery, body <=> 'beta'::wquery, weights => '{1.1,1}')) s;
+RESET enable_seqscan;
+SELECT b.o AS lexical_before_flush, a.o AS lexical_after_flush, a.o = b.o AS lexical_flush_invariant
+  FROM fpn_before b, fpn_after a;
+DROP TABLE fpn_before;
+DROP TABLE fpn_after;
+DROP TABLE fpn;
+
+-- Vector, on an ip index: X `alpha` at 0.1 and Y `beta` at 1 are flushed, P `gamma`
+-- at 10 is pending, q = [1,0,0,0].  The vector key's ceiling is P's 10 once P is
+-- counted (X's lexical half then outweighs Y's tenth: P, X, Y); bolts-only it is
+-- about 1, and Y's whole 1.0 beats X (P, Y, X).
+CREATE TABLE fpi (id text, body wdoc, emb wvec(4));
+INSERT INTO fpi VALUES ('X', to_wdoc('simple', 'alpha wx'), '[0.1,0,0,0]'),
+                       ('Y', to_wdoc('simple', 'beta wy'), '[1,0,0,0]');
+CREATE INDEX fpi_weave ON fpi USING weave (body, emb) WITH (metric = 'ip');
+INSERT INTO fpi VALUES ('P', to_wdoc('simple', 'gamma wp'), '[10,0,0,0]');
+ANALYZE fpi;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM fpi ORDER BY fuse(body <=> 'alpha'::wquery, emb <#> '[1,0,0,0]'::wvec);
+CREATE TEMP TABLE fpi_before AS
+  SELECT array_agg(id) AS o
+    FROM (SELECT id FROM fpi
+           ORDER BY fuse(body <=> 'alpha'::wquery, emb <#> '[1,0,0,0]'::wvec)) s;
+SELECT weave_merge('fpi_weave') IS NOT NULL AS fpi_flushed;
+CREATE TEMP TABLE fpi_after AS
+  SELECT array_agg(id) AS o
+    FROM (SELECT id FROM fpi
+           ORDER BY fuse(body <=> 'alpha'::wquery, emb <#> '[1,0,0,0]'::wvec)) s;
+RESET enable_seqscan;
+SELECT b.o AS vector_before_flush, a.o AS vector_after_flush, a.o = b.o AS vector_flush_invariant
+  FROM fpi_before b, fpi_after a;
+DROP TABLE fpi_before;
+DROP TABLE fpi_after;
+DROP TABLE fpi;
 
 DROP TABLE fp_nb;
 DROP TABLE fp_l2b;
