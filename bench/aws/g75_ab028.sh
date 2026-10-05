@@ -16,6 +16,9 @@ LIB=$($PGC --pkglibdir)
 SRC=$HOME/pg_weave
 N=${AB_N:-10}
 ARMS=${AB_ARMS:-branch base}
+TEST=${AB_TEST:-t/028_vacuum_truncate_race.pl}	# the file to run
+MARK=${AB_MARK:-113}							# the test number that decides
+TB=$(basename $TEST .pl)
 log() { echo "$(date +%T) $*" | tee -a $OUT/ab028.log; }
 
 declare -A dir fails runs
@@ -48,21 +51,21 @@ for r in $(seq 1 $N); do
 		d=${dir[$arm]}
 		md5=$(install $d $arm) || { log "$arm: build failed"; exit 1; }
 		(cd $d && make installcheck PG_CONFIG=$PGC REGRESS= ISOLATION= \
-			PROVE_TESTS=t/028_vacuum_truncate_race.pl > $OUT/ab-$arm-$r.log 2>&1)
-		rl=$d/tmp_check/log/regress_log_028_vacuum_truncate_race
-		line=$(grep -E '(not )?ok 113 ' $rl 2>/dev/null | head -1)
-		if [ -z "$line" ]; then log "$arm run $r (so=$md5): test 113 NOT REACHED"; continue; fi
+			PROVE_TESTS=$TEST > $OUT/ab-$TB-$arm-$r.log 2>&1)
+		rl=$d/tmp_check/log/regress_log_$TB
+		line=$(grep -E "(not )?ok $MARK " $rl 2>/dev/null | head -1)
+		if [ -z "$line" ]; then log "$TB $arm run $r (so=$md5): test $MARK NOT REACHED"; continue; fi
 		runs[$arm]=$((runs[$arm]+1))
 		case "$line" in *"not ok"*)
 			fails[$arm]=$((fails[$arm]+1))
-			cp $rl $OUT/ab-$arm-$r.regress_log
-			cp $d/tmp_check/log/028_vacuum_truncate_race_primary.log $OUT/ab-$arm-$r.server_log 2>/dev/null ;;
+			cp $rl $OUT/ab-$TB-$arm-$r.regress_log
+			cp $d/tmp_check/log/${TB}_*.log $OUT/ 2>/dev/null ;;
 		esac
-		log "$arm run $r (so=$md5): $(echo "$line" | grep -oE '(not ok|ok) 113 .*')"
-		grep -h 'G73 trail' $rl | sed "s/^/    $arm run $r: /" >> $OUT/ab028.log
+		log "$TB $arm run $r (so=$md5): $(echo "$line" | grep -oE "(not ok|ok) $MARK .*" | cut -c1-200)"
+		grep -h 'G73 trail\|excess of' $rl | sed "s/^/    $arm run $r: /" >> $OUT/ab028.log
 	done
 done
 summary=""
-for arm in $ARMS; do summary="$summary $arm: ${fails[$arm]} of ${runs[$arm]} failed 113;"; done
-log "RESULT$summary"
+for arm in $ARMS; do summary="$summary $arm: ${fails[$arm]} of ${runs[$arm]} failed $MARK;"; done
+log "RESULT $TB$summary"
 install $SRC branch-restore > /dev/null

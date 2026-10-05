@@ -1423,15 +1423,31 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 			 * pages with a stamp of the crash-time next XID, and after restart
 			 * no XID had completed past it.
 			 */
-			if (GetRecordedFreeSpace(index, blk) < BLCKSZ / 2)
+			bool		infsm = GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2;
+
+			/*
+			 * BOTH DIRECTIONS.  Recorded only if reusable now, and REMOVED if
+			 * the FSM lists it while it is not: a crash restores FSM pages
+			 * older than the frees they describe, so the FSM can offer a page
+			 * the crashed VACUUM freed a moment before the crash, whose stamp
+			 * is not yet past the horizon.  The first version only added pages
+			 * and t/033's crashed index went on growing a flush per cycle,
+			 * identically, because the flush right after this pass met exactly
+			 * those entries.  The next pass records them once they qualify.
+			 */
+			if (weave_page_reusable_now(index, page))
 			{
-				if (weave_page_reusable_now(index, page))
+				if (!infsm)
 				{
 					RecordFreeIndexPage(index, blk);
 					nrecorded++;
 				}
-				else
-					nnotyet++;
+			}
+			else
+			{
+				if (infsm)
+					RecordUsedIndexPage(index, blk);
+				nnotyet++;
 			}
 			UnlockReleaseBuffer(buf);
 			continue;
