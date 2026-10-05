@@ -405,6 +405,12 @@ pulled artifacts and terminated the instance. The job's recorded exit status is 
 - **Correlated predicates are untested.** Both gates here are uncorrelated with the
   ranking and with heap order. A facet correlated with the vector neighbourhood would help
   A's bolt bounds and leave C unchanged.
+- **A = D does not independently check the gate.** B, C and D take the qualifying set
+  from the same index predicate path A uses (a docvals or lexical index scan), so a gate
+  that admitted the wrong rows would fool all four arms equally. Gate exactness is
+  `sql/docvals.sql`'s index = heap check. Here it is only cross-checked by the seqscan
+  `count(*)` for each point and by A returning exactly that many rows at the points below
+  k (5 of 5, 6 of 6, and so on).
 - **The local cliff split and the counter identity come from the workstation** and are
   counts, not times. The cliff's latency comes from EC2.
 
