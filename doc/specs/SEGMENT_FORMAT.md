@@ -607,6 +607,12 @@ Fuzz target: `test/fuzz/fuzz_doclist.c`. Property test: `test/hegel/test_doclist
   provably holds `AccessExclusiveLock`, verified with `CheckRelationLockedByMe()`.
   This gate exists because of an AddressSanitizer-found SEGV: a reader holding a
   pointer into a page that `weave_vacuum()` had freed and reused.
+- A segment writer that does not hold the maintenance mutex (the oversized INSERT,
+  a build) holds the **segment-write lock** (`WEAVE_SEGWRITE_LOCKBLK`, share) from
+  its first allocation to its publish record, so VACUUM's reclaim of stranded pages
+  can wait it out. Lock order is segment-write lock before maintenance mutex, never
+  the reverse. The argument is in §10, "Pages a crash strands between write and
+  link".
 
 ## 8. Compatibility policy
 
@@ -952,3 +958,174 @@ that, whereas removing it would make `t/012` fail for a durability reason if thi
 fix ever regressed — duplicating what `t/014` says more directly. A `CHECKPOINT`
 would also have worked and is the wrong tool: it puts the pages on disk and leaves
 WAL replay, the thing the test exists to exercise, untested.
+
+### Pages a crash strands between write and link — reclaimed by VACUUM (doc/GAPS.md G75, G72) — DESIGNED 2026-10-05
+
+Every multi-page structure is written *before* the one record that links it, and
+every replaced structure is freed *after* the record that unlinks it. A crash or
+an ERROR inside either window leaves pages that are unreachable from the metapage
+and not flagged `WEAVE_FREED`. `t/031` measures it: a mixed pending flush leaks
+one page per record, up to 12. Answers stay right, but before this design only
+REINDEX got the pages back. The class has four members. All four are reclaimed by
+one mechanism:
+
+| leaked page | how it arises | how it is reclaimed |
+|---|---|---|
+| written, never linked | crash/ERROR before a segment publish (flush, oversized INSERT, merge output, tombstone blob) | **freed** (flagged, stamped, FSM) |
+| unlinked, never freed | crash/ERROR between the unlinking record and the last `weave_free_page()` (merge inputs, folded pending pages, old tombstone blob) | **freed** |
+| flagged freed, absent from the FSM | the FSM is not WAL-logged; a crash loses recent `RecordFreeIndexPage()` calls | **re-recorded** in the FSM |
+| zero page, absent from the FSM | a crash after `P_NEW` extended the file but before the page's first record reached disk | **re-recorded** in the FSM |
+
+**The choice: reclaim in VACUUM, no format change.** At the start of
+`weave_vacuumcleanup()`, and in `weave_vacuum()`, a reclaim pass
+(`weave_reclaim_unreachable()`) marks every page reachable from the metapage and
+frees the rest. The walk is the one `weave_check()` uses
+(`wvck_mark_reachable()`), so the reclaim and the leak report cannot disagree
+about which pages are live.
+
+**Rejected: (b), a "bolt being built" marker that the publish supersedes.** It
+needs a new page flag or kind, which is a format change. Every page a writer
+creates would carry the mark until the publish, and then something would have to
+clear it. That is one more record per page, or a list of pages kept somewhere,
+and either one is a second structure that must agree with the chains. It also
+covers only the first row of the table above. The free-after-unlink and FSM rows
+would still need a reachability walk, so (b) adds a mechanism without removing
+one.
+
+**Rejected heuristic: "an unreachable page whose LSN is older than the last
+directory change is a leak".** It is unsound with two writers. Oversized INSERTs
+W1 and W2 run at the same time. W1 writes its pages, W2 writes and publishes, and
+W1 has not yet published. W1's pages are now older than the last directory change
+(W2's publish), and they are live.
+
+#### Which writers can run beside the reclaim
+
+The reclaim holds the maintenance mutex `M` (`weave_maintenance_lock()`, a
+heavyweight lock on page 0). Every writer, and the lock that keeps it apart from
+the reclaim:
+
+| writer | lock it holds | relation to the reclaim |
+|---|---|---|
+| pending flush, every merge, compaction, bulkdelete's tombstone swap, `weave_merge()`, `weave_vacuum()`, a build's finalize | `M` | excluded by `M` |
+| parallel-merge workers | run while their leader holds `M` | excluded, with one exception below |
+| CREATE INDEX, REINDEX (serial or parallel) | `AccessExclusiveLock` or `ShareLock` on the table, which conflicts with VACUUM's `ShareUpdateExclusiveLock` | cannot overlap a VACUUM. `weave_vacuum()` holds `AccessExclusiveLock` on the index, which the build's index lock conflicts with |
+| CREATE INDEX CONCURRENTLY's build | `ShareUpdateExclusiveLock` on the table, which conflicts with VACUUM's | cannot overlap a VACUUM; its finalize takes `M` anyway |
+| **oversized INSERT** (`weave_insert_oversized_as_segment()`) | `RowExclusiveLock` only, no `M` | **runs beside the reclaim.** Writes a whole bolt and then publishes it |
+| **pending append** (`weave_insert()`) | `RowExclusiveLock` only, no `M` | **runs beside the reclaim.** A new pending page is written and linked from the old tail (or the metapage) in the SAME record |
+
+So the two writers that can run concurrently are the oversized INSERT, which has a
+write-before-link window, and the pending append, which has none. Two mechanisms
+make the reclaim safe against them.
+
+**1. The segment-write lock `X` and a barrier.** A heavyweight lock on page
+`InvalidBlockNumber` of the index, used for nothing else (`WEAVE_SEGWRITE_LOCKBLK`).
+Every segment writer that does not hold `M` takes `X` in `ShareLock` before its
+first page allocation and releases it after its publish record. That means the
+oversized INSERT, and also `weave_build()` (a CIC build does not hold
+`AccessExclusiveLock`, so the allocator's check below needs it). Share mode does
+not block other share holders, so concurrent inserters still write in parallel.
+Before the reclaim takes `M`, it acquires `X` in `ExclusiveLock` and immediately
+releases it. That barrier waits for every segment writer that was already in its
+window. Lock order: a writer holds `X` and may then take `M` (a full directory
+merges inside `weave_add_segment_with_room()`). The reclaim takes `X` only while
+it does NOT hold `M`. So the order is always `X` then `M`, and no deadlock is
+possible. A share request queues behind the waiting exclusive request, so inserts
+pause for as long as the barrier waits. That is the length of the longest
+oversized INSERT already running, the same price GIN's cleanup charges.
+
+**2. The LSN fence `F`.** `F = GetXLogInsertRecPtr()` is read *before* the barrier.
+A page is a reclaim candidate only if its `pd_lsn <= F`. A writer that takes `X`
+after the barrier is unaffected by the barrier, but every page it writes gets an
+LSN greater than `F`, so the reclaim never touches it. The pending append is
+covered the same way. Its new page's first record gets an LSN greater than `F`
+unless it was written before `F`. If it was written before `F`, it was linked by
+that same record, so the walk reaches it.
+
+#### Why the reclaim never frees a page a later publish links
+
+The claim: when the reclaim frees page P, no backend will later link P, and no
+reader is about to be handed P through the directory.
+
+1. P is unmarked by a walk over the directory snapshot S, read under `M`. P is
+   initialized, not `WEAVE_FREED`, and `pd_lsn(P) <= F`. These conditions are
+   re-checked under P's exclusive buffer lock, and P is freed under that same
+   lock.
+2. P was last written before `F`. So P was not written by any writer that
+   started after the barrier.
+3. Writers holding `M` are excluded for the whole pass, so P is not part of an
+   in-flight flush, merge or swap. Every structure they published is in S.
+4. A segment writer holding `X` that was in its window at the barrier has
+   published or aborted before the barrier returns. If it published, its bolt is
+   in S, because S is read after the barrier. If it aborted, its pages are leaked
+   and freeing them is correct.
+5. A pending page written before `F` was linked by its own record, so it is
+   reachable in S unless a flush has since folded it. A flush holds `M`, so that
+   fold is also complete in S, and its cut pages are either still on the chain or
+   already leaked.
+6. The pending walk stops at S's `pendingtail`. Pages appended after S are past
+   the tail, and their LSNs are greater than `F`.
+7. The walk must be **complete**. A walk that hits a chain error (a page past
+   EOF, a wrong kind, a freed page on a live chain, a cycle), cannot open a
+   descriptor or a weft root, or finds a weft kind it does not know marks the map
+   **incomplete**. An incomplete map frees nothing, logs, and leaves the decision
+   to `weave_check(deep)` and REINDEX. That stops an unreadable chain, or a weft
+   added later without a walker arm, from being freed as a leak. The "unknown
+   weft kind" arm is what turns a forgotten walker arm into a skipped reclaim
+   instead of data loss.
+8. A reader holding an older directory snapshot can still read P, if P is a
+   merge input whose free was interrupted. The free stamps `pd_prune_xid` like
+   every other free, so the allocator's recycle gate (`weave_page_recyclable()`)
+   still waits out that reader.
+
+**The race the fence does not close, and why it does not matter.** A parallel
+merge whose leader errors drops `M` (`PG_FINALLY`) while its workers may still
+be running. A reclaim can then free pages a dying worker writes afterwards. No
+publish ever follows, because the leader has abandoned the merge, and the freed
+pages are stamped with an XID no older than the worker's transaction. So the
+allocator cannot hand them out until the worker is gone. A worker that writes
+into an already-freed page can, at worst, overwrite the `WEAVE_FREED` flag and
+leak that page again until the next VACUUM.
+
+**Zero pages, and pages already flagged freed, are only re-recorded in the FSM.
+The reclaim never writes them.** A zero page below the relation length read
+under the relation extension lock is not being extended, because
+`weave_new_buffer()` holds that lock until it has the new buffer exclusively
+locked. Every caller then keeps that lock until the page's first record. If
+`ConditionalLockBuffer()` gets the page and it is still zero, nobody is writing
+it. Recording a page in the FSM is safe even if another backend takes it at the
+same moment, because of a change to the allocator: **a free-list candidate that
+is initialized and not `WEAVE_FREED` is a live page and is dropped from the
+candidate set**. It is no longer pushed back into the FSM (`RecordUsedIndexPage`
+for the low-free list, no re-record for the live FSM). Before this change a stale
+FSM entry for a live page was re-recorded every time it was refused, so it lived
+for ever. nbtree and GIN deal with stale FSM entries the same way: refuse the page
+and drop it.
+
+**What enforces the two locks.** `weave_new_buffer()` raises
+`elog(ERROR)` unless the caller holds `M`, `X`, or `AccessExclusiveLock` on the
+index, or is a parallel worker. A parallel worker is a build or merge
+participant whose leader holds the right lock. The pending append is the one
+writer exempt from this, because it links each page in the record that writes
+it, and it allocates through `weave_new_buffer_linked()`, which states that
+exemption in its name. A future segment writer that forgets `X` therefore fails
+its first allocation in every build, rather than corrupting an index months
+later. This is the `weave_assert_merge_serialized()` argument again: the comment
+form of a locking rule was already in this tree and was not followed.
+
+**Cost.** One reachability walk over every chain and one pass that reads every
+block's buffer, per VACUUM cleanup. That is the same order as GIN's and GiST's
+cleanup, which read every page to recycle them. It is measured at 1M rows in
+`bench/RESULTS_G75_RECLAIM.md` (owed until that run exists). The pass yields to
+`vacuum_delay_point()` per block.
+
+**What it does not cover.**
+- A server that has loaded the new `.so` into some backends but not others. A
+  backend still running the old library writes oversized segments without `X`.
+  After an upgrade, restart the server. Loading pg_weave already needs that for
+  `shared_preload_libraries` users, and a mixed-version backend set is not
+  supported in general.
+- A temporary or unlogged index's LSNs do not advance, so `F` excludes nothing
+  there. That is safe: a temporary index has no concurrent writer. An unlogged
+  index is refused at build (`weave_reject_unlogged()`).
+- ANALYZE-only cleanup (`info->analyze_only`) skips the reclaim, as it skips the
+  flush.
