@@ -136,11 +136,18 @@ cleanup() {
 
 	if [ -n "$IID" ]; then
 		say "terminating $IID"
-		aws ec2 terminate-instances --profile "$PROFILE" \
-			--instance-ids "$IID" --output text >/dev/null 2>&1
 		# Verify, do not assume.  An API call that silently failed leaves a
-		# running instance and a clean-looking log.
-		for _ in $(seq 1 30); do
+		# running instance and a clean-looking log.  And RETRY the call, not just
+		# the check: on 2026-10-05 the one terminate call failed silently
+		# (2>/dev/null) and the loop then watched a running instance for five
+		# minutes, warned, and left it running.  Re-issuing every 30 s is
+		# harmless on an instance already shutting down.
+		for i in $(seq 1 30); do
+			if [ $((i % 3)) = 1 ]; then
+				aws ec2 terminate-instances --profile "$PROFILE" \
+					--instance-ids "$IID" --output text >/dev/null 2>"$OUT/terminate.err" \
+					|| say "  terminate-instances failed: $(tail -1 "$OUT/terminate.err")"
+			fi
 			st=$(aws ec2 describe-instances --profile "$PROFILE" \
 				--instance-ids "$IID" \
 				--query 'Reservations[].Instances[].State.Name' \
