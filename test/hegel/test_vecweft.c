@@ -59,6 +59,27 @@
  *		(src/vector/vecwrite.c drives its own loop); the byte-identity assertion over
  *		weave_vec_lanes() in sql/vecindex.sql is what catches a re-encoding there.
  *
+ *	P8	BIT IDENTITY ACROSS SHAPE (AGENTS.md hard rule 16; sect. 7.1 "v4").  A weft's
+ *		page images depend on (dim, bits, version, nvec) and the lanes' codes in
+ *		warp order, and on NOTHING else.  So a merge of any split of a lane
+ *		sequence -- each part written as its own weft, at v3 or v4, read back off
+ *		its pages and re-written -- must give the same bytes as one write of the
+ *		whole sequence.  Swept over the axis the v4 layout actually depends on: dim
+ *		(including the bands where the centroid does NOT fit and spills), bits,
+ *		nvec mod 32, and split points on and off a block boundary.  Written before
+ *		the packed writer was trusted, which is the rule's whole point.
+ *	P9	A READER THAT DISAGREES WITH THE WRITER ABOUT PACKING IS REFUSED, both ways:
+ *		v4 pages walked with a v3 geometry and v3 pages walked with a v4 geometry,
+ *		through the production page reader, must fail somewhere in the chain.  This
+ *		is the standalone home of the "plan and reader disagree on the page index"
+ *		mutant.
+ *
+ *	P1 also checks the plan's packing decision against the spec's rule computed
+ *	independently here, and P2 reads every page TWICE: once with an independent
+ *	reader that knows only the spec's byte rule (a second header at
+ *	align4(12 + 4*bits*ncoords) after a lane strip), and once with the production
+ *	reader weave_vecweft_page_take().  Both must reproduce the packed block.
+ *
  *	P0	the sweep is NOT VACUOUS: it contains a geometry with a middle lane strip,
  *		one whose j0 is neither the first coordinate nor the last strip's.  Checked
  *		because everything above is about WHERE bytes go and at 4 bits a page holds
@@ -93,6 +114,9 @@
  * and the 8-byte weave opaque area.  Hard-coded rather than derived, because the
  * point is to test the geometry the shipped writer uses. */
 #define PAYLOAD 8160
+
+/* The weft version every Weft below is built at; main() sweeps it. */
+static int cur_version = WEAVE_VECWEFT_CUR;
 
 static long checks = 0;
 static long failures = 0;
@@ -145,7 +169,7 @@ typedef struct Weft
 	weave_uint8 *live;
 
 	/* the pages */
-	weave_uint8 *codepage;		/* nstrips * PAYLOAD */
+	weave_uint8 *codepage;		/* npages * PAYLOAD, block-major as on the chain */
 	weave_uint8 *dirpage;		/* ndirpages * PAYLOAD */
 
 	/* what the writer computed, kept for comparison */
@@ -186,8 +210,8 @@ weft_build(Weft *w, int dim, int bits, unsigned int nlane, int livemod,
 	float	   *v;
 
 	memset(w, 0, sizeof(*w));
-	assert(weave_vecweft_geom(&w->g, PAYLOAD, dim, bits, WEAVE_PACK_LANE,
-							  nlane) == 0);
+	assert(weave_vecweft_geom_v(&w->g, PAYLOAD, dim, bits, WEAVE_PACK_LANE,
+								nlane, cur_version) == 0);
 	assert(weave_quantizer_init(&w->q, dim, bits, NULL, malloc, free) == 0);
 
 	w->nlane = nlane;
@@ -195,7 +219,7 @@ weft_build(Weft *w, int dim, int bits, unsigned int nlane, int livemod,
 	w->scale = (float *) calloc((size_t) nlane, sizeof(float));
 	w->norm = (float *) calloc((size_t) nlane, sizeof(float));
 	w->live = (weave_uint8 *) calloc((size_t) nlane, 1);
-	w->codepage = (weave_uint8 *) malloc((size_t) w->g.nstrips * PAYLOAD);
+	w->codepage = (weave_uint8 *) malloc((size_t) w->g.npages * PAYLOAD);
 	w->dirpage = (weave_uint8 *) malloc((size_t) w->g.ndirpages * PAYLOAD);
 	w->blocks = (weave_uint8 *) calloc((size_t) w->g.nblocks,
 									   (size_t) w->g.blockbytes);
@@ -205,7 +229,7 @@ weft_build(Weft *w, int dim, int bits, unsigned int nlane, int livemod,
 										sizeof(WeaveVecDirRec));
 	assert(w->code && w->scale && w->norm && w->live && w->codepage &&
 		   w->dirpage && w->blocks && w->cencodes && w->recs);
-	memset(w->codepage, poison, (size_t) w->g.nstrips * PAYLOAD);
+	memset(w->codepage, poison, (size_t) w->g.npages * PAYLOAD);
 	memset(w->dirpage, poison, (size_t) w->g.ndirpages * PAYLOAD);
 
 	/* encode: every livemod'th lane is a dead one (a NULL or zero vector) */
@@ -321,22 +345,15 @@ weft_write(Weft *w)
 			assert(weave_vecdir_write(w->dirpage + (size_t) dirpg * PAYLOAD,
 									  PAYLOAD, PAYLOAD, dirslot, rec) == 0);
 
-			for (k = 0; k < w->g.strips_per_block; k++)
+			/* the backend writer's loop: pages, not strips, since v4 */
+			for (k = 0; k < w->g.pages_per_block; k++)
 			{
-				WeaveVecStripPlan p;
-				unsigned int si = b * (unsigned int) w->g.strips_per_block +
+				unsigned int pi = b * (unsigned int) w->g.pages_per_block +
 					(unsigned int) k;
-				weave_uint8 *dst = w->codepage + (size_t) si * PAYLOAD;
-				int			n;
 
-				assert(weave_vecweft_strip_plan(&w->g, si, &p) == 0);
-				if ((p.flags & WEAVE_VSTRIP_F_CENTROID) != 0)
-					n = weave_censtrip_build(dst, PAYLOAD, &w->g, &p, cencode);
-				else
-					n = weave_strip_build(dst, PAYLOAD, WEAVE_PACK_LANE, dim,
-										  bits, p.blockno, p.j0, p.ncoords,
-										  p.flags, block);
-				assert(n > 0);
+				assert(weave_vecweft_page_build(w->codepage + (size_t) pi * PAYLOAD,
+												PAYLOAD, &w->g, b, k, block,
+												cencode) > 0);
 			}
 		}
 		free(recon);
@@ -354,6 +371,26 @@ prop_partition(const Weft *w)
 	int		   *cencov = (int *) calloc((size_t) w->g.dim, sizeof(int));
 
 	assert(lanecov && cencov);
+
+	/* P1b: the packing decision is the spec's rule, computed here independently */
+	{
+		int			nlast = w->g.dim - (w->g.lane_strips - 1) * w->g.lane_cpp;
+		int			laneend = ((12 + 4 * w->g.bits * nlast) + 3) & ~3;
+		int			cenbytes = (w->g.dim * w->g.bits + 7) / 8;
+		int			fits = (w->g.version >= 4 && w->g.cen_strips == 1 &&
+							laneend + 12 + cenbytes <= PAYLOAD);
+
+		CHECK(w->g.cen_packed == fits,
+			  "dim %d bits %d v%d: cen_packed %d but the spec's rule says %d",
+			  w->g.dim, w->g.bits, w->g.version, w->g.cen_packed, fits);
+		CHECK(w->g.pages_per_block ==
+			  w->g.lane_strips + w->g.cen_strips - (fits ? 1 : 0),
+			  "dim %d bits %d v%d: %d pages per block", w->g.dim, w->g.bits,
+			  w->g.version, w->g.pages_per_block);
+		CHECK(w->g.npages == w->g.nblocks * (weave_uint32) w->g.pages_per_block,
+			  "npages %u is not nblocks x pages_per_block", w->g.npages);
+	}
+
 	for (b = 0; b < w->g.nblocks; b++)
 	{
 		int			k;
@@ -386,8 +423,17 @@ prop_partition(const Weft *w)
 				CHECK(p.j0 % w->g.cen_gran == 0,
 					  "centroid strip %u starts at coordinate %d, not a multiple of %d",
 					  si, p.j0, w->g.cen_gran);
-			CHECK(p.nbytes > 0 && p.nbytes <= PAYLOAD - 12,
-				  "strip %u payload %d does not fit a page", si, p.nbytes);
+			CHECK(p.nbytes > 0 && p.pageoff + 12 + p.nbytes <= PAYLOAD,
+				  "strip %u payload %d at offset %d does not fit a page", si,
+				  p.nbytes, p.pageoff);
+			CHECK(p.page >= 0 && p.page < w->g.pages_per_block &&
+				  p.pageoff % 4 == 0,
+				  "strip %u is on page %d at offset %d", si, p.page, p.pageoff);
+			CHECK(((p.flags & WEAVE_VSTRIP_F_CENTROID) != 0 && w->g.cen_packed)
+				  ? (p.page == w->g.lane_strips - 1 && p.pageoff > 0)
+				  : (p.page == k && p.pageoff == 0),
+				  "strip %u (k %d) placed on page %d at %d, against the layout",
+				  si, k, p.page, p.pageoff);
 		}
 		for (j = 0; j < w->g.dim; j++)
 		{
@@ -454,8 +500,9 @@ prop_roundtrip(const Weft *w)
 		memset(block, 0, (size_t) w->g.blockbytes);
 		memset(cencode, 0, (size_t) w->g.codebytes);
 
-		/* scan every page for this block's strips, as the backend reader does */
-		for (si = 0; si < w->g.nstrips; si++)
+		/* scan every page for this block's strips, as the backend reader does --
+		 * with a reader that knows only the spec's byte rule, not the plan */
+		for (si = 0; si < w->g.npages; si++)
 		{
 			const weave_uint8 *pg = w->codepage + (size_t) si * PAYLOAD;
 			const WeaveVecStripHdr *raw = (const WeaveVecStripHdr *) pg;
@@ -477,6 +524,8 @@ prop_roundtrip(const Weft *w)
 			}
 			else
 			{
+				int			end;
+
 				n = weave_strip_parse(pg, PAYLOAD, w->g.dim, w->g.bits, &hdr,
 									  &bytes, &why);
 				CHECK(n > 0, "lane strip %u unparseable: %s", si,
@@ -485,8 +534,49 @@ prop_roundtrip(const Weft *w)
 					CHECK(weave_strip_scatter(block, w->g.blockbytes, w->g.dim,
 											  w->g.bits, &hdr, bytes) == 0,
 						  "lane strip %u does not scatter", si);
+				/* sect. 7.1 v4: a second header at align4(end of the lane strip) */
+				end = ((12 + 4 * w->g.bits * (n > 0 ? n : 0)) + 3) & ~3;
+				if (n > 0 && end + 12 <= PAYLOAD &&
+					((const WeaveVecStripHdr *) (pg + end))->ncoords != 0)
+				{
+					CHECK(w->g.cen_packed, "page %u carries a second strip in an unpacked weft", si);
+					n = weave_censtrip_parse(pg + end, PAYLOAD - end, &w->g, &hdr,
+											 &bytes, &why);
+					CHECK(n > 0 && hdr.blockno == b,
+						  "packed centroid strip on page %u unparseable: %s", si,
+						  why != NULL ? why : "wrong block");
+					if (n > 0)
+						CHECK(weave_censtrip_scatter(cencode, w->g.codebytes,
+													 &w->g, &hdr, bytes) == 0,
+							  "packed centroid strip on page %u does not scatter", si);
+					nseen++;
+				}
 			}
 			nseen++;
+		}
+
+		/* ... and the production reader, page by page, must agree with it */
+		{
+			weave_uint8 *pblock = (weave_uint8 *) calloc(1, (size_t) w->g.blockbytes);
+			weave_uint8 *pcen = (weave_uint8 *) calloc(1, (size_t) w->g.codebytes);
+			int			k;
+
+			assert(pblock && pcen);
+			for (k = 0; k < w->g.pages_per_block; k++)
+			{
+				const weave_uint8 *pg = w->codepage +
+					((size_t) b * w->g.pages_per_block + (size_t) k) * PAYLOAD;
+
+				CHECK(weave_vecweft_page_take(&w->g, pg, PAYLOAD, b, k, pblock,
+											  pcen, &why) > 0,
+					  "block %u page %d refused by the production reader: %s", b,
+					  k, why != NULL ? why : "?");
+			}
+			CHECK(memcmp(pblock, block, (size_t) w->g.blockbytes) == 0 &&
+				  memcmp(pcen, cencode, (size_t) w->g.codebytes) == 0,
+				  "block %u: the production page reader and the spec-rule reader disagree", b);
+			free(pblock);
+			free(pcen);
 		}
 		CHECK(nseen == w->g.strips_per_block,
 			  "block %u was reassembled from %d strips, not %d", b, nseen,
@@ -608,7 +698,34 @@ prop_refusals(void)
 	CHECK(weave_vecweft_geom(&g, 12, 64, 4, WEAVE_PACK_LANE, 10) == -1,
 		  "a page with no room for a coordinate was accepted");
 
+	CHECK(weave_vecweft_geom_v(&g, PAYLOAD, 64, 4, WEAVE_PACK_LANE, 10, 2) == -1,
+		  "a v2 weft geometry was accepted");
+	CHECK(weave_vecweft_geom_v(&g, PAYLOAD, 64, 4, WEAVE_PACK_LANE, 10, 5) == -1,
+		  "a v5 weft geometry was accepted");
+
 	assert(weave_vecweft_geom(&g, PAYLOAD, 64, 4, WEAVE_PACK_LANE, 100) == 0);
+	CHECK(g.cen_packed && g.pages_per_block == 1,
+		  "a 64-d 4-bit v4 weft does not pack its centroid");
+	{
+		weave_uint8 *block = (weave_uint8 *) calloc(1, (size_t) g.blockbytes);
+		const char *why = NULL;
+
+		assert(block != NULL);
+		CHECK(weave_vecweft_page_build(buf, PAYLOAD, &g, 0, 1, block, code) == -1,
+			  "a page past the block's layout was built");
+		CHECK(weave_vecweft_page_build(buf, PAYLOAD, &g, g.nblocks, 0, block,
+									   code) == -1,
+			  "a page of a block past the weft was built");
+		assert(weave_vecweft_page_build(buf, PAYLOAD, &g, 0, 0, block, code) > 0);
+		CHECK(weave_vecweft_page_take(&g, buf, PAYLOAD, 1, 0, NULL, NULL, &why) == -1,
+			  "block 0's page was accepted as block 1's");
+		CHECK(weave_vecweft_page_take(&g, buf, 100, 0, 0, NULL, NULL, &why) == -1,
+			  "a page payload too short for its packed centroid was accepted");
+		buf[WEAVE_VECWEFT_ALIGN(12 + 16 * 64) + 4] ^= 1;	/* centroid j0 */
+		CHECK(weave_vecweft_page_take(&g, buf, PAYLOAD, 0, 0, NULL, NULL, &why) == -1,
+			  "a packed centroid strip claiming the wrong range was accepted");
+		free(block);
+	}
 	CHECK(weave_vecweft_strip_plan(&g, g.nstrips, &p) == -1,
 		  "a strip index past the weft was accepted");
 
@@ -673,6 +790,8 @@ prop_sweep_not_vacuous(const int *dims, int ndims)
 	int			bits;
 	int			multi = 0;
 	int			middle = 0;
+	int			packed = 0;
+	int			spilled = 0;
 
 	for (di = 0; di < ndims; di++)
 	{
@@ -689,8 +808,15 @@ prop_sweep_not_vacuous(const int *dims, int ndims)
 				multi++;
 			if (g.lane_strips >= 3)
 				middle++;
+			if (g.cen_packed)
+				packed++;
+			else
+				spilled++;
 		}
 	}
+	CHECK(packed > 0 && spilled > 0,
+		  "the v4 sweep must contain a geometry whose centroid packs (%d) AND one whose centroid spills to its own page (%d)",
+		  packed, spilled);
 	CHECK(multi > 0,
 		  "no swept geometry has more than one lane strip per block: every j0 is 0 and the coordinate cut is untested");
 	CHECK(middle > 0,
@@ -712,7 +838,7 @@ weft_read_lane(const Weft *w, unsigned int warp, weave_uint8 *code)
 	int			nseen = 0;
 
 	assert(block != NULL);
-	for (si = 0; si < w->g.nstrips; si++)
+	for (si = 0; si < w->g.npages; si++)
 	{
 		const weave_uint8 *pg = w->codepage + (size_t) si * PAYLOAD;
 		const WeaveVecStripHdr *raw = (const WeaveVecStripHdr *) pg;
@@ -823,8 +949,8 @@ prop_move(const Weft *src)
 
 	/* write the output weft through the SAME writer, from pre-encoded lanes */
 	memset(&dst, 0, sizeof(dst));
-	assert(weave_vecweft_geom(&dst.g, PAYLOAD, src->g.dim, src->g.bits,
-							  WEAVE_PACK_LANE, nlive) == 0);
+	assert(weave_vecweft_geom_v(&dst.g, PAYLOAD, src->g.dim, src->g.bits,
+								WEAVE_PACK_LANE, nlive, cur_version) == 0);
 	assert(weave_quantizer_init(&dst.q, src->g.dim, src->g.bits, NULL,
 								malloc, free) == 0);
 	dst.nlane = nlive;
@@ -832,7 +958,7 @@ prop_move(const Weft *src)
 	dst.scale = (float *) calloc((size_t) nlive, sizeof(float));
 	dst.norm = (float *) calloc((size_t) nlive, sizeof(float));
 	dst.live = (weave_uint8 *) calloc((size_t) nlive, 1);
-	dst.codepage = (weave_uint8 *) malloc((size_t) dst.g.nstrips * PAYLOAD);
+	dst.codepage = (weave_uint8 *) malloc((size_t) dst.g.npages * PAYLOAD);
 	dst.dirpage = (weave_uint8 *) malloc((size_t) dst.g.ndirpages * PAYLOAD);
 	dst.blocks = (weave_uint8 *) calloc((size_t) dst.g.nblocks,
 										(size_t) dst.g.blockbytes);
@@ -842,7 +968,7 @@ prop_move(const Weft *src)
 										 sizeof(WeaveVecDirRec));
 	assert(dst.code && dst.scale && dst.norm && dst.live && dst.codepage &&
 		   dst.dirpage && dst.blocks && dst.cencodes && dst.recs);
-	memset(dst.codepage, 0x5A, (size_t) dst.g.nstrips * PAYLOAD);
+	memset(dst.codepage, 0x5A, (size_t) dst.g.npages * PAYLOAD);
 	memset(dst.dirpage, 0x5A, (size_t) dst.g.ndirpages * PAYLOAD);
 	for (i = 0; i < nlive; i++)
 	{
@@ -885,6 +1011,156 @@ prop_move(const Weft *src)
 	free(codes);
 }
 
+/*
+ * Write a weft from lanes that are ALREADY ENCODED, at `version`: the writer half
+ * of producer 2 (sect. 7.3), which is what a merge's output is.
+ */
+static void
+weft_from_lanes(Weft *w, int dim, int bits, unsigned int n,
+				const weave_uint8 *code, const float *scale, const float *norm,
+				const weave_uint8 *live, int version)
+{
+	memset(w, 0, sizeof(*w));
+	assert(weave_vecweft_geom_v(&w->g, PAYLOAD, dim, bits, WEAVE_PACK_LANE, n,
+								version) == 0);
+	assert(weave_quantizer_init(&w->q, dim, bits, NULL, malloc, free) == 0);
+	w->nlane = n;
+	w->code = (weave_uint8 *) malloc((size_t) n * w->g.codebytes);
+	w->scale = (float *) malloc((size_t) n * sizeof(float));
+	w->norm = (float *) malloc((size_t) n * sizeof(float));
+	w->live = (weave_uint8 *) malloc((size_t) n);
+	w->codepage = (weave_uint8 *) malloc((size_t) w->g.npages * PAYLOAD);
+	w->dirpage = (weave_uint8 *) malloc((size_t) w->g.ndirpages * PAYLOAD);
+	w->blocks = (weave_uint8 *) calloc((size_t) w->g.nblocks,
+									   (size_t) w->g.blockbytes);
+	w->cencodes = (weave_uint8 *) calloc((size_t) w->g.nblocks,
+										 (size_t) w->g.codebytes);
+	w->recs = (WeaveVecDirRec *) calloc((size_t) w->g.nblocks,
+										sizeof(WeaveVecDirRec));
+	assert(w->code && w->scale && w->norm && w->live && w->codepage &&
+		   w->dirpage && w->blocks && w->cencodes && w->recs);
+	memcpy(w->code, code, (size_t) n * w->g.codebytes);
+	memcpy(w->scale, scale, (size_t) n * sizeof(float));
+	memcpy(w->norm, norm, (size_t) n * sizeof(float));
+	memcpy(w->live, live, (size_t) n);
+	memset(w->codepage, 0xC3, (size_t) w->g.npages * PAYLOAD);
+	memset(w->dirpage, 0xC3, (size_t) w->g.ndirpages * PAYLOAD);
+	weft_write(w);
+}
+
+/*
+ * P8: bit identity across SHAPE.  `w` is the whole lane sequence written once at
+ * the current version.  Split it at `cuts`, write every part as a weft of its own
+ * at `inver`, read each part's lanes back OFF ITS PAGES (codes through
+ * weft_read_lane, the (scale, norm) pair through the directory record, exactly as
+ * weave_vec_merge_append() does), concatenate -- a merge of runs in docid order --
+ * and write the result at the current version.  Every code page and directory page
+ * must equal w's, byte for byte.
+ */
+static void
+prop_shape_identity(const Weft *w, const unsigned int *cuts, int ncuts, int inver)
+{
+	unsigned int n = w->nlane;
+	weave_uint8 *code = (weave_uint8 *) calloc((size_t) n, (size_t) w->g.codebytes);
+	float	   *scale = (float *) calloc((size_t) n, sizeof(float));
+	float	   *norm = (float *) calloc((size_t) n, sizeof(float));
+	weave_uint8 *live = (weave_uint8 *) calloc((size_t) n, 1);
+	unsigned int lo = 0;
+	int			c;
+	Weft		m;
+
+	assert(code && scale && norm && live);
+	for (c = 0; c <= ncuts; c++)
+	{
+		unsigned int hi = (c < ncuts) ? cuts[c] : n;
+		Weft		part;
+		unsigned int i;
+
+		if (hi <= lo || hi > n)
+			continue;
+		weft_from_lanes(&part, w->g.dim, w->g.bits, hi - lo,
+						w->code + (size_t) lo * w->g.codebytes, w->scale + lo,
+						w->norm + lo, w->live + lo, inver);
+		for (i = 0; i < hi - lo; i++)
+		{
+			unsigned int b = i / WEAVE_VEC_BLOCK;
+			int			sl = (int) (i % WEAVE_VEC_BLOCK);
+			WeaveVecDirRec rec;
+			const char *why = NULL;
+
+			assert(weave_vecdir_read(part.dirpage +
+									 (size_t) weave_vecdir_page_index(b, part.g.rpp) * PAYLOAD,
+									 PAYLOAD, PAYLOAD,
+									 weave_vecdir_slot_index(b, part.g.rpp),
+									 &rec, &why) == 0);
+			if ((rec.livemask & (1u << sl)) == 0)
+				continue;		/* dead: zero code, zero pair, live 0 */
+			CHECK(weft_read_lane(&part, i, code + (size_t) (lo + i) * w->g.codebytes) == 0,
+				  "P8 dim %d bits %d: part lane %u unreadable", w->g.dim,
+				  w->g.bits, i);
+			scale[lo + i] = rec.lane[2 * sl];
+			norm[lo + i] = rec.lane[2 * sl + 1];
+			live[lo + i] = 1;
+		}
+		weft_free(&part);
+		lo = hi;
+	}
+
+	weft_from_lanes(&m, w->g.dim, w->g.bits, n, code, scale, norm, live,
+					w->g.version);
+	CHECK(m.g.npages == w->g.npages &&
+		  memcmp(m.codepage, w->codepage, (size_t) w->g.npages * PAYLOAD) == 0,
+		  "P8 dim %d bits %d nvec %u: a merge of %d part(s) written at v%d does not reproduce the code pages of one v%d write",
+		  w->g.dim, w->g.bits, n, ncuts + 1, inver, w->g.version);
+	CHECK(memcmp(m.dirpage, w->dirpage, (size_t) w->g.ndirpages * PAYLOAD) == 0,
+		  "P8 dim %d bits %d nvec %u: the merged directory pages differ",
+		  w->g.dim, w->g.bits, n);
+	weft_free(&m);
+	free(code);
+	free(scale);
+	free(norm);
+	free(live);
+}
+
+/*
+ * P9: a reader whose geometry disagrees with the writer's about packing is refused
+ * somewhere in the chain, walking it exactly as the scan cursor does -- page k of
+ * block b is the next page on the chain, taken by weave_vecweft_page_take().
+ */
+static void
+prop_version_mismatch_refused(const Weft *w, int readver)
+{
+	WeaveVecWeftGeom rg;
+	unsigned int b;
+	unsigned int at = 0;
+	int			refused = 0;
+	const char *why = NULL;
+
+	assert(weave_vecweft_geom_v(&rg, PAYLOAD, w->g.dim, w->g.bits,
+								WEAVE_PACK_LANE, w->nlane, readver) == 0);
+	if (rg.cen_packed == w->g.cen_packed)
+		return;					/* same layout: nothing to disagree about */
+	for (b = 0; b < rg.nblocks && !refused; b++)
+	{
+		int			k;
+
+		for (k = 0; k < rg.pages_per_block && !refused; k++)
+		{
+			if (at >= w->g.npages)
+				refused = 1;	/* the chain ends early: the cursor refuses */
+			else if (weave_vecweft_page_take(&rg, w->codepage + (size_t) at * PAYLOAD,
+											 PAYLOAD, b, k, NULL, NULL, &why) < 0)
+				refused = 1;
+			at++;
+		}
+	}
+	if (!refused && at != w->g.npages)
+		refused = 1;			/* weave_check()'s chain-length invariant */
+	CHECK(refused,
+		  "P9 dim %d bits %d: v%d pages read through a v%d geometry were ACCEPTED",
+		  w->g.dim, w->g.bits, w->g.version, readver);
+}
+
 static void
 one_point(int dim, int bits, unsigned int nlane, int livemod)
 {
@@ -896,6 +1172,25 @@ one_point(int dim, int bits, unsigned int nlane, int livemod)
 	prop_roundtrip(&w);
 	prop_wrong_slot_detectable(&w);
 	prop_move(&w);
+	prop_version_mismatch_refused(&w, WEAVE_VECWEFT_V3);
+	prop_version_mismatch_refused(&w, WEAVE_VECWEFT_V4);
+	if (w.g.version == WEAVE_VECWEFT_CUR)
+	{
+		/* cuts on a block boundary, inside a block, and three-way; inputs at both
+		 * versions, because an upgraded index merges v3 bolts into a v4 one */
+		unsigned int c1[1] = {32};
+		unsigned int c2[1] = {nlane / 2 + 1};
+		unsigned int c3[2] = {nlane / 3, (2 * nlane) / 3 + 5};
+		int			iv;
+
+		for (iv = WEAVE_VECWEFT_V3; iv <= WEAVE_VECWEFT_V4; iv++)
+		{
+			prop_shape_identity(&w, NULL, 0, iv);
+			prop_shape_identity(&w, c1, 1, iv);
+			prop_shape_identity(&w, c2, 1, iv);
+			prop_shape_identity(&w, c3, 2, iv);
+		}
+	}
 
 	/*
 	 * P4: determinism.  Same vectors -- the RNG is re-seeded so the second run
@@ -911,7 +1206,7 @@ one_point(int dim, int bits, unsigned int nlane, int livemod)
 		rngstate = 88172645463325252ull;
 		weft_build(&w2, dim, bits, nlane, livemod, 0xFF);
 		CHECK(memcmp(w.codepage, w2.codepage,
-					 (size_t) w.g.nstrips * PAYLOAD) == 0,
+					 (size_t) w.g.npages * PAYLOAD) == 0,
 			  "dim %d bits %d: the code pages are not deterministic", dim, bits);
 		CHECK(memcmp(w.dirpage, w2.dirpage,
 					 (size_t) w.g.ndirpages * PAYLOAD) == 0,
@@ -933,16 +1228,22 @@ main(void)
 	 * something it cannot score.  Recorded here because it is a real product limit
 	 * that no document stated.
 	 */
-	static const int dims[] = {4, 15, 64, 96, 509, 510, 511, 960, 1536};
+	/* 384 / 768 / 960 / 1024 pack at 4 bits; 500 and 1000 are in the spill bands
+	 * (sect. 7.1 "v4": the last lane page is too full for the centroid) */
+	static const int dims[] = {4, 15, 64, 96, 384, 500, 509, 510, 511, 768, 960,
+	1000, 1024, 1536};
 	static const unsigned int lanes[] = {1, 31, 32, 33, 100, 289};
 	int			di;
 	int			bits;
 	int			li;
+	int			ver;
 
 	prop_sweep_not_vacuous(dims, (int) (sizeof(dims) / sizeof(dims[0])));
 
+	for (ver = WEAVE_VECWEFT_V3; ver <= WEAVE_VECWEFT_V4; ver++)
 	for (di = 0; di < (int) (sizeof(dims) / sizeof(dims[0])); di++)
 	{
+		cur_version = ver;
 		for (bits = WEAVE_BITS_MIN; bits <= WEAVE_BITS_MAX; bits++)
 		{
 			for (li = 0; li < (int) (sizeof(lanes) / sizeof(lanes[0])); li++)
@@ -957,6 +1258,7 @@ main(void)
 			}
 		}
 	}
+	cur_version = WEAVE_VECWEFT_CUR;
 	prop_refusals();
 
 	printf("checks: %ld, failures: %ld\n", checks, failures);
