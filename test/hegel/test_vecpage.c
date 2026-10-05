@@ -206,6 +206,12 @@ one_point(int dim, int bits, int usable)
 							  (weave_uint32) 7, j0, ncoords, 0, block);
 		CHECK(n == (int) need, "dim=%d bits=%d: build returned %d, wanted %zu",
 			  dim, bits, n, need);
+		/* v4 (doc/specs/VECTOR_CHANNEL.md sect. 7.1) puts a second strip header at
+		 * align4(end of the lane strip) and says the pad is always zero bytes
+		 * because a lane strip's size is a multiple of 4.  Pin that claim here,
+		 * where every (dim, bits, ncoords) a strip can have is swept. */
+		CHECK(n % 4 == 0, "dim=%d bits=%d ncoords=%d: a lane strip of %d bytes is not 4-aligned",
+			  dim, bits, ncoords, n);
 
 		/* P5: nothing outside the buffer moved. */
 		for (i = 0; i < GUARD; i++)

@@ -32,6 +32,10 @@ done
 # reader are too big to live in a header, so the target links the REAL
 # src/query/surftrie.c (no transcription, no modeling gap).
 $CC $CFLAGS "$here/fuzz_surftrie.c" "$root/src/query/surftrie.c" -o "$out/fuzz_surftrie"
+$CC $CFLAGS "$here/fuzz_vecstrip.c" "$root/src/vector/vecweft.c" "$root/src/vector/vecpage.c" \
+    -o "$out/fuzz_vecstrip"
+$CC $CFLAGS -DWEAVE_VECWEFT_PLANT_NO_OFF_LEN=1 "$here/fuzz_vecstrip.c" \
+    "$root/src/vector/vecweft.c" "$root/src/vector/vecpage.c" -o "$out/fuzz_vecstrip_nooff"
 # planted-bug binaries: fuzz_block with (a) the count clamp reverted, (b) the
 # shipped ONE-SIDED clamp (misses count>INT_MAX -> negative int -> wild read),
 # and (c) a fully-random FOR stream (corrupt width -> read past page).  All MUST
@@ -83,7 +87,7 @@ $CC $CFLAGS -DWEAVE_PAGEBOUND_PLANT_NO_LOW_GUARD=1 "$here/fuzz_pagebound.c" \
 echo "== running fuzzers =="
 rc=0
 for f in fuzz_for fuzz_docvalid fuzz_block fuzz_chandesc fuzz_docvals fuzz_surftrie fuzz_dictwalk \
-         fuzz_pagebound; do
+         fuzz_pagebound fuzz_vecstrip; do
     if "$out/$f"; then
         echo "PASS: $f"
     else
@@ -137,6 +141,17 @@ fi
 # The chandesc no-array-guard build lets a corrupt nweft walk the descriptor
 # array past the buffer; ASan must abort it -- proving the harness detects the
 # missing-length-guard class on the v6 channel-descriptor page.
+# The vector code-page reader with the strip's remaining length computed from the
+# page start rather than the strip's offset: invisible for a strip at offset 0, so
+# only the v4 packed centroid (doc/specs/VECTOR_CHANNEL.md sect. 7.1) exposes it,
+# and ASan must abort on a truncated page.
+if "$out/fuzz_vecstrip_nooff" >/dev/null 2>&1; then
+    echo "FAIL: fuzz_vecstrip_nooff exited 0 -- harness did NOT catch the offset-blind length!"
+    rc=1
+else
+    echo "PASS: fuzz_vecstrip_nooff aborted as expected (packed-strip length teeth)"
+fi
+
 if "$out/fuzz_chandesc_noarray" >/dev/null 2>&1; then
     echo "FAIL: fuzz_chandesc_noarray exited 0 -- harness did NOT catch the missing array guard!"
     rc=1
