@@ -177,7 +177,8 @@ typedef struct WeaveVecMeta
 								 * block-major.  A page holds one coordinate range
 								 * of one block's 32 lanes; the centroid code is
 								 * sliced the same way and follows a block's lane
-								 * strips. */
+								 * strips -- on the last lane page itself in a v4
+								 * weft whenever it fits (geom.cen_packed). */
 	BlockNumber warpstart;		/* first WEAVE_PK_VWARP page: warp -> docid, 8 bytes
 								 * per lane.  Never Invalid on a weft that exists --
 								 * a weft that cannot name the document behind a warp
@@ -207,7 +208,19 @@ typedef struct WeaveVecMeta
  * version ever wrote a v1 weft: the vector weft and this change are both after tag
  * v2026.09.06, so the refusal is reachable only from a working tree.
  */
-#define WEAVE_VMETA_VERSION		3
+#define WEAVE_VMETA_VERSION		WEAVE_VECWEFT_CUR	/* 4: weave/vecweft.h */
+#define WEAVE_VMETA_VERSION_MIN	WEAVE_VECWEFT_V3	/* oldest still read */
+
+/*
+ * 4 since 2026-10-05: a code page may carry its block's centroid strip after the
+ * last lane strip (doc/specs/VECTOR_CHANNEL.md sect. 7.1 "v4"), which takes the
+ * centroid's whole page -- 256 B/vector at every dim -- out of the index.  v3 wefts
+ * are STILL READ: the version off the VMETA page goes into WeaveVecWeftGeom and
+ * every reader asks the geometry where a strip is, never this constant.  An
+ * upgraded index holds both until a merge rewrites the old bolts (the output is
+ * always v4).  WEAVE_VERSION does not bump: doc/specs/SEGMENT_FORMAT.md sect. 8
+ * item 7.
+ */
 
 /*
  * 3 since G27's block->page pointer: WeaveVecDirRec gained `firstpage`, which moved
@@ -547,39 +560,16 @@ extern bool weave_vec_dir_read(const WeaveVecWeft *w, uint32 blockno,
  * the 0-28 slack bytes weave_block_codebytes() counts and no pack function writes
  * are defined on both sides of the round trip.
  *
- * COST, stated because it is not what sect. 7.1 implies: the strips are found by
- * WALKING the code chain, so this is O(pages in the weft) and not the
- * ceil(dim/coords_per_page) the block-major argument promises.  The ratified
- * format has no index over the strips and WeaveVecDirRec has no room for one, so
- * O(1) single-block access is not available to a reader; see the note in
- * doc/specs/VECTOR_CHANNEL.md sect. 7.1.  V7's callers (weave_check(), the round
- * trip) walk the whole weft anyway.  THE SCAN DOES NOT USE THIS AT ALL: once per
- * block it is O(blocks x pages), quadratic in the weft, so task V8 carries a
- * forward-only cursor over the same chain instead (src/vector/vecshuttle.c),
- * sharing weave_vec_strip_take() below.  V10's rerank window and vacuum's lane
- * update still want single-block access, and that is the task that has to add the
- * index.
+ * COST: the strips are found by WALKING the code chain from codestart, so this is
+ * O(pages in the weft).  The directory's `firstpage` (G27) would make it O(1) and
+ * the scan cursor uses it; this reader does not yet, because its callers --
+ * weave_check(), the merge producer, weave_vec_lanes() -- walk every block anyway.
+ * Each page is taken through weave_vecweft_page_take(), the one reader of the page
+ * layout, shared with the scan's cursor (src/vector/vecshuttle.c).
  */
 extern bool weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno,
 								 uint8 *block, uint8 *cencode,
 								 const char **why);
-
-/*
- * Take one WEAVE_PK_VCODES page's strip into the block it belongs to, validating
- * it against the weft's strip plan first.  The shared half of the two readers of
- * the code chain: weave_vec_block_read() above, which walks the whole chain per
- * block, and the forward-only cursor the scan uses (src/vector/vecshuttle.c),
- * which cannot afford to.  Exported for that second caller and for no other
- * reason -- two implementations of the strip format would not crash, they would
- * return wrong distances (src/vector/pack.c).
- *
- * `block` and `cencode` may be NULL: a strip whose destination is NULL is still
- * parsed and still counted, so a chain walk that wants no bytes -- which is what a
- * block skipped on the allowlist is -- validates the chain without scattering.
- */
-extern bool weave_vec_strip_take(const WeaveVecWeft *w, const void *contents,
-								 uint32 blockno, uint8 *block, uint8 *cencode,
-								 bool *seen, int *nseen, const char **why);
 
 /*
  * A forward cursor over a weft's warp map: warp 0's docid, then warp 1's, for all

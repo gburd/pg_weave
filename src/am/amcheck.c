@@ -954,6 +954,43 @@ wvck_vector(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 			continue;
 		}
 
+		/*
+		 * THE CODE CHAIN IS EXACTLY geom.npages PAGES.  pages_per_block is a
+		 * function of (dim, bits, version) -- one strip per page in v3, the
+		 * centroid on the last lane page in a v4 weft where it fits -- so a chain
+		 * of any other length means the writer and the layout disagree, which no
+		 * per-block read below can see: weave_vec_block_read() takes the pages that
+		 * claim a block, and an extra page claiming no valid block is invisible to
+		 * it.  This is the v4 half of "plan and reader cannot disagree".
+		 */
+		{
+			BlockNumber cblk = w.meta.codestart;
+			BlockNumber nrel = RelationGetNumberOfBlocks(cx->index);
+			uint32		ncode = 0;
+
+			while (cblk != InvalidBlockNumber && cblk != WEAVE_METAPAGE_BLKNO &&
+				   cblk < nrel && ncode <= w.geom.npages)
+			{
+				Buffer		cbuf = ReadBuffer(cx->index, cblk);
+
+				CHECK_FOR_INTERRUPTS();
+				LockBuffer(cbuf, BUFFER_LOCK_SHARE);
+				cblk = WeavePageGetOpaque(BufferGetPage(cbuf))->nextblk;
+				UnlockReleaseBuffer(cbuf);
+				ncode++;
+			}
+			if (ncode != w.geom.npages)
+			{
+				ok = false;
+				appendStringInfo(&d, "%sbolt %u: the vector code chain has %u pages where a v%d weft of %u blocks at %d pages per block has %u",
+								 d.len > 0 ? "; " : "", s, ncode,
+								 w.geom.version, w.geom.nblocks,
+								 w.geom.pages_per_block, w.geom.npages);
+				weave_quantizer_free(&q, pfree);
+				continue;
+			}
+		}
+
 		block = (uint8 *) palloc(w.geom.blockbytes);
 		cencode = (uint8 *) palloc(w.geom.codebytes);
 		recode = (uint8 *) palloc(w.geom.codebytes);

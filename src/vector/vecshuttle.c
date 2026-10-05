@@ -256,10 +256,12 @@ dir_cur_advance(VecDirCursor *c, uint32 target, WeaveVecDirRec *out,
 /* ---------------------------------------------------------------------------
  * Cursor 2: the codes
  *
- * One strip per page, strips_per_block pages per block, block-major -- the order
- * weave_vecweft_strip_plan() defines and src/vector/vecwrite.c emits.  This cursor
- * VALIDATES that order rather than filtering on it the way weave_vec_block_read()
- * does: page k of block b must claim block b.  That is a strictly stronger check
+ * geom.pages_per_block pages per block, block-major -- the layout
+ * weave_vecweft_strip_plan() defines and src/vector/vecwrite.c emits (one strip per
+ * page in v3; in a v4 weft whose centroid fits, the last lane page carries the
+ * centroid strip too).  This cursor VALIDATES that order rather than filtering on it
+ * the way weave_vec_block_read() does: page k of block b must BE page k of block b,
+ * which weave_vecweft_page_take() decides from the plan.  That is a strictly stronger check
  * and it is what makes a lockstep cursor sound, because a cursor that merely
  * filtered would silently fall out of step with the directory on a mislinked
  * chain and score one block's codes against another's bounds.
@@ -271,7 +273,6 @@ typedef struct VecCodeCursor
 	BlockNumber blk;			/* first strip page of block `blockno` */
 	uint32		blockno;		/* the block the next advance() will assemble */
 	uint32		npages;			/* pages walked, the cycle guard */
-	bool	   *seen;			/* strips_per_block, reset per block */
 	uint8	   *block;			/* geom.blockbytes, valid after a want=true call */
 	uint8	   *cencode;		/* geom.codebytes, same */
 } VecCodeCursor;
@@ -290,7 +291,6 @@ code_cur_begin(VecCodeCursor *c, const WeaveVecWeft *w)
 	c->blk = w->meta.codestart;
 	c->blockno = 0;
 	c->npages = 0;
-	c->seen = (bool *) palloc0((Size) w->geom.strips_per_block * sizeof(bool));
 	c->block = (uint8 *) palloc(w->geom.blockbytes);
 	c->cencode = (uint8 *) palloc(w->geom.codebytes);
 }
@@ -302,9 +302,9 @@ code_cur_begin(VecCodeCursor *c, const WeaveVecWeft *w)
  * `want == false` is the whole point of the cursor: the chain is walked, every
  * strip is still PARSED and still checked against the strip plan -- a corrupt page
  * must not be mistaken for an absent one just because nobody wanted its bytes --
- * and not one byte is scattered.  weave_vec_strip_take() is shared with
- * weave_vec_block_read() so there is exactly one implementation of the strip
- * format; two would not crash, they would return wrong distances
+ * and not one byte is scattered.  weave_vecweft_page_take() is shared with
+ * weave_vec_block_read() so there is exactly one implementation of the page
+ * layout; two would not crash, they would return wrong distances
  * (src/vector/pack.c).
  */
 static bool
@@ -312,7 +312,6 @@ code_cur_block(VecCodeCursor *c, bool want, const char **why)
 {
 	const WeaveVecWeftGeom *g = &c->w->geom;
 	BlockNumber nrel = RelationGetNumberOfBlocks(c->w->index);
-	int			nseen = 0;
 	int			k;
 
 	*why = NULL;
@@ -327,9 +326,7 @@ code_cur_block(VecCodeCursor *c, bool want, const char **why)
 		MemSet(c->block, 0, g->blockbytes);
 		MemSet(c->cencode, 0, g->codebytes);
 	}
-	MemSet(c->seen, 0, (Size) g->strips_per_block * sizeof(bool));
-
-	for (k = 0; k < g->strips_per_block; k++)
+	for (k = 0; k < g->pages_per_block; k++)
 	{
 		Buffer		buf;
 		Page		page;
@@ -338,7 +335,7 @@ code_cur_block(VecCodeCursor *c, bool want, const char **why)
 
 		CHECK_FOR_INTERRUPTS();
 		if (c->blk == InvalidBlockNumber || c->blk == WEAVE_METAPAGE_BLKNO ||
-			c->blk >= nrel || ++c->npages > g->nstrips)
+			c->blk >= nrel || ++c->npages > g->npages)
 		{
 			*why = "the vector code chain ends early, leaves the relation, or cycles";
 			return false;
@@ -359,20 +356,14 @@ code_cur_block(VecCodeCursor *c, bool want, const char **why)
 			*why = "a vector code page does not carry the block the chain's block-major order calls for";
 			return false;
 		}
-		ok = weave_vec_strip_take(c->w, PageGetContents(page), c->blockno,
-								  want ? c->block : NULL,
-								  want ? c->cencode : NULL,
-								  c->seen, &nseen, why);
+		ok = weave_vecweft_page_take(g, PageGetContents(page),
+									 WEAVE_VECPAGE_PAYLOAD, c->blockno, k,
+									 want ? c->block : NULL,
+									 want ? c->cencode : NULL, why) >= 0;
 		c->blk = WeavePageGetOpaque(page)->nextblk;
 		UnlockReleaseBuffer(buf);
 		if (!ok)
 			return false;
-	}
-
-	if (nseen != g->strips_per_block)
-	{
-		*why = "the vector code chain is missing strips for this block";
-		return false;
 	}
 	c->blockno++;
 	return true;
