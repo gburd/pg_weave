@@ -4953,7 +4953,7 @@ or document that its `ctid` column is the root and give the join the
 `heap_get_root_tuples()`-equivalent it needs. The same audit is due for `weave_vec_scan()`,
 which returns docids.
 
-### G75 — t/029's "weave_check(deep) is clean after recovery" failed once: one violated invariant after an immediate stop right after a VACUUM flush — **FOUND 2026-10-04 by the g46 agent's smoke (`pgweave-20261004-221406`, branch at main 89d7dcf + 3 commits touching no C); NOT YET REPRODUCED; OPEN**
+### G75 — a crash during a flush LEAKS every page the flush wrote before its publish record (up to 12): harmless to answers, reclaimable only by REINDEX — **FOUND 2026-10-04 by the g46 agent's smoke (`pgweave-20261004-221406`); RECURRED with its diagnostic and MEASURED deterministically by `t/031` on 2026-10-05; mechanism known; OPEN, fix owed (reclaim on recovery or next VACUUM)**
 
 t/029 (G65's test) crashes the server immediately after a VACUUM that flushes the pending
 list, restarts it, and asserts `weave_check(fa_w, deep)` has zero violated rows. Once, it
