@@ -5039,3 +5039,31 @@ docvalues fixture has a non-NULL `wdoc`.
    prize on nullable columns.
 3. **Document it** as "the lexical column must be NOT NULL", as G71 did before its fix.
    Not acceptable as the end state: it is a wrong answer, not a slow one.
+
+### G78 — `@@@ '!q'` omits documents with NO TERMS (empty text, stopwords only), and the omission depends on the plan — **FOUND 2026-10-04 while scoping G76; a SILENT WRONG ANSWER; OPEN, not investigated past the reproducer**
+
+`weave_match(to_wdoc(''), '!common')` is true, as it should be: a document with no terms
+contains no `common`. The index disagrees. 10 `common` rows, `''`, `'the'`, `'rare'` at
+build, then `''` and `'rare pend'` pending (local, 2026-10-04):
+
+| arm | `!common` |
+|---|---|
+| heap, `weave_match()` | `{101,102,103,201,202}` |
+| weave Index Scan | `{102,103,201,202}`: **101 missing** (the built empty doc) |
+| `weave_count()` | 4 |
+| after `VACUUM` (flushed) | `{102,103,202}`: **201 missing too** |
+
+So the NOT universe is built from postings (`weave_universe_bounded()`), and a document
+with no terms has none. The pending path includes the empty doc until it is flushed. On a
+second table (`g76c`, 300 rows plus an empty doc with a vector) the plain Index Scan
+**included** the empty doc and the Bitmap scan **omitted** it, so the answer depends on the
+plan as well. That second observation is unexplained.
+
+`'the'` matches in the index because `to_wdoc('the')` keeps the stopword as a term. Only a
+document with zero terms is affected.
+
+The likely fix is the universe from the doc-length store or the vector warp map (both
+enumerate every docid in a segment, posting-less ones included; the VWARP chain exists
+for exactly this reason, `doc/specs/VECTOR_CHANNEL.md` "warp → docid"), not from postings.
+
+G76's fix does not rely on the universe: a NOT query keeps the heap walk.
