@@ -627,6 +627,14 @@ first strip" rule is unimplementable at the declared maximum. Instead:
   pages at all. Cost is `1/32` of the code bytes, matching the 3 % the note above
   `weave_codebook_solve()` already predicted.
 
+  > **SUPERSEDED 2026-10-05 on both counts (v4, below).** "Never reads these pages"
+  > was false of the shipped scan: the code cursor (`src/vector/vecshuttle.c`
+  > `code_cur_block()`) reads all `strips_per_block` pages of every block it
+  > visits, the centroid page included, whether it prunes or not. And "1/32 of the
+  > code bytes" was true of the *bytes* and false of the *pages*: one strip per page
+  > gave every centroid a whole 8 KB page, which is **256 B/vector at every dim**,
+  > measured in `bench/RESULTS_VECMAJOR.md` as 24-48 % of the built index.
+
 Every page self-describes, following L17's precedent (a per-object discriminator, not
 a per-index one, because after an upgrade one relation holds both generations):
 
@@ -668,6 +676,92 @@ and the writer packs greedily while a strip fits. That is a writer-side decision
 no format consequence, which is the reason to state it here and implement it once
 there is a low-`dim` corpus to measure it on. Until then the writer emits one strip
 per page and the waste is recorded rather than claimed away.
+
+> **SUPERSEDED 2026-10-05 in one respect: it is NOT free of format consequence.**
+> Every reader of v3 assumed one strip per page -- the scan cursor walked exactly
+> `strips_per_block` pages per block and refused a page whose header named another
+> block -- so a writer that packed would have been read as corrupt. Packing needs
+> the readers to know the layout, which is what v4 below does for the one case that
+> was measured to matter. Cross-block packing of lane strips is still not done; the
+> argument above for it still holds and is still unmeasured.
+
+#### v4 (`WEAVE_VMETA_VERSION` 4): the centroid shares its block's last lane page — ratified 2026-10-05
+
+**Why.** The built index measured 534 / 789 / 789 / 1,045 B/vector at 384 / 768 /
+960 / 1,024-d, of which 256 B/vector at every dim was the centroid strip's page
+(`bench/RESULTS_VECMAJOR.md`). That failed the 0.15× storage gate below 960-d. The
+centroid is `dim*bits/8` bytes -- 192 to 512 at 4 bits -- and the block's last lane
+page has 932 to 8,052 bytes free at those dims, so the bytes fit where a page
+already exists.
+
+**The rule.** A v4 weft's `WEAVE_PK_VCODES` page holds the strips of ONE block, at
+most two of them:
+
+    [ WeaveVecStripHdr | lane payload ] [ pad to 4 ] [ WeaveVecStripHdr(F_CENTROID) | centroid payload ]
+
+- Only the block's **last** lane page may carry a second strip, and the second strip
+  is only ever the block's **sole** centroid strip. Two strips of one page are both
+  self-describing (each has its own header); the second header starts at
+  `align4(12 + ncoords * 4 * bits)` from the payload's start. Four-aligned because
+  the header holds a `uint32`, and a lane strip's size is already a multiple of 4
+  (`4*bits` per coordinate plus a 12-byte header), so the pad is always zero bytes
+  today and the alignment is written down so it stays true.
+- **The writer decides per weft geometry, not per block, and not by choice.**
+  `weave_vecweft_geom()` sets `cen_packed` iff the version is >= 4, the centroid is
+  one strip (it is at every `dim` <= 16,296 at 4 bits, so at every dim the AM
+  accepts), and `align4(12 + 4*bits*n_last) + 12 + ceil(dim*bits/8) <= usable`,
+  where `n_last` is the last lane strip's coordinate count. All blocks of a weft
+  share `dim` and `bits`, so the answer is the same for every block; "the writer
+  decides per block" in the task statement reduces to this, and computing it once
+  is what makes it impossible for two blocks of one weft to disagree.
+- **When it does not fit, the centroid keeps its own page** exactly as in v3, and
+  the weft is still v4. At 4 bits that is `dim` in 494-509, 987-1018, 1481-1527, ...
+  (one band just under each multiple of 509, where the last lane page is nearly
+  full). **1,000-d spills; 384 / 768 / 960 / 1,024 / 1,536 do not.** Every width has
+  such bands (`test/hegel/test_vecweft.c` sweeps them).
+- **Pages per block** is `lane_strips` when packed and `lane_strips + cen_strips`
+  otherwise. That is the number a reader walks, `weave_check()` counts, and the
+  page model prices: at 4 bits, 1 / 2 / 2 / 3 pages per 32-lane block at 384 / 768
+  / 960 / 1,024-d, against 2 / 3 / 3 / 4 in v3, **predicting 278 / 533 / 533 / 789
+  B/vector** with directory and warp unchanged.
+
+**One plan, both sides.** `weave_vecweft_strip_plan()` gains `page` (which of the
+block's pages the strip is on) and `pageoff` (where in that page's payload its
+header starts), and two functions in `src/vector/vecweft.c` turn the plan into
+bytes and back: `weave_vecweft_page_build()` (block `b`, page `pg` -> the page
+payload) and `weave_vecweft_page_take()` (a page payload claimed to be block `b`'s
+page `pg` -> strips validated against the plan and scattered). The backend writer,
+`weave_vec_block_read()`, the scan's forward code cursor, the property tests and the
+fuzz target all go through those two; nothing else computes an offset into a code
+page. A page whose strips are not exactly the ones the plan assigns to `(b, pg)` --
+wrong block, wrong range, wrong flavour, or no header where the plan puts one -- is
+refused, so a v3 reader's "two strips claim one range" and "a strip is missing"
+faults carry over as "this page is not the page the plan says it is". A writer and a
+reader that disagree about packing are caught either way round: a reader expecting a
+packed centroid finds a zero header at `pageoff` (`ncoords` 0 is refused), and a
+reader expecting a separate centroid page finds the next block's first page there.
+The unused tail is NOT checked for zeros on read -- it is up to 8 KB per page on the
+scan's hot path, and the determinism it would protect is asserted where it is
+produced (`weave_vecweft_page_build()` zeroes the whole payload; P4).
+
+**What a scan reads.** The cursor already read the centroid page of every block it
+visited (see the note above), so packing removes one page read per visited block:
+3 -> 2 at 960-d. The bytes it scores are unchanged.
+
+**Bit identity across shape (hard rule 16).** The page images a weft writes depend
+on `(dim, bits, version, nvec)` and on the lanes' codes in warp order -- nothing
+else. In particular they do not depend on how many inputs a merge had, where their
+block boundaries fell, or whether their wefts were v3 or v4: a merge re-packs lanes
+(it never re-encodes, §7.3) and writes the output at the current version, so a merge
+of any split of a lane sequence and a fresh build of the same sequence produce the
+same bytes. `test/hegel/test_vecweft.c` P8 asserts exactly that, sweeping dim
+(including the spill bands), bits, `nvec mod 32`, and split points that do and do
+not fall on a block boundary.
+
+**Versioning.** v3 wefts are still read (dual-read per weft: `WeaveVecWeftGeom`
+carries the version it was built for, and every reader asks the geometry, never
+the constant). v1 and v2 are still refused. The metapage `WEAVE_VERSION` does
+**not** bump; `doc/specs/SEGMENT_FORMAT.md` §8 item 7 gives the reason.
 
 Two pack layouts, recorded in `WeaveVecMeta` because a reader that guesses wrong
 returns wrong distances rather than an error: `WEAVE_PACK_LANE`
