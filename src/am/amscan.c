@@ -1352,9 +1352,8 @@ typedef struct EvalVal
 typedef struct UniverseSrc
 {
 	Relation	index;
-	BlockNumber dictstart;
-	double		ndocs;
-	bool		has_doclen_col;
+	const WeaveSegMeta *seg;
+	uint32		gen0;			/* the caller's directory generation */
 	bool		built;
 	TidSet		set;
 } UniverseSrc;
@@ -1362,13 +1361,81 @@ typedef struct UniverseSrc
 static TidSet weave_universe_bounded(Relation index, BlockNumber dictstart,
 									 double ndocs, bool has_doclen_col);
 
+/*
+ * THE UNIVERSE OF A BOLT: every document `@@@ '!q'` can match in it.
+ *
+ * v12 (doc/GAPS.md G78): the bolt's DOCUMENT LIST minus its NULL documents.
+ * It used to be the distinct posting docids (weave_universe_bounded()), so a
+ * document with no terms -- to_wdoc(''), or text that analyzes to nothing --
+ * had no posting, was not in the universe, and `!q` silently omitted it even
+ * though weave_match(to_wdoc(''), '!q') is true.  A NULL document is in the
+ * list (it has a docvalue and a lane) and must NOT be in the universe: an
+ * empty document matches `!q`, a NULL one matches nothing.
+ *
+ * A pre-v12 bolt has no list and keeps the posting-derived universe, and with
+ * it G78, until a merge or REINDEX rewrites it (SEGMENT_FORMAT.md sect. 6,
+ * "What is NOT fixed in place").
+ *
+ * A list that fails to read is a RACE until the generation says otherwise: a
+ * concurrent merge may have freed and recycled the chain this scan's directory
+ * snapshot names.  Moved -> return empty; the caller's generation re-check
+ * discards this pass and restarts.  Unmoved -> it is corruption.
+ */
+static TidSet
+weave_universe_seg(Relation index, const WeaveSegMeta *seg, uint32 gen0)
+{
+	BlockNumber root = weave_doclist_root(index, seg);
+	WeaveDocset ds;
+	const char *detail = NULL;
+	TidSet		u;
+	Size		i,
+				k = 0;
+	int			n = 0;
+
+	if (root == InvalidBlockNumber)
+		return weave_universe_bounded(index, seg->dictstart, seg->ndocs,
+									  seg->doclenstart == InvalidBlockNumber);
+	if (!weave_doclist_read(index, root, &ds, &detail))
+	{
+		if (weave_read_meta_generation(index) != gen0)
+		{
+			u.tids = NULL;
+			u.n = 0;
+			return u;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("weave index \"%s\" has a corrupt document list",
+						RelationGetRelationName(index)),
+				 errdetail("%s", detail != NULL ? detail : "unknown"),
+				 errhint("REINDEX the index.")));
+	}
+	if (ds.n - ds.nnull > (Size) TIDSET_MAX_N)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("pg_weave: candidate set for this query is too large")));
+	u.tids = (ItemPointerData *) palloc(Max(ds.n - ds.nnull, 1) * sizeof(ItemPointerData));	/* alloc-ok: <= TIDSET_MAX_N, checked just above */
+	/* both arrays ascend, and docid order is TID order, so the result is a
+	 * sorted, duplicate-free TidSet with one linear merge */
+	for (i = 0; i < ds.n; i++)
+	{
+		while (k < ds.nnull && ds.nullids[k] < ds.ids[i])
+			k++;
+		if (k < ds.nnull && ds.nullids[k] == ds.ids[i])
+			continue;			/* a NULL document matches no `@@@` */
+		weave_docid_to_tid(ds.ids[i], &u.tids[n++]);
+	}
+	u.n = n;
+	weave_docset_free(&ds);
+	return u;
+}
+
 static TidSet
 universe_get(UniverseSrc *u)
 {
 	if (!u->built)
 	{
-		u->set = weave_universe_bounded(u->index, u->dictstart, u->ndocs,
-										u->has_doclen_col);
+		u->set = weave_universe_seg(u->index, u->seg, u->gen0);
 		u->built = true;
 	}
 	return u->set;
@@ -4712,8 +4779,7 @@ collect_retry:
 				 * high-vocabulary corpus.
 				 */
 				need_recheck = true;
-				universe = weave_universe_bounded(index, sg->dictstart, sg->ndocs,
-												 sg->doclenstart == InvalidBlockNumber);
+				universe = weave_universe_seg(index, sg, gen0);
 				if (universe.n > 0)
 				{
 					weave_filter_tombstoned_seg(&seg_tombs, s, &universe);
@@ -4732,9 +4798,8 @@ collect_retry:
 		 * that was then discarded.
 		 */
 		uni.index = index;
-		uni.dictstart = sg->dictstart;
-		uni.ndocs = sg->ndocs;
-		uni.has_doclen_col = (sg->doclenstart == InvalidBlockNumber);
+		uni.seg = sg;
+		uni.gen0 = gen0;
 		uni.built = false;
 		uni.set.tids = NULL;
 		uni.set.n = 0;
