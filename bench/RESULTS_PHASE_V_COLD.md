@@ -77,6 +77,13 @@ times. Measured, m=16, ef_construction=64, `vector_cosine_ops`, 999,990 × 960-d
 > other than 4 bits were not measured and should not be read as index sizes.** At
 > 384-d and 768-d the shipped index fails the gate (0.261× / 0.193× against same-run
 > HNSW).
+>
+> **SUPERSEDED 2026-10-05 (weft v4, `bench/RESULTS_VECMAJOR.md` "Measured: the
+> centroid lever, built").** The centroid strip now shares its block's last lane
+> page. The built 4-bit index measures **278 / 533 / 533 / 789 B/vector** at 384 /
+> 768 / 960 / 1,024-d: 0.136 / 0.130 / 0.065 / 0.096× of same-run HNSW, and 0.066× /
+> 0.098× of 8,056 at 960 / 1,024-d. It **passes 0.15× at all four dims.** The
+> coordinate-split waste at 1,024-d is still there.
 
 | bits | index B/vector | × HNSW | window @ 0.99 (n=1M) | SIMD kernel |
 |---|---:|---:|---|---|
@@ -98,7 +105,7 @@ was leaning on a guess.
 The recommended shape is unchanged and now has more margin: **4 bits plus an exact
 rerank of a top-25 window** — 0.9920 recall at n=1M, 512 B/vector = **0.064×
 HNSW** (**CORRECTED 2026-10-04:** code bytes; the built index is 789 B/vector = 0.098× at
-960-d, see the note above), and the widest width that keeps the SIMD code-scan kernel.
+960-d, see the note above; **SUPERSEDED 2026-10-05:** 533 B/vector = 0.066× since weft v4), and the widest width that keeps the SIMD code-scan kernel.
 
 ## 3. pgvector HNSW never reaches recall@10 0.99 on this corpus
 

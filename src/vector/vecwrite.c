@@ -704,11 +704,14 @@ weave_vec_write_weft(Relation index, WeaveVecAccum *acc)
 						lane_norm, slot, cen, cencode, tmpcode);
 
 		/*
-		 * The block's strips, in the order weave_vecweft_strip_plan() defines:
-		 * lane strips then centroid strips, block-major.  ONE page per strip; the
-		 * greedy several-strips-per-page packing sect. 7.1 leaves to the writer is
-		 * not implemented, so the low-dim waste it describes is real and recorded
-		 * rather than claimed away.
+		 * The block's code pages, in the order weave_vecweft_strip_plan() defines:
+		 * lane strips then centroid strips, block-major, and in a v4 weft whose
+		 * centroid fits (g.cen_packed) the centroid strip on the LAST lane page
+		 * rather than a page of its own -- the 256 B/vector that one page per strip
+		 * cost (bench/RESULTS_VECMAJOR.md).  Which strip lands on which page and at
+		 * which offset is the plan's decision and weave_vecweft_page_build()'s
+		 * bytes; this loop only allocates the pages.  Cross-block packing of LANE
+		 * strips is still not done (sect. 7.1).
 		 *
 		 * BEFORE THE DIRECTORY RECORD, and that order is load-bearing since G27:
 		 * the record carries `firstpage`, the block number of the strip page
@@ -717,29 +720,18 @@ weave_vec_write_weft(Relation index, WeaveVecAccum *acc)
 		 * until 2026-09-23 -- would mean patching a page whose GenericXLog cycle
 		 * the chain has already closed.
 		 */
-		for (k = 0; k < g.strips_per_block; k++)
+		for (k = 0; k < g.pages_per_block; k++)
 		{
-			WeaveVecStripPlan p;
-			uint32		i = b * (uint32) g.strips_per_block + (uint32) k;
 			int			n;
-
-			if (weave_vecweft_strip_plan(&g, i, &p) != 0)
-				elog(ERROR, "no plan for vector strip %u of %u", i, g.nstrips);
 
 			page = vec_chain_append(&codes);
 			if (k == 0)
 				rec.firstpage = (weave_uint32) BufferGetBlockNumber(codes.buf);
-			if ((p.flags & WEAVE_VSTRIP_F_CENTROID) != 0)
-				n = weave_censtrip_build(PageGetContents(page),
-										 WEAVE_VECPAGE_PAYLOAD, &g, &p, cencode);
-			else
-				n = weave_strip_build(PageGetContents(page),
-									  WEAVE_VECPAGE_PAYLOAD, acc->layout,
-									  g.dim, g.bits, p.blockno, p.j0,
-									  p.ncoords, p.flags, block);
+			n = weave_vecweft_page_build(PageGetContents(page),
+										 WEAVE_VECPAGE_PAYLOAD, &g, b, k,
+										 block, cencode);
 			if (n < 0)
-				elog(ERROR, "could not build vector strip %u (block %u, j0 %d)",
-					 i, p.blockno, p.j0);
+				elog(ERROR, "could not build vector code page %d of block %u", k, b);
 			vec_page_used(page, n);
 		}
 
@@ -862,9 +854,9 @@ weave_vec_write_weft(Relation index, WeaveVecAccum *acc)
 	pfree(block);
 	pfree(perm);
 
-	elog(DEBUG1, "pg_weave build: index \"%s\": vector weft of %u lanes (%u live) in %u blocks, %u strips, %u directory pages, %u warp map pages",
-		 RelationGetRelationName(index), acc->nlane, acc->nlive, g.nblocks,
-		 g.nstrips, g.ndirpages, g.nwarppages);
+	elog(DEBUG1, "pg_weave build: index \"%s\": vector weft v%d of %u lanes (%u live) in %u blocks, %u strips on %u code pages, %u directory pages, %u warp map pages",
+		 RelationGetRelationName(index), g.version, acc->nlane, acc->nlive,
+		 g.nblocks, g.nstrips, g.npages, g.ndirpages, g.nwarppages);
 	return root;
 }
 
@@ -925,7 +917,8 @@ vec_meta_read(Relation index, BlockNumber root, WeaveVecMeta *out,
 		*why = "the WEAVE_VMETA page has the wrong magic";
 		return false;
 	}
-	if (out->version != WEAVE_VMETA_VERSION)
+	if (out->version < WEAVE_VMETA_VERSION_MIN ||
+		out->version > WEAVE_VMETA_VERSION)
 	{
 		/* An unknown version is an ERROR-class refusal, not a best-effort read
 		 * (doc/CONVENTIONS.md decision 3) -- reported, because this reader does
@@ -978,9 +971,11 @@ weave_vec_weft_open(Relation index, BlockNumber root, WeaveVecWeft *out,
 		*why = "a vector weft chain root is out of range";
 		return false;
 	}
-	if (weave_vecweft_geom(&out->geom, WEAVE_VECPAGE_PAYLOAD, out->meta.dim,
-						   out->meta.bits, (int) out->meta.layout,
-						   out->meta.nvec) != 0)
+	/* The VERSION goes into the geometry, so every reader below asks it where a
+	 * strip is -- a v3 weft keeps its own page per centroid (sect. 7.1 "v4"). */
+	if (weave_vecweft_geom_v(&out->geom, WEAVE_VECPAGE_PAYLOAD, out->meta.dim,
+							 out->meta.bits, (int) out->meta.layout,
+							 out->meta.nvec, (int) out->meta.version) != 0)
 	{
 		*why = "the vector weft's geometry cannot be stored in this page size";
 		return false;
@@ -1107,113 +1102,13 @@ weave_vec_dir_read(const WeaveVecWeft *w, uint32 blockno, WeaveVecDirRec *out,
 	return false;
 }
 
-/*
- * Take ONE strip page's payload into the block it belongs to.
- *
- * `contents` is PageGetContents() of a WEAVE_PK_VCODES page whose strip header
- * already names `blockno`; the caller has established that much because it is the
- * caller that knows which block it is assembling.  `block` receives lane strips
- * (geom.blockbytes) and `cencode` the centroid strips (geom.codebytes); either may
- * be NULL, and a strip whose destination is NULL is validated and DISCARDED rather
- * than skipped, so a chain walk that wants no bytes still cannot mistake a corrupt
- * page for an absent one.
- *
- * `seen` is strips_per_block booleans and `*nseen` their count, both owned by the
- * caller across a block's strips: they are what turns "two strips claim the same
- * coordinate range" and "a strip is missing" into detected faults.
- *
- * WHY THIS IS ITS OWN FUNCTION.  It was the body of weave_vec_block_read()'s loop
- * until task V8, which needs the identical scatter from a forward-only cursor
- * (src/vector/vecshuttle.c) because weave_vec_block_read() walks the whole chain
- * per call and a scan cannot afford that.  Two copies of this would be two
- * definitions of the strip format, and the failure mode of a disagreement is not a
- * crash: weave_strip_scatter() puts bytes at a computed offset, so a reader that
- * computed it differently returns wrong distances (src/vector/pack.c).  One
- * implementation, two callers.
- */
-bool
-weave_vec_strip_take(const WeaveVecWeft *w, const void *contents,
-					 uint32 blockno, uint8 *block, uint8 *cencode,
-					 bool *seen, int *nseen, const char **why)
-{
-	const WeaveVecStripHdr *raw = (const WeaveVecStripHdr *) contents;
-	WeaveVecStripHdr hdr;
-	const uint8 *bytes = NULL;
-	bool		iscen = (raw->flags & WEAVE_VSTRIP_F_CENTROID) != 0;
-	int			want = -1;
-	int			k;
-	int			n;
-
-	*why = NULL;
-	if (iscen)
-		n = weave_censtrip_parse(contents, WEAVE_VECPAGE_PAYLOAD, &w->geom,
-								 &hdr, &bytes, why);
-	else
-		n = weave_strip_parse(contents, WEAVE_VECPAGE_PAYLOAD, w->geom.dim,
-							  w->geom.bits, &hdr, &bytes, why);
-	if (n < 0)
-		return false;
-
-	/*
-	 * A strip is only accepted where the PLAN says it belongs.  This is what
-	 * turns "the writer used the wrong j0" from a wrong answer into a detected
-	 * fault: the coordinates a strip claims must be the coordinates its position
-	 * in the weft calls for.
-	 */
-	for (k = 0; k < w->geom.strips_per_block; k++)
-	{
-		WeaveVecStripPlan p;
-		uint32		i = blockno * (uint32) w->geom.strips_per_block + (uint32) k;
-
-		if (weave_vecweft_strip_plan(&w->geom, i, &p) != 0)
-			continue;
-		if (p.j0 == (int) hdr.j0 && p.ncoords == (int) hdr.ncoords &&
-			((p.flags & WEAVE_VSTRIP_F_CENTROID) != 0) == iscen)
-		{
-			want = k;
-			break;
-		}
-	}
-	if (want < 0)
-	{
-		*why = "a vector strip carries a coordinate range the weft's layout does not call for";
-		return false;
-	}
-	if (seen[want])
-	{
-		*why = "two vector strips claim the same coordinate range of one block";
-		return false;
-	}
-	if (iscen)
-	{
-		if (cencode != NULL &&
-			weave_censtrip_scatter(cencode, w->geom.codebytes, &w->geom,
-								   &hdr, bytes) != 0)
-		{
-			*why = "a centroid strip does not fit the code it belongs to";
-			return false;
-		}
-	}
-	else if (block != NULL &&
-			 weave_strip_scatter(block, w->geom.blockbytes, w->geom.dim,
-								 w->geom.bits, &hdr, bytes) != 0)
-	{
-		*why = "a lane strip does not fit the block it belongs to";
-		return false;
-	}
-	seen[want] = true;
-	(*nseen)++;
-	return true;
-}
-
 bool
 weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno, uint8 *block,
 					 uint8 *cencode, const char **why)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(w->index);
 	BlockNumber blk = w->meta.codestart;
-	bool	   *seen;
-	int			nseen = 0;
+	int			pg = 0;
 	int			npages = 0;
 	bool		ok = true;
 
@@ -1227,21 +1122,13 @@ weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno, uint8 *block,
 	MemSet(block, 0, w->geom.blockbytes);
 	if (cencode != NULL)
 		MemSet(cencode, 0, w->geom.codebytes);
-	seen = (bool *) palloc0((Size) w->geom.strips_per_block * sizeof(bool));
 
 	/*
-	 * THE WALK IS THE COST, and it is not the one sect. 7.1 advertises.  Strips
-	 * are block-major, so this block's strips are consecutive in the chain -- but
-	 * nothing records WHERE, and WeaveVecDirRec is full (284 bytes, fixed by the
-	 * O(1) requirement), so there is no room to record it without a format change.
-	 * A reader therefore walks from codestart, which is O(pages in the weft) and
-	 * not the ceil(dim/coords_per_page) the block-major argument promises.  V7's
-	 * callers walk every block anyway (weave_check(), the round-trip test); V8's
-	 * SCAN cannot -- O(blocks x pages) is quadratic in the weft -- so it carries a
-	 * forward-only cursor over the same chain instead (src/vector/vecshuttle.c),
-	 * sharing weave_vec_strip_take() above.  V10's rerank window and vacuum's lane
-	 * update still want single-block access, and that is the task that has to add
-	 * the index.  Recorded in sect. 7.1 as a correction, not left implicit.
+	 * Walk from codestart and take every page whose header claims this block, in
+	 * chain order, as the block's page 0, 1, ... -- block-major order makes them
+	 * consecutive, and weave_vecweft_page_take() refuses a page that is not the
+	 * page the plan says it is, so a missing, duplicated or misplaced strip is a
+	 * refusal rather than a wrong distance.  O(pages in the weft); see the header.
 	 */
 	while (blk != InvalidBlockNumber && ok)
 	{
@@ -1269,18 +1156,27 @@ weave_vec_block_read(const WeaveVecWeft *w, uint32 blockno, uint8 *block,
 		}
 		raw = (const WeaveVecStripHdr *) PageGetContents(page);
 		if (raw->blockno == blockno)
-			ok = weave_vec_strip_take(w, PageGetContents(page), blockno, block,
-									  cencode, seen, &nseen, why);
+		{
+			if (pg >= w->geom.pages_per_block)
+			{
+				*why = "the vector code chain carries more pages for this block than its layout has";
+				ok = false;
+			}
+			else if (weave_vecweft_page_take(&w->geom, PageGetContents(page),
+											 WEAVE_VECPAGE_PAYLOAD, blockno, pg,
+											 block, cencode, why) < 0)
+				ok = false;
+			pg++;
+		}
 		blk = WeavePageGetOpaque(page)->nextblk;
 		UnlockReleaseBuffer(buf);
 	}
 
-	if (ok && nseen != w->geom.strips_per_block)
+	if (ok && pg != w->geom.pages_per_block)
 	{
 		*why = "the vector code chain is missing strips for this block";
 		ok = false;
 	}
-	pfree(seen);
 	return ok;
 }
 
@@ -1810,7 +1706,8 @@ weave_vec_blocks(PG_FUNCTION_ARGS)
 }
 
 /*
- * weave_vec_strips(regclass) -> one row per WEAVE_PK_VCODES page of every weft
+ * weave_vec_strips(regclass) -> one row per STRIP of every weft (since v4 a page
+ * may carry two; `blkno` is the page, so count(DISTINCT blkno) counts pages)
  *
  * The coordinate slicing sect. 7.1 ratified, read back off the pages as the RAW
  * strip headers store it: which block a strip belongs to, which coordinate range it
@@ -1850,8 +1747,20 @@ weave_vec_strips(PG_FUNCTION_ARGS)
 		BlockNumber blk;
 		int			npages = 0;
 
+		WeaveVecStripPlan lastplan;
+		WeaveVecStripPlan cenplan;
+		bool		cenpacked;
+
 		if (!vec_introspect_weft(index, s, &meta.segs[s], &w, NULL))
 			continue;
+
+		/* Where the plan puts block 0's last lane strip and its centroid strip;
+		 * pageoff does not depend on the block. */
+		cenpacked = w.geom.cen_packed &&
+			weave_vecweft_strip_plan(&w.geom, (uint32) w.geom.lane_strips - 1,
+									 &lastplan) == 0 &&
+			weave_vecweft_strip_plan(&w.geom, (uint32) w.geom.lane_strips,
+									 &cenplan) == 0;
 
 		/* The same guarded walk weave_vec_block_read() makes, and guarded for the
 		 * same reason: the chain comes off disk, so a cycle or an out-of-relation
@@ -1892,10 +1801,32 @@ weave_vec_strips(PG_FUNCTION_ARGS)
 			values[3] = Int32GetDatum((int32) hdr->j0);
 			values[4] = Int32GetDatum((int32) hdr->ncoords);
 			values[5] = BoolGetDatum((hdr->flags & WEAVE_VSTRIP_F_CENTROID) != 0);
+			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+
+			/*
+			 * ONE ROW PER STRIP, not per page, since v4: the block's last lane
+			 * page of a cen_packed weft carries the centroid strip too, and it is
+			 * reported the same way -- its header verbatim, from where the PLAN
+			 * puts it (cenplan.pageoff), so a writer that put it somewhere else
+			 * shows up as a garbage row here rather than as a plausible one.  Two
+			 * rows then share `blkno`, which is how a caller counts pages.
+			 */
+			if (cenpacked && (hdr->flags & WEAVE_VSTRIP_F_CENTROID) == 0 &&
+				(int) hdr->j0 == lastplan.j0 &&
+				(Size) cenplan.pageoff + sizeof(WeaveVecStripHdr) <=
+				WEAVE_VECPAGE_PAYLOAD)
+			{
+				const WeaveVecStripHdr *ch = (const WeaveVecStripHdr *)
+				((const char *) PageGetContents(page) + cenplan.pageoff);
+
+				values[2] = Int64GetDatum((int64) ch->blockno);
+				values[3] = Int32GetDatum((int32) ch->j0);
+				values[4] = Int32GetDatum((int32) ch->ncoords);
+				values[5] = BoolGetDatum((ch->flags & WEAVE_VSTRIP_F_CENTROID) != 0);
+				tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+			}
 			blk = WeavePageGetOpaque(page)->nextblk;
 			UnlockReleaseBuffer(buf);
-
-			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 		}
 	}
 

@@ -132,6 +132,13 @@ vector at 1024-d, against the ~855 B that 0.15x of pgvector HNSW allows.
 > estimated denominator: neither half is a measured index ratio. The 4-bit
 > recommendation still passes the storage gate at these widths, with less margin.
 > Below 960-d it does not (`bench/RESULTS_VECMAJOR.md`).
+>
+> **SUPERSEDED 2026-10-05 (weft v4, `bench/RESULTS_VECMAJOR.md` "Measured: the
+> centroid lever, built").** The centroid strip now shares its block's last lane
+> page. The built 4-bit index measures **278 / 533 / 533 / 789 B/vector** at 384 /
+> 768 / 960 / 1,024-d: 0.136 / 0.130 / 0.065 / 0.096× of same-run HNSW, and 0.066× /
+> 0.098× of 8,056 at 960 / 1,024-d. It **passes 0.15× at all four dims.** The
+> coordinate-split waste at 1,024-d is still there.
 
 | bits | window @ 0.99 | index B/vector | x HNSW | page reads/query | SIMD kernel |
 |---|---|---:|---:|---:|---|

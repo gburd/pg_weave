@@ -78,8 +78,22 @@ weave_cen_gran(int bits)
  * describe it.  Held by the writer and rebuilt by the reader from the VMETA page,
  * so both sides compute every offset from the same expressions.
  */
+/*
+ * Weft layout versions, which are WeaveVecMeta.version (include/weave/vector.h
+ * defines WEAVE_VMETA_VERSION from these so the two cannot drift).  v3: one strip
+ * per page.  v4: a block's last lane page may also carry its centroid strip
+ * (doc/specs/VECTOR_CHANNEL.md sect. 7.1 "v4").  Older versions are refused.
+ */
+#define WEAVE_VECWEFT_V3	3
+#define WEAVE_VECWEFT_V4	4
+#define WEAVE_VECWEFT_CUR	WEAVE_VECWEFT_V4
+
+/* Where a second strip may start on a page: its header holds a uint32. */
+#define WEAVE_VECWEFT_ALIGN(off) (((off) + 3) & ~3)
+
 typedef struct WeaveVecWeftGeom
 {
+	int			version;		/* WEAVE_VECWEFT_V3 or _V4 */
 	int			dim;
 	int			bits;
 	int			layout;			/* WeavePackLayout; only WEAVE_PACK_LANE is storable */
@@ -97,6 +111,17 @@ typedef struct WeaveVecWeftGeom
 	int			lane_strips;	/* lane strips per block */
 	int			cen_strips;		/* centroid strips per block */
 	int			strips_per_block;
+
+	/*
+	 * Code PAGES per block, which is what every reader walks and weave_check()
+	 * counts.  strips_per_block in v3, and also in v4 when the centroid does not
+	 * fit after the last lane strip; lane_strips when it does (cen_packed).
+	 * Decided once per weft, here, because every block of a weft has the same dim
+	 * and bits -- so two blocks cannot disagree, and neither can writer and reader.
+	 */
+	int			cen_packed;		/* 1 = the centroid shares the last lane page */
+	int			pages_per_block;
+	weave_uint32 npages;		/* code pages in the whole weft */
 
 	int			rpp;			/* directory records per page */
 	weave_uint32 ndirpages;
@@ -119,6 +144,8 @@ typedef struct WeaveVecStripPlan
 	weave_uint16 flags;
 	int			nbytes;			/* payload bytes, header excluded */
 	int			srcoff;			/* byte offset in the source buffer */
+	int			page;			/* which of the block's pages it is on */
+	int			pageoff;		/* where its header starts in that page's payload */
 } WeaveVecStripPlan;
 
 /*
@@ -129,6 +156,13 @@ typedef struct WeaveVecStripPlan
  */
 extern int	weave_vecweft_geom(WeaveVecWeftGeom *g, int usable, int dim, int bits,
 							   int layout, weave_uint32 nvec);
+
+/* The same, for a weft written at `version` -- what a reader of an existing weft
+ * calls, with the version off its VMETA page.  weave_vecweft_geom() is this at
+ * WEAVE_VECWEFT_CUR, the version every writer writes. */
+extern int	weave_vecweft_geom_v(WeaveVecWeftGeom *g, int usable, int dim,
+								 int bits, int layout, weave_uint32 nvec,
+								 int version);
 
 /*
  * The i-th strip of the weft in WRITE ORDER, which is block-major: block 0's lane
@@ -142,6 +176,37 @@ extern int	weave_vecweft_geom(WeaveVecWeftGeom *g, int usable, int dim, int bits
  */
 extern int	weave_vecweft_strip_plan(const WeaveVecWeftGeom *g, weave_uint32 i,
 									 WeaveVecStripPlan *out);
+
+/*
+ * THE PAGE, as one unit, both directions.  Every byte placed on or taken off a
+ * WEAVE_PK_VCODES page goes through these two -- the backend writer, both backend
+ * readers (weave_vec_block_read() and the scan's code cursor), the property tests
+ * and the fuzz target -- so the plan's `page`/`pageoff` is the only description of
+ * where a strip lives, and nothing else computes an offset into a code page.
+ *
+ * Page `pg` of a block holds strips [pg, pg + n) of that block in plan order, where
+ * n is 2 on the last lane page of a cen_packed weft and 1 everywhere else.
+ *
+ * page_build zeroes all `dstlen` bytes first (sect. 7's determinism requirement)
+ * and returns the payload bytes used, or -1.  `block` is geom.blockbytes of packed
+ * lanes, `cencode` geom.codebytes of centroid code.
+ *
+ * page_take validates a page payload claimed to be block `blockno`'s page `pg`:
+ * every strip the plan puts there must be there, at its offset, of its flavour,
+ * claiming this block and exactly the plan's coordinate range.  Scatters into
+ * `block` / `cencode` when non-NULL (a NULL destination still validates -- a chain
+ * walk that wants no bytes must not mistake a corrupt page for an absent one).
+ * Returns the strips taken, or -1 with *why set.  On-disk bytes are not trusted.
+ */
+extern int	weave_vecweft_page_build(void *dst, size_t dstlen,
+									 const WeaveVecWeftGeom *g,
+									 weave_uint32 blockno, int pg,
+									 const weave_uint8 *block,
+									 const weave_uint8 *cencode);
+extern int	weave_vecweft_page_take(const WeaveVecWeftGeom *g, const void *src,
+									size_t srclen, weave_uint32 blockno, int pg,
+									weave_uint8 *block, weave_uint8 *cencode,
+									const char **why);
 
 /* Lane slots block `blockno` covers: 32 for every block but possibly the last. */
 extern int	weave_vecweft_block_lanes(const WeaveVecWeftGeom *g,

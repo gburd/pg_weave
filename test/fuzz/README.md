@@ -113,6 +113,18 @@ each weft's `root` becomes a `ReadBuffer` argument).
 - Iterations: 856,784 (32 + 1,089 truncations + 400,000 + 400,000 + 50,000).
 - Seed: splitmix64 from `0x9E3779B97F4A7C15`.
 
+### `fuzz_vecstrip.c` -- vector weft code pages (`weave/vecweft.h`)
+Exercises `weave_vecweft_page_take()`, **the real page reader** that both
+`weave_vec_block_read()` and the scan's code cursor call, over the v3 layout (one
+strip per page) and v4 (a block's last lane page also carries its centroid strip,
+`doc/specs/VECTOR_CHANNEL.md` sect. 7.1). Dims that pack and dims whose centroid
+spills, 2..8 bits. (P1) every writer-built page is accepted and round-trips;
+(P2) random geometry never places a strip past `usable`; (P3) every truncation, in
+an exactly-sized buffer, is read in bounds; (P4) random corruption never crashes
+and a corrupted pinned header field is never accepted. Teeth:
+`-DWEAVE_VECWEFT_PLANT_NO_OFF_LEN` (remaining length forgets the strip's offset)
+must abort under ASan.
+
 ### `fuzz_surftrie.c` -- the Z3 SuRF vocabulary trie (`weave/surftrie.h`)
 Exercises `weave_surftrie_open()` / `weave_surftrie_validate()` and then every
 query path -- **the real code, not a model**, linked from

@@ -331,6 +331,19 @@ converges('advancing xid horizon', $burn_sizes);
 # 2000 rows is the smallest fixture found that reproduces it (438 279 424 279 424),
 # which is what keeps this arm cheap.
 #
+# 2400 SINCE VECTOR WEFT v4 (2026-10-05), and the reason is a measurement, not a
+# loosening.  v4 puts each block's centroid on its last lane page, so this fixture's
+# floor (weave_vacuum()) went from 142 pages to 86 -- and at 2000 rows the whole post-merge
+# index then FIT in the pages the merge had already freed: plain VACUUM's first cycle
+# reused 84 low pages with ZERO extends and landed on the floor, so plain VACUUM and
+# weave_vacuum() both settled at 86 and "AEL reaches a SMALLER fixed point" failed by
+# being equal.  Same fixture under the v3 .so, same host: 297 -> 280 plain vs 142 AEL.
+# With 400 more weftless rows the pending-flush bolt is big enough to need fresh
+# pages again: v4 measured 207 -> 195 plain vs 99 AEL at 2400, 254 -> 232 vs 121 at
+# 3000 (bench/aws/out pgweave-20261005-063541-9dc4).  The arm discriminates the
+# two-tier model again at 2400; the fixed-point and zero-work assertions below were
+# green at every size.
+#
 # TODO, NOT A FAILING TEST, deliberately.  The defect is real and unfixed; the fix is
 # a maintainer decision because the credible options change what a plain VACUUM does
 # (doc/GAPS.md G47 states them).  A TODO block pins the shape now and turns into a
@@ -346,7 +359,7 @@ $node->safe_psql('postgres', q{
     CREATE INDEX vdocs_weave ON vdocs USING weave (d, v) WITH (metric = 'ip');
     INSERT INTO vdocs
       SELECT i, to_wdoc('b' || (i % 97) || ' later ' || i), NULL
-        FROM generate_series(1601, 2000) i;
+        FROM generate_series(1601, 2400) i;
     SELECT weave_merge('vdocs_weave');
     DELETE FROM vdocs WHERE id % 10 = 0;
 });
