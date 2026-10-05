@@ -1279,6 +1279,10 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
  *     RE-RECORDED, under the page's exclusive lock (the comment at that arm
  *     says what that does and does not guarantee).  Never written.
  *
+ * And every REACHABLE page the FSM lists as free has a stale entry, which a
+ * crash leaves; it is marked used (the comment in the loop says why that is not
+ * optional).
+ *
  * Frees nothing if the map is incomplete (weave_reach_map), and says so.
  * Returns the number of pages freed.
  */
@@ -1294,6 +1298,7 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 	int64		nrecorded = 0;
 	int64		nnewer = 0;
 	int64		ncontended = 0;
+	int64		nstale = 0;
 	MemoryContext ctx;
 	MemoryContext old;
 	instr_time	t0,
@@ -1343,8 +1348,28 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 		Buffer		buf;
 		Page		page;
 
+		/*
+		 * A REACHABLE page the FSM calls free is a stale entry -- a crash
+		 * restored an FSM page older than the page's reuse.  Mark it used.
+		 * Not optional, and measured: the allocator refuses a live candidate,
+		 * RE-RECORDS it and stops reusing for the rest of its allocation
+		 * sequence (weave_new_buffer()), so one such entry makes every later
+		 * flush extend, for as long as the page stays live.  t/033's crashed
+		 * index grew by a whole flush per cycle (~1,900 pages) through five
+		 * cycles in which no crash stranded anything, while its never-crashed
+		 * twin stayed flat.  Safe without the page's lock: the mutex is held,
+		 * so nothing frees a reachable page during this pass, and marking a page
+		 * used never hands it to anyone.
+		 */
 		if (reach[blk] != 0)
+		{
+			if (GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2)
+			{
+				RecordUsedIndexPage(index, blk);
+				nstale++;
+			}
 			continue;
+		}
 #if PG_VERSION_NUM >= 180000
 		vacuum_delay_point(false);
 #else
@@ -1429,16 +1454,16 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 	}
 	MemoryContextDelete(ctx);
 
-	if (nfreed > 0 || nrecorded > 0)
+	if (nfreed > 0 || nrecorded > 0 || nstale > 0)
 		IndexFreeSpaceMapVacuum(index);
 
 	INSTR_TIME_SET_CURRENT(t1);
 	INSTR_TIME_SUBTRACT(t1, t0);
 	ereport(nfreed > 0 ? Max(elevel, LOG) : elevel,
-			(errmsg("pg_weave: index \"%s\": reclaimed %lld stranded page(s), re-recorded %lld free page(s); %lld unreachable page(s) newer than the fence, %lld busy; %u pages walked in %.1f ms",
+			(errmsg("pg_weave: index \"%s\": reclaimed %lld stranded page(s), re-recorded %lld free page(s); %lld unreachable page(s) newer than the fence, %lld busy; %lld stale free-space entr(ies) for live pages cleared; %u pages walked in %.1f ms",
 					RelationGetRelationName(index), (long long) nfreed,
 					(long long) nrecorded, (long long) nnewer,
-					(long long) ncontended, nblocks,
+					(long long) ncontended, (long long) nstale, nblocks,
 					INSTR_TIME_GET_MILLISEC(t1))));
 	return nfreed;
 }

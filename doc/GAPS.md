@@ -5090,6 +5090,22 @@ erased from the evidence by the next merge, which is the class G15 and G62 belon
 try, before a later VACUUM can merge. The owed fix is for the merge's chain walkers to
 raise an ERROR, not stop, on a `WEAVE_FREED` page met on a live chain.
 
+**A pre-existing growth defect, found by `t/033` once the allocator change above was
+reverted, and FIXED here because the reclaim pass is where it belongs.** A crash
+restores FSM pages that are older than the index pages they describe. So the FSM can
+list as free a page that has since been reused and is live, and is *reachable*, not
+stranded. The allocator refuses that candidate, which is correct, but then re-records it
+and stops reusing for the rest of its allocation sequence (`weave_new_buffer()`, the
+documented `break`). As long as that page stays live, every later flush extends. In
+`t/033` on `3d94f0b` (`pgweave-20261005-221527-9ad3`), the crashed index grew by a whole
+flush, about 1,900 pages, per cycle through five cycles in which nothing was stranded,
+while its never-crashed twin stayed flat: excess 844 → 2,568 → … → 9,707. The
+allocator change had been hiding it. The reclaim pass now marks such an entry used for
+every reachable page the FSM lists as free. This is safe under the mutex: nothing frees a
+reachable page during the pass, and marking a page used hands it to nobody. On `main`,
+any crash with recent FSM updates can trigger this ratchet. It is not specific to
+pending flushes.
+
 **Costs and limits, recorded as prominently as the fix:**
 - Every VACUUM cleanup now reads every page of the index once, as GIN's and GiST's
   cleanups do. Measured at 1M rows in the scale run (below).

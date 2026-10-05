@@ -975,6 +975,7 @@ one mechanism:
 | unlinked, never freed | crash/ERROR between the unlinking record and the last `weave_free_page()` (merge inputs, folded pending pages, old tombstone blob) | **freed** |
 | flagged freed, absent from the FSM | the FSM is not WAL-logged; a crash loses recent `RecordFreeIndexPage()` calls | **re-recorded** in the FSM |
 | zero page, absent from the FSM | a crash after `P_NEW` extended the file but before the page's first record reached disk | **re-recorded** in the FSM |
+| *(not a leak)* reachable live page that the FSM lists as free | a crash restores an FSM page older than the page's reuse | its stale FSM entry is **cleared**; otherwise every later allocation stops at it and extends (measured, `doc/GAPS.md` G75) |
 
 **The choice: reclaim in VACUUM, no format change.** In `weave_vacuumcleanup()`
 and in `weave_vacuum()`, before the pending flush, a reclaim pass
