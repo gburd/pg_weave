@@ -188,8 +188,26 @@ END \$\$});
 # conditionally and truncates the freed tail.
 $node->safe_psql('postgres', q{DELETE FROM t WHERE id % 10 <> 0});
 my $before = $node->safe_psql('postgres', q{SELECT pg_relation_size('w') / 8192});
-$node->safe_psql('postgres', 'VACUUM t') for 1 .. 3;
+# doc/GAPS.md G73: when this control fails it must say why.  Per VACUUM: the
+# size, how many pages are flagged freed, how many unreachable live ones, and
+# the tail page's state -- the truncation needs a freed tail and the compaction
+# trigger needs a quarter of the file free.
+my $state_sql = q{
+	SELECT pg_relation_size('w') / 8192 || ' pages, ' ||
+	       count(*) FILTER (WHERE freed) || ' freed, ' ||
+	       count(*) FILTER (WHERE NOT reachable AND NOT coalesce(freed, false) AND NOT uninitialized) || ' leaked, ' ||
+	       count(*) FILTER (WHERE uninitialized) || ' zero; tail ' ||
+	       coalesce((SELECT kind || CASE WHEN freed THEN '/freed' ELSE '' END FROM weave_page_info('w')
+	                  ORDER BY blkno DESC LIMIT 1), '?')
+	  FROM weave_page_info('w')};
+my @trail = ('before: ' . $node->safe_psql('postgres', $state_sql));
+for my $v (1 .. 3)
+{
+	$node->safe_psql('postgres', 'VACUUM t');
+	push @trail, "after VACUUM $v: " . $node->safe_psql('postgres', $state_sql);
+}
 my $after = $node->safe_psql('postgres', q{SELECT pg_relation_size('w') / 8192});
+note("G73 trail: $_") for @trail;
 cmp_ok($after, '<', $before,
 	"quiet plain VACUUM still truncates the index ($before -> $after blocks)");
 for my $pred ("cat < 'k'", "cat >= 'k'")
