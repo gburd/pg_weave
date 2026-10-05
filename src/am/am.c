@@ -1021,15 +1021,19 @@ weave_new_buffer_internal(Relation index)
 		{
 			if (!weave_page_recyclable(index, BufferGetPage(buffer)))
 			{
+				bool		live = weave_page_is_live(BufferGetPage(buffer));
+
 				/* a scan may still reference this just-freed page; leave it in
-				 * the FSM for a later allocation once its horizon passes.  (A
-				 * LIVE page here has a stale entry; the gather never marked it
-				 * used, so this leaves the entry as it was and the FSM loop
-				 * below is what drops it -- weave_page_is_live.) */
+				 * the FSM for a later allocation once its horizon passes --
+				 * unless it is a LIVE page, whose entry is stale: drop it, or
+				 * every later gather would probe it again (weave_page_is_live) */
 				weave_alloc_lowfree_defer++;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				ReleaseBuffer(buffer);
-				RecordFreeIndexPage(index, blk);
+				if (live)
+					RecordUsedIndexPage(index, blk);
+				else
+					RecordFreeIndexPage(index, blk);
 				/*
 				 * BOUNDED PROBE, snapshot mode only, and it is a measured cost
 				 * rather than a precaution.  Every candidate costs a buffer read

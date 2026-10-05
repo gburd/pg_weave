@@ -1339,10 +1339,17 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 #else
 		vacuum_delay_point();
 #endif
-		/* already offered by the FSM: the allocator decides (weave_page_is_live) */
-		if (GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2)
-			continue;
 
+		/*
+		 * NOT skipped when the FSM already calls it free.  The FSM is not
+		 * crash-safe: a page a crashed writer took from it and wrote can still
+		 * be recorded free after recovery (t/031's recovery points start from a
+		 * base backup's FSM and hit exactly that), and skipping it would leave
+		 * it stranded for good.  Freeing it is safe against a backend that took
+		 * it from the FSM a moment ago: that backend either holds the buffer
+		 * lock (busy, below) or will find a page freed by a current XID, which
+		 * weave_page_recyclable() defers.
+		 */
 		buf = ReadBuffer(index, blk);
 		if (!ConditionalLockBuffer(buf))
 		{
@@ -1357,8 +1364,11 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 			 WeavePageIsFreed(page)))
 		{
 			UnlockReleaseBuffer(buf);
-			RecordFreeIndexPage(index, blk);
-			nrecorded++;
+			if (GetRecordedFreeSpace(index, blk) < BLCKSZ / 2)
+			{
+				RecordFreeIndexPage(index, blk);
+				nrecorded++;
+			}
 			continue;
 		}
 		if (PageGetLSN(page) > fence)

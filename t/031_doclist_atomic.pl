@@ -99,6 +99,7 @@ my @lsns = split /\n/, $node->safe_psql('postgres', qq{
 cmp_ok(scalar(@lsns), '>=', 5, 'the flush wrote ' . scalar(@lsns) . ' index WAL records');
 
 my $i = 0;
+my $max_leaked = 0;
 my $seen_list_unpublished = 0;
 my $seen_published = 0;
 foreach my $lsn (@lsns)
@@ -120,11 +121,11 @@ archive_mode = off
 		q{SELECT count(*) FROM weave_page_info('da_w') WHERE kind = 'doclist'});
 	$seen_list_unpublished = 1 if $nseg eq '1' && $dlpages > 1;
 	$seen_published = 1 if $nseg eq '2';
-	# Not asserted, recorded: pages the flush had already logged when recovery
-	# stopped short of its publish record are unreachable and not freed.  That
-	# is the G72 leak class (doc/GAPS.md G75): harmless to answers, reclaimed
-	# only by REINDEX.  Counting it at every point is what turns G75's "once in
-	# a while after an immediate stop" into a deterministic measurement.
+	# Pages the flush had already logged when recovery stopped short of its
+	# publish record are unreachable and not freed: the G72 leak class,
+	# doc/GAPS.md G75.  Counted at every point, which is what turned G75's "once
+	# in a while after an immediate stop" into a deterministic measurement; and
+	# since G75's fix, ONE VACUUM must reclaim every one of them (below).
 	my $leaked = $pitr->safe_psql('postgres', q{
 		SELECT count(*) FROM weave_page_info('da_w')
 		 WHERE NOT reachable AND coalesce(freed, false) = false AND NOT uninitialized});
@@ -134,6 +135,7 @@ archive_mode = off
 		         WHERE NOT reachable AND coalesce(freed, false) = false
 		           AND NOT uninitialized GROUP BY kind) k});
 	note("point $i at $lsn: bolts=$nseg doclist_pages=$dlpages leaked_pages=$leaked [$leakkinds]");
+	$max_leaked = $leaked if $leaked > $max_leaked;
 
 	is($pitr->safe_psql('postgres', q{
 		SELECT string_agg(invariant || '=' || ok, ',' ORDER BY invariant)
@@ -143,6 +145,27 @@ archive_mode = off
 		"point $i: every published bolt's list validates and covers its postings");
 	is_deeply(answers($pitr, 'index'), $heap,
 		"point $i (bolts=$nseg): the index answers price<6, !common and the vector ORDER BY as the heap");
+
+	# G75: one VACUUM reclaims what the crash stranded.  VERBOSE so the reclaim's
+	# own line is in the log as evidence that the pass ran and what it freed.
+	my ($vrc, $vout, $verr) = $pitr->psql('postgres', 'VACUUM (VERBOSE) da');
+	is($vrc, 0, "point $i: VACUUM succeeds after recovery") or diag($verr);
+	my ($reclaimed) = $verr =~ /reclaimed (\d+) stranded page/;
+	ok(defined $reclaimed, "point $i: the VACUUM ran the stranded-page reclaim")
+	  or diag($verr);
+	$reclaimed //= -1;
+	cmp_ok($reclaimed, '>=', $leaked,
+		"point $i: the reclaim freed every stranded page ($reclaimed of $leaked)");
+	is($pitr->safe_psql('postgres', q{
+		SELECT count(*) FROM weave_page_info('da_w')
+		 WHERE NOT reachable AND coalesce(freed, false) = false AND NOT uninitialized}),
+		'0', "point $i: after one VACUUM no page is leaked (was $leaked)");
+	my $bad = $pitr->safe_psql('postgres', q{
+		SELECT coalesce(string_agg(invariant || ': ' || coalesce(detail, ''), '; '), '')
+		  FROM weave_check('da_w', true) WHERE NOT ok});
+	is($bad, '', "point $i: after one VACUUM weave_check(deep) is clean");
+	is_deeply(answers($pitr, 'index'), $heap,
+		"point $i: after the reclaim the index still answers as the heap");
 	$pitr->stop('immediate');
 	$pitr->clean_node;
 }
@@ -154,5 +177,8 @@ archive_mode = off
 ok($seen_list_unpublished,
 	'some recovery point has the new list written but its bolt not yet published');
 ok($seen_published, 'and some recovery point has the bolt published');
+# And for G75: the reclaim assertions above are vacuous unless some point leaked.
+cmp_ok($max_leaked, '>=', 5,
+	"some recovery point stranded several pages for the reclaim to find (max $max_leaked)");
 
 done_testing();
