@@ -241,6 +241,8 @@ my $pool = $node->safe_psql('postgres', q{
 note("phase B pool of free pages: $pool");
 cmp_ok($pool, '>', 100, 'phase B precondition: a pool of free pages exists for the writer to reuse');
 
+my $delay = sprintf('%.3fms', 15000 / $pool < 0.05 ? 0.05 : (15000 / $pool > 20 ? 20 : 15000 / $pool));
+note("phase B reclaim delay per unreachable block: $delay");
 my $hitB = 0;
 my $newerB = 0;
 for my $try (1 .. 5)
@@ -248,7 +250,9 @@ for my $try (1 .. 5)
 	# a SLOW reclaim scan: vacuum_delay_point() per block
 	my $logpos = -s $node->logfile;
 	my $v = $node->background_psql('postgres', on_error_stop => 0);
-	$v->query_safe(q{SET vacuum_cost_delay = '10ms'; SET vacuum_cost_limit = 1});
+	# about 15 s of scan over the pool, whatever its size (measured: a fixed 10 ms
+	# against a 40,698-page pool would have scanned for ~400 s and timed out)
+	$v->query_safe("SET vacuum_cost_delay = '$delay'; SET vacuum_cost_limit = 1");
 	# the reclaim reports at DEBUG2 (PG17's lazy vacuum passes an index AM that
 	# message level whatever VERBOSE says), so send this session's to the log
 	$v->query_until(qr/started/, "SET log_min_messages = debug2;\n\\echo started\nVACUUM big;\n");
