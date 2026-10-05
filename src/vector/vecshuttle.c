@@ -1211,7 +1211,7 @@ weave_vec_shuttle_stats(WeaveShuttle *s)
  * weave_vecwork_lanes() reports the same way.  A docid here is an index-resident
  * document id, not a proof that a visible row exists.  The access method's ORDER
  * BY runs the same loop and DOES apply them, through weave_vec_topk_run()'s
- * allowlist hook (doc/GAPS.md G79).
+ * `dropped` hook (doc/GAPS.md G79).
  * ------------------------------------------------------------------------- */
 
 /*
@@ -1265,17 +1265,10 @@ vec_docid_member(const uint64 *sorted, int n, uint64 d)
  * channel over the shared docid space.  The conversion is one pass of the warp
  * map per bolt, which the scan walks anyway.
  */
-typedef struct VecDocList
-{
-	const uint64 *sorted;
-	int			n;
-} VecDocList;
-
 static uint64 *
-vec_allow_from_docids(void *arg, const WeaveVecWeft *w, int segno)
+vec_allow_from_docids(const WeaveVecWeft *w, int segno, const uint64 *sorted,
+					  int nwant)
 {
-	const uint64 *sorted = ((const VecDocList *) arg)->sorted;
-	int			nwant = ((const VecDocList *) arg)->n;
 	uint32		nvec = w->meta.nvec;
 	Size		nwords = ((Size) nvec + 63) / 64;
 	uint64	   *bm = (uint64 *) palloc0(nwords * sizeof(uint64));
@@ -1351,7 +1344,8 @@ vec_topk_admit(WeaveVecTopK *r, int32 segno, uint32 warp, uint64 docid, float4 s
 /* Drive one bolt's shuttle to exhaustion, folding its lanes into the top-k. */
 static void
 vec_scan_bolt(WeaveVecTopK *r, const WeaveVecWeft *w, int segno, const WVec *query,
-			  const uint64 *allow)
+			  const uint64 *allow,
+			  bool (*dropped) (void *arg, int segno, uint64 docid), void *droparg)
 {
 	WeaveShuttle *sh = weave_vec_shuttle_begin(w, segno, query->x, (int) query->dim,
 											   allow, (WeaveWarp) w->meta.nvec,
@@ -1394,6 +1388,8 @@ vec_scan_bolt(WeaveVecTopK *r, const WeaveVecWeft *w, int segno, const WVec *que
 			 * instead of a re-walk (doc/specs/VECTOR_CHANNEL.md sect. 8b).
 			 */
 			docid = weave_vec_shuttle_docid(sh, warp + (WeaveWarp) i);
+			if (dropped != NULL && dropped(droparg, segno, docid))
+				continue;		/* tombstoned in this bolt (G79) */
 			vec_topk_admit(r, (int32) segno, (uint32) (warp + (WeaveWarp) i),
 						   docid, s);
 			weave_vec_shuttle_set_threshold(sh, vec_topk_theta(r));
@@ -1426,7 +1422,9 @@ vec_scan_bolt(WeaveVecTopK *r, const WeaveVecWeft *w, int segno, const WVec *que
 WeaveVecTopK *
 weave_vec_topk_run(Relation index, const WeaveMetaPageData *meta,
 				   const WVec *query, int k, uint16 attnum,
-				   WeaveVecAllowFn allowfn, void *allowarg)
+				   const uint64 *want, int nwant, bool filtered,
+				   bool (*dropped) (void *arg, int segno, uint64 docid),
+				   void *droparg)
 {
 	WeaveVecTopK *r;
 	uint32		s;
@@ -1483,9 +1481,9 @@ weave_vec_topk_run(Relation index, const WeaveMetaPageData *meta,
 					 errdetail("%s.", why != NULL ? why : "unknown reason")));
 
 		r->nlane += (uint64) w.meta.nvec;
-		if (allowfn != NULL)
-			allow = allowfn(allowarg, &w, (int) s);
-		vec_scan_bolt(r, &w, (int) s, query, allow);
+		if (filtered)
+			allow = vec_allow_from_docids(&w, (int) s, want, nwant);
+		vec_scan_bolt(r, &w, (int) s, query, allow, dropped, droparg);
 		if (allow != NULL)
 			pfree(allow);
 	}
@@ -1567,12 +1565,8 @@ vec_scan_run(Oid indexoid, const WVec *query, int k, ArrayType *arr)
 	 * against and it is the behaviour of this function before F7 split the loop
 	 * out of it.  The ORDER BY driver passes the attribute the scan key named.
 	 */
-	{
-		VecDocList	dl = {want, nwant};
-
-		r = weave_vec_topk_run(index, &meta, query, k, 0,
-							   filtered ? vec_allow_from_docids : NULL, &dl);
-	}
+	r = weave_vec_topk_run(index, &meta, query, k, 0, want, nwant, filtered,
+						   NULL, NULL);		/* raw: no tombstones, per (C6) above */
 
 	pgstat_count_index_tuples(index, r->nhit);
 	index_close(index, AccessShareLock);
