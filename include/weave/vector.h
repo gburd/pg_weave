@@ -897,7 +897,10 @@ extern const WeaveVecScanState *weave_vec_shuttle_stats(WeaveShuttle *s);
  * MVCC IS NOT APPLIED HERE, per (C6): dead LANES are excluded by the shuttle
  * (score WEAVE_SCORE_NEVER), but a docid is an index-resident document id, not a
  * proof that a visible row exists.  The amgettuple driver probes the heap; the SRF
- * deliberately does not.
+ * deliberately does not.  TOMBSTONES are not applied here either, but the
+ * amgettuple driver MUST apply them, through `dropped`: after VACUUM a tombstoned
+ * docid's TID can belong to a new live row, so the heap probe succeeds and the new
+ * row is ranked at the dead row's distance (doc/GAPS.md G79).
  * ------------------------------------------------------------------------- */
 
 typedef struct WeaveVecTopKHit
@@ -953,6 +956,14 @@ typedef struct WeaveVecTopK
  * an EMPTY allowlist (admits nothing) from the ABSENCE of one (admits everything),
  * which a NULL pointer alone cannot.
  *
+ * `dropped`, when not NULL, is asked about each candidate as it is ADMITTED --
+ * (segno, docid), docids non-decreasing within a bolt -- and a true answer keeps
+ * it out of the top-k.  It is how the access method applies a bolt's own
+ * TOMBSTONES (weave_vec_tomb_dropped() in src/am/amscan.c, doc/GAPS.md G79); the
+ * SRF passes NULL.  At admission and not as a lane bitmap, because the docid is
+ * resolved there anyway and a bitmap needs a second walk of the warp map per bolt
+ * per pass, which measured +24 % on a 200k top-10 for no change in the answer.
+ *
  * An index with no vector weft in any bolt returns nhit == 0 and nlane == 0 -- not
  * an error.  A query that reaches the operator against such an index is a
  * legitimate plan over an empty channel, and the caller turns it into zero rows.
@@ -961,7 +972,10 @@ extern WeaveVecTopK *weave_vec_topk_run(Relation index,
 										const WeaveMetaPageData *meta,
 										const WVec *query, int k, uint16 attnum,
 										const uint64 *want, int nwant,
-										bool filtered);
+										bool filtered,
+										bool (*dropped) (void *arg, int segno,
+														 uint64 docid),
+										void *droparg);
 
 /*
  * The scan SRFs (src/vector/vecshuttle.c).  They exist because a mutation in scan
