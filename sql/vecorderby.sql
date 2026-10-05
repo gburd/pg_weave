@@ -802,17 +802,25 @@ SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT id FROM g79 ORDER BY emb <-> '[0,0,0,0]'::wvec LIMIT 3;
 SELECT array_agg(id) AS recycled_limit3
   FROM (SELECT id FROM g79 ORDER BY emb <-> '[0,0,0,0]'::wvec LIMIT 3) s;
--- no LIMIT: every row exactly once, row 100 19th, row 101 (padding) last
+-- No LIMIT: every row exactly once, row 100 19th, row 101 (padding) last.  The
+-- helpers set their own planner GUCs; the seq scan goes back ON around everything
+-- that reads g79 without an ordering, for PostgreSQL 18's G39 reason (see the top
+-- of this file).
+SET enable_seqscan = on;
 SELECT * FROM pg_temp.g79_check('SELECT id FROM g79 ORDER BY emb <-> ''[0,0,0,0]''::wvec');
 -- the fused route, which applied tombstones before this fix and must keep doing so
+SET enable_seqscan = off;
 EXPLAIN (COSTS OFF)
 SELECT id FROM g79 ORDER BY fuse(body <=> 'common'::wquery, emb <-> '[0,0,0,0]'::wvec);
+SET enable_seqscan = on;
 SELECT * FROM pg_temp.g79_check(
   'SELECT id FROM g79 ORDER BY fuse(body <=> ''common''::wquery, emb <-> ''[0,0,0,0]''::wvec)');
 -- `<@>`: the dead row 1 held the term `w1` at distance 0, row 100 is at distance 3.
 -- Compared as the sequence of the operator's own distances, which the ties in it do
 -- not perturb (sql/edist.sql).
+SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT id FROM g79 ORDER BY body <@> 'w1';
+SET enable_seqscan = on;
 SELECT (SELECT array_agg(g.body <@> 'w1' ORDER BY i.rn)
           FROM pg_temp.g79_idx('SELECT id FROM g79 ORDER BY body <@> ''w1''') i
           JOIN g79 g USING (id))
@@ -830,11 +838,12 @@ SELECT (SELECT count(*) FROM weave_search('g79_w', 'w1', 10)) AS lex_dead_term_h
 -- bolt 0 has tombstoned.  Row 100 must be found there -- a tombstone applied across
 -- bolts would drop it to the padding at +Infinity and make it LAST for its own vector.
 VACUUM g79;
-SET enable_seqscan = on;
-SELECT weave_index_nsegments('g79_w') AS g79_bolts_after_flush;
+SELECT weave_index_nsegments('g79_w') AS g79_bolts_after_flush,
+       (SELECT ndeleted FROM weave_index_stats('g79_w')) AS g79_tombstones_after_flush;
 SET enable_seqscan = off;
 SELECT array_agg(id) AS own_vector_limit2
   FROM (SELECT id FROM g79 ORDER BY emb <-> '[1000,1000,1000,1000]'::wvec LIMIT 2) s;
+SET enable_seqscan = on;
 SELECT * FROM pg_temp.g79_check('SELECT id FROM g79 ORDER BY emb <-> ''[0,0,0,0]''::wvec');
 SELECT * FROM pg_temp.g79_check(
   'SELECT id FROM g79 ORDER BY fuse(body <=> ''common''::wquery, emb <-> ''[0,0,0,0]''::wvec)');
