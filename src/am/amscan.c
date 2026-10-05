@@ -3531,6 +3531,16 @@ weave_pad_begin(IndexScanDesc scan, WeaveScanOpaque so)
 		}
 	}
 
+	/*
+	 * Which walk, said at DEBUG1 because no counter can see it (G76 was found
+	 * because the cost was invisible) and because the choice is the thing a test
+	 * of weave_index_v12_complete() must observe: the answer is the same either
+	 * way on most fixtures, so only the choice tells a correct predicate from one
+	 * that is always true.
+	 */
+	elog(DEBUG1, "weave padding walks %s",
+		 (so->plainInit && so->plainGateLex) ? "the gate set" : "the heap");
+
 	if (so->plainInit && so->plainGateLex)
 	{
 #if PG_VERSION_NUM >= 190000
