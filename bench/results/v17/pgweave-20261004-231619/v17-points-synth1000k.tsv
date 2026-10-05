@@ -1,0 +1,10 @@
+kind	target	pred	rows	sel
+none	1	-	1000000	1.000000
+dv	0.1	price < 100000	100000	0.100000
+dv	0.01	price < 10000	10000	0.010000
+dv	0.001	price < 1000	1000	0.001000
+dv	0.0001	price < 100	100	0.000100
+lex	0.1	body @@@ 'gtenth'::wquery	100105	0.100105
+lex	0.01	body @@@ 'ghundredth'::wquery	10161	0.010161
+lex	0.001	body @@@ 'gthousandth'::wquery	1052	0.001052
+lex	0.0001	body @@@ 'gtenthousandth'::wquery	114	0.000114
