@@ -5010,7 +5010,20 @@ usually on disk.
 
 `t/031_doclist_atomic.pl` now measures this deterministically instead of waiting for it:
 it recovers to every WAL record of a flush and prints the unreachable-page count and
-kinds at each point (`leaked_pages=`), without asserting on it.
+kinds at each point (`leaked_pages=`), without asserting on it. **Measured
+(`pgweave-20261005-081655-7f64`, merged tree 3057eeb), 14 records:** stopping after
+record 1 leaks `postings:1`, which is G75's signature exactly. After record 2 it is
+`dictionary:1,postings:1`, and so on, one page per record, through `doclen_sidecar`,
+`surf_trie`, the four vector kinds, `docvalues`, `doclist` and `chandesc`, up to **12
+pages at record 12**. Record 13 is the publish: the bolt is live and the only leak is
+the folded **`pending:1`** page, until record 14 frees it (0). Every point answered
+`price < 6`, `!common` and the vector ORDER BY exactly as the heap did. So G75 is not
+intermittent in mechanism, only in exposure: every flush has a window of N records in
+which a crash leaks everything written so far, and t/029 hits it only when the immediate
+stop lands there. **Fix, owed and not part of this branch:** reclaim on recovery or on
+the next VACUUM (an unreachable, unfreed page whose LSN is older than the last
+directory change is a leak by construction), or write the bolt's pages under a
+"pending bolt" record that the publish supersedes. Harmless to answers either way.
 
 ### G76 — a gated ORDER BY whose gate admits fewer rows than LIMIT walks the WHOLE HEAP in the padding phase: correct, O(heap), invisible to every counter — **FOUND 2026-10-04 by the v17 agent (`pgweave-20261004-231619`, scifact); FIXED 2026-10-05 for every lexical gate without a NOT (merge of `wt/g76`); docvalues-only and NOT gates still walk the heap, by design, until G77 and G78 are fixed**
 
