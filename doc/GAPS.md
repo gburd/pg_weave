@@ -5032,7 +5032,7 @@ by design; `fuse()` is the gated form.
 **Owed:** re-measure scifact's 5-row gate at LIMIT 10 (40 ms and 17k buffers before) with
 the v17 harness.
 
-### G77 — a docvalues restriction answered by the index silently DROPS every row whose lexical column is NULL — **FOUND 2026-10-04 while scoping G76; a SILENT WRONG ANSWER on any nullable `wdoc` column with a docvalues key; OPEN**
+### G77 — a docvalues restriction answered by the index silently DROPS every row whose lexical column is NULL — **FOUND 2026-10-04 while scoping G76; a SILENT WRONG ANSWER on any nullable `wdoc` column with a docvalues key; FIXED 2026-10-05 on `wt/doclist` (option 1, format v12) for every index built or REINDEXed by v12**
 
 The build callback and `weave_insert()` both return early when the lexical column is
 NULL (`src/am/ambuild.c`, `if (isnull[lexidx]) return`), so the row gets no docid, no
@@ -5067,7 +5067,20 @@ docvalues fixture has a non-NULL `wdoc`.
 3. **Document it** as "the lexical column must be NOT NULL", as G71 did before its fix.
    Not acceptable as the end state: it is a wrong answer, not a slow one.
 
-### G78 — `@@@ '!q'` omits documents with NO TERMS (empty text, stopwords only), and the omission depends on the plan — **FOUND 2026-10-04 while scoping G76; a SILENT WRONG ANSWER; OPEN, not investigated past the reproducer**
+**Fixed (option 1, maintainer decision 2026-10-05), branch `wt/doclist`.** The build
+callback and `weave_insert()` index a NULL-document row: a docid in the bolt's new
+document list and its NULL set, its docvalue, its vector lane, no postings, and no share
+of `ndocs`/`sumdoclen`. A pending NULL document is a `doclen == 0` item on a
+`WEAVE_PK_PENDING_V12` page. `@@@` excludes it (no posting, and the NOT universe
+subtracts the NULL set); the fused ranked phase pads it whenever `fuse()` has a lexical
+key, because `body <=> q` is NULL for it. `doc/specs/SEGMENT_FORMAT.md` sect. 6 "The
+document list" is the format. `sql/doclist.sql` sections (1)-(4) pin build, pending,
+flush and merge against the heap on index and bitmap scans, and `sql/vecorderby.sql`'s
+recorded loss ("the ten NULL-DOCUMENT rows are excluded from that rank") is now the
+opposite assertion. **Not fixed in place:** an index built before v12 never indexed its
+NULL-document rows, and no merge can invent them; REINDEX is the cure.
+
+### G78 — `@@@ '!q'` omits documents with NO TERMS (empty text, stopwords only), and the omission depends on the plan — **FOUND 2026-10-04 while scoping G76; a SILENT WRONG ANSWER; FIXED 2026-10-05 on `wt/doclist` for every v12 bolt**
 
 `weave_match(to_wdoc(''), '!common')` is true, as it should be: a document with no terms
 contains no `common`. The index disagrees. 10 `common` rows, `''`, `'the'`, `'rare'` at
@@ -5094,6 +5107,14 @@ enumerate every docid in a segment, posting-less ones included; the VWARP chain 
 for exactly this reason, `doc/specs/VECTOR_CHANNEL.md` "warp → docid"), not from postings.
 
 G76's fix does not rely on the universe: a NOT query keeps the heap walk.
+
+**Fixed, branch `wt/doclist`:** the universe is the bolt's v12 document list minus its
+NULL documents (`weave_universe_seg()`, `src/am/amscan.c`), for both the NOT evaluator
+and the no-trigram fuzzy/regex fallback. A pre-v12 bolt keeps the posting universe, and
+G78 with it, until a merge or REINDEX rewrites it. `sql/doclist.sql` compares `!common`
+and `!common & !rare` on index, bitmap and `weave_count()` with the heap at build,
+pending, flush and merge. The second table's plan dependence was not traced; it was the
+same omission reached by a different route, and both routes now read the same universe.
 
 ### G79 — the vector ORDER BY ignores TOMBSTONES: after DELETE + VACUUM, a NEW row that reuses the dead row's ctid is ranked at the DEAD row's distance — **FOUND 2026-10-05 while designing G77's fix; a SILENT WRONG ANSWER reachable by DELETE, VACUUM, INSERT; FIXED 2026-10-05 (`wt/g79`), except for the G80 shape**
 
@@ -5206,7 +5227,7 @@ row on its ctid is still ranked at its distance *and* emitted again from the pen
 Measured on EC2: `ndeleted = 0`, index `{100,2,3}`, heap `{2,3,4}`. The per-segment document
 list that fixes G80 in `weave_bulkdelete()` closes this with no change to the vector path.
 
-### G80 — VACUUM cannot tombstone a ZERO-TERM document, so its docvalue and vector lane outlive the row and a NEW row on the recycled ctid inherits them — **FOUND 2026-10-05 while designing G77's fix; a SILENT WRONG ANSWER; OPEN; same root cause as G78**
+### G80 — VACUUM cannot tombstone a ZERO-TERM document, so its docvalue and vector lane outlive the row and a NEW row on the recycled ctid inherits them — **FOUND 2026-10-05 while designing G77's fix; a SILENT WRONG ANSWER; FIXED 2026-10-05 on `wt/doclist`, for old bolts too**
 
 `weave_bulkdelete()` asks the vacuum callback about every docid in
 `weave_segment_docids()`, and that set is built **from posting lists**. A document whose
@@ -5233,7 +5254,21 @@ a per-segment **document list** (every docid the segment holds, posting or not),
 build, flush and merge, and used by bulkdelete, the NOT universe and the padding's
 completeness argument.
 
-### G81 — a segment whose documents have NO TERMS is not written: a build or a flush of only zero-term documents loses their docvalues and vectors — **FOUND 2026-10-05 by the doclist agent's investigation, confirmed locally; a SILENT WRONG ANSWER; OPEN; part of the G77/G78/G80 document-list work**
+**Fixed, branch `wt/doclist`:** `weave_bulkdelete()` asks the callback about
+`weave_segment_docset()`: the v12 list, or for a pre-v12 bolt the union of its postings,
+docvalues docids and vector warp docids, so an index upgraded in place is fixed at its
+next VACUUM without a merge. The merge output's list is built from the same docset minus
+tombstones, so a merge cannot carry a zero-term document's docvalue outside its list.
+`ndeleted` excludes tombstoned NULL documents so `ndocs - ndeleted` stays corpus N.
+`sql/doclist.sql` section (5) is this reproducer plus a vector ORDER BY variant (the G79
+agent's), before and after the new row is flushed.
+
+**A consequence worth knowing:** CREATE INDEX CONCURRENTLY's validate pass uses
+`ambulkdelete` to enumerate what the index holds, so before this fix it also never saw a
+zero-term document and would insert it a second time. The docset closes that too; it was
+not separately reproduced.
+
+### G81 — a segment whose documents have NO TERMS is not written: a build or a flush of only zero-term documents loses their docvalues and vectors — **FOUND 2026-10-05 by the doclist agent's investigation, confirmed locally; a SILENT WRONG ANSWER; FIXED 2026-10-05 on `wt/doclist`**
 
 `weave_build_flush_segment()` returns early when `bs->nterms == 0` (`src/am/ambuild.c`),
 and a segment whose `dictstart` is `InvalidBlockNumber` is the "consumed slot, skip it"
@@ -5249,3 +5284,10 @@ The flushed index also fails `weave_check(deep)`: `pages_reachable_or_freed` rep
 returned `{1,2,3}`, so the vector lanes were either written or answered from elsewhere; this
 has not been traced. The fix belongs to the document-list design: a segment with documents
 must always be written, with an empty dictionary page, so `dictstart` is valid.
+
+**Fixed, branch `wt/doclist`:** `weave_build_flush_segment()` now returns early only
+when the state indexed no document (its document list is empty), and
+`weave_write_dictionary_iter()` writes one empty `WEAVE_PK_DICT` page for a lexical weft
+with no terms. That also covers a third shape the entry did not list: a MERGE whose every
+posting was tombstoned while zero-term documents survived. `sql/doclist.sql` section (6)
+is both reproducers, each with `weave_check(deep)` clean.

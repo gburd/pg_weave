@@ -502,16 +502,28 @@ typedef struct WeaveDocListHeader     /* 40 bytes */
 	uint32		reserved;   /* must read as zero */
 	uint32		reserved2;  /* must read as zero */
 } WeaveDocListHeader;
-/* then: ALL  = sm_serialize() of every docid the bolt holds, at offset 40
- *       NULL = sm_serialize() of the NULL-document docids, at 40 + MAXALIGN(alllen)
- * total image length == 40 + MAXALIGN(alllen) + nulllen, exactly. */
+/* then: ALL  = the raw sparsemap buffer (sm_get_data/sm_get_size, the livedocs
+ *              blob's encoding) of every docid the bolt holds, at offset 40
+ *       NULL = the same for the NULL-document docids, at 40 + ALIGN8(alllen)
+ * total image length == 40 + ALIGN8(alllen) + nulllen, exactly. */
 ```
 
 Docids are the global tid-derived ones (`weave_tid_to_docid()`), the same space the
 tombstone sparsemap uses. The validator checks magic, version, flags, reserved words,
-the exact total length, that each sparsemap deserializes (`sm_deserialize()` is
-bounded-safe) and has the declared cardinality, `nnull <= ndocs`, `NULL ⊆ ALL`, and
+the exact total length, that each set is at least a sparsemap header long, that each
+set's membership -- counted with the SAME `sm_next_member()` walk the decoder uses,
+over a scratch copy because `sm_open()` rewrites an invalid buffer -- equals its
+declared count, `nnull <= ndocs`, `NULL ⊆ ALL` (one merge of the two walks), and
 `ndocs >= 1`. A bolt with no documents carries no document list.
+
+Two properties of the vendored sparsemap shaped this, both found by
+`test/hegel/test_doclist.c` and worth knowing before anyone else builds on it:
+`sm_create_from_array()` is a use-after-free once the map grows past its initial
+1 KiB (it `sm_free()`s the pre-`realloc` pointer), so the encoder uses
+`sm_create()` + `sm_add_many_grow()`; and `sm_cardinality()` can DISAGREE with an
+`sm_next_member()` walk on a buffer `sm_validate()` accepts (one flipped byte: 1,973 vs
+1,909), so a validator that counted with one and a decoder that iterated with the
+other would accept an image the decoder cannot honour.
 
 **`WEAVE_DOCLIST_F_COMPLETE`.** Set when the list was produced by a v12 writer from
 the heap (CREATE INDEX) or from pending items whose page kind is `WEAVE_PK_PENDING_V12`:
