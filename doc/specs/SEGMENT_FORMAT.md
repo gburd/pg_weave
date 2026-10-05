@@ -1092,20 +1092,41 @@ allocator cannot hand them out until the worker is gone. A worker that writes
 into an already-freed page can, at worst, overwrite the `WEAVE_FREED` flag and
 leak that page again until the next VACUUM.
 
-**Zero pages, and pages already flagged freed, are only re-recorded in the FSM.
-The reclaim never writes them.** A zero page below the relation length read
-under the relation extension lock is not being extended, because
+**Zero pages and pages already flagged freed are only re-recorded in the FSM; the
+reclaim never writes them.** A zero page below the relation length is not being
+extended if that length was read under the relation extension lock.
 `weave_new_buffer()` holds that lock until it has the new buffer exclusively
-locked. Every caller then keeps that lock until the page's first record. If
-`ConditionalLockBuffer()` gets the page and it is still zero, nobody is writing
-it. Recording a page in the FSM is safe even if another backend takes it at the
-same moment, because of a change to the allocator: **a free-list candidate that
-is initialized and not `WEAVE_FREED` is a live page and is dropped from the
-candidate set**. It is no longer pushed back into the FSM (`RecordUsedIndexPage`
-for the low-free list, no re-record for the live FSM). Before this change a stale
-FSM entry for a live page was re-recorded every time it was refused, so it lived
-for ever. nbtree and GIN deal with stale FSM entries the same way: refuse the page
-and drop it.
+locked, and every caller keeps the buffer locked until the page's first record.
+So a zero page that `ConditionalLockBuffer()` gets is abandoned.
+
+Correctness does not depend on the FSM. The allocator's first check
+(`weave_page_recyclable()`, liveness before anything else) refuses any page that
+is initialized and not `WEAVE_FREED`, whatever the FSM says about it. The worst a
+mistimed FSM record can do is leave a **stale entry for a live page**. The base
+allocator already copes with that: it refuses the page and extends, a cost bounded
+per allocation, and the entry becomes true again when that page's segment is
+merged away and freed. To keep that rare, the reclaim reads and writes the FSM only
+while it holds the page's exclusive buffer lock, as GIN's cleanup does. An
+allocator takes a page in two steps, `GetFreeIndexPage()` and then
+`ConditionalLockBuffer()`, and one that tries to lock the page during the
+reclaim's critical section fails and drops it; `weave_new_buffer()` does not
+re-record a contended page. The window that remains is narrower: an allocator
+whose first step lands before the reclaim locks the page and whose second step
+lands after the reclaim unlocks it. That allocator uses the page legitimately, and
+the FSM keeps an entry the reclaim wrote in between.
+
+*Superseded on the branch, recorded because it was measured:* the first version
+closed that window by changing the allocator, so that it dropped a free-list
+candidate that turned out to be live instead of re-recording it (nbtree's
+`_bt_allocbuf()` does the same). That change made `t/028`'s "a quiet VACUUM still
+truncates the index" control fail 3 times in 10, against 0 in 10 on the base
+(`pgweave-20261005-204623-fc2c`). In a three-arm rerun
+(`pgweave-20261005-212522-de13`) the branch failed 2 of 7, the branch with only
+the allocator change removed failed 0 of 7, and the base failed 0 of 7. The
+mechanism is most likely that the extra reuse empties the pool of recyclable free
+pages that `weave_vacuum_compact()`'s trigger probes for, so the compaction never
+runs. The change was reverted. A stale FSM entry costs an extension, and a
+compaction that does not run costs the whole free tail.
 
 **What enforces the two locks.** `weave_new_buffer()` raises
 `elog(ERROR)` unless the caller holds `M`, `X`, or `AccessExclusiveLock` on the

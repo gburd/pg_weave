@@ -1276,8 +1276,8 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
  *   - initialized, not WEAVE_FREED, pd_lsn > fence: written after the fence by
  *     a writer this pass does not exclude.  LEFT ALONE; a later VACUUM decides.
  *   - zero, or WEAVE_FREED, and not in the FSM: the FSM is not crash-safe.
- *     RE-RECORDED.  Never written: weave_page_is_live() in src/am/am.c is what
- *     makes an FSM entry for a page someone takes at the same moment harmless.
+ *     RE-RECORDED, under the page's exclusive lock (the comment at that arm
+ *     says what that does and does not guarantee).  Never written.
  *
  * Frees nothing if the map is incomplete (weave_reach_map), and says so.
  * Returns the number of pages freed.
@@ -1370,16 +1370,29 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 			continue;
 		}
 		page = BufferGetPage(buf);
+		/*
+		 * Every FSM read and write below happens WHILE THIS BUFFER IS LOCKED
+		 * EXCLUSIVELY (GIN's cleanup records pages under the page lock too).
+		 * Correctness never depends on it -- the allocator refuses a page that
+		 * is initialized and not WEAVE_FREED whatever the FSM says -- but it
+		 * narrows the one way this pass can leave a stale FSM entry for a live
+		 * page: an allocator that called GetFreeIndexPage() before we locked
+		 * and ConditionalLockBuffer() after we unlocked.  One that tries to
+		 * lock in between fails and drops the page (weave_new_buffer() does
+		 * not re-record a contended page).  doc/specs/SEGMENT_FORMAT.md sect.
+		 * 10 records the allocator change that closed the window fully and why
+		 * it was reverted (it broke the compaction trigger, measured).
+		 */
 		if (PageIsNew(page) ||
 			(PageGetSpecialSize(page) == MAXALIGN(sizeof(WeavePageOpaqueData)) &&
 			 WeavePageIsFreed(page)))
 		{
-			UnlockReleaseBuffer(buf);
 			if (GetRecordedFreeSpace(index, blk) < BLCKSZ / 2)
 			{
 				RecordFreeIndexPage(index, blk);
 				nrecorded++;
 			}
+			UnlockReleaseBuffer(buf);
 			continue;
 		}
 		if (PageGetLSN(page) > fence)
@@ -1406,12 +1419,12 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 		 * recording it here poisons every allocation until the next VACUUM.
 		 * t/033 measured it both ways: recorded, the crashed index's excess
 		 * over a never-crashed twin grew by about one flush per cycle.  And if
-		 * a crash reverted the FSM to list it as free, take it off: a page in
-		 * the FSM that its writer did not record there is what that loop meets.
+		 * a crash reverted the FSM to list it as free, take it off -- before
+		 * the free and under the lock, for the reason given above.
 		 */
-		weave_free_page_locked(index, buf, false);
 		if (GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2)
 			RecordUsedIndexPage(index, blk);
+		weave_free_page_locked(index, buf, false);
 		nfreed++;
 	}
 	MemoryContextDelete(ctx);

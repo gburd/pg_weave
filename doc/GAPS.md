@@ -5056,9 +5056,14 @@ swaps and oversized INSERTs.
   second disagreement remains and is fenced: `weave_vec_free_weft()` frees a
   `calibstart` chain the walk has no kind for. No writer produces one, and a bolt that
   has one marks the map incomplete.
-- **An allocator change came with it.** A free-list candidate that is a LIVE page (not
-  `WEAVE_FREED`) is now dropped from the FSM instead of re-recorded, as nbtree and GIN
-  do. That is what makes it safe for the reclaim to record zero pages in the FSM.
+- **An allocator change was tried and REVERTED, on measurement.** Making the allocator drop
+  a free-list candidate that turned out to be live (nbtree's rule) made `t/028`'s
+  quiet-VACUUM truncation control fail 3 times in 10 against 0 in 10 on the base, and
+  the arm with only that change removed failed 0 of 7. So the allocator is unchanged.
+  The reclaim touches the FSM only under the page's exclusive lock. Correctness never
+  depended on the FSM, because the allocator refuses any initialized page that is not
+  `WEAVE_FREED`. What is left is a narrow window that can produce a stale FSM entry,
+  which costs an extension and nothing else (`SEGMENT_FORMAT.md` §10).
 
 **Two orders were measured wrong before the right one.** `t/033` crashes a flush ten
 times and compares the crashed index with a never-crashed twin. When the pass recorded

@@ -725,23 +725,6 @@ cmp_blocknumber(const void *a, const void *b)
 }
 
 /*
- * Is a free-list candidate actually a LIVE page -- initialized and not flagged
- * WEAVE_FREED?  Then its free-space entry is stale, and the allocator DROPS it
- * instead of re-recording it.  Before doc/GAPS.md G75 a refused live page was
- * pushed back into the FSM every time, so one stale entry lived forever; that
- * was harmless only because nothing but a crash-lost FSM update produced one.
- * VACUUM's reclaim now records zero pages and unreachable freed pages in the
- * FSM, and a zero page can be taken and written by another backend a moment
- * later, so a stale entry is an expected state with a defined end: the first
- * allocator that meets it.  nbtree and GIN treat a stale FSM entry the same way.
- */
-static bool
-weave_page_is_live(Page page)
-{
-	return !PageIsNew(page) && !WeavePageIsFreed(page);
-}
-
-/*
  * Gather all free blocks (via a linear FSM probe) into an ascending array so
  * subsequent weave_new_buffer() calls reuse the lowest blocks first.  Single
  * writer only.  Cheap relative to the segment rewrite it precedes.
@@ -1021,19 +1004,12 @@ weave_new_buffer_internal(Relation index)
 		{
 			if (!weave_page_recyclable(index, BufferGetPage(buffer)))
 			{
-				bool		live = weave_page_is_live(BufferGetPage(buffer));
-
 				/* a scan may still reference this just-freed page; leave it in
-				 * the FSM for a later allocation once its horizon passes --
-				 * unless it is a LIVE page, whose entry is stale: drop it, or
-				 * every later gather would probe it again (weave_page_is_live) */
+				 * the FSM for a later allocation once its horizon passes */
 				weave_alloc_lowfree_defer++;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				ReleaseBuffer(buffer);
-				if (live)
-					RecordUsedIndexPage(index, blk);
-				else
-					RecordFreeIndexPage(index, blk);
+				RecordFreeIndexPage(index, blk);
 				/*
 				 * BOUNDED PROBE, snapshot mode only, and it is a measured cost
 				 * rather than a precaution.  Every candidate costs a buffer read
@@ -1112,16 +1088,6 @@ weave_new_buffer_internal(Relation index)
 				 * ending the sequence is a bounded cost, not a ratchet.
 				 */
 				weave_alloc_fsm_defer++;
-				if (weave_page_is_live(BufferGetPage(buffer)))
-				{
-					/* a stale entry for a LIVE page: GetFreeIndexPage() already
-					 * marked it used, so dropping it is just not re-recording it,
-					 * and the next free page is worth trying (this one will not
-					 * come back) -- see weave_page_is_live */
-					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-					ReleaseBuffer(buffer);
-					continue;
-				}
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				ReleaseBuffer(buffer);
 				RecordFreeIndexPage(index, blk);
