@@ -4790,7 +4790,7 @@ is `{401,1,201}`), at the position an exact oracle gives. Pending row 402 has a 
 and is still padded at NULL, as G71 requires. The mutant that drops that exclusion ranks it
 and pads it, so it appears twice.
 
-### G72 — VACUUM's tombstone swap and its corpus-`ndocs` refresh were two WAL records, so a crash or ERROR between them left BM25's N counting deleted rows; and pages a crash strands between write and link are reclaimed only by REINDEX — **FOUND 2026-10-04 by an audit of every metapage writer, prompted by G65; PRE-EXISTING; the two-record window FIXED 2026-10-04; the leak class OPEN**
+### G72 — VACUUM's tombstone swap and its corpus-`ndocs` refresh were two WAL records, so a crash or ERROR between them left BM25's N counting deleted rows; and pages a crash strands between write and link are reclaimed only by REINDEX — **FOUND 2026-10-04 by an audit of every metapage writer, prompted by G65; PRE-EXISTING; the two-record window FIXED 2026-10-04; the leak class FIXED 2026-10-05 by G75's reclaim**
 
 G65 was one operation written as two GenericXLog records, with recovery able to land
 between them. This entry is the audit that asked where else that happens. It covers every
@@ -4871,7 +4871,9 @@ predicted (4 records; 2800 / 2830 / 2860; sticky 2600 vs 2340).
   build time. That is rare (it needs a pinned horizon during CREATE INDEX), and the result
   is off by that count until a merge rewrites the segment.
 
-**OPEN: the leak class.** Every multi-page structure is written *before* the record that
+**The leak class — FIXED 2026-10-05 by G75's reclaim (see G75 "FIX"); the paragraphs
+below are the analysis as it stood, kept because the fix answers each objection in it.**
+Every multi-page structure is written *before* the record that
 links it (a segment, a merge output, a tombstone blob). Every replaced structure is
 freed *after* the record that unlinks it (merge inputs, folded pending pages, the old
 tombstone blob). Freeing is one record per page (`weave_free_page()`, `am.c:3670`). A crash, or
