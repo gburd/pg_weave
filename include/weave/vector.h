@@ -897,7 +897,10 @@ extern const WeaveVecScanState *weave_vec_shuttle_stats(WeaveShuttle *s);
  * MVCC IS NOT APPLIED HERE, per (C6): dead LANES are excluded by the shuttle
  * (score WEAVE_SCORE_NEVER), but a docid is an index-resident document id, not a
  * proof that a visible row exists.  The amgettuple driver probes the heap; the SRF
- * deliberately does not.
+ * deliberately does not.  TOMBSTONES are not applied here either, but the
+ * amgettuple driver MUST apply them, through the allowlist hook: after VACUUM a
+ * tombstoned docid's TID can belong to a new live row, so the heap probe succeeds
+ * and the new row is ranked at the dead row's distance (doc/GAPS.md G79).
  * ------------------------------------------------------------------------- */
 
 typedef struct WeaveVecTopKHit
@@ -949,19 +952,26 @@ typedef struct WeaveVecTopK
  * that counts correctly.  The 0 case preserves the SRF's behaviour, which names
  * no attribute.
  *
- * `want` is a SORTED docid allowlist of `nwant` entries; `filtered` distinguishes
- * an EMPTY allowlist (admits nothing) from the ABSENCE of one (admits everything),
- * which a NULL pointer alone cannot.
+ * `allowfn`, when not NULL, is asked once per scored bolt for that bolt's lane
+ * allowlist: a bitmap of ceil(nvec/64) words in the current context, which the
+ * runner pfrees, or NULL for "everything".  NULL `allowfn` and an allowfn that
+ * returns NULL are the same thing; an all-zero bitmap is NOT -- it admits nothing.
+ * It is a hook rather than a bitmap argument because a lane bitmap is per BOLT and
+ * only the runner opens the bolts.  Two callers use it today: the SRF's docid
+ * filter (vec_allow_from_docids()) and the access method's TOMBSTONES
+ * (weave_vec_tomb_allow() in src/am/amscan.c, doc/GAPS.md G79) -- the second is
+ * why a scan that ignores it returns a dead row's distance for a recycled TID.
  *
  * An index with no vector weft in any bolt returns nhit == 0 and nlane == 0 -- not
  * an error.  A query that reaches the operator against such an index is a
  * legitimate plan over an empty channel, and the caller turns it into zero rows.
  */
+typedef uint64 *(*WeaveVecAllowFn) (void *arg, const WeaveVecWeft *w, int segno);
+
 extern WeaveVecTopK *weave_vec_topk_run(Relation index,
 										const WeaveMetaPageData *meta,
 										const WVec *query, int k, uint16 attnum,
-										const uint64 *want, int nwant,
-										bool filtered);
+										WeaveVecAllowFn allowfn, void *allowarg);
 
 /*
  * The scan SRFs (src/vector/vecshuttle.c).  They exist because a mutation in scan

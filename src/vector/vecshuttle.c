@@ -1209,7 +1209,9 @@ weave_vec_shuttle_stats(WeaveShuttle *s)
  * MVCC AND TOMBSTONES ARE NOT APPLIED, deliberately and per (C6): livedocs are
  * the fused scorer's job, this is a view of what the weft contains, and
  * weave_vecwork_lanes() reports the same way.  A docid here is an index-resident
- * document id, not a proof that a visible row exists.
+ * document id, not a proof that a visible row exists.  The access method's ORDER
+ * BY runs the same loop and DOES apply them, through weave_vec_topk_run()'s
+ * allowlist hook (doc/GAPS.md G79).
  * ------------------------------------------------------------------------- */
 
 /*
@@ -1263,10 +1265,17 @@ vec_docid_member(const uint64 *sorted, int n, uint64 d)
  * channel over the shared docid space.  The conversion is one pass of the warp
  * map per bolt, which the scan walks anyway.
  */
-static uint64 *
-vec_allow_from_docids(const WeaveVecWeft *w, int segno, const uint64 *sorted,
-					  int nwant)
+typedef struct VecDocList
 {
+	const uint64 *sorted;
+	int			n;
+} VecDocList;
+
+static uint64 *
+vec_allow_from_docids(void *arg, const WeaveVecWeft *w, int segno)
+{
+	const uint64 *sorted = ((const VecDocList *) arg)->sorted;
+	int			nwant = ((const VecDocList *) arg)->n;
 	uint32		nvec = w->meta.nvec;
 	Size		nwords = ((Size) nvec + 63) / 64;
 	uint64	   *bm = (uint64 *) palloc0(nwords * sizeof(uint64));
@@ -1417,7 +1426,7 @@ vec_scan_bolt(WeaveVecTopK *r, const WeaveVecWeft *w, int segno, const WVec *que
 WeaveVecTopK *
 weave_vec_topk_run(Relation index, const WeaveMetaPageData *meta,
 				   const WVec *query, int k, uint16 attnum,
-				   const uint64 *want, int nwant, bool filtered)
+				   WeaveVecAllowFn allowfn, void *allowarg)
 {
 	WeaveVecTopK *r;
 	uint32		s;
@@ -1474,8 +1483,8 @@ weave_vec_topk_run(Relation index, const WeaveMetaPageData *meta,
 					 errdetail("%s.", why != NULL ? why : "unknown reason")));
 
 		r->nlane += (uint64) w.meta.nvec;
-		if (filtered)
-			allow = vec_allow_from_docids(&w, (int) s, want, nwant);
+		if (allowfn != NULL)
+			allow = allowfn(allowarg, &w, (int) s);
 		vec_scan_bolt(r, &w, (int) s, query, allow);
 		if (allow != NULL)
 			pfree(allow);
@@ -1558,7 +1567,12 @@ vec_scan_run(Oid indexoid, const WVec *query, int k, ArrayType *arr)
 	 * against and it is the behaviour of this function before F7 split the loop
 	 * out of it.  The ORDER BY driver passes the attribute the scan key named.
 	 */
-	r = weave_vec_topk_run(index, &meta, query, k, 0, want, nwant, filtered);
+	{
+		VecDocList	dl = {want, nwant};
+
+		r = weave_vec_topk_run(index, &meta, query, k, 0,
+							   filtered ? vec_allow_from_docids : NULL, &dl);
+	}
 
 	pgstat_count_index_tuples(index, r->nhit);
 	index_close(index, AccessShareLock);

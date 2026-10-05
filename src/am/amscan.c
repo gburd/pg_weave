@@ -609,6 +609,13 @@ weave_tombstones_free(WeaveTombstones *t)
 	t->hasany = false;			/* idempotent: the lexical retry path frees again */
 }
 
+/* the vector ORDER BY's tombstone allowlist (G79), built by the fused pass's
+ * warp-map walk; both are defined with the vector passes below */
+static uint32 weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
+									 const WeaveTombstones *tombs, uint64 **docid_out,
+									 uint64 **allow_out);
+static uint64 *weave_vec_tomb_allow(void *arg, const WeaveVecWeft *w, int segno);
+
 /*
  * Drop TIDs tombstoned in ONE specific segment from a TidSet in place.
  * Tombstones are per-segment: a docid deleted in segment A must only be
@@ -8283,9 +8290,10 @@ weave_ord_grow(Relation index, WeaveScanOpaque so)
  *
  *	 1. nhit < veck.  The pass's top-k heap never filled, so its floor stayed at
  *	    -INFINITY for the whole scan; WEAVE_VSCAN_SKIP_BOUND is only reachable when
- *	    a block's bound is <= that floor, and no allowlist is in play so
- *	    WEAVE_VSCAN_SKIP_MASK is not either.  Nothing was skipped, so the pass IS
- *	    every live lane in the index.  Exact, and the analogue of `candfull`.
+ *	    a block's bound is <= that floor, and the only allowlist in play is the
+ *	    tombstone one (weave_vec_tomb_allow(), G79), so WEAVE_VSCAN_SKIP_MASK skips
+ *	    only blocks with no untombstoned live lane.  The pass IS every live,
+ *	    untombstoned lane in the index.  Exact, and the analogue of `candfull`.
  *	 2. veck >= nlane.  The pass was at least as wide as the total lane count of
  *	    every bolt it scanned, so no wider pass can find more.  The analogue of
  *	    `curk >= maxhits`, and unlike that one it is a count rather than a bound, so
@@ -8430,6 +8438,35 @@ weave_vec_collect_pending(Relation index, const WeaveMetaPageData *meta,
 }
 
 /*
+ * A bolt's lane allowlist for the ORDER BY: its live lanes minus its OWN
+ * tombstones -- doc/GAPS.md G79.
+ *
+ * WHY THE VECTOR PASS NEEDS TOMBSTONES AT ALL when the heap probe applies MVCC:
+ * after VACUUM a tombstoned docid's TID is free for the heap to reuse, and the
+ * probe of a reused TID finds the NEW row, visible.  Without this the new row was
+ * ranked at the DEAD row's distance -- the farthest vector in a table came out
+ * first -- and, being in the pending list (or a newer bolt) too, emitted a second
+ * time at its own.  The lexical channel (weave_filter_tombstoned_seg()) and the
+ * fused pass have always subtracted them; the plain vector route did not.
+ *
+ * ONE BUILDER: weave_fuse_vec_warpmap(), the fused pass's, so the two routes
+ * cannot disagree about which lanes a tombstone removes.  A bolt with no
+ * tombstones gets NULL -- no allowlist, no warp-map walk -- which is the common,
+ * delete-free case paying nothing.
+ */
+static uint64 *
+weave_vec_tomb_allow(void *arg, const WeaveVecWeft *w, int segno)
+{
+	const WeaveTombstones *t = (const WeaveTombstones *) arg;
+	uint64	   *allow;
+
+	if (!t->hasany || segno < 0 || (uint32) segno >= t->nseg || !t->present[segno])
+		return NULL;
+	(void) weave_fuse_vec_warpmap(w->index, w, segno, t, NULL, &allow);
+	return allow;
+}
+
+/*
  * One pass, bracketed against the A1 race.
  *
  * The bolt loop reads VDIR/VCODES/VWARP pages under per-page SHARE locks off a
@@ -8455,9 +8492,14 @@ weave_vec_topk_guarded(Relation index, WeaveScanOpaque so)
 		uint32		gen0 = weave_read_meta_generation(index);
 		WeaveVecTopK *r;
 
+		WeaveTombstones tombs;
+
 		weave_read_meta(index, &meta);
+		weave_tombstones_load(index, &meta, &tombs);
 		r = weave_vec_topk_run(index, &meta, so->vecQuery, so->veck,
-							   (uint16) so->vecAttno, NULL, 0, false);
+							   (uint16) so->vecAttno,
+							   tombs.hasany ? weave_vec_tomb_allow : NULL, &tombs);
+		weave_tombstones_free(&tombs);
 		weave_vec_collect_pending(index, &meta, so);
 		if (weave_read_meta_generation(index) == gen0)
 			return r;
@@ -9355,7 +9397,8 @@ typedef struct FuseVecChan
  * can carry millions of tombstones.
  *
  * Returns the live lane count.  `*docid_out` and `*allow_out` are allocated in the
- * current context.
+ * current context; `docid_out` may be NULL, which is the plain vector ORDER BY's
+ * case (weave_vec_tomb_allow()): it needs the allowlist and not the relabelling.
  */
 static uint32
 weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
@@ -9376,7 +9419,8 @@ weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
 	/* Relation-scale, one entry per document of this bolt: huge-safe, and the
 	 * ascending check in weave_vecdoc_chan_init() reads every entry, so nothing is
 	 * left uninitialized by not zeroing it. */
-	docid = (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) Max(nlane, 1) * sizeof(uint64));
+	docid = docid_out == NULL ? NULL :
+		(uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) Max(nlane, 1) * sizeof(uint64));
 	allow = (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) Max(nword, 1) * sizeof(uint64));
 	memset(allow, 0, (Size) Max(nword, 1) * sizeof(uint64));
 
@@ -9392,7 +9436,8 @@ weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
 					 errmsg("bolt %d of index \"%s\" has an unreadable vector warp map",
 							segidx, RelationGetRelationName(index)),
 					 errdetail("%s.", why != NULL ? why : "unknown reason")));
-		docid[i] = d;
+		if (docid != NULL)
+			docid[i] = d;
 		if (havetombs && sm_contains(&tombs->maps[segidx], d, &tombcursor))
 			continue;
 		allow[i / 64] |= UINT64CONST(1) << (i % 64);
@@ -9400,7 +9445,8 @@ weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
 	}
 	weave_vec_warp_end(&wc);
 
-	*docid_out = docid;
+	if (docid_out != NULL)
+		*docid_out = docid;
 	*allow_out = allow;
 	return nlive;
 }
