@@ -610,6 +610,26 @@ weave_tombstones_free(WeaveTombstones *t)
 }
 
 /*
+ * THE vector-lane tombstone rule, once (doc/GAPS.md G79): a docid published by
+ * bolt `segidx` is dropped iff it is tombstoned in THAT bolt's map.  Its own
+ * bolt's and no other's -- the same TID may have been reused by a live document in
+ * a newer bolt or the pending list (weave_filter_tombstoned_seg() has the
+ * paragraph).  `cur` is a forward-resume cursor for that one map: probes must
+ * arrive with non-decreasing docids, and the caller resets it when it changes
+ * bolt.  Both vector routes call this -- the fused pass's warp-map walk
+ * (weave_fuse_vec_warpmap()) and the plain ORDER BY's admission test
+ * (weave_vec_tomb_dropped()) -- so they cannot disagree about which lane a
+ * tombstone removes.
+ */
+static inline bool
+weave_tombstoned_in(const WeaveTombstones *t, uint32 segidx, uint64 docid,
+					sm_cursor_t *cur)
+{
+	return t != NULL && t->hasany && segidx < t->nseg && t->present[segidx] &&
+		sm_contains(&t->maps[segidx], docid, cur);
+}
+
+/*
  * Drop TIDs tombstoned in ONE specific segment from a TidSet in place.
  * Tombstones are per-segment: a docid deleted in segment A must only be
  * suppressed among matches produced BY segment A -- the same heap TID may have
@@ -8284,8 +8304,10 @@ weave_ord_grow(Relation index, WeaveScanOpaque so)
  *	 1. nhit < veck.  The pass's top-k heap never filled, so its floor stayed at
  *	    -INFINITY for the whole scan; WEAVE_VSCAN_SKIP_BOUND is only reachable when
  *	    a block's bound is <= that floor, and no allowlist is in play so
- *	    WEAVE_VSCAN_SKIP_MASK is not either.  Nothing was skipped, so the pass IS
- *	    every live lane in the index.  Exact, and the analogue of `candfull`.
+ *	    WEAVE_VSCAN_SKIP_MASK is not either.  Nothing was skipped, and only a
+ *	    tombstoned lane was refused admission (weave_vec_tomb_dropped(), G79), so
+ *	    the pass IS every live, untombstoned lane in the index.  Exact, and the
+ *	    analogue of `candfull`.
  *	 2. veck >= nlane.  The pass was at least as wide as the total lane count of
  *	    every bolt it scanned, so no wider pass can find more.  The analogue of
  *	    `curk >= maxhits`, and unlike that one it is a count rather than a bound, so
@@ -8430,6 +8452,46 @@ weave_vec_collect_pending(Relation index, const WeaveMetaPageData *meta,
 }
 
 /*
+ * The plain vector ORDER BY's tombstone test, asked by weave_vec_topk_run() as
+ * each candidate is admitted -- doc/GAPS.md G79.
+ *
+ * WHY THE VECTOR PASS NEEDS TOMBSTONES AT ALL when the heap probe applies MVCC:
+ * after VACUUM a tombstoned docid's TID is free for the heap to reuse, and the
+ * probe of a reused TID finds the NEW row, visible.  Without this the new row was
+ * ranked at the DEAD row's distance -- the reproducer's farthest vector came out
+ * first -- and, being in the pending list (or a newer bolt) too, emitted a second
+ * time at its own: 1,727 duplicate rows in a 50,000-row drain.  The lexical
+ * channel and the fused pass always subtracted them; this route did not.
+ *
+ * AT ADMISSION, not as a lane allowlist like the fused pass's, because the docid
+ * is resolved there anyway and admissions arrive warp-ascending, hence
+ * docid-ascending, so one forward cursor per bolt serves them.  The allowlist
+ * costs a second warp-map walk per bolt per pass, measured at +24 % on a 200k
+ * top-10 (doc/GAPS.md G79).  A lane rejected here is still scored, which is the
+ * work the delete-free index does anyway.
+ */
+typedef struct WeaveVecTombDrop
+{
+	const WeaveTombstones *t;
+	int			segno;			/* the bolt `cur` belongs to, or -1 */
+	sm_cursor_t cur;
+} WeaveVecTombDrop;
+
+static bool
+weave_vec_tomb_dropped(void *arg, int segno, uint64 docid)
+{
+	WeaveVecTombDrop *d = (WeaveVecTombDrop *) arg;
+	static const sm_cursor_t init = SM_CURSOR_INIT;
+
+	if (segno != d->segno)
+	{
+		d->segno = segno;
+		d->cur = init;
+	}
+	return segno >= 0 && weave_tombstoned_in(d->t, (uint32) segno, docid, &d->cur);
+}
+
+/*
  * One pass, bracketed against the A1 race.
  *
  * The bolt loop reads VDIR/VCODES/VWARP pages under per-page SHARE locks off a
@@ -8454,10 +8516,17 @@ weave_vec_topk_guarded(Relation index, WeaveScanOpaque so)
 		WeaveMetaPageData meta;
 		uint32		gen0 = weave_read_meta_generation(index);
 		WeaveVecTopK *r;
+		WeaveTombstones tombs;
+		WeaveVecTombDrop drop;
 
 		weave_read_meta(index, &meta);
+		weave_tombstones_load(index, &meta, &tombs);
+		drop.t = &tombs;
+		drop.segno = -1;
 		r = weave_vec_topk_run(index, &meta, so->vecQuery, so->veck,
-							   (uint16) so->vecAttno, NULL, 0, false);
+							   (uint16) so->vecAttno, NULL, 0, false,
+							   tombs.hasany ? weave_vec_tomb_dropped : NULL, &drop);
+		weave_tombstones_free(&tombs);
 		weave_vec_collect_pending(index, &meta, so);
 		if (weave_read_meta_generation(index) == gen0)
 			return r;
@@ -9393,7 +9462,7 @@ weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
 							segidx, RelationGetRelationName(index)),
 					 errdetail("%s.", why != NULL ? why : "unknown reason")));
 		docid[i] = d;
-		if (havetombs && sm_contains(&tombs->maps[segidx], d, &tombcursor))
+		if (havetombs && weave_tombstoned_in(tombs, (uint32) segidx, d, &tombcursor))
 			continue;
 		allow[i / 64] |= UINT64CONST(1) << (i % 64);
 		nlive++;

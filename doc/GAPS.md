@@ -5095,7 +5095,7 @@ for exactly this reason, `doc/specs/VECTOR_CHANNEL.md` "warp → docid"), not fr
 
 G76's fix does not rely on the universe: a NOT query keeps the heap walk.
 
-### G79 — the vector ORDER BY ignores TOMBSTONES: after DELETE + VACUUM, a NEW row that reuses the dead row's ctid is ranked at the DEAD row's distance — **FOUND 2026-10-05 while designing G77's fix; a SILENT WRONG ANSWER reachable by DELETE, VACUUM, INSERT; OPEN**
+### G79 — the vector ORDER BY ignores TOMBSTONES: after DELETE + VACUUM, a NEW row that reuses the dead row's ctid is ranked at the DEAD row's distance — **FOUND 2026-10-05 while designing G77's fix; a SILENT WRONG ANSWER reachable by DELETE, VACUUM, INSERT; FIXED 2026-10-05 (`wt/g79`), except for the G80 shape**
 
 The lexical channel subtracts a segment's tombstones (`weave_collect_matches()`,
 `WeaveTombstones`), the docvalues gate excludes them, and the fused pass gates through the
@@ -5129,6 +5129,83 @@ tombstones. A docvalues restriction answered correctly too.
 as the raw diagnostic it is documented to be. Then pin it with this reproducer plus a
 fused variant and a padding variant.
 
+> **SUPERSEDED 2026-10-05: "the allowlist is the natural carrier" was MEASURED and is the
+> wrong carrier.** Building it means a second walk of the bolt's warp map per bolt per
+> pass, the fused pass's `weave_fuse_vec_warpmap()`. That was the first cut, and it was
+> correct: every gate below passed on it, run `pgweave-20261005-043307-c605`. It also cost
+> **+24 %** on a 200k-row, 2-bolt, 10 %-tombstoned top-10: 61.8 ms → 76.6 ms, and again
+> 76.6 → 76.8 ms, three runs per arm with a spread of 0.4 ms. The shipped fix tests the
+> tombstone at **admission**, where `vec_scan_bolt()` resolves the docid anyway.
+
+**FIXED 2026-10-05, branch `wt/g79`.** `weave_vec_topk_run()` gained a `dropped(segno,
+docid)` hook, asked as each candidate is admitted to the top-k. The access method passes
+`weave_vec_tomb_dropped()` (`src/am/amscan.c`) and the `weave_vec_scan()` SRF passes NULL,
+so the SRF stays raw. Admissions within a bolt are warp-ascending, and so docid-ascending,
+so one forward `sm_cursor_t` per bolt serves them: the amortization the WAND cursors rely
+on. There is now **one** rule for "this lane is tombstoned in its own bolt",
+`weave_tombstoned_in()`. The fused warp-map walk and the ORDER BY both call it, so the two
+vector routes cannot disagree. The per-bolt half matters: a docid tombstoned in bolt 0 can
+be live in bolt 1 under the same TID, and mutant M3 below tests exactly that.
+
+Cost: none measured. On the same 200k shape, fixed vs. hook disabled (mutant M1, wrong
+answers) was 57.5/58.4/57.9 and 57.2/57.1/57.8 ms against 58.2/58.3/58.9 and
+60.0/59.4/58.5 ms (run `pgweave-20261005-050302-0cb3`). The between-arm delta is inside
+the within-arm spread, so by hard rule 10 it is not a result. A tombstoned lane is still
+scored; only its admission is refused. Absolute times are not comparable across the two
+runs, because they were different hosts.
+
+**Evidence (EC2, PG 17.11, both runs on the final code `4022cfa`, plus the earlier cut):**
+
+- **Regression, `sql/vecorderby.sql` §(13).** The reproducer (`LIMIT 3` → `{3,4,5}`, the
+  heap's answer, with rows 1 and 2 deleted). A LIMIT-less drain: every row once, the far row
+  and a NULL-vector padding row at the heap's rank. The fused ORDER BY. `<@>` and lexical
+  over the same recycled ctids. The same table after a second VACUUM moves the new rows into
+  a newer bolt. The section first prints the ctids `(0,1)`/`(0,2)` and `ndeleted = 2`, so it
+  shows that the reuse happened. The expected output came from a full `installcheck` and is
+  the old file **byte-identical** plus the new section (hard rule 3).
+- **Mutants, each confirmed BUILT** (distinct `.so` md5s), and each caught by the regression
+  test: M1 `dropped` returns false (20 diff lines); M2 `weave_tombstoned_in()` returns false,
+  which also disables the fused route (36 lines); M3 tests bolt 0's map whatever the bolt
+  (`own_vector_limit2` `{100,20}` → `{20,19}`). The scale run catches M1 and M2 (M2 also on the fused route,
+  once the new rows are in bolt 1: 47 wrong rows in 50 fused top-10s). It **does
+  not catch M3**: its tombstones are all in bolt 0, so the bolt-0 map is the right map for
+  every tombstoned lane. Only the regression section's second-bolt assertion pins the
+  per-bolt rule.
+- **Hard rule 12, `bench/aws/g79_scale.sql`, at 200k and 50k.** Delete ~10 % by hash
+  (19,914 / 5,041 rows), VACUUM (tombstones equal deletions), insert as many FAR rows
+  (19,894 / 5,038 landed on a dead ctid), then compare against the heap with 50 queries ×
+  {vec LIMIT 10, vec LIMIT 100, fused LIMIT 10}, before and after a second VACUUM flushes
+  them into bolt 1, plus one LIMIT-less drain. Fixed: **0 wrong rows and 0 duplicates in
+  every cell at both scales**, and both drains emit every row once with every new row after
+  every old one. Under M1 at 50k: 47 wrong rows across 34 of 50 top-10s, 478 across 50 of 50
+  top-100s, and a drain of **51,727 rows for a 50,000-row table** (1,727 emitted twice; the
+  first new row at rank 17). Under M1 at 200k (the timing table): 40 wrong rows in 50
+  top-10s. Recall against the exact heap order is 0.60–0.74, the 4-bit quantizer's at 16-d;
+  it is reported and not gated, because it is the same before and after.
+- Full `installcheck` (22 regression, 2 isolation, 30 TAP files) green on `4022cfa`.
+
+**Checked and NOT this bug:**
+
+- **Pending.** `weave_vec_collect_pending()` applies no tombstones, and needs none: VACUUM
+  flushes the pending list before it tombstones (G69), so a pending row is never
+  tombstoned, and a recycled TID in the list is the new row's, with its own vector. The
+  duplicate was a stale *lane* plus a pending entry for one TID. `weave_vec_pass()` merges
+  the two without de-duplicating by TID, so it emitted both; with the stale lane refused,
+  there is only one.
+- **Padding.** `weave_pad_gettuple()` skips every TID the ranked phase emitted (`padSeen`),
+  so it cannot emit a row twice. The NULL-vector row on a recycled ctid had been coming out
+  of the *ranked* phase, at the dead row's distance (`{100,101,3}` under M1). It now pads
+  last, as the heap has it.
+- **`<@>` and lexical `<=>`** with recycled ctids give the heap's answers on the fixed build
+  (`edist_distances_as_heap`, a dead term with 0 `weave_search()` hits). Neither touches
+  the changed code, so this is also their pre-fix behaviour.
+
+**RESIDUAL, AND IT IS G80's:** the hook can only apply tombstones that exist. A dead row
+whose `wdoc` has no terms is never tombstoned (G80), so its lane stays admissible, and a new
+row on its ctid is still ranked at its distance *and* emitted again from the pending list.
+Measured on EC2: `ndeleted = 0`, index `{100,2,3}`, heap `{2,3,4}`. The per-segment document
+list that fixes G80 in `weave_bulkdelete()` closes this with no change to the vector path.
+
 ### G80 — VACUUM cannot tombstone a ZERO-TERM document, so its docvalue and vector lane outlive the row and a NEW row on the recycled ctid inherits them — **FOUND 2026-10-05 while designing G77's fix; a SILENT WRONG ANSWER; OPEN; same root cause as G78**
 
 `weave_bulkdelete()` asks the vacuum callback about every docid in
@@ -5155,3 +5232,20 @@ population of posting-less documents and make both worse, so the three are fixed
 a per-segment **document list** (every docid the segment holds, posting or not), written by
 build, flush and merge, and used by bulkdelete, the NOT universe and the padding's
 completeness argument.
+
+### G81 — a segment whose documents have NO TERMS is not written: a build or a flush of only zero-term documents loses their docvalues and vectors — **FOUND 2026-10-05 by the doclist agent's investigation, confirmed locally; a SILENT WRONG ANSWER; OPEN; part of the G77/G78/G80 document-list work**
+
+`weave_build_flush_segment()` returns early when `bs->nterms == 0` (`src/am/ambuild.c`),
+and a segment whose `dictstart` is `InvalidBlockNumber` is the "consumed slot, skip it"
+sentinel in about 26 places. So a segment holding documents but no terms cannot exist.
+Reproducer (local, 2026-10-05):
+
+| shape | `WHERE price < 4`, index | heap |
+|---|---|---|
+| CREATE INDEX over 10 rows, every `body` = `to_wdoc('')` | `{}` | `{1,2,3}` |
+| 1 seeded row, then 9 such rows pending, then `VACUUM` (flush) | `{}` | `{2,3}` |
+
+The flushed index also fails `weave_check(deep)`: `pages_reachable_or_freed` reports **7 unreachable page(s) not flagged freed**, so the flush wrote the docvalues and vector pages and then published no segment pointing at them -- a leak as well as a lost answer. The vector ORDER BY over the first table
+returned `{1,2,3}`, so the vector lanes were either written or answered from elsewhere; this
+has not been traced. The fix belongs to the document-list design: a segment with documents
+must always be written, with an empty dictionary page, so `dictstart` is valid.
