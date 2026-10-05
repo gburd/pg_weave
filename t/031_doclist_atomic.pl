@@ -148,7 +148,7 @@ archive_mode = off
 
 	# G75: one VACUUM reclaims what the crash stranded.  VERBOSE so the reclaim's
 	# own line is in the log as evidence that the pass ran and what it freed.
-	my ($vrc, $vout, $verr) = $pitr->psql('postgres', 'VACUUM (VERBOSE) da');
+	my ($vrc, $vout, $verr) = $pitr->psql('postgres', 'SET client_min_messages = debug2; VACUUM da');
 	is($vrc, 0, "point $i: VACUUM succeeds after recovery") or diag($verr);
 	my ($reclaimed) = $verr =~ /reclaimed (\d+) stranded page/;
 	ok(defined $reclaimed, "point $i: the VACUUM ran the stranded-page reclaim")

@@ -47,7 +47,6 @@ $node->append_conf('postgresql.conf', qq{
 autovacuum = off
 log_lock_waits = on
 deadlock_timeout = 10ms
-log_min_messages = info
 });
 $node->start;
 
@@ -116,7 +115,7 @@ like($kinds, qr/doclist/, 'phase 0 precondition: the index has a document list')
 like($kinds, qr/pending/, 'phase 0 precondition: the index has pending pages');
 for my $pass (1 .. 2)
 {
-	my ($freed) = vacuum_verbose('VACUUM (VERBOSE) allch');
+	my ($freed) = vacuum_verbose('SET client_min_messages = debug2; VACUUM allch');
 	is($freed, 0, "phase 0 pass $pass: a healthy all-channel index has nothing to reclaim");
 	is(deep_bad('allch_w'), '', "phase 0 pass $pass: weave_check(deep) is clean");
 }
@@ -184,7 +183,7 @@ for my $try (1 .. 8)
 	}
 
 	my $v = $node->background_psql('postgres', on_error_stop => 0);
-	$v->query_until(qr/started/, "\\echo started\nVACUUM (VERBOSE) big;\n");
+	$v->query_until(qr/started/, "SET client_min_messages = debug2;\n\\echo started\nVACUUM big;\n");
 	# the VACUUM must be seen WAITING on that lock while the inserter holds it
 	my $waited = 0;
 	for (1 .. 3000)
@@ -247,7 +246,9 @@ for my $try (1 .. 5)
 	my $logpos = -s $node->logfile;
 	my $v = $node->background_psql('postgres', on_error_stop => 0);
 	$v->query_safe(q{SET vacuum_cost_delay = '5ms'; SET vacuum_cost_limit = 1});
-	$v->query_until(qr/started/, "\\echo started\nVACUUM (VERBOSE) big;\n");
+	# the reclaim reports at DEBUG2 (PG17's lazy vacuum passes an index AM that
+	# message level whatever VERBOSE says), so send this session's to the log
+	$v->query_until(qr/started/, "SET log_min_messages = debug2;\n\\echo started\nVACUUM big;\n");
 	# the VACUUM is past its barrier once it holds the maintenance mutex (page 0)
 	$node->poll_query_until('postgres', q{
 		SELECT count(*) > 0 FROM pg_locks
@@ -275,7 +276,7 @@ is($node->safe_psql('postgres', q{
 	$node->safe_psql('postgres', 'SELECT count(*) FROM big'),
 	'phase B: every row answers through the index');
 # and the pages the concurrent writer published survive the NEXT reclaim too
-my ($freedB2) = vacuum_verbose('VACUUM (VERBOSE) big');
+my ($freedB2) = vacuum_verbose('SET client_min_messages = debug2; VACUUM big');
 is($freedB2, 0, 'phase B: a quiet VACUUM afterwards has nothing to reclaim');
 is(deep_bad('big_w'), '', 'phase B: still clean after that VACUUM');
 

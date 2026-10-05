@@ -66,6 +66,25 @@ run_tap() {
 ok=1
 CLEAN_MD5=
 
+# the smoke that ran before this script left its TAP logs in the tree: keep them
+if [[ " $PHASES " == *" smokelogs "* ]]; then
+	mkdir -p $OUT/smoke-taplog
+	cp $SRC/tmp_check/log/* $OUT/smoke-taplog/ 2>/dev/null
+	log "SMOKELOGS: copied $(ls $OUT/smoke-taplog | wc -l) files"
+fi
+
+# TAPS (a list) run TAPN times each on the clean install, logs kept per run
+if [[ " $PHASES " == *" tap "* ]]; then
+	install_tree "$SRC" clean || { log "TAP build/install FAILED"; exit 1; }
+	for t in ${TAPS:-}; do
+		for r in $(seq 1 ${TAPN:-1}); do
+			res=$(run_tap "$SRC" "$(basename $t .pl)-$r" $t)
+			log "TAP $t run $r: $res"
+			case "$res" in *"Result: PASS"*) ;; *) ok=0 ;; esac
+		done
+	done
+fi
+
 if [[ " $PHASES " == *" control "* ]]; then
 	install_tree "$SRC" clean || { log "CONTROL build/install FAILED"; exit 1; }
 	CLEAN_MD5=$(md5sum $LIB/pg_weave.so | cut -d' ' -f1)
