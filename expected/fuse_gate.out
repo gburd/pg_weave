@@ -344,4 +344,86 @@ SELECT e.name,
 DROP TABLE fge;
 DROP TABLE fgq;
 DROP TABLE fg;
+-- ---------------------------------------------------------------------------
+-- (5) G76: THE PADDING WALKS THE GATE, NOT THE HEAP.  When the gate admits fewer
+-- rows than LIMIT, the ranked phase runs out and the padding phase hands every
+-- remaining row to the executor for recheck.  It used to be a heap walk, so 20
+-- qualifying rows of 3,002 made the executor recheck and discard ~2,980 -- correct,
+-- O(heap), and invisible to every pg_weave counter.  With a lexical gate the
+-- padding walks the gate set, so `Rows Removed by Index Recheck` is bounded by the
+-- gate.  Each route that pads is checked, and so is its answer against the heap.
+--
+-- Except the plain VECTOR route's removed count, which is not asserted: its ranked
+-- phase applies no gate at all -- it emits every live lane in distance order and
+-- the executor discards those outside `@@@` -- so its removed count measures the
+-- ranked phase (~2,980 here before the padding starts), not the padding.  That is
+-- rank-then-filter by design; `fuse()` is the gated form, and is arm 1.
+--
+-- The positive control is a fused NOT gate: a `!q` gate cannot be walked
+-- (doc/GAPS.md G78: the NOT universe omits zero-term documents), so it keeps the
+-- heap walk, and its removed count must stay large.  Without it, "removed is small"
+-- could hold because the padding never ran.  Row 3004 is a zero-term document with
+-- a vector, so walking the NOT gate would also LOSE a row: same_set goes false.  The
+-- control is fused, not vector, because a vector ranked phase rejects ~2,980 rows by
+-- itself (below), which would satisfy "removed is large" without any padding.
+-- ---------------------------------------------------------------------------
+CREATE TABLE gp (id int, body wdoc, emb wvec(4)) WITH (autovacuum_enabled = off);
+INSERT INTO gp SELECT g, to_wdoc('simple', 'rare alpha w' || g), ('[' || g || ',1,1,1]')::wvec
+  FROM generate_series(1, 10) g;
+INSERT INTO gp SELECT g, to_wdoc('simple', 'rare beta w' || g), NULL FROM generate_series(11, 20) g;
+INSERT INTO gp SELECT g, to_wdoc('simple', 'common w' || g), ('[' || g || ',1,1,1]')::wvec
+  FROM generate_series(21, 3000) g;
+INSERT INTO gp VALUES (3001, NULL, '[1,1,1,1]'), (3004, to_wdoc('simple', ''), '[3,1,1,1]');
+CREATE INDEX gp_w ON gp USING weave (body, emb);
+-- pending rows, a HOT update, a non-HOT update and a delete, all inside the gate
+INSERT INTO gp VALUES (3002, to_wdoc('simple', 'rare pend'), '[2,1,1,1]'),
+                      (3003, to_wdoc('simple', 'rare pendnull'), NULL);
+UPDATE gp SET emb = '[99,1,1,1]' WHERE id = 7;
+DELETE FROM gp WHERE id = 6;
+ANALYZE gp;
+-- Rows Removed by Index Recheck for q in the index arm (0 when the line is absent).
+CREATE FUNCTION pg_temp.gp_removed(q text) RETURNS int
+LANGUAGE plpgsql AS $$
+DECLARE
+  l text;
+  n int := 0;
+BEGIN
+  PERFORM pg_temp.fg_arm('index');
+  FOR l IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+    IF l ~ 'Rows Removed by Index Recheck' THEN
+      n := substring(l from '(\d+)\s*$')::int;
+    END IF;
+  END LOOP;
+  RETURN n;
+END $$;
+CREATE TEMP TABLE gpq (ord int, name text, q text);
+INSERT INTO gpq VALUES
+  (1, 'fused lex+vec', 'SELECT id FROM gp WHERE body @@@ ''rare'' ORDER BY fuse(body <=> ''alpha'', emb <-> ''[0,1,1,1]'') LIMIT 100'),
+  (2, 'fused lex only', 'SELECT id FROM gp WHERE body @@@ ''rare'' ORDER BY fuse(body <=> ''alpha'', body <=> ''beta'') LIMIT 100'),
+  (3, 'vector', 'SELECT id FROM gp WHERE body @@@ ''rare'' ORDER BY emb <-> ''[0,1,1,1]'' LIMIT 100'),
+  (4, 'lexical, other query', 'SELECT id FROM gp WHERE body @@@ ''rare'' ORDER BY body <=> ''alpha'' LIMIT 100'),
+  (5, 'edit distance', 'SELECT id FROM gp WHERE body @@@ ''rare'' ORDER BY body <@> ''alpah'' LIMIT 100'),
+  (6, 'CONTROL: NOT gate, heap walk', 'SELECT id FROM gp WHERE body @@@ ''!common'' ORDER BY fuse(body <=> ''alpha'', emb <-> ''[0,1,1,1]'') LIMIT 100');
+SELECT q.name,
+       (SELECT count(*) FROM pg_temp.fg_ids(q.q, 'index')) AS n_index,
+       (SELECT array_agg(id ORDER BY id) FROM pg_temp.fg_ids(q.q, 'index'))
+         = (SELECT array_agg(id ORDER BY id) FROM pg_temp.fg_ids(q.q, 'heap')) AS same_set_as_the_heap,
+       (SELECT count(DISTINCT id) FROM pg_temp.fg_ids(q.q, 'index'))
+         = (SELECT count(*) FROM pg_temp.fg_ids(q.q, 'index')) AS once,
+       CASE WHEN q.ord = 3 THEN NULL
+            WHEN q.ord < 6 THEN pg_temp.gp_removed(q.q) <= 25
+            ELSE pg_temp.gp_removed(q.q) > 2900 END AS removed_as_expected
+  FROM gpq q ORDER BY q.ord;
+             name             | n_index | same_set_as_the_heap | once | removed_as_expected 
+------------------------------+---------+----------------------+------+---------------------
+ fused lex+vec                |      21 | t                    | t    | t
+ fused lex only               |      21 | t                    | t    | t
+ vector                       |      21 | t                    | t    | 
+ lexical, other query         |      21 | t                    | t    | t
+ edit distance                |      21 | t                    | t    | t
+ CONTROL: NOT gate, heap walk |      22 | t                    | t    | t
+(6 rows)
+
+DROP TABLE gpq;
+DROP TABLE gp;
 RESET max_parallel_workers_per_gather;
