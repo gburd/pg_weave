@@ -342,6 +342,18 @@ corpus — the original named Cohere-wiki), all of:
    comparator makes both this gate and the next one easier and both worthless; a
    better-built HNSW is also *larger*, so this rule can only cost us.
 
+   **STATED PER DIMENSION since 2026-10-05.** The ratio must hold at **each** of 384,
+   768, 960 and 1,024 dimensions, measured from `pg_relation_size` of a built index on
+   both sides, never from codec arithmetic. A single ratio hid a failure for three
+   weeks: the design's bytes per vector are not proportional to `dim` the way HNSW's
+   are, because each 32-lane block carries per-block overhead and its strips are cut
+   at page boundaries, so the same index measured 0.096× at 960-d and 0.261× at
+   384-d (`bench/RESULTS_VECMAJOR.md`). 384-d and 768-d are the common embedding
+   widths, so the dimension the claim was checked at was the one least likely to be
+   deployed. **Today (weft v4, V21):** 0.136 / 0.130 / 0.065 / 0.096× at 384 / 768 /
+   960 / 1,024-d, all passing; 384-d has 29 B/vector of headroom measured on one-token
+   synthetic documents, so a real corpus's lexical bytes are the owed measurement.
+
 3. **Latency, iso-recall, with the cache state declared.** Let
    `R* = min(0.99, best recall@10 pgvector HNSW achieves on this corpus over the
    swept m / ef_construction / ef_search)`. At recall ≥ `R*`, pg_weave's p50 must
