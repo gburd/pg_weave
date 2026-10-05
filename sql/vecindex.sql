@@ -543,7 +543,41 @@ SELECT invariant, ok FROM weave_check('vwbig_weave')
 SELECT count(*) AS violations FROM weave_check('vwbig_weave', true) WHERE NOT ok;
 SELECT sum(bytes) = pg_relation_size('vwbig_weave') AS sums_to_relation_size
   FROM weave_index_size_detail('vwbig_weave');
+
+-- v4 (doc/specs/VECTOR_CHANNEL.md sect. 7.1): the centroid strip SHARES its block's
+-- last lane page whenever it fits, and at 1024-d 4 bits it does -- the third lane
+-- strip holds 6 coordinates (108 bytes) and the 524-byte centroid strip follows it.
+-- So 8 strips on 6 pages, every centroid on the same page as that block's j0 = 1018
+-- strip, and the size report's page count is the chain's.  In v3 this was 8 pages,
+-- one per strip: 256 B/vector of centroid pages (bench/RESULTS_VECMAJOR.md).
+SELECT count(*) AS strips, count(DISTINCT blkno) AS code_pages,
+       count(*) FILTER (WHERE centroid AND blkno IN
+                          (SELECT blkno FROM weave_vec_strips('vwbig_weave')
+                            WHERE NOT centroid AND j0 = 1018)) AS centroids_sharing
+  FROM weave_vec_strips('vwbig_weave');
+SELECT npages AS size_detail_code_pages FROM weave_index_size_detail('vwbig_weave')
+ WHERE kind = 'vector_codes';
 DROP TABLE vwbig;
+
+-- ... and where it does NOT fit, it keeps a page of its own: at 500-d one lane strip
+-- is 12 + 16*500 = 8,012 bytes of an 8,160-byte payload, leaving 148 for a 262-byte
+-- centroid strip.  The writer must spill rather than overfill, and every reader must
+-- read the spilled layout -- the scan below goes through the code cursor, and
+-- weave_check() through weave_vec_block_read() and the chain-length invariant.
+CREATE TABLE vwspill (id serial, d wdoc, v wvec(500));
+INSERT INTO vwspill(d, v)
+  SELECT to_wdoc('spill tag' || g),
+         (SELECT '[' || string_agg(((g * 31 + k * 17) % 199 - 99)::text, ',') || ']'
+            FROM generate_series(1, 500) k)::wvec
+    FROM generate_series(1, 40) g;
+CREATE INDEX vwspill_weave ON vwspill USING weave (d, v);
+SELECT count(*) AS strips, count(DISTINCT blkno) AS code_pages,
+       count(*) FILTER (WHERE centroid) AS centroid_strips
+  FROM weave_vec_strips('vwspill_weave');
+SELECT count(*) AS violations FROM weave_check('vwspill_weave', true) WHERE NOT ok;
+SELECT count(*) AS scanned FROM weave_vec_scan('vwspill_weave',
+  (SELECT v FROM vwspill WHERE id = 7), 40);
+DROP TABLE vwspill;
 
 -- ---------------------------------------------------------------------------
 -- G27: a block's directory record names its first code page, and that pointer
