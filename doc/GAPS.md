@@ -4988,7 +4988,7 @@ show. So the one failure is either a rarer interleaving or something else entire
 **Disposition, G21's: not hunted further until it recurs**, and when it does, the test now
 prints what failed.
 
-### G76 — a gated ORDER BY whose gate admits fewer rows than LIMIT walks the WHOLE HEAP in the padding phase: correct, O(heap), invisible to every counter — **FOUND 2026-10-04 by the v17 agent (`pgweave-20261004-231619`, scifact); OPEN, fix in progress**
+### G76 — a gated ORDER BY whose gate admits fewer rows than LIMIT walks the WHOLE HEAP in the padding phase: correct, O(heap), invisible to every counter — **FOUND 2026-10-04 by the v17 agent (`pgweave-20261004-231619`, scifact); FIXED 2026-10-05 for every lexical gate without a NOT (merge of `wt/g76`); docvalues-only and NOT gates still walk the heap, by design, until G77 and G78 are fixed**
 
 When `WHERE body @@@ q ORDER BY fuse(...) LIMIT k` has fewer than k qualifying rows, the
 ranked phase runs out and the G56/G71 padding phase begins (`weave_pad_begin()`),
@@ -5004,6 +5004,33 @@ column is NULL is in no index structure at all, so for a gate that does not invo
 lexical column (a docvalues-only `price < c`) the heap walk is what finds it. A lexical
 gate cannot admit such a row (`NULL @@@ q` is NULL), so for any gate with a lexical key
 the gate set is a complete superset of the qualifying rows, and the padding can walk it.
+
+**Fixed 2026-10-05.** `weave_pad_begin()` fetches the gate set's TIDs through the snapshot
+(`table_index_fetch_tuple()`, as `weave_ord_probe()` does) instead of
+`table_beginscan()`, whenever the gate is COMPLETE: it has a lexical key whose query has no
+NOT (`so->plainGateLex`). Every padding row is still classified exactly as before (partial
+predicate, NULL document, NULL fused column, already ranked). The vector route has no gate
+set of its own, so the padding collects the WHERE query's. So does the lexical-ordering
+route, which keeps the WHERE query in `padWhereQuery` because `so->query` is replaced by
+the ORDER BY query. Two gates keep the heap walk: docvalues-only (G77) and any NOT query
+(G78, which was found because the first version of this fix walked a NOT gate and lost a
+zero-term document).
+
+Pinned by `sql/fuse_gate.sql` section (5): five routes over 3,004 rows with a 21-row gate
+that holds pending rows, a NULL document, a NULL vector, a HOT update, a non-HOT update
+and a delete. Each route's answer equals the heap's, and `Rows Removed by Index Recheck`
+is at most 25 (it was about 2,980). The positive control is a fused NOT gate, which must
+still walk the heap and must keep zero-term document 3004. Mutants, both BUILT (`.so` md5
+changed) and both caught: **M1**, the gate walk disabled, fails all four asserted routes;
+**M2**, NOT gates walked, fails the control's removed count and loses row 3004.
+
+**Not asserted, and why:** the plain vector route's removed count. Its ranked phase applies
+no gate, emitting every live lane in distance order for the executor to filter, so its
+removed count measures the ranked phase rather than the padding. That is rank-then-filter
+by design; `fuse()` is the gated form.
+
+**Owed:** re-measure scifact's 5-row gate at LIMIT 10 (40 ms and 17k buffers before) with
+the v17 harness.
 
 ### G77 — a docvalues restriction answered by the index silently DROPS every row whose lexical column is NULL — **FOUND 2026-10-04 while scoping G76; a SILENT WRONG ANSWER on any nullable `wdoc` column with a docvalues key; OPEN**
 
