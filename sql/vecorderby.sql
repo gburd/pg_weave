@@ -700,3 +700,145 @@ DROP TABLE vol;
 DROP TABLE voe;
 DROP TABLE voq;
 DROP TABLE vo;
+
+-- ============================================================================
+-- (13) A RECYCLED CTID IS NOT THE DEAD ROW -- doc/GAPS.md G79.
+--
+-- After DELETE + VACUUM a row's docid is TOMBSTONED in its bolt, its lane is still
+-- in the weft, and the heap is free to give its ctid to a new row.  The heap probe
+-- of that ctid then finds the NEW row, visible, so a vector pass that skips the
+-- tombstones ranks the new row at the DEAD row's distance: the reproducer's farthest
+-- vector came out FIRST.  And because the new row is also in the pending list (or a
+-- newer bolt) it was emitted a SECOND time at its own distance, which a LIMIT hid.
+--
+-- Rows 1 and 2 are deleted; row 100 (the farthest vector by orders of magnitude)
+-- takes row 1's ctid and row 101 (a NULL vector, so a PADDING row) takes row 2's.
+-- The ctids and the tombstone count are printed first, because the assertions below
+-- prove nothing unless the reuse happened and VACUUM recorded it.  Each shape is
+-- compared against the heap's own answer: the plain vector ORDER BY with and without
+-- a LIMIT, the fused ORDER BY, `<@>` and the lexical channel (which already applied
+-- tombstones, pinned here so they stay that way), and finally the same table after a
+-- second VACUUM has flushed rows 100/101 into a NEWER bolt -- where the docid is
+-- tombstoned in bolt 0 and LIVE in bolt 1, so a tombstone must suppress only its own
+-- bolt's lane.
+-- ============================================================================
+CREATE FUNCTION pg_temp.wait_for_horizon() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE x xid := (txid_current() % 4294967296)::text::xid; i int;
+BEGIN
+  FOR i IN 1 .. 600 LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_stat_activity
+                    WHERE datname = current_database() AND pid <> pg_backend_pid()
+                      AND (age(backend_xmin) > age(x) OR age(backend_xid) > age(x))) THEN
+      RETURN;
+    END IF;
+    PERFORM pg_sleep(0.1);
+    PERFORM pg_stat_clear_snapshot();  -- else every pass re-reads the first
+  END LOOP;
+  RAISE NOTICE 'wait_for_horizon: an older snapshot was still held after 60 s';
+END $$;
+
+-- The heap's order of a query, numbered, with the index paths off.
+CREATE FUNCTION pg_temp.g79_heap(q text) RETURNS TABLE (rn bigint, id int)
+LANGUAGE plpgsql AS $$
+DECLARE r record;
+BEGIN
+  PERFORM set_config('enable_seqscan', 'on', true);
+  PERFORM set_config('enable_indexscan', 'off', true);
+  PERFORM set_config('enable_bitmapscan', 'off', true);
+  rn := 0;
+  FOR r IN EXECUTE q LOOP rn := rn + 1; id := r.id; RETURN NEXT; END LOOP;
+END $$;
+-- ...and the index's, with the seq scan off; the query runs AS WRITTEN.
+CREATE FUNCTION pg_temp.g79_idx(q text) RETURNS TABLE (rn bigint, id int)
+LANGUAGE plpgsql AS $$
+DECLARE r record;
+BEGIN
+  PERFORM set_config('enable_seqscan', 'off', true);
+  PERFORM set_config('enable_indexscan', 'on', true);
+  PERFORM set_config('enable_bitmapscan', 'off', true);
+  rn := 0;
+  FOR r IN EXECUTE q LOOP rn := rn + 1; id := r.id; RETURN NEXT; END LOOP;
+END $$;
+-- Index vs heap for one query: every row once, the farthest row and the NULL-vector
+-- row at the heap's rank, and the first three as the heap has them.
+CREATE FUNCTION pg_temp.g79_check(q text,
+    OUT n_index bigint, OUT n_heap bigint, OUT once bool,
+    OUT far_rank_as_heap bool, OUT nullvec_rank_as_heap bool,
+    OUT index_top3 int[], OUT heap_top3 int[])
+LANGUAGE plpgsql AS $$
+BEGIN
+  CREATE TEMP TABLE g79_i AS SELECT * FROM pg_temp.g79_idx(q);
+  CREATE TEMP TABLE g79_h AS SELECT * FROM pg_temp.g79_heap(q);
+  n_index := (SELECT count(*) FROM g79_i);
+  n_heap := (SELECT count(*) FROM g79_h);
+  once := n_index = (SELECT count(DISTINCT id) FROM g79_i);
+  far_rank_as_heap := (SELECT array_agg(rn) FROM g79_i WHERE id = 100)
+                    = (SELECT array_agg(rn) FROM g79_h WHERE id = 100);
+  nullvec_rank_as_heap := (SELECT array_agg(rn) FROM g79_i WHERE id = 101)
+                        = (SELECT array_agg(rn) FROM g79_h WHERE id = 101);
+  index_top3 := (SELECT array_agg(id ORDER BY rn) FROM g79_i WHERE rn <= 3);
+  heap_top3 := (SELECT array_agg(id ORDER BY rn) FROM g79_h WHERE rn <= 3);
+  DROP TABLE g79_i;
+  DROP TABLE g79_h;
+END $$;
+
+CREATE TABLE g79 (id int, body wdoc, emb wvec(4)) WITH (autovacuum_enabled = off);
+INSERT INTO g79 SELECT g, to_wdoc('simple', 'common w' || g),
+                       ('[' || g || ',' || g || ',' || g || ',' || g || ']')::wvec
+  FROM generate_series(1, 20) g;
+CREATE INDEX g79_w ON g79 USING weave (body, emb);
+DELETE FROM g79 WHERE id IN (1, 2);
+DO $$ BEGIN PERFORM pg_temp.wait_for_horizon(); END $$;   -- G60
+VACUUM g79;                                               -- tombstones (0,1), (0,2)
+INSERT INTO g79 VALUES (100, to_wdoc('simple', 'common new'), '[1000,1000,1000,1000]'),
+                       (101, to_wdoc('simple', 'common nullvec'), NULL);
+SET enable_seqscan = on;
+SELECT id, ctid FROM g79 WHERE id >= 100 ORDER BY id;     -- the reuse happened
+SELECT ndeleted AS g79_tombstones, weave_index_nsegments('g79_w') AS g79_bolts
+  FROM weave_index_stats('g79_w');
+SET enable_seqscan = off;
+
+-- the reproducer, and the plan that answers it
+EXPLAIN (COSTS OFF) SELECT id FROM g79 ORDER BY emb <-> '[0,0,0,0]'::wvec LIMIT 3;
+SELECT array_agg(id) AS recycled_limit3
+  FROM (SELECT id FROM g79 ORDER BY emb <-> '[0,0,0,0]'::wvec LIMIT 3) s;
+-- no LIMIT: every row exactly once, row 100 19th, row 101 (padding) last
+SELECT * FROM pg_temp.g79_check('SELECT id FROM g79 ORDER BY emb <-> ''[0,0,0,0]''::wvec');
+-- the fused route, which applied tombstones before this fix and must keep doing so
+EXPLAIN (COSTS OFF)
+SELECT id FROM g79 ORDER BY fuse(body <=> 'common'::wquery, emb <-> '[0,0,0,0]'::wvec);
+SELECT * FROM pg_temp.g79_check(
+  'SELECT id FROM g79 ORDER BY fuse(body <=> ''common''::wquery, emb <-> ''[0,0,0,0]''::wvec)');
+-- `<@>`: the dead row 1 held the term `w1` at distance 0, row 100 is at distance 3.
+-- Compared as the sequence of the operator's own distances, which the ties in it do
+-- not perturb (sql/edist.sql).
+EXPLAIN (COSTS OFF) SELECT id FROM g79 ORDER BY body <@> 'w1';
+SELECT (SELECT array_agg(g.body <@> 'w1' ORDER BY i.rn)
+          FROM pg_temp.g79_idx('SELECT id FROM g79 ORDER BY body <@> ''w1''') i
+          JOIN g79 g USING (id))
+       = (SELECT array_agg(g.body <@> 'w1' ORDER BY h.rn)
+            FROM pg_temp.g79_heap('SELECT id FROM g79 ORDER BY body <@> ''w1''') h
+            JOIN g79 g USING (id)) AS edist_distances_as_heap,
+       (SELECT count(*) FROM pg_temp.g79_idx('SELECT id FROM g79 ORDER BY body <@> ''w1''')) AS edist_rows;
+-- lexical: weave_search() enters the scan machinery with no executor recheck behind it
+SELECT (SELECT count(*) FROM weave_search('g79_w', 'w1', 10)) AS lex_dead_term_hits,
+       (SELECT count(*) FROM weave_search('g79_w', 'new', 10)) AS lex_new_term_hits,
+       (SELECT array_agg(id) FROM pg_temp.g79_idx(
+          'SELECT id FROM g79 WHERE body @@@ ''w1 | w3'' ORDER BY body <=> ''w1 | w3''')) AS lex_ranked;
+
+-- A NEWER BOLT: the second VACUUM folds rows 100/101 into bolt 1, under the docids
+-- bolt 0 has tombstoned.  Row 100 must be found there -- a tombstone applied across
+-- bolts would drop it to the padding at +Infinity and make it LAST for its own vector.
+VACUUM g79;
+SET enable_seqscan = on;
+SELECT weave_index_nsegments('g79_w') AS g79_bolts_after_flush;
+SET enable_seqscan = off;
+SELECT array_agg(id) AS own_vector_limit2
+  FROM (SELECT id FROM g79 ORDER BY emb <-> '[1000,1000,1000,1000]'::wvec LIMIT 2) s;
+SELECT * FROM pg_temp.g79_check('SELECT id FROM g79 ORDER BY emb <-> ''[0,0,0,0]''::wvec');
+SELECT * FROM pg_temp.g79_check(
+  'SELECT id FROM g79 ORDER BY fuse(body <=> ''common''::wquery, emb <-> ''[0,0,0,0]''::wvec)');
+RESET enable_seqscan;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE g79;
