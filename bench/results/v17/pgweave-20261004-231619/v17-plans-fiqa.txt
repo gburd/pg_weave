@@ -1,0 +1,1470 @@
+=== none 1 A ()
+Limit
+  ->  Index Scan using vx_w on vx
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+=== none 1 B ()
+Limit
+  CTE l
+    ->  Function Scan on weave_search
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        ->  Hash Right Join
+              Hash Cond: (l.ctid = vx.ctid)
+              ->  CTE Scan on l
+              ->  Hash
+                    ->  Seq Scan on vx
+=== none 1 C ()
+Limit
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        ->  Seq Scan on vx
+=== none 1 D ()
+Limit
+  CTE ids
+    ->  Seq Scan on vx
+  CTE l
+    ->  Function Scan on weave_search
+  CTE v
+    ->  Function Scan on weave_vec_scan
+          InitPlan 3
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_1
+          InitPlan 4
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_2
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        ->  Merge Right Join
+              Merge Cond: (v.docid = ids.docid)
+              ->  Sort
+                    Sort Key: v.docid
+                    ->  CTE Scan on v
+              ->  Sort
+                    Sort Key: ids.docid
+                    ->  Merge Right Join
+                          Merge Cond: (l.ctid = ids.rt)
+                          ->  Sort
+                                Sort Key: l.ctid
+                                ->  CTE Scan on l
+                          ->  Sort
+                                Sort Key: ids.rt
+                                ->  CTE Scan on ids
+=== dv 0.1 A (price < 5760)
+Limit
+  ->  Index Scan using vx_w on vx
+        Index Cond: (price < 5760)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+=== dv 0.1 B (price < 5760)
+Limit
+  CTE l
+    ->  Function Scan on weave_search
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        ->  Hash Right Join
+              Hash Cond: (l.ctid = vx.ctid)
+              ->  CTE Scan on l
+              ->  Hash
+                    ->  Bitmap Heap Scan on vx
+                          Recheck Cond: (price < 5760)
+                          ->  Bitmap Index Scan on vx_w
+                                Index Cond: (price < 5760)
+=== dv 0.1 C (price < 5760)
+Limit
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        ->  Bitmap Heap Scan on vx
+              Recheck Cond: (price < 5760)
+              ->  Bitmap Index Scan on vx_w
+                    Index Cond: (price < 5760)
+=== dv 0.1 D (price < 5760)
+Limit
+  CTE ids
+    ->  Bitmap Heap Scan on vx
+          Recheck Cond: (price < 5760)
+          ->  Bitmap Index Scan on vx_w
+                Index Cond: (price < 5760)
+  CTE l
+    ->  Function Scan on weave_search
+  CTE v
+    ->  Function Scan on weave_vec_scan
+          InitPlan 3
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_1
+          InitPlan 4
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_2
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        ->  Merge Right Join
+              Merge Cond: (v.docid = ids.docid)
+              ->  Sort
+                    Sort Key: v.docid
+                    ->  CTE Scan on v
+              ->  Sort
+                    Sort Key: ids.docid
+                    ->  Merge Right Join
+                          Merge Cond: (l.ctid = ids.rt)
+                          ->  Sort
+                                Sort Key: l.ctid
+                                ->  CTE Scan on l
+                          ->  Sort
+                                Sort Key: ids.rt
+                                ->  CTE Scan on ids
+=== dv 0.01 A (price < 576)
+Limit
+  ->  Index Scan using vx_w on vx
+        Index Cond: (price < 576)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+=== dv 0.01 B (price < 576)
+Limit
+  CTE l
+    ->  Function Scan on weave_search
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        ->  Hash Right Join
+              Hash Cond: (l.ctid = vx.ctid)
+              ->  CTE Scan on l
+              ->  Hash
+                    ->  Bitmap Heap Scan on vx
+                          Recheck Cond: (price < 576)
+                          ->  Bitmap Index Scan on vx_w
+                                Index Cond: (price < 576)
+=== dv 0.01 C (price < 576)
+Limit
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        ->  Bitmap Heap Scan on vx
+              Recheck Cond: (price < 576)
+              ->  Bitmap Index Scan on vx_w
+                    Index Cond: (price < 576)
+=== dv 0.01 D (price < 576)
+Limit
+  CTE ids
+    ->  Bitmap Heap Scan on vx
+          Recheck Cond: (price < 576)
+          ->  Bitmap Index Scan on vx_w
+                Index Cond: (price < 576)
+  CTE l
+    ->  Function Scan on weave_search
+  CTE v
+    ->  Function Scan on weave_vec_scan
+          InitPlan 3
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_1
+          InitPlan 4
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_2
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        ->  Merge Right Join
+              Merge Cond: (v.docid = ids.docid)
+              ->  Sort
+                    Sort Key: v.docid
+                    ->  CTE Scan on v
+              ->  Sort
+                    Sort Key: ids.docid
+                    ->  Hash Right Join
+                          Hash Cond: (l.ctid = ids.rt)
+                          ->  CTE Scan on l
+                          ->  Hash
+                                ->  CTE Scan on ids
+=== dv 0.001 A (price < 58)
+Limit
+  ->  Index Scan using vx_w on vx
+        Index Cond: (price < 58)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+=== dv 0.001 B (price < 58)
+Limit
+  CTE l
+    ->  Function Scan on weave_search
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        ->  Hash Right Join
+              Hash Cond: (l.ctid = vx.ctid)
+              ->  CTE Scan on l
+              ->  Hash
+                    ->  Index Scan using vx_w on vx
+                          Index Cond: (price < 58)
+=== dv 0.001 C (price < 58)
+Limit
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        ->  Index Scan using vx_w on vx
+              Index Cond: (price < 58)
+=== dv 0.001 D (price < 58)
+Limit
+  CTE ids
+    ->  Index Scan using vx_w on vx
+          Index Cond: (price < 58)
+  CTE l
+    ->  Function Scan on weave_search
+  CTE v
+    ->  Function Scan on weave_vec_scan
+          InitPlan 3
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_1
+          InitPlan 4
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_2
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        ->  Hash Right Join
+              Hash Cond: (v.docid = ids.docid)
+              ->  CTE Scan on v
+              ->  Hash
+                    ->  Hash Right Join
+                          Hash Cond: (l.ctid = ids.rt)
+                          ->  CTE Scan on l
+                          ->  Hash
+                                ->  CTE Scan on ids
+=== dv 0.0001 A (price < 6)
+Limit
+  ->  Index Scan using vx_w on vx
+        Index Cond: (price < 6)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+=== dv 0.0001 B (price < 6)
+Limit
+  CTE l
+    ->  Function Scan on weave_search
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        ->  Hash Right Join
+              Hash Cond: (l.ctid = vx.ctid)
+              ->  CTE Scan on l
+              ->  Hash
+                    ->  Index Scan using vx_w on vx
+                          Index Cond: (price < 6)
+=== dv 0.0001 C (price < 6)
+Limit
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        ->  Index Scan using vx_w on vx
+              Index Cond: (price < 6)
+=== dv 0.0001 D (price < 6)
+Limit
+  CTE ids
+    ->  Index Scan using vx_w on vx
+          Index Cond: (price < 6)
+  CTE l
+    ->  Function Scan on weave_search
+  CTE v
+    ->  Function Scan on weave_vec_scan
+          InitPlan 3
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_1
+          InitPlan 4
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_2
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        ->  Hash Right Join
+              Hash Cond: (v.docid = ids.docid)
+              ->  CTE Scan on v
+              ->  Hash
+                    ->  Hash Right Join
+                          Hash Cond: (l.ctid = ids.rt)
+                          ->  CTE Scan on l
+                          ->  Hash
+                                ->  CTE Scan on ids
+=== lex 0.1 A (body @@@ 'long'::wquery)
+Limit
+  ->  Index Scan using vx_w on vx
+        Index Cond: (body @@@ '''long'''::wquery)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+=== lex 0.1 B (body @@@ 'long'::wquery)
+Limit
+  CTE l
+    ->  Function Scan on weave_search
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        ->  Hash Right Join
+              Hash Cond: (l.ctid = vx.ctid)
+              ->  CTE Scan on l
+              ->  Hash
+                    ->  Bitmap Heap Scan on vx
+                          Recheck Cond: (body @@@ '''long'''::wquery)
+                          ->  Bitmap Index Scan on vx_w
+                                Index Cond: (body @@@ '''long'''::wquery)
+=== lex 0.1 C (body @@@ 'long'::wquery)
+Limit
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        ->  Bitmap Heap Scan on vx
+              Recheck Cond: (body @@@ '''long'''::wquery)
+              ->  Bitmap Index Scan on vx_w
+                    Index Cond: (body @@@ '''long'''::wquery)
+=== lex 0.1 D (body @@@ 'long'::wquery)
+Limit
+  CTE ids
+    ->  Bitmap Heap Scan on vx
+          Recheck Cond: (body @@@ '''long'''::wquery)
+          ->  Bitmap Index Scan on vx_w
+                Index Cond: (body @@@ '''long'''::wquery)
+  CTE l
+    ->  Function Scan on weave_search
+  CTE v
+    ->  Function Scan on weave_vec_scan
+          InitPlan 3
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_1
+          InitPlan 4
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_2
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        ->  Merge Right Join
+              Merge Cond: (v.docid = ids.docid)
+              ->  Sort
+                    Sort Key: v.docid
+                    ->  CTE Scan on v
+              ->  Sort
+                    Sort Key: ids.docid
+                    ->  Hash Right Join
+                          Hash Cond: (l.ctid = ids.rt)
+                          ->  CTE Scan on l
+                          ->  Hash
+                                ->  CTE Scan on ids
+=== lex 0.01 A (body @@@ 'alternative'::wquery)
+Limit
+  ->  Index Scan using vx_w on vx
+        Index Cond: (body @@@ '''alternative'''::wquery)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+=== lex 0.01 B (body @@@ 'alternative'::wquery)
+Limit
+  CTE l
+    ->  Function Scan on weave_search
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        ->  Hash Right Join
+              Hash Cond: (l.ctid = vx.ctid)
+              ->  CTE Scan on l
+              ->  Hash
+                    ->  Bitmap Heap Scan on vx
+                          Recheck Cond: (body @@@ '''alternative'''::wquery)
+                          ->  Bitmap Index Scan on vx_w
+                                Index Cond: (body @@@ '''alternative'''::wquery)
+=== lex 0.01 C (body @@@ 'alternative'::wquery)
+Limit
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        ->  Bitmap Heap Scan on vx
+              Recheck Cond: (body @@@ '''alternative'''::wquery)
+              ->  Bitmap Index Scan on vx_w
+                    Index Cond: (body @@@ '''alternative'''::wquery)
+=== lex 0.01 D (body @@@ 'alternative'::wquery)
+Limit
+  CTE ids
+    ->  Bitmap Heap Scan on vx
+          Recheck Cond: (body @@@ '''alternative'''::wquery)
+          ->  Bitmap Index Scan on vx_w
+                Index Cond: (body @@@ '''alternative'''::wquery)
+  CTE l
+    ->  Function Scan on weave_search
+  CTE v
+    ->  Function Scan on weave_vec_scan
+          InitPlan 3
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_1
+          InitPlan 4
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_2
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        ->  Merge Right Join
+              Merge Cond: (v.docid = ids.docid)
+              ->  Sort
+                    Sort Key: v.docid
+                    ->  CTE Scan on v
+              ->  Sort
+                    Sort Key: ids.docid
+                    ->  Hash Right Join
+                          Hash Cond: (l.ctid = ids.rt)
+                          ->  CTE Scan on l
+                          ->  Hash
+                                ->  CTE Scan on ids
+=== lex 0.001 A (body @@@ 'abstract'::wquery)
+Limit
+  ->  Index Scan using vx_w on vx
+        Index Cond: (body @@@ '''abstract'''::wquery)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+=== lex 0.001 B (body @@@ 'abstract'::wquery)
+Limit
+  CTE l
+    ->  Function Scan on weave_search
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        ->  Hash Right Join
+              Hash Cond: (l.ctid = vx.ctid)
+              ->  CTE Scan on l
+              ->  Hash
+                    ->  Bitmap Heap Scan on vx
+                          Recheck Cond: (body @@@ '''abstract'''::wquery)
+                          ->  Bitmap Index Scan on vx_w
+                                Index Cond: (body @@@ '''abstract'''::wquery)
+=== lex 0.001 C (body @@@ 'abstract'::wquery)
+Limit
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        ->  Bitmap Heap Scan on vx
+              Recheck Cond: (body @@@ '''abstract'''::wquery)
+              ->  Bitmap Index Scan on vx_w
+                    Index Cond: (body @@@ '''abstract'''::wquery)
+=== lex 0.001 D (body @@@ 'abstract'::wquery)
+Limit
+  CTE ids
+    ->  Bitmap Heap Scan on vx
+          Recheck Cond: (body @@@ '''abstract'''::wquery)
+          ->  Bitmap Index Scan on vx_w
+                Index Cond: (body @@@ '''abstract'''::wquery)
+  CTE l
+    ->  Function Scan on weave_search
+  CTE v
+    ->  Function Scan on weave_vec_scan
+          InitPlan 3
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_1
+          InitPlan 4
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_2
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        ->  Merge Right Join
+              Merge Cond: (v.docid = ids.docid)
+              ->  Sort
+                    Sort Key: v.docid
+                    ->  CTE Scan on v
+              ->  Sort
+                    Sort Key: ids.docid
+                    ->  Hash Right Join
+                          Hash Cond: (l.ctid = ids.rt)
+                          ->  CTE Scan on l
+                          ->  Hash
+                                ->  CTE Scan on ids
+=== lex 0.0001 A (body @@@ 'aaron'::wquery)
+Limit
+  ->  Index Scan using vx_w on vx
+        Index Cond: (body @@@ '''aaron'''::wquery)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+=== lex 0.0001 B (body @@@ 'aaron'::wquery)
+Limit
+  CTE l
+    ->  Function Scan on weave_search
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        ->  Hash Right Join
+              Hash Cond: (l.ctid = vx.ctid)
+              ->  CTE Scan on l
+              ->  Hash
+                    ->  Bitmap Heap Scan on vx
+                          Recheck Cond: (body @@@ '''aaron'''::wquery)
+                          ->  Bitmap Index Scan on vx_w
+                                Index Cond: (body @@@ '''aaron'''::wquery)
+=== lex 0.0001 C (body @@@ 'aaron'::wquery)
+Limit
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        ->  Bitmap Heap Scan on vx
+              Recheck Cond: (body @@@ '''aaron'''::wquery)
+              ->  Bitmap Index Scan on vx_w
+                    Index Cond: (body @@@ '''aaron'''::wquery)
+=== lex 0.0001 D (body @@@ 'aaron'::wquery)
+Limit
+  CTE ids
+    ->  Bitmap Heap Scan on vx
+          Recheck Cond: (body @@@ '''aaron'''::wquery)
+          ->  Bitmap Index Scan on vx_w
+                Index Cond: (body @@@ '''aaron'''::wquery)
+  CTE l
+    ->  Function Scan on weave_search
+  CTE v
+    ->  Function Scan on weave_vec_scan
+          InitPlan 3
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_1
+          InitPlan 4
+            ->  Aggregate
+                  ->  CTE Scan on ids ids_2
+  ->  Sort
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        ->  Merge Right Join
+              Merge Cond: (v.docid = ids.docid)
+              ->  Sort
+                    Sort Key: v.docid
+                    ->  CTE Scan on v
+              ->  Sort
+                    Sort Key: ids.docid
+                    ->  Hash Right Join
+                          Hash Cond: (l.ctid = ids.rt)
+                          ->  CTE Scan on l
+                          ->  Hash
+                                ->  CTE Scan on ids
+=== BUFFERS none 1 A
+Limit  (cost=0.01..2.34 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=4492
+  ->  Index Scan using vx_w on vx  (cost=0.01..13424.85 rows=57600 width=16) (actual rows=10 loops=1)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+        Buffers: shared hit=4492
+Planning:
+  Buffers: shared hit=179
+Planning Time: 0.396 ms
+Execution Time: 20.577 ms
+=== BUFFERS none 1 B
+Limit  (cost=12456.47..12456.49 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=146535
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  ->  Sort  (cost=12446.47..12590.47 rows=57600 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=146535
+        ->  Hash Right Join  (cost=10448.00..11201.75 rows=57600 width=16) (actual rows=57600 loops=1)
+              Hash Cond: (l.ctid = vx.ctid)
+              Buffers: shared hit=146529
+              ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                    Buffers: shared hit=20358
+              ->  Hash  (cost=9728.00..9728.00 rows=57600 width=524) (actual rows=57600 loops=1)
+                    Buckets: 65536  Batches: 1  Memory Usage: 31835kB
+                    Buffers: shared hit=9152
+                    ->  Seq Scan on vx  (cost=0.00..9728.00 rows=57600 width=524) (actual rows=57600 loops=1)
+                          Buffers: shared hit=9152
+Planning:
+  Buffers: shared hit=274
+Planning Time: 0.543 ms
+Execution Time: 191.689 ms
+=== BUFFERS none 1 C
+Limit  (cost=11836.72..11836.74 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=178947
+  ->  Sort  (cost=11836.72..11980.72 rows=57600 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=178947
+        ->  Seq Scan on vx  (cost=0.00..10592.00 rows=57600 width=16) (actual rows=57600 loops=1)
+              Buffers: shared hit=178941
+Planning:
+  Buffers: shared hit=186
+Planning Time: 0.427 ms
+Execution Time: 377.227 ms
+=== BUFFERS none 1 D
+Limit  (cost=117333.36..117333.39 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=33364
+  CTE ids
+    ->  Seq Scan on vx  (cost=0.00..11312.00 rows=57600 width=22) (actual rows=57600 loops=1)
+          Buffers: shared hit=9152
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  CTE v
+    ->  Function Scan on weave_vec_scan  (cost=2592.03..2602.03 rows=1000 width=12) (actual rows=57600 loops=1)
+          Buffers: shared hit=12999
+          InitPlan 3
+            ->  Aggregate  (cost=1296.00..1296.01 rows=1 width=8) (actual rows=1 loops=1)
+                  Buffers: shared hit=9152
+                  ->  CTE Scan on ids ids_1  (cost=0.00..1152.00 rows=57600 width=0) (actual rows=57600 loops=1)
+                        Buffers: shared hit=9152
+          InitPlan 4
+            ->  Aggregate  (cost=1296.00..1296.01 rows=1 width=32) (actual rows=1 loops=1)
+                  ->  CTE Scan on ids ids_2  (cost=0.00..1152.00 rows=57600 width=8) (actual rows=57600 loops=1)
+  ->  Sort  (cost=103409.33..107009.33 rows=1440000 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=33364
+        ->  Merge Right Join  (cost=36286.45..72291.45 rows=1440000 width=16) (actual rows=57600 loops=1)
+              Merge Cond: (v.docid = ids.docid)
+              Buffers: shared hit=33361
+              ->  Sort  (cost=69.83..72.33 rows=1000 width=12) (actual rows=57600 loops=1)
+                    Sort Key: v.docid
+                    Sort Method: quicksort  Memory: 3337kB
+                    Buffers: shared hit=12999
+                    ->  CTE Scan on v  (cost=0.00..20.00 rows=1000 width=12) (actual rows=57600 loops=1)
+                          Buffers: shared hit=12999
+              ->  Sort  (cost=36216.62..36936.62 rows=288000 width=24) (actual rows=57600 loops=1)
+                    Sort Key: ids.docid
+                    Sort Method: quicksort  Memory: 3494kB
+                    Buffers: shared hit=20362
+                    ->  Merge Right Join  (cost=5776.20..10101.20 rows=288000 width=24) (actual rows=57600 loops=1)
+                          Merge Cond: (l.ctid = ids.rt)
+                          Buffers: shared hit=20362
+                          ->  Sort  (cost=69.83..72.33 rows=1000 width=14) (actual rows=20100 loops=1)
+                                Sort Key: l.ctid
+                                Sort Method: quicksort  Memory: 1397kB
+                                Buffers: shared hit=20362
+                                ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                                      Buffers: shared hit=20358
+                          ->  Sort  (cost=5706.37..5850.37 rows=57600 width=22) (actual rows=57600 loops=1)
+                                Sort Key: ids.rt
+                                Sort Method: quicksort  Memory: 3787kB
+                                ->  CTE Scan on ids  (cost=0.00..1152.00 rows=57600 width=22) (actual rows=57600 loops=1)
+Planning:
+  Buffers: shared hit=305
+Planning Time: 0.674 ms
+Execution Time: 990.526 ms
+=== BUFFERS dv 0.1 A
+Limit  (cost=0.01..8.97 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=3285
+  ->  Index Scan using vx_w on vx  (cost=0.01..5121.31 rows=5710 width=16) (actual rows=10 loops=1)
+        Index Cond: (price < 5760)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+        Buffers: shared hit=3285
+Planning:
+  Buffers: shared hit=200
+Planning Time: 0.431 ms
+Execution Time: 17.646 ms
+=== BUFFERS dv 0.1 B
+Limit  (cost=5551.40..5551.43 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=36751
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  ->  Sort  (cost=5541.40..5555.67 rows=5710 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=36751
+        ->  Hash Right Join  (cost=5321.89..5418.01 rows=5710 width=16) (actual rows=5760 loops=1)
+              Hash Cond: (l.ctid = vx.ctid)
+              Buffers: shared hit=36745
+              ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                    Buffers: shared hit=20358
+              ->  Hash  (cost=5250.52..5250.52 rows=5710 width=524) (actual rows=5760 loops=1)
+                    Buckets: 8192  Batches: 1  Memory Usage: 3181kB
+                    Buffers: shared hit=4629
+                    ->  Bitmap Heap Scan on vx  (cost=691.05..5250.52 rows=5710 width=524) (actual rows=5760 loops=1)
+                          Recheck Cond: (price < 5760)
+                          Heap Blocks: exact=4399
+                          Buffers: shared hit=4629
+                          ->  Bitmap Index Scan on vx_w  (cost=0.00..689.63 rows=5710 width=0) (actual rows=5760 loops=1)
+                                Index Cond: (price < 5760)
+                                Buffers: shared hit=230
+Planning:
+  Buffers: shared hit=289
+Planning Time: 0.682 ms
+Execution Time: 47.289 ms
+=== BUFFERS dv 0.1 C
+Limit  (cost=5459.56..5459.58 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=21648
+  ->  Sort  (cost=5459.56..5473.83 rows=5710 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=21648
+        ->  Bitmap Heap Scan on vx  (cost=691.05..5336.17 rows=5710 width=16) (actual rows=5760 loops=1)
+              Recheck Cond: (price < 5760)
+              Heap Blocks: exact=4399
+              Buffers: shared hit=21642
+              ->  Bitmap Index Scan on vx_w  (cost=0.00..689.63 rows=5710 width=0) (actual rows=5760 loops=1)
+                    Index Cond: (price < 5760)
+                    Buffers: shared hit=230
+Planning:
+  Buffers: shared hit=201
+Planning Time: 0.421 ms
+Execution Time: 49.848 ms
+=== BUFFERS dv 0.1 D
+Limit  (cost=15499.31..15499.34 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=28841
+  CTE ids
+    ->  Bitmap Heap Scan on vx  (cost=691.05..5407.54 rows=5710 width=22) (actual rows=5760 loops=1)
+          Recheck Cond: (price < 5760)
+          Heap Blocks: exact=4399
+          Buffers: shared hit=4629
+          ->  Bitmap Index Scan on vx_w  (cost=0.00..689.63 rows=5710 width=0) (actual rows=5760 loops=1)
+                Index Cond: (price < 5760)
+                Buffers: shared hit=230
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  CTE v
+    ->  Function Scan on weave_vec_scan  (cost=256.98..266.98 rows=1000 width=12) (actual rows=5760 loops=1)
+          Buffers: shared hit=8476
+          InitPlan 3
+            ->  Aggregate  (cost=128.47..128.48 rows=1 width=8) (actual rows=1 loops=1)
+                  Buffers: shared hit=4629
+                  ->  CTE Scan on ids ids_1  (cost=0.00..114.20 rows=5710 width=0) (actual rows=5760 loops=1)
+                        Buffers: shared hit=4629
+          InitPlan 4
+            ->  Aggregate  (cost=128.48..128.49 rows=1 width=32) (actual rows=1 loops=1)
+                  ->  CTE Scan on ids ids_2  (cost=0.00..114.20 rows=5710 width=8) (actual rows=5760 loops=1)
+  ->  Sort  (cost=9814.79..10171.66 rows=142750 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=28841
+        ->  Merge Right Join  (cost=3156.26..6730.01 rows=142750 width=16) (actual rows=5760 loops=1)
+              Merge Cond: (v.docid = ids.docid)
+              Buffers: shared hit=28838
+              ->  Sort  (cost=69.83..72.33 rows=1000 width=12) (actual rows=5760 loops=1)
+                    Sort Key: v.docid
+                    Sort Method: quicksort  Memory: 373kB
+                    Buffers: shared hit=8476
+                    ->  CTE Scan on v  (cost=0.00..20.00 rows=1000 width=12) (actual rows=5760 loops=1)
+                          Buffers: shared hit=8476
+              ->  Sort  (cost=3086.43..3157.81 rows=28550 width=24) (actual rows=5760 loops=1)
+                    Sort Key: ids.docid
+                    Sort Method: quicksort  Memory: 388kB
+                    Buffers: shared hit=20362
+                    ->  Merge Right Join  (cost=540.31..973.56 rows=28550 width=24) (actual rows=5760 loops=1)
+                          Merge Cond: (l.ctid = ids.rt)
+                          Buffers: shared hit=20362
+                          ->  Sort  (cost=69.83..72.33 rows=1000 width=14) (actual rows=20099 loops=1)
+                                Sort Key: l.ctid
+                                Sort Method: quicksort  Memory: 1397kB
+                                Buffers: shared hit=20362
+                                ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                                      Buffers: shared hit=20358
+                          ->  Sort  (cost=470.48..484.76 rows=5710 width=22) (actual rows=5760 loops=1)
+                                Sort Key: ids.rt
+                                Sort Method: quicksort  Memory: 418kB
+                                ->  CTE Scan on ids  (cost=0.00..114.20 rows=5710 width=22) (actual rows=5760 loops=1)
+Planning:
+  Buffers: shared hit=320
+Planning Time: 0.649 ms
+Execution Time: 67.622 ms
+=== BUFFERS dv 0.01 A
+Limit  (cost=0.01..11.29 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=1928
+  ->  Index Scan using vx_w on vx  (cost=0.01..615.03 rows=545 width=16) (actual rows=10 loops=1)
+        Index Cond: (price < 576)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+        Buffers: shared hit=1928
+Planning:
+  Buffers: shared hit=200
+Planning Time: 0.384 ms
+Execution Time: 12.747 ms
+=== BUFFERS dv 0.01 B
+Limit  (cost=703.23..703.25 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=22383
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  ->  Sort  (cost=693.22..694.59 rows=545 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=22383
+        ->  Hash Right Join  (cost=650.79..681.45 rows=545 width=16) (actual rows=576 loops=1)
+              Hash Cond: (l.ctid = vx.ctid)
+              Buffers: shared hit=22377
+              ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                    Buffers: shared hit=20358
+              ->  Hash  (cost=643.98..643.98 rows=545 width=524) (actual rows=576 loops=1)
+                    Buckets: 1024  Batches: 1  Memory Usage: 301kB
+                    Buffers: shared hit=779
+                    ->  Bitmap Heap Scan on vx  (cost=66.92..643.98 rows=545 width=524) (actual rows=576 loops=1)
+                          Recheck Cond: (price < 576)
+                          Heap Blocks: exact=549
+                          Buffers: shared hit=779
+                          ->  Bitmap Index Scan on vx_w  (cost=0.00..66.79 rows=545 width=0) (actual rows=576 loops=1)
+                                Index Cond: (price < 576)
+                                Buffers: shared hit=230
+Planning:
+  Buffers: shared hit=289
+Planning Time: 0.623 ms
+Execution Time: 23.609 ms
+=== BUFFERS dv 0.01 C
+Limit  (cost=663.93..663.96 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=2521
+  ->  Sort  (cost=663.93..665.30 rows=545 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=2521
+        ->  Bitmap Heap Scan on vx  (cost=66.92..652.16 rows=545 width=16) (actual rows=576 loops=1)
+              Recheck Cond: (price < 576)
+              Heap Blocks: exact=549
+              Buffers: shared hit=2515
+              ->  Bitmap Index Scan on vx_w  (cost=0.00..66.79 rows=545 width=0) (actual rows=576 loops=1)
+                    Index Cond: (price < 576)
+                    Buffers: shared hit=230
+Planning:
+  Buffers: shared hit=201
+Planning Time: 0.375 ms
+Execution Time: 7.519 ms
+=== BUFFERS dv 0.01 D
+Limit  (cost=1703.86..1703.89 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=24987
+  CTE ids
+    ->  Bitmap Heap Scan on vx  (cost=66.92..658.97 rows=545 width=22) (actual rows=576 loops=1)
+          Recheck Cond: (price < 576)
+          Heap Blocks: exact=549
+          Buffers: shared hit=779
+          ->  Bitmap Index Scan on vx_w  (cost=0.00..66.79 rows=545 width=0) (actual rows=576 loops=1)
+                Index Cond: (price < 576)
+                Buffers: shared hit=230
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  CTE v
+    ->  Function Scan on weave_vec_scan  (cost=24.55..34.55 rows=1000 width=12) (actual rows=576 loops=1)
+          Buffers: shared hit=4626
+          InitPlan 3
+            ->  Aggregate  (cost=12.26..12.27 rows=1 width=8) (actual rows=1 loops=1)
+                  Buffers: shared hit=779
+                  ->  CTE Scan on ids ids_1  (cost=0.00..10.90 rows=545 width=0) (actual rows=576 loops=1)
+                        Buffers: shared hit=779
+          InitPlan 4
+            ->  Aggregate  (cost=12.27..12.28 rows=1 width=32) (actual rows=1 loops=1)
+                  ->  CTE Scan on ids ids_2  (cost=0.00..10.90 rows=545 width=8) (actual rows=576 loops=1)
+  ->  Sort  (cost=1000.34..1034.40 rows=13625 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=24987
+        ->  Merge Right Join  (cost=360.28..705.91 rows=13625 width=16) (actual rows=576 loops=1)
+              Merge Cond: (v.docid = ids.docid)
+              Buffers: shared hit=24984
+              ->  Sort  (cost=69.83..72.33 rows=1000 width=12) (actual rows=576 loops=1)
+                    Sort Key: v.docid
+                    Sort Method: quicksort  Memory: 43kB
+                    Buffers: shared hit=4626
+                    ->  CTE Scan on v  (cost=0.00..20.00 rows=1000 width=12) (actual rows=576 loops=1)
+                          Buffers: shared hit=4626
+              ->  Sort  (cost=290.45..297.26 rows=2725 width=24) (actual rows=576 loops=1)
+                    Sort Key: ids.docid
+                    Sort Method: quicksort  Memory: 44kB
+                    Buffers: shared hit=20358
+                    ->  Hash Right Join  (cost=17.71..134.96 rows=2725 width=24) (actual rows=576 loops=1)
+                          Hash Cond: (l.ctid = ids.rt)
+                          Buffers: shared hit=20358
+                          ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                                Buffers: shared hit=20358
+                          ->  Hash  (cost=10.90..10.90 rows=545 width=22) (actual rows=576 loops=1)
+                                Buckets: 1024  Batches: 1  Memory Usage: 40kB
+                                ->  CTE Scan on ids  (cost=0.00..10.90 rows=545 width=22) (actual rows=576 loops=1)
+Planning:
+  Buffers: shared hit=320
+Planning Time: 0.610 ms
+Execution Time: 32.940 ms
+=== BUFFERS dv 0.001 A
+Limit  (cost=0.01..11.61 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=1133
+  ->  Index Scan using vx_w on vx  (cost=0.01..63.81 rows=55 width=16) (actual rows=10 loops=1)
+        Index Cond: (price < 58)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+        Buffers: shared hit=1133
+Planning:
+  Buffers: shared hit=200
+Planning Time: 0.375 ms
+Execution Time: 9.199 ms
+=== BUFFERS dv 0.001 B
+Limit  (cost=104.39..104.41 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=20801
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  ->  Sort  (cost=94.39..94.52 rows=55 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=20801
+        ->  Hash Right Join  (cost=68.75..93.20 rows=55 width=16) (actual rows=58 loops=1)
+              Hash Cond: (l.ctid = vx.ctid)
+              Buffers: shared hit=20795
+              ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                    Buffers: shared hit=20358
+              ->  Hash  (cost=68.06..68.06 rows=55 width=524) (actual rows=58 loops=1)
+                    Buckets: 1024  Batches: 1  Memory Usage: 42kB
+                    Buffers: shared hit=295
+                    ->  Index Scan using vx_w on vx  (cost=0.00..68.06 rows=55 width=524) (actual rows=58 loops=1)
+                          Index Cond: (price < 58)
+                          Buffers: shared hit=295
+Planning:
+  Buffers: shared hit=289
+Planning Time: 0.530 ms
+Execution Time: 21.225 ms
+=== BUFFERS dv 0.001 C
+Limit  (cost=70.08..70.10 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=498
+  ->  Sort  (cost=70.08..70.21 rows=55 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=498
+        ->  Index Scan using vx_w on vx  (cost=0.00..68.89 rows=55 width=16) (actual rows=58 loops=1)
+              Index Cond: (price < 58)
+              Buffers: shared hit=492
+Planning:
+  Buffers: shared hit=201
+Planning Time: 0.407 ms
+Execution Time: 2.162 ms
+=== BUFFERS dv 0.001 D
+Limit  (cost=209.77..209.80 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=24506
+  CTE ids
+    ->  Index Scan using vx_w on vx  (cost=0.00..69.58 rows=55 width=22) (actual rows=58 loops=1)
+          Index Cond: (price < 58)
+          Buffers: shared hit=295
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  CTE v
+    ->  Function Scan on weave_vec_scan  (cost=2.50..12.51 rows=1000 width=12) (actual rows=58 loops=1)
+          Buffers: shared hit=3847
+          InitPlan 3
+            ->  Aggregate  (cost=1.24..1.25 rows=1 width=8) (actual rows=1 loops=1)
+                  ->  CTE Scan on ids ids_1  (cost=0.00..1.10 rows=55 width=0) (actual rows=58 loops=1)
+          InitPlan 4
+            ->  Aggregate  (cost=1.24..1.25 rows=1 width=32) (actual rows=1 loops=1)
+                  ->  CTE Scan on ids ids_2  (cost=0.00..1.10 rows=55 width=8) (actual rows=58 loops=1)
+  ->  Sort  (cost=117.69..121.13 rows=1375 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=24506
+        ->  Hash Right Join  (cost=31.73..87.97 rows=1375 width=16) (actual rows=58 loops=1)
+              Hash Cond: (v.docid = ids.docid)
+              Buffers: shared hit=24500
+              ->  CTE Scan on v  (cost=0.00..20.00 rows=1000 width=12) (actual rows=58 loops=1)
+                    Buffers: shared hit=3847
+              ->  Hash  (cost=28.29..28.29 rows=275 width=24) (actual rows=58 loops=1)
+                    Buckets: 1024  Batches: 1  Memory Usage: 11kB
+                    Buffers: shared hit=20653
+                    ->  Hash Right Join  (cost=1.79..28.29 rows=275 width=24) (actual rows=58 loops=1)
+                          Hash Cond: (l.ctid = ids.rt)
+                          Buffers: shared hit=20653
+                          ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                                Buffers: shared hit=20358
+                          ->  Hash  (cost=1.10..1.10 rows=55 width=22) (actual rows=58 loops=1)
+                                Buckets: 1024  Batches: 1  Memory Usage: 12kB
+                                Buffers: shared hit=295
+                                ->  CTE Scan on ids  (cost=0.00..1.10 rows=55 width=22) (actual rows=58 loops=1)
+                                      Buffers: shared hit=295
+Planning:
+  Buffers: shared hit=320
+Planning Time: 0.619 ms
+Execution Time: 30.297 ms
+=== BUFFERS dv 0.0001 A
+Limit  (cost=0.01..7.06 rows=6 width=16) (actual rows=6 loops=1)
+  Buffers: shared hit=28271
+  ->  Index Scan using vx_w on vx  (cost=0.01..7.06 rows=6 width=16) (actual rows=6 loops=1)
+        Index Cond: (price < 6)
+        Rows Removed by Index Recheck: 57594
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+        Buffers: shared hit=28271
+Planning:
+  Buffers: shared hit=200
+Planning Time: 0.376 ms
+Execution Time: 31.981 ms
+=== BUFFERS dv 0.0001 B
+Limit  (cost=41.80..41.81 rows=6 width=16) (actual rows=6 loops=1)
+  Buffers: shared hit=20647
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  ->  Sort  (cost=31.79..31.81 rows=6 width=16) (actual rows=6 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        Sort Method: quicksort  Memory: 25kB
+        Buffers: shared hit=20647
+        ->  Hash Right Join  (cost=7.88..31.71 rows=6 width=16) (actual rows=6 loops=1)
+              Hash Cond: (l.ctid = vx.ctid)
+              Buffers: shared hit=20641
+              ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                    Buffers: shared hit=20358
+              ->  Hash  (cost=7.81..7.81 rows=6 width=524) (actual rows=6 loops=1)
+                    Buckets: 1024  Batches: 1  Memory Usage: 12kB
+                    Buffers: shared hit=243
+                    ->  Index Scan using vx_w on vx  (cost=0.00..7.81 rows=6 width=524) (actual rows=6 loops=1)
+                          Index Cond: (price < 6)
+                          Buffers: shared hit=243
+Planning:
+  Buffers: shared hit=289
+Planning Time: 0.545 ms
+Execution Time: 19.091 ms
+=== BUFFERS dv 0.0001 C
+Limit  (cost=7.97..7.99 rows=6 width=16) (actual rows=6 loops=1)
+  Buffers: shared hit=295
+  ->  Sort  (cost=7.97..7.99 rows=6 width=16) (actual rows=6 loops=1)
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        Sort Method: quicksort  Memory: 25kB
+        Buffers: shared hit=295
+        ->  Index Scan using vx_w on vx  (cost=0.00..7.90 rows=6 width=16) (actual rows=6 loops=1)
+              Index Cond: (price < 6)
+              Buffers: shared hit=289
+Planning:
+  Buffers: shared hit=201
+Planning Time: 0.379 ms
+Execution Time: 0.947 ms
+=== BUFFERS dv 0.0001 D
+Limit  (cost=87.88..87.91 rows=10 width=16) (actual rows=6 loops=1)
+  Buffers: shared hit=24446
+  CTE ids
+    ->  Index Scan using vx_w on vx  (cost=0.00..7.97 rows=6 width=22) (actual rows=6 loops=1)
+          Index Cond: (price < 6)
+          Buffers: shared hit=243
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  CTE v
+    ->  Function Scan on weave_vec_scan  (cost=0.30..10.30 rows=1000 width=12) (actual rows=6 loops=1)
+          Buffers: shared hit=3839
+          InitPlan 3
+            ->  Aggregate  (cost=0.14..0.15 rows=1 width=8) (actual rows=1 loops=1)
+                  ->  CTE Scan on ids ids_1  (cost=0.00..0.12 rows=6 width=0) (actual rows=6 loops=1)
+          InitPlan 4
+            ->  Aggregate  (cost=0.14..0.15 rows=1 width=32) (actual rows=1 loops=1)
+                  ->  CTE Scan on ids ids_2  (cost=0.00..0.12 rows=6 width=8) (actual rows=6 loops=1)
+  ->  Sort  (cost=59.61..59.99 rows=150 width=16) (actual rows=6 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        Sort Method: quicksort  Memory: 25kB
+        Buffers: shared hit=24446
+        ->  Hash Right Join  (cost=24.62..56.37 rows=150 width=16) (actual rows=6 loops=1)
+              Hash Cond: (v.docid = ids.docid)
+              Buffers: shared hit=24440
+              ->  CTE Scan on v  (cost=0.00..20.00 rows=1000 width=12) (actual rows=6 loops=1)
+                    Buffers: shared hit=3839
+              ->  Hash  (cost=24.25..24.25 rows=30 width=24) (actual rows=6 loops=1)
+                    Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                    Buffers: shared hit=20601
+                    ->  Hash Right Join  (cost=0.20..24.25 rows=30 width=24) (actual rows=6 loops=1)
+                          Hash Cond: (l.ctid = ids.rt)
+                          Buffers: shared hit=20601
+                          ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                                Buffers: shared hit=20358
+                          ->  Hash  (cost=0.12..0.12 rows=6 width=22) (actual rows=6 loops=1)
+                                Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                Buffers: shared hit=243
+                                ->  CTE Scan on ids  (cost=0.00..0.12 rows=6 width=22) (actual rows=6 loops=1)
+                                      Buffers: shared hit=243
+Planning:
+  Buffers: shared hit=320
+Planning Time: 0.675 ms
+Execution Time: 31.482 ms
+=== BUFFERS lex 0.1 A
+Limit  (cost=0.01..11.44 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=3444
+  ->  Index Scan using vx_w on vx  (cost=0.01..329.30 rows=288 width=16) (actual rows=10 loops=1)
+        Index Cond: (body @@@ '''long'''::wquery)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+        Buffers: shared hit=3444
+Planning:
+  Buffers: shared hit=181
+Planning Time: 0.401 ms
+Execution Time: 17.862 ms
+=== BUFFERS lex 0.1 B
+Limit  (cost=393.46..393.48 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=31896
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  ->  Sort  (cost=383.45..384.17 rows=288 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=31896
+        ->  Hash Right Join  (cost=349.83..377.23 rows=288 width=16) (actual rows=5711 loops=1)
+              Hash Cond: (l.ctid = vx.ctid)
+              Buffers: shared hit=31890
+              ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                    Buffers: shared hit=20358
+              ->  Hash  (cost=346.23..346.23 rows=288 width=524) (actual rows=5711 loops=1)
+                    Buckets: 8192 (originally 1024)  Batches: 1 (originally 1)  Memory Usage: 5432kB
+                    Buffers: shared hit=4457
+                    ->  Bitmap Heap Scan on vx  (cost=35.23..346.23 rows=288 width=524) (actual rows=5711 loops=1)
+                          Recheck Cond: (body @@@ '''long'''::wquery)
+                          Heap Blocks: exact=4449
+                          Buffers: shared hit=4457
+                          ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=5711 loops=1)
+                                Index Cond: (body @@@ '''long'''::wquery)
+                                Buffers: shared hit=8
+Planning:
+  Buffers: shared hit=279
+Planning Time: 0.600 ms
+Execution Time: 43.795 ms
+=== BUFFERS lex 0.1 C
+Limit  (cost=356.77..356.80 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=22071
+  ->  Sort  (cost=356.77..357.49 rows=288 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=22071
+        ->  Bitmap Heap Scan on vx  (cost=35.23..350.55 rows=288 width=16) (actual rows=5711 loops=1)
+              Recheck Cond: (body @@@ '''long'''::wquery)
+              Heap Blocks: exact=4449
+              Buffers: shared hit=22065
+              ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=5711 loops=1)
+                    Index Cond: (body @@@ '''long'''::wquery)
+                    Buffers: shared hit=8
+Planning:
+  Buffers: shared hit=188
+Planning Time: 0.420 ms
+Execution Time: 64.506 ms
+=== BUFFERS lex 0.1 D
+Limit  (cost=955.61..955.64 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=28665
+  CTE ids
+    ->  Bitmap Heap Scan on vx  (cost=35.23..354.15 rows=288 width=22) (actual rows=5711 loops=1)
+          Recheck Cond: (body @@@ '''long'''::wquery)
+          Heap Blocks: exact=4449
+          Buffers: shared hit=4457
+          ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=5711 loops=1)
+                Index Cond: (body @@@ '''long'''::wquery)
+                Buffers: shared hit=8
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  CTE v
+    ->  Function Scan on weave_vec_scan  (cost=12.99..22.99 rows=1000 width=12) (actual rows=5711 loops=1)
+          Buffers: shared hit=8304
+          InitPlan 3
+            ->  Aggregate  (cost=6.48..6.49 rows=1 width=8) (actual rows=1 loops=1)
+                  Buffers: shared hit=4457
+                  ->  CTE Scan on ids ids_1  (cost=0.00..5.76 rows=288 width=0) (actual rows=5711 loops=1)
+                        Buffers: shared hit=4457
+          InitPlan 4
+            ->  Aggregate  (cost=6.48..6.49 rows=1 width=32) (actual rows=1 loops=1)
+                  ->  CTE Scan on ids ids_2  (cost=0.00..5.76 rows=288 width=8) (actual rows=5711 loops=1)
+  ->  Sort  (cost=568.47..586.47 rows=7200 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=28665
+        ->  Merge Right Join  (cost=227.88..412.88 rows=7200 width=16) (actual rows=5711 loops=1)
+              Merge Cond: (v.docid = ids.docid)
+              Buffers: shared hit=28662
+              ->  Sort  (cost=69.83..72.33 rows=1000 width=12) (actual rows=5711 loops=1)
+                    Sort Key: v.docid
+                    Sort Method: quicksort  Memory: 371kB
+                    Buffers: shared hit=8304
+                    ->  CTE Scan on v  (cost=0.00..20.00 rows=1000 width=12) (actual rows=5711 loops=1)
+                          Buffers: shared hit=8304
+              ->  Sort  (cost=158.05..161.65 rows=1440 width=24) (actual rows=5711 loops=1)
+                    Sort Key: ids.docid
+                    Sort Method: quicksort  Memory: 393kB
+                    Buffers: shared hit=20358
+                    ->  Hash Right Join  (cost=9.36..82.51 rows=1440 width=24) (actual rows=5711 loops=1)
+                          Hash Cond: (l.ctid = ids.rt)
+                          Buffers: shared hit=20358
+                          ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                                Buffers: shared hit=20358
+                          ->  Hash  (cost=5.76..5.76 rows=288 width=22) (actual rows=5711 loops=1)
+                                Buckets: 8192 (originally 1024)  Batches: 1 (originally 1)  Memory Usage: 377kB
+                                ->  CTE Scan on ids  (cost=0.00..5.76 rows=288 width=22) (actual rows=5711 loops=1)
+Planning:
+  Buffers: shared hit=307
+Planning Time: 0.652 ms
+Execution Time: 62.745 ms
+=== BUFFERS lex 0.01 A
+Limit  (cost=0.01..11.44 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=1679
+  ->  Index Scan using vx_w on vx  (cost=0.01..329.30 rows=288 width=16) (actual rows=10 loops=1)
+        Index Cond: (body @@@ '''alternative'''::wquery)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+        Buffers: shared hit=1679
+Planning:
+  Buffers: shared hit=181
+Planning Time: 0.386 ms
+Execution Time: 12.181 ms
+=== BUFFERS lex 0.01 B
+Limit  (cost=393.46..393.48 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=21664
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  ->  Sort  (cost=383.45..384.17 rows=288 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=21664
+        ->  Hash Right Join  (cost=349.83..377.23 rows=288 width=16) (actual rows=576 loops=1)
+              Hash Cond: (l.ctid = vx.ctid)
+              Buffers: shared hit=21658
+              ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                    Buffers: shared hit=20358
+              ->  Hash  (cost=346.23..346.23 rows=288 width=524) (actual rows=576 loops=1)
+                    Buckets: 1024  Batches: 1  Memory Usage: 554kB
+                    Buffers: shared hit=570
+                    ->  Bitmap Heap Scan on vx  (cost=35.23..346.23 rows=288 width=524) (actual rows=576 loops=1)
+                          Recheck Cond: (body @@@ '''alternative'''::wquery)
+                          Heap Blocks: exact=563
+                          Buffers: shared hit=570
+                          ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=576 loops=1)
+                                Index Cond: (body @@@ '''alternative'''::wquery)
+                                Buffers: shared hit=7
+Planning:
+  Buffers: shared hit=279
+Planning Time: 0.587 ms
+Execution Time: 21.816 ms
+=== BUFFERS lex 0.01 C
+Limit  (cost=356.77..356.80 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=2380
+  ->  Sort  (cost=356.77..357.49 rows=288 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=2380
+        ->  Bitmap Heap Scan on vx  (cost=35.23..350.55 rows=288 width=16) (actual rows=576 loops=1)
+              Recheck Cond: (body @@@ '''alternative'''::wquery)
+              Heap Blocks: exact=563
+              Buffers: shared hit=2374
+              ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=576 loops=1)
+                    Index Cond: (body @@@ '''alternative'''::wquery)
+                    Buffers: shared hit=7
+Planning:
+  Buffers: shared hit=188
+Planning Time: 0.396 ms
+Execution Time: 8.882 ms
+=== BUFFERS lex 0.01 D
+Limit  (cost=955.61..955.64 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=24778
+  CTE ids
+    ->  Bitmap Heap Scan on vx  (cost=35.23..354.15 rows=288 width=22) (actual rows=576 loops=1)
+          Recheck Cond: (body @@@ '''alternative'''::wquery)
+          Heap Blocks: exact=563
+          Buffers: shared hit=570
+          ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=576 loops=1)
+                Index Cond: (body @@@ '''alternative'''::wquery)
+                Buffers: shared hit=7
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  CTE v
+    ->  Function Scan on weave_vec_scan  (cost=12.99..22.99 rows=1000 width=12) (actual rows=576 loops=1)
+          Buffers: shared hit=4417
+          InitPlan 3
+            ->  Aggregate  (cost=6.48..6.49 rows=1 width=8) (actual rows=1 loops=1)
+                  Buffers: shared hit=570
+                  ->  CTE Scan on ids ids_1  (cost=0.00..5.76 rows=288 width=0) (actual rows=576 loops=1)
+                        Buffers: shared hit=570
+          InitPlan 4
+            ->  Aggregate  (cost=6.48..6.49 rows=1 width=32) (actual rows=1 loops=1)
+                  ->  CTE Scan on ids ids_2  (cost=0.00..5.76 rows=288 width=8) (actual rows=576 loops=1)
+  ->  Sort  (cost=568.47..586.47 rows=7200 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=24778
+        ->  Merge Right Join  (cost=227.88..412.88 rows=7200 width=16) (actual rows=576 loops=1)
+              Merge Cond: (v.docid = ids.docid)
+              Buffers: shared hit=24775
+              ->  Sort  (cost=69.83..72.33 rows=1000 width=12) (actual rows=576 loops=1)
+                    Sort Key: v.docid
+                    Sort Method: quicksort  Memory: 43kB
+                    Buffers: shared hit=4417
+                    ->  CTE Scan on v  (cost=0.00..20.00 rows=1000 width=12) (actual rows=576 loops=1)
+                          Buffers: shared hit=4417
+              ->  Sort  (cost=158.05..161.65 rows=1440 width=24) (actual rows=576 loops=1)
+                    Sort Key: ids.docid
+                    Sort Method: quicksort  Memory: 45kB
+                    Buffers: shared hit=20358
+                    ->  Hash Right Join  (cost=9.36..82.51 rows=1440 width=24) (actual rows=576 loops=1)
+                          Hash Cond: (l.ctid = ids.rt)
+                          Buffers: shared hit=20358
+                          ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                                Buffers: shared hit=20358
+                          ->  Hash  (cost=5.76..5.76 rows=288 width=22) (actual rows=576 loops=1)
+                                Buckets: 1024  Batches: 1  Memory Usage: 40kB
+                                ->  CTE Scan on ids  (cost=0.00..5.76 rows=288 width=22) (actual rows=576 loops=1)
+Planning:
+  Buffers: shared hit=307
+Planning Time: 0.657 ms
+Execution Time: 32.534 ms
+=== BUFFERS lex 0.001 A
+Limit  (cost=0.01..11.44 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=909
+  ->  Index Scan using vx_w on vx  (cost=0.01..329.30 rows=288 width=16) (actual rows=10 loops=1)
+        Index Cond: (body @@@ '''abstract'''::wquery)
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+        Buffers: shared hit=909
+Planning:
+  Buffers: shared hit=181
+Planning Time: 0.376 ms
+Execution Time: 8.398 ms
+=== BUFFERS lex 0.001 B
+Limit  (cost=393.46..393.48 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=20523
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  ->  Sort  (cost=383.45..384.17 rows=288 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=20523
+        ->  Hash Right Join  (cost=349.83..377.23 rows=288 width=16) (actual rows=58 loops=1)
+              Hash Cond: (l.ctid = vx.ctid)
+              Buffers: shared hit=20517
+              ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                    Buffers: shared hit=20358
+              ->  Hash  (cost=346.23..346.23 rows=288 width=524) (actual rows=58 loops=1)
+                    Buckets: 1024  Batches: 1  Memory Usage: 66kB
+                    Buffers: shared hit=65
+                    ->  Bitmap Heap Scan on vx  (cost=35.23..346.23 rows=288 width=524) (actual rows=58 loops=1)
+                          Recheck Cond: (body @@@ '''abstract'''::wquery)
+                          Heap Blocks: exact=58
+                          Buffers: shared hit=65
+                          ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=58 loops=1)
+                                Index Cond: (body @@@ '''abstract'''::wquery)
+                                Buffers: shared hit=7
+Planning:
+  Buffers: shared hit=279
+Planning Time: 0.503 ms
+Execution Time: 18.741 ms
+=== BUFFERS lex 0.001 C
+Limit  (cost=356.77..356.80 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=278
+  ->  Sort  (cost=356.77..357.49 rows=288 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=278
+        ->  Bitmap Heap Scan on vx  (cost=35.23..350.55 rows=288 width=16) (actual rows=58 loops=1)
+              Recheck Cond: (body @@@ '''abstract'''::wquery)
+              Heap Blocks: exact=58
+              Buffers: shared hit=272
+              ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=58 loops=1)
+                    Index Cond: (body @@@ '''abstract'''::wquery)
+                    Buffers: shared hit=7
+Planning:
+  Buffers: shared hit=188
+Planning Time: 0.384 ms
+Execution Time: 1.538 ms
+=== BUFFERS lex 0.001 D
+Limit  (cost=955.61..955.64 rows=10 width=16) (actual rows=10 loops=1)
+  Buffers: shared hit=24273
+  CTE ids
+    ->  Bitmap Heap Scan on vx  (cost=35.23..354.15 rows=288 width=22) (actual rows=58 loops=1)
+          Recheck Cond: (body @@@ '''abstract'''::wquery)
+          Heap Blocks: exact=58
+          Buffers: shared hit=65
+          ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=58 loops=1)
+                Index Cond: (body @@@ '''abstract'''::wquery)
+                Buffers: shared hit=7
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  CTE v
+    ->  Function Scan on weave_vec_scan  (cost=12.99..22.99 rows=1000 width=12) (actual rows=58 loops=1)
+          Buffers: shared hit=3912
+          InitPlan 3
+            ->  Aggregate  (cost=6.48..6.49 rows=1 width=8) (actual rows=1 loops=1)
+                  Buffers: shared hit=65
+                  ->  CTE Scan on ids ids_1  (cost=0.00..5.76 rows=288 width=0) (actual rows=58 loops=1)
+                        Buffers: shared hit=65
+          InitPlan 4
+            ->  Aggregate  (cost=6.48..6.49 rows=1 width=32) (actual rows=1 loops=1)
+                  ->  CTE Scan on ids ids_2  (cost=0.00..5.76 rows=288 width=8) (actual rows=58 loops=1)
+  ->  Sort  (cost=568.47..586.47 rows=7200 width=16) (actual rows=10 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=24273
+        ->  Merge Right Join  (cost=227.88..412.88 rows=7200 width=16) (actual rows=58 loops=1)
+              Merge Cond: (v.docid = ids.docid)
+              Buffers: shared hit=24270
+              ->  Sort  (cost=69.83..72.33 rows=1000 width=12) (actual rows=58 loops=1)
+                    Sort Key: v.docid
+                    Sort Method: quicksort  Memory: 26kB
+                    Buffers: shared hit=3912
+                    ->  CTE Scan on v  (cost=0.00..20.00 rows=1000 width=12) (actual rows=58 loops=1)
+                          Buffers: shared hit=3912
+              ->  Sort  (cost=158.05..161.65 rows=1440 width=24) (actual rows=58 loops=1)
+                    Sort Key: ids.docid
+                    Sort Method: quicksort  Memory: 27kB
+                    Buffers: shared hit=20358
+                    ->  Hash Right Join  (cost=9.36..82.51 rows=1440 width=24) (actual rows=58 loops=1)
+                          Hash Cond: (l.ctid = ids.rt)
+                          Buffers: shared hit=20358
+                          ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                                Buffers: shared hit=20358
+                          ->  Hash  (cost=5.76..5.76 rows=288 width=22) (actual rows=58 loops=1)
+                                Buckets: 1024  Batches: 1  Memory Usage: 12kB
+                                ->  CTE Scan on ids  (cost=0.00..5.76 rows=288 width=22) (actual rows=58 loops=1)
+Planning:
+  Buffers: shared hit=307
+Planning Time: 0.589 ms
+Execution Time: 28.767 ms
+=== BUFFERS lex 0.0001 A
+Limit  (cost=0.01..11.44 rows=10 width=16) (actual rows=6 loops=1)
+  Buffers: shared hit=80756
+  ->  Index Scan using vx_w on vx  (cost=0.01..329.30 rows=288 width=16) (actual rows=6 loops=1)
+        Index Cond: (body @@@ '''aaron'''::wquery)
+        Rows Removed by Index Recheck: 57594
+        Order By: ((body <=> '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery) AND (emb <#> '[<vec>]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+        Buffers: shared hit=80756
+Planning:
+  Buffers: shared hit=181
+Planning Time: 0.361 ms
+Execution Time: 274.012 ms
+=== BUFFERS lex 0.0001 B
+Limit  (cost=393.46..393.48 rows=10 width=16) (actual rows=6 loops=1)
+  Buffers: shared hit=20411
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  ->  Sort  (cost=383.45..384.17 rows=288 width=16) (actual rows=6 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * (- (vx.emb <#> '[<vec>]'::wvec))))) DESC, vx.id
+        Sort Method: quicksort  Memory: 25kB
+        Buffers: shared hit=20411
+        ->  Hash Right Join  (cost=349.83..377.23 rows=288 width=16) (actual rows=6 loops=1)
+              Hash Cond: (l.ctid = vx.ctid)
+              Buffers: shared hit=20405
+              ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                    Buffers: shared hit=20358
+              ->  Hash  (cost=346.23..346.23 rows=288 width=524) (actual rows=6 loops=1)
+                    Buckets: 1024  Batches: 1  Memory Usage: 15kB
+                    Buffers: shared hit=13
+                    ->  Bitmap Heap Scan on vx  (cost=35.23..346.23 rows=288 width=524) (actual rows=6 loops=1)
+                          Recheck Cond: (body @@@ '''aaron'''::wquery)
+                          Heap Blocks: exact=6
+                          Buffers: shared hit=13
+                          ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=6 loops=1)
+                                Index Cond: (body @@@ '''aaron'''::wquery)
+                                Buffers: shared hit=7
+Planning:
+  Buffers: shared hit=279
+Planning Time: 0.588 ms
+Execution Time: 19.498 ms
+=== BUFFERS lex 0.0001 C
+Limit  (cost=356.77..356.80 rows=10 width=16) (actual rows=6 loops=1)
+  Buffers: shared hit=66
+  ->  Sort  (cost=356.77..357.49 rows=288 width=16) (actual rows=6 loops=1)
+        Sort Key: ((('0.5'::double precision * weave_bm25(body, '(((((((''tax'' | ''implications'') | ''holding'') | ''ewu'') | ''other'') | ''such'') | ''etfs'') | ''citizen'')'::wquery, '57600'::double precision, '138.72319444444443'::double precision, '{6546,223,906,1,11972,4963,544,224}'::double precision[])) + ('0.5'::double precision * (- (emb <#> '[<vec>]'::wvec))))) DESC, id
+        Sort Method: quicksort  Memory: 25kB
+        Buffers: shared hit=66
+        ->  Bitmap Heap Scan on vx  (cost=35.23..350.55 rows=288 width=16) (actual rows=6 loops=1)
+              Recheck Cond: (body @@@ '''aaron'''::wquery)
+              Heap Blocks: exact=6
+              Buffers: shared hit=60
+              ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=6 loops=1)
+                    Index Cond: (body @@@ '''aaron'''::wquery)
+                    Buffers: shared hit=7
+Planning:
+  Buffers: shared hit=188
+Planning Time: 0.385 ms
+Execution Time: 0.307 ms
+=== BUFFERS lex 0.0001 D
+Limit  (cost=955.61..955.64 rows=10 width=16) (actual rows=6 loops=1)
+  Buffers: shared hit=24211
+  CTE ids
+    ->  Bitmap Heap Scan on vx  (cost=35.23..354.15 rows=288 width=22) (actual rows=6 loops=1)
+          Recheck Cond: (body @@@ '''aaron'''::wquery)
+          Heap Blocks: exact=6
+          Buffers: shared hit=13
+          ->  Bitmap Index Scan on vx_w  (cost=0.00..35.16 rows=288 width=0) (actual rows=6 loops=1)
+                Index Cond: (body @@@ '''aaron'''::wquery)
+                Buffers: shared hit=7
+  CTE l
+    ->  Function Scan on weave_search  (cost=0.00..10.00 rows=1000 width=14) (actual rows=20100 loops=1)
+          Buffers: shared hit=20358
+  CTE v
+    ->  Function Scan on weave_vec_scan  (cost=12.99..22.99 rows=1000 width=12) (actual rows=6 loops=1)
+          Buffers: shared hit=3850
+          InitPlan 3
+            ->  Aggregate  (cost=6.48..6.49 rows=1 width=8) (actual rows=1 loops=1)
+                  Buffers: shared hit=13
+                  ->  CTE Scan on ids ids_1  (cost=0.00..5.76 rows=288 width=0) (actual rows=6 loops=1)
+                        Buffers: shared hit=13
+          InitPlan 4
+            ->  Aggregate  (cost=6.48..6.49 rows=1 width=32) (actual rows=1 loops=1)
+                  ->  CTE Scan on ids ids_2  (cost=0.00..5.76 rows=288 width=8) (actual rows=6 loops=1)
+  ->  Sort  (cost=568.47..586.47 rows=7200 width=16) (actual rows=6 loops=1)
+        Sort Key: ((('0.5'::double precision * COALESCE(l.score, '0'::double precision)) + ('0.5'::double precision * COALESCE((v.score)::double precision, '0'::double precision)))) DESC, ids.id
+        Sort Method: quicksort  Memory: 25kB
+        Buffers: shared hit=24211
+        ->  Merge Right Join  (cost=227.88..412.88 rows=7200 width=16) (actual rows=6 loops=1)
+              Merge Cond: (v.docid = ids.docid)
+              Buffers: shared hit=24208
+              ->  Sort  (cost=69.83..72.33 rows=1000 width=12) (actual rows=6 loops=1)
+                    Sort Key: v.docid
+                    Sort Method: quicksort  Memory: 25kB
+                    Buffers: shared hit=3850
+                    ->  CTE Scan on v  (cost=0.00..20.00 rows=1000 width=12) (actual rows=6 loops=1)
+                          Buffers: shared hit=3850
+              ->  Sort  (cost=158.05..161.65 rows=1440 width=24) (actual rows=6 loops=1)
+                    Sort Key: ids.docid
+                    Sort Method: quicksort  Memory: 25kB
+                    Buffers: shared hit=20358
+                    ->  Hash Right Join  (cost=9.36..82.51 rows=1440 width=24) (actual rows=6 loops=1)
+                          Hash Cond: (l.ctid = ids.rt)
+                          Buffers: shared hit=20358
+                          ->  CTE Scan on l  (cost=0.00..20.00 rows=1000 width=14) (actual rows=20100 loops=1)
+                                Buffers: shared hit=20358
+                          ->  Hash  (cost=5.76..5.76 rows=288 width=22) (actual rows=6 loops=1)
+                                Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                ->  CTE Scan on ids  (cost=0.00..5.76 rows=288 width=22) (actual rows=6 loops=1)
+Planning:
+  Buffers: shared hit=307
+Planning Time: 0.685 ms
+Execution Time: 28.451 ms

@@ -1,0 +1,1 @@
+CHECK 225 (point,query) pairs: A!=D untied 0 (D ties 0), B!=C untied 48 (B ties 0), mean |A n B|/|A| 0.9990, positive control (normalize=on vs D) disagreed 173

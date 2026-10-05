@@ -1,0 +1,10 @@
+kind	target	pred	rows	sel
+none	1	-	5183	1.000000
+dv	0.1	price < 518	518	0.099942
+dv	0.01	price < 52	52	0.010033
+dv	0.001	price < 5	5	0.000965
+dv	0.0001	price < 1	1	0.000193
+lex	0.1	body @@@ 'low'::wquery	517	0.099749
+lex	0.01	body @@@ 'accumulate'::wquery	52	0.010033
+lex	0.001	body @@@ 'abolish'::wquery	5	0.000965
+lex	0.0001	body @@@ 'aab'::wquery	1	0.000193

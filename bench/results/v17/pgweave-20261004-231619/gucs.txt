@@ -1,0 +1,4 @@
+jit=off
+max_parallel_workers_per_gather=4
+shared_buffers=1616000
+work_mem=262144
