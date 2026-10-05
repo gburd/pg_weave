@@ -408,6 +408,30 @@ pulled artifacts and terminated the instance. The job's recorded exit status is 
 - **The local cliff split and the counter identity come from the workstation** and are
   counts, not times. The cliff's latency comes from EC2.
 
+## Proposal: renumber the duplicate ids (NOT applied)
+
+`doc/PHASES.md` has **two** duplicated task ids, not one. The zvec-review rows added on
+2026-09-21 reused numbers that were already DONE:
+
+| line | row | status | proposed id |
+|---|---|---|---|
+| 289 | **V16** "Cosine, as a storage decision" (zvec review) | NEW | **V19** |
+| 290 | **V17** "Switch plan strategy on predicate selectivity" (this file) | NEW, crossover measured | **V20** |
+| 291 | **V18** "Bit-plane progressive refinement" | NEW | V18 (unique, keep) |
+| 292 | ~~V16~~ nibble-LUT kernel | DONE 2026-09-15 | V16 (keep) |
+| 293 | ~~V17~~ kernel sweep across `dim` | DONE 2026-09-15 | V17 (keep) |
+
+The DONE rows keep their ids, because `bench/RESULTS_CODE_SCAN.md` (§"V17: the kernel
+ordering across `dim`"), `bench/aws/run.sh`'s `csdim` job and `doc/specs/VECTOR_CHANNEL.md`
+cite them as V16/V17 and are a week older. References to the NEW V17 that would need the
+rename: this file, `bench/v17_crossover.sh`, `bench/aws/v17_job.sh`,
+`bench/v17_padding_cliff.sql`, `bench/results/v17/`, `doc/PRODUCTION_READINESS.md`
+(~line 533–537, "V16, V17, V18 from a read-only review of Alibaba's zvec"),
+`doc/GAPS.md` ~2453 ("V17's selectivity switch"), `doc/specs/DOCVALS_CHANNEL.md:29` and
+`bench/RESULTS_DOCVALS_PRIZE.md:77`. The NEW V16 is cited in the same
+`PRODUCTION_READINESS.md` paragraph. A rename should leave a dated
+"formerly V17 (NEW 2026-09-21)" note at each site, in the spirit of hard rule 13.
+
 ## Reproduce
 
 ```sh
