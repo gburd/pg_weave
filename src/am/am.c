@@ -725,6 +725,23 @@ cmp_blocknumber(const void *a, const void *b)
 }
 
 /*
+ * Is a free-list candidate actually a LIVE page -- initialized and not flagged
+ * WEAVE_FREED?  Then its free-space entry is stale, and the allocator DROPS it
+ * instead of re-recording it.  Before doc/GAPS.md G75 a refused live page was
+ * pushed back into the FSM every time, so one stale entry lived forever; that
+ * was harmless only because nothing but a crash-lost FSM update produced one.
+ * VACUUM's reclaim now records zero pages and unreachable freed pages in the
+ * FSM, and a zero page can be taken and written by another backend a moment
+ * later, so a stale entry is an expected state with a defined end: the first
+ * allocator that meets it.  nbtree and GIN treat a stale FSM entry the same way.
+ */
+static bool
+weave_page_is_live(Page page)
+{
+	return !PageIsNew(page) && !WeavePageIsFreed(page);
+}
+
+/*
  * Gather all free blocks (via a linear FSM probe) into an ascending array so
  * subsequent weave_new_buffer() calls reuse the lowest blocks first.  Single
  * writer only.  Cheap relative to the segment rewrite it precedes.
@@ -927,8 +944,59 @@ uint64		weave_vecwork_blocks = 0;
 uint64		weave_vecwork_blk_bound = 0;
 uint64		weave_vecwork_shuttles = 0;
 
+/*
+ * Is this backend licensed to allocate a page for an unpublished structure?
+ * doc/specs/SEGMENT_FORMAT.md sect. 10: VACUUM's reclaim frees an unreachable
+ * page unless the writer holds the maintenance mutex, holds the segment-write
+ * lock, or owns the index outright.  A parallel worker writes on behalf of a
+ * leader that holds one of those for the worker's whole life.
+ */
+static bool
+weave_alloc_licensed(Relation index)
+{
+	LOCKTAG		tag;
+
+	if (IsParallelWorker())
+		return true;
+	SET_LOCKTAG_PAGE(tag, index->rd_lockInfo.lockRelId.dbId,
+					 index->rd_lockInfo.lockRelId.relId, WEAVE_METAPAGE_BLKNO);
+	if (LockHeldByMe(&tag, ExclusiveLock, false))
+		return true;
+	SET_LOCKTAG_PAGE(tag, index->rd_lockInfo.lockRelId.dbId,
+					 index->rd_lockInfo.lockRelId.relId, WEAVE_SEGWRITE_LOCKBLK);
+	if (LockHeldByMe(&tag, ShareLock, false))
+		return true;
+	return CheckRelationLockedByMe(index, AccessExclusiveLock, true);
+}
+
+static Buffer weave_new_buffer_internal(Relation index);
+
+/*
+ * Every page of an UNPUBLISHED structure -- a bolt, a merge output, a tombstone
+ * blob -- comes through here, and a page written without the license above is
+ * a page VACUUM's reclaim may free while its writer is still writing it.  So
+ * this is enforced, not documented, for the reason weave_assert_merge_serialized()
+ * gives: elog(ERROR) in every build, on the first allocation, rather than a
+ * corrupted index months later.  The pending append, which links each page in
+ * the record that writes it, uses weave_new_buffer_linked() instead.
+ */
 Buffer
 weave_new_buffer(Relation index)
+{
+	if (unlikely(!weave_alloc_licensed(index)))
+		elog(ERROR, "pg_weave: segment page allocated without the maintenance mutex or the segment-write lock on index \"%s\"",
+			 RelationGetRelationName(index));
+	return weave_new_buffer_internal(index);
+}
+
+Buffer
+weave_new_buffer_linked(Relation index)
+{
+	return weave_new_buffer_internal(index);
+}
+
+static Buffer
+weave_new_buffer_internal(Relation index)
 {
 	Buffer		buffer;
 
@@ -954,7 +1022,10 @@ weave_new_buffer(Relation index)
 			if (!weave_page_recyclable(index, BufferGetPage(buffer)))
 			{
 				/* a scan may still reference this just-freed page; leave it in
-				 * the FSM for a later allocation once its horizon passes */
+				 * the FSM for a later allocation once its horizon passes.  (A
+				 * LIVE page here has a stale entry; the gather never marked it
+				 * used, so this leaves the entry as it was and the FSM loop
+				 * below is what drops it -- weave_page_is_live.) */
 				weave_alloc_lowfree_defer++;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				ReleaseBuffer(buffer);
@@ -1037,6 +1108,16 @@ weave_new_buffer(Relation index)
 				 * ending the sequence is a bounded cost, not a ratchet.
 				 */
 				weave_alloc_fsm_defer++;
+				if (weave_page_is_live(BufferGetPage(buffer)))
+				{
+					/* a stale entry for a LIVE page: GetFreeIndexPage() already
+					 * marked it used, so dropping it is just not re-recording it,
+					 * and the next free page is worth trying (this one will not
+					 * come back) -- see weave_page_is_live */
+					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+					ReleaseBuffer(buffer);
+					continue;
+				}
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 				ReleaseBuffer(buffer);
 				RecordFreeIndexPage(index, blk);
@@ -3692,11 +3773,21 @@ void
 weave_free_page(Relation index, BlockNumber blk)
 {
 	Buffer		buf = ReadBuffer(index, blk);
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	weave_free_page_locked(index, buf);
+}
+
+/* The same, for a buffer the caller has exclusively locked (the reclaim frees
+ * under the lock it re-checked the page with).  Releases the buffer. */
+void
+weave_free_page_locked(Relation index, Buffer buf)
+{
+	BlockNumber blk = BufferGetBlockNumber(buf);
 	GenericXLogState *state;
 	Page		page;
 	WeavePageOpaque op;
 
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	state = GenericXLogStart(index);
 	page = GenericXLogRegisterBuffer(state, buf, 0);
 	op = WeavePageGetOpaque(page);

@@ -1151,6 +1151,8 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	return stats;
 }
 
+static XLogRecPtr weave_reclaim_prepare(Relation index);
+
 IndexBulkDeleteResult *
 weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
@@ -1160,6 +1162,9 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	/* Fold any pending documents into a new segment, then compact segments. */
 	if (!info->analyze_only)
 	{
+		/* the reclaim's fence and barrier, BEFORE the mutex (see the function) */
+		XLogRecPtr	fence = weave_reclaim_prepare(info->index);
+
 		/* serialize against any concurrent flush/merge/compact on this index
 		 * (a user weave_merge/weave_vacuum, or another autovacuum worker): they take
 		 * different relation locks that do not conflict, so this heavyweight
@@ -1167,6 +1172,14 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		weave_maintenance_lock(info->index);
 		PG_TRY();
 		{
+			/*
+			 * Reclaim stranded pages FIRST (doc/GAPS.md G75): the flush and
+			 * merges below then reuse them, and the compaction trigger counts
+			 * them as free.  Before them, too, because a page they allocate
+			 * from here on is written after the fence.
+			 */
+			(void) weave_reclaim_unreachable(info->index, fence,
+											 info->message_level);
 			(void) weave_flush_pending(info->index);
 			weave_merge_segments(info->index);
 
@@ -1232,6 +1245,162 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	}
 
 	return stats;
+}
+
+/*
+ * RECLAIM PAGES A CRASH STRANDED (doc/GAPS.md G75, G72's leak class).
+ *
+ * The design and its safety argument are doc/specs/SEGMENT_FORMAT.md sect. 10,
+ * "Pages a crash strands between write and link"; read that before changing
+ * anything here.  In short, the caller must:
+ *
+ *   1. read `fence` = GetXLogInsertRecPtr(),
+ *   2. pass weave_segwrite_barrier() WITHOUT holding the maintenance mutex,
+ *   3. take the maintenance mutex (or hold AccessExclusiveLock), and only then
+ *      call this.
+ *
+ * Then every page below the relation length that is not reachable from the
+ * metapage is one of:
+ *
+ *   - initialized, not WEAVE_FREED, pd_lsn <= fence: stranded by a crash or an
+ *     ERROR before its publish or after its unlink.  FREED, under the same
+ *     exclusive buffer lock its state was checked with.
+ *   - initialized, not WEAVE_FREED, pd_lsn > fence: written after the fence by
+ *     a writer this pass does not exclude.  LEFT ALONE; a later VACUUM decides.
+ *   - zero, or WEAVE_FREED, and not in the FSM: the FSM is not crash-safe.
+ *     RE-RECORDED.  Never written: weave_page_is_live() in src/am/am.c is what
+ *     makes an FSM entry for a page someone takes at the same moment harmless.
+ *
+ * Frees nothing if the map is incomplete (weave_reach_map), and says so.
+ * Returns the number of pages freed.
+ */
+int64
+weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
+{
+	WeaveMetaPageData meta;
+	BlockNumber nblocks;
+	BlockNumber blk;
+	uint8	   *reach;
+	bool		complete;
+	int64		nfreed = 0;
+	int64		nrecorded = 0;
+	int64		nnewer = 0;
+	int64		ncontended = 0;
+	MemoryContext ctx;
+	MemoryContext old;
+
+	{
+		Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
+
+		LockBuffer(mb, BUFFER_LOCK_SHARE);
+		weave_meta_from_page(BufferGetPage(mb), &meta);
+		UnlockReleaseBuffer(mb);
+	}
+
+	/*
+	 * AFTER the metapage, so every page the snapshot reaches is below it, and
+	 * under the extension lock, so no extension is in flight: weave_new_buffer()
+	 * holds that lock until it has the new buffer exclusively locked, and every
+	 * caller keeps it locked until the page's first record.  A zero page below
+	 * this length that ConditionalLockBuffer() gets is therefore abandoned.
+	 */
+	LockRelationForExtension(index, ExclusiveLock);
+	nblocks = RelationGetNumberOfBlocks(index);
+	UnlockRelationForExtension(index, ExclusiveLock);
+	if (nblocks <= 1)
+		return 0;
+
+	ctx = AllocSetContextCreate(CurrentMemoryContext, "weave reclaim",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(ctx);
+	reach = weave_reach_map(index, &meta, nblocks, &complete);
+	MemoryContextSwitchTo(old);
+	if (!complete)
+	{
+		/* an unfollowed chain is live pages this pass would call leaked */
+		ereport(LOG,
+				(errmsg("pg_weave: index \"%s\": stranded-page reclaim skipped, the reachability walk could not follow every chain",
+						RelationGetRelationName(index)),
+				 errhint("Run weave_check('%s', true) to see which invariant fails.",
+						 RelationGetRelationName(index))));
+		MemoryContextDelete(ctx);
+		return 0;
+	}
+
+	for (blk = 1; blk < nblocks; blk++)
+	{
+		Buffer		buf;
+		Page		page;
+
+		if (reach[blk] != 0)
+			continue;
+#if PG_VERSION_NUM >= 180000
+		vacuum_delay_point(false);
+#else
+		vacuum_delay_point();
+#endif
+		/* already offered by the FSM: the allocator decides (weave_page_is_live) */
+		if (GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2)
+			continue;
+
+		buf = ReadBuffer(index, blk);
+		if (!ConditionalLockBuffer(buf))
+		{
+			/* someone is writing it right now, so it is not stranded */
+			ncontended++;
+			ReleaseBuffer(buf);
+			continue;
+		}
+		page = BufferGetPage(buf);
+		if (PageIsNew(page) ||
+			(PageGetSpecialSize(page) == MAXALIGN(sizeof(WeavePageOpaqueData)) &&
+			 WeavePageIsFreed(page)))
+		{
+			UnlockReleaseBuffer(buf);
+			RecordFreeIndexPage(index, blk);
+			nrecorded++;
+			continue;
+		}
+		if (PageGetLSN(page) > fence)
+		{
+			UnlockReleaseBuffer(buf);
+			nnewer++;
+			continue;
+		}
+		if (PageGetSpecialSize(page) != MAXALIGN(sizeof(WeavePageOpaqueData)) ||
+			WeavePageGetKind(page) == WEAVE_PK_UNKNOWN)
+		{
+			/* not a page this AM wrote; weave_check reports it, nothing frees it */
+			UnlockReleaseBuffer(buf);
+			continue;
+		}
+		weave_free_page_locked(index, buf);
+		nfreed++;
+	}
+	MemoryContextDelete(ctx);
+
+	if (nfreed > 0 || nrecorded > 0)
+		IndexFreeSpaceMapVacuum(index);
+
+	ereport(nfreed > 0 ? Max(elevel, LOG) : elevel,
+			(errmsg("pg_weave: index \"%s\": reclaimed %lld stranded page(s), re-recorded %lld free page(s); %lld unreachable page(s) newer than the fence, %lld busy",
+					RelationGetRelationName(index), (long long) nfreed,
+					(long long) nrecorded, (long long) nnewer,
+					(long long) ncontended)));
+	return nfreed;
+}
+
+/*
+ * The caller's half of weave_reclaim_unreachable()'s contract, steps 1 and 2:
+ * the fence BEFORE the barrier, and neither under the maintenance mutex.
+ */
+static XLogRecPtr
+weave_reclaim_prepare(Relation index)
+{
+	XLogRecPtr	fence = GetXLogInsertRecPtr();
+
+	weave_segwrite_barrier(index);
+	return fence;
 }
 
 PG_FUNCTION_INFO_V1(weave_merge);
@@ -1348,6 +1517,7 @@ weave_vacuum(PG_FUNCTION_ARGS)
 	Oid			indexoid = PG_GETARG_OID(0);
 	Relation	index;
 	bool		done;
+	XLogRecPtr	fence;
 
 	weave_maintenance_guard(indexoid, "weave_vacuum");
 	index = index_open(indexoid, AccessExclusiveLock);
@@ -1359,10 +1529,13 @@ weave_vacuum(PG_FUNCTION_ARGS)
 	/* AccessExclusiveLock on the index blocks scans/inserts on it, but NOT
 	 * autovacuum's cleanup (which locks the table) -- so still take the
 	 * maintenance mutex.  Blocking. */
+	fence = weave_reclaim_prepare(index);
 	weave_maintenance_lock(index);
 	PG_TRY();
 	{
-		done = weave_flush_pending(index);
+		done = weave_reclaim_unreachable(index, fence, DEBUG1) > 0;
+		if (weave_flush_pending(index))
+			done = true;
 		if (weave_vacuum_compact(index))
 			done = true;
 	}

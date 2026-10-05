@@ -1230,6 +1230,58 @@ weave_assert_merge_serialized(Relation index)
 		elog(ERROR, "pg_weave: merge entered without the maintenance mutex on index \"%s\"",
 			 RelationGetRelationName(index));
 }
+/*
+ * The SEGMENT-WRITE LOCK (doc/specs/SEGMENT_FORMAT.md sect. 10, "Pages a crash
+ * strands between write and link"; doc/GAPS.md G75).
+ *
+ * A heavyweight page lock on a block number no page has, used for nothing else.
+ * Every writer that builds a whole bolt WITHOUT the maintenance mutex -- the
+ * oversized INSERT, a build -- holds it in ShareLock from before its first page
+ * allocation until after its publish record.  Share mode, so such writers do
+ * not serialize against each other.  VACUUM's reclaim takes it in ExclusiveLock
+ * and releases it at once (weave_segwrite_barrier), which waits out every writer
+ * that was already between its first page and its publish: those are the only
+ * writers whose unpublished pages could look leaked to a reclaim that does not
+ * hold them off with the mutex.
+ *
+ * LOCK ORDER: segment-write lock, then maintenance mutex.  A holder may take the
+ * mutex (a full directory merges inside weave_add_segment_with_room()); the
+ * barrier is taken only while the mutex is NOT held.  So the two never wait on
+ * each other in the opposite order.
+ */
+#define WEAVE_SEGWRITE_LOCKBLK	InvalidBlockNumber
+
+static inline void
+weave_segwrite_lock(Relation index)
+{
+	LockPage(index, WEAVE_SEGWRITE_LOCKBLK, ShareLock);
+}
+
+static inline void
+weave_segwrite_unlock(Relation index)
+{
+	UnlockPage(index, WEAVE_SEGWRITE_LOCKBLK, ShareLock);
+}
+
+static inline void
+weave_segwrite_barrier(Relation index)
+{
+	LockPage(index, WEAVE_SEGWRITE_LOCKBLK, ExclusiveLock);
+	UnlockPage(index, WEAVE_SEGWRITE_LOCKBLK, ExclusiveLock);
+}
+
+/* Reachability map shared by weave_check() and the VACUUM reclaim
+ * (src/am/amcheck.c says why it must be one walk). */
+extern uint8 *weave_reach_map(Relation index, const WeaveMetaPageData *meta,
+							  BlockNumber nblocks, bool *complete);
+/* The reclaim itself (src/am/amvacuum.c): returns the pages freed */
+extern int64 weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel);
+/* Allocation for a page linked IN THE SAME RECORD that writes it (the pending
+ * append): exempt from the segment-write-lock check in weave_new_buffer() */
+extern Buffer weave_new_buffer_linked(Relation index);
+/* Free a page whose buffer the caller holds exclusively locked */
+extern void weave_free_page_locked(Relation index, Buffer buf);
+
 /* --- doclen sidecar: the on-page block header (written by ambuild.c,
  * read by am.c's cursor) -------------------------------------------------- */
 /* One doclen-sidecar block header: count docs, first docid for binary locate,
