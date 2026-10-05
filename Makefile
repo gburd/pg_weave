@@ -37,6 +37,7 @@ OBJS = \
 	src/am/amcheck.o \
 	src/pages/trgm_page.o \
 	src/pages/docvals_page.o \
+	src/pages/doclist_page.o \
 	src/util/migrate.o \
 	src/query/trgm.o \
 	src/query/cgram.o \

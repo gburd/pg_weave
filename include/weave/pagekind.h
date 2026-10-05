@@ -313,6 +313,25 @@ typedef enum WeavePageKind
 	 */
 	WEAVE_PK_PENDING_V11 = 34,	/* pending page in the v11 item layout */
 
+	/*
+	 * v12 (doc/GAPS.md G77/G78/G80/G81): the per-bolt DOCUMENT LIST, one image
+	 * (include/weave/doclist.h) on a nextblk chain of these pages, rooted by the
+	 * bolt's WEAVE_WK_DOCLIST descriptor.  doc/specs/SEGMENT_FORMAT.md sect. 6.
+	 */
+	WEAVE_PK_DOCLIST = 35,
+
+	/*
+	 * v12: a pending page in the v11 item layout on which an item with
+	 * doclen == 0 is a NULL DOCUMENT (a row whose lexical column was NULL, now
+	 * indexed for its docvalue and vector, G77).  A NEW KIND although the layout
+	 * did not move, for the refusal reason the v9..v11 kinds exist: a v11 .so
+	 * would hand a zero-length document to weave_doc_is_valid() and WARN-and-
+	 * skip it, and the kind is also how a flush knows its items came from a
+	 * build that writes NULL documents down (the doclist COMPLETE flag).
+	 * WEAVE_PK_PENDING_V11 joins the read-only legacy kinds.
+	 */
+	WEAVE_PK_PENDING_V12 = 36,
+
 	WEAVE_PK_NKINDS				/* first unassigned id; not a kind */
 } WeavePageKind;
 

@@ -855,121 +855,14 @@ weave_vacuum_compact(Relation index)
 }
 
 /*
- * Collect the distinct docids present in a segment into a sparsemap (the
- * segment's docid "universe").  Used by bulkdelete to enumerate the TIDs the
- * vacuum callback must be asked about.
+ * The documents bulkdelete asks the vacuum callback about come from
+ * weave_segment_docset() (src/pages/doclist_page.c): the bolt's v12 document
+ * list, or for a pre-v12 bolt the union of its postings, docvalues docids and
+ * warp docids.  It used to be postings alone (weave_segment_docids(), now
+ * weave_segment_posting_docids() in am.c), so a document with no posting -- a
+ * zero-term wdoc -- was never asked about, never tombstoned, and a new row on
+ * its recycled ctid inherited its docvalue and vector lane (doc/GAPS.md G80).
  */
-static sm_t *
-weave_segment_docids(Relation index, const WeaveSegMeta *seg)
-{
-	sm_t	   *seen = sm_create(256);
-	sm_t *volatile seen_v;
-	BlockNumber blk = seg->dictstart;
-	uint64	   *ids = NULL;
-	int			nids = 0;
-	int			capids = 0;
-
-	if (seen == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of memory building weave tombstone map")));
-
-	/* seen is a libc-malloc sparsemap: free it if the page reads / bulk add
-	 * below throw, else it would leak past transaction abort.  volatile: the
-	 * pointer is rewritten inside PG_TRY (sm_add_many_grow may realloc) and read
-	 * in PG_FINALLY. */
-	seen_v = seen;
-	PG_TRY();
-	{
-	/*
-	 * Collect EVERY posting's docid across all terms into one array, then do a
-	 * SINGLE bulk add.  A high-vocabulary segment has millions of low-frequency
-	 * (often single-doc) terms; adding each term's postings with its own
-	 * sm_add_many_grow call restarts the sparsemap cursor per call, so the adds
-	 * are effectively unsorted and each re-walks the chunk chain -> O(N^2) (the
-	 * CIC-validate / VACUUM spin observed at scale).  One bulk add over the full
-	 * array sorts once and threads the cursor across the whole ascending run =
-	 * true O(N).
-	 */
-	while (blk != InvalidBlockNumber)
-	{
-		Buffer		buffer = ReadBuffer(index, blk);
-		Page		page;
-		char	   *ptr,
-				   *end;
-		BlockNumber next;
-
-		LockBuffer(buffer, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buffer);
-		ptr = (char *) PageGetContents(page);
-		end = weave_page_entry_end(page);
-		next = WeavePageGetOpaque(page)->nextblk;
-		while (ptr < end)
-		{
-			WeaveDictEntry *de = (WeaveDictEntry *) ptr;
-			Size		esize;
-			WeavePosting *post;
-			int			np,
-						k;
-
-			/*
-			 * This walk runs on EVERY vacuum and every CIC validate.  Unguarded,
-			 * a garbage termlen oversteps the page AND a garbage de->df is handed
-			 * to weave_decode_term below.  Because the failure is inside the
-			 * vacuum path it does not merely produce a wrong answer: it makes the
-			 * index permanently unvacuumable, which is how the same defect
-			 * presented upstream.  See doc/GAPS.md G15.
-			 */
-			if (!weave_dict_entry_fits(de, end))
-				break;
-			esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
-
-			np = weave_decode_term(index, de->firstposting, de->firstoffset,
-								  de->df, &post, NULL, false, NULL, true,
-								  seg->doclenstart == InvalidBlockNumber);
-			if (np > 0)
-			{
-				if (nids + np > capids)
-				{
-					capids = Max(nids + np, capids ? capids * 2 : 4096);
-					ids = ids ? WEAVE_REALLOC_MAYBE_HUGE(ids, (Size) capids * sizeof(uint64))
-						: (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) capids * sizeof(uint64));
-				}
-				for (k = 0; k < np; k++)
-					ids[nids++] = weave_tid_to_docid(&post[k].tid);
-			}
-			pfree(post);
-			ptr += esize;
-		}
-		UnlockReleaseBuffer(buffer);
-		blk = next;
-	}
-
-	if (nids > 0 && !sm_add_many_grow(&seen, ids, nids))
-	{
-		/* sm_add_many_grow updates *map even on a partial grow-then-fail, so the
-		 * live pointer is `seen`, not the pre-call value; resync BEFORE the throw
-		 * so PG_FINALLY frees the current (not a freed-by-realloc) map. */
-		seen_v = seen;
-		ereport(ERROR,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of memory building weave livedocs set")));
-	}
-	seen_v = seen;			/* sm_add_many_grow may realloc: resync cleanup ptr */
-	if (ids)
-		pfree(ids);
-	seen_v = NULL;			/* success: ownership passes to the caller, do not free */
-	}
-	PG_FINALLY();
-	{
-		/* runs on error only (seen_v NULLed on the success path above); frees the
-		 * libc-malloc map before FINALLY re-throws */
-		if (seen_v)
-			sm_free((sm_t *) seen_v);
-	}
-	PG_END_TRY();
-	return seen;
-}
 
 /*
  * weave_bulkdelete: VACUUM asks us, via `callback`, which of the TIDs in the
@@ -995,7 +888,6 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * ereport(ERROR) between create and sm_free would leak past transaction
 	 * abort.  Track the live maps here so PG_FINALLY frees them on error too.
 	 * volatile: pointers are written inside PG_TRY, read in PG_FINALLY. */
-	sm_t *volatile seen_v = NULL;
 	sm_t *volatile dead_v = NULL;
 
 	if (stats == NULL)
@@ -1041,19 +933,19 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	for (s = 0; s < meta.nsegments; s++)
 	{
 		WeaveSegMeta *sg = &meta.segs[s];
-		sm_t	   *seen;
+		WeaveDocset ds;
 		sm_t	   *dead;
-		sm_cursor_t cur = SM_CURSOR_INIT;
+		Size		di;
 		uint64		v;
 		uint32		ndead = 0;
+		uint32		ndeadnull = 0;	/* tombstoned NULL documents: not corpus N */
 		BlockNumber oldlivedocs;
 		uint32		oldlen;
 
 		if (sg->dictstart == InvalidBlockNumber)
 			continue;
 
-		seen = weave_segment_docids(index, sg);
-		seen_v = seen;
+		weave_segment_docset(index, sg, &ds);
 		dead = sm_create(256);
 		dead_v = dead;
 		if (dead == NULL)
@@ -1089,6 +981,8 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 						: WEAVE_ALLOC_MAYBE_HUGE((Size) carrycap * sizeof(uint64));
 				}
 				carry[ncarry++] = dv;
+				if (ds.nnull > 0 && weave_docids_contains(ds.nullids, ds.nnull, dv))
+					ndeadnull++;
 			}
 			/* bulk O(N) add; one-at-a-time sm_add_grow is O(N^2) at scale */
 			if (ncarry > 0 && !sm_add_many_grow(&dead, carry, ncarry))
@@ -1107,7 +1001,7 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 		/* ask the callback about each live (not-yet-tombstoned) docid.  Collect
 		 * the newly-dead docids and bulk-add them to `dead` once at the end:
-		 * each docid in `seen` is visited exactly once, so the in-loop
+		 * each docid in the docset is visited exactly once, so the in-loop
 		 * sm_contains() check only needs to see the carried-forward tombstones,
 		 * and adding one at a time with sm_add_grow would be O(N^2). */
 		{
@@ -1127,11 +1021,11 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			 * reason (see bench/RESULTS_P0_MERGE_TOMBSTONE.md).  Unlike the merge,
 			 * this one is merely slow: the answer was always right.
 			 */
-			for (v = sm_next_member(seen, (uint64_t) -1, &cur);
-				 v != SM_IDX_MAX;
-				 v = sm_next_member(seen, v, &cur))
+			for (di = 0; di < ds.n; di++)
 			{
 				ItemPointerData tid;
+
+				v = ds.ids[di];
 
 				num_index_tuples++;
 				if (sm_contains(dead, v, &ccur))
@@ -1148,6 +1042,9 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 					}
 					newdead[nnew++] = v;
 					tuples_removed++;
+					if (ds.nnull > 0 &&
+						weave_docids_contains(ds.nullids, ds.nnull, v))
+						ndeadnull++;
 				}
 			}
 			if (nnew > 0 && !sm_add_many_grow(&dead, newdead, nnew))
@@ -1162,8 +1059,7 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			if (newdead)
 				pfree(newdead);
 		}
-		sm_free(seen);
-		seen_v = NULL;
+		weave_docset_free(&ds);
 
 		oldlivedocs = sg->livedocs;
 		oldlen = sg->livedocslen;
@@ -1201,7 +1097,16 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 					m->segs[s].livedocs = newblk;
 					m->segs[s].livedocslen = newlen;
-					m->segs[s].ndeleted = ndead;
+					/*
+					 * ndeleted is the tombstoned share of the bolt's CORPUS
+					 * documents, so ndocs - ndeleted stays BM25's N: a NULL
+					 * document never counted in ndocs (doc/specs/
+					 * SEGMENT_FORMAT.md sect. 6 "The document list"), so its
+					 * tombstone must not be subtracted from it either.  The
+					 * livedocs blob still carries it -- that is what keeps a
+					 * recycled ctid from inheriting its docvalue and lane.
+					 */
+					m->segs[s].ndeleted = ndead - ndeadnull;
 					m->generation++;	/* livedocs blob pages freed: invalidate scan snapshots */
 
 					/*
@@ -1234,8 +1139,6 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	}
 	PG_FINALLY();
 	{
-		if (seen_v)
-			sm_free((sm_t *) seen_v);
 		if (dead_v)
 			sm_free((sm_t *) dead_v);
 		weave_maintenance_unlock(index);

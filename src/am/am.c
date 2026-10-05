@@ -50,6 +50,7 @@
 #include "weave/am.h"
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
 #include "weave/vector.h"			/* V7: the vector weft's writer, reader and free path */
+#include "weave/doclist.h"			/* v12: weave_doclist_sort_uniq */
 #include <math.h>
 #include "access/genam.h"
 #include "access/generic_xlog.h"
@@ -1468,7 +1469,11 @@ weave_page_kind_name(WeavePageKind kind)
 		case WEAVE_PK_PENDING_V10:
 			return "pending_v10";
 		case WEAVE_PK_PENDING_V11:
+			return "pending_v11";
+		case WEAVE_PK_PENDING_V12:
 			return "pending";
+		case WEAVE_PK_DOCLIST:
+			return "doclist";
 		case WEAVE_PK_TRGM:
 			return "trigram_dir";
 		case WEAVE_PK_TRGM_DATA:
@@ -3941,6 +3946,89 @@ weave_free_segment(Relation index, const WeaveSegMeta *seg)
 		}
 		weave_free_chain(index, seg->chandesc);	/* v6 weft descriptor page */
 	}
+}
+
+/*
+ * Every distinct posting docid of a bolt, ascending, into a palloc'd array.
+ *
+ * The pre-v12 "documents of this bolt" -- moved here from amvacuum.c's
+ * weave_segment_docids() when the v12 document list made it ONE input of the
+ * legacy docset (weave_segment_docset()) rather than the whole answer.  One
+ * bulk array and one sort, for the O(N) reason that function gave: a
+ * per-term add restarts the sparsemap cursor and is O(N^2) on a
+ * high-vocabulary bolt.  The array is folded (sort_uniq) whenever it passes
+ * twice the bolt's ndocs, so peak memory is O(ndocs) and not O(Sum df) -- the
+ * weave_universe_bounded() fold, for the same multi-gigabyte reason.
+ */
+void
+weave_segment_posting_docids(Relation index, const WeaveSegMeta *seg,
+							 uint64 **out, Size *nout)
+{
+	BlockNumber blk = seg->dictstart;
+	uint64	   *ids = NULL;
+	Size		nids = 0;
+	Size		capids = 0;
+	Size		fold_at;
+
+	{
+		double		f = seg->ndocs * 2.0 + 4096.0;
+
+		fold_at = (f > 1e12) ? (Size) 1e12 : (Size) f;
+	}
+
+	while (blk != InvalidBlockNumber)
+	{
+		Buffer		buffer = ReadBuffer(index, blk);
+		Page		page;
+		char	   *ptr,
+				   *end;
+		BlockNumber next;
+
+		CHECK_FOR_INTERRUPTS();
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buffer);
+		ptr = (char *) PageGetContents(page);
+		end = weave_page_entry_end(page);
+		next = WeavePageGetOpaque(page)->nextblk;
+		while (ptr < end)
+		{
+			WeaveDictEntry *de = (WeaveDictEntry *) ptr;
+			Size		esize;
+			WeavePosting *post;
+			int			np,
+						k;
+
+			/* G15: a garbage termlen/df on this path makes VACUUM fail forever */
+			if (!weave_dict_entry_fits(de, end))
+				break;
+			esize = MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+			np = weave_decode_term(index, de->firstposting, de->firstoffset,
+								   de->df, &post, NULL, false, NULL, true,
+								   seg->doclenstart == InvalidBlockNumber);
+			if (np > 0)
+			{
+				if (nids + (Size) np > capids)
+				{
+					if (nids >= fold_at)
+						nids = (Size) weave_doclist_sort_uniq(ids, nids);
+					if (nids + (Size) np > capids)
+					{
+						capids = Max(nids + (Size) np, capids ? capids * 2 : 4096);
+						ids = ids ? (uint64 *) WEAVE_REALLOC_MAYBE_HUGE(ids, capids * sizeof(uint64))
+							: (uint64 *) WEAVE_ALLOC_MAYBE_HUGE(capids * sizeof(uint64));
+					}
+				}
+				for (k = 0; k < np; k++)
+					ids[nids++] = weave_tid_to_docid(&post[k].tid);
+			}
+			pfree(post);
+			ptr += esize;
+		}
+		UnlockReleaseBuffer(buffer);
+		blk = next;
+	}
+	*out = ids;
+	*nout = (Size) weave_doclist_sort_uniq(ids, nids);
 }
 
 static void

@@ -64,6 +64,9 @@ typedef enum WeaveWeftKind
 	WEAVE_WK_FUZZY = 3,			/* reserved (Z): root = WEAVE_SURF page */
 	WEAVE_WK_DOCVALS = 4,		/* reserved: root = WEAVE_DOCVALS page */
 	WEAVE_WK_CGRAM = 5,			/* reserved: root = WEAVE_CGRAM page */
+	WEAVE_WK_DOCLIST = 6,		/* v12: root = WEAVE_PK_DOCLIST chain, the bolt's
+								 * document list (include/weave/doclist.h); attnum
+								 * 0 -- it is not tied to an index attribute */
 	WEAVE_WK_NKINDS				/* first unassigned id; not a kind */
 } WeaveWeftKind;
 

@@ -35,7 +35,18 @@
 #include "weave/weave.h"
 
 #define WEAVE_MAGIC			0x42324635	/* "B2F5" */
-#define WEAVE_VERSION		11		/* v11: a PENDING page carries each inserted
+#define WEAVE_VERSION		12		/* v12: every bolt carries a DOCUMENT LIST
+										 * weft (WEAVE_WK_DOCLIST, include/weave/
+										 * doclist.h): every docid it holds, posting
+										 * or not, and which are NULL documents --
+										 * rows whose lexical column is NULL are now
+										 * indexed (doc/GAPS.md G77/G78/G80/G81).
+										 * Pending pages are WEAVE_PK_PENDING_V12.
+										 * Bumped for the v7 reason: a v11 .so does
+										 * not know weft kind 6, so it would refuse
+										 * every v12 descriptor page (WEAVE_CD_KIND)
+										 * and could free none of the bolt's wefts.
+										 * v11: a PENDING page carries each inserted
 										 * row's int8 docvalues value as well, on a
 										 * WEAVE_PK_PENDING_V11 page whose item
 										 * layout differs from v10's (docvals
@@ -132,6 +143,8 @@
 #define WEAVE_VERSION_PENDING_DV 11	/* first version whose pending items carry the
 										 * row's int8 docvalues value, so a scalar
 										 * gate sees un-flushed INSERTs (G52) */
+#define WEAVE_VERSION_DOCLIST	12	/* first version writing the per-bolt document
+										 * list and indexing NULL-document rows */
 
 /*
  * Set in WeaveDoclenBlockHdr.count to mark a sidecar block whose docid column is
@@ -222,7 +235,8 @@ weave_page_is_live_pending(Page page)
 	if (PageIsNew(page) || WeavePageIsFreed(page))
 		return false;
 	k = WeavePageGetKind(page);
-	return k == WEAVE_PK_PENDING_V11 || k == WEAVE_PK_PENDING_V10 ||
+	return k == WEAVE_PK_PENDING_V12 || k == WEAVE_PK_PENDING_V11 ||
+		k == WEAVE_PK_PENDING_V10 ||
 		k == WEAVE_PK_PENDING_V9 || k == WEAVE_PK_PENDING;
 }
 
@@ -1855,6 +1869,45 @@ extern BlockNumber weave_docvals_write_weft(Relation index,
 extern BlockNumber weave_docvals_root_for_segment(Relation index,
 												  const WeaveSegMeta *seg,
 												  AttrNumber *attnum);
+
+/* ---------------------------------------------------------------------------
+ * The v12 per-bolt DOCUMENT LIST (src/pages/doclist_page.c, include/weave/
+ * doclist.h; doc/specs/SEGMENT_FORMAT.md sect. 6 "The document list").
+ *
+ * A WeaveDocset is the answer to "which documents does this bolt hold": two
+ * ascending palloc'd docid arrays.  `has_list` says it came from a v12 list;
+ * otherwise it is the legacy union (postings U docvalues U warp) and nullids is
+ * empty.  `complete` is the list's COMPLETE flag (G76 keys off it).
+ * ------------------------------------------------------------------------- */
+typedef struct WeaveDocset
+{
+	uint64	   *ids;			/* every docid the bolt holds, ascending */
+	Size		n;
+	uint64	   *nullids;		/* the NULL-document subset, ascending */
+	Size		nnull;
+	bool		has_list;
+	bool		complete;
+} WeaveDocset;
+
+/* Write a list (n >= 1, both arrays strictly ascending, nul a subset of all);
+ * returns its root for weave_attach_chandesc(), or Invalid when n == 0. */
+extern BlockNumber weave_doclist_write(Relation index, const uint64 *all, Size n,
+									   const uint64 *nul, Size nnull,
+									   bool complete);
+/* The bolt's WEAVE_WK_DOCLIST root, or Invalid (pre-v12 bolt).  Non-throwing. */
+extern BlockNumber weave_doclist_root(Relation index, const WeaveSegMeta *seg);
+/* Read + validate; false with *detail on any problem, never throws. */
+extern bool weave_doclist_read(Relation index, BlockNumber root, WeaveDocset *ds,
+							   const char **detail);
+/* The bolt's docset (list, or the legacy union); ERROR on a corrupt list. */
+extern void weave_segment_docset(Relation index, const WeaveSegMeta *seg,
+								 WeaveDocset *ds);
+extern void weave_docset_free(WeaveDocset *ds);
+extern bool weave_docids_contains(const uint64 *v, Size n, uint64 x);
+/* Every distinct posting docid of a bolt, ascending, palloc'd (am.c).  The
+ * pre-v12 enumeration, kept for the legacy docset and weave_check(). */
+extern void weave_segment_posting_docids(Relation index, const WeaveSegMeta *seg,
+										 uint64 **out, Size *nout);
 
 /*
  * The one posting decoder.  Every channel reads a term's postings through this:
