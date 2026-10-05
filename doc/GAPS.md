@@ -5128,3 +5128,30 @@ tombstones. A docvalues restriction answered correctly too.
 `weave_vec_topk_run()` already accepts is the natural carrier), leaving `weave_vec_scan()`
 as the raw diagnostic it is documented to be. Then pin it with this reproducer plus a
 fused variant and a padding variant.
+
+### G80 — VACUUM cannot tombstone a ZERO-TERM document, so its docvalue and vector lane outlive the row and a NEW row on the recycled ctid inherits them — **FOUND 2026-10-05 while designing G77's fix; a SILENT WRONG ANSWER; OPEN; same root cause as G78**
+
+`weave_bulkdelete()` asks the vacuum callback about every docid in
+`weave_segment_docids()`, and that set is built **from posting lists**. A document whose
+`wdoc` has no terms (`to_wdoc('')`, or text that analyzes to nothing) has no posting, so it
+is never asked about and never tombstoned. Its docvalue and its vector lane stay live.
+
+Reproducer (local, 2026-10-05):
+```sql
+CREATE TABLE g80 (id int, body wdoc, price int8) WITH (autovacuum_enabled = off);
+INSERT INTO g80 VALUES (1, to_wdoc('alpha'), 100), (2, to_wdoc(''), 1), (3, to_wdoc('gamma'), 300);
+CREATE INDEX g80_w ON g80 USING weave (body, price int8_docval_ops);
+DELETE FROM g80 WHERE id = 2;  VACUUM g80;   -- ndocs stays 3: nothing was tombstoned
+INSERT INTO g80 VALUES (4, to_wdoc('delta'), 1000);   -- reuses (0,2)
+SELECT id, price FROM g80 WHERE price < 6;   -- index: {4:1000}; heap: {}
+```
+A row with `price = 1000` satisfies `price < 6` because it inherited the deleted row's
+docvalue. The control, the same script with row 2 = `to_wdoc('beta')`, answers `{}`.
+
+**One root cause with G78**: the index has no enumeration of the documents it holds other
+than its postings. G78 is the NOT universe and G80 is VACUUM's universe. G77's fix (index a
+NULL-document row with a docid, a docvalue and a lane but no postings) would add a third
+population of posting-less documents and make both worse, so the three are fixed together:
+a per-segment **document list** (every docid the segment holds, posting or not), written by
+build, flush and merge, and used by bulkdelete, the NOT universe and the padding's
+completeness argument.
