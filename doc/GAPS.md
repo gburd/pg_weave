@@ -5025,7 +5025,7 @@ the next VACUUM (an unreachable, unfreed page whose LSN is older than the last
 directory change is a leak by construction), or write the bolt's pages under a
 "pending bolt" record that the publish supersedes. Harmless to answers either way.
 
-### G76 — a gated ORDER BY whose gate admits fewer rows than LIMIT walks the WHOLE HEAP in the padding phase: correct, O(heap), invisible to every counter — **FOUND 2026-10-04 by the v17 agent (`pgweave-20261004-231619`, scifact); FIXED 2026-10-05 for every lexical gate without a NOT (merge of `wt/g76`); docvalues-only and NOT gates still walk the heap, by design, until G77 and G78 are fixed**
+### G76 — a gated ORDER BY whose gate admits fewer rows than LIMIT walks the WHOLE HEAP in the padding phase: correct, O(heap), invisible to every counter — **FOUND 2026-10-04 by the v17 agent (`pgweave-20261004-231619`, scifact); FIXED 2026-10-05 for every lexical gate without a NOT (merge of `wt/g76`), and for docvalues-only and NOT gates on a v12-complete index (merge of `wt/g76b`, after G77/G78); an index holding any pre-v12 bolt or pending page keeps the heap walk for those two until REINDEX**
 
 When `WHERE body @@@ q ORDER BY fuse(...) LIMIT k` has fewer than k qualifying rows, the
 ranked phase runs out and the G56/G71 padding phase begins (`weave_pad_begin()`),
@@ -5068,6 +5068,23 @@ by design; `fuse()` is the gated form.
 
 **Owed:** re-measure scifact's 5-row gate at LIMIT 10 (40 ms and 17k buffers before) with
 the v17 harness.
+
+**Widened 2026-10-05 (`wt/g76b`).** Once the v12 document list (G77/G78/G80) made the
+docvalues gate hold NULL-document rows and the NOT universe hold zero-term documents,
+both gates became complete, but only where every part of the index was written by v12.
+`weave_index_v12_complete()` checks exactly that: every live bolt's document list carries
+the COMPLETE flag and every pending page is `WEAVE_PK_PENDING_V12`. The padding consults
+it only when the cheap test says no, and logs its choice at DEBUG1 (`weave padding walks
+the gate set` / `the heap`), because no counter can see it and the answer is identical
+either way on most fixtures. Pinned by `sql/fuse_gate.sql` (5), which has four v12 arms
+(fused NOT, and fused, vector and lexical under `price < 25`) whose gates include a NULL
+document and a zero-term document, and by `t/019`, which asserts the CHOICE three times:
+heap while a manufactured v8 pending page exists, heap after the mixed flush (that bolt
+cannot vouch for rows an older binary skipped, so its list is not COMPLETE), and gate set
+on a freshly built index. Mutants, both BUILT: **M1** (predicate always false) flips the
+three asserted v12 arms' removed count; **M2** (always true) fails t/019's two heap
+assertions (`pgweave-20261005-121631-de53`). An index upgraded from before v12 keeps the
+heap walk for these two gates until REINDEX, which is the safe direction.
 
 ### G77 — a docvalues restriction answered by the index silently DROPS every row whose lexical column is NULL — **FOUND 2026-10-04 while scoping G76; a SILENT WRONG ANSWER on any nullable `wdoc` column with a docvalues key; FIXED 2026-10-05 on `wt/doclist` (option 1, format v12) for every index built or REINDEXed by v12**
 
