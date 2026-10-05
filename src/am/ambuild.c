@@ -51,6 +51,7 @@
 
 #include "weave/weave.h"
 #include "weave/am.h"
+#include "weave/doclist.h"
 #include "weave/docvals.h"			/* Docvals: the int8 scalar store the docvalues gate evaluates */
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
 #include "weave/vector.h"			/* V7: producer 1, the vector weft accumulator */
@@ -275,7 +276,87 @@ typedef struct WeaveBuildState
 								 * pending items on the flush, and from the
 								 * inputs' wefts on a merge
 								 * (weave_docvals_merge_append). */
+
+	/*
+	 * v12: THE DOCUMENT LIST of the bolt this state will write (doc/specs/
+	 * SEGMENT_FORMAT.md sect. 6 "The document list"; doc/GAPS.md G77/G78/G80).
+	 * Every docid this state indexed, posting or not, and the subset that are
+	 * NULL documents.  Unsorted while accumulating (a heap scan is not in docid
+	 * order -- t/017 -- and a merge appends per input); sorted and deduped once
+	 * at write time.  In bs->ctx, so the build budget counts it (8 bytes per
+	 * document) and the flush's MemoryContextReset frees it.
+	 *
+	 * dl_complete: may this bolt's list claim COMPLETE?  True on the build and
+	 * oversized-insert paths; on a flush, false if any item is a pre-v12 layout
+	 * (its NULL-document rows were never written down); on a merge, the AND of
+	 * the inputs' flags.
+	 */
+	uint64	   *dl_all;
+	Size		dl_n;
+	Size		dl_cap;
+	uint64	   *dl_null;
+	Size		dl_nnull;
+	Size		dl_nullcap;
+	bool		dl_complete;
 } WeaveBuildState;
+
+/* Reset the document-list accumulator.  Its arrays live in bs->ctx, so after a
+ * MemoryContextReset(bs->ctx) the pointers dangle and this must run. */
+static inline void
+bs_doclist_init(WeaveBuildState *bs, bool complete)
+{
+	bs->dl_all = NULL;
+	bs->dl_n = 0;
+	bs->dl_cap = 0;
+	bs->dl_null = NULL;
+	bs->dl_nnull = 0;
+	bs->dl_nullcap = 0;
+	bs->dl_complete = complete;
+}
+
+/* corpus-scale, inside bs->ctx: huge-safe growth (make check-alloc) */
+static void
+bs_doclist_push(WeaveBuildState *bs, uint64 docid, bool isnulldoc)
+{
+	MemoryContext old = MemoryContextSwitchTo(bs->ctx);
+
+	if (bs->dl_n >= bs->dl_cap)
+	{
+		bs->dl_cap = bs->dl_cap ? bs->dl_cap * 2 : 1024;
+		bs->dl_all = bs->dl_all
+			? (uint64 *) WEAVE_REALLOC_MAYBE_HUGE(bs->dl_all, bs->dl_cap * sizeof(uint64))
+			: (uint64 *) WEAVE_ALLOC_MAYBE_HUGE(bs->dl_cap * sizeof(uint64));
+	}
+	bs->dl_all[bs->dl_n++] = docid;
+	if (isnulldoc)
+	{
+		if (bs->dl_nnull >= bs->dl_nullcap)
+		{
+			bs->dl_nullcap = bs->dl_nullcap ? bs->dl_nullcap * 2 : 64;
+			bs->dl_null = bs->dl_null
+				? (uint64 *) WEAVE_REALLOC_MAYBE_HUGE(bs->dl_null, bs->dl_nullcap * sizeof(uint64))
+				: (uint64 *) WEAVE_ALLOC_MAYBE_HUGE(bs->dl_nullcap * sizeof(uint64));
+		}
+		bs->dl_null[bs->dl_nnull++] = docid;
+	}
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Write this state's document list and return its root (Invalid when the state
+ * indexed no document).  Sorts + dedupes in place: a document appears once per
+ * input on the merge path only if two inputs claimed the same docid, which a
+ * correct directory never does, and deduping makes that harmless rather than a
+ * validator refusal of the whole bolt.
+ */
+static BlockNumber
+bs_doclist_write(Relation index, WeaveBuildState *bs)
+{
+	bs->dl_n = weave_doclist_sort_uniq(bs->dl_all, bs->dl_n);
+	bs->dl_nnull = weave_doclist_sort_uniq(bs->dl_null, bs->dl_nnull);
+	return weave_doclist_write(index, bs->dl_all, bs->dl_n,
+							   bs->dl_null, bs->dl_nnull, bs->dl_complete);
+}
 
 /*
  * Which values[] slot holds the wdoc.  Wraps weave_index_layout() so the seven
