@@ -5155,3 +5155,20 @@ population of posting-less documents and make both worse, so the three are fixed
 a per-segment **document list** (every docid the segment holds, posting or not), written by
 build, flush and merge, and used by bulkdelete, the NOT universe and the padding's
 completeness argument.
+
+### G81 — a segment whose documents have NO TERMS is not written: a build or a flush of only zero-term documents loses their docvalues and vectors — **FOUND 2026-10-05 by the doclist agent's investigation, confirmed locally; a SILENT WRONG ANSWER; OPEN; part of the G77/G78/G80 document-list work**
+
+`weave_build_flush_segment()` returns early when `bs->nterms == 0` (`src/am/ambuild.c`),
+and a segment whose `dictstart` is `InvalidBlockNumber` is the "consumed slot, skip it"
+sentinel in about 26 places. So a segment holding documents but no terms cannot exist.
+Reproducer (local, 2026-10-05):
+
+| shape | `WHERE price < 4`, index | heap |
+|---|---|---|
+| CREATE INDEX over 10 rows, every `body` = `to_wdoc('')` | `{}` | `{1,2,3}` |
+| 1 seeded row, then 9 such rows pending, then `VACUUM` (flush) | `{}` | `{2,3}` |
+
+The flushed index also fails `weave_check(deep)`. The vector ORDER BY over the first table
+returned `{1,2,3}`, so the vector lanes were either written or answered from elsewhere; this
+has not been traced. The fix belongs to the document-list design: a segment with documents
+must always be written, with an empty dictionary page, so `dictstart` is valid.
