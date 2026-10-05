@@ -117,7 +117,14 @@ for my $cyc (0 .. $cycles - 1)
 	$total_stranded += $leak;
 	push @strand, $strand;
 
-	$node->safe_psql('postgres', 'VACUUM c; VACUUM t');
+	# The allocator's outcomes for the post-crash VACUUM, read in ITS session
+	# (the counters are backend-local; am.c says why a zero elsewhere means
+	# nothing).  When the excess grows, these name the branch that extended.
+	my ($vrc, $vout, $verr) = $node->psql('postgres',
+		"SELECT weave_alloc_stats_reset();\nVACUUM c;\nSELECT 'alloc ' || weave_alloc_stats()::text;");
+	my ($alloc) = $vout =~ /(alloc .*)/;
+	note("cycle $cyc: post-crash VACUUM c " . ($alloc // "no alloc stats: $verr"));
+	$node->safe_psql('postgres', 'VACUUM t');
 	is(leaked('c_w'), '0', "cycle $cyc: after VACUUM no page is leaked (the crash stranded $leak, window seen: $inwindow)");
 	is($node->safe_psql('postgres', q{
 		SELECT coalesce(string_agg(invariant || ': ' || coalesce(detail, ''), '; '), '')
