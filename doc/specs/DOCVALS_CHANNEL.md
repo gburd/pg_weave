@@ -26,7 +26,7 @@ to **82.8× (fiqa) / 129.6× (scifact)** fewer vector blocks at 0.1 % selectivit
 
 This is what makes claim 3 general: "a selective `WHERE` makes a vector query faster" for
 `WHERE price < x`, not only for another lexical term (the weak, near-circular form the gate
-sweep measures today). `doc/PHASES.md` V17's last sentence names this gap.
+sweep measures today). `doc/PHASES.md` V20's (formerly V17's) last sentence names this gap.
 
 ## 2. What is already built, and what is new
 

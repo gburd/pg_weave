@@ -1,4 +1,6 @@
-# Result: when does scoring the qualifying set beat the gated fused scan? (V17, measurement only)
+# Result: when does scoring the qualifying set beat the gated fused scan? (V20, formerly V17; measurement only)
+
+> **Renumbered 2026-10-05:** this task was `doc/PHASES.md` V17, which duplicated the DONE V17 (kernel sweep). It is now **V20**. The file and script names keep `v17` so the recorded run artifacts still resolve.
 
 **`doc/PHASES.md` V17 ("switch plan strategy on predicate selectivity"), measured 2026-10-04.
 No production code changed. This is the evidence for or against building the switch.**
@@ -437,7 +439,7 @@ pulled artifacts and terminated the instance. The job's recorded exit status is 
 - **The local cliff split and the counter identity come from the workstation** and are
   counts, not times. The cliff's latency comes from EC2.
 
-## Proposal: renumber the duplicate ids (NOT applied)
+## Proposal: renumber the duplicate ids (APPLIED 2026-10-05: V16 → V19, V17 → V20)
 
 `doc/PHASES.md` has **two** duplicated task ids, not one. The zvec-review rows added on
 2026-09-21 reused numbers that were already DONE:

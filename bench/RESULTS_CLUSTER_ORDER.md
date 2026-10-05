@@ -59,7 +59,7 @@ does not move, because it needs a factor, not a percentage.
 ## The inversion: how tight the radius would have to be
 
 A block is prunable when `⟨q,c⟩ + ‖q‖·R ≤ θ`. With ‖q‖ = 1 (normalized corpus, inner
-product — pg_weave has no `metric='cosine'`, V16), the required radius is `θ − ⟨q,c⟩`:
+product — pg_weave has no `metric='cosine'`, V19, formerly V16), the required radius is `θ − ⟨q,c⟩`:
 
 | corpus | required R | best measured R | factor still needed |
 |---|---|---|---|

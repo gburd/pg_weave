@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # bench/aws/v17_job.sh -- the EC2 driver for bench/v17_crossover.sh (doc/PHASES.md
-# V17, measurement only).  Run as the `script` job, which has already built,
+# V20, formerly V17, measurement only).  Run as the `script` job, which has already built,
 # installed and smoke-tested the extension on this host:
 #
 #   SCRIPT=bench/aws/v17_job.sh bench/aws/run.sh c7i.4xlarge script

@@ -74,7 +74,7 @@ only one that generalizes claim 3 — the differentiator — from "another lexic
 "any scalar facet". This is an **architectural** change (new on-disk channel: page kind,
 writer at build/flush/merge, reader, `block_max` bound property test per hard rule 1, fuzz
 target, crash-recovery + concurrency TAP, upgrade path) and needs its own design + approval
-before implementation. `doc/PHASES.md` V17's last sentence already flags this gap.
+before implementation. `doc/PHASES.md` V20's (formerly V17's) last sentence already flags this gap.
 
 ## MEASURED WITH THE CHANNEL — 2026-09-26 (the channel is now built; docvals int8 slice)
 

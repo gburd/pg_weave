@@ -530,10 +530,10 @@ query is answered by the index** -- and it fixed a live wrong answer on the way 
 **G41**: `fuse()` had no score-recovery function for `<->`, `<#>` or `<@>`, so a raw DISTANCE
 entered the sum as a score and the FARTHEST vector ranked first; the defect was printed in a
 checked-in expected file and reviewed three times, because both arms were wrong in the same
-direction and every assertion compared the two arms). Also **V16**, **V17**, **V18** from a read-only review of Alibaba's zvec
-(ideas only, hard rule 6). V16 is the one that matters soonest: cosine is refused today for
+direction and every assertion compared the two arms). Also **V19**, **V20**, **V18** (V19 and V20 were numbered V16 and V17 until 2026-10-05, which duplicated two DONE ids) from a read-only review of Alibaba's zvec
+(ideas only, hard rule 6). V19 is the one that matters soonest: cosine is refused today for
 want of a stored maximum true norm, and pg_weave already stores a per-lane `(scale, norm)`
-pair, so cosine may be a **storage** decision rather than an unsupportable metric. V17 is
+pair, so cosine may be a **storage** decision rather than an unsupportable metric. V20 is
 **claim 3's missing mechanism** -- switch plan strategy on predicate selectivity -- and claim
 3 has been unmeasured since F4's withdrawal.
 

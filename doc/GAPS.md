@@ -2450,7 +2450,7 @@ normalization or calibration *before* the sum. Options, none measured:
   - a rank-based fused objective, which would keep RRF's scale-freeness but gives up the
     threshold algebra §2 is built on, since a rank is not known until the scan ends.
 The first is the only one that preserves the design. **It is also the one that makes
-V17's selectivity switch and claim 3 meaningful**, since neither matters if the ranking
+V20's (formerly V17's) selectivity switch and claim 3 meaningful**, since neither matters if the ranking
 is not competitive.
 
 **MEASURED 2026-09-22, same day: NORMALIZATION IS THE ANSWER, and it overturns the

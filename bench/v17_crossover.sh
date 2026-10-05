@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# v17_crossover.sh -- doc/PHASES.md V17 ("switch plan strategy on predicate
+# v17_crossover.sh -- doc/PHASES.md V20, formerly V17 ("switch plan strategy on predicate
 # selectivity"), MEASUREMENT ONLY: is there a selectivity below which scoring the
 # qualifying set exactly beats the gated fused scan?
 #
