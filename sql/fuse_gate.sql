@@ -313,25 +313,34 @@ DROP TABLE fg;
 -- ranked phase (~2,980 here before the padding starts), not the padding.  That is
 -- rank-then-filter by design; `fuse()` is the gated form, and is arm 1.
 --
--- The positive control is a fused NOT gate: a `!q` gate cannot be walked
--- (doc/GAPS.md G78: the NOT universe omits zero-term documents), so it keeps the
--- heap walk, and its removed count must stay large.  Without it, "removed is small"
--- could hold because the padding never ran.  Row 3004 is a zero-term document with
--- a vector, so walking the NOT gate would also LOSE a row: same_set goes false.  The
--- control is fused, not vector, because a vector ranked phase rejects ~2,980 rows by
--- itself (below), which would satisfy "removed is large" without any padding.
+-- WIDENED 2026-10-05 (format v12).  A NOT gate and a docvalues-only gate are walked
+-- too, on an index every bolt and pending page of which a v12 writer produced
+-- (weave_index_v12_complete()): the v12 document list makes the NOT universe hold
+-- zero-term documents (G78) and makes NULL-document rows carry their docvalue
+-- (G77), so both sets are now complete.  Before v12 they were not, and the padding
+-- kept the heap walk for them.  Two rows carry that argument: 3004 is a ZERO-TERM
+-- document (matches `!common`, has price 7) and 3001 a NULL DOCUMENT (matches no
+-- `@@@`, has price 5).  A walk of an incomplete set would LOSE them, and
+-- same_set_as_the_heap would go false.
+--
+-- "Removed is small" could hold because the padding never ran.  It does run here:
+-- every LIMIT is past its gate, and n_index counts the rows only the padding emits
+-- (NULL-vector rows 11..20, pending rows that no scored channel reaches).  The heap
+-- walk's own positive control is a pre-v12 index, which SQL cannot build; the
+-- mutation runs recorded under doc/GAPS.md G76 are that control.
 -- ---------------------------------------------------------------------------
-CREATE TABLE gp (id int, body wdoc, emb wvec(4)) WITH (autovacuum_enabled = off);
-INSERT INTO gp SELECT g, to_wdoc('simple', 'rare alpha w' || g), ('[' || g || ',1,1,1]')::wvec
+CREATE TABLE gp (id int, body wdoc, emb wvec(4), price bigint) WITH (autovacuum_enabled = off);
+INSERT INTO gp SELECT g, to_wdoc('simple', 'rare alpha w' || g), ('[' || g || ',1,1,1]')::wvec, g
   FROM generate_series(1, 10) g;
-INSERT INTO gp SELECT g, to_wdoc('simple', 'rare beta w' || g), NULL FROM generate_series(11, 20) g;
-INSERT INTO gp SELECT g, to_wdoc('simple', 'common w' || g), ('[' || g || ',1,1,1]')::wvec
+INSERT INTO gp SELECT g, to_wdoc('simple', 'rare beta w' || g), NULL, g FROM generate_series(11, 20) g;
+INSERT INTO gp SELECT g, to_wdoc('simple', 'common w' || g), ('[' || g || ',1,1,1]')::wvec, g
   FROM generate_series(21, 3000) g;
-INSERT INTO gp VALUES (3001, NULL, '[1,1,1,1]'), (3004, to_wdoc('simple', ''), '[3,1,1,1]');
-CREATE INDEX gp_w ON gp USING weave (body, emb);
+INSERT INTO gp VALUES (3001, NULL, '[1,1,1,1]', 5), (3004, to_wdoc('simple', ''), '[3,1,1,1]', 7);
+CREATE INDEX gp_w ON gp USING weave (body, emb, price int8_docval_ops);
 -- pending rows, a HOT update, a non-HOT update and a delete, all inside the gate
-INSERT INTO gp VALUES (3002, to_wdoc('simple', 'rare pend'), '[2,1,1,1]'),
-                      (3003, to_wdoc('simple', 'rare pendnull'), NULL);
+INSERT INTO gp VALUES (3002, to_wdoc('simple', 'rare pend'), '[2,1,1,1]', 3),
+                      (3003, to_wdoc('simple', 'rare pendnull'), NULL, 4),
+                      (3005, NULL, '[4,1,1,1]', 9);
 UPDATE gp SET emb = '[99,1,1,1]' WHERE id = 7;
 DELETE FROM gp WHERE id = 6;
 ANALYZE gp;
@@ -359,7 +368,10 @@ INSERT INTO gpq VALUES
   (3, 'vector', 'SELECT id FROM gp WHERE body @@@ ''rare'' ORDER BY emb <-> ''[0,1,1,1]'' LIMIT 100'),
   (4, 'lexical, other query', 'SELECT id FROM gp WHERE body @@@ ''rare'' ORDER BY body <=> ''alpha'' LIMIT 100'),
   (5, 'edit distance', 'SELECT id FROM gp WHERE body @@@ ''rare'' ORDER BY body <@> ''alpah'' LIMIT 100'),
-  (6, 'CONTROL: NOT gate, heap walk', 'SELECT id FROM gp WHERE body @@@ ''!common'' ORDER BY fuse(body <=> ''alpha'', emb <-> ''[0,1,1,1]'') LIMIT 100');
+  (6, 'fused NOT gate (v12)', 'SELECT id FROM gp WHERE body @@@ ''!common'' ORDER BY fuse(body <=> ''alpha'', emb <-> ''[0,1,1,1]'') LIMIT 100'),
+  (7, 'fused docvalues gate (v12)', 'SELECT id FROM gp WHERE price < 25 ORDER BY fuse(body <=> ''alpha'', emb <-> ''[0,1,1,1]'') LIMIT 100'),
+  (8, 'vector, docvalues gate (v12)', 'SELECT id FROM gp WHERE price < 25 ORDER BY emb <-> ''[0,1,1,1]'' LIMIT 100'),
+  (9, 'lexical, docvalues gate (v12)', 'SELECT id FROM gp WHERE price < 25 ORDER BY body <=> ''alpha'' LIMIT 100');
 
 SELECT q.name,
        (SELECT count(*) FROM pg_temp.fg_ids(q.q, 'index')) AS n_index,
@@ -367,9 +379,8 @@ SELECT q.name,
          = (SELECT array_agg(id ORDER BY id) FROM pg_temp.fg_ids(q.q, 'heap')) AS same_set_as_the_heap,
        (SELECT count(DISTINCT id) FROM pg_temp.fg_ids(q.q, 'index'))
          = (SELECT count(*) FROM pg_temp.fg_ids(q.q, 'index')) AS once,
-       CASE WHEN q.ord = 3 THEN NULL
-            WHEN q.ord < 6 THEN pg_temp.gp_removed(q.q) <= 25
-            ELSE pg_temp.gp_removed(q.q) > 2900 END AS removed_as_expected
+       CASE WHEN q.ord IN (3, 8) THEN NULL
+            ELSE pg_temp.gp_removed(q.q) <= 25 END AS removed_as_expected
   FROM gpq q ORDER BY q.ord;
 
 DROP TABLE gpq;
