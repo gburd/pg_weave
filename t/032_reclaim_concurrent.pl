@@ -218,8 +218,18 @@ for my $try (1 .. 8)
 	}
 	$w->quit;
 	$v->quit;
+	# What each side said: the VACUUM's reclaim line (DEBUG2, to its client) and
+	# any error the INSERT raised.  Without these a phase that is not hit cannot
+	# say whether the reclaim ran before the writer's publish or after it.
+	my ($vline) = ($v->{stderr} // '') =~ /(reclaimed \d+ stranded.*?ms)/;
+	my ($werr) = ($w->{stderr} // '') =~ /(ERROR:.*)/;
+	note("phase A try $try: VACUUM said: " . ($vline // '(no reclaim line)')
+		  . '; INSERT ' . (defined $werr ? "raised $werr" : 'raised nothing'));
 	my $log = substr(slurp_file($node->logfile), $logpos);
 	my $sawlog = $log =~ /still waiting for ExclusiveLock on page 4294967295 of relation/;
+	# every lock wait in this try, whatever it was on: a VACUUM that never
+	# reaches its reclaim while the INSERT is in flight is waiting on SOMETHING
+	note("phase A try $try: lock wait: $_") for ($log =~ /(process \d+ still waiting for [^\n]*)/g);
 	note("phase A try $try: waited=$waited log=" . ($sawlog ? 1 : 0) . " inflight=$inflight");
 	if ($waited && $sawlog && $inflight > 0)
 	{
