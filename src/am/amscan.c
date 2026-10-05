@@ -4887,6 +4887,8 @@ collect_retry:
 				/* A pending doc is raw page bytes; validate before the matcher
 				 * walks its offsets, so a torn/corrupt page cannot segfault a
 				 * SELECT.  A malformed doc is simply not matched (and flagged). */
+				if (rec.nulldoc)
+					continue;	/* v12 NULL document: matches no `@@@`, not even `!q` */
 				if (!weave_doc_is_valid(rec.doc, rec.doclen))
 					ereport(WARNING,
 							(errcode(ERRCODE_DATA_CORRUPTED),
@@ -8855,7 +8857,7 @@ edist_collect_pending(Relation index, const WeaveMetaPageData *meta,
 		{
 			int			d;
 
-			if (!weave_doc_is_valid(rec.doc, rec.doclen))
+			if (rec.nulldoc || !weave_doc_is_valid(rec.doc, rec.doclen))
 				continue;		/* weave_collect_matches warns about these */
 			d = weave_doc_min_edist(rec.doc, so->edistPat, so->edistPatLen);
 			if (d < 0)
@@ -9540,7 +9542,9 @@ weave_fuse_collect_pending(Relation index, const WeaveMetaPageData *meta,
 			int			t;
 			int			i;
 
-			if (!weave_doc_is_valid(rec.doc, rec.doclen))
+			/* a v12 NULL document is scored like a zero-term one: no lexical
+			 * contribution, its vector as usual (a bolt gives it a lane) */
+			if (!rec.nulldoc && !weave_doc_is_valid(rec.doc, rec.doclen))
 				continue;	/* weave_collect_matches warns about these */
 
 			for (qi = 0; qi < so->nfuse; qi++)
@@ -9549,8 +9553,9 @@ weave_fuse_collect_pending(Relation index, const WeaveMetaPageData *meta,
 				{
 					for (t = 0; t < kt[qi].nterms; t++)
 					{
-						WeaveTermEntry *e = weave_doc_lookup(rec.doc, kt[qi].terms[t],
-															 kt[qi].lens[t]);
+						WeaveTermEntry *e = rec.nulldoc ? NULL :
+							weave_doc_lookup(rec.doc, kt[qi].terms[t],
+											 kt[qi].lens[t]);
 						int			sl = kt[qi].off + t;
 
 						vals[sl] = e != NULL ? (double) e->tf : 0.0;
@@ -9632,7 +9637,8 @@ weave_fuse_collect_pending(Relation index, const WeaveMetaPageData *meta,
 			}
 			p->tid[p->n] = *rec.tid;
 			p->qdl[p->n] = (double)
-				weave_byte_to_doclen(weave_doclen_to_byte(rec.doc->doclen));
+				weave_byte_to_doclen(weave_doclen_to_byte(rec.nulldoc ? 0 :
+														  rec.doc->doclen));
 			memcpy(&p->val[(Size) p->n * Max(nslot, 1)], vals,
 				   Max(nslot, 1) * sizeof(double));
 			p->n++;
@@ -10870,7 +10876,7 @@ weave_pending_ranked(Relation index, WeaveQuery q, ScoredTid **out)
 				double		score = 0.0;
 				double		qdl;
 
-				if (!weave_doc_is_valid(rec.doc, rec.doclen))
+				if (rec.nulldoc || !weave_doc_is_valid(rec.doc, rec.doclen))
 					continue;	/* weave_collect_matches warns about these */
 				if (pass == 0)
 				{

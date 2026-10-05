@@ -809,13 +809,21 @@ typedef struct WeavePendingIter
 								 * the INDEX LAYOUT, because the item cannot say
 								 * (plan decision 5); a parameter of init so no
 								 * reader can forget to state it. */
+	bool		v12;			/* the page is WEAVE_PK_PENDING_V12: an item with
+								 * doclen == 0 is a NULL DOCUMENT (G77) */
 } WeavePendingIter;
 
 typedef struct WeavePendingRec
 {
 	ItemPointer tid;
-	WeaveDoc	doc;
+	WeaveDoc	doc;			/* NULL iff nulldoc */
 	uint32		doclen;
+	bool		nulldoc;		/* v12: a NULL-DOCUMENT item (doclen == 0 on a
+								 * WEAVE_PK_PENDING_V12 page) -- the row's lexical
+								 * column was NULL.  It has a docid, a docvalue and
+								 * a vector but no document: a lexical reader must
+								 * skip it (it matches no `@@@`, not even `!q`)
+								 * and never hand it to weave_doc_is_valid(). */
 	const void *vec;			/* NULL unless the item carries one */
 	uint32		veclen;
 	const void *gram;			/* the gram_ops column's raw text (a varlena), or
@@ -874,7 +882,8 @@ weave_pending_iter_init(WeavePendingIter *it, Page page, bool dvtext)
 	it->ptr = (char *) PageGetContents(page);
 	it->end = weave_page_entry_end(page);
 	it->dvtext = dvtext;
-	if (pk == WEAVE_PK_PENDING_V11)
+	it->v12 = (pk == WEAVE_PK_PENDING_V12);
+	if (pk == WEAVE_PK_PENDING_V12 || pk == WEAVE_PK_PENDING_V11)
 		it->hdrsz = sizeof(WeavePendingItem);
 	else if (pk == WEAVE_PK_PENDING_V10)
 		it->hdrsz = sizeof(WeavePendingItemV10);
@@ -932,6 +941,7 @@ weave_pending_iter_next(WeavePendingIter *it, WeavePendingRec *rec)
 	rec->hasdv = false;
 	rec->dvslot = false;		/* only the v11 layout has a dvlen field; set
 								 * true in that branch below */
+	rec->nulldoc = false;
 	/* both the v11 (24-byte) and v10 (20-byte) headers carry a gram field */
 	rec->hasgram = (it->hdrsz == sizeof(WeavePendingItem) ||
 					it->hdrsz == sizeof(WeavePendingItemV10));
@@ -950,6 +960,13 @@ weave_pending_iter_next(WeavePendingIter *it, WeavePendingRec *rec)
 		if (it->ptr + stride > it->end)
 			return false;
 		rec->doc = (WeaveDoc) (it->ptr + sizeof(WeavePendingItem));
+		/* v12: doclen 0 is a NULL document.  On a v11 page it is garbage (no
+		 * v11 writer emits it), left to weave_doc_is_valid() to refuse. */
+		if (it->v12 && pi->doclen == 0)
+		{
+			rec->nulldoc = true;
+			rec->doc = NULL;
+		}
 		docoff = MAXALIGN(sizeof(WeavePendingItem) + (Size) pi->doclen);
 		if (pi->veclen > 0)
 			rec->vec = it->ptr + docoff;
@@ -1479,7 +1496,8 @@ extern void weave_add_segment_with_room_ex(Relation index, const WeaveSegMeta *s
  */
 extern void weave_attach_chandesc(Relation index, WeaveSegMeta *seg,
 								  BlockNumber surfroot, BlockNumber vecroot,
-								  BlockNumber cgramroot, BlockNumber dvroot);
+								  BlockNumber cgramroot, BlockNumber dvroot,
+								  BlockNumber dlroot);
 
 /* ---------------------------------------------------------------------------
  * The cgram weft: corpus byte trigrams -> docids (task Z8)

@@ -2558,7 +2558,7 @@ static int
 weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
 						   BlockNumber surfroot, BlockNumber vecroot,
 						   BlockNumber cgramroot, BlockNumber dvroot,
-						   WeaveChannelDesc *weft)
+						   BlockNumber dlroot, WeaveChannelDesc *weft)
 {
 	int			n = 0;
 
@@ -2676,6 +2676,22 @@ weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
 		weft[n].root = cgramroot;
 		n++;
 	}
+
+	/*
+	 * v12: the DOCUMENT LIST, rooted at its WEAVE_PK_DOCLIST chain.  LAST,
+	 * because WEAVE_WK_DOCLIST (6) is the highest kind and the array must be
+	 * strictly ascending by (kind, attnum).  attnum 0: the list is the bolt's,
+	 * not any one index attribute's.  Absent only for a bolt with no document,
+	 * which no writer publishes.
+	 */
+	if (dlroot != InvalidBlockNumber)
+	{
+		weft[n].kind = (uint16) WEAVE_WK_DOCLIST;
+		weft[n].attnum = 0;
+		weft[n].flags = 0;
+		weft[n].root = dlroot;
+		n++;
+	}
 	return n;
 }
 
@@ -2684,11 +2700,12 @@ weave_chandesc_for_segment(Relation index, const WeaveSegMeta *seg,
 void
 weave_attach_chandesc(Relation index, WeaveSegMeta *seg, BlockNumber surfroot,
 					  BlockNumber vecroot, BlockNumber cgramroot,
-					  BlockNumber dvroot)
+					  BlockNumber dvroot, BlockNumber dlroot)
 {
 	WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
 	int			nweft = weave_chandesc_for_segment(index, seg, surfroot, vecroot,
-												   cgramroot, dvroot, weft);
+												   cgramroot, dvroot, dlroot,
+												   weft);
 
 	seg->chandesc = weave_write_chandesc(index, weft, nweft);
 }
