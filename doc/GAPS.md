@@ -4987,3 +4987,55 @@ leaked, and none did. The free records are on disk by the stop, which is what an
 show. So the one failure is either a rarer interleaving or something else entirely.
 **Disposition, G21's: not hunted further until it recurs**, and when it does, the test now
 prints what failed.
+
+### G76 — a gated ORDER BY whose gate admits fewer rows than LIMIT walks the WHOLE HEAP in the padding phase: correct, O(heap), invisible to every counter — **FOUND 2026-10-04 by the v17 agent (`pgweave-20261004-231619`, scifact); OPEN, fix in progress**
+
+When `WHERE body @@@ q ORDER BY fuse(...) LIMIT k` has fewer than k qualifying rows, the
+ranked phase runs out and the G56/G71 padding phase begins (`weave_pad_begin()`),
+which is `table_beginscan()` over the whole heap, handing every row to the executor for
+recheck. On scifact, a lexical gate admitting 5 rows with LIMIT 10 costs **40 ms and 17k
+buffers**, against 0.70 ms with 52 qualifying rows. Locally on 20k rows:
+`Rows Removed by Index Recheck: 19995`, and every fuse/work counter is identical to the
+LIMIT 2 run, so `weave_index_stats()` cannot see it. The vector and edit-distance routes
+pad the same way under a `@@@` restriction.
+
+**Why it is not simply "walk the gate set instead":** see G77. A row whose lexical
+column is NULL is in no index structure at all, so for a gate that does not involve the
+lexical column (a docvalues-only `price < c`) the heap walk is what finds it. A lexical
+gate cannot admit such a row (`NULL @@@ q` is NULL), so for any gate with a lexical key
+the gate set is a complete superset of the qualifying rows, and the padding can walk it.
+
+### G77 — a docvalues restriction answered by the index silently DROPS every row whose lexical column is NULL — **FOUND 2026-10-04 while scoping G76; a SILENT WRONG ANSWER on any nullable `wdoc` column with a docvalues key; OPEN**
+
+The build callback and `weave_insert()` both return early when the lexical column is
+NULL (`src/am/ambuild.c`, `if (isnull[lexidx]) return`), so the row gets no docid, no
+docvalue and no vector lane. Each restriction or ordering on another column of the
+index therefore cannot see it. Reproducer (local, 2026-10-04): 2,000 rows plus
+`(9001, NULL, '[1,1,1,1]', 3)` and `(9002, 'common', NULL, 4)`, index
+`USING weave (body, emb, price int8_docval_ops)`:
+
+| query | heap (Seq Scan) | weave (Index Scan, `Index Cond: (price < 6)`) |
+|---|---|---|
+| `WHERE price < 6` | `{1,2,3,4,5,9001,9002}` | `{1,2,3,4,5,9002}`: **9001 missing** |
+| `WHERE price < 6 ORDER BY emb <-> q LIMIT 3` | `{9001,1,2}` | `{1,2,3}`: **9001 missing** |
+| `ORDER BY emb <-> q LIMIT 3` (no WHERE) | `{9001,1,2}` | `{1,2,3}`; 9001 comes out of the padding at +Infinity |
+| `WHERE price < 6 ORDER BY fuse(...)` | 9001 present | 9001 present, **only because** the padding walks the heap (G76) |
+
+The bitmap route answers the same as the index scan. The vector row was already
+recorded as a loss in `sql/vecorderby.sql` ("The ten NULL-DOCUMENT rows are excluded from
+that rank, and they are a loss recorded here rather than a pass"). It was treated as an
+ordering imperfection, but with a docvalues key it is a missing row, because a WHERE
+clause the executor does not recheck is answered from a set that does not contain it.
+
+`sql/docvals.sql` never has a NULL document, which is why nothing caught it. Every
+docvalues fixture has a non-NULL `wdoc`.
+
+**Fix options, owed and a maintainer-visible choice:**
+1. **Index NULL-document rows** with a docid, a docvalue and a lane but no postings, and a
+   per-docid "document is NULL" mark so `@@@` (including `!q`, which an empty document
+   matches and a NULL one must not) excludes them. Correct everywhere; a format change.
+2. **Refuse to serve** a restriction or ordering on a non-lexical column when the lexical
+   column is nullable (`attnotnull` false at plan time). Correct; gives up the docvalues
+   prize on nullable columns.
+3. **Document it** as "the lexical column must be NOT NULL", as G71 did before its fix.
+   Not acceptable as the end state: it is a wrong answer, not a slow one.
