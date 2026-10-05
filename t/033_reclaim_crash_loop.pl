@@ -111,6 +111,15 @@ for my $cyc (0 .. $cycles - 1)
 	$node->stop('immediate');
 	eval { $bg->quit };
 	$node->start;
+	# THE TWIN GETS THE SAME VACUUM SCHEDULE: one VACUUM where `c` had the one
+	# the stop interrupted (or, once the window is missed, let finish), and one
+	# after the restart.  Without this the control is not a control: `c` got two
+	# VACUUMs a cycle and the twin one, and a second back-to-back VACUUM after a
+	# large merge runs the share-lock compaction that cannot reuse its own frees
+	# (the ratchet weave_vacuumcleanup()'s L19 note records) -- measured: from
+	# cycle 8, each post-restart VACUUM of `c` rewrote the whole index and
+	# extended ~2,080 pages while nothing was stranded, and the twin stayed flat.
+	$node->safe_psql('postgres', 'VACUUM t');
 
 	my $leak = leaked('c_w');
 	my $strand = stranded('c_w');
