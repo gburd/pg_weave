@@ -33,7 +33,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
 
-my $cycles = 10;
+my $cycles = 14;
 my $rows = 30000;
 
 my $node = PostgreSQL::Test::Cluster->new('crashloop');
@@ -163,14 +163,17 @@ is($node->safe_psql('postgres', q{
 my @excess = map { $sizes[$_] - $twin[$_] } 0 .. $#sizes;
 my ($maxs, $sums) = (0, 0);
 for (@strand) { $maxs = $_ if $_ > $maxs; $sums += $_; }
-my $flush = int(($twin[-1] - $twin[0]) / ($cycles - 1)) + 1;
-my $bound = $maxs + $flush + 32;
+# Slack: 5 % of the twin, for merges and compactions that land in different
+# cycles on the two indexes (measured: 844 pages at a cycle that stranded 4).
+# One whole flush was tried first and is too loose to tell the two cases apart.
+my $slack = 64 + int($twin[-1] / 20);
+my $bound = $maxs + $slack;
 my $worst = -1e9;
 for (@excess) { $worst = $_ if $_ > $worst; }
 note('excess of c_w over its twin per cycle: ' . join(' ', @excess)
-	  . '; stranded per crash: ' . join(' ', @strand) . "; one flush ~ $flush pages");
+	  . '; stranded per crash: ' . join(' ', @strand) . "; slack $slack pages");
 cmp_ok($worst, '<=', $bound,
-	"at every cycle the crashed index's excess over its twin (worst $worst pages) is at most one crash's stranding ($maxs) + one flush ($flush) + 32");
+	"at every cycle the crashed index's excess over its twin (worst $worst pages) is at most one crash's stranding ($maxs) + $slack");
 cmp_ok($sums, '>', $bound,
 	"and the crashes stranded enough in total ($sums pages) that accumulation would exceed that bound");
 
