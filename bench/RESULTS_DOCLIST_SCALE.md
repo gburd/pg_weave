@@ -51,9 +51,9 @@ bolt carried a COMPLETE document list in every phase.
 NULL document is not a BM25 document, as specified. Each cycle's inserted NULL
 documents likewise do not move it.
 
-**The job's exit status was 1, from the vector comparison alone** (`DONE fails=10`: 10
-of 20 vector comparisons printed `distances differ`, and 0 of 40 set comparisons
-failed). See below.
+**The job's exit status was 1, from the vector comparison alone** (`DONE fails=10`
+counts failing PHASES; 11 of 20 vector comparisons printed `distances differ`, and 0 of
+40 set comparisons failed). See below.
 
 **Not measured here:** time. Each `weave_check(deep)` took about 6.5 minutes at 1M rows,
 which is a cost in its own right (it walks every chain and recomputes the docset
@@ -76,6 +76,8 @@ not the index. The property this gate exists for holds, and the harness's shape 
 what proves it: the distances it prints are recomputed by `emb <-> q` from the rows the
 INDEX returned, so a recycled ctid ranked at a dead row's distance (G79/G80) would
 appear in the index list at its OWN true distance, about 8,660 for the inserted
-`[5000,...]` vectors. No such distance appears in any of the 20 index lists. What is
+`[5000,...]` vectors. No such distance appears in any of the 20 index lists: the 9
+that matched are the heap's own, and the largest distance in the 11 that did not is
+137.89. What is
 left is ANN ordering among live rows, a property of the quantized vector channel and
 not of the document list. **Loss recorded:** one boundary row at k = 50 in three phases.
