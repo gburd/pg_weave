@@ -5168,7 +5168,7 @@ Reproducer (local, 2026-10-05):
 | CREATE INDEX over 10 rows, every `body` = `to_wdoc('')` | `{}` | `{1,2,3}` |
 | 1 seeded row, then 9 such rows pending, then `VACUUM` (flush) | `{}` | `{2,3}` |
 
-The flushed index also fails `weave_check(deep)`. The vector ORDER BY over the first table
+The flushed index also fails `weave_check(deep)`: `pages_reachable_or_freed` reports **7 unreachable page(s) not flagged freed**, so the flush wrote the docvalues and vector pages and then published no segment pointing at them -- a leak as well as a lost answer. The vector ORDER BY over the first table
 returned `{1,2,3}`, so the vector lanes were either written or answered from elsewhere; this
 has not been traced. The fix belongs to the document-list design: a segment with documents
 must always be written, with an empty dictionary page, so `dictstart` is valid.
