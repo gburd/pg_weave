@@ -7,7 +7,7 @@ No production code changed. This is the evidence for or against building the swi
 
 - **There is a crossover, and it sits at roughly 1–2 % selectivity, or about 100–800
   qualifying rows.** Above it the shipped gated fused scan (arm A) wins by 2.8–5.5× at 10 %
-  and 25–33× with no predicate. Below it, an exact per-row rescore of the qualifying set
+  and 23–31× with no predicate. Below it, an exact per-row rescore of the qualifying set
   (arm C) wins by 1.3–1.6× at 1 % and 3.7× at 0.1 %. It wins on **every one of 25 queries**
   at every point at or below 1 %, with one exception: the fiqa lexical gate at 1 %, which
   is a tie (0.97×, C faster on 7 of 25 queries).
@@ -31,8 +31,8 @@ at or below 1 %: 3.1× and 5.1× at 1 %, 7.5× and 32× at 0.1 %, on 25 of 25 qu
 loses at 10 % (0.45× and 0.52×). The interpolated crossover is **~4–5 % (~40–50k rows)**,
 against ~1–2 % (~100–800 rows) at scale 1. So the switch point is **neither a constant
 selectivity nor a constant row count**. Across three corpora spanning 190× in size it
-grows with the corpus, which is what A's per-query floor predicts: 2 ms at 5k rows, 2 ms
-at 58k, 23–29 ms at 1M. The constants also depend on document shape, because the synthetic
+grows with the corpus, which is what A's per-query floor predicts. At the smallest point that does not pad, A costs
+0.70–0.76 ms at 5k rows (52 qualifying), 2.1–2.3 ms at 58k (58) and 23–29 ms at 1M (100–114). The constants also depend on document shape, because the synthetic
 documents are short and never TOASTed. **A clear crossover at two scales, by the task's
 own criterion, but a switch threshold cannot be a fixed constant.** See "What this means
 for the switch".
@@ -309,7 +309,7 @@ At 1M, B and A are a **coin flip** at or below 1 %. D never wins.
 **Interpolated crossover (A/C = 1):** facet ~3.8 % (~38k rows), lexical ~5.2 % (~52k rows).
 
 **Margins against noise.** The largest slot-to-slot spread is 1.7 ms, at 1 %. The smallest
-A−C gap at or below 1 % is 24.6 ms, so every win clears the floor by more than 14×. At
+A−C gap at or below 1 % is 22.9 ms, so every win clears the floor by more than 13×. At
 10 %, C loses by 62–93 ms against a spread of 1.1 ms.
 
 **Three things scale 2 shows that scale 1 could not.**
@@ -323,7 +323,7 @@ A−C gap at or below 1 % is 24.6 ms, so every win clears the floor by more than
   cheaper on the facet.** p50 is 67.6 (lexical) and 75.3 (facet) against 92.1 ms with no
   predicate. The gate costs something to materialize and drive, so selectivity has to fall
   well below 10 % before claim 3's "faster" is visible at 1M. At scale 1 the 10 % point was
-  already 0.74–0.86× of the no-predicate time.
+  already 0.78–0.89× of the no-predicate time.
 - **The facet has a materialization floor that the lexical gate does not.** C at 100
   qualifying rows costs 4.07 ms on the facet and 0.083 ms on the lexical gate. A plain
   `SELECT count(*) FROM vx WHERE price < 100` through the docvals index costs **4,033
@@ -334,9 +334,10 @@ A−C gap at or below 1 % is 24.6 ms, so every win clears the floor by more than
 ## What this means for the switch
 
 **Is there a crossover at two scales? Yes**, by the task's criterion, at four of four
-(scale, gate) series. Above it, the gated fused scan wins by 2–5× at 10 % and 25–33× with
-no predicate. Below it, per-row exact rescoring wins by 1.3–7.5× on the facet and
-1.6–277× on the lexical gate, on every query.
+(scale, gate) series. Above it, the gated fused scan wins by 1.9–5.5× at 10 % and, at scale 1, by 23–31×
+with no predicate. Below it, per-row exact rescoring wins by 1.3–7.5× on the facet and
+1.6–277× on the lexical gate, on every query. The one exception is a tie at fiqa's lexical
+1 % point.
 
 **Where it sits:**
 
@@ -346,10 +347,10 @@ no predicate. Below it, per-row exact rescoring wins by 1.3–7.5× on the facet
 | fiqa | 57,600 | ~1.4 % (~810 rows) | ~0.95 % (~550 rows) |
 | synthetic | 1,000,000 | ~3.8 % (~38k rows) | ~5.2 % (~52k rows) |
 
-**A fixed selectivity constant would be wrong by 2–5× in either direction, and a fixed
-row count by ~500×.** What the data support is a cost comparison. Estimate A's cost from
+**A fixed selectivity constant would be off by up to ~5×, and a fixed row count by
+~500×.** What the data support is a cost comparison. Estimate A's cost from
 its floor (which grows with corpus size; this file has three points of it, not a model)
-and C's cost as qualifying rows × a per-row constant (1.7 µs on short untoasted synthetic
+and C's cost as qualifying rows × a per-row constant (1.2–1.7 µs on short untoasted synthetic
 documents, 7–10 µs on BEIR's toasted ones). Then take the cheaper. Planning a switch
 needs the qualifying count **before** the scan, and the gate's tidset is materialized
 before the bolt loop (`so->nplain`), so an in-AM switch would have it for free.
@@ -392,7 +393,7 @@ pulled artifacts and terminated the instance. The job's recorded exit status is 
   by an amount this file measures but does not decide on. A code-scoring switch would not.
 - **Scale 2 is synthetic.** Random unit vectors give the vector block bounds little to
   prune with, which inflates A relative to a real 1M corpus, and short untoasted
-  documents make C cheaper per row (1.7 µs against 7–10 µs). The 1M crossover could sit
+  documents make C cheaper per row (1.2–1.7 µs against 7–10 µs). The 1M crossover could sit
   lower on real data. A real 1M corpus (msmarco-sub through `bench/prepdata.py`) is the
   owed third point.
 - **One k (10), one weight vector (0.5/0.5), one embedding model, one instance type.** The
