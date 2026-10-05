@@ -159,21 +159,38 @@ for my $try (1 .. 8)
 	my $wpid = $w->query_safe('SELECT pg_backend_pid()');
 	$w->query_until(qr/started/, "\\echo started\nINSERT INTO big VALUES (1000 + $try, $n);\n");
 
-	# Wait until the inserter HOLDS the segment-write lock (it is between its
-	# first page and its publish), or has finished without being seen holding it.
-	# A bounded loop rather than poll_query_until: that one would wait out its
-	# whole timeout on a try whose window closed before the first poll.
+	# Wait until the inserter HOLDS the segment-write lock AND has pages of its
+	# unpublished bolt ON DISK: unreachable, unflagged, initialized pages, which
+	# is exactly what a reclaim without the barrier would free.  Holding the
+	# lock alone is not enough -- the writer sorts its terms under it before it
+	# writes a page, and a VACUUM started then has every page the writer will
+	# write AFTER its fence, so the fence alone protects them and this phase
+	# could not tell a missing barrier from a present one (measured: the
+	# barrier-removed mutant passed every corruption assertion of the first
+	# version of this phase, caught only by the waiting assertion).  A bounded
+	# loop rather than poll_query_until: that one would wait out its whole
+	# timeout on a try whose window closed before the first poll.
 	my $state = 'wait';
+	my $inflight = 0;
 	for (1 .. 3000)
 	{
 		$state = $node->safe_psql('postgres', qq{
 			SELECT CASE
-			  WHEN EXISTS (SELECT FROM pg_locks WHERE pid = $wpid AND locktype = 'page'
-			                 AND page = -1 AND mode = 'ShareLock' AND granted) THEN 'held'
-			  WHEN (SELECT state FROM pg_stat_activity WHERE pid = $wpid) <> 'active' THEN 'done'
+			  WHEN NOT EXISTS (SELECT FROM pg_locks WHERE pid = $wpid AND locktype = 'page'
+			                     AND page = -1 AND mode = 'ShareLock' AND granted)
+			    THEN CASE WHEN (SELECT state FROM pg_stat_activity WHERE pid = $wpid) <> 'active'
+			              THEN 'done' ELSE 'wait' END
+			  WHEN (SELECT count(*) FROM weave_page_info('big_w')
+			         WHERE NOT reachable AND coalesce(freed, false) = false
+			           AND NOT uninitialized) >= 8 THEN 'held'
 			  ELSE 'wait' END});
 		last if $state ne 'wait';
-		usleep(5_000);
+		usleep(2_000);
+	}
+	if ($state eq 'held')
+	{
+		$inflight = leaked('big_w');
+		note("phase A try $try: the in-flight bolt has $inflight page(s) on disk");
 	}
 	if ($state ne 'held')
 	{
@@ -203,14 +220,14 @@ for my $try (1 .. 8)
 	$v->quit;
 	my $log = substr(slurp_file($node->logfile), $logpos);
 	my $sawlog = $log =~ /still waiting for ExclusiveLock on page 4294967295 of relation/;
-	note("phase A try $try: waited=$waited log=" . ($sawlog ? 1 : 0));
-	if ($waited && $sawlog)
+	note("phase A try $try: waited=$waited log=" . ($sawlog ? 1 : 0) . " inflight=$inflight");
+	if ($waited && $sawlog && $inflight > 0)
 	{
 		$hitA = 1;
 		last;
 	}
 }
-ok($hitA, 'phase A: a VACUUM was observed waiting on the segment-write lock of an in-flight oversized INSERT');
+ok($hitA, 'phase A: a VACUUM was observed waiting on the segment-write lock of an oversized INSERT whose unpublished pages were already on disk');
 is(leaked('big_w'), '0', 'phase A: no page is leaked after the concurrent INSERT and VACUUM');
 is(deep_bad('big_w'), '', 'phase A: weave_check(deep) is clean');
 is($node->safe_psql('postgres', q{
