@@ -291,7 +291,7 @@ is(read_metapage_version($abspath), WEAVE_VERSION_CUR,
 like($node->safe_psql('postgres',
 		q{SELECT detail FROM weave_check('docs_weave')
 		   WHERE invariant = 'metapage_version_recognized'}),
-	qr/^format v11 /, 'weave_check() now reports the current format (v11)');
+	qr/^format v12 /, 'weave_check() now reports the current format (v12)');
 
 my $cd_after = $node->safe_psql('postgres',
 	q{SELECT detail FROM weave_check('docs_weave')

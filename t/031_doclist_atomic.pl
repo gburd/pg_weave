@@ -120,7 +120,20 @@ archive_mode = off
 		q{SELECT count(*) FROM weave_page_info('da_w') WHERE kind = 'doclist'});
 	$seen_list_unpublished = 1 if $nseg eq '1' && $dlpages > 1;
 	$seen_published = 1 if $nseg eq '2';
-	note("point $i at $lsn: bolts=$nseg doclist_pages=$dlpages");
+	# Not asserted, recorded: pages the flush had already logged when recovery
+	# stopped short of its publish record are unreachable and not freed.  That
+	# is the G72 leak class (doc/GAPS.md G75): harmless to answers, reclaimed
+	# only by REINDEX.  Counting it at every point is what turns G75's "once in
+	# a while after an immediate stop" into a deterministic measurement.
+	my $leaked = $pitr->safe_psql('postgres', q{
+		SELECT count(*) FROM weave_page_info('da_w')
+		 WHERE NOT reachable AND coalesce(freed, false) = false AND NOT uninitialized});
+	my $leakkinds = $pitr->safe_psql('postgres', q{
+		SELECT coalesce(string_agg(kind || ':' || n, ',' ORDER BY kind), '')
+		  FROM (SELECT kind, count(*) AS n FROM weave_page_info('da_w')
+		         WHERE NOT reachable AND coalesce(freed, false) = false
+		           AND NOT uninitialized GROUP BY kind) k});
+	note("point $i at $lsn: bolts=$nseg doclist_pages=$dlpages leaked_pages=$leaked [$leakkinds]");
 
 	is($pitr->safe_psql('postgres', q{
 		SELECT string_agg(invariant || '=' || ok, ',' ORDER BY invariant)
