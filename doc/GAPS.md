@@ -5328,3 +5328,29 @@ when the state indexed no document (its document list is empty), and
 with no terms. That also covers a third shape the entry did not list: a MERGE whose every
 posting was tombstoned while zero-term documents survived. `sql/doclist.sql` section (6)
 is both reproducers, each with `weave_check(deep)` clean.
+
+### G82 — two defects in the vendored sparsemap v5.8.0: `sm_create_from_array()` is a use-after-free past 1 KiB, and `sm_cardinality()` can disagree with iteration on a buffer `sm_validate()` accepts — **FOUND 2026-10-05 by `test/hegel/test_doclist.c` (doclist work); NOT REACHABLE from pg_weave (worked around); OPEN UPSTREAM**
+
+Both are recorded in `doc/specs/SEGMENT_FORMAT.md` §6 next to the code that avoids them;
+this entry exists so they are not only in a spec.
+
+1. **`sm_create_from_array()`** creates a 1 KiB map and calls the NON-growing
+   `sm_add_many()`. When the result outgrows the buffer, `__sm_replace_buffer()` grows it
+   with `sm_set_data_size()`, the caller's pointer goes stale, `sm_add_many()` returns
+   false because `m != map`, and `sm_create_from_array()` then `sm_free()`s the stale
+   pointer. Reproduced against the upstream checkout (`~/ws/sparsemap`, `72c98c6`) under
+   ASan with 5,000 sparse members: `heap-use-after-free ... in sm_free ... in
+   sm_create_from_array sm.c:8716`. Reproducer: `/scratch/pg_weave/sparsemap-uaf-repro.c`
+   (build: `gcc -g -fsanitize=address -I ~/ws/sparsemap -o r r.c ~/ws/sparsemap/sm.c -lm`).
+   **Fix, upstream:** use `sm_add_many_grow()` there. pg_weave never calls it
+   (`include/weave/doclist.h` builds with `sm_create()` + `sm_add_many_grow()`, the idiom
+   `amvacuum.c` already used).
+2. **`sm_cardinality()` vs `sm_next_member()`**: one flipped byte in a serialized map that
+   `sm_validate()` still accepts gave cardinality 1,973 against a walk of 1,909.
+   pg_weave's document-list validator counts with the same iteration its decoder uses, so a
+   validated image is a decodable one. The tombstone path reads cardinality nowhere that
+   matters for correctness, but any future validator must not mix the two.
+
+Neither is a pg_weave defect today. Both are worth a report and a fix in the sparsemap
+project (same author); the vendored copy then needs a bump (`doc/LICENSING.md` describes
+the manual merge).
