@@ -76,6 +76,30 @@ sub deep_bad
 		  FROM weave_check('$idx', true) WHERE NOT ok});
 }
 
+# EVERY POSTING OF EVERY ROW, not just one term.  A reclaim that freed pages of
+# an in-flight bolt does not always leave a deep-check violation behind: freeing
+# resets a page's nextblk, so a later merge that reads the published bolt stops
+# its chain walk at the freed page, writes a merged bolt WITHOUT the postings
+# behind it, and frees what it could reach -- a self-consistent index with rows
+# missing from some terms.  'big' sorts first and lives on the first posting
+# page, so asking for it proves nothing about the rest of the chain.  Each row's
+# terms are 't<id>x<g>' for g in 1..n and belong to that row alone, so the
+# truth is known without evaluating the expression: an index-scan AND over 24
+# terms sampled across 1..n must return the row.  Returns the ids that failed.
+sub incomplete_rows
+{
+	return $node->safe_psql('postgres', q{
+		SET enable_seqscan = off; SET enable_bitmapscan = off;
+		SELECT coalesce(string_agg(r.id::text, ',' ORDER BY r.id), '')
+		  FROM big r
+		 WHERE NOT EXISTS (
+		   SELECT FROM big b
+		    WHERE b.id = r.id
+		      AND bigdoc(b.n, b.id) @@@ (SELECT string_agg('t' || r.id || 'x' || g, ' & ')
+		                                   FROM (SELECT DISTINCT 1 + ((i * 7919) % r.n) AS g
+		                                           FROM generate_series(0, 23) i) s)::wquery)});
+}
+
 sub vacuum_verbose
 {
 	my ($sql) = @_;
@@ -231,6 +255,18 @@ for my $try (1 .. 8)
 	# reaches its reclaim while the INSERT is in flight is waiting on SOMETHING
 	note("phase A try $try: lock wait: $_") for ($log =~ /(process \d+ still waiting for [^\n]*)/g);
 	note("phase A try $try: waited=$waited log=" . ($sawlog ? 1 : 0) . " inflight=$inflight");
+
+	# CHECKED NOW, after every try, not once after the loop.  This is where a
+	# reclaim that freed an in-flight bolt's pages is visible: the bolt has just
+	# been published with WEAVE_FREED pages on its live chains.  One VACUUM later
+	# it is not -- the cleanup's merge reads the freed pages (their contents are
+	# intact), stops at their reset nextblk, writes a self-consistent bolt and
+	# frees the input, and weave_check(deep) is clean over an index that lost
+	# postings.  Measured on the barrier-removed mutant: its try 1 freed 3,298
+	# pages while the in-flight bolt had 2,113 on disk, and the end-of-phase
+	# deep check passed.
+	is(deep_bad('big_w'), '', "phase A try $try: weave_check(deep) is clean right after the concurrent publish");
+	is(incomplete_rows(), '', "phase A try $try: every row is found by terms sampled across its posting chain");
 	if ($waited && $sawlog && $inflight > 0)
 	{
 		$hitA = 1;
@@ -245,6 +281,7 @@ is($node->safe_psql('postgres', q{
 	SELECT count(*) FROM big WHERE bigdoc(n, id) @@@ 'big'}),
 	$node->safe_psql('postgres', 'SELECT count(*) FROM big'),
 	'phase A: every row, including the concurrent bolt, answers through the index');
+is(incomplete_rows(), '', 'phase A: every row is found by terms sampled across its whole posting chain');
 
 # ---- phase B: the fence ------------------------------------------------------
 # A pool of FREE pages for the second writer to reuse: several oversized bolts,
@@ -309,6 +346,7 @@ is($node->safe_psql('postgres', q{
 	SELECT count(*) FROM big WHERE bigdoc(n, id) @@@ 'big'}),
 	$node->safe_psql('postgres', 'SELECT count(*) FROM big'),
 	'phase B: every row answers through the index');
+is(incomplete_rows(), '', 'phase B: every row is found by terms sampled across its whole posting chain');
 # and the pages the concurrent writer published survive the NEXT reclaim too
 my ($freedB2) = vacuum_verbose('SET client_min_messages = debug2; VACUUM big');
 is($freedB2, 0, 'phase B: a quiet VACUUM afterwards has nothing to reclaim');
