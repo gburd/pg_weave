@@ -3856,6 +3856,18 @@ weave_page_recyclable(Relation index, Page page)
 	}
 }
 
+/*
+ * Would the allocator hand out this page NOW?  For the reclaim, which must not
+ * record a page in the FSM that the allocator would refuse: one such entry makes
+ * the live-FSM loop in weave_new_buffer() stop reusing and extend for the rest of
+ * its allocation sequence.  `page` must be pinned and locked.
+ */
+bool
+weave_page_reusable_now(Relation index, Page page)
+{
+	return weave_page_recyclable(index, page);
+}
+
 /* Recycle a chained page list (dict/trigram/posting/data) to the FSM. */
 void
 weave_free_chain(Relation index, BlockNumber blk)

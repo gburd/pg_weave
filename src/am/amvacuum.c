@@ -1299,6 +1299,7 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 	int64		nnewer = 0;
 	int64		ncontended = 0;
 	int64		nstale = 0;
+	int64		nnotyet = 0;
 	MemoryContext ctx;
 	MemoryContext old;
 	instr_time	t0,
@@ -1412,10 +1413,25 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 			(PageGetSpecialSize(page) == MAXALIGN(sizeof(WeavePageOpaqueData)) &&
 			 WeavePageIsFreed(page)))
 		{
+			/*
+			 * Only a page the allocator would take NOW.  A freed page whose XID
+			 * stamp is not yet past the horizon is left for a later VACUUM, for
+			 * the reason the stranded-page arm below gives: one such entry stops
+			 * every live-FSM allocation at it.  Measured, not a precaution --
+			 * t/033's crashed index grew a flush per cycle until this was added,
+			 * because the VACUUM that crashed had freed the previous crash's
+			 * pages with a stamp of the crash-time next XID, and after restart
+			 * no XID had completed past it.
+			 */
 			if (GetRecordedFreeSpace(index, blk) < BLCKSZ / 2)
 			{
-				RecordFreeIndexPage(index, blk);
-				nrecorded++;
+				if (weave_page_reusable_now(index, page))
+				{
+					RecordFreeIndexPage(index, blk);
+					nrecorded++;
+				}
+				else
+					nnotyet++;
 			}
 			UnlockReleaseBuffer(buf);
 			continue;
@@ -1460,10 +1476,11 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 	INSTR_TIME_SET_CURRENT(t1);
 	INSTR_TIME_SUBTRACT(t1, t0);
 	ereport(nfreed > 0 ? Max(elevel, LOG) : elevel,
-			(errmsg("pg_weave: index \"%s\": reclaimed %lld stranded page(s), re-recorded %lld free page(s); %lld unreachable page(s) newer than the fence, %lld busy; %lld stale free-space entr(ies) for live pages cleared; %u pages walked in %.1f ms",
+			(errmsg("pg_weave: index \"%s\": reclaimed %lld stranded page(s), re-recorded %lld free page(s); %lld unreachable page(s) newer than the fence, %lld busy; %lld stale free-space entr(ies) for live pages cleared, %lld free page(s) not yet recyclable; %u pages walked in %.1f ms",
 					RelationGetRelationName(index), (long long) nfreed,
 					(long long) nrecorded, (long long) nnewer,
-					(long long) ncontended, (long long) nstale, nblocks,
+					(long long) ncontended, (long long) nstale,
+					(long long) nnotyet, nblocks,
 					INSTR_TIME_GET_MILLISEC(t1))));
 	return nfreed;
 }

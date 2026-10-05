@@ -1279,6 +1279,8 @@ extern int64 weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int ele
 /* Allocation for a page linked IN THE SAME RECORD that writes it (the pending
  * append): exempt from the segment-write-lock check in weave_new_buffer() */
 extern Buffer weave_new_buffer_linked(Relation index);
+/* Would the allocator take this (pinned, locked) page now? (src/am/am.c) */
+extern bool weave_page_reusable_now(Relation index, Page page);
 /* Free a page whose buffer the caller holds exclusively locked; `record` false
  * keeps it out of the FSM until a later reclaim re-records it */
 extern void weave_free_page_locked(Relation index, Buffer buf, bool record);
