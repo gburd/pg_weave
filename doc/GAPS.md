@@ -5094,3 +5094,37 @@ enumerate every docid in a segment, posting-less ones included; the VWARP chain 
 for exactly this reason, `doc/specs/VECTOR_CHANNEL.md` "warp → docid"), not from postings.
 
 G76's fix does not rely on the universe: a NOT query keeps the heap walk.
+
+### G79 — the vector ORDER BY ignores TOMBSTONES: after DELETE + VACUUM, a NEW row that reuses the dead row's ctid is ranked at the DEAD row's distance — **FOUND 2026-10-05 while designing G77's fix; a SILENT WRONG ANSWER reachable by DELETE, VACUUM, INSERT; OPEN**
+
+The lexical channel subtracts a segment's tombstones (`weave_collect_matches()`,
+`WeaveTombstones`), the docvalues gate excludes them, and the fused pass gates through the
+same sets. The plain vector route does not. `weave_vec_topk_run()` (`src/vector/vecshuttle.c`)
+walks every lane of every weft with no tombstone check, and its own comment says so ("MVCC
+AND TOMBSTONES ARE NOT APPLIED, deliberately and per (C6)"). That is right for the
+`weave_vec_scan()` diagnostic and wrong for the AM's ORDER BY: the scan relies on the heap
+fetch for visibility, and after VACUUM the heap fetch of a recycled TID finds a DIFFERENT,
+live row.
+
+Reproducer (local, 2026-10-05; the same answer in two trials):
+```sql
+CREATE TABLE g79 (id int, body wdoc, emb wvec) WITH (autovacuum_enabled = off);
+INSERT INTO g79 SELECT g, to_wdoc('w' || g), ('[' || g || ',' || g || ',' || g || ',' || g || ']')::wvec
+  FROM generate_series(1, 20) g;
+CREATE INDEX g79_w ON g79 USING weave (body, emb);
+DELETE FROM g79 WHERE id = 1;  VACUUM g79;                -- tombstones (0,1)
+INSERT INTO g79 VALUES (100, to_wdoc('new'), '[1000,1000,1000,1000]');   -- reuses (0,1)
+SELECT id FROM g79 ORDER BY emb <-> '[0,0,0,0]' LIMIT 3;  -- index: {100,2,3}; heap: {2,3,4}
+```
+Row 100 is the **farthest** vector in the table and comes out **first**, at the deleted
+row 1's distance. Row 100 is in the pending list, so it is also ranked again at its own
+distance later, which is the second half of the defect: one heap row emitted twice by the
+ranked phase is prevented only by the executor never seeing it again under the LIMIT.
+
+The fused route answered `{2,3,4}`, correctly, because its lexical channel applies
+tombstones. A docvalues restriction answered correctly too.
+
+**Fix, owed:** apply each segment's tombstones in the AM's vector pass (the allowlist
+`weave_vec_topk_run()` already accepts is the natural carrier), leaving `weave_vec_scan()`
+as the raw diagnostic it is documented to be. Then pin it with this reproducer plus a
+fused variant and a padding variant.
