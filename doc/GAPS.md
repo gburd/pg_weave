@@ -5059,7 +5059,7 @@ swaps and oversized INSERTs.
 - **An allocator change was tried and REVERTED, on measurement.** Making the allocator drop
   a free-list candidate that turned out to be live (nbtree's rule) made `t/028`'s
   quiet-VACUUM truncation control fail 3 times in 10 against 0 in 10 on the base, and
-  the arm with only that change removed failed 0 of 7. So the allocator is unchanged.
+  the arm with only that change removed failed 0 of 8 (branch 3 of 8, base 0 of 8, `pgweave-20261005-212522-de13`). So the allocator is unchanged.
   The reclaim touches the FSM only under the page's exclusive lock. Correctness never
   depended on the FSM, because the allocator refuses any initialized page that is not
   `WEAVE_FREED`. What is left is a narrow window that can produce a stale FSM entry,

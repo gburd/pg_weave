@@ -1121,8 +1121,8 @@ candidate that turned out to be live instead of re-recording it (nbtree's
 `_bt_allocbuf()` does the same). That change made `t/028`'s "a quiet VACUUM still
 truncates the index" control fail 3 times in 10, against 0 in 10 on the base
 (`pgweave-20261005-204623-fc2c`). In a three-arm rerun
-(`pgweave-20261005-212522-de13`) the branch failed 2 of 7, the branch with only
-the allocator change removed failed 0 of 7, and the base failed 0 of 7. The
+(`pgweave-20261005-212522-de13`) the branch failed 3 of 8, the branch with only
+the allocator change removed failed 0 of 8, and the base failed 0 of 8. The
 mechanism is most likely that the extra reuse empties the pool of recyclable free
 pages that `weave_vacuum_compact()`'s trigger probes for, so the compaction never
 runs. The change was reverted. A stale FSM entry costs an extension, and a
