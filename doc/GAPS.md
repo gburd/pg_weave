@@ -4988,6 +4988,30 @@ show. So the one failure is either a rarer interleaving or something else entire
 **Disposition, G21's: not hunted further until it recurs**, and when it does, the test now
 prints what failed.
 
+**RECURRED 2026-10-05, with the diagnostic, on `wt/doclist` (`pgweave-20261005-063841-2905`,
+commit 76577dc, full TAP sequence).** The violated invariant was
+`pages_reachable_or_freed`: **2 unreachable page(s) not flagged freed, both
+`postings`**, block 12 (`nextblk=20`) and block 20 (`nextblk=none`), in a 27-page
+relation. Every other assertion held: every row of the crashed flush answered exactly
+once and `ndocs` equalled the heap, so the published state was intact. That narrows the
+mechanism to one shape. A flush writes its posting chain FIRST (`weave_write_segment()`'s
+posting writer), then the dictionary, sidecar, other wefts, the descriptor page and the
+v12 document list, and only then the one metapage record that publishes the bolt and
+cuts the pending list. A posting chain that is on disk with nothing pointing at it is a
+flush whose WAL was cut AFTER its posting pages and BEFORE its publish -- G72's "written
+before linked" leak class, observed, with the pending list still holding the rows, which
+is why every answer was right. It is not specific to the document list (the leaked pages
+are postings, and the list is written after them), but the branch does lengthen the
+window by the list's pages. The rate stays low: the same branch ran t/029 alone **20 more
+times with 0 failures** (`pgweave-20261005-071445-11f1`), so 1 in 21 here and 1 in 89
+overall. What is still unexplained is why an immediate stop loses the tail of the
+VACUUM's WAL only sometimes; the probe's 20 of 20 clean trials say the records are
+usually on disk.
+
+`t/031_doclist_atomic.pl` now measures this deterministically instead of waiting for it:
+it recovers to every WAL record of a flush and prints the unreachable-page count and
+kinds at each point (`leaked_pages=`), without asserting on it.
+
 ### G76 — a gated ORDER BY whose gate admits fewer rows than LIMIT walks the WHOLE HEAP in the padding phase: correct, O(heap), invisible to every counter — **FOUND 2026-10-04 by the v17 agent (`pgweave-20261004-231619`, scifact); FIXED 2026-10-05 for every lexical gate without a NOT (merge of `wt/g76`); docvalues-only and NOT gates still walk the heap, by design, until G77 and G78 are fixed**
 
 When `WHERE body @@@ q ORDER BY fuse(...) LIMIT k` has fewer than k qualifying rows, the
