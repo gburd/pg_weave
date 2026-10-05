@@ -10,6 +10,7 @@ PGC=/usr/lib/postgresql/17/bin/pg_config
 LIB=$($PGC --pkglibdir)
 SRC=$HOME/pg_weave
 PHASES="${PHASES:-control mutants scale}"
+MUTS="${MUTS:-noreclaim:t/031_doclist_atomic.pl noguard:t/032_reclaim_concurrent.pl nobarrier:t/032_reclaim_concurrent.pl nofence:t/032_reclaim_concurrent.pl}"
 log() { echo "$(date +%T) $*" | tee -a $OUT/g75.log; }
 
 cat > $OUT/apply.sh <<'MUTEOF'
@@ -25,8 +26,7 @@ sub() {	# file, from (literal), to (literal): must match exactly once
 }
 case $m in
 noreclaim)
-	sub $f '		weave_free_page_locked(index, buf);
-		nfreed++;' '		UnlockReleaseBuffer(buf);	/* MUTANT noreclaim */
+	sub $f '		weave_free_page_locked(index, buf, false);' '		UnlockReleaseBuffer(buf);	/* MUTANT noreclaim */
 		continue;' ;;
 nobarrier)
 	sub $f '	weave_segwrite_barrier(index);
@@ -99,8 +99,7 @@ if [[ " $PHASES " == *" mutants "* ]]; then
 	[ -n "$CLEAN_MD5" ] || { install_tree "$SRC" clean; CLEAN_MD5=$(md5sum $LIB/pg_weave.so | cut -d' ' -f1); }
 	# which files each mutant must fail: noreclaim -> t/031 (the brief's gate);
 	# the guard mutants -> t/032 (the concurrency test)
-	for spec in "noreclaim:t/031_doclist_atomic.pl" "noguard:t/032_reclaim_concurrent.pl" \
-	            "nobarrier:t/032_reclaim_concurrent.pl" "nofence:t/032_reclaim_concurrent.pl"; do
+	for spec in $MUTS; do
 		m=${spec%%:*}; tests=${spec#*:}
 		D=/tmp/mut-$m
 		rm -rf $D; cp -a $SRC $D
