@@ -5071,6 +5071,20 @@ offering them to the FSM, and let the next VACUUM record them. The excess stays 
 or below one crash's stranding, 148–973 pages, against 3,356 pages stranded in total
 (`pgweave-20261005-184549-bb9b`).
 
+**Found while mutation-testing it, NOT fixed here: a merge LAUNDERS a freed live page.**
+The mutant with the barrier removed freed 3,298 pages of an oversized INSERT's
+unpublished bolt (try 1 of `t/032` phase A, run `pgweave-20261005-204622-760e`). The
+INSERT then published that bolt, and the end-of-phase `weave_check(deep)` was *clean*.
+The next VACUUM's merge had read the freed pages, whose contents are intact. Freeing
+resets `nextblk`, so `merge_source_load_page()`'s dictionary walk stopped at the first
+freed page with no check of `WEAVE_FREED`. The merge then wrote a smaller,
+self-consistent bolt and freed its input. The index loses postings and no invariant
+reports it. This is not specific to the reclaim. **Any** bug that frees a live page is
+erased from the evidence by the next merge, which is the class G15 and G62 belong to.
+`t/032` now runs the deep check and a per-row posting probe after **every** concurrent
+try, before a later VACUUM can merge. The owed fix is for the merge's chain walkers to
+raise an ERROR, not stop, on a `WEAVE_FREED` page met on a live chain.
+
 **Costs and limits, recorded as prominently as the fix:**
 - Every VACUUM cleanup now reads every page of the index once, as GIN's and GiST's
   cleanups do. Measured at 1M rows in the scale run (below).
