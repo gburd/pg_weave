@@ -380,8 +380,10 @@ unchanged. The centroid is read only by bound (B3), the shipping scans pass
 `-INFINITY` as the threshold, and B3 measured 0.00 % pruning (§8b). So a reader that
 loses the centroid gets a wrong bound, never a wrong row, until a pruning scan exists.
 Only `weave_check()` (its recomputation of the centroid) and the standalone tests catch
-it. In the standalone layer, `test/hegel/test_vecweft.c` reported this mutant 21 times,
-and also caught the other two plus a plan placing the centroid 4 bytes late.
+it. In the standalone layer, `test/hegel/test_vecweft.c` exits 1 on this mutant (the
+production page reader and the spec-rule reader disagree; the centroid does not round
+trip). It also catches a missing fit check (an assertion abort) and a plan placing the
+centroid 4 bytes late (more than 20 failures, then exit 1).
 
 ### Standalone and fuzz
 

@@ -192,7 +192,7 @@ at ef = 800 and warm p50 there is 73.764 ms:
 
 | gate term | bar | measured | verdict |
 |---|---|---|---|
-| storage | ≤ 0.15× | ~~**0.064×** (512 B vs 8,056 B/vector)~~ **built index 0.098× at 960-d, 0.130× at 1,024-d; 0.261× at 384-d and 0.193× at 768-d** (corrected 2026-10-04, `bench/RESULTS_VECMAJOR.md`) | passes at 960-d and above; **FAILS below 960-d** |
+| storage | ≤ 0.15× | ~~**0.064×** (512 B vs 8,056 B/vector)~~ ~~built index 0.098× at 960-d, 0.130× at 1,024-d; 0.261× at 384-d and 0.193× at 768-d (corrected 2026-10-04)~~ **built index, weft v4: 0.136× at 384-d, 0.130× at 768-d, 0.065× at 960-d, 0.096× at 1,024-d** (same-run HNSW; superseded 2026-10-05, `bench/RESULTS_VECMAJOR.md`) | ~~passes at 960-d and above; FAILS below 960-d~~ **passes at all four dims measured**; tightest at 384-d (29 B/vector of headroom, one synthetic corpus) |
 | latency | ≤ 2× at matched recall | **0.76×** (56.2 ms at recall 0.9880) | passes |
 | recall@10 | ≥ 0.99 | **0.9930** at n = 1M, 100 queries | passes |
 
