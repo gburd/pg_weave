@@ -77,27 +77,25 @@ sub deep_bad
 }
 
 # EVERY POSTING OF EVERY ROW, not just one term.  A reclaim that freed pages of
-# an in-flight bolt does not always leave a deep-check violation behind: freeing
-# resets a page's nextblk, so a later merge that reads the published bolt stops
-# its chain walk at the freed page, writes a merged bolt WITHOUT the postings
-# behind it, and frees what it could reach -- a self-consistent index with rows
-# missing from some terms.  'big' sorts first and lives on the first posting
-# page, so asking for it proves nothing about the rest of the chain.  Each row's
-# terms are 't<id>x<g>' for g in 1..n and belong to that row alone, so the
-# truth is known without evaluating the expression: an index-scan AND over 24
-# terms sampled across 1..n must return the row.  Returns the ids that failed.
+# an in-flight bolt does not always leave a deep-check violation behind: a later
+# merge reads the freed pages, stops its chain walk at their reset nextblk,
+# writes a self-consistent bolt WITHOUT the postings behind them, and frees what
+# it reached.  'big' sorts first and lives on the first posting page, so asking
+# for it proves nothing about the rest.  Row r's terms are 't<r>x<g>' for g in
+# 1..n and belong to r alone, so the truth is known without the expression: the
+# index's own scan of an AND over 24 terms sampled across 1..n must count 1.
+# Returns the ids for which it does not.
 sub incomplete_rows
 {
+	# weave_count() runs the index's own scan, so this cannot be answered by a
+	# heap recheck the way a planner-chosen path could
 	return $node->safe_psql('postgres', q{
-		SET enable_seqscan = off; SET enable_bitmapscan = off;
 		SELECT coalesce(string_agg(r.id::text, ',' ORDER BY r.id), '')
 		  FROM big r
-		 WHERE NOT EXISTS (
-		   SELECT FROM big b
-		    WHERE b.id = r.id
-		      AND bigdoc(b.n, b.id) @@@ (SELECT string_agg('t' || r.id || 'x' || g, ' & ')
-		                                   FROM (SELECT DISTINCT 1 + ((i * 7919) % r.n) AS g
-		                                           FROM generate_series(0, 23) i) s)::wquery)});
+		 WHERE weave_count('big_w',
+		         (SELECT string_agg('t' || r.id || 'x' || g, ' & ')
+		            FROM (SELECT DISTINCT 1 + ((i * 7919) % r.n) AS g
+		                    FROM generate_series(0, 23) i) s)::wquery) <> 1});
 }
 
 sub vacuum_verbose
