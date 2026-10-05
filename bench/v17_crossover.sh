@@ -72,10 +72,11 @@ K=${K:-10}
 W=${W:-'{0.5,0.5}'}
 OUT=${OUT:-/tmp/out}
 TAG=${TAG:-$DB}
-# MATNONE=0 skips TIMING the three materializing arms at the no-predicate point (they
-# are still correctness-checked there).  At 1M rows each of them scores the whole
-# corpus per run -- seconds per statement, ~half an hour per arm at the protocol's
-# rep count -- to measure a regime no switch would ever choose.
+# MATNONE=0 skips the three materializing arms at the no-predicate point ENTIRELY --
+# timing and correctness check.  At 1M rows each of them scores the whole corpus per
+# statement, and arm D's weave_vec_scan(k = 1M, docids = 1M) exceeded the 300 s
+# statement_timeout on the first such run (2026-10-04), which is a regime no switch
+# would ever choose.  A at that point is still timed and plan-checked.
 MATNONE=${MATNONE:-1}
 
 W1=$(printf '%s' "$W" | tr -d '{}' | cut -d, -f1)
@@ -286,12 +287,18 @@ sorted()   { tr ' ' '\n' | grep -v '^$' | sort -n | tr '\n' ' '; }
 while IFS=$'\t' read -r kind tgt pred rows sel; do
     [ "$kind" = kind ] && continue
     [ "$pred" = - ] && pred=
+    [ "$kind" = none ] && [ "$MATNONE" = 0 ] && continue
     while IFS=$'\t' read -r qid wq qv nd adl dfs; do
         a=$( { echo "$SETUP $(arm_gucs A "$pred")"; arm_sql A "$pred" "$wq" "$qv" "$nd" "$adl" "$dfs" "$K"; } | ids_of) || die "check A failed"
         an=$( { echo "$SETUP $(arm_gucs A "$pred") SET pg_weave.fuse_normalize = on;"; arm_sql A "$pred" "$wq" "$qv" "$nd" "$adl" "$dfs" "$K"; } | ids_of) || die "check Anorm failed"
         c=$( { echo "$SETUP $(arm_gucs C "$pred")"; arm_sql C "$pred" "$wq" "$qv" "$nd" "$adl" "$dfs" "$K"; } | ids_of) || die "check C failed"
         read -r btie bids < <( { echo "$SETUP $(arm_gucs B "$pred")"; arm_sql B "$pred" "$wq" "$qv" "$nd" "$adl" "$dfs" 11 sc; } | tie_ids) || die "check B failed"
         read -r dtie dids < <( { echo "$SETUP $(arm_gucs D "$pred")"; arm_sql D "$pred" "$wq" "$qv" "$nd" "$adl" "$dfs" 11 sc; } | tie_ids) || die "check D failed"
+        # An arm that errored (a timeout, say) leaves an EMPTY id list, and `read < <(...)`
+        # does not propagate the failure -- so refuse an empty arm rather than record it
+        # as a disagreement.  Every point here admits at least one row.
+        [ -n "$a" ] && [ -n "$c" ] && [ -n "${bids// /}" ] && [ -n "${dids// /}" ] \
+            || die "$kind/$tgt qid=$qid: an arm returned no rows (A='$a' C='$c' B='$bids' D='$dids')"
         b=$(echo "$bids" | sorted); d=$(echo "$dids" | sorted)
         ov=$(comm -12 <(echo "$a" | tr ' ' '\n' | grep -v '^$' | sort) <(echo "$b" | tr ' ' '\n' | grep -v '^$' | sort) | wc -l)
         na=$(echo "$a" | wc -w)
@@ -369,6 +376,7 @@ while IFS=$'\t' read -r kind tgt pred rows sel; do
     [ "$kind" = kind ] && continue
     [ "$pred" = - ] && pred=
     for arm in $ARMS; do
+        [ "$kind" = none ] && [ "$arm" != A ] && [ "$MATNONE" = 0 ] && continue
         ex=$( { echo "$SETUP $(arm_gucs "$arm" "$pred")"; echo "EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)"; arm_sql "$arm" "$pred" "$wq1" "$qv1" "$nd1" "$adl1" "$dfs1" "$K"; } \
               | psql -X -q -v ON_ERROR_STOP=1 -d "$DB" -t -A) || die "buffers EXPLAIN failed"
         printf '=== BUFFERS %s %s %s\n%s\n' "$kind" "$tgt" "$arm" "$ex" >> "$PLANS"
