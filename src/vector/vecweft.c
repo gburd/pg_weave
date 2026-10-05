@@ -40,11 +40,32 @@ int
 weave_vecweft_geom(WeaveVecWeftGeom *g, int usable, int dim, int bits,
 				   int layout, weave_uint32 nvec)
 {
+	return weave_vecweft_geom_v(g, usable, dim, bits, layout, nvec,
+								WEAVE_VECWEFT_CUR);
+}
+
+/* Payload bytes the block's last lane strip occupies, header included. */
+static int
+last_lane_used(const WeaveVecWeftGeom *g)
+{
+	int			n = g->dim - (g->lane_strips - 1) * g->lane_cpp;
+
+	return (int) sizeof(WeaveVecStripHdr) + n * weave_strip_coordbytes(g->bits);
+}
+
+int
+weave_vecweft_geom_v(WeaveVecWeftGeom *g, int usable, int dim, int bits,
+					 int layout, weave_uint32 nvec, int version)
+{
 	int			avail;
 
 	if (g == NULL)
 		return -1;
 	memset(g, 0, sizeof(*g));
+
+	if (version != WEAVE_VECWEFT_V3 && version != WEAVE_VECWEFT_V4)
+		return -1;
+	g->version = version;
 
 	/*
 	 * VECMAJOR is refused here as well as in weave_strip_build(), not merely
@@ -99,6 +120,20 @@ weave_vecweft_geom(WeaveVecWeftGeom *g, int usable, int dim, int bits,
 		(weave_uint32) g->rpp;
 	g->nstrips = g->nblocks * (weave_uint32) g->strips_per_block;
 
+	/*
+	 * v4: the centroid strip follows the last lane strip on its page when the
+	 * whole of it fits there.  One centroid strip is the only case packed -- at 4
+	 * bits a centroid strip holds 16,296 coordinates, so this is every dim the AM
+	 * accepts -- and a centroid that would need two strips keeps v3's layout.
+	 */
+	g->cen_packed = 0;
+	if (version >= WEAVE_VECWEFT_V4 && g->cen_strips == 1 &&
+		WEAVE_VECWEFT_ALIGN(last_lane_used(g)) + (int) sizeof(WeaveVecStripHdr) +
+		(int) cen_coord_bytes(bits, dim) <= usable)
+		g->cen_packed = 1;
+	g->pages_per_block = g->cen_packed ? g->lane_strips : g->strips_per_block;
+	g->npages = g->nblocks * (weave_uint32) g->pages_per_block;
+
 	g->wpp = weave_vecwarp_per_page(usable);
 	if (g->wpp <= 0)
 		return -1;
@@ -135,6 +170,8 @@ weave_vecweft_strip_plan(const WeaveVecWeftGeom *g, weave_uint32 i,
 		out->flags = 0;
 		out->nbytes = n * weave_strip_coordbytes(g->bits);
 		out->srcoff = j0 * weave_strip_coordbytes(g->bits);
+		out->page = k;
+		out->pageoff = 0;
 	}
 	else
 	{
@@ -149,8 +186,181 @@ weave_vecweft_strip_plan(const WeaveVecWeftGeom *g, weave_uint32 i,
 		out->flags = WEAVE_VSTRIP_F_CENTROID;
 		out->nbytes = (int) cen_coord_bytes(g->bits, n);
 		out->srcoff = (int) cen_coord_offset(g->bits, j0);
+		if (g->cen_packed)
+		{
+			out->page = g->lane_strips - 1;
+			out->pageoff = WEAVE_VECWEFT_ALIGN(last_lane_used(g));
+		}
+		else
+		{
+			out->page = k;
+			out->pageoff = 0;
+		}
 	}
 	return 0;
+}
+
+/* The block-relative strip indexes on page `pg`: [*k0, *k0 + return). */
+static int
+page_strips(const WeaveVecWeftGeom *g, int pg, int *k0)
+{
+	if (pg < 0 || pg >= g->pages_per_block)
+		return 0;
+	*k0 = pg;
+	if (g->cen_packed && pg == g->lane_strips - 1)
+		return 2;
+	return 1;
+}
+
+int
+weave_vecweft_page_build(void *dst, size_t dstlen, const WeaveVecWeftGeom *g,
+						 weave_uint32 blockno, int pg,
+						 const weave_uint8 *block, const weave_uint8 *cencode)
+{
+	int			k0 = 0;
+	int			n;
+	int			k;
+	int			used = 0;
+
+	if (dst == NULL || g == NULL || block == NULL || cencode == NULL)
+		return -1;
+	if (blockno >= g->nblocks || (n = page_strips(g, pg, &k0)) == 0)
+		return -1;
+
+	memset(dst, 0, dstlen);
+	for (k = k0; k < k0 + n; k++)
+	{
+		WeaveVecStripPlan p;
+		weave_uint8 *at;
+		int			m;
+
+		if (weave_vecweft_strip_plan(g, blockno * (weave_uint32) g->strips_per_block +
+									 (weave_uint32) k, &p) != 0 ||
+			p.page != pg || p.pageoff < used || (size_t) p.pageoff > dstlen)
+			return -1;
+		at = (weave_uint8 *) dst + p.pageoff;
+		if ((p.flags & WEAVE_VSTRIP_F_CENTROID) != 0)
+			m = weave_censtrip_build(at, dstlen - (size_t) p.pageoff, g, &p,
+									 cencode);
+		else
+			m = weave_strip_build(at, dstlen - (size_t) p.pageoff,
+								  (WeavePackLayout) g->layout, g->dim, g->bits,
+								  p.blockno, p.j0, p.ncoords, p.flags, block);
+		if (m < 0)
+			return -1;
+		used = p.pageoff + m;
+	}
+	return used;
+}
+
+int
+weave_vecweft_page_take(const WeaveVecWeftGeom *g, const void *src, size_t srclen,
+						weave_uint32 blockno, int pg, weave_uint8 *block,
+						weave_uint8 *cencode, const char **why)
+{
+	int			k0 = 0;
+	int			n;
+	int			k;
+
+	if (why != NULL)
+		*why = NULL;
+	if (g == NULL || src == NULL)
+	{
+		if (why)
+			*why = "null argument";
+		return -1;
+	}
+	if (blockno >= g->nblocks || (n = page_strips(g, pg, &k0)) == 0)
+	{
+		if (why)
+			*why = "no such vector code page in the weft's layout";
+		return -1;
+	}
+
+	for (k = k0; k < k0 + n; k++)
+	{
+		WeaveVecStripPlan p;
+		WeaveVecStripHdr hdr;
+		const weave_uint8 *at;
+		const weave_uint8 *bytes = NULL;
+		size_t		len;
+		int			got;
+
+		if (weave_vecweft_strip_plan(g, blockno * (weave_uint32) g->strips_per_block +
+									 (weave_uint32) k, &p) != 0 || p.page != pg)
+		{
+			if (why)
+				*why = "the weft's strip plan has no strip for this page";
+			return -1;
+		}
+		if ((size_t) p.pageoff + sizeof(WeaveVecStripHdr) > srclen)
+		{
+			if (why)
+				*why = "page payload shorter than the strips the layout puts on it";
+			return -1;
+		}
+		at = (const weave_uint8 *) src + p.pageoff;
+#ifdef WEAVE_VECWEFT_PLANT_NO_OFF_LEN
+		len = srclen;			/* test/fuzz/fuzz_vecstrip.c teeth: the length
+								 * forgets the offset, so a strip declared past
+								 * the end of the page is read past it */
+#else
+		len = srclen - (size_t) p.pageoff;
+#endif
+
+		/*
+		 * The FLAVOUR comes from the plan, never from the page: a page that
+		 * claims to be a centroid strip where the plan puts a lane strip is
+		 * refused by the parser the plan picked, not reinterpreted.
+		 */
+		if ((p.flags & WEAVE_VSTRIP_F_CENTROID) != 0)
+			got = weave_censtrip_parse(at, len, g, &hdr, &bytes, why);
+		else
+		{
+			got = weave_strip_parse(at, len, g->dim, g->bits, &hdr, &bytes, why);
+			if (got >= 0 && (hdr.flags & WEAVE_VSTRIP_F_CENTROID) != 0)
+			{
+				if (why)
+					*why = "a centroid strip is where the weft's layout puts a lane strip";
+				return -1;
+			}
+		}
+		if (got < 0)
+			return -1;
+		if (hdr.blockno != blockno)
+		{
+			if (why)
+				*why = "a vector code page does not carry the block the weft's layout calls for";
+			return -1;
+		}
+		if ((int) hdr.j0 != p.j0 || (int) hdr.ncoords != p.ncoords)
+		{
+			if (why)
+				*why = "a vector strip carries a coordinate range the weft's layout does not call for";
+			return -1;
+		}
+
+		if ((p.flags & WEAVE_VSTRIP_F_CENTROID) != 0)
+		{
+			if (cencode != NULL &&
+				weave_censtrip_scatter(cencode, (size_t) g->codebytes, g, &hdr,
+									   bytes) != 0)
+			{
+				if (why)
+					*why = "a centroid strip does not fit the code it belongs to";
+				return -1;
+			}
+		}
+		else if (block != NULL &&
+				 weave_strip_scatter(block, (size_t) g->blockbytes, g->dim,
+									 g->bits, &hdr, bytes) != 0)
+		{
+			if (why)
+				*why = "a lane strip does not fit the block it belongs to";
+			return -1;
+		}
+	}
+	return n;
 }
 
 int

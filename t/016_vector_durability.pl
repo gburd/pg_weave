@@ -105,8 +105,12 @@ my ($nblocks_before, $npages_before) = split /\|/, $node->safe_psql('postgres', 
 	                        'vector_warp'))});
 cmp_ok($nblocks_before, '>', 28,
 	"the weft has $nblocks_before blocks, so its directory is a multi-page chain");
-cmp_ok($npages_before, '>', 100,
-	"the weft occupies $npages_before pages, so a truncated chain would be visible");
+# 63 blocks at 96-d: 63 code pages (v4 packs each centroid onto its block's lane
+# page; it was 126 in v3), 3 directory, 2 warp, 1 meta.  The threshold was 100 under
+# v3 and is stated in BLOCKS now, so a later layout change cannot quietly make the
+# chain too short to show a truncation.
+cmp_ok($npages_before, '>', $nblocks_before,
+	"the weft occupies $npages_before pages, more than its $nblocks_before blocks, so a truncated chain would be visible");
 
 my $live_before = $node->safe_psql('postgres',
 	q{SELECT sum(nlive) FROM weave_vec_blocks('vd_weave')});

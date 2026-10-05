@@ -13,9 +13,11 @@
 #   CREATE INDEX ... USING weave (d, v) WITH (bits = 4)
 #   CREATE INDEX ... USING hnsw (v vector_cosine_ops) WITH (m = 16, ef_construction = 64)
 # and every byte of the weave index split by weave_index_size_detail(), with the
-# code weft additionally split into lane strips and centroid strips by
-# weave_vec_strips().  The two splits are independent reports, so the script
-# asserts they agree on the code-page count before it prints anything.
+# code weft additionally split into lane pages and centroid-only pages by
+# weave_vec_strips() (one row per strip; since weft v4 a lane page may also carry
+# its block's centroid strip, so pages are counted as DISTINCT blkno).  The two
+# splits are independent reports, so the script asserts they agree on the
+# code-page count before it prints anything.
 #
 # Writes /tmp/out/vmajor_raw.tsv (every size_detail row) and
 # /tmp/out/vmajor_bytes.tsv (one row per dim), and prints the latter.
@@ -130,7 +132,7 @@ for D in $DIMS; do
 	# size_detail buckets must sum to the relation, or nothing below means anything.
 	chk=$($PSQL -tAc "
 		SELECT (SELECT npages FROM weave_index_size_detail('tw_idx') WHERE kind = 'vector_codes')
-		       = (SELECT count(*) FROM weave_vec_strips('tw_idx'))
+		       = (SELECT count(DISTINCT (segno, blkno)) FROM weave_vec_strips('tw_idx'))
 		   AND (SELECT sum(bytes) FROM weave_index_size_detail('tw_idx')) = pg_relation_size('tw_idx')
 		   AND (SELECT sum(nvec) FROM weave_vec_meta('tw_idx')) = $N
 		   AND (SELECT bool_and(bits = 4 AND dim = $D) FROM weave_vec_meta('tw_idx'))")
@@ -139,9 +141,15 @@ for D in $DIMS; do
 	$PSQL -tA -F$'\t' >> "$OUT/vmajor_bytes.tsv" <<-SQL
 		WITH sd AS (SELECT kind, npages, bytes FROM weave_index_size_detail('tw_idx')),
 		     vm AS (SELECT count(*) AS segs, sum(nblocks) AS nblocks FROM weave_vec_meta('tw_idx')),
-		     st AS (SELECT count(*) FILTER (WHERE NOT centroid) AS lane_pages,
-		                   count(*) FILTER (WHERE centroid) AS cen_pages
-		              FROM weave_vec_strips('tw_idx')),
+		     -- per PAGE, since a v4 page may carry a lane strip and its block's
+		     -- centroid strip: a lane page is any page with a lane strip on it, a
+		     -- centroid page one that carries ONLY a centroid strip (v3, or a v4
+		     -- dim whose centroid spills)
+		     pg AS (SELECT segno, blkno, bool_or(NOT centroid) AS has_lane
+		              FROM weave_vec_strips('tw_idx') GROUP BY segno, blkno),
+		     st AS (SELECT count(*) FILTER (WHERE has_lane) AS lane_pages,
+		                   count(*) FILTER (WHERE NOT has_lane) AS cen_pages
+		              FROM pg),
 		     r AS (
 		SELECT $D AS dim, $N::numeric AS n, vm.segs, vm.nblocks,
 		       pg_relation_size('tw_idx') AS weave_b,

@@ -407,7 +407,7 @@ check-standalone:
 		src/vector/vecpage.c src/vector/pack.c; \
 	$$tmp/vecpage > $$tmp/vecpage.log 2>&1 || { cat $$tmp/vecpage.log; exit 1; }; \
 	tail -1 $$tmp/vecpage.log; \
-	echo "== V7 vector weft: partition, round trip, statistics recompute, the merge MOVE =="; \
+	echo "== V7 vector weft (v3+v4): partition, round trip, statistics recompute, the merge MOVE, shape bit-identity =="; \
 	$(CHECK_CC) $(STANDALONE_CFLAGS) -o $$tmp/vecweft test/hegel/test_vecweft.c \
 		src/vector/vecweft.c src/vector/vecpage.c src/vector/vecstats.c \
 		src/vector/quantize.c src/vector/pack.c -lm; \

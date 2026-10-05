@@ -585,6 +585,35 @@ keep growing and the trie does not.
    out-of-tree in the release qualification (it needs two `.so` builds)", which is
    a gate nobody runs. One `.so` is enough if the old image is *manufactured*
    rather than built, and the v5 → v6 delta is small enough to manufacture exactly.
+7. **A weft-internal version is a per-object discriminator, and bumping it does not
+   by itself bump `WEAVE_VERSION`.** The vector weft carries its own version on its
+   `WEAVE_PK_VMETA` page (`WEAVE_VMETA_VERSION`): 3 since G27's `firstpage`, **4
+   since 2026-10-05**, when a code page may carry its block's centroid strip after
+   the last lane strip (`doc/specs/VECTOR_CHANNEL.md` §7.1, "v4"). This build reads
+   v3 and v4 wefts and writes v4; an upgraded index holds both until a merge rewrites
+   the old bolts, and a merge's output is always v4.
+
+   The metapage stays at its version, by item 1's rule -- "does the reading build
+   know how to free this?" -- applied to the OLDER binary meeting a v4 weft:
+
+   - **It cannot misread one.** `vec_meta_read()` refuses any `version` but its own
+     (an `ERROR`-class refusal, `ERRCODE_INDEX_CORRUPTED`, on scan), so a v3-only
+     `.so` never parses a packed page.
+   - **It cannot leak one.** A weft it cannot open makes `weave_vec_merge_geom()`
+     refuse every merge group containing that bolt, so the bolt is never a merge
+     input and its pages are never handed to `weave_vec_free_weft()`. Nothing else
+     frees a weft page by page (compaction is a merge; bulkdelete rewrites only the
+     livedocs bitmap).
+   - **It cannot under-count.** No pending item, metapage field or `segs[]` stride
+     changed.
+
+   That is the opposite of v7's situation (an older binary would have *merged* and
+   leaked a weft kind it did not know), and the same as the VMETA 2 -> 3 change for
+   G27, which also left `WEAVE_VERSION` alone. The cost of not bumping is that the
+   older binary fails at query time on a v4 bolt rather than at metapage read: the
+   error names the bolt and says the weft is "a format version this build does not
+   read". Downgrading a binary over an index that a newer binary has written to is
+   not a supported operation in either case.
 
 ## 9. Invariants `weave_check()` must verify
 
@@ -675,6 +704,11 @@ The following are specified and unimplemented:
   sequence for the same input — asserted over 2.8 M random cases by
   `test/hegel/test_doclen_block.c`, because a disagreement produces a wrong
   document length, hence a plausible-but-wrong BM25 ranking rather than an error.
+- (vector) The code chain is exactly `nblocks * pages_per_block` pages, where
+  `pages_per_block` is the weft geometry's (it depends on `dim`, `bits` and the
+  weft version: v4 packs the centroid onto the last lane page when it fits).
+  Checked inside `vector_block_stats_match_codes`, because a page that claims no
+  valid block is invisible to every per-block read.
 - (vector) Every `WeaveVecBlockHdr.smax`, `maxrecnorm`, `minnorm`, `cenrad` equals
   a recomputation from the block's live lanes. See
   `bench/RESULTS_BOUND_PRUNING.md` for why `cenrad` in particular must be

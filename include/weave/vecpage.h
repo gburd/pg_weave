@@ -74,9 +74,9 @@ typedef struct WeaveVecStripHdr
 #define WEAVE_VSTRIP_F_CENTROID 0x0001	/* this strip holds the block's centroid
 										 * code (one lane's worth per coordinate),
 										 * not the 32 lanes.  Read only by the (B3)
-										 * bound, which measured 0.00% pruning on
-										 * real corpora, so a non-pruning scan never
-										 * touches these pages. */
+										 * bound.  In a v4 weft it sits after the
+										 * block's last lane strip on the same page
+										 * when it fits (weave/vecweft.h). */
 
 /*
  * How many coordinates fit on a page with `usable` bytes of payload space.
