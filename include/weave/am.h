@@ -1920,6 +1920,9 @@ extern bool weave_doclist_read(Relation index, BlockNumber root, WeaveDocset *ds
 /* The bolt's docset (list, or the legacy union); ERROR on a corrupt list. */
 extern void weave_segment_docset(Relation index, const WeaveSegMeta *seg,
 								 WeaveDocset *ds);
+/* Just the NULL-document set (cheap when there is none); false on a bad list. */
+extern bool weave_doclist_nulls(Relation index, const WeaveSegMeta *seg,
+								uint64 **out, Size *nout, const char **detail);
 extern void weave_segment_docset_legacy(Relation index, const WeaveSegMeta *seg,
 										WeaveDocset *ds);
 extern void weave_docset_free(WeaveDocset *ds);

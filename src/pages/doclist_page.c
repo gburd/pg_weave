@@ -275,6 +275,64 @@ weave_docset_free(WeaveDocset *ds)
 	memset(ds, 0, sizeof(*ds));
 }
 
+/*
+ * Only the NULL-document set of a bolt, ascending, into *out (palloc'd; NULL
+ * and 0 when there is none).  The common bolt has NO NULL document, and a
+ * reader on a hot path (the fused ranked phase, once per bolt per scan) should
+ * not decode every docid to learn that, so the header on the chain's FIRST page
+ * is peeked: nnull == 0 there costs one page read.  Any other answer -- a
+ * nonzero count, or a header that does not even carry the magic -- takes the
+ * full validated read, so an unvalidated peek can only ever skip work, never
+ * supply data.  Returns false with *detail on a list that does not read.
+ */
+bool
+weave_doclist_nulls(Relation index, const WeaveSegMeta *seg, uint64 **out,
+					Size *nout, const char **detail)
+{
+	BlockNumber root = weave_doclist_root(index, seg);
+	WeaveDocset ds;
+
+	*out = NULL;
+	*nout = 0;
+	*detail = NULL;
+	if (root == InvalidBlockNumber)
+		return true;			/* pre-v12 bolt: never indexed a NULL document */
+	if (root < RelationGetNumberOfBlocks(index))
+	{
+		Buffer		buf = ReadBuffer(index, root);
+		Page		page;
+		bool		none = false;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!PageIsNew(page) && !WeavePageIsFreed(page) &&
+			WeavePageHasKind(page, WEAVE_PK_DOCLIST) &&
+			weave_page_entry_end(page) - (char *) PageGetContents(page) >=
+			(ptrdiff_t) WEAVE_DOCLIST_HDRSIZE)
+		{
+			WeaveDocListHeader h;
+
+			memcpy(&h, PageGetContents(page), sizeof(h));
+			none = (h.magic == WEAVE_DOCLIST_MAGIC &&
+					h.version == WEAVE_DOCLIST_VERSION && h.nnull == 0);
+		}
+		UnlockReleaseBuffer(buf);
+		if (none)
+			return true;
+	}
+	if (!weave_doclist_read(index, root, &ds, detail))
+		return false;
+	pfree(ds.ids);
+	if (ds.nnull == 0)
+	{
+		pfree(ds.nullids);
+		return true;
+	}
+	*out = ds.nullids;
+	*nout = ds.nnull;
+	return true;
+}
+
 /* grow-append for the legacy union; corpus-scale, huge-safe */
 static void
 docset_push(uint64 **v, Size *n, Size *cap, uint64 x)

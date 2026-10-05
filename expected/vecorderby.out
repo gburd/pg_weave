@@ -932,12 +932,13 @@ SELECT count(*) AS vec_filtered
 -- among every row that HAS A LANE OR A PENDING ITEM whatever the quantizer does.
 -- Killed the mutant that drops the frontier (it put this row at rank 5).
 --
--- The ten NULL-DOCUMENT rows are excluded from that rank, and they are a loss
--- recorded here rather than a pass: the build skips a row whose wdoc is NULL, so its
--- vector is in no weft, and it comes out of the padding at +Infinity -- AFTER this
--- row, where a heap sort would put it by its real distance.  Scoring padded rows
--- exactly would mean emitting a distance below ones already handed out, which the
--- executor refuses ("index returned tuples in wrong order").  doc/GAPS.md G56.
+-- The ten NULL-DOCUMENT rows used to be excluded from that rank, recorded here as
+-- a loss: the build skipped a row whose wdoc is NULL, so its vector was in no weft
+-- and it came out of the padding at +Infinity, AFTER this row (doc/GAPS.md G56,
+-- G77).  Since v12 a NULL document is indexed with its lane (doc/specs/
+-- SEGMENT_FORMAT.md sect. 6 "The document list"), so the far pending row is last
+-- among EVERY row with a vector, NULL documents included, and every NULL-document
+-- vector ranks BEFORE it, by its real distance, as a heap sort puts it.
 INSERT INTO vg(d, v) VALUES (to_wdoc('simple', 'farpend'), '[1000,1000,1000,1000]');
 SET pg_weave.wand_initial_k = 1;
 CREATE TEMP TABLE vgf AS
@@ -945,13 +946,13 @@ CREATE TEMP TABLE vgf AS
 RESET pg_weave.wand_initial_k;
 SET enable_seqscan = on;
 SELECT (SELECT rn FROM vgf WHERE id = (SELECT max(id) FROM vg))
-       = (SELECT count(*) FROM vg WHERE v IS NOT NULL AND d IS NOT NULL) AS far_pending_row_is_last_indexed,
-       (SELECT min(rn) FROM vgf JOIN vg USING (id) WHERE vg.d IS NULL AND vg.v IS NOT NULL)
-       > (SELECT rn FROM vgf WHERE id = (SELECT max(id) FROM vg)) AS null_doc_vectors_come_after,
+       = (SELECT count(*) FROM vg WHERE v IS NOT NULL) AS far_pending_row_is_last_indexed,
+       (SELECT max(rn) FROM vgf JOIN vg USING (id) WHERE vg.d IS NULL AND vg.v IS NOT NULL)
+       < (SELECT rn FROM vgf WHERE id = (SELECT max(id) FROM vg)) AS null_doc_vectors_rank_by_distance,
        (SELECT count(*) FROM vgf) = (SELECT count(*) FROM vg) AS narrow_every_row;
- far_pending_row_is_last_indexed | null_doc_vectors_come_after | narrow_every_row 
----------------------------------+-----------------------------+------------------
- t                               | t                           | t
+ far_pending_row_is_last_indexed | null_doc_vectors_rank_by_distance | narrow_every_row 
+---------------------------------+-----------------------------------+------------------
+ t                               | t                                 | t
 (1 row)
 
 SET enable_seqscan = off;

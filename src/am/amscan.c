@@ -9495,9 +9495,10 @@ typedef struct FuseVecChan
  */
 static uint32
 weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
-					   const WeaveTombstones *tombs, uint64 **docid_out,
-					   uint64 **allow_out)
+					   const WeaveTombstones *tombs, const uint64 *nulls,
+					   Size nnull, uint64 **docid_out, uint64 **allow_out)
 {
+	Size		nk = 0;
 	WeaveVecWarpCursor wc;
 	uint64	   *docid;
 	uint64	   *allow;
@@ -9530,6 +9531,18 @@ weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
 					 errdetail("%s.", why != NULL ? why : "unknown reason")));
 		docid[i] = d;
 		if (havetombs && weave_tombstoned_in(tombs, (uint32) segidx, d, &tombcursor))
+			continue;
+
+		/*
+		 * v12: a NULL DOCUMENT has a lane but no fuse() value when the fusion
+		 * has a lexical key -- `body <=> q` is NULL for a NULL body, and fuse()
+		 * is NULL when any argument is (G71) -- so it is padded, never ranked.
+		 * The caller passes the bolt's NULL set only in that case.  Both
+		 * sequences ascend, so one forward merge.
+		 */
+		while (nk < nnull && nulls[nk] < d)
+			nk++;
+		if (nk < nnull && nulls[nk] == d)
 			continue;
 		allow[i / 64] |= UINT64CONST(1) << (i % 64);
 		nlive++;
@@ -9607,9 +9620,24 @@ weave_fuse_collect_pending(Relation index, const WeaveMetaPageData *meta,
 			int			t;
 			int			i;
 
-			/* a v12 NULL document is scored like a zero-term one: no lexical
-			 * contribution, its vector as usual (a bolt gives it a lane) */
-			if (!rec.nulldoc && !weave_doc_is_valid(rec.doc, rec.doclen))
+			/*
+			 * v12: a NULL DOCUMENT's fuse() is NULL whenever the fusion has a
+			 * lexical key (`body <=> q` is NULL for a NULL body), so it is
+			 * padded, not ranked -- the bolt pass masks its lane for the same
+			 * reason (weave_fuse_vec_warpmap()).  With vector keys only it is
+			 * scored like a zero-term document: by its vector.
+			 */
+			if (rec.nulldoc)
+			{
+				bool		haslex = false;
+
+				for (qi = 0; qi < so->nfuse; qi++)
+					if (so->fuseStrat[qi] == WEAVE_STRAT_DISTANCE)
+						haslex = true;
+				if (haslex)
+					continue;
+			}
+			else if (!weave_doc_is_valid(rec.doc, rec.doclen))
 				continue;	/* weave_collect_matches warns about these */
 
 			for (qi = 0; qi < so->nfuse; qi++)
@@ -10330,8 +10358,28 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 									WEAVE_FUSE_MAX_CHAN),
 							 errhint("Use fewer query terms, or move a term into a WHERE clause so it becomes a gate.")));
 
-				nlane = weave_fuse_vec_warpmap(index, &w, (int) s, &tombs,
-											   &dmap, &allow);
+				{
+					uint64	   *nulls = NULL;
+					Size		nnull = 0;
+					const char *ndetail = NULL;
+					bool		haslex = false;
+					int			qj;
+
+					for (qj = 0; qj < so->nfuse; qj++)
+						if (so->fuseStrat[qj] == WEAVE_STRAT_DISTANCE)
+							haslex = true;
+					if (haslex &&
+						!weave_doclist_nulls(index, sg, &nulls, &nnull, &ndetail))
+						ereport(ERROR,
+								(errcode(ERRCODE_INDEX_CORRUPTED),
+								 errmsg("bolt %u of index \"%s\" has a corrupt document list",
+										s, RelationGetRelationName(index)),
+								 errdetail("%s", ndetail != NULL ? ndetail : "unknown")));
+					nlane = weave_fuse_vec_warpmap(index, &w, (int) s, &tombs,
+												   nulls, nnull, &dmap, &allow);
+					if (nulls)
+						pfree(nulls);
+				}
 				if (nlane == 0)
 				{
 					novector = true;	/* every document here is tombstoned */

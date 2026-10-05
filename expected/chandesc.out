@@ -35,6 +35,8 @@ SELECT invariant, ok FROM weave_check('cd_weave') ORDER BY invariant;
  chandesc_reachable               | t
  chandesc_roots_agree             | t
  chandesc_version_consistent      | t
+ doclist_coverage                 | t
+ doclist_valid                    | t
  metapage_version_recognized      | t
  nsegments_bound                  | t
  page_kinds_decodable             | t
@@ -45,7 +47,7 @@ SELECT invariant, ok FROM weave_check('cd_weave') ORDER BY invariant;
  vector_block_stats_match_codes   | t
  vector_coverage                  | t
  vector_warp_map_ascending        | t
-(14 rows)
+(16 rows)
 
 -- The deep pass adds full-relation page reachability and the
 -- no-two-chains-overlap assertion (SEGMENT_FORMAT.md section 8 item 5).
@@ -57,6 +59,9 @@ SELECT invariant, ok FROM weave_check('cd_weave', true) ORDER BY invariant;
  chandesc_reachable               | t
  chandesc_roots_agree             | t
  chandesc_version_consistent      | t
+ doclist_coverage                 | t
+ doclist_covers_postings          | t
+ doclist_valid                    | t
  docvals_dictionary_ascending     | t
  metapage_version_recognized      | t
  nsegments_bound                  | t
@@ -69,7 +74,7 @@ SELECT invariant, ok FROM weave_check('cd_weave', true) ORDER BY invariant;
  vector_block_stats_match_codes   | t
  vector_coverage                  | t
  vector_warp_map_ascending        | t
-(17 rows)
+(20 rows)
 
 -- The only assertion that matters: nothing is violated.
 SELECT count(*) AS violations FROM weave_check('cd_weave', true) WHERE NOT ok;
@@ -83,7 +88,7 @@ SELECT detail FROM weave_check('cd_weave')
  WHERE invariant = 'metapage_version_recognized';
                       detail                       
 ---------------------------------------------------
- format v11 (this build reads v3..v11, writes v11)
+ format v12 (this build reads v3..v12, writes v12)
 (1 row)
 
 -- Every bolt is self-describing on a fresh v6 build.
@@ -281,10 +286,10 @@ ERROR:  "cdnb_btree" is not a weave index
 -- empty result reads as "that page is fine".
 SELECT * FROM weave_page_info('cd_weave', 1000000000);
 ERROR:  block number 1000000000 is out of range for index "cd_weave"
-DETAIL:  The relation has 13 block(s).
+DETAIL:  The relation has 14 block(s).
 SELECT * FROM weave_page_info('cd_weave', -1);
 ERROR:  block number -1 is out of range for index "cd_weave"
-DETAIL:  The relation has 13 block(s).
+DETAIL:  The relation has 14 block(s).
 -- An index built over an empty table still has a metapage and an empty bolt
 -- directory, so every invariant holds vacuously and nothing is violated.  (The
 -- zero-block case weave_check() also handles is only reachable for an index whose
