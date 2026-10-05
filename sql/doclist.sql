@@ -1,0 +1,198 @@
+-- The v12 per-bolt DOCUMENT LIST: doc/specs/SEGMENT_FORMAT.md sect. 6 "The
+-- document list"; doc/GAPS.md G77, G78, G80, G81.
+--
+-- Before v12 the only enumeration of a bolt's documents was its posting lists, so
+-- a document with no posting was invisible to whatever asked "which documents are
+-- in this bolt?".  Four silent wrong answers followed, each reproduced below and
+-- each compared against the HEAP's own answer rather than a fixed expectation:
+--
+--   G77  a row whose lexical column is NULL was never indexed, so a docvalues
+--        restriction or a vector ORDER BY answered by the index dropped it;
+--   G78  `@@@ '!q'` omitted a document with no terms (to_wdoc(''));
+--   G80  VACUUM never tombstoned a zero-term document, so a new row on its
+--        recycled ctid inherited its docvalue (and vector lane);
+--   G81  a build or flush whose documents had no terms wrote no bolt at all.
+--
+-- Every phase is checked the same way: index scan, bitmap scan and the heap.
+-- Phases: build, pending (un-flushed INSERTs), after a flush, after a merge,
+-- after DELETE + VACUUM with a recycled ctid.
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+
+-- The set a query returns with only the named access path allowed.
+CREATE FUNCTION pg_temp.dl_ids(q text, path text) RETURNS int[]
+LANGUAGE plpgsql AS $$
+DECLARE r int[];
+BEGIN
+  PERFORM set_config('enable_seqscan', CASE WHEN path = 'heap' THEN 'on' ELSE 'off' END, true);
+  PERFORM set_config('enable_indexscan', CASE WHEN path = 'index' THEN 'on' ELSE 'off' END, true);
+  PERFORM set_config('enable_bitmapscan', CASE WHEN path = 'bitmap' THEN 'on' ELSE 'off' END, true);
+  EXECUTE 'SELECT array_agg(id ORDER BY id) FROM (' || q || ') s' INTO r;
+  RETURN coalesce(r, '{}');
+END $$;
+-- index and bitmap against the heap, for one query
+CREATE FUNCTION pg_temp.dl_check(q text,
+    OUT heap int[], OUT index_ok bool, OUT bitmap_ok bool)
+LANGUAGE plpgsql AS $$
+BEGIN
+  heap := pg_temp.dl_ids(q, 'heap');
+  index_ok := pg_temp.dl_ids(q, 'index') = heap;
+  bitmap_ok := pg_temp.dl_ids(q, 'bitmap') = heap;
+END $$;
+-- an ORDER BY ... LIMIT answered by the index, as an ordered array
+CREATE FUNCTION pg_temp.dl_order(q text, path text) RETURNS int[]
+LANGUAGE plpgsql AS $$
+DECLARE r int[]; x record;
+BEGIN
+  PERFORM set_config('enable_seqscan', CASE WHEN path = 'heap' THEN 'on' ELSE 'off' END, true);
+  PERFORM set_config('enable_indexscan', CASE WHEN path = 'index' THEN 'on' ELSE 'off' END, true);
+  PERFORM set_config('enable_bitmapscan', 'off', true);
+  r := '{}';
+  FOR x IN EXECUTE q LOOP r := r || x.id; END LOOP;
+  RETURN r;
+END $$;
+CREATE FUNCTION pg_temp.wait_for_horizon() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE x xid := (txid_current() % 4294967296)::text::xid; i int;
+BEGIN
+  FOR i IN 1 .. 600 LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_stat_activity
+                    WHERE datname = current_database() AND pid <> pg_backend_pid()
+                      AND (age(backend_xmin) > age(x) OR age(backend_xid) > age(x))) THEN
+      RETURN;
+    END IF;
+    PERFORM pg_sleep(0.1);
+    PERFORM pg_stat_clear_snapshot();
+  END LOOP;
+  RAISE NOTICE 'wait_for_horizon: an older snapshot was still held after 60 s';
+END $$;
+
+-- ============================================================================
+-- (1) G77 + G78 at BUILD: NULL documents, empty documents, docvalues, vectors
+-- ============================================================================
+CREATE TABLE dl (id int, body wdoc, emb wvec(4), price int8)
+  WITH (autovacuum_enabled = off);
+INSERT INTO dl SELECT g, to_wdoc('simple', 'common w' || g),
+                      ('[' || g || ',' || g || ',' || g || ',' || g || ']')::wvec, g
+  FROM generate_series(1, 200) g;
+INSERT INTO dl VALUES
+  (9001, NULL, '[0.5,0.5,0.5,0.5]', 3),           -- NULL document, live vector
+  (9002, to_wdoc('simple', ''), '[0.6,0.6,0.6,0.6]', 4),  -- empty document
+  (9003, NULL, NULL, 2),                           -- NULL document, NULL vector
+  (9004, to_wdoc('simple', 'rare'), NULL, 5);
+CREATE INDEX dl_w ON dl USING weave (body, emb, price int8_docval_ops);
+ANALYZE dl;
+
+-- the bolt carries a list, COMPLETE, and it is consistent
+SELECT invariant, ok, detail FROM weave_check('dl_w', true)
+ WHERE invariant LIKE 'doclist%' ORDER BY invariant;
+-- BM25 corpus N excludes the two NULL documents: 202 documents, not 204
+SELECT ndocs FROM weave_index_stats('dl_w');
+
+-- G77: the docvalues restriction finds the NULL documents
+SELECT * FROM pg_temp.dl_check('SELECT id FROM dl WHERE price < 6');
+-- G78: an empty document matches !q, a NULL document matches nothing
+SELECT * FROM pg_temp.dl_check('SELECT id FROM dl WHERE body @@@ ''!common''');
+SELECT * FROM pg_temp.dl_check('SELECT id FROM dl WHERE body @@@ ''!common & !rare''');
+-- weave_count() enters the scan machinery with no executor recheck behind it
+SELECT weave_count('dl_w', '!common') AS not_common_count,
+       (SELECT count(*) FROM dl WHERE weave_match(body, '!common')) AS heap_count;
+-- G77, vector: the NULL document with a live vector ranks by its vector
+SELECT pg_temp.dl_order('SELECT id FROM dl ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'index') AS idx,
+       pg_temp.dl_order('SELECT id FROM dl ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'heap') AS heap;
+SELECT pg_temp.dl_order('SELECT id FROM dl WHERE price < 6 ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'index') AS idx,
+       pg_temp.dl_order('SELECT id FROM dl WHERE price < 6 ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'heap') AS heap;
+
+-- ============================================================================
+-- (2) PENDING: the same shapes inserted after the build, before any flush
+-- ============================================================================
+INSERT INTO dl VALUES
+  (9101, NULL, '[0.4,0.4,0.4,0.4]', 1),
+  (9102, to_wdoc('simple', ''), NULL, 2),
+  (9103, NULL, NULL, 100);
+SELECT kind, npages > 0 AS present FROM weave_index_size_detail('dl_w')
+ WHERE kind LIKE 'pending%' ORDER BY kind;
+SELECT ndocs FROM weave_index_stats('dl_w');   -- 203: one more document, two NULL ones
+SELECT * FROM pg_temp.dl_check('SELECT id FROM dl WHERE price < 6');
+SELECT * FROM pg_temp.dl_check('SELECT id FROM dl WHERE body @@@ ''!common''');
+SELECT pg_temp.dl_order('SELECT id FROM dl ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'index') AS idx,
+       pg_temp.dl_order('SELECT id FROM dl ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'heap') AS heap;
+
+-- ============================================================================
+-- (3) AFTER A FLUSH: VACUUM folds the pending items into a second bolt
+-- ============================================================================
+VACUUM dl;
+SELECT weave_index_nsegments('dl_w') AS bolts, ndocs FROM weave_index_stats('dl_w');
+SELECT invariant, ok, detail FROM weave_check('dl_w', true)
+ WHERE invariant LIKE 'doclist%' OR NOT ok ORDER BY invariant;
+SELECT * FROM pg_temp.dl_check('SELECT id FROM dl WHERE price < 6');
+SELECT * FROM pg_temp.dl_check('SELECT id FROM dl WHERE body @@@ ''!common''');
+SELECT pg_temp.dl_order('SELECT id FROM dl ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'index') AS idx,
+       pg_temp.dl_order('SELECT id FROM dl ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'heap') AS heap;
+
+-- ============================================================================
+-- (4) AFTER A MERGE: the two bolts become one, the list is their union
+-- ============================================================================
+SELECT weave_merge('dl_w') AS merged;
+SELECT weave_index_nsegments('dl_w') AS bolts, ndocs FROM weave_index_stats('dl_w');
+SELECT invariant, ok, detail FROM weave_check('dl_w', true)
+ WHERE invariant LIKE 'doclist%' OR NOT ok ORDER BY invariant;
+SELECT * FROM pg_temp.dl_check('SELECT id FROM dl WHERE price < 6');
+SELECT * FROM pg_temp.dl_check('SELECT id FROM dl WHERE body @@@ ''!common''');
+SELECT pg_temp.dl_order('SELECT id FROM dl ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'index') AS idx,
+       pg_temp.dl_order('SELECT id FROM dl ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'heap') AS heap;
+DROP TABLE dl;
+
+-- ============================================================================
+-- (5) G80: DELETE + VACUUM + INSERT on the recycled ctid of a ZERO-TERM row
+-- ============================================================================
+-- The GAPS reproducer, verbatim, plus a vector so the same recycled ctid is
+-- checked on the vector ORDER BY too (the G79 agent's variant: with G79 fixed the
+-- vector pass applies tombstones, and this is what gives it one to apply).
+CREATE TABLE g80 (id int, body wdoc, emb wvec(4), price int8)
+  WITH (autovacuum_enabled = off);
+INSERT INTO g80 SELECT g, CASE WHEN g = 2 THEN to_wdoc('simple', '')  -- zero-term
+                              ELSE to_wdoc('simple', 'w' || g) END,
+                       ('[' || g || ',' || g || ',' || g || ',' || g || ']')::wvec,
+                       CASE WHEN g = 2 THEN 1 ELSE 100 * g END
+  FROM generate_series(1, 20) g;
+CREATE INDEX g80_w ON g80 USING weave (body, emb, price int8_docval_ops);
+DELETE FROM g80 WHERE id = 2;
+DO $$ BEGIN PERFORM pg_temp.wait_for_horizon(); END $$;
+VACUUM g80;                                      -- must tombstone the zero-term row
+SELECT ndeleted FROM weave_index_stats('g80_w'); -- 1, not 0
+INSERT INTO g80 VALUES (100, to_wdoc('simple', 'delta'), '[1000,1000,1000,1000]', 1000);
+SET enable_seqscan = on;
+SELECT id, ctid FROM g80 WHERE id IN (100) ORDER BY id;  -- the reuse happened
+SELECT * FROM pg_temp.dl_check('SELECT id FROM g80 WHERE price < 6');
+SELECT pg_temp.dl_order('SELECT id FROM g80 ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'index') AS idx,
+       pg_temp.dl_order('SELECT id FROM g80 ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'heap') AS heap;
+-- and again once the new row is flushed into a newer bolt
+VACUUM g80;
+SELECT * FROM pg_temp.dl_check('SELECT id FROM g80 WHERE price < 6');
+SELECT pg_temp.dl_order('SELECT id FROM g80 ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'index') AS idx,
+       pg_temp.dl_order('SELECT id FROM g80 ORDER BY emb <-> ''[0,0,0,0]''::wvec LIMIT 3', 'heap') AS heap;
+SELECT count(*) FILTER (WHERE NOT ok) AS violated FROM weave_check('g80_w', true);
+DROP TABLE g80;
+
+-- ============================================================================
+-- (6) G81: a build, and a flush, of ONLY zero-term documents
+-- ============================================================================
+CREATE TABLE g81 (id int, body wdoc, price int8) WITH (autovacuum_enabled = off);
+INSERT INTO g81 SELECT g, to_wdoc('simple', ''), g FROM generate_series(1, 10) g;
+CREATE INDEX g81_w ON g81 USING weave (body, price int8_docval_ops);
+SELECT weave_index_nsegments('g81_w') AS bolts;
+SELECT * FROM pg_temp.dl_check('SELECT id FROM g81 WHERE price < 4');
+SELECT * FROM pg_temp.dl_check('SELECT id FROM g81 WHERE body @@@ ''!anything''');
+DROP TABLE g81;
+CREATE TABLE g81 (id int, body wdoc, price int8) WITH (autovacuum_enabled = off);
+INSERT INTO g81 VALUES (1, to_wdoc('simple', 'seed'), 1);
+CREATE INDEX g81_w ON g81 USING weave (body, price int8_docval_ops);
+INSERT INTO g81 SELECT g, to_wdoc('simple', ''), g FROM generate_series(2, 10) g;
+INSERT INTO g81 VALUES (11, NULL, 2);
+VACUUM g81;                                      -- the flush of zero-term documents only
+SELECT weave_index_nsegments('g81_w') AS bolts;
+SELECT * FROM pg_temp.dl_check('SELECT id FROM g81 WHERE price < 4');
+SELECT count(*) FILTER (WHERE NOT ok) AS violated FROM weave_check('g81_w', true);
+DROP TABLE g81;
+RESET enable_seqscan;
+RESET enable_indexscan;
+RESET enable_bitmapscan;

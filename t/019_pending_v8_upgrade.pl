@@ -55,7 +55,8 @@ use constant {
 	OPAQUE_SIZE           => 8,		# MAXALIGN(sizeof(WeavePageOpaqueData))
 	WEAVE_PENDING_BIT     => 1 << 3,	# the legacy one-hot kind bit
 	WEAVE_PAGE_KIND_EXT   => 1 << 15,
-	WEAVE_PK_PENDING_V11  => 34,
+	WEAVE_PK_PENDING_V11  => 36,	# the CURRENT kind: v12's WEAVE_PK_PENDING_V12
+								# (same item layout as v11; doclen 0 = NULL document)
 	V11_HDR               => 24,
 	V8_HDR                => 12,
 };
