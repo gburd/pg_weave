@@ -704,6 +704,11 @@ The following are specified and unimplemented:
   sequence for the same input — asserted over 2.8 M random cases by
   `test/hegel/test_doclen_block.c`, because a disagreement produces a wrong
   document length, hence a plausible-but-wrong BM25 ranking rather than an error.
+- (vector) The code chain is exactly `nblocks * pages_per_block` pages, where
+  `pages_per_block` is the weft geometry's (it depends on `dim`, `bits` and the
+  weft version: v4 packs the centroid onto the last lane page when it fits).
+  Checked inside `vector_block_stats_match_codes`, because a page that claims no
+  valid block is invisible to every per-block read.
 - (vector) Every `WeaveVecBlockHdr.smax`, `maxrecnorm`, `minnorm`, `cenrad` equals
   a recomputation from the block's live lanes. See
   `bench/RESULTS_BOUND_PRUNING.md` for why `cenrad` in particular must be
