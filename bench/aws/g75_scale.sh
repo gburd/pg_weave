@@ -71,12 +71,14 @@ check setup || fail=1
 p0=$(pages); log "SCALE setup: $N rows, index $p0 pages"
 
 # the reclaim's cost on the 1M-row index, VACUUM with nothing pending (twice)
+# (stdin, not -c: a multi-statement -c string is a transaction block, and
+# VACUUM refuses one; the reclaim reports at DEBUG2 for a plain VACUUM)
 for r in 1 2; do
 	t0=$(date +%s.%N)
-	q "VACUUM s" > /dev/null
+	echo "SET client_min_messages = debug2; VACUUM s;" | $PSQL > $OUT/scale_quiet$r.log 2>&1
 	t1=$(date +%s.%N)
-	line=$(grep 'reclaimed .* stranded' $OUT/scale_server.log | tail -1)
-	log "SCALE quiet VACUUM $r: $(echo "$t1 - $t0" | bc) s; $line"
+	line=$(grep -o 'reclaimed .*' $OUT/scale_quiet$r.log | tail -1)
+	log "SCALE quiet VACUUM $r: $(awk "BEGIN{print $t1 - $t0}") s total; $line"
 done
 
 sumstranded=0
@@ -95,13 +97,15 @@ for c in $(seq 1 $CYCLES); do
 	start || { log "restart failed in cycle $c"; exit 1; }
 	st=$(leaked)
 	sumstranded=$((sumstranded + st))
-	q "VACUUM s" > /dev/null || { log "VACUUM failed after cycle $c"; fail=1; }
+	echo "SET client_min_messages = debug2; VACUUM s;" | $PSQL > $OUT/scale_post$c.log 2>&1 \
+		|| { log "VACUUM failed after cycle $c"; fail=1; }
+	rline=$(grep -o 'reclaimed .*' $OUT/scale_post$c.log | tail -1)
 	lk=$(leaked)
 	bad=$(q "SELECT coalesce(string_agg(invariant || ': ' || coalesce(detail,''), '; '), '') FROM weave_check('s_w', true) WHERE NOT ok")
 	check cycle$c || fail=1
 	[ "$lk" = 0 ] || fail=1
 	[ -z "$bad" ] || fail=1
-	log "SCALE cycle $c: in_window=$inwin stranded=$st leaked_after_vacuum=$lk deep_bad='$bad' pages $before -> $(pages)"
+	log "SCALE cycle $c: in_window=$inwin stranded=$st leaked_after_vacuum=$lk deep_bad='$bad' pages $before -> $(pages); $rline"
 done
 
 # a never-crashed reference for the same row count: REINDEX is the minimum

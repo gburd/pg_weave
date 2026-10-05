@@ -56,7 +56,7 @@ $node->safe_psql('postgres', q{
 	-- document, so the heap row stays tiny and the oversized path is the only
 	-- slow part of an INSERT.
 	CREATE FUNCTION bigdoc(n int, k int) RETURNS wdoc IMMUTABLE LANGUAGE sql
-	  AS $$ SELECT to_wdoc('simple', 'big' || ' ' ||
+	  AS $$ SELECT to_wdoc('simple'::regconfig, 'big' || ' ' ||
 	          (SELECT string_agg('t' || k || 'x' || g, ' ') FROM generate_series(1, n) g)) $$;
 });
 
@@ -223,7 +223,10 @@ is($node->safe_psql('postgres', q{
 # A pool of FREE pages for the second writer to reuse: several oversized bolts,
 # merged into one, free their inputs.  Reuse waits out the freeing XID, which
 # has committed by the time phase B starts.
-for my $k (1 .. 4)
+# The reclaim's scan sleeps (vacuum_delay_point) only on UNREACHABLE blocks, so
+# the pool is also what makes the scan slow enough for the writer to overtake it:
+# the writer takes pool pages from the FSM faster than the scan walks them.
+for my $k (1 .. 6)
 {
 	$node->safe_psql('postgres', "INSERT INTO big VALUES (2000 + $k, " . int($n / 3) . ')');
 }
@@ -236,7 +239,7 @@ $node->safe_psql('postgres', 'SELECT txid_current()') for 1 .. 2;
 my $pool = $node->safe_psql('postgres', q{
 	SELECT count(*) FROM weave_page_info('big_w') WHERE freed});
 note("phase B pool of free pages: $pool");
-cmp_ok($pool, '>', 50, 'phase B precondition: a pool of free pages exists for the writer to reuse');
+cmp_ok($pool, '>', 100, 'phase B precondition: a pool of free pages exists for the writer to reuse');
 
 my $hitB = 0;
 my $newerB = 0;
@@ -245,7 +248,7 @@ for my $try (1 .. 5)
 	# a SLOW reclaim scan: vacuum_delay_point() per block
 	my $logpos = -s $node->logfile;
 	my $v = $node->background_psql('postgres', on_error_stop => 0);
-	$v->query_safe(q{SET vacuum_cost_delay = '5ms'; SET vacuum_cost_limit = 1});
+	$v->query_safe(q{SET vacuum_cost_delay = '10ms'; SET vacuum_cost_limit = 1});
 	# the reclaim reports at DEBUG2 (PG17's lazy vacuum passes an index AM that
 	# message level whatever VERBOSE says), so send this session's to the log
 	$v->query_until(qr/started/, "SET log_min_messages = debug2;\n\\echo started\nVACUUM big;\n");

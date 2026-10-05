@@ -1172,16 +1172,30 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		weave_maintenance_lock(info->index);
 		PG_TRY();
 		{
+			(void) weave_flush_pending(info->index);
+			weave_merge_segments(info->index);
+
 			/*
-			 * Reclaim stranded pages FIRST (doc/GAPS.md G75): the flush and
-			 * merges below then reuse them, and the compaction trigger counts
-			 * them as free.  Before them, too, because a page they allocate
-			 * from here on is written after the fence.
+			 * Reclaim stranded pages (doc/GAPS.md G75) AFTER the flush and the
+			 * merge, and before the compaction trigger counts free pages.
+			 *
+			 * NOT BEFORE THEM, and that was measured, not assumed: t/033 ran it
+			 * first and the crashed index's excess over a never-crashed twin
+			 * grew by a crash's worth of pages every cycle (148 -> 2848 pages
+			 * over eight cycles, until compaction fired).  A page freed here is
+			 * stamped with the current XID, so the flush right after it cannot
+			 * reuse it yet (weave_page_recyclable), and the live-FSM loop in
+			 * weave_new_buffer() stops reusing at the FIRST deferred page and
+			 * extends for the rest of the flush.  Afterwards, the flush reuses
+			 * what EARLIER passes freed, and these pages wait for the next one.
+			 *
+			 * The safety argument does not move with it: the mutex is still held,
+			 * the fence was still read before the barrier, and every page the
+			 * flush and the merge wrote is reachable or freed by the time this
+			 * walks (doc/specs/SEGMENT_FORMAT.md sect. 10).
 			 */
 			(void) weave_reclaim_unreachable(info->index, fence,
 											 info->message_level);
-			(void) weave_flush_pending(info->index);
-			weave_merge_segments(info->index);
 
 			/*
 			 * If the relation carries substantial dead space (physical size well
@@ -1288,7 +1302,10 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 	int64		ncontended = 0;
 	MemoryContext ctx;
 	MemoryContext old;
+	instr_time	t0,
+				t1;
 
+	INSTR_TIME_SET_CURRENT(t0);
 	{
 		Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
 
@@ -1392,11 +1409,14 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 	if (nfreed > 0 || nrecorded > 0)
 		IndexFreeSpaceMapVacuum(index);
 
+	INSTR_TIME_SET_CURRENT(t1);
+	INSTR_TIME_SUBTRACT(t1, t0);
 	ereport(nfreed > 0 ? Max(elevel, LOG) : elevel,
-			(errmsg("pg_weave: index \"%s\": reclaimed %lld stranded page(s), re-recorded %lld free page(s); %lld unreachable page(s) newer than the fence, %lld busy",
+			(errmsg("pg_weave: index \"%s\": reclaimed %lld stranded page(s), re-recorded %lld free page(s); %lld unreachable page(s) newer than the fence, %lld busy; %u pages walked in %.1f ms",
 					RelationGetRelationName(index), (long long) nfreed,
 					(long long) nrecorded, (long long) nnewer,
-					(long long) ncontended)));
+					(long long) ncontended, nblocks,
+					INSTR_TIME_GET_MILLISEC(t1))));
 	return nfreed;
 }
 
@@ -1543,8 +1563,9 @@ weave_vacuum(PG_FUNCTION_ARGS)
 	weave_maintenance_lock(index);
 	PG_TRY();
 	{
-		done = weave_reclaim_unreachable(index, fence, DEBUG1) > 0;
-		if (weave_flush_pending(index))
+		/* the same order as weave_vacuumcleanup(), for the same reason */
+		done = weave_flush_pending(index);
+		if (weave_reclaim_unreachable(index, fence, DEBUG1) > 0)
 			done = true;
 		if (weave_vacuum_compact(index))
 			done = true;

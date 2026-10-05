@@ -976,10 +976,15 @@ one mechanism:
 | flagged freed, absent from the FSM | the FSM is not WAL-logged; a crash loses recent `RecordFreeIndexPage()` calls | **re-recorded** in the FSM |
 | zero page, absent from the FSM | a crash after `P_NEW` extended the file but before the page's first record reached disk | **re-recorded** in the FSM |
 
-**The choice: reclaim in VACUUM, no format change.** At the start of
-`weave_vacuumcleanup()`, and in `weave_vacuum()`, a reclaim pass
-(`weave_reclaim_unreachable()`) marks every page reachable from the metapage and
-frees the rest. The walk is the one `weave_check()` uses
+**The choice: reclaim in VACUUM, no format change.** In `weave_vacuumcleanup()`
+and in `weave_vacuum()`, after the pending flush and the merge and before the
+compaction trigger, a reclaim pass (`weave_reclaim_unreachable()`) marks every
+page reachable from the metapage and frees the rest. It runs *after* the flush on
+purpose. A page the pass frees is stamped with the current XID, so the same
+VACUUM's flush cannot reuse it yet, and the live-FSM allocator extends once it
+meets a deferred page. Run first, the pass made every post-crash flush extend by
+a full flush; `t/033` measured the crashed index's excess over a never-crashed
+twin growing by about a crash's worth of pages per cycle. The walk is the one `weave_check()` uses
 (`wvck_mark_reachable()`), so the reclaim and the leak report cannot disagree
 about which pages are live.
 

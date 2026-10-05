@@ -146,22 +146,31 @@ is($node->safe_psql('postgres', q{
 
 # BOUNDED.  The crashed index's EXCESS over its never-crashed twin must not
 # accumulate.  Unfixed, every crash strands its pages for good, so the excess is
-# the SUM of what the crashes stranded.  Fixed, a crash's pages are reclaimed by
-# the next VACUUM and reused by the flush after it (a freed page waits out its
-# XID, so not by the same VACUUM's flush), so the excess is at most what ONE
-# crash stranded.  The second assertion is the evidence that the first one can
-# tell those apart on this run: the crashes must have stranded more in total
-# than the bound allows.
+# the running SUM of what the crashes stranded.  Fixed, a crash's pages are freed
+# by the next VACUUM's reclaim and reused by the flush of the VACUUM after it (a
+# freed page waits out its XID), so the excess at any cycle is about what ONE
+# crash stranded, plus up to one flush of allocation-order noise.  Asserted at
+# EVERY cycle: the final cycle alone is not evidence, because a compaction that
+# happens to fire on one index and not the other swings the difference by
+# thousands of pages (measured: +2848 -> -8653 in one cycle).
+#
+# The bound was measured to discriminate, not assumed to: with the reclaim run
+# BEFORE the flush (the first version of the fix) the excess climbed 148, 255,
+# 255, 1076, 1126, 1670, 2259, 2848 against crash strandings of at most 1076 --
+# above this bound from cycle 7.
 my @excess = map { $sizes[$_] - $twin[$_] } 0 .. $#sizes;
 my ($maxs, $sums) = (0, 0);
 for (@strand) { $maxs = $_ if $_ > $maxs; $sums += $_; }
-my $slack = 16 + int($twin[-1] / 20);	# merges and compaction differ slightly
+my $flush = int(($twin[-1] - $twin[0]) / ($cycles - 1)) + 1;
+my $bound = $maxs + $flush + 32;
+my $worst = -1e9;
+for (@excess) { $worst = $_ if $_ > $worst; }
 note('excess of c_w over its twin per cycle: ' . join(' ', @excess)
-	  . '; stranded per crash: ' . join(' ', @strand));
-cmp_ok($excess[-1], '<=', $maxs + $slack,
-	"the crashed index's excess over its twin ($excess[-1] pages) is at most one crash's stranding ($maxs) + $slack");
-cmp_ok($sums, '>', $maxs + $slack,
-	"and the crashes stranded enough in total ($sums pages) that accumulation would have exceeded that bound");
+	  . '; stranded per crash: ' . join(' ', @strand) . "; one flush ~ $flush pages");
+cmp_ok($worst, '<=', $bound,
+	"at every cycle the crashed index's excess over its twin (worst $worst pages) is at most one crash's stranding ($maxs) + one flush ($flush) + 32");
+cmp_ok($sums, '>', $bound,
+	"and the crashes stranded enough in total ($sums pages) that accumulation would exceed that bound");
 
 $node->stop;
 done_testing();
