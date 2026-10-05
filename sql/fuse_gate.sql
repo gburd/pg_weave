@@ -313,10 +313,13 @@ DROP TABLE fg;
 -- ranked phase (~2,980 here before the padding starts), not the padding.  That is
 -- rank-then-filter by design; `fuse()` is the gated form, and is arm 1.
 --
--- The positive control is the NOT gate: a `!q` gate cannot be walked (doc/GAPS.md
--- G78: the NOT universe omits zero-term documents), so it keeps the heap walk, and
--- its removed count must stay large.  Without it, "removed is small" could hold
--- because the padding never ran.
+-- The positive control is a fused NOT gate: a `!q` gate cannot be walked
+-- (doc/GAPS.md G78: the NOT universe omits zero-term documents), so it keeps the
+-- heap walk, and its removed count must stay large.  Without it, "removed is small"
+-- could hold because the padding never ran.  Row 3004 is a zero-term document with
+-- a vector, so walking the NOT gate would also LOSE a row: same_set goes false.  The
+-- control is fused, not vector, because a vector ranked phase rejects ~2,980 rows by
+-- itself (below), which would satisfy "removed is large" without any padding.
 -- ---------------------------------------------------------------------------
 CREATE TABLE gp (id int, body wdoc, emb wvec(4)) WITH (autovacuum_enabled = off);
 INSERT INTO gp SELECT g, to_wdoc('simple', 'rare alpha w' || g), ('[' || g || ',1,1,1]')::wvec
@@ -324,7 +327,7 @@ INSERT INTO gp SELECT g, to_wdoc('simple', 'rare alpha w' || g), ('[' || g || ',
 INSERT INTO gp SELECT g, to_wdoc('simple', 'rare beta w' || g), NULL FROM generate_series(11, 20) g;
 INSERT INTO gp SELECT g, to_wdoc('simple', 'common w' || g), ('[' || g || ',1,1,1]')::wvec
   FROM generate_series(21, 3000) g;
-INSERT INTO gp VALUES (3001, NULL, '[1,1,1,1]');
+INSERT INTO gp VALUES (3001, NULL, '[1,1,1,1]'), (3004, to_wdoc('simple', ''), '[3,1,1,1]');
 CREATE INDEX gp_w ON gp USING weave (body, emb);
 -- pending rows, a HOT update, a non-HOT update and a delete, all inside the gate
 INSERT INTO gp VALUES (3002, to_wdoc('simple', 'rare pend'), '[2,1,1,1]'),
@@ -356,7 +359,7 @@ INSERT INTO gpq VALUES
   (3, 'vector', 'SELECT id FROM gp WHERE body @@@ ''rare'' ORDER BY emb <-> ''[0,1,1,1]'' LIMIT 100'),
   (4, 'lexical, other query', 'SELECT id FROM gp WHERE body @@@ ''rare'' ORDER BY body <=> ''alpha'' LIMIT 100'),
   (5, 'edit distance', 'SELECT id FROM gp WHERE body @@@ ''rare'' ORDER BY body <@> ''alpah'' LIMIT 100'),
-  (6, 'CONTROL: NOT gate, heap walk', 'SELECT id FROM gp WHERE body @@@ ''!common'' ORDER BY emb <-> ''[0,1,1,1]'' LIMIT 100');
+  (6, 'CONTROL: NOT gate, heap walk', 'SELECT id FROM gp WHERE body @@@ ''!common'' ORDER BY fuse(body <=> ''alpha'', emb <-> ''[0,1,1,1]'') LIMIT 100');
 
 SELECT q.name,
        (SELECT count(*) FROM pg_temp.fg_ids(q.q, 'index')) AS n_index,
