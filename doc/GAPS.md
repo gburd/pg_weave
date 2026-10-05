@@ -5368,6 +5368,17 @@ this entry exists so they are not only in a spec.
    validated image is a decodable one. The tombstone path reads cardinality nowhere that
    matters for correctness, but any future validator must not mix the two.
 
+**Reported 2026-10-05:** `/tmp/sparsemap-report/REPORT.md` with one self-contained
+reproducer per finding. Writing it sharpened both: defect 1's root cause is
+`sm_add_many()` itself, which relocates an owned map that must grow, returns `false` and
+leaves the caller holding the freed pointer; `sm_create_from_array()` then double-frees
+it, returns `NULL` and leaks the result (ASan: use-after-free, double-free, 83,896 bytes
+leaked). Defect 2 is `sm_validate()` accepting a `SM_PAYLOAD_NONE` flag before non-NONE
+flags in a sparse chunk descriptor, a shape the encoder never writes: rank/cardinality
+then count 1,936 where the walk and `sm_contains()` find 1,920. A fuzz over 210,596
+single-byte corruptions found 139 such disagreements, all at descriptor offsets, and one
+validated corruption that claims and walks 579 million members.
+
 Neither is a pg_weave defect today. Both are worth a report and a fix in the sparsemap
 project (same author); the vendored copy then needs a bump (`doc/LICENSING.md` describes
 the manual merge).
