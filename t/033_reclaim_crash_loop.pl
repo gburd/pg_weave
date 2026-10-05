@@ -154,10 +154,12 @@ is($node->safe_psql('postgres', q{
 # happens to fire on one index and not the other swings the difference by
 # thousands of pages (measured: +2848 -> -8653 in one cycle).
 #
-# The bound was measured to discriminate, not assumed to: with the reclaim run
-# BEFORE the flush (the first version of the fix) the excess climbed 148, 255,
-# 255, 1076, 1126, 1670, 2259, 2848 against crash strandings of at most 1076 --
-# above this bound from cycle 7.
+# The bound was measured to discriminate, not assumed to.  Two earlier versions
+# of the fix reclaimed every page and still failed it: recording the freed pages
+# in the FSM at once (the excess climbed 148, 255, 255, 1076, 1126, 1670, 2259,
+# 2848) and running the pass after the flush (256, 2931, 4259, 5565, 7347,
+# 7992).  Both leave the flush extending instead of reusing; see the comment at
+# the pass in weave_vacuumcleanup().
 my @excess = map { $sizes[$_] - $twin[$_] } 0 .. $#sizes;
 my ($maxs, $sums) = (0, 0);
 for (@strand) { $maxs = $_ if $_ > $maxs; $sums += $_; }

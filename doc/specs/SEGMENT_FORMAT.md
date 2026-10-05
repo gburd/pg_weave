@@ -977,16 +977,17 @@ one mechanism:
 | zero page, absent from the FSM | a crash after `P_NEW` extended the file but before the page's first record reached disk | **re-recorded** in the FSM |
 
 **The choice: reclaim in VACUUM, no format change.** In `weave_vacuumcleanup()`
-and in `weave_vacuum()`, after the pending flush and the merge and before the
-compaction trigger, a reclaim pass (`weave_reclaim_unreachable()`) marks every
-page reachable from the metapage and frees the rest. It runs *after* the flush on
-purpose. A page the pass frees is stamped with the current XID, so the same
-VACUUM's flush cannot reuse it yet, and the live-FSM allocator extends once it
-meets a deferred page. Run first, the pass made every post-crash flush extend by
-a full flush; `t/033` measured the crashed index's excess over a never-crashed
-twin growing by about a crash's worth of pages per cycle. The walk is the one `weave_check()` uses
-(`wvck_mark_reachable()`), so the reclaim and the leak report cannot disagree
-about which pages are live.
+and in `weave_vacuum()`, before the pending flush, a reclaim pass
+(`weave_reclaim_unreachable()`) marks every page reachable from the metapage and
+frees the rest. It frees a stranded page **without recording it in the FSM**, and
+the next VACUUM's pass records it (it is then the "flagged freed, absent from the
+FSM" row). Both choices were measured by `t/033` against a never-crashed twin.
+A freed page is stamped with an XID that is still running, so nothing can reuse
+it before the VACUUM ends. Worse, the live-FSM allocator stops reusing at the
+first deferred page and extends for the rest of the allocation. Recording the
+page at once therefore made the same VACUUM's flush extend: the excess grew by
+about 350 pages per cycle. Running the pass after the flush instead left the
+flush facing a stale, crash-restored FSM: about 1,300 pages per cycle.
 
 **Rejected: (b), a "bolt being built" marker that the publish supersedes.** It
 needs a new page flag or kind, which is a format change. Every page a writer

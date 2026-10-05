@@ -56,7 +56,7 @@ $node->safe_psql('postgres', q{
 	-- document, so the heap row stays tiny and the oversized path is the only
 	-- slow part of an INSERT.
 	CREATE FUNCTION bigdoc(n int, k int) RETURNS wdoc IMMUTABLE LANGUAGE sql
-	  AS $$ SELECT to_wdoc('simple'::regconfig, 'big' || ' ' ||
+	  AS $$ SELECT public.to_wdoc('simple'::regconfig, 'big' || ' ' ||
 	          (SELECT string_agg('t' || k || 'x' || g, ' ') FROM generate_series(1, n) g)) $$;
 });
 

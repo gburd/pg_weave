@@ -3779,13 +3779,20 @@ weave_free_page(Relation index, BlockNumber blk)
 	Buffer		buf = ReadBuffer(index, blk);
 
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-	weave_free_page_locked(index, buf);
+	weave_free_page_locked(index, buf, true);
 }
 
-/* The same, for a buffer the caller has exclusively locked (the reclaim frees
- * under the lock it re-checked the page with).  Releases the buffer. */
+/*
+ * The same, for a buffer the caller has exclusively locked (the reclaim frees
+ * under the lock it re-checked the page with).  Releases the buffer.
+ *
+ * `record` false leaves the page OUT of the free space map: flagged, stamped,
+ * free, and not offered to anyone until a later VACUUM's reclaim re-records it
+ * (it is then FREED, unreachable and absent from the FSM, which is the state that
+ * pass looks for).  The reclaim uses it for what it frees, and says why.
+ */
 void
-weave_free_page_locked(Relation index, Buffer buf)
+weave_free_page_locked(Relation index, Buffer buf, bool record)
 {
 	BlockNumber blk = BufferGetBlockNumber(buf);
 	GenericXLogState *state;
@@ -3802,7 +3809,8 @@ weave_free_page_locked(Relation index, Buffer buf)
 	op->nextblk = InvalidBlockNumber;
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);
-	RecordFreeIndexPage(index, blk);
+	if (record)
+		RecordFreeIndexPage(index, blk);
 }
 
 /*

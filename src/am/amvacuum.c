@@ -1172,30 +1172,24 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		weave_maintenance_lock(info->index);
 		PG_TRY();
 		{
-			(void) weave_flush_pending(info->index);
-			weave_merge_segments(info->index);
-
 			/*
-			 * Reclaim stranded pages (doc/GAPS.md G75) AFTER the flush and the
-			 * merge, and before the compaction trigger counts free pages.
+			 * Reclaim stranded pages FIRST (doc/GAPS.md G75), so the flush below
+			 * reuses the pages an earlier pass freed and this one re-records.
 			 *
-			 * NOT BEFORE THEM, and that was measured, not assumed: t/033 ran it
-			 * first and the crashed index's excess over a never-crashed twin
-			 * grew by a crash's worth of pages every cycle (148 -> 2848 pages
-			 * over eight cycles, until compaction fired).  A page freed here is
-			 * stamped with the current XID, so the flush right after it cannot
-			 * reuse it yet (weave_page_recyclable), and the live-FSM loop in
-			 * weave_new_buffer() stops reusing at the FIRST deferred page and
-			 * extends for the rest of the flush.  Afterwards, the flush reuses
-			 * what EARLIER passes freed, and these pages wait for the next one.
-			 *
-			 * The safety argument does not move with it: the mutex is still held,
-			 * the fence was still read before the barrier, and every page the
-			 * flush and the merge wrote is reachable or freed by the time this
-			 * walks (doc/specs/SEGMENT_FORMAT.md sect. 10).
+			 * BOTH ORDERS WERE MEASURED (t/033, crashed index vs a never-crashed
+			 * twin).  After the flush, the flush can never reuse what a crash left:
+			 * the FSM a crash restores is stale, so each flush extends and the
+			 * excess grew ~1,300 pages per cycle.  Before the flush but recording
+			 * what it freed, the flush met those just-freed pages first, could not
+			 * reuse them (their XID is this transaction's), and extended anyway:
+			 * ~350 per cycle.  What fixes it is the pass not RECORDING what it
+			 * frees (see the free arm there), so this order is right only together
+			 * with that.
 			 */
 			(void) weave_reclaim_unreachable(info->index, fence,
 											 info->message_level);
+			(void) weave_flush_pending(info->index);
+			weave_merge_segments(info->index);
 
 			/*
 			 * If the relation carries substantial dead space (physical size well
@@ -1401,7 +1395,23 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 			UnlockReleaseBuffer(buf);
 			continue;
 		}
-		weave_free_page_locked(index, buf);
+		/*
+		 * FREED, BUT NOT OFFERED: kept out of the FSM until the NEXT VACUUM's
+		 * pass re-records it (FREED, unreachable, absent from the FSM -- the arm
+		 * above).  This is measured, not a precaution.  A page freed now is
+		 * stamped with an XID that is still running, so no allocation can reuse
+		 * it before this transaction ends; and the live-FSM loop in
+		 * weave_new_buffer() treats the first such deferred page as the end of
+		 * reuse and EXTENDS for the rest of its allocation sequence.  So
+		 * recording it here poisons every allocation until the next VACUUM.
+		 * t/033 measured it both ways: recorded, the crashed index's excess
+		 * over a never-crashed twin grew by about one flush per cycle.  And if
+		 * a crash reverted the FSM to list it as free, take it off: a page in
+		 * the FSM that its writer did not record there is what that loop meets.
+		 */
+		weave_free_page_locked(index, buf, false);
+		if (GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2)
+			RecordUsedIndexPage(index, blk);
 		nfreed++;
 	}
 	MemoryContextDelete(ctx);
@@ -1564,8 +1574,8 @@ weave_vacuum(PG_FUNCTION_ARGS)
 	PG_TRY();
 	{
 		/* the same order as weave_vacuumcleanup(), for the same reason */
-		done = weave_flush_pending(index);
-		if (weave_reclaim_unreachable(index, fence, DEBUG1) > 0)
+		done = weave_reclaim_unreachable(index, fence, DEBUG1) > 0;
+		if (weave_flush_pending(index))
 			done = true;
 		if (weave_vacuum_compact(index))
 			done = true;
