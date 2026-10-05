@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BASE=${BASE:-$(git merge-base HEAD main)}
-job=/scratch/pg_weave/cenpack_job_$(git rev-parse --short HEAD).sh
+job=${TMPDIR:-/tmp}/cenpack_job_$(git rev-parse --short HEAD).sh
 {
 	echo '#!/usr/bin/env bash'
 	echo 'write_v3_patch() {'
