@@ -76,7 +76,10 @@ and extending `weave_check()` with an invariant for the new page type.
 | 30 | `WEAVE_PK_CGRAM_DICT` | `kind` = 30 | cgram (trigram → docid dictionary) | **exists** |
 | 31 | `WEAVE_PK_CGRAM_DICTINDEX` | `kind` = 31 | cgram (sparse block index) | **exists** |
 | 32 | `WEAVE_PK_CGRAM_POST` | `kind` = 32 | cgram (docid posting chain) | **exists** |
-| 33 | `WEAVE_PK_PENDING_V10` | `kind` = 33 | segment machinery (pending page, current item layout) | **v10, the only kind written** |
+| 33 | `WEAVE_PK_PENDING_V10` | `kind` = 33 | segment machinery (pending page, v10 item layout) | **read-only legacy** |
+| 34 | `WEAVE_PK_PENDING_V11` | `kind` = 34 | segment machinery (pending page, v11 item layout: + docvalues trailer) | **read-only legacy** (written by v11) |
+| 35 | `WEAVE_PK_DOCLIST` | `kind` = 35 | segment machinery (per-bolt document list, §6 "The document list") | **v12, exists** |
+| 36 | `WEAVE_PK_PENDING_V12` | `kind` = 36 | segment machinery (pending page, v11 item layout, `doclen == 0` = NULL document) | **v12, the only kind written** |
 
 **The pending chain is the one chain that legitimately mixes page kinds**, because
 the item HEADER has grown twice — 12 bytes (v8) → 16 (v9, a `veclen` for the
@@ -351,7 +354,7 @@ typedef struct WeaveChannelDesc		/* 12 bytes */
 } WeaveChannelDesc;
 ```
 
-`WeaveWeftKind` is `{ LEXICAL=1, VECTOR=2, FUZZY=3, DOCVALS=4, CGRAM=5 }`.
+`WeaveWeftKind` is `{ LEXICAL=1, VECTOR=2, FUZZY=3, DOCVALS=4, CGRAM=5, DOCLIST=6 }`.
 `LEXICAL`, `FUZZY` (v7), `VECTOR` (v8) and `CGRAM` (Z8) are written; `DOCVALS` is
 reserved so the remaining channel cannot collide, which is the same reason the
 page-kind ids are allocated in one table (§2).
@@ -465,6 +468,129 @@ index is not flat and is not a property of the trie — it falls as the corpus g
 past the point where the vocabulary saturates (Heaps' law), because the postings
 keep growing and the trie does not.
 
+### The document list — v12, SPECIFIED 2026-10-05 (doc/GAPS.md G77, G78, G80, G81)
+
+**The problem.** Before v12 a bolt had no enumeration of the documents it holds other
+than its posting lists, so a document with no posting was invisible to everything that
+asks "which documents are in this bolt?". Three silent wrong answers followed: VACUUM
+could not tombstone a zero-term document, so a recycled ctid inherited its docvalue and
+vector lane (G80); the NOT universe omitted it (G78); and a row whose lexical column is
+NULL was not indexed at all, so a docvalues restriction or a vector ORDER BY answered by
+the index dropped it (G77). A fourth defect sat underneath: a bolt whose documents had
+no terms at all was not written (G81).
+
+**The structure.** A sixth weft kind, `WEAVE_WK_DOCLIST = 6`, `attnum = 0` (it is not
+tied to an index attribute), emitted LAST on the descriptor page because 6 is the
+highest kind (§6: strictly ascending `(kind, attnum)`). Its root is the first page of a
+chain of `WEAVE_PK_DOCLIST` pages (§2, id 35) that carries one image and nothing else —
+the `WEAVE_PK_SURF` / `WEAVE_PK_DOCVALS` chain shape, with the same walker discipline
+(kind checked on every page, length = sum of page payloads, measured before allocating).
+`WeaveSegMeta` gained no field: it has no free byte, which is why this is a weft.
+
+Image (`include/weave/doclist.h`, backend-independent so it can be fuzzed):
+
+```c
+typedef struct WeaveDocListHeader     /* 40 bytes */
+{
+	uint32		magic;      /* WEAVE_DOCLIST_MAGIC = 0x57444c31, "WDL1" */
+	uint16		version;    /* WEAVE_DOCLIST_VERSION = 1; anything else is refused */
+	uint16		flags;      /* WEAVE_DOCLIST_F_COMPLETE; unknown bits are an ERROR */
+	uint64		ndocs;      /* cardinality of ALL, >= 1 */
+	uint64		nnull;      /* cardinality of NULL, <= ndocs */
+	uint32		alllen;     /* serialized length of ALL */
+	uint32		nulllen;    /* serialized length of NULL; 0 iff nnull == 0 */
+	uint32		reserved;   /* must read as zero */
+	uint32		reserved2;  /* must read as zero */
+} WeaveDocListHeader;
+/* then: ALL  = the raw sparsemap buffer (sm_get_data/sm_get_size, the livedocs
+ *              blob's encoding) of every docid the bolt holds, at offset 40
+ *       NULL = the same for the NULL-document docids, at 40 + ALIGN8(alllen)
+ * total image length == 40 + ALIGN8(alllen) + nulllen, exactly. */
+```
+
+Docids are the global tid-derived ones (`weave_tid_to_docid()`), the same space the
+tombstone sparsemap uses. The validator checks magic, version, flags, reserved words,
+the exact total length, that each set is at least a sparsemap header long, that each
+set's membership -- counted with the SAME `sm_next_member()` walk the decoder uses,
+over a scratch copy because `sm_open()` rewrites an invalid buffer -- equals its
+declared count, `nnull <= ndocs`, `NULL ⊆ ALL` (one merge of the two walks), and
+`ndocs >= 1`. A bolt with no documents carries no document list.
+
+Two properties of the vendored sparsemap shaped this, both found by
+`test/hegel/test_doclist.c` and worth knowing before anyone else builds on it:
+`sm_create_from_array()` is a use-after-free once the map grows past its initial
+1 KiB (it `sm_free()`s the pre-`realloc` pointer), so the encoder uses
+`sm_create()` + `sm_add_many_grow()`; and `sm_cardinality()` can DISAGREE with an
+`sm_next_member()` walk on a buffer `sm_validate()` accepts (one flipped byte: 1,973 vs
+1,909), so a validator that counted with one and a decoder that iterated with the
+other would accept an image the decoder cannot honour.
+
+**`WEAVE_DOCLIST_F_COMPLETE`.** Set when the list was produced by a v12 writer from
+the heap (CREATE INDEX) or from pending items whose page kind is `WEAVE_PK_PENDING_V12`:
+then ALL is every row the bolt indexes, NULL-document rows included. A merge output is
+COMPLETE only if every input was. A flush that folds any pre-v12 pending item writes a
+list WITHOUT the flag (the item's NULL-document rows were never written down, so the
+list cannot claim them). The flag is what a reader may use to argue "this bolt's
+documents are exactly ALL" — G76's padding completeness argument keys off "every live
+bolt COMPLETE and every pending page `WEAVE_PK_PENDING_V12`". A list without the flag is
+still exact about the documents the bolt holds; it just does not vouch for rows that
+were never indexed.
+
+**The docset of a bolt** (one function, `weave_segment_docset()`, used by every reader
+below):
+
+- a bolt with a document list: ALL;
+- a pre-v12 bolt (no list): postings ∪ docvalues docids ∪ vector warp docids. The union
+  matters. With postings alone, a merge of an old bolt would carry a zero-term
+  document's docvalue (the docvalues merge carries every non-tombstoned docid) into an
+  output whose list does not contain it, and G80 would become permanent in the merged
+  bolt.
+
+**Readers.**
+
+- `weave_bulkdelete()` asks the vacuum callback about every docid in the docset
+  (closes G80, for pre-v12 bolts too).
+- The NOT universe and the fuzzy/regex no-trigram fallback are ALL minus NULL
+  (closes G78). A pre-v12 bolt keeps the posting-derived universe and keeps G78 until a
+  merge or REINDEX rewrites it.
+- `@@@` never matches a NULL document. A NULL document has no postings, so a positive
+  query cannot reach it; the universe subtraction above is what keeps it out of `!q`.
+- `ndeleted` counts tombstoned docids that are NOT NULL documents, so
+  `ndocs - ndeleted` stays the BM25 corpus N.
+
+**Writers.** Every path that writes a bolt writes its list: the build flush, the
+pending flush, the oversized-insert bolt, and the merge (output = ∪ (docset_i \
+tombstones_i), NULL = ∪ (NULL_i \ tombstones_i)). VACUUM's compaction is a merge and
+needs nothing else. The list's root is recorded on the descriptor page, which is written
+after every chain and published by the metapage record that adds the bolt, so a crash
+can leak a list but cannot publish a bolt without one or with someone else's.
+
+**NULL-document rows (G77, maintainer decision 2026-10-05, option 1).** The build
+callback and `weave_insert()` no longer skip a row whose lexical column is NULL. It gets
+a docid in ALL and in NULL, its docvalue, and its vector lane (a live lane if its vector
+is non-NULL), and no postings. It does not count in `ndocs`, `sumdoclen` or the
+metapage N: a NULL document is not a document for IDF. A pending NULL document is an
+item with `doclen == 0` (no wdoc bytes) on a `WEAVE_PK_PENDING_V12` page — the v11 item
+layout, under a new kind because a v11 `.so` would hand a zero-length document to
+`weave_doc_is_valid()`. It counts in `npending` but not in the metapage N.
+
+**G81.** A bolt with documents but no terms is written with ONE EMPTY dictionary page
+(`pd_lower` at the contents start), so `dictstart` is valid and the 26 places that read
+`dictstart == InvalidBlockNumber` as "consumed slot, skip it" keep meaning only that.
+Every dictionary walker already handles a page with no entries.
+
+**What is NOT fixed in place.** An index written before v12 keeps its pre-v12 bolts
+until a merge rewrites them. Their G78 behaviour remains until then; G80 is fixed for
+them immediately (the union docset); their unindexed NULL-document rows (G77) can only
+come back by REINDEX, because no merge can invent rows that were never indexed, and
+their merged output is therefore not COMPLETE.
+
+`weave_check()` invariants: `doclist_valid` (every list validates and its root chain is
+`WEAVE_PK_DOCLIST` pages), `doclist_covers_postings` (`deep`: every posting docid, every
+docvalues docid and every warp docid is in ALL; NULL documents have no posting), and
+`doclist_coverage` (informational: bolts with a list, and how many are COMPLETE).
+Fuzz target: `test/fuzz/fuzz_doclist.c`. Property test: `test/hegel/test_doclist.c`.
+
 ## 7. Concurrency invariants — v4, EXISTS
 
 - Readers take `AccessShareLock` + `BUFFER_LOCK_SHARE`. Merge under
@@ -484,7 +610,7 @@ keep growing and the trie does not.
 
 ## 8. Compatibility policy
 
-1. **Versions read: v3 … v10. Version written: v10.** `WEAVE_VERSION` is 10.
+1. **Versions read: v3 … v12. Version written: v12.** `WEAVE_VERSION` is 12.
    The range is one constant pair in `include/weave/am.h`
    (`WEAVE_VERSION_DOCLEN_INLINE` = 3 is the floor, `WEAVE_VERSION` the ceiling)
    and `weave_check_meta()` is the single gate; `weave_check()` reports the range
@@ -503,6 +629,8 @@ keep growing and the trie does not.
    | 8 | the vector weft (`WEAVE_PK_VMETA` + directory + code strips) | per-**bolt**: a `WEAVE_WK_VECTOR` entry on the descriptor page |
    | 9 | a pending item carries the row's `wvec` | per-**page**: kind `WEAVE_PK_PENDING_V9` |
    | 10 | a pending item carries the row's raw `gram_ops` text, and a merged bolt may carry a cgram weft | per-**page**: kind `WEAVE_PK_PENDING_V10` |
+   | 11 | a pending item carries the row's docvalues value | per-**page**: kind `WEAVE_PK_PENDING_V11` |
+   | 12 | every bolt carries a DOCUMENT LIST; NULL-document rows are indexed; a pending item may be a NULL document | per-**bolt**: a `WEAVE_WK_DOCLIST` entry on the descriptor page; per-**page**: kind `WEAVE_PK_PENDING_V12` |
 
    **v8, v9 and v10 changed no metapage struct either, and bumped anyway**, for
    v7's reason and one more. v9 and v10 grew the pending ITEM, so an older `.so`

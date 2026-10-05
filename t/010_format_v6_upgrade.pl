@@ -70,9 +70,10 @@ use constant {
 	# The version this build WRITES.  v7 added the fuzzy weft, v8 the vector one,
 	# v9 a pending page whose items carry the inserted row's vector, v10 one whose
 	# items also carry the raw gram text (doc/GAPS.md G35), and v11 one whose items
-	# also carry the int8 docvalues value (G52); the
+	# also carry the int8 docvalues value (G52), v12 a per-bolt document list
+	# and indexed NULL-document rows (G77/G78/G80/G81); the
 	# changes no metapage field still bumps it.
-	WEAVE_VERSION_CUR     => 11,
+	WEAVE_VERSION_CUR     => 12,
 };
 
 # Rewrite the metapage of an index file into the v5 on-disk shape.  Server MUST be
@@ -290,7 +291,7 @@ is(read_metapage_version($abspath), WEAVE_VERSION_CUR,
 like($node->safe_psql('postgres',
 		q{SELECT detail FROM weave_check('docs_weave')
 		   WHERE invariant = 'metapage_version_recognized'}),
-	qr/^format v11 /, 'weave_check() now reports the current format (v11)');
+	qr/^format v12 /, 'weave_check() now reports the current format (v12)');
 
 my $cd_after = $node->safe_psql('postgres',
 	q{SELECT detail FROM weave_check('docs_weave')

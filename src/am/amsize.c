@@ -116,7 +116,8 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 		 * upgraded with un-flushed pending pages holds some of each, and the whole
 		 * point of the per-page discriminator (weave/pagekind.h) is that they
 		 * coexist -- so this report has to be able to say which. */
-		{"pending", WEAVE_PK_PENDING_V11, 0, 0},
+		{"pending", WEAVE_PK_PENDING_V12, 0, 0},
+		{"pending_v11", WEAVE_PK_PENDING_V11, 0, 0},
 		{"pending_v10", WEAVE_PK_PENDING_V10, 0, 0},
 		{"pending_v9", WEAVE_PK_PENDING_V9, 0, 0},
 		{"pending_v8", WEAVE_PK_PENDING, 0, 0},
@@ -156,6 +157,8 @@ weave_index_size_detail(PG_FUNCTION_ARGS)
 		{"cgram_dictionary", WEAVE_PK_CGRAM_DICT, 0, 0},
 		{"cgram_dict_index", WEAVE_PK_CGRAM_DICTINDEX, 0, 0},
 		{"cgram_postings", WEAVE_PK_CGRAM_POST, 0, 0},
+		/* v12: the per-bolt document list (doc/GAPS.md G77/G78/G80) */
+		{"doclist", WEAVE_PK_DOCLIST, 0, 0},
 	};
 	int			nbuckets = lengthof(buckets);
 	int64		unknown_pages = 0;

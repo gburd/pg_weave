@@ -717,6 +717,9 @@ SELECT invariant, ok FROM weave_check('dvt_idx', true) ORDER BY invariant;
  chandesc_reachable               | t
  chandesc_roots_agree             | t
  chandesc_version_consistent      | t
+ doclist_coverage                 | t
+ doclist_covers_postings          | t
+ doclist_valid                    | t
  docvals_dictionary_ascending     | t
  metapage_version_recognized      | t
  nsegments_bound                  | t
@@ -729,7 +732,7 @@ SELECT invariant, ok FROM weave_check('dvt_idx', true) ORDER BY invariant;
  vector_block_stats_match_codes   | t
  vector_coverage                  | t
  vector_warp_map_ascending        | t
-(17 rows)
+(20 rows)
 
 SELECT count(*) AS violations FROM weave_check('dvt_idx', true) WHERE NOT ok;
  violations 
@@ -793,6 +796,9 @@ SELECT invariant, ok FROM weave_check('dvtm_idx', true) ORDER BY invariant;
  chandesc_reachable               | t
  chandesc_roots_agree             | t
  chandesc_version_consistent      | t
+ doclist_coverage                 | t
+ doclist_covers_postings          | t
+ doclist_valid                    | t
  docvals_dictionary_ascending     | t
  metapage_version_recognized      | t
  nsegments_bound                  | t
@@ -805,7 +811,7 @@ SELECT invariant, ok FROM weave_check('dvtm_idx', true) ORDER BY invariant;
  vector_block_stats_match_codes   | t
  vector_coverage                  | t
  vector_warp_map_ascending        | t
-(17 rows)
+(20 rows)
 
 SELECT count(*) AS violations FROM weave_check('dvtm_idx', true) WHERE NOT ok;
  violations 

@@ -51,6 +51,7 @@
 
 #include "weave/weave.h"
 #include "weave/am.h"
+#include "weave/doclist.h"
 #include "weave/docvals.h"			/* Docvals: the int8 scalar store the docvalues gate evaluates */
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
 #include "weave/vector.h"			/* V7: producer 1, the vector weft accumulator */
@@ -275,7 +276,87 @@ typedef struct WeaveBuildState
 								 * pending items on the flush, and from the
 								 * inputs' wefts on a merge
 								 * (weave_docvals_merge_append). */
+
+	/*
+	 * v12: THE DOCUMENT LIST of the bolt this state will write (doc/specs/
+	 * SEGMENT_FORMAT.md sect. 6 "The document list"; doc/GAPS.md G77/G78/G80).
+	 * Every docid this state indexed, posting or not, and the subset that are
+	 * NULL documents.  Unsorted while accumulating (a heap scan is not in docid
+	 * order -- t/017 -- and a merge appends per input); sorted and deduped once
+	 * at write time.  In bs->ctx, so the build budget counts it (8 bytes per
+	 * document) and the flush's MemoryContextReset frees it.
+	 *
+	 * dl_complete: may this bolt's list claim COMPLETE?  True on the build and
+	 * oversized-insert paths; on a flush, false if any item is a pre-v12 layout
+	 * (its NULL-document rows were never written down); on a merge, the AND of
+	 * the inputs' flags.
+	 */
+	uint64	   *dl_all;
+	Size		dl_n;
+	Size		dl_cap;
+	uint64	   *dl_null;
+	Size		dl_nnull;
+	Size		dl_nullcap;
+	bool		dl_complete;
 } WeaveBuildState;
+
+/* Reset the document-list accumulator.  Its arrays live in bs->ctx, so after a
+ * MemoryContextReset(bs->ctx) the pointers dangle and this must run. */
+static inline void
+bs_doclist_init(WeaveBuildState *bs, bool complete)
+{
+	bs->dl_all = NULL;
+	bs->dl_n = 0;
+	bs->dl_cap = 0;
+	bs->dl_null = NULL;
+	bs->dl_nnull = 0;
+	bs->dl_nullcap = 0;
+	bs->dl_complete = complete;
+}
+
+/* corpus-scale, inside bs->ctx: huge-safe growth (make check-alloc) */
+static void
+bs_doclist_push(WeaveBuildState *bs, uint64 docid, bool isnulldoc)
+{
+	MemoryContext old = MemoryContextSwitchTo(bs->ctx);
+
+	if (bs->dl_n >= bs->dl_cap)
+	{
+		bs->dl_cap = bs->dl_cap ? bs->dl_cap * 2 : 1024;
+		bs->dl_all = bs->dl_all
+			? (uint64 *) WEAVE_REALLOC_MAYBE_HUGE(bs->dl_all, bs->dl_cap * sizeof(uint64))
+			: (uint64 *) WEAVE_ALLOC_MAYBE_HUGE(bs->dl_cap * sizeof(uint64));
+	}
+	bs->dl_all[bs->dl_n++] = docid;
+	if (isnulldoc)
+	{
+		if (bs->dl_nnull >= bs->dl_nullcap)
+		{
+			bs->dl_nullcap = bs->dl_nullcap ? bs->dl_nullcap * 2 : 64;
+			bs->dl_null = bs->dl_null
+				? (uint64 *) WEAVE_REALLOC_MAYBE_HUGE(bs->dl_null, bs->dl_nullcap * sizeof(uint64))
+				: (uint64 *) WEAVE_ALLOC_MAYBE_HUGE(bs->dl_nullcap * sizeof(uint64));
+		}
+		bs->dl_null[bs->dl_nnull++] = docid;
+	}
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Write this state's document list and return its root (Invalid when the state
+ * indexed no document).  Sorts + dedupes in place: a document appears once per
+ * input on the merge path only if two inputs claimed the same docid, which a
+ * correct directory never does, and deduping makes that harmless rather than a
+ * validator refusal of the whole bolt.
+ */
+static BlockNumber
+bs_doclist_write(Relation index, WeaveBuildState *bs)
+{
+	bs->dl_n = weave_doclist_sort_uniq(bs->dl_all, bs->dl_n);
+	bs->dl_nnull = weave_doclist_sort_uniq(bs->dl_null, bs->dl_nnull);
+	return weave_doclist_write(index, bs->dl_all, bs->dl_n,
+							   bs->dl_null, bs->dl_nnull, bs->dl_complete);
+}
 
 /*
  * Which values[] slot holds the wdoc.  Wraps weave_index_layout() so the seven
@@ -774,7 +855,13 @@ weave_build_flush_segment(Relation index, WeaveBuildState *bs)
 {
 	WeaveSegMeta seg;
 
-	if (bs->nterms == 0)
+	/*
+	 * Nothing to write only when the state indexed NO DOCUMENT.  This used to be
+	 * `nterms == 0`, so a build (or a build's last chunk) whose documents had no
+	 * terms -- every body to_wdoc(''), or all NULL documents -- wrote no bolt
+	 * and lost those rows' docvalues and vectors (doc/GAPS.md G81).
+	 */
+	if (bs->dl_n == 0)
 		return;
 	if (bs->nterms > 1)
 		qsort(bs->terms, bs->nterms, sizeof(BuildTerm), cmp_buildterm);
@@ -870,6 +957,7 @@ weave_build_flush_segment(Relation index, WeaveBuildState *bs)
 											 * text mode, the byte arena and its
 											 * toff/tlenv arrays */
 	MemoryContextReset(bs->ctx);
+	bs_doclist_init(bs, bs->dl_complete);	/* the reset freed its arrays */
 	bs->terms = NULL;
 	bs->nterms = 0;
 	bs->maxterms = 0;
@@ -890,9 +978,20 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 	uint32		i;
 	MemoryContext old;
 
+	bool		nulldoc;
+
 	Assert(bs->lexattno >= 1);
-	if (isnull[lexidx])
-		return;
+
+	/*
+	 * A NULL LEXICAL COLUMN IS A NULL DOCUMENT, AND IT IS INDEXED (v12,
+	 * doc/GAPS.md G77, maintainer decision 2026-10-05).  It used to `return`
+	 * here, so the row had no docid, docvalue or lane and every restriction or
+	 * ordering on another column of the index silently dropped it.  Now it gets
+	 * all three and no postings, and the document list's NULL set keeps it out
+	 * of `@@@` -- including `!q`, which an EMPTY document matches and a NULL one
+	 * must not.  It is not a document for BM25: it does not count in ndocs.
+	 */
+	nulldoc = isnull[lexidx];
 
 	/*
 	 * Bound build memory: if the accumulated segment has grown past the budget,
@@ -910,7 +1009,7 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 	 * exactly what MemoryContextReset frees at flush, so `true` counts precisely
 	 * the reclaimable footprint the budget is meant to bound.
 	 */
-	if (bs->nterms > 0 &&
+	if ((bs->nterms > 0 || bs->dl_n > 0) &&
 		MemoryContextMemAllocated(bs->ctx, true) >=
 		(bs->flush_budget ? bs->flush_budget : weave_build_mem_budget()))
 		weave_build_flush_segment(index, bs);
@@ -984,6 +1083,14 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 		int			dvidx = bs->dvattno - 1;
 
 		weave_docvals_accum_add(&bs->dv, tid, values[dvidx], isnull[dvidx]);
+	}
+
+	/* v12: every indexed row is in the bolt's document list */
+	bs_doclist_push(bs, weave_tid_to_docid(tid), nulldoc);
+	if (nulldoc)
+	{
+		MemoryContextSwitchTo(old);
+		return;					/* no postings, and not a BM25 document */
 	}
 
 	doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
@@ -2157,6 +2264,32 @@ weave_write_dictionary_iter(Relation index, DictNextFn next, void *nstate,
 			weave_vocab_add(voc, r.term, (uint32) r.len);
 	}
 
+	/*
+	 * A LEXICAL WEFT WITH NO TERMS STILL GETS ONE (EMPTY) DICTIONARY PAGE
+	 * (v12, doc/GAPS.md G81).  dictstart == InvalidBlockNumber is the "consumed
+	 * slot, skip it" sentinel in about 26 places, so a bolt whose documents
+	 * have no terms -- every body to_wdoc(''), all NULL documents, or a merge
+	 * whose every posting was tombstoned away while zero-term documents
+	 * survived -- must not be expressed as an absent dictionary: it would be a
+	 * bolt every reader skips, and its docvalues, lanes and document list would
+	 * be unreachable (and, unreferenced, leaked).  Every dictionary walker
+	 * already handles a page with no entries: its entry loop simply does not
+	 * run.  No block index is written for it (npages stays 0), so
+	 * dictindexstart stays Invalid and lookups walk the one empty page.
+	 *
+	 * The cgram weft's dictionary goes through here too and keeps its old
+	 * behaviour: its writer checks for zero terms before calling, and an absent
+	 * cgram weft is its own well-defined state.
+	 */
+	if (buffer == InvalidBuffer && dictkind == WEAVE_PK_DICT)
+	{
+		buffer = weave_new_buffer(index);
+		first = BufferGetBlockNumber(buffer);
+		state = GenericXLogStart(index);
+		page = GenericXLogRegisterBuffer(state, buffer, GENERIC_XLOG_FULL_IMAGE);
+		weave_init_page(page, dictkind);
+	}
+
 	if (buffer != InvalidBuffer)
 	{
 		GenericXLogFinish(state);
@@ -2842,6 +2975,7 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 	BlockNumber vecroot;
 	BlockNumber cgramroot;
 	BlockNumber dvroot;
+	BlockNumber dlroot;
 	int			i;
 
 	postings = (BlockNumber *) palloc(Max(bs->nterms, 1) * sizeof(BlockNumber));	/* alloc-ok: bs->nterms is a single build/pending segment, bounded by maintenance_work_mem (the merge path spills to disk instead) */
@@ -2905,7 +3039,10 @@ weave_write_segment(Relation index, WeaveBuildState *bs, WeaveSegMeta *seg)
 	 * docid order -- the store invariant and the order the gate emits through.
 	 */
 	dvroot = weave_docvals_write_weft(index, &bs->dv);
-	weave_attach_chandesc(index, seg, surfroot, vecroot, cgramroot, dvroot);	/* v6: last, so every root is known */
+	/* v12: the document list -- every docid this state indexed */
+	dlroot = bs_doclist_write(index, bs);
+	weave_attach_chandesc(index, seg, surfroot, vecroot, cgramroot, dvroot,
+						  dlroot);	/* v6: last, so every root is known */
 	doclen_collector_free(&dc);
 	pfree(postings);
 	pfree(offsets);
@@ -3387,30 +3524,30 @@ merge_cmp_u64(const void *a, const void *b)
  * counted in the memory note above weave_vec_accum_add_encoded().
  */
 static void
-merge_vec_dead_lanes(WeaveVecAccum *acc, const DoclenCollector *out)
+merge_vec_dead_lanes(WeaveVecAccum *acc, const uint64 *out, Size nout)
 {
 	uint32		n = acc->nlane;
 	uint32		i = 0;
 	uint64	   *have;
-	DoclenCursor cur;
-	DoclenEntry e;
+	Size		k;
 
 	have = (uint64 *) WEAVE_ALLOC_MAYBE_HUGE((Size) Max(n, 1u) * sizeof(uint64));
 	memcpy(have, acc->docid, (Size) n * sizeof(uint64));
 	qsort(have, n, sizeof(uint64), merge_cmp_u64);
 
-	doclen_cursor_init(&cur, out);
-	while (doclen_cursor_next(&cur, &e))
+	for (k = 0; k < nout; k++)
 	{
+		uint64		d = out[k];
+
 		CHECK_FOR_INTERRUPTS();
-		while (i < n && have[i] < e.docid)
+		while (i < n && have[i] < d)
 			i++;
-		if (i < n && have[i] == e.docid)
+		if (i < n && have[i] == d)
 		{
 			i++;
 			continue;			/* this document already has a lane */
 		}
-		weave_vec_accum_add_dead_docid(acc, e.docid);
+		weave_vec_accum_add_dead_docid(acc, d);
 	}
 	pfree(have);
 }
@@ -3516,6 +3653,7 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	BlockNumber vecroot;
 	BlockNumber cgramroot;
 	BlockNumber dvroot;
+	BlockNumber dlroot;
 	uint32		nout = 0;
 	uint32		i;
 	MemoryContext old = MemoryContextSwitchTo(bs->ctx);
@@ -3527,6 +3665,41 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 		bs->ndocs += chosen[i].ndocs - chosen[i].ndeleted;
 		merge_source_open(index, &chosen[i], &srcv[i], bs->ctx);
 	}
+
+	/*
+	 * v12: THE OUTPUT'S DOCUMENT LIST = U (docset_i \ tombstones_i), and its
+	 * NULL set likewise (doc/specs/SEGMENT_FORMAT.md sect. 6).  From the
+	 * DOCSET, not from the postings that survive below: a zero-term or NULL
+	 * document has no posting, and an output list built from postings would not
+	 * contain it while its docvalue and lane are carried -- G80 made permanent
+	 * in the merged bolt.  For a pre-v12 input the docset is postings U
+	 * docvalues U warp, which is exactly the population the docvalues and
+	 * vector merges carry.  COMPLETE only if every input's list was.
+	 *
+	 * HERE, before any page is allocated, for producer 2's reason: a corrupt
+	 * input list ERRORs, and an ERROR now leaks nothing.
+	 */
+	for (i = 0; i < nsel; i++)
+	{
+		WeaveDocset ds;
+		Size		k;
+
+		weave_segment_docset(index, &chosen[i], &ds);
+		if (!ds.complete)
+			bs->dl_complete = false;
+		for (k = 0; k < ds.n; k++)
+		{
+			uint64		d = ds.ids[k];
+
+			if (merge_src_dropped(&srcv[i], d))
+				continue;		/* tombstoned: physically dropped */
+			bs_doclist_push(bs, d, ds.nnull > 0 &&
+							weave_docids_contains(ds.nullids, ds.nnull, d));
+		}
+		weave_docset_free(&ds);
+	}
+	bs->dl_n = weave_doclist_sort_uniq(bs->dl_all, bs->dl_n);
+	bs->dl_nnull = weave_doclist_sort_uniq(bs->dl_null, bs->dl_nnull);
 
 	/*
 	 * PRODUCER 2 (doc/specs/VECTOR_CHANNEL.md sect. 7.3), first half: MOVE every
@@ -3831,14 +4004,15 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	 * document has no vector" has ONE code path here instead of two that must
 	 * agree.
 	 *
-	 * The source of truth is `mergedc`, the merged segment's docid set: it was
-	 * filled from the postings that SURVIVED tombstoning, so a deleted document is
-	 * absent from it and gets neither a lane nor a warp -- which is what dropping a
-	 * document means.  A document with a vector but no surviving posting keeps its
-	 * moved lane and is simply not in this pass.
+	 * The source of truth is the OUTPUT DOCUMENT LIST (v12), built above from
+	 * each input's docset minus its tombstones, so a deleted document is absent
+	 * from it and gets neither a lane nor a warp -- which is what dropping a
+	 * document means -- and a zero-term or NULL document keeps a warp position,
+	 * as it has in the build.  It used to be `mergedc`, i.e. the surviving
+	 * POSTINGS, which gave a posting-less document with a NULL vector no lane.
 	 */
 	if (bs->vec.active)
-		merge_vec_dead_lanes(&bs->vec, &mergedc);
+		merge_vec_dead_lanes(&bs->vec, bs->dl_all, bs->dl_n);
 
 	/*
 	 * Emit the dictionary and trigram index by streaming the spilled per-term
@@ -3917,8 +4091,9 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	 * descriptor: correct, and it never writes a self-describing ndocs=0 store.
 	 */
 	dvroot = weave_docvals_write_weft(index, &bs->dv);
+	dlroot = bs_doclist_write(index, bs);	/* v12, accumulated above */
 	weave_attach_chandesc(index, seg, surfroot, vecroot, cgramroot,
-						  dvroot);
+						  dvroot, dlroot);
 
 	for (i = 0; i < nsel; i++)
 		weave_doclens_free(&srcv[i].doclens);
@@ -4078,6 +4253,7 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 	bs.nterms = 0;
 	bs.maxterms = 0;
 	bs.ndocs = 0;
+	bs_doclist_init(&bs, true);	/* v12; a merge ANDs its inputs' COMPLETE, a flush clears it on a pre-v12 item */
 	bs.sumdoclen = 0;
 
 	/* Streaming k-way merge (bounded memory); page appends are serialized
@@ -4329,6 +4505,7 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	bs.nterms = 0;
 	bs.maxterms = 0;
 	bs.ndocs = 0;
+	bs_doclist_init(&bs, true);	/* v12; a merge ANDs its inputs' COMPLETE, a flush clears it on a pre-v12 item */
 	bs.sumdoclen = 0;
 
 	/* Streaming k-way merge: bounded to one term's postings at a time, so a
@@ -5284,6 +5461,7 @@ weave_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	bs.nterms = 0;
 	bs.maxterms = 0;
 	bs.ndocs = 0;
+	bs_doclist_init(&bs, true);	/* v12; a merge ANDs its inputs' COMPLETE, a flush clears it on a pre-v12 item */
 	bs.sumdoclen = 0;
 	bs.flush_budget = 0;
 	bs.nflushes = 0;
@@ -5586,6 +5764,7 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	bs.nterms = 0;
 	bs.maxterms = 0;
 	bs.ndocs = 0;
+	bs_doclist_init(&bs, true);	/* v12; a merge ANDs its inputs' COMPLETE, a flush clears it on a pre-v12 item */
 	bs.sumdoclen = 0;
 	bs.flush_budget = 0;
 	bs.nflushes = 0;
@@ -5789,7 +5968,10 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 								 Datum dvval, bool dvisnull)
 {
 	WeaveBuildState bs;
-	WeaveTermEntry *entries = WEAVE_DOC_ENTRIES(doc);
+	/* doc is NULL for a NULL DOCUMENT (v12, G77) whose vector, gram text or
+	 * docvalue made its pending item too large for a page: no postings */
+	WeaveTermEntry *entries = (doc != NULL) ? WEAVE_DOC_ENTRIES(doc) : NULL;
+	uint32		nterms = (doc != NULL) ? doc->nterms : 0;
 	uint32		j;
 
 	bs.ctx = AllocSetContextCreate(CurrentMemoryContext, "weave oversized",
@@ -5835,6 +6017,7 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 	bs.nterms = 0;
 	bs.maxterms = 0;
 	bs.ndocs = 0;
+	bs_doclist_init(&bs, true);	/* v12; a merge ANDs its inputs' COMPLETE, a flush clears it on a pre-v12 item */
 	bs.sumdoclen = 0;
 	bs.nflushes = 0;
 	bs.flush_budget = 0;
@@ -5861,7 +6044,7 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 		if (bs.dvattno != 0)
 			weave_docvals_accum_add(&bs.dv, tid, dvval, dvisnull);
 
-		for (j = 0; j < doc->nterms; j++)
+		for (j = 0; j < nterms; j++)
 		{
 			const uint32 *pos = (bs.want_positions && WEAVE_DOC_HAS_POS(doc))
 				? WEAVE_DOC_TERMPOS(doc, &entries[j]) : NULL;
@@ -5870,8 +6053,10 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 						tid, entries[j].tf, doc->doclen,
 						pos, pos ? (int) entries[j].tf : 0);
 		}
-		bs.ndocs = 1.0;
-		bs.sumdoclen = doc->doclen;
+		/* v12: the one document of this bolt, NULL or not */
+		bs_doclist_push(&bs, weave_tid_to_docid(tid), doc == NULL);
+		bs.ndocs = (doc == NULL) ? 0.0 : 1.0;
+		bs.sumdoclen = (doc == NULL) ? 0.0 : doc->doclen;
 		MemoryContextSwitchTo(old);
 	}
 
@@ -5979,7 +6164,8 @@ weave_pending_item_write(WeavePendingItem *pi, ItemPointer tid,
 	pi->veclen = veclen;
 	pi->gramlen = gramlen;
 	pi->dvlen = dvlen;
-	memcpy((char *) pi + sizeof(WeavePendingItem), doc, doclen);
+	if (doclen > 0)				/* 0 = a v12 NULL document: no wdoc bytes */
+		memcpy((char *) pi + sizeof(WeavePendingItem), doc, doclen);
 	if (vecoff > docend)
 		MemSet((char *) pi + docend, 0, vecoff - docend);
 	if (veclen > 0)
@@ -6057,11 +6243,25 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	weave_index_layout(index, &layout);
 	lexidx = layout.lexattno - 1;
 
+	/*
+	 * A NULL DOCUMENT IS INDEXED (v12, doc/GAPS.md G77): it used to return
+	 * false here, so a row inserted with a NULL lexical column was invisible to
+	 * every docvalues restriction and vector ordering the index answers.  It
+	 * becomes a pending item with doclen == 0 on a WEAVE_PK_PENDING_V12 page:
+	 * no document bytes, its vector, gram text and docvalue as usual.  It is
+	 * counted in npending (an item exists) but NOT in the metapage N or
+	 * sumdoclen: a NULL document is not a document for BM25.
+	 */
 	if (isnull[lexidx])
-		return false;
-
-	doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
-	doclen = VARSIZE(doc);
+	{
+		doc = NULL;
+		doclen = 0;
+	}
+	else
+	{
+		doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
+		doclen = VARSIZE(doc);
+	}
 
 	/*
 	 * PRODUCER 1's INPUT, CARRIED FORWARD (doc/GAPS.md G23).  weave_insert() has
@@ -6170,13 +6370,15 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	}
 
 	/*
-	 * ...and the page kind is the v11 layout either way, including for an index
-	 * with no vector, gram_ops or docvalues column, whose items just carry
+	 * ...and the page kind is the v12 kind (the v11 item layout, on which
+	 * doclen == 0 is a NULL document) either way, including for an index with
+	 * no vector, gram_ops or docvalues column, whose items just carry
 	 * veclen == gramlen == dvlen == 0.  The kind names the ITEM LAYOUT; see
 	 * WEAVE_PK_PENDING_V11 in weave/pagekind.h for what happened when it named
-	 * the payload instead.
+	 * the payload instead, and WEAVE_PK_PENDING_V12 for why a layout that did
+	 * not move still got a kind.
 	 */
-	wantkind = WEAVE_PK_PENDING_V11;
+	wantkind = WEAVE_PK_PENDING_V12;
 
 	/*
 	 * The trailer length is the one weave_pending_item_write() will lay down.
@@ -6261,8 +6463,11 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			 * by grepping every in-place metapage writer; if a future field is
 			 * added to the head, revisit this.
 			 */
-			meta->ndocs += 1.0;
-			meta->sumdoclen += doc->doclen;
+			if (doc != NULL)
+			{
+				meta->ndocs += 1.0;
+				meta->sumdoclen += doc->doclen;
+			}
 			meta->npending += 1;
 			GenericXLogFinish(state);
 			appended = true;
@@ -6303,8 +6508,11 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
 			meta = WeavePageGetMeta(metapage);
 			meta->pendingtail = newblk;
-			meta->ndocs += 1.0;
-			meta->sumdoclen += doc->doclen;
+			if (doc != NULL)
+			{
+				meta->ndocs += 1.0;
+				meta->sumdoclen += doc->doclen;
+			}
 			meta->npending += 1;
 			GenericXLogFinish(state);
 			UnlockReleaseBuffer(oldtail);
@@ -6315,8 +6523,11 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 			meta = WeavePageGetMeta(metapage);
 			meta->pendinghead = newblk;
 			meta->pendingtail = newblk;
-			meta->ndocs += 1.0;
-			meta->sumdoclen += doc->doclen;
+			if (doc != NULL)
+			{
+				meta->ndocs += 1.0;
+				meta->sumdoclen += doc->doclen;
+			}
 			meta->npending += 1;
 			GenericXLogFinish(state);
 		}
@@ -6531,6 +6742,7 @@ weave_flush_pending(Relation index)
 	bs.nterms = 0;
 	bs.maxterms = 0;
 	bs.ndocs = 0;
+	bs_doclist_init(&bs, true);	/* v12; a merge ANDs its inputs' COMPLETE, a flush clears it on a pre-v12 item */
 	bs.sumdoclen = 0;
 	bs.nflushes = 0;
 	bs.flush_budget = 0;
@@ -6573,6 +6785,14 @@ weave_flush_pending(Relation index)
 
 			cut_nitems++;
 
+			/*
+			 * v12: a pre-v12 item comes from a build that skipped NULL-document
+			 * rows, so this bolt's list cannot vouch for every row (the
+			 * COMPLETE flag, doc/specs/SEGMENT_FORMAT.md sect. 6).
+			 */
+			if (!it.v12)
+				bs.dl_complete = false;
+
 			/* Never trust raw pending-page bytes: a torn page or any producing
 			 * bug could give a bad nterms/len/posoff that turns into a wild
 			 * write in add_posting.  Validate against the item's own doclen and
@@ -6584,7 +6804,7 @@ weave_flush_pending(Relation index)
 			 * document that contributes no postings would be legal (an empty
 			 * document does exactly that), but counting it in neither place is
 			 * simpler and keeps bs.ndocs honest. */
-			if (!weave_doc_is_valid(rec.doc, rec.doclen))
+			if (!rec.nulldoc && !weave_doc_is_valid(rec.doc, rec.doclen))
 			{
 				ereport(WARNING,
 						(errcode(ERRCODE_DATA_CORRUPTED),
@@ -6707,6 +6927,11 @@ weave_flush_pending(Relation index)
 				weave_docvals_accum_add_pair_null(&bs.dv,
 												  weave_tid_to_docid(rec.tid),
 												  0, true);
+
+			/* v12: every folded item is in the bolt's document list */
+			bs_doclist_push(&bs, weave_tid_to_docid(rec.tid), rec.nulldoc);
+			if (rec.nulldoc)
+				continue;		/* no postings; not a BM25 document */
 
 			entries = WEAVE_DOC_ENTRIES(rec.doc);
 

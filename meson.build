@@ -73,6 +73,7 @@ sources = files(
   'src/am/amcheck.c',
   'src/pages/trgm_page.c',
   'src/pages/docvals_page.c',
+  'src/pages/doclist_page.c',
   'src/util/migrate.c',
   'src/query/trgm.c',
   'src/query/cgram.c',

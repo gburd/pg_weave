@@ -1352,9 +1352,8 @@ typedef struct EvalVal
 typedef struct UniverseSrc
 {
 	Relation	index;
-	BlockNumber dictstart;
-	double		ndocs;
-	bool		has_doclen_col;
+	const WeaveSegMeta *seg;
+	uint32		gen0;			/* the caller's directory generation */
 	bool		built;
 	TidSet		set;
 } UniverseSrc;
@@ -1362,13 +1361,81 @@ typedef struct UniverseSrc
 static TidSet weave_universe_bounded(Relation index, BlockNumber dictstart,
 									 double ndocs, bool has_doclen_col);
 
+/*
+ * THE UNIVERSE OF A BOLT: every document `@@@ '!q'` can match in it.
+ *
+ * v12 (doc/GAPS.md G78): the bolt's DOCUMENT LIST minus its NULL documents.
+ * It used to be the distinct posting docids (weave_universe_bounded()), so a
+ * document with no terms -- to_wdoc(''), or text that analyzes to nothing --
+ * had no posting, was not in the universe, and `!q` silently omitted it even
+ * though weave_match(to_wdoc(''), '!q') is true.  A NULL document is in the
+ * list (it has a docvalue and a lane) and must NOT be in the universe: an
+ * empty document matches `!q`, a NULL one matches nothing.
+ *
+ * A pre-v12 bolt has no list and keeps the posting-derived universe, and with
+ * it G78, until a merge or REINDEX rewrites it (SEGMENT_FORMAT.md sect. 6,
+ * "What is NOT fixed in place").
+ *
+ * A list that fails to read is a RACE until the generation says otherwise: a
+ * concurrent merge may have freed and recycled the chain this scan's directory
+ * snapshot names.  Moved -> return empty; the caller's generation re-check
+ * discards this pass and restarts.  Unmoved -> it is corruption.
+ */
+static TidSet
+weave_universe_seg(Relation index, const WeaveSegMeta *seg, uint32 gen0)
+{
+	BlockNumber root = weave_doclist_root(index, seg);
+	WeaveDocset ds;
+	const char *detail = NULL;
+	TidSet		u;
+	Size		i,
+				k = 0;
+	int			n = 0;
+
+	if (root == InvalidBlockNumber)
+		return weave_universe_bounded(index, seg->dictstart, seg->ndocs,
+									  seg->doclenstart == InvalidBlockNumber);
+	if (!weave_doclist_read(index, root, &ds, &detail))
+	{
+		if (weave_read_meta_generation(index) != gen0)
+		{
+			u.tids = NULL;
+			u.n = 0;
+			return u;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("weave index \"%s\" has a corrupt document list",
+						RelationGetRelationName(index)),
+				 errdetail("%s", detail != NULL ? detail : "unknown"),
+				 errhint("REINDEX the index.")));
+	}
+	if (ds.n - ds.nnull > (Size) TIDSET_MAX_N)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("pg_weave: candidate set for this query is too large")));
+	u.tids = (ItemPointerData *) palloc(Max(ds.n - ds.nnull, 1) * sizeof(ItemPointerData));	/* alloc-ok: <= TIDSET_MAX_N, checked just above */
+	/* both arrays ascend, and docid order is TID order, so the result is a
+	 * sorted, duplicate-free TidSet with one linear merge */
+	for (i = 0; i < ds.n; i++)
+	{
+		while (k < ds.nnull && ds.nullids[k] < ds.ids[i])
+			k++;
+		if (k < ds.nnull && ds.nullids[k] == ds.ids[i])
+			continue;			/* a NULL document matches no `@@@` */
+		weave_docid_to_tid(ds.ids[i], &u.tids[n++]);
+	}
+	u.n = n;
+	weave_docset_free(&ds);
+	return u;
+}
+
 static TidSet
 universe_get(UniverseSrc *u)
 {
 	if (!u->built)
 	{
-		u->set = weave_universe_bounded(u->index, u->dictstart, u->ndocs,
-										u->has_doclen_col);
+		u->set = weave_universe_seg(u->index, u->seg, u->gen0);
 		u->built = true;
 	}
 	return u->set;
@@ -4712,8 +4779,7 @@ collect_retry:
 				 * high-vocabulary corpus.
 				 */
 				need_recheck = true;
-				universe = weave_universe_bounded(index, sg->dictstart, sg->ndocs,
-												 sg->doclenstart == InvalidBlockNumber);
+				universe = weave_universe_seg(index, sg, gen0);
 				if (universe.n > 0)
 				{
 					weave_filter_tombstoned_seg(&seg_tombs, s, &universe);
@@ -4732,9 +4798,8 @@ collect_retry:
 		 * that was then discarded.
 		 */
 		uni.index = index;
-		uni.dictstart = sg->dictstart;
-		uni.ndocs = sg->ndocs;
-		uni.has_doclen_col = (sg->doclenstart == InvalidBlockNumber);
+		uni.seg = sg;
+		uni.gen0 = gen0;
 		uni.built = false;
 		uni.set.tids = NULL;
 		uni.set.n = 0;
@@ -4887,6 +4952,8 @@ collect_retry:
 				/* A pending doc is raw page bytes; validate before the matcher
 				 * walks its offsets, so a torn/corrupt page cannot segfault a
 				 * SELECT.  A malformed doc is simply not matched (and flagged). */
+				if (rec.nulldoc)
+					continue;	/* v12 NULL document: matches no `@@@`, not even `!q` */
 				if (!weave_doc_is_valid(rec.doc, rec.doclen))
 					ereport(WARNING,
 							(errcode(ERRCODE_DATA_CORRUPTED),
@@ -8855,7 +8922,7 @@ edist_collect_pending(Relation index, const WeaveMetaPageData *meta,
 		{
 			int			d;
 
-			if (!weave_doc_is_valid(rec.doc, rec.doclen))
+			if (rec.nulldoc || !weave_doc_is_valid(rec.doc, rec.doclen))
 				continue;		/* weave_collect_matches warns about these */
 			d = weave_doc_min_edist(rec.doc, so->edistPat, so->edistPatLen);
 			if (d < 0)
@@ -9428,9 +9495,10 @@ typedef struct FuseVecChan
  */
 static uint32
 weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
-					   const WeaveTombstones *tombs, uint64 **docid_out,
-					   uint64 **allow_out)
+					   const WeaveTombstones *tombs, const uint64 *nulls,
+					   Size nnull, uint64 **docid_out, uint64 **allow_out)
 {
+	Size		nk = 0;
 	WeaveVecWarpCursor wc;
 	uint64	   *docid;
 	uint64	   *allow;
@@ -9463,6 +9531,18 @@ weave_fuse_vec_warpmap(Relation index, const WeaveVecWeft *w, int segidx,
 					 errdetail("%s.", why != NULL ? why : "unknown reason")));
 		docid[i] = d;
 		if (havetombs && weave_tombstoned_in(tombs, (uint32) segidx, d, &tombcursor))
+			continue;
+
+		/*
+		 * v12: a NULL DOCUMENT has a lane but no fuse() value when the fusion
+		 * has a lexical key -- `body <=> q` is NULL for a NULL body, and fuse()
+		 * is NULL when any argument is (G71) -- so it is padded, never ranked.
+		 * The caller passes the bolt's NULL set only in that case.  Both
+		 * sequences ascend, so one forward merge.
+		 */
+		while (nk < nnull && nulls[nk] < d)
+			nk++;
+		if (nk < nnull && nulls[nk] == d)
 			continue;
 		allow[i / 64] |= UINT64CONST(1) << (i % 64);
 		nlive++;
@@ -9540,7 +9620,24 @@ weave_fuse_collect_pending(Relation index, const WeaveMetaPageData *meta,
 			int			t;
 			int			i;
 
-			if (!weave_doc_is_valid(rec.doc, rec.doclen))
+			/*
+			 * v12: a NULL DOCUMENT's fuse() is NULL whenever the fusion has a
+			 * lexical key (`body <=> q` is NULL for a NULL body), so it is
+			 * padded, not ranked -- the bolt pass masks its lane for the same
+			 * reason (weave_fuse_vec_warpmap()).  With vector keys only it is
+			 * scored like a zero-term document: by its vector.
+			 */
+			if (rec.nulldoc)
+			{
+				bool		haslex = false;
+
+				for (qi = 0; qi < so->nfuse; qi++)
+					if (so->fuseStrat[qi] == WEAVE_STRAT_DISTANCE)
+						haslex = true;
+				if (haslex)
+					continue;
+			}
+			else if (!weave_doc_is_valid(rec.doc, rec.doclen))
 				continue;	/* weave_collect_matches warns about these */
 
 			for (qi = 0; qi < so->nfuse; qi++)
@@ -9549,8 +9646,9 @@ weave_fuse_collect_pending(Relation index, const WeaveMetaPageData *meta,
 				{
 					for (t = 0; t < kt[qi].nterms; t++)
 					{
-						WeaveTermEntry *e = weave_doc_lookup(rec.doc, kt[qi].terms[t],
-															 kt[qi].lens[t]);
+						WeaveTermEntry *e = rec.nulldoc ? NULL :
+							weave_doc_lookup(rec.doc, kt[qi].terms[t],
+											 kt[qi].lens[t]);
 						int			sl = kt[qi].off + t;
 
 						vals[sl] = e != NULL ? (double) e->tf : 0.0;
@@ -9632,7 +9730,8 @@ weave_fuse_collect_pending(Relation index, const WeaveMetaPageData *meta,
 			}
 			p->tid[p->n] = *rec.tid;
 			p->qdl[p->n] = (double)
-				weave_byte_to_doclen(weave_doclen_to_byte(rec.doc->doclen));
+				weave_byte_to_doclen(weave_doclen_to_byte(rec.nulldoc ? 0 :
+														  rec.doc->doclen));
 			memcpy(&p->val[(Size) p->n * Max(nslot, 1)], vals,
 				   Max(nslot, 1) * sizeof(double));
 			p->n++;
@@ -10259,8 +10358,28 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 									WEAVE_FUSE_MAX_CHAN),
 							 errhint("Use fewer query terms, or move a term into a WHERE clause so it becomes a gate.")));
 
-				nlane = weave_fuse_vec_warpmap(index, &w, (int) s, &tombs,
-											   &dmap, &allow);
+				{
+					uint64	   *nulls = NULL;
+					Size		nnull = 0;
+					const char *ndetail = NULL;
+					bool		haslex = false;
+					int			qj;
+
+					for (qj = 0; qj < so->nfuse; qj++)
+						if (so->fuseStrat[qj] == WEAVE_STRAT_DISTANCE)
+							haslex = true;
+					if (haslex &&
+						!weave_doclist_nulls(index, sg, &nulls, &nnull, &ndetail))
+						ereport(ERROR,
+								(errcode(ERRCODE_INDEX_CORRUPTED),
+								 errmsg("bolt %u of index \"%s\" has a corrupt document list",
+										s, RelationGetRelationName(index)),
+								 errdetail("%s", ndetail != NULL ? ndetail : "unknown")));
+					nlane = weave_fuse_vec_warpmap(index, &w, (int) s, &tombs,
+												   nulls, nnull, &dmap, &allow);
+					if (nulls)
+						pfree(nulls);
+				}
 				if (nlane == 0)
 				{
 					novector = true;	/* every document here is tombstoned */
@@ -10870,7 +10989,7 @@ weave_pending_ranked(Relation index, WeaveQuery q, ScoredTid **out)
 				double		score = 0.0;
 				double		qdl;
 
-				if (!weave_doc_is_valid(rec.doc, rec.doclen))
+				if (rec.nulldoc || !weave_doc_is_valid(rec.doc, rec.doclen))
 					continue;	/* weave_collect_matches warns about these */
 				if (pass == 0)
 				{

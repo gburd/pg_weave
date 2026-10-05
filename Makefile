@@ -37,6 +37,7 @@ OBJS = \
 	src/am/amcheck.o \
 	src/pages/trgm_page.o \
 	src/pages/docvals_page.o \
+	src/pages/doclist_page.o \
 	src/util/migrate.o \
 	src/query/trgm.o \
 	src/query/cgram.o \
@@ -126,7 +127,7 @@ PGFILEDESC = "pg_weave - unified lexical + vector + fuzzy retrieval in one index
 # --inputdir=$(srcdir) for pg_regress), so plain REGRESS with no REGRESS_OPTS
 # picks up sql/<name>.sql + expected/<name>.out directly. No relayout fix
 # needed here.
-REGRESS = weave unicode_fold idx_scan_stats wvec orderby chandesc surf vecindex vecscan vecorderby pendingvec chanstats fuzzyuleven regexdict edist cgram fuse_fallback fuse_degenerate fuse_pushdown fuse_gate docvals fusesearch
+REGRESS = weave unicode_fold idx_scan_stats wvec orderby chandesc surf vecindex vecscan vecorderby pendingvec chanstats fuzzyuleven regexdict edist cgram fuse_fallback fuse_degenerate fuse_pushdown fuse_gate docvals fusesearch doclist
 
 # --- Isolation tests -------------------------------------------------------
 # pg_isolation_regress hardcodes its two lookup paths relative to a SINGLE
@@ -462,6 +463,21 @@ check-standalone:
 		-o $$tmp/docvals test/hegel/test_docvals.c -lm; \
 	$$tmp/docvals > $$tmp/docvals.log 2>&1 || { cat $$tmp/docvals.log; exit 1; }; \
 	tail -1 $$tmp/docvals.log; \
+	echo "== v12 document list (G77/G78/G80): round trip, list >= postings, corruption refused =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -Wno-implicit-fallthrough \
+		-o $$tmp/doclist test/hegel/test_doclist.c src/util/sparsemap.c; \
+	$$tmp/doclist 1500 > $$tmp/doclist.log 2>&1 || { cat $$tmp/doclist.log; exit 1; }; \
+	tail -1 $$tmp/doclist.log; \
+	echo "== v12 document list: validator vs hostile images, planted-bug control must ABORT =="; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -Wno-implicit-fallthrough \
+		-o $$tmp/fdl test/fuzz/fuzz_doclist.c src/util/sparsemap.c; \
+	$$tmp/fdl 1000 > $$tmp/fdl.log 2>&1 || { cat $$tmp/fdl.log; exit 1; }; \
+	tail -1 $$tmp/fdl.log; \
+	$(CHECK_CC) $(STANDALONE_CFLAGS) -Wno-implicit-fallthrough -DFUZZ_NO_SUBSET_CHECK \
+		-o $$tmp/fdlbug test/fuzz/fuzz_doclist.c src/util/sparsemap.c; \
+	if $$tmp/fdlbug 50 > $$tmp/fdlbug.log 2>&1; then \
+		echo "fuzz_doclist planted-bug control PASSED: the harness has no teeth"; exit 1; \
+	else echo "planted-bug control aborted, as it must"; fi; \
 	echo "== TRE d0e0c997 -> f864ed0 (pg_tre 1521662): backref wrong-answer fix =="; \
 	bash test/hegel/run_tre_bump.sh backref > $$tmp/tre.log 2>&1 || { cat $$tmp/tre.log; exit 1; }; \
 	tail -1 $$tmp/tre.log; \
