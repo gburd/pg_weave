@@ -24,6 +24,16 @@ asked:
   under 0.15× this HNSW **in any layout**: dim bytes per vector is more than the whole
   budget. At 960-d and 1,024-d a copy fits only after the centroid lever below.
 
+> **SUPERSEDED IN PART 2026-10-05: finding (A)'s numbers describe weft v3, which no
+> build writes any more.** The lever below was built as vector weft **v4** (the
+> centroid strip shares its block's last lane page; `doc/specs/VECTOR_CHANNEL.md`
+> §7.1 "v4"). The built index now measures **278.0 / 533.3 / 533.3 / 789.3 B/vector
+> = 0.136 / 0.130 / 0.065 / 0.096× HNSW**, which **passes 0.15× at all four dims**.
+> See "Measured: the centroid lever, built (v4)" at the end of this file. Finding (B)
+> is unchanged in kind (a second copy still fails at 384/768-d for the arithmetic
+> reason stated there); its "lever + lean" column is now measurement + projection
+> rather than projection + projection.
+
 ## Harness and exact commands
 
 `bench/vmajor_bytes.sh`, run as a `script` job on one `c7i.2xlarge` (8 vCPU, 16 GB,
@@ -158,6 +168,9 @@ Same-run HNSW denominator, n = 200,000. n = 50,000 agrees to ±0.001.
 | 960, vs 8,056 | 0.098 ✓ | 0.162 ✗ | | | | 0.066 ✓ | 0.130 ✓ |
 
 ³ **Projected, not implemented.** This is a format change and the maintainer's call.
+**[MEASURED 2026-10-05: built as weft v4, 0.1357 / 0.1302 / 0.0651 / 0.0964 at n = 200k
+and 0.1362 / 0.1305 / 0.0652 / 0.0965 at n = 50k — the projection, to the third
+decimal. Section at the end of this file.]**
 
 - **Shipped:** the gate breaks **below 960-d**.
 - **With any second copy on today's layout:** it breaks at **every dimension
@@ -192,7 +205,8 @@ lane's worth of coordinates, dim/2 bytes. It gets a whole page per block, which 
   are already 75 % / 75 % / 94 % full.
 
 Either lever changes what a strip page may hold, and the reader's seek/validation and
-`weave_check()` would have to change with it. **The writer's comment already calls
+`weave_check()` would have to change with it. **[2026-10-05: option 2 is built (weft v4)
+and measured below. The lane-strip coordinate-split lever is not.]** **The writer's comment already calls
 this waste "real and recorded rather than claimed away".** Until today it was recorded
 nowhere in bytes per vector.
 
@@ -234,3 +248,183 @@ not annotated in this commit:
 At 960-d and 1,024-d the corrected ratios still pass, so none of these sites is wrong
 about *pass/fail*. They are wrong about the number and the margin, and about any
 dimension below 960.
+
+## Measured: the centroid lever, built (v4) — 2026-10-05
+
+Task `cenpack`, branch `wt/cenpack`. **Maintainer decision 2026-10-05: build it.** The
+format change is vector weft **v4**: a block's last lane page also carries the block's
+centroid strip whenever it fits (`doc/specs/VECTOR_CHANNEL.md` §7.1 "v4",
+`doc/specs/SEGMENT_FORMAT.md` §8 item 7). Where it does not fit, the centroid keeps its
+own page. At 4 bits that happens at dim 494–509, 987–1,018, 1,481–1,527 and so on, a
+band just under each multiple of 509. **Of the dims below, none spills. 500 and 1,000
+spill.**
+
+### Bytes: the projection was right
+
+`bench/vmajor_bytes.sh` unchanged in method. Since v4 a page can carry two strips, so
+its two consistency checks now count pages as `DISTINCT blkno` over
+`weave_vec_strips()`, which returns one row per strip. The script still asserts that the
+code-page counts agree and that the buckets sum to `pg_relation_size` before it prints
+anything. Both runs: commit `e278db4`, `c7i.2xlarge`, PG17, pgvector 0.8.6, smoke green
+first (lint PASS, `regression.diffs` 0 bytes, TAP `Result: PASS`).
+
+```sh
+cd /scratch/pg_weave/wt-cenpack
+SCRIPT=bench/vmajor_bytes.sh bench/aws/run.sh c7i.2xlarge script        # pgweave-20261005-065540-b52d (n = 200k)
+{ echo 'export N=50000'; cat bench/vmajor_bytes.sh; } > /scratch/pg_weave/cenpack-tmp/vmajor_n50k.sh
+SCRIPT=/scratch/pg_weave/cenpack-tmp/vmajor_n50k.sh bench/aws/run.sh c7i.2xlarge script   # pgweave-20261005-065600-a6bd (n = 50k)
+```
+
+B/vector, n = 200,000 (n = 50,000 in parentheses):
+
+| dim | v3 (2026-10-04) | predicted | **v4, measured** | lane pages / block | centroid-only pages | **HNSW** | **v4 / HNSW** | v3 / HNSW | 0.15× |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--:|
+| 384 | 534.0 | 278 | **278.0** (279.0) | 1 | 0 | 2,048.0 | **0.136** (0.136) | 0.261 | ✓ (was ✗) |
+| 768 | 789.3 | 533 | **533.3** (534.4) | 2 | 0 | 4,096.0 | **0.130** (0.130) | 0.193 | ✓ (was ✗) |
+| 960 | 789.3 | 533 | **533.3** (534.4) | 2 | 0 | 8,192.0 | **0.065** (0.065) | 0.096 | ✓ |
+| 1024 | 1,045.3 | 789 | **789.3** (790.5) | 3 | 0 | 8,192.0 | **0.096** (0.096) | 0.128 | ✓ |
+
+Against the recorded GIST-1M HNSW (8,056 B/row) the 960-d figure is **0.066×** and the
+1,024-d figure 0.098×.
+
+- **Measured matches predicted to within 0.3 B/vector at every dim and both scales.**
+  The prediction was v3 minus exactly 256.0 B/vector, which is one 8 KB page per
+  32-lane block. That is what the change removes, because no dim here spills. The
+  residual 0.3 is the fixed pages (metapage, VMETA, first directory and warp pages)
+  that the prediction rounded away. It is why n = 50k sits about 1 B above n = 200k,
+  exactly as in v3.
+- **The page model still holds to the byte.** `vector_codes` `free_bytes` is
+  11,225,000 / 22,525,000 / 2,725,000 / 47,025,000 at n = 200k. That is
+  `Σ (8,160 − used − 4) × nblocks` with the centroid placed at
+  `align4(12 + 16 × n_last)` on the last lane page, computed independently, and it
+  matches at all four dims. So the layout on disk is the layout the spec describes,
+  not just one of the same size.
+- **The 0.15× storage gate now passes at all four dims.** The tightest margin is
+  384-d at 0.136×: 29 B/vector of headroom against a 307 B/vector budget. That
+  headroom is smaller than the lexical bytes a real document adds (see "What this
+  does not tell us" above). **A real-corpus 384-d index could still fail; that is
+  unmeasured.**
+- **Finding (B) is unchanged.** At 384-d and 768-d a second copy still costs `dim`
+  bytes per vector, more than the whole budget. At 960-d, the measured v4 index plus
+  the projected lean copy is 533.3 + 512.0 = 1,045.3 B/vector = **0.128×**, still a
+  projection in its second term.
+
+### Answers: bit-identical, so recall cannot have moved
+
+`bench/cenpack_job.sh` via `bench/cenpack_launch.sh` (it embeds the v3 tree as a
+reverse diff against the merge-base `3064d47`, because the host has no git history),
+`c7i.4xlarge`, run `pgweave-20261005-063556-13d6`, commit `5469f6a`. **The smoke before
+it was red on one TAP file, `t/015`, fixed afterwards in `e278db4` (below). The job ran
+with `SMOKE_TOLERATE_RED=1` for that reason, and nothing it measures touches VACUUM.**
+Two `.so` builds with different md5s were each installed and recorded. Dims 384 / 500 /
+768 / 960 / 1,000 / 1,024 at 20,000 rows each, with 20 queries per dim, compared as an
+md5 of `(segno, warp, docid, score)` over the top 50 under the scalar kernel:
+
+- **Upgrade.** Indexes built by the v3 `.so` answered **identically** under the v4
+  `.so` at all six dims, and `weave_check(deep)` found 0 violations. This is dual-read.
+- **Merge writes v4.** Before the merge the VMETA page, read with `pageinspect`, said
+  v3. After an insert and two `weave_merge()` calls it said v4, with 0 violations.
+- **REINDEX under v4.** Answers identical to v3 at all six dims. Every lane's code
+  bytes (`weave_vec_lanes`) and every block record (`weave_vec_blocks`) were
+  byte-identical. Only the pages moved. Pages per block, v3 → v4: 2→1 / 2→2 / 3→2 /
+  3→2 / 3→3 / 4→3. The two spill dims (500, 1,000) are unchanged, as specified.
+- Because the codes, the per-lane `(scale, norm)` and the bounds are byte-identical,
+  **recall cannot differ** from v3. The answer comparison shows it directly, not by
+  inference.
+
+### Cold latency: faster, because the scan stopped reading the centroid's page
+
+Same job, same binary (v4 `.so`). The arms are a v3 index, built under the v3 `.so`
+and dual-read, and its v4 rebuild: 200,000 × 960-d at 4 bits, same vectors. Both
+answer 8 queries identically, checked before timing. Each sample is `sync`,
+`drop_caches`, a PostgreSQL restart, then one
+`SELECT count(*) FROM weave_vec_scan(idx, q, 10)` under
+`EXPLAIN (ANALYZE, BUFFERS)`. 15 samples per (arm, run), **two runs per arm** (hard
+rule 10), with arm order alternating per sample.
+
+| arm | run | p50 ms | p25 | p75 | min–max | shared reads |
+|---|---:|---:|---:|---:|---:|---:|
+| v3 index | 1 | **1,143.7** | 1,100.7 | 1,150.1 | 1,033–1,154 | 19,166 |
+| v3 index | 2 | **1,146.0** | 1,112.9 | 1,150.2 | 1,024–1,157 | 19,166 |
+| v4 index | 1 | **835.5** | 772.6 | 840.6 | 738–842 | 12,916 |
+| v4 index | 2 | **834.5** | 754.2 | 837.5 | 743–844 | 12,916 |
+
+- **About 27 % lower p50 (1,145 → 835 ms), with 6,250 fewer page reads.** 6,250 is
+  exactly the number of blocks: one page per block not read. The within-arm p50
+  spread is 2.3 ms (v3) and 1.0 ms (v4), against a between-arm delta of 310 ms, so
+  the difference is a result (hard rule 10).
+- **Why it is faster, which the old spec text got wrong.** §7.1 said a scan that
+  does not prune "never reads these pages at all". The shipped code cursor
+  (`code_cur_block()`) read every one of a block's `strips_per_block` pages,
+  centroid included, whether or not the bound pruned. So v3 paid 3 reads per block
+  at 960-d and v4 pays 2. The note is now marked SUPERSEDED in place.
+- **What this is not.** It is the flat `weave_vec_scan()` SRF, cold, on one
+  `c7i.4xlarge` with gp3 storage. It is not the Phase V gate's latency (heap rerank,
+  `ORDER BY` plan) and not a comparison against HNSW. The reduction should carry to
+  any scan that reads whole blocks, in proportion to pages per block (3→2 at 960-d,
+  2→1 at 384-d). **That is predicted, not measured.**
+
+### Mutants, each confirmed to BUILD
+
+Run on the host in the same job. Each mutant tree was built and installed (md5
+recorded), then a fresh index at 1,024 / 500 / 960-d was built, scanned and checked.
+
+| mutant | caught by | how |
+|---|---|---|
+| the reader ignores the packed centroid (`weave_vecweft_page_take()` takes only the first strip of each page) | `weave_check(deep)` at 1,024-d and 960-d, 1 violation each | **not by the scan's answers**; see below |
+| the writer packs a centroid that does not fit (fit check removed) | `CREATE INDEX` at 500-d: "could not build vector code page 0 of block 0" | the strip builder refuses a short destination, so this cannot write past the page |
+| plan and reader disagree on the page index (cursor walks `strips_per_block` pages, not `pages_per_block`) | the scan at 1,024-d and 960-d: "cannot read bolt 0" | the cursor reads the next block's page and refuses it |
+
+**A gap, stated rather than discovered later:** the first mutant left every scan answer
+unchanged. The centroid is read only by bound (B3), the shipping scans pass
+`-INFINITY` as the threshold, and B3 measured 0.00 % pruning (§8b). So a reader that
+loses the centroid gets a wrong bound, never a wrong row, until a pruning scan exists.
+Only `weave_check()` (its recomputation of the centroid) and the standalone tests catch
+it. In the standalone layer, `test/hegel/test_vecweft.c` reported this mutant 21 times,
+and also caught the other two plus a plan placing the centroid 4 bytes late.
+
+### Standalone and fuzz
+
+- `test/hegel/test_vecweft.c` runs at v3 and v4 over dims including 384, 500, 768,
+  960, 1,000 and 1,024, all widths 2–8 at small dims, and partial blocks: **10,183,775
+  checks, 0 failures.** Two new properties:
+  - **P8 (hard rule 16):** a merge of any split of a lane sequence, with inputs at v3
+    or v4 and split points on and off a block boundary, reproduces the code and
+    directory pages of one v4 write byte for byte.
+  - **P9:** a reader whose geometry disagrees about packing is refused, in both
+    directions.
+- `test/fuzz/fuzz_vecstrip.c` is new, under ASan+UBSan. It ran 654,078 random
+  geometries (no strip placed past the page), every truncation of every page, and
+  random corruption. Its teeth build (`-DWEAVE_VECWEFT_PLANT_NO_OFF_LEN`) aborts with
+  a heap-buffer-overflow.
+- `make check-standalone` and `test/fuzz/run.sh` both pass locally. **They were not
+  run on EC2:** the smoke runs only the codec test. This is a local result.
+
+### A test that v4 broke by being smaller
+
+The smoke on `5469f6a` was red on `t/015_alloc_outcomes.pl` test 22, "weave_vacuum()
+(AEL) reaches a smaller fixed point than plain VACUUM does". At its 2,000-row vector
+fixture, the v4 index was small enough that plain VACUUM's first cycle reused 84 pages
+the merge had freed, with zero extends. It landed on the floor, so both sides settled at
+86 pages. Measured on one host (`pgweave-20261005-063541-9dc4`), same fixture:
+
+| | plain VACUUM series | AEL fixed point |
+|---|---|---:|
+| v3 `.so`, 2,000 rows | 297 → 280 → 280 → 280 → 280 | 142 |
+| v4 `.so`, 2,000 rows | 86 → 86 → 86 → 86 → 86 | 86 |
+| v4 `.so`, 2,400 rows | 207 → 195 → 195 → 195 → 195 | 99 |
+| v4 `.so`, 3,000 rows | 254 → 232 → 232 → 232 → 232 | 121 |
+
+The fixture is now 2,400 rows (`e278db4`), with this table's numbers in a comment.
+The fixed-point and zero-allocation assertions passed at every size.
+
+### What is still not measured
+
+- A real corpus at 384-d, where the margin (29 B/vector) is smaller than plausible
+  lexical bytes.
+- Multi-segment and post-VACUUM indexes: every index here was a fresh single segment
+  or a two-call merge.
+- `ORDER BY` / heap-rerank latency. Only the flat SRF was timed.
+- The lane-strip coordinate-split lever (1,024-d lanes, 768 → ~515 B/vector) is not
+  built.
+
