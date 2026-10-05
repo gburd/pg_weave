@@ -25,7 +25,17 @@ No production code changed. This is the evidence for or against building the swi
   cases. See "The padding cliff" below. It is tracked as **G76** on main, so it is not
   written up in `doc/GAPS.md` here.
 
-**Scale 2 (1M synthetic rows): see "Scale 2" below.**
+**Scale 2 (1M synthetic rows × 384-d) reproduces the crossover's existence, sign and
+ordering, and moves it to a higher selectivity.** The per-row rescore wins at every point
+at or below 1 %: 3.1× and 5.1× at 1 %, 7.5× and 32× at 0.1 %, on 25 of 25 queries. It
+loses at 10 % (0.45× and 0.52×). The interpolated crossover is **~4–5 % (~40–50k rows)**,
+against ~1–2 % (~100–800 rows) at scale 1. So the switch point is **neither a constant
+selectivity nor a constant row count**. Across three corpora spanning 190× in size it
+grows with the corpus, which is what A's per-query floor predicts: 2 ms at 5k rows, 2 ms
+at 58k, 23–29 ms at 1M. The constants also depend on document shape, because the synthetic
+documents are short and never TOASTed. **A clear crossover at two scales, by the task's
+own criterion, but a switch threshold cannot be a fixed constant.** See "What this means
+for the switch".
 
 Harness: `bench/v17_crossover.sh` (new), driven on EC2 by `bench/aws/v17_job.sh` through
 the `script` job. Raw data: `bench/results/v17/<run>/`.
@@ -264,9 +274,110 @@ fails the predicate passed through the executor.
 materializing would hide it, and so would restricting the padding walk to the gate's
 tidset. The crossover numbers above are all taken at points where A does not pad.
 
-## Scale 2
+## Scale 2: 1M synthetic rows
 
-*(pending: synthetic 1M rows × 384-d, same run, in progress when this was written)*
+**Corpus.** 1,000,000 rows. Each has a 384-d vector, uniform on the sphere, and a `wdoc`
+of 8 tokens drawn log-uniformly from `w1..w100000`, plus four gate tokens at hash-chosen
+rates of ~10 / 1 / 0.1 / 0.01 %. Each query vector is a corpus vector plus an equal-norm
+perturbation, and each query text is 3 distinct tokens from `w10..w10000`. `price` is a
+hash rank, as at scale 1 (`corr(price, block)` = 0.0002). One segment, index 550 MB,
+heap 1.95 GB, built in 515 s. Same instance and run as scale 1; weights `{0.5,0.5}`.
+
+**Correctness.** 200 (point, query) pairs: **A ≠ D on 0**, B ≠ C on 0 (documents of 8–12
+tokens make the doclen quantization exact), mean |A ∩ B|/|A| = 0.961 (random vectors
+quantize worse than MiniLM's), positive control fired on 156. The no-predicate point was
+not run for B, C or D (`MATNONE=0`). At 1M each of them scores the whole corpus per
+statement, and the first attempt's D exceeded the 300 s `statement_timeout`. See
+"Harness incident".
+
+| gate | sel | rows | A p50 | A p99 | C p50 | C p99 | B p50 | D p50 | **A/C** | A/A ms | A buf | C buf |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| none | 1.000 | 1000000 | 92.103 | 123.932 | -- | -- | -- | -- | -- | 0.874 | 17299 | -- |
+| facet | 0.100 | 100000 | 75.260 | 311.400 | 168.641 | 170.319 | 261.435 | 3308.570 | **0.45** | 1.139 | 28718 | 89888 |
+| facet | 0.010 | 10000 | 71.103 | 111.968 | 23.225 | 24.954 | 57.224 | 203.933 | **3.06** | 1.715 | 27449 | 13770 |
+| facet | 0.001 | 1000 | 37.664 | 39.088 | 5.046 | 5.409 | 36.657 | 113.741 | **7.46** | 0.122 | 12227 | 4936 |
+| facet | 0.0001 | 100 | 28.692 | 29.364 | 4.069 | 4.316 | 35.460 | 97.919 | **7.05** | 0.178 | 10455 | 4039 |
+| lexical | 0.100 | 100105 | 67.575 | 304.334 | 129.739 | 132.351 | 228.416 | 3216.196 | **0.52** | 0.732 | 24397 | 86178 |
+| lexical | 0.010 | 10161 | 60.191 | 105.554 | 11.724 | 15.435 | 56.745 | 195.656 | **5.13** | 1.645 | 23783 | 10032 |
+| lexical | 0.001 | 1052 | 31.750 | 32.454 | 0.992 | 1.039 | 29.643 | 109.514 | **32.01** | 0.079 | 8411 | 1071 |
+| lexical | 0.0001 | 114 | 22.971 | 23.268 | 0.083 | 0.098 | 28.202 | 98.258 | **276.76** | 0.056 | 6534 | 134 |
+
+**Per query, C faster than A:** 4/25 (facet) and 5/25 (lexical) at 10 %, and **25/25** at
+every point at or below 1 %. **B faster than A:** 3–4/25 at 10 % and 12–14/25 below.
+At 1M, B and A are a **coin flip** at or below 1 %. D never wins.
+
+**Interpolated crossover (A/C = 1):** facet ~3.8 % (~38k rows), lexical ~5.2 % (~52k rows).
+
+**Margins against noise.** The largest slot-to-slot spread is 1.7 ms, at 1 %. The smallest
+A−C gap at or below 1 % is 24.6 ms, so every win clears the floor by more than 14×. At
+10 %, C loses by 62–93 ms against a spread of 1.1 ms.
+
+**Three things scale 2 shows that scale 1 could not.**
+- **A has a heavy, query-specific tail at 1M.** At 10 % the p50 is 67–75 ms and the p99
+  is 304–311 ms. The tail is three queries (11, 21, 22) that take ~311 ms in **both** slots,
+  so it is reproducible and not noise. C at the same point is a flat 166–169 ms for every
+  query, including those three. Unexplained; the counters were not collected per query.
+  It is A's p99, and it does not affect the crossover, which is a p50 statement here and
+  the same at p99.
+- **A gets more expensive at 10 % than with no predicate on the lexical gate, and barely
+  cheaper on the facet.** p50 is 67.6 (lexical) and 75.3 (facet) against 92.1 ms with no
+  predicate. The gate costs something to materialize and drive, so selectivity has to fall
+  well below 10 % before claim 3's "faster" is visible at 1M. At scale 1 the 10 % point was
+  already 0.74–0.86× of the no-predicate time.
+- **The facet has a materialization floor that the lexical gate does not.** C at 100
+  qualifying rows costs 4.07 ms on the facet and 0.083 ms on the lexical gate. A plain
+  `SELECT count(*) FROM vx WHERE price < 100` through the docvals index costs **4,033
+  buffers** at 1M (10.9 ms with EXPLAIN instrumentation). The docvals scan walks its column
+  pages to find 100 rows. Any materializing switch pays that floor, so the facet's
+  crossover advantage below 0.1 % is capped at ~7×, against the lexical gate's 32–277×.
+
+## What this means for the switch
+
+**Is there a crossover at two scales? Yes**, by the task's criterion, at four of four
+(scale, gate) series. Above it, the gated fused scan wins by 2–5× at 10 % and 25–33× with
+no predicate. Below it, per-row exact rescoring wins by 1.3–7.5× on the facet and
+1.6–277× on the lexical gate, on every query.
+
+**Where it sits:**
+
+| corpus | rows | facet crossover | lexical crossover |
+|---|---|---|---|
+| scifact | 5,183 | ~1.9 % (~97 rows) | ~2.0 % (~106 rows) |
+| fiqa | 57,600 | ~1.4 % (~810 rows) | ~0.95 % (~550 rows) |
+| synthetic | 1,000,000 | ~3.8 % (~38k rows) | ~5.2 % (~52k rows) |
+
+**A fixed selectivity constant would be wrong by 2–5× in either direction, and a fixed
+row count by ~500×.** What the data support is a cost comparison. Estimate A's cost from
+its floor (which grows with corpus size; this file has three points of it, not a model)
+and C's cost as qualifying rows × a per-row constant (1.7 µs on short untoasted synthetic
+documents, 7–10 µs on BEIR's toasted ones). Then take the cheaper. Planning a switch
+needs the qualifying count **before** the scan, and the gate's tidset is materialized
+before the bolt loop (`so->nplain`), so an in-AM switch would have it for free.
+
+**Recommendation, measured rather than argued: build it only as a cost comparison on
+`nplain`, and only after measuring the in-AM per-row constant.** C is SQL scoring heap
+vectors. An AM switch would score weft codes, which no arm here measures (see below).
+The padding cliff (G76) is independent of the switch and should be fixed first: it is
+4,663× at its worst and costs nothing to choose.
+
+## Harness incident (recorded, hard rule 13's spirit)
+
+The job's first scale-2 attempt ran the correctness check at the no-predicate point for
+all four arms. Arm D's `weave_vec_scan(k = 1M, docids = <1M ids>)` exceeded the 300 s
+`statement_timeout`, and `read < <(...)` swallowed the error. The check therefore recorded
+an **`A ≠ D` disagreement against an empty D**, a false failure (kept as
+`bench/results/v17/<run>/first-synth-attempt/`). Fixed in `0a06b66`:
+- the no-predicate point skips B, C and D entirely under `MATNONE=0`;
+- an arm that returns no rows is now fatal.
+
+The new guard was positive-controlled locally: forcing D to a 1 ms timeout fails the run
+with `an arm returned no rows`. The scale-2 numbers above come from a manual relaunch of
+the fixed harness on the same host (`PREP=none` against the already-built table and
+index), with the job process `SIGSTOP`ped meanwhile and resumed afterwards so the harness
+pulled artifacts and terminated the instance. The job's recorded exit status is therefore
+1, from the killed original child, and the completion marker
+`V17_CROSSOVER_DONE db=synth1000k rows=1000000 points=9 checks=200` is in
+`run-synth1000k.log`.
 
 ## What this does NOT tell us
 
@@ -279,6 +390,11 @@ tidset. The crossover numbers above are all taken at points where A does not pad
 - **C changes the answer.** Its objective is exact while A's is quantized; they overlap
   99.7–99.9 %. A switch that scores heap vectors would make results depend on selectivity
   by an amount this file measures but does not decide on. A code-scoring switch would not.
+- **Scale 2 is synthetic.** Random unit vectors give the vector block bounds little to
+  prune with, which inflates A relative to a real 1M corpus, and short untoasted
+  documents make C cheaper per row (1.7 µs against 7–10 µs). The 1M crossover could sit
+  lower on real data. A real 1M corpus (msmarco-sub through `bench/prepdata.py`) is the
+  owed third point.
 - **One k (10), one weight vector (0.5/0.5), one embedding model, one instance type.** The
   crossover in rows should scale with the cost of A's floor, which depends on segment count
   (one segment per index here), corpus size and k. A larger k raises the number of
