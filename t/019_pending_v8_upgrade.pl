@@ -239,6 +239,33 @@ is($node->safe_psql('postgres',
 		  SELECT count(*) FROM docs WHERE d @@@ 'pendingdoc'::wquery}),
 	'4', 'all four pending documents answer across the MIXED chain');
 
+# --- 2b. G76 over a MIXED chain: the padding must keep the heap walk ---------
+# doc/GAPS.md G76 lets the padding phase walk a NOT gate's set instead of the heap
+# only when weave_index_v12_complete() holds: every bolt has a COMPLETE document
+# list and every pending page is v12.  The v8 page manufactured above is the one
+# state SQL cannot otherwise reach in which that predicate must be FALSE.  A
+# zero-term row is inserted now, onto the current-layout page, and `!pendingdoc`
+# must return every row the heap says it should -- including that row -- under a
+# LIMIT past the gate, so the padding phase runs.  The positive control is the
+# predicate itself: the padding chooses the heap walk here, and "Rows Removed by
+# Index Recheck" says so (it is large only for the heap walk).
+$node->safe_psql('postgres', q{
+    INSERT INTO docs(body, d, v) VALUES ('', to_wdoc('simple', ''), '[1,1,1,1]');
+});
+my $not_q = q{SELECT id FROM docs WHERE d @@@ '!pendingdoc'::wquery
+               ORDER BY fuse(d <=> 'shared'::wquery, v <-> '[0,0,0,0]'::wvec) LIMIT 1000};
+my $heap_ids = $node->safe_psql('postgres', qq{
+	SET enable_indexscan = off; SET enable_bitmapscan = off;
+	SELECT string_agg(id::text, ',' ORDER BY id) FROM ($not_q) s});
+my $idx_ids = $node->safe_psql('postgres', qq{
+	SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_sort = off;
+	SELECT string_agg(id::text, ',' ORDER BY id) FROM ($not_q) s});
+is($idx_ids, $heap_ids, 'G76: a NOT gate over a mixed v8 chain answers as the heap does');
+my $plan = $node->safe_psql('postgres', qq{
+	SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_sort = off;
+	EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) $not_q});
+like($plan, qr/Index Scan using docs_weave/, 'and that answer came from the fused index scan');
+
 # weave_check(deep) must accept the MIXED v8 + v11 pending chain: the deep walk
 # validates the pending chain kind-by-kind (amcheck's four-accepted-kinds walk),
 # so a v11 page it did not know about would be reported as a wrong-kind leak.
