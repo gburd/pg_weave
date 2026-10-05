@@ -40,7 +40,7 @@ $node->append_conf('postgresql.conf', "autovacuum = off\n");
 # VACUUM section below depends on.
 $node->append_conf('postgresql.conf', "wal_level = replica\n");
 $node->start;
-$node->safe_psql('postgres', 'CREATE EXTENSION pg_weave');
+$node->safe_psql('postgres', 'CREATE EXTENSION pg_weave; CREATE EXTENSION pg_freespacemap');
 
 my $conn = $node->connstr('postgres');
 
@@ -196,15 +196,24 @@ my $state_sql = q{
 	SELECT pg_relation_size('w') / 8192 || ' pages, ' ||
 	       count(*) FILTER (WHERE freed) || ' freed, ' ||
 	       count(*) FILTER (WHERE NOT reachable AND NOT coalesce(freed, false) AND NOT uninitialized) || ' leaked, ' ||
-	       count(*) FILTER (WHERE uninitialized) || ' zero; tail ' ||
+	       count(*) FILTER (WHERE uninitialized) || ' zero, ' ||
+	       (SELECT count(*) FROM generate_series(1, pg_relation_size('w') / 8192 - 1) b
+	         WHERE pg_freespace('w', b) >= 4096) || ' in FSM; tail ' ||
 	       coalesce((SELECT kind || CASE WHEN freed THEN '/freed' ELSE '' END FROM weave_page_info('w')
 	                  ORDER BY blkno DESC LIMIT 1), '?')
 	  FROM weave_page_info('w')};
 my @trail = ('before: ' . $node->safe_psql('postgres', $state_sql));
 for my $v (1 .. 3)
 {
-	$node->safe_psql('postgres', 'VACUUM t');
-	push @trail, "after VACUUM $v: " . $node->safe_psql('postgres', $state_sql);
+	# the reclaim's own line (DEBUG2 for an index AM under plain VACUUM) and the
+	# allocator's outcomes, both from the VACUUM's own session
+	my ($vrc, $vout, $verr) = $node->psql('postgres',
+		"SET client_min_messages = debug2;\nSELECT weave_alloc_stats_reset();\nVACUUM t;\n"
+		. "SELECT 'alloc ' || weave_alloc_stats()::text;");
+	my ($rline) = $verr =~ /(reclaimed \d+ stranded.*?ms)/;
+	my ($aline) = $vout =~ /(alloc .*)/;
+	push @trail, "after VACUUM $v: " . $node->safe_psql('postgres', $state_sql)
+	  . '; ' . ($rline // 'no reclaim line') . '; ' . ($aline // 'no alloc stats');
 }
 my $after = $node->safe_psql('postgres', q{SELECT pg_relation_size('w') / 8192});
 note("G73 trail: $_") for @trail;
