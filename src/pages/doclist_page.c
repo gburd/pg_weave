@@ -308,9 +308,6 @@ void
 weave_segment_docset(Relation index, const WeaveSegMeta *seg, WeaveDocset *ds)
 {
 	BlockNumber root = weave_doclist_root(index, seg);
-	uint64	   *v = NULL;
-	Size		n = 0,
-				cap = 0;
 
 	if (root != InvalidBlockNumber)
 	{
@@ -325,6 +322,21 @@ weave_segment_docset(Relation index, const WeaveSegMeta *seg, WeaveDocset *ds)
 					 errhint("REINDEX the index.")));
 		return;
 	}
+	weave_segment_docset_legacy(index, seg, ds);
+}
+
+/*
+ * The pre-v12 docset, whether or not the bolt has a list: postings U docvalues
+ * docids U warp docids.  Exported for weave_check()'s doclist_covers_postings,
+ * which asserts a v12 list is a superset of exactly this.
+ */
+void
+weave_segment_docset_legacy(Relation index, const WeaveSegMeta *seg,
+							WeaveDocset *ds)
+{
+	uint64	   *v = NULL;
+	Size		n = 0,
+				cap = 0;
 
 	memset(ds, 0, sizeof(*ds));
 

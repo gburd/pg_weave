@@ -1920,6 +1920,8 @@ extern bool weave_doclist_read(Relation index, BlockNumber root, WeaveDocset *ds
 /* The bolt's docset (list, or the legacy union); ERROR on a corrupt list. */
 extern void weave_segment_docset(Relation index, const WeaveSegMeta *seg,
 								 WeaveDocset *ds);
+extern void weave_segment_docset_legacy(Relation index, const WeaveSegMeta *seg,
+										WeaveDocset *ds);
 extern void weave_docset_free(WeaveDocset *ds);
 extern bool weave_docids_contains(const uint64 *v, Size n, uint64 x);
 /* Every distinct posting docid of a bolt, ascending, palloc'd (am.c).  The

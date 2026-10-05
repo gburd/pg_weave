@@ -150,9 +150,9 @@ wvck_mark_alloc(BlockNumber nblocks)
  * times.
  */
 static int64
-wvck_walk_chain_4kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
+wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 					   WeavePageKind alt, WeavePageKind alt2,
-					   WeavePageKind alt3, StringInfo err)
+					   WeavePageKind alt3, WeavePageKind alt4, StringInfo err)
 {
 	int64		n = 0;
 
@@ -196,7 +196,7 @@ wvck_walk_chain_4kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 							 blk, weave_page_kind_name(want));
 			return -1;
 		}
-		if (pk != want && pk != alt && pk != alt2 && pk != alt3)
+		if (pk != want && pk != alt && pk != alt2 && pk != alt3 && pk != alt4)
 		{
 			UnlockReleaseBuffer(buf);
 			appendStringInfo(err, "block %u on a %s chain has kind \"%s\"",
@@ -216,7 +216,7 @@ static int64
 wvck_walk_chain(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 				StringInfo err)
 {
-	return wvck_walk_chain_4kinds(cx, blk, want, want, want, want, err);
+	return wvck_walk_chain_5kinds(cx, blk, want, want, want, want, want, err);
 }
 
 /*
@@ -1240,6 +1240,112 @@ wvck_vector(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
  * ERRORs from weave_docvals_load() (ERRCODE_INDEX_CORRUPTED), the same trust
  * boundary every reader goes through.
  */
+/*
+ * v12 document list invariants (doc/specs/SEGMENT_FORMAT.md sect. 6 "The
+ * document list"):
+ *
+ *	doclist_valid            every list a bolt names reads and validates (the
+ *	                         chain is WEAVE_PK_DOCLIST pages, the image passes
+ *	                         weave_doclist_check()); a bolt with no list is a
+ *	                         pre-v12 bolt and not a violation
+ *	doclist_covers_postings  (deep) every posting docid, docvalues docid and
+ *	                         warp docid of the bolt is in ALL, and no NULL
+ *	                         document has a posting -- the property bulkdelete
+ *	                         and the NOT universe rest on
+ *	doclist_coverage         informational: bolts with a list, how many COMPLETE
+ */
+static void
+wvck_doclist(WeaveCheckCtx *cx, const WeaveMetaPageData *meta, bool deep)
+{
+	uint32		s;
+	bool		ok = true;
+	bool		covok = true;
+	int64		nwith = 0,
+				ncomplete = 0,
+				nlive = 0,
+				nchecked = 0;
+	StringInfoData d,
+				cd;
+
+	initStringInfo(&d);
+	initStringInfo(&cd);
+	for (s = 0; s < meta->nsegments && s < WEAVE_MAX_SEGMENTS; s++)
+	{
+		const WeaveSegMeta *seg = &meta->segs[s];
+		BlockNumber root;
+		WeaveDocset ds;
+		const char *detail = NULL;
+
+		if (seg->dictstart == InvalidBlockNumber)
+			continue;
+		nlive++;
+		root = weave_doclist_root(cx->index, seg);
+		if (root == InvalidBlockNumber)
+			continue;			/* a pre-v12 bolt: not a violation */
+		nwith++;
+		if (!weave_doclist_read(cx->index, root, &ds, &detail))
+		{
+			ok = false;
+			appendStringInfo(&d, "%sbolt %u: %s", d.len > 0 ? "; " : "", s,
+							 detail != NULL ? detail : "unreadable");
+			continue;
+		}
+		if (ds.complete)
+			ncomplete++;
+		if (deep)
+		{
+			WeaveDocset legacy;
+			uint64	   *p = NULL;
+			Size		np = 0,
+						i;
+
+			/* the legacy union, i.e. what this list must cover: postings,
+			 * docvalues docids and warp docids, read by the pre-v12 path */
+			weave_segment_posting_docids(cx->index, seg, &p, &np);
+			for (i = 0; i < np && covok; i++)
+			{
+				if (!weave_docids_contains(ds.ids, ds.n, p[i]))
+				{
+					covok = false;
+					appendStringInfo(&cd, "%sbolt %u: posting docid " UINT64_FORMAT " is not in the document list",
+									 cd.len > 0 ? "; " : "", s, p[i]);
+				}
+				else if (ds.nnull > 0 &&
+						 weave_docids_contains(ds.nullids, ds.nnull, p[i]))
+				{
+					covok = false;
+					appendStringInfo(&cd, "%sbolt %u: NULL document " UINT64_FORMAT " has a posting",
+									 cd.len > 0 ? "; " : "", s, p[i]);
+				}
+			}
+			if (p)
+				pfree(p);
+			weave_segment_docset_legacy(cx->index, seg, &legacy);
+			for (i = 0; i < legacy.n && covok; i++)
+				if (!weave_docids_contains(ds.ids, ds.n, legacy.ids[i]))
+				{
+					covok = false;
+					appendStringInfo(&cd, "%sbolt %u: docvalues/warp docid " UINT64_FORMAT " is not in the document list",
+									 cd.len > 0 ? "; " : "", s, legacy.ids[i]);
+				}
+			weave_docset_free(&legacy);
+			nchecked++;
+		}
+		weave_docset_free(&ds);
+	}
+	wvck_emit(cx, "doclist_valid", ok, ok ? NULL : d.data);
+	if (deep)
+		wvck_emit(cx, "doclist_covers_postings", covok, covok ? NULL : cd.data);
+	pfree(d.data);
+	pfree(cd.data);
+	initStringInfo(&d);
+	appendStringInfo(&d, "%lld of %lld bolt(s) carry a document list, %lld COMPLETE",
+					 (long long) nwith, (long long) nlive, (long long) ncomplete);
+	wvck_emit(cx, "doclist_coverage", true, d.data);
+	pfree(d.data);
+	(void) nchecked;
+}
+
 static void
 wvck_docvals(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 {
@@ -1416,10 +1522,11 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 		StringInfoData e;
 
 		initStringInfo(&e);
-		(void) wvck_walk_chain_4kinds(cx, meta->pendinghead, WEAVE_PK_PENDING,
+		(void) wvck_walk_chain_5kinds(cx, meta->pendinghead, WEAVE_PK_PENDING,
 									  WEAVE_PK_PENDING_V9,
 									  WEAVE_PK_PENDING_V10,
-									  WEAVE_PK_PENDING_V11, &e);
+									  WEAVE_PK_PENDING_V11,
+									  WEAVE_PK_PENDING_V12, &e);
 		pfree(e.data);
 	}
 
@@ -1472,6 +1579,15 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 
 				if (dvroot != InvalidBlockNumber)
 					(void) wvck_walk_chain(cx, dvroot, WEAVE_PK_DOCVALS, &e);
+			}
+
+			/* v12: the document list is one nextblk chain, freed by
+			 * weave_free_segment()'s default arm; marked for the same reason */
+			{
+				BlockNumber dlroot = weave_doclist_root(cx->index, seg);
+
+				if (dlroot != InvalidBlockNumber)
+					(void) wvck_walk_chain(cx, dlroot, WEAVE_PK_DOCLIST, &e);
 			}
 
 			/*
@@ -1748,6 +1864,7 @@ weave_check(PG_FUNCTION_ARGS)
 	wvck_chandesc(&cx, &meta);
 	wvck_surf(&cx, &meta);
 	wvck_vector(&cx, &meta);
+	wvck_doclist(&cx, &meta, deep);
 
 	if (deep)
 	{
