@@ -264,6 +264,28 @@ Local output, workstation, so the times are only indicative:
     Execution Time: 0.329 ms
 ```
 
+**After the G76 fix (2026-10-05, main `beea69b`, same local database `v17sci`, same
+script).** The padding now fetches the gate set's TIDs instead of walking the heap:
+
+```
+(1) Limit (actual rows=5 loops=1)
+      Buffers: shared hit=161
+      ->  Index Scan using fd_weave on fd (actual rows=5 loops=1)
+            Index Cond: (body @@@ '''abolish'''::wquery)
+(2) Limit (actual rows=5 loops=1)
+      Buffers: shared hit=128
+```
+
+There is **no `Rows Removed by Index Recheck` line**, and the buffer count fell from
+17,009 to **161**: the control's 128 plus 33 for fetching the five rows again. Buffers
+were identical across four runs. Workstation timing, warm, eight `\timing` repetitions:
+**0.74–1.05 ms** at LIMIT 10, against 0.79–0.93 ms at LIMIT 6 and 0.92 ms at LIMIT 5, so
+the LIMIT no longer matters. The first `EXPLAIN ANALYZE` in each fresh session reads
+12–94 ms. That is a cold-session effect, not padding: the LIMIT 5 control's first run is
+12 ms too. These are workstation times, so treat them as indicative; the EC2
+re-measurement is owed. The **facet** points still pad over the heap, by design (G77: a
+NULL-document row is in no index structure, so a docvalues-only gate is not complete).
+
 The EC2 run shows the same signature on the MiniLM corpus, for the same term and query 1
 (`v17-plans-scifact.txt`, `=== BUFFERS lex 0.001 A`): `Buffers: shared hit=17109`,
 `Rows Removed by Index Recheck: 5178`. **5178 = 5183 − 5.** Every row in the table that
@@ -272,7 +294,8 @@ fails the predicate passed through the executor.
 **Why this matters to V17 itself.** The cliff is the largest effect in this file
 (4,663× on fiqa's 6-row lexical point), but it is **not** the crossover. A switch to
 materializing would hide it, and so would restricting the padding walk to the gate's
-tidset. The crossover numbers above are all taken at points where A does not pad.
+tidset, which is what G76's fix does for a lexical gate. The crossover numbers above are
+all taken at points where A does not pad, so the fix does not move them.
 
 ## Scale 2: 1M synthetic rows
 
