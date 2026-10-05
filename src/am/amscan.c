@@ -214,6 +214,26 @@ typedef struct WeaveScanOpaqueData
 	int			nplain;
 	int			plainpos;
 	bool		plainRecheck;	/* results need a heap recheck (fuzzy/regex) */
+	/*
+	 * plainTids holds a COMPLETE gate (doc/GAPS.md G76): a superset of every row
+	 * the scan's restriction can admit, so the padding phase may walk it instead
+	 * of the heap.  True for a lexical key whose query has no NOT: `NULL @@@ q` is
+	 * NULL, so no row outside the index qualifies, and without a NOT a matching
+	 * document holds a posting of some query term, so the collector -- segments
+	 * and pending list -- has it.  Two gates are NOT complete and keep the heap
+	 * walk: a docvalues-only gate, because a row whose lexical column is NULL is
+	 * in no index structure and may still satisfy `price < c` (G77); and a NOT
+	 * query, because its universe is built from postings and a document with no
+	 * terms has none, yet matches `!q` (G78).
+	 */
+	bool		plainGateLex;
+	/*
+	 * The WHERE clause's first `@@@` query when the lexical ORDER BY route
+	 * replaced so->query with its own (weave_rescan()); NULL otherwise.  The
+	 * padding phase collects it as its gate (G76).  Borrowed from the scan key,
+	 * like so->query, so it is valid for the life of the rescan.
+	 */
+	WeaveQuery	padWhereQuery;
 	IndexTuple	plainItup;		/* cached all-NULL itup for index-only scans */
 	TupleDesc	plainItupDesc;
 
@@ -438,6 +458,8 @@ typedef struct WeaveScanOpaqueData
 	ItemPointerData *padSeen;	/* sorted TIDs the ranked phase emitted */
 	int			npadSeen;
 	OffsetNumber *padRoots;		/* heap_get_root_tuples of padRootBlk */
+	IndexFetchTableData *padFetch;	/* G76: walking the gate set, not the heap */
+	int			padGatePos;		/* next so->plainTids[] the gate walk fetches */
 	BlockNumber padRootBlk;
 	ItemPointerData *padNulls;	/* NULL-document rows, emitted after the walk */
 	int			npadNulls;
@@ -2518,6 +2540,7 @@ weave_beginscan(Relation r, int nkeys, int norderbys)
 	so->nplain = 0;
 	so->plainpos = 0;
 	so->plainRecheck = false;
+	so->plainGateLex = false;
 	so->edistScan = false;
 	so->edistPat = NULL;
 	so->edistPatLen = 0;
@@ -2853,6 +2876,8 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->nplain = 0;
 	so->plainpos = 0;
 	so->plainRecheck = false;
+	so->plainGateLex = false;
+	so->padWhereQuery = NULL;
 	so->edistScan = false;
 	/* the previous rescan's pattern copy (opaque context; G59) */
 	if (so->edistPat != NULL)
@@ -3111,6 +3136,7 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 			so->ordQueryRestricts = (so->queryValid && so->query != NULL &&
 									 VARSIZE_ANY(so->query) == VARSIZE_ANY(oq) &&
 									 memcmp(so->query, oq, VARSIZE_ANY(oq)) == 0);
+			so->padWhereQuery = (so->queryValid && so->query != NULL) ? so->query : NULL;
 			so->query = oq;
 			so->queryValid = true;
 		}
@@ -3169,6 +3195,21 @@ weave_set_itup(IndexScanDesc scan, WeaveScanOpaque so)
 	}
 	scan->xs_itup = so->plainItup;
 	scan->xs_itupdesc = so->plainItupDesc;
+}
+
+/*
+ * Does q contain a NOT anywhere?  Such a query can match a document with no
+ * postings at all, which no posting-derived set holds (doc/GAPS.md G78).
+ */
+static bool
+weave_query_has_not(WeaveQuery q)
+{
+	uint32		i;
+
+	for (i = 0; i < q->nitems; i++)
+		if (q->items[i].type == WEAVE_QI_OPR && q->items[i].op == WEAVE_OP_NOT)
+			return true;
+	return false;
 }
 
 /*
@@ -3233,7 +3274,59 @@ weave_pad_begin(IndexScanDesc scan, WeaveScanOpaque so)
 	so->npadNulls = 0;
 	so->capPadNulls = 0;
 	so->padNullPos = 0;
-	so->padScan = table_beginscan(so->padHeap, scan->xs_snapshot, 0, NULL);
+
+	/*
+	 * WHICH ROWS TO WALK (doc/GAPS.md G76).  Every row the ranked phase did not
+	 * emit, among the rows the restriction can admit.  With a lexical gate those
+	 * are exactly the gate set's rows, so walk that: it is sorted, so the fetches
+	 * go in heap order, and its TIDs are the index's own, which are HOT-chain
+	 * roots -- the only TIDs an AM may return.  Walking the heap instead is
+	 * correct but O(heap): a gate admitting 5 rows of 5,183 under LIMIT 10 handed
+	 * the executor all 5,183 to recheck (40 ms and 17k buffers on scifact,
+	 * against 0.7 ms with the LIMIT inside the gate), and no counter showed it.
+	 */
+	so->padFetch = NULL;
+	so->padGatePos = 0;
+	so->padScan = NULL;
+
+	/*
+	 * The vector and lexical-ordering routes apply no `@@@` key in their ranked
+	 * phase -- the executor rechecks it -- so they have no gate set yet.  Collect
+	 * the first key's, which the padding needs only as a superset: the keys are
+	 * ANDed and every padding row is rechecked.  On the lexical route so->query
+	 * is the ORDER BY query by now; the WHERE one is padWhereQuery.
+	 */
+	{
+		WeaveQuery	wq = so->vecScan && so->queryValid ? so->query
+			: (!so->vecScan && !so->edistScan && !so->fuseScan) ? so->padWhereQuery
+			: NULL;
+
+	if (!so->plainInit && wq != NULL && !weave_query_has_not(wq))
+	{
+		TidSet		m;
+		bool		recheck;
+		/* the scan's own context: weave_rescan() pfrees plainTids */
+		MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+
+		weave_collect_matches(index, wq, &m, &recheck);
+		MemoryContextSwitchTo(old);
+		so->plainTids = m.tids;
+		so->nplain = m.n;
+		so->plainInit = true;
+		so->plainGateLex = true;
+	}
+	}
+
+	if (so->plainInit && so->plainGateLex)
+	{
+#if PG_VERSION_NUM >= 190000
+		so->padFetch = table_index_fetch_begin(so->padHeap, SO_NONE);
+#else
+		so->padFetch = table_index_fetch_begin(so->padHeap);
+#endif
+	}
+	else
+		so->padScan = table_beginscan(so->padHeap, scan->xs_snapshot, 0, NULL);
 }
 
 /* the heap-walk half of weave_pad_end: everything but the NULL-row list */
@@ -3242,6 +3335,10 @@ weave_pad_end_walk(WeaveScanOpaque so)
 {
 	if (so->padScan != NULL)
 		table_endscan(so->padScan);
+	if (so->padFetch != NULL)
+		table_index_fetch_end(so->padFetch);
+	so->padFetch = NULL;
+	so->padGatePos = 0;
 	if (so->padSlot != NULL)
 		ExecDropSingleTupleTableSlot(so->padSlot);
 	if (so->padEstate != NULL)
@@ -3377,6 +3474,65 @@ weave_pad_fuse_null(WeaveScanOpaque so, const bool *isnull)
 static bool
 weave_pad_gettuple(IndexScanDesc scan, WeaveScanOpaque so)
 {
+	/*
+	 * THE GATE WALK (doc/GAPS.md G76): the lexical gate's own sorted TIDs, which
+	 * are HOT-chain roots because they came out of the index.  Each is fetched
+	 * through the snapshot exactly as weave_ord_probe() fetches a candidate,
+	 * and then classified exactly as the heap walk below classifies a row.
+	 */
+	if (so->padFetch != NULL)
+	{
+		ExprContext *econtext = GetPerTupleExprContext(so->padEstate);
+
+		while (so->padGatePos < so->nplain)
+		{
+			ItemPointerData rtid = so->plainTids[so->padGatePos++];
+			ItemPointerData ftid = rtid;
+			bool		call_again = false;
+			bool		all_dead = false;
+			Datum		values[INDEX_MAX_KEYS];
+			bool		isnull[INDEX_MAX_KEYS];
+			bool		keep = true;
+
+			CHECK_FOR_INTERRUPTS();
+			if (!table_index_fetch_tuple(so->padFetch, &ftid, scan->xs_snapshot,
+										 so->padSlot, &call_again, &all_dead))
+				continue;		/* no version visible to this snapshot */
+			econtext->ecxt_scantuple = so->padSlot;
+			if (so->padPred != NULL)
+				keep = ExecQual(so->padPred, econtext);
+			if (keep)
+				FormIndexDatum(so->padInfo, so->padSlot, so->padEstate,
+							   values, isnull);
+			ResetExprContext(econtext);
+			if (!keep)
+				continue;
+
+			if (isnull[so->padAttIdx] || weave_pad_fuse_null(so, isnull))
+			{
+				if (so->npadNulls >= so->capPadNulls)
+				{
+					/* bounded by the gate set, which is corpus-scale */
+					so->capPadNulls = so->capPadNulls ? so->capPadNulls * 2 : 64;
+					so->padNulls = (ItemPointerData *)
+						(so->padNulls
+						 ? WEAVE_REALLOC_MAYBE_HUGE(so->padNulls, (Size) so->capPadNulls * sizeof(ItemPointerData))
+						 : WEAVE_ALLOC_MAYBE_HUGE((Size) so->capPadNulls * sizeof(ItemPointerData)));
+				}
+				so->padNulls[so->npadNulls++] = rtid;
+				continue;
+			}
+			if (so->npadSeen > 0 &&
+				bsearch(&rtid, so->padSeen, so->npadSeen, sizeof(ItemPointerData),
+						cmp_tid) != NULL)
+				continue;		/* ranked already */
+
+			weave_pad_emit(scan, so, &rtid, false);
+			return true;
+		}
+		weave_pad_end_walk(so);
+	}
+
 	if (so->padScan != NULL)
 	{
 		ExprContext *econtext = GetPerTupleExprContext(so->padEstate);
@@ -8669,6 +8825,7 @@ weave_edist_pass(Relation index, WeaveScanOpaque so)
 		so->plainTids = m.tids;
 		so->nplain = m.n;
 		so->plainInit = true;
+		so->plainGateLex = !weave_query_has_not(so->query);
 	}
 
 	acc.hits = NULL;
@@ -9505,6 +9662,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		so->plainTids = m.tids;
 		so->nplain = m.n;
 		so->plainInit = true;
+		so->plainGateLex = haveLex && !weave_query_has_not(so->query);
 		MemoryContextSwitchTo(old);
 	}
 
@@ -11191,6 +11349,208 @@ weave_search(PG_FUNCTION_ARGS)
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
 	}
 	SRF_RETURN_DONE(funcctx);
+}
+
+/*
+ * weave_fuse_search(index regclass, lex wquery[], vec wvec[], weights float4[],
+ *                   k int) -> setof (ctid tid, score float8, parts float4[])
+ *
+ * A fused top-k (doc/specs/FUSED_TOPK.md sect. 7e, task F3) that returns each
+ * row's fused SCORE.  The channels are every lex entry, then every vec entry;
+ * weights has one entry per channel in that order, NULL meaning 1.0 each.
+ *
+ * A WORKAROUND FOR A POSTGRESQL CORE LIMITATION, and only that: an index scan
+ * cannot hand its ORDER BY value to the SELECT list, so in
+ * `SELECT fuse(...) ... ORDER BY fuse(...)` the fused pass computes every score
+ * and the executor throws them away and re-evaluates fuse() per row.
+ * doc/upstream/ORDERBY_VALUES_TO_TLIST.md proposes that core change.  If it ever
+ * lands, `SELECT fuse(...) ... ORDER BY fuse(...)` becomes the intended surface
+ * and this function optional.
+ *
+ * IT DRIVES A REAL INDEX SCAN rather than a private top-k, so the fused pass,
+ * MVCC (index_getnext_slot() fetches under the active snapshot), the pending
+ * ranking of doc/GAPS.md G66 and the gating of G71 all apply unchanged: the scan
+ * keys are exactly the ones src/am/fusepath.c builds -- one ORDER BY key per
+ * channel and one WEAVE_STRAT_FUSE_WEIGHTS transport key -- and
+ * weave_fuse_rescan() validates them as it validates the planner's.  The score
+ * is the negation of the scan's slot-0 order-by value, which the fused pass
+ * stores as -S; a +Inf or NULL value is a row the fused pass did not rank, and
+ * ends the result.
+ *
+ * `parts` (per-channel contributions) is NOT YET RETURNED: always NULL, owed by
+ * doc/PHASES.md F3.
+ */
+PG_FUNCTION_INFO_V1(weave_fuse_search);
+
+static void
+weave_fuse_search_unpack(ArrayType *arr, Datum **elems, int *n)
+{
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	bool	   *nulls;
+	int			i;
+
+	if (ARR_NDIM(arr) > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("weave_fuse_search channel arrays must be one-dimensional")));
+	get_typlenbyvalalign(ARR_ELEMTYPE(arr), &typlen, &typbyval, &typalign);
+	deconstruct_array(arr, ARR_ELEMTYPE(arr), typlen, typbyval, typalign,
+					  elems, &nulls, n);
+	for (i = 0; i < *n; i++)
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("weave_fuse_search channel arrays must not contain NULLs")));
+}
+
+Datum
+weave_fuse_search(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			indexoid;
+	Oid			heapoid;
+	Relation	heap;
+	Relation	index;
+	WeaveIndexLayout lay;
+	Datum	   *lexd = NULL;
+	Datum	   *vecd = NULL;
+	int			nlex = 0;
+	int			nvec = 0;
+	int			nchan;
+	int			k;
+	int			vecstrat = 0;
+	Datum		wdatum;
+	ScanKeyData orderbys[INDEX_MAX_KEYS];
+	IndexScanDesc scan;
+	TupleTableSlot *slot;
+	AclResult	aclresult;
+	int			i;
+	int			got;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(4))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("weave_fuse_search index and k must not be NULL")));
+	indexoid = PG_GETARG_OID(0);
+	k = PG_GETARG_INT32(4);
+	if (!PG_ARGISNULL(1))
+		weave_fuse_search_unpack(PG_GETARG_ARRAYTYPE_P(1), &lexd, &nlex);
+	if (!PG_ARGISNULL(2))
+		weave_fuse_search_unpack(PG_GETARG_ARRAYTYPE_P(2), &vecd, &nvec);
+	nchan = nlex + nvec;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	/* the fused pass refuses fewer than two; its stack arrays cap the top */
+	if (nchan < 2 || nchan + 1 > INDEX_MAX_KEYS)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("weave_fuse_search needs between 2 and %d channels, got %d",
+						INDEX_MAX_KEYS - 1, nchan)));
+	if (k <= 0)
+		return (Datum) 0;
+
+	heapoid = IndexGetRelation(indexoid, true);
+	if (!OidIsValid(heapoid))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not an index", get_rel_name(indexoid))));
+	aclresult = pg_class_aclcheck(heapoid, GetUserId(), ACL_SELECT);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(heapoid));
+
+	/* the executor's order: table, then index */
+	heap = table_open(heapoid, AccessShareLock);
+	index = index_open(indexoid, AccessShareLock);
+	if (index->rd_rel->relam != get_index_am_oid("weave", true))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a weave index",
+						RelationGetRelationName(index))));
+
+	weave_index_layout(index, &lay);	/* throws when there is no lexical column */
+	if (nvec > 0)
+	{
+		int			metric = weave_index_vec_metric_raw(index);
+
+		if (lay.vecattno == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("weave index \"%s\" has no vector column",
+							RelationGetRelationName(index))));
+		if (metric == WEAVE_METRIC_L2)
+			vecstrat = WEAVE_STRAT_VEC_L2;
+		else if (metric == WEAVE_METRIC_IP)
+			vecstrat = WEAVE_STRAT_VEC_IP;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("weave_fuse_search supports only the l2 and ip vector metrics")));
+	}
+
+	for (i = 0; i < nchan; i++)
+	{
+		bool		islex = (i < nlex);
+		AttrNumber	attno = islex ? lay.lexattno : lay.vecattno;
+
+		ScanKeyEntryInitialize(&orderbys[i], SK_ORDER_BY, attno,
+							   islex ? WEAVE_STRAT_DISTANCE : vecstrat,
+							   InvalidOid, index->rd_indcollation[attno - 1],
+							   InvalidOid, islex ? lexd[i] : vecd[i - nlex]);
+	}
+
+	/*
+	 * The transport key, on the lexical column as src/am/fusepath.c hangs it;
+	 * weave_fuse_rescan() checks its length against nchan.
+	 */
+	if (PG_ARGISNULL(3))
+	{
+		Datum	   *ones = palloc(nchan * sizeof(Datum));	/* alloc-ok: nchan < INDEX_MAX_KEYS */
+
+		for (i = 0; i < nchan; i++)
+			ones[i] = Float4GetDatum(1.0f);
+		wdatum = PointerGetDatum(construct_array(ones, nchan, FLOAT4OID,
+												 sizeof(float4), true, TYPALIGN_INT));
+	}
+	else
+		wdatum = PointerGetDatum(PG_GETARG_ARRAYTYPE_P(3));
+	ScanKeyEntryInitialize(&orderbys[nchan], SK_ORDER_BY, lay.lexattno,
+						   WEAVE_STRAT_FUSE_WEIGHTS, InvalidOid, InvalidOid,
+						   InvalidOid, wdatum);
+
+#if PG_VERSION_NUM >= 180000
+	scan = index_beginscan(heap, index, GetActiveSnapshot(), NULL, 0, nchan + 1);
+#else
+	scan = index_beginscan(heap, index, GetActiveSnapshot(), 0, nchan + 1);
+#endif
+	index_rescan(scan, NULL, 0, orderbys, nchan + 1);
+	slot = table_slot_create(heap, NULL);
+
+	for (got = 0; got < k && index_getnext_slot(scan, ForwardScanDirection, slot); got++)
+	{
+		Datum		values[3];
+		bool		nulls[3] = {false, false, true};
+		double		v;
+
+		if (scan->xs_orderbynulls[0])
+			break;
+		v = DatumGetFloat8(scan->xs_orderbyvals[0]);
+		if (isinf(v) && v > 0)
+			break;				/* padding: a row the fused pass did not rank */
+		values[0] = ItemPointerGetDatum(&slot->tts_tid);
+		values[1] = Float8GetDatum(-v);
+		values[2] = (Datum) 0;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+	index_endscan(scan);
+	index_close(index, AccessShareLock);
+	table_close(heap, AccessShareLock);
+	return (Datum) 0;
 }
 
 /* ----- lexical anomaly detection: rare-term (low-df) dictionary tail ----- */

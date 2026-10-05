@@ -748,8 +748,108 @@ that can be arbitrarily negative. Three consequences for a pushdown that must ag
 - **(c) Leave `<@>` unfused.** The fallback is already correct for small result
   sets, and the plan refuses the pushdown today (`req->servable = false`).
 
-Until one is chosen F9 stays open, and `fusepath.c`'s refusal stands: correct, and
-slower than a pushdown would be.
+~~Until one is chosen F9 stays open, and `fusepath.c`'s refusal stands: correct, and
+slower than a pushdown would be.~~ **SUPERSEDED 2026-10-04: one was chosen. See below.**
+
+### 7d-decision. (b) was chosen — maintainer, 2026-10-04
+
+**Fuzzy matching joins a fused ranking as a GATE, a `WHERE` restriction, and not as a
+scored channel inside `fuse()`.** Options (a) and (c) are not taken; (c)'s refusal
+survives only as the *consequence* of (b) for the one spelling (b) does not serve.
+
+What that means for a user, stated so it can be copied into a reference:
+
+- **Fuzziness filters; it does not rank.** `WHERE body @@@ 'protien~2'` admits every
+  document with a term within two edits of `protien`, and `ORDER BY fuse(...)` then
+  ranks the admitted documents by the channels inside `fuse()` alone. A document
+  spelling it `protien` exactly and one spelling it `protean` are admitted equally;
+  neither outranks the other for being closer. This is one fused Index Scan, with the
+  fuzzy term as `Index Cond` beside any docvalues predicate, and it is the same for a
+  prefix (`'prot*'`) and a regex (`'/^prot[a-z]*n$/'`) gate, which the same `@@@`
+  grammar carries.
+- **To rank by spelling closeness, do it without fusion:** `ORDER BY body <@> 'protien'`
+  on its own is an ordering Index Scan (task Z9), nearest spelling first.
+- **`fuse(..., body <@> p)` still runs, and is not fused.** `src/am/fusepath.c` refuses
+  the `<@>` channel (`req->servable = false`, with a comment pointing here), so the
+  planner keeps the Sort over the executable fallback, whose arithmetic is correct
+  (`weave_edistscore(d) = -d`, G41) and whose cost is a full evaluation of the match
+  set. That is the price of writing the spelling (b) does not serve, and it is a
+  correct answer, not an error.
+
+**Why (b) and not (a), in one sentence:** (a) needs a widening-threshold ladder and a
+catalog change to `weave_edistscore`, so that the pushdown and the fallback share one
+objective, and the use case most hybrid-search users mean by "fuzzy match plus
+relevance" is a filter, which (b) serves with no code.
+
+**Evidence** (`sql/fuse_gate.sql`, in the regression suite): for `~1`, `~2`, prefix,
+regex, `~1`/`~2` beside `price < 2`, and a fuzzy gate matching nothing, each at a LIMIT
+inside the match set and one beyond the table, the plan is one Index Scan with the gate
+as `Index Cond` and the `<~>` transport key in `Order By`, no Sort and no Filter; every
+row is returned once, inside the gate, and the set equals a Seq Scan + Sort of the same
+query. The corpus is built so the two arms agree on *order* (both channels prefer the
+same rows), so the top-k comparison is exact rather than §7a (1)'s approximation. Rows
+matching the gate with a NULL vector come after every ranked row (G71). The `<@>`-in-
+`fuse()` spelling plans as a Sort with no `<~>` key and returns the heap's rows.
+**Mutation-tested**: with the fused pass's gate shuttle removed (`weave_fuse_pass()` in
+`src/am/amscan.c`), the file goes red, returning 61-62 rows for an 18-46-row answer; with `<@>` made servable, the plan becomes a fused Index Scan. Both mutants BUILT first (run `pgweave-20261004-205010`).
+
+**The limit, recorded as a loss (hard rule 8):** a user who wants a closer spelling to
+*score higher inside* a fused ranking has no fused plan for it. They get either a filter
+(fused, fast) or a Sort over `fuse(..., body <@> p)` (correct, O(match set)). If that use
+case turns up, option (a) above is the design, and `bench/RESULTS_F9_FANOUT.md` bounds
+its merge cost.
+
+## 7e. `weave_fuse_search()`: the fused scores, as a workaround (F3, 2026-10-04)
+
+Sect. 7's `SELECT id, score() FROM ...` cannot be built: a function in the SELECT list
+has no handle on the scan that produced the row, and PostgreSQL discards an index scan's
+ORDER BY values unless a reorder queue consumes them, so `SELECT fuse(...)` beside
+`ORDER BY fuse(...)` re-evaluates the fallback arithmetic (sect. 7a (1)) instead of
+reading the score the fused pass computed. The maintainer's decision (2026-10-04) is an
+SRF:
+
+```sql
+SELECT * FROM weave_fuse_search('t_weave',
+         lex => ARRAY['postgres index'::wquery],
+         vec => ARRAY[$1::wvec],
+         weights => '{0.4,0.6}', k => 10);   -- (ctid tid, score float8, parts float4[])
+```
+
+Channels are every `lex` entry, then every `vec` entry; `weights` has one entry per
+channel in that order, NULL meaning 1.0 each. It builds the same scan keys
+`src/am/fusepath.c` builds (one ORDER BY key per channel, plus the
+`WEAVE_STRAT_FUSE_WEIGHTS` transport key on the lexical column) and drives a real index
+scan with them. So the fused pass, MVCC, G66's pending ranking and G71's gating all apply
+unchanged. `score` is the negation of the scan's slot-0 order-by value. The result ends
+at the first row the fused pass did not rank, i.e. a NULL or +Infinity padding value.
+`sql/fusesearch.sql` holds it to the `ORDER BY fuse(...)` index path's row order in both
+`fuse_normalize` modes, and, with normalization off, to an exact oracle score within 1e-4.
+
+**IT IS A WORKAROUND FOR A POSTGRESQL CORE LIMITATION.** An index scan cannot hand its
+ORDER BY value to the SELECT list. `doc/upstream/ORDERBY_VALUES_TO_TLIST.md` proposes the
+core change. If it ever lands, `SELECT fuse(...) ... ORDER BY fuse(...)` becomes the
+intended surface and this SRF is optional. The build assumes it will not land
+(maintainer direction 2026-10-01).
+
+**`ctid` is the row's LIVE ctid, unlike `weave_search()`'s.** The SRF reads it from the
+heap fetch, so a HOT-updated row comes back where `SELECT ctid` finds it.
+`weave_search()` returns the index's HOT-chain root TID, so `JOIN t ON t.ctid = s.ctid`
+silently drops HOT-updated rows. `sql/fusesearch.sql`'s first oracle lost row 3's
+lexical score exactly that way (EC2 run `pgweave-20261004-214115`), and the test now maps
+root TIDs to rows through ctids taken before the update.
+
+**Visibility has two layers, and only the SRF's is observable.** The fused pass's
+`weave_ord_probe()` drops dead candidates, and `index_getnext_slot()` drops them again. A
+mutant that disables only the first survives (equivalent). A mutant that disables only the
+second (`index_getnext_tid()`) is caught, by the HOT row.
+
+Two limits, both recorded in `doc/PHASES.md` F3:
+
+- **`parts` is always NULL.** The per-channel breakdown is owed.
+- **Lexical-only fusion pads unranked documents at score -0.** With no vector key, a
+  document no channel reached gets the padding value 0.0 (not +Infinity), so it comes
+  back with score `-0` until `k` is reached. That is fuse()'s own value for the
+  document, not an error, but it is not a ranked row either.
 
 ## 8. What must be benchmarked before this is called a win
 
@@ -824,7 +924,7 @@ state whether it was cleared:
 
 | row | gate | scifact | nfcorpus | fiqa | |
 |---|---|---|---|---|---|
-| recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | **PASS**, and for the **raw** objective only — the oracle cannot express the normalized one (`doc/GAPS.md` G46) |
+| recall vs exhaustive | 1.000 | 1.000 | 1.000 | 1.000 | **PASS** — ~~for the **raw** objective only; the oracle cannot express the normalized one~~ **CORRECTED 2026-10-04:** for both objectives, both ceilings recomputed independently (`doc/GAPS.md` G46, closed; `bench/RESULTS_FUSE.md` "Sixth measurement") |
 | nDCG@10, normalizer **on** (the default since 2026-09-22) | ≥ RRF | 1.053× | 1.010× | 1.114× | **MET** |
 | p99 latency, normalizer **on** | ≤ 0.70× | 0.710× | 0.612× | **1.000×** | **FAIL on two of three — measured 2026-09-22 (night), run `pgweave-20260922-224507`** |
 | p50 latency, normalizer **on** | ≤ 0.50× | 0.710× | 0.827× | **1.172×** | **FAIL**, and on fiqa the fused arm is **slower than the RRF control it replaces** |
@@ -1168,7 +1268,7 @@ chosen here** — the choice is the maintainer's:
     honest only if the restated gate is stated before it is measured against.
   - **(b) A second, vector-major copy of the codes**, so a single lane can be scored
     without touching its 31 neighbours. This forfeits the storage gate — a second copy of
-    the code weft — and `include/weave/vecpage.h:24-26` refuses `WEAVE_PACK_VECMAJOR` on
+    the code weft — [**MEASURED 2026-10-04, `bench/RESULTS_VECMAJOR.md`:** the copy, measured on top of the built index, gives 0.356× / 0.288× / 0.159× / 0.194× HNSW at 384 / 768 / 960 / 1,024-d. The cheapest variant is dense with no centroid, sharing the directory's per-lane scale/norm. It fits only at 960-d, and only after the centroid strip is moved off its own page (0.128×). At 384/768-d no layout fits] and `include/weave/vecpage.h:24-26` refuses `WEAVE_PACK_VECMAJOR` on
     the coordinate-split page layout, so it is a new on-disk shape, not a reloption.
   - **(c) Cluster-order the weft** so a query's candidates are contiguous and a block probe
     is not wasted. This **CONTRADICTS the strictly-ascending-docid requirement the fused

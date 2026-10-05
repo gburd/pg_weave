@@ -169,8 +169,10 @@ at n = 1M and measured the HNSW denominator instead of estimating it. Windows ar
 | 6 | ~20 | 768 | 0.095 | no |
 | 8 | — (0.9860 ceiling) | 1024 | 0.127 | no |
 
+> **CORRECTED 2026-10-04:** the B/vector and × HNSW columns above are CODE BYTES (`bits × dim / 8`), not the built index. Built at 4 bits the index measures 534 / 789 / 789 / 1,045 B/vector at 384 / 768 / 960 / 1,024-d: 0.098× at 960-d and 0.130× at 1,024-d against 8,056, and it FAILS 0.15× below 960-d. Each 32-lane block's centroid strip occupies a whole 8 KB page (256 B/vector at every dim). `bench/RESULTS_VECMAJOR.md`.
+
 **The recommended shape is 4 bits with a top-25 window:** recall@10 **0.9920** at
-n = 1M, index **512 B/vector = 0.064× HNSW**, and the widest width that keeps the
+n = 1M, index **512 B/vector = 0.064× HNSW** [**CORRECTED 2026-10-04:** 0.064× is code bytes (`bits × dim / 8`); the built index measures 0.098× at 960-d and 0.130× at 1,024-d against the recorded 8,056 B/vector, and FAILS 0.15× at 384-d (0.261×) and 768-d (0.193×). `bench/RESULTS_VECMAJOR.md`.], and the widest width that keeps the
 SIMD code-scan kernel (§9: 5–8 bits fall back to the scalar oracle). The code scan
 touches every vector while the rerank touches twenty-five, so giving up vectorized
 scoring to save five candidates is the wrong trade. Two bits is off the frontier
@@ -247,7 +249,8 @@ worth carrying:
 
 - the cost is **bimodal**, not linear: when the vectors fit in the buffer pool
   these reads go to zero and the rerank is pure CPU. Since the codes are 0.064× of
-  what HNSW must keep resident, there is a corpus range where the codes fit and
+  what HNSW must keep resident (the code bytes; the built index is 0.098-0.130× at
+  960-1,024-d and 0.19-0.26× below that, corrected 2026-10-04), there is a corpus range where the codes fit and
   HNSW's index does not;
 - 1024-d reads **more** pages per candidate than 1536-d (2.388 vs 2.043), because
   3 chunks straddle page boundaries while 4 chunks fill a page exactly. If rerank

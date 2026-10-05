@@ -42,6 +42,21 @@ SELECT id, score()
  LIMIT 10;
 ```
 
+Fuzzy, prefix and regex terms join a fused ranking as **filters**, not as scored
+channels: they decide which rows are ranked, and `fuse()` decides the order.
+
+```sql
+SELECT id FROM docs
+ WHERE body @@@ 'protien~2'                  -- within 2 edits; or 'prot*', '/^prot.*n$/'
+ ORDER BY fuse(body      <=> 'alpha'::wquery,
+               embedding <-> $1::wvec)
+ LIMIT 10;                                   -- one fused Index Scan
+```
+
+A closer spelling does not rank higher there. To rank by spelling closeness, use
+`ORDER BY body <@> 'protien'` on its own. `fuse(..., body <@> 'protien')` is accepted
+and correct but not fused (a Sort). `doc/specs/FUSED_TOPK.md` §7d has the decision.
+
 The reason to put these in one index is not code reuse. It is that all channels
 in a segment share one dense document-id space, so a bound derived in one channel
 can skip work in another. Post-filtering an ANN search by a lexical or scalar

@@ -218,7 +218,7 @@ fundamental and no amount of engineering removes them; they are knobs, not bugs.
 
    What does work, and is now the ratified shape (`doc/PHASES.md`): **4-bit codes
    plus an exact float32 rerank of a top-25 window, read from the heap** — recall@10
-   **0.9920** at n = 1M on GIST-960d, at **512 B/vector = 0.064× HNSW**. The rerank
+   **0.9920** at n = 1M on GIST-960d, at **512 B/vector = 0.064× HNSW** [**CORRECTED 2026-10-04:** 0.064× is code bytes (`bits × dim / 8`); the built index measures 0.098× at 960-d and 0.130× at 1,024-d against the recorded 8,056 B/vector, and FAILS 0.15× at 384-d (0.261×) and 768-d (0.193×). `bench/RESULTS_VECMAJOR.md`.]. The rerank
    must be full precision, and a *stored* float32 sidecar costs `4 * dim` bytes per
    vector, half of what HNSW spends per vector, so it would forfeit the storage
    budget by itself. The heap already holds the vector; the index pays nothing.
@@ -263,7 +263,7 @@ fundamental and no amount of engineering removes them; they are knobs, not bugs.
 
    So the honest position is:
 
-   - **recall and storage:** 0.9920 at 0.064× measured, one corpus, n = 1M. The
+   - **recall and storage:** 0.9920 at 0.064× measured, one corpus, n = 1M [**CORRECTED 2026-10-04:** 0.064× is code bytes (`bits × dim / 8`); the built index measures 0.098× at 960-d and 0.130× at 1,024-d against the recorded 8,056 B/vector, and FAILS 0.15× at 384-d (0.261×) and 768-d (0.193×). `bench/RESULTS_VECMAJOR.md`.]. The
      earlier fallback framing — "~0.92 recall at ~0.12× storage, or ~1.00 recall at
      0.067× plus an untimed heap-fetch cost" — is superseded.
    - **latency:** the *scan* is measured and passes at iso-recall — 0.76× at the
@@ -468,7 +468,7 @@ Four things, and it should claim exactly four things:
    claimed on **work saved for the vector channel** — not pending a tighter bound, which is
    what the earlier notes implied, but pending a maintainer decision among: restating §8's
    row in **blocks or bytes** rather than lanes; a second **vector-major** copy of the codes,
-   forfeiting the storage gate; or a **cluster-ordered weft**, which contradicts the
+   forfeiting the storage gate [**MEASURED 2026-10-04, `bench/RESULTS_VECMAJOR.md`:** true at every dim measured, from 0.159× HNSW at 960-d to 0.356× at 384-d. At 384/768-d no layout fits, because two 4-bit copies exceed the whole budget]; or a **cluster-ordered weft**, which contradicts the
    strictly-ascending-docid requirement the fused vector channel depends on
    (`include/weave/vecdocmap.h:35,105,122`) — i.e. **claim 3's clustering lever and this
    claim's docid adapter are not independent**, which nothing in the tree had recorded before

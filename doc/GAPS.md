@@ -3017,7 +3017,7 @@ skipped for a tied oracle / 0 mismatched, fiqa 100 of 100 compared / 0 mismatche
 fallback differed on 100 / 85 / 100 queries, which is `FUSED_TOPK.md` §7a's documented
 divergence and not a defect. Index build 6.6 MB / 0.8 s, 4.9 MB / 0.3 s, 45.4 MB / 6.2 s.
 
-**GATE STATE: 2 of 5.** recall **PASS** (raw objective — G46), nDCG@10 **MET**, p50 / p99 /
+**GATE STATE: 2 of 5.** recall **PASS** (raw objective — G46; both objectives since 2026-10-04, G46 closed), nDCG@10 **MET**, p50 / p99 /
 `score()` **FAIL**. Before the normalizer it was also 2 of 5 (recall, p99). **THIS ENTRY'S FIX
 TRADED p99 FOR nDCG**, and that sentence is the honest summary of G44 as a whole.
 
@@ -3177,7 +3177,7 @@ silently; the first evidence was a 404 on a paid instance. A harness that downlo
 anything should fetch the smallest file first and fail fast, which is what happened here
 by luck of ordering rather than design.
 
-### G46 — `bench/fuse.sh`'s exhaustive oracle cannot express the shipping objective, so the correctness gate runs with `pg_weave.fuse_normalize = off` — **OPEN 2026-09-22**
+### G46 — `bench/fuse.sh`'s exhaustive oracle cannot express the shipping objective, so the correctness gate runs with `pg_weave.fuse_normalize = off` — **OPEN 2026-09-22, CLOSED 2026-10-04**
 
 The gate compares the fused pushdown against `0.5*lex + 0.5*vec` computed from
 `weave_search()` and `weave_vec_scan()`. Since 2026-09-22 the shipping scorer divides each
@@ -3210,6 +3210,60 @@ per-key normalizer directly as an accessor so the oracle divides by the same con
 scan does. The second is less surface and more coupling: it makes the oracle agree with the
 scan **by construction**, which is exactly what an oracle must not do if the constant itself
 can be wrong. Prefer max tf, and let the oracle recompute the normalizer from it.
+
+**CLOSED 2026-10-04 (branch `wt/g46`).** The paragraphs above are the 2026-09-22 state, left
+as written. Two steps closed it, the first of which landed before this entry was updated:
+
+1. **`681f9c4` (2026-09-22)** shipped the max-tf form of the fix recommended above,
+   `weave_index_max_tf()` (0.20.0), and switched `bench/fuse.sh`'s oracle to the normalized
+   objective, with N_L recomputed in SQL from df, max tf and ndocs. That left four gaps:
+   the raw check was **dropped** rather than kept alongside; N_V still came from
+   `weave_vec_scan_stats().maxscore`, which is **produced by the scan's own fold**
+   (`weave_vec_scan_maxscore()`, `src/vector/vecscan.c`), so a wrong fold moved the oracle
+   with the scan; the tie test was exact float equality; and **nothing in installcheck**
+   checked the normalized objective.
+2. **`wt/g46`** closes those gaps without adding SQL objects or bumping the version:
+   - **`sql/fuse_pushdown.sql` (2c)** pins the normalized objective on an ip fixture
+     **where it and the raw one pick different top-5s** (normalized {6..10}, raw {1..5}).
+     Both ceilings are recomputed in SQL, N_V from `weave_vec_blocks().maxrecnorm` × ‖q‖
+     and cross-checked against the shuttle's fold. The cut is a tolerance, and the
+     section asserts on the oracle that each wrong ceiling (M1–M3 below) picks a
+     different top 5, so the fixture's power to catch them is itself pinned.
+   - **(2b) was comparing a normalized scan against a raw oracle.** Its "exact oracle"
+     sums `0.5*lex + 0.5*vec` while the pushdown it compared ran with `fuse_normalize`
+     at its default (on). It passed only because that L2 fixture is vector-dominated
+     under both objectives. **(2b) now runs with `fuse_normalize = off`** and checks the
+     raw objective; (2c) checks the normalized one.
+   - **`bench/fuse.sh`'s gate** checks **both** objectives on every query. N_V is
+     recomputed from `maxrecnorm` × ‖q‖, and the stats number is now a cross-check.
+     Both keys' N are also read off the scan itself (the `fuse_check_bounds` NOTICE prints
+     w = w_key / N_key), the NOTICE is required to fire, and the cut must clear a tolerance
+     (`FUSE_TIE_TOL`, 1e-5 of the top |score|) or the query is counted as **tied**, which is
+     neither a pass nor a fail.
+
+**Mutation evidence**, EC2 run `pgweave-20261004-223426` (c7i.2xlarge, PG17; the smoke step
+before it, the full installcheck with all 30 TAP files, was `Result: PASS`). Each mutant was
+confirmed BUILT and installed: `pg_weave.so` md5 differs from the baseline, and the site
+matched exactly once. The gate figures are scifact, `--embed hash`, 30 queries,
+`FUSE_GATE_ONLY=1`:
+
+| arm | mutation | installcheck (2c) | new gate (normalized) | N_key NOTICE | old gate |
+|---|---|---|---|---|---|
+| baseline | none | matches expected | 0 / 30 mismatched, 0 tied; raw 0 / 30 | 0 disagree | passes |
+| control | `GATE_PRE` = `fuse_normalize = off` | — | **30 / 30** mismatched | 60 disagree | — |
+| M1 | lexical keynorm ×2 (`amscan.c`) | **caught**: pushdown {11..15} | **29 / 30** | 30 | — |
+| M2 | `weave_vec_scan_maxscore` ip ×1.5 (`vecscan.c`) | **caught**: fold cross-check `f`, pushdown {1..5} | **21 / 30**, vector ceiling vs stats 30 | 60 | **PASSES: blind** |
+| M3 | vector keynorm ×2 (`amscan.c`) | **caught**: pushdown {1..5} | **25 / 30** | 30 | — |
+
+**M2 is the one that justifies step 2.** It corrupts the shared fold, so the scan and
+`weave_vec_scan_stats()` move together. The 681f9c4 gate, run on the same build against the
+same 30 queries, **passed with 0 mismatches**. The raw arm shows 0 mismatches under every
+mutant, which is correct, because N_key is unused when the normalizer is off. It also means
+the raw arm alone could never have caught any of the three.
+
+**Limits.** The mutation gate figures come from a hash-embedded corpus, which is enough to
+show the gate can fail but says nothing about quality. Installcheck (2c) ran on PG17 only.
+The corpus-scale gate is in `bench/RESULTS_FUSE.md` "Sixth measurement".
 
 
 ### G47 — with a vector weft, `weave_vacuum_compact()` has no fixed point: every other VACUUM rewrites the live segment, extends the relation, truncates nothing, and achieves no net change — **OPEN 2026-09-24**
@@ -4862,3 +4916,181 @@ reclaims, and `weave_check(deep)` is how to tell that one is due.**
   `ndocs + ndeleted` = 2800/2830/2860; point 4 (the separate refresh) is consistent;
   `STICKY ... (2600 vs 2340)`. That is exactly the predicted failure, so the test
   measures the window.
+
+### G73 — t/028's "quiet plain VACUUM still truncates the index" control failed once on a tree that does not touch VACUUM — **FOUND 2026-10-04; flake in a test's positive control, not a product defect so far; OPEN**
+
+The full gate on `wt/f9b` (`eb28db7`, run `pgweave-20261004-210709`) failed exactly one
+TAP assertion out of 1,100: t/028 test 113, `quiet plain VACUUM still truncates the index
+(4143 -> 4213 blocks)`. The relation **grew** across three plain VACUUMs after the
+DELETE. That branch changes no C code on the VACUUM path; it adds a regression file and
+docs, and a comment in `fusepath.c`. Re-run in isolation on the same commit five times
+(`pgweave-20261004-212408`): 5 of 5 pass. Nine other recorded full runs pass t/028.
+
+**What it might be, unproven:** truncation takes AccessExclusiveLock **conditionally**
+(`weave_truncate_tail_above()`, G67) and skips it if anyone else holds a lock. A leftover
+backend from t/028's own concurrent rounds, or autovacuum on another table, could make
+all three conditional attempts skip. Growth rather than no change needs a second
+explanation: the cleanup's merge writing new pages before it frees old ones, which the
+skipped truncation then cannot return. The control should either retry until truncation
+is observed with a time cap (as t/027's rounds do) or assert "not larger than before plus
+the merge's output" instead of "smaller". **Owed:** reproduce with `log_lock_waits` and a
+NOTICE on the skipped conditional lock before changing the assertion; a test that relaxes
+its assertion without knowing why it failed is the eleventh-member mistake.
+
+### G74 — `weave_search()` returns a HOT-chain ROOT TID, so `JOIN t ON t.ctid = s.ctid` silently drops every HOT-updated row — **FOUND 2026-10-04 by the F3 agent while building `weave_fuse_search()`'s oracle; PRE-EXISTING; OPEN**
+
+An access method must hand the executor HOT-chain root TIDs (AGENTS.md), and
+`weave_search()` returns the TID the index holds, which is the root. Joining that to the
+heap's `ctid`, which is the live tuple's TID, matches nothing for a row that has been
+HOT-updated since it was indexed. The row disappears from the join with no error. Every
+oracle in `sql/fuse_pushdown.sql` (2)/(2b) and `bench/fuse.sh` joins this way; they are
+correct only because their fixtures have no HOT updates.
+
+`weave_fuse_search()` (F3, 2026-10-04) returns the live ctid, read from the slot after
+the heap fetch, and `sql/fusesearch.sql` pins it with a HOT-updated row. **Owed:** decide
+whether `weave_search()` should do the same (a behaviour change to a 0.1.0 SQL function),
+or document that its `ctid` column is the root and give the join the
+`heap_get_root_tuples()`-equivalent it needs. The same audit is due for `weave_vec_scan()`,
+which returns docids.
+
+### G75 — t/029's "weave_check(deep) is clean after recovery" failed once: one violated invariant after an immediate stop right after a VACUUM flush — **FOUND 2026-10-04 by the g46 agent's smoke (`pgweave-20261004-221406`, branch at main 89d7dcf + 3 commits touching no C); NOT YET REPRODUCED; OPEN**
+
+t/029 (G65's test) crashes the server immediately after a VACUUM that flushes the pending
+list, restarts it, and asserts `weave_check(fa_w, deep)` has zero violated rows. Once, it
+had **one**. The run kept only the installcheck tail, and the test printed only the count,
+so which invariant failed is not known. That is the G21 mistake, repeated: the same
+symptom shape, "one leaked page after crash recovery, once", is still OPEN for t/014.
+
+**Done:** t/029 now prints, on failure, every violated invariant with its detail and every
+unreachable unflagged page with its kind, flags, nextblk and LSN. A recurrence will name
+the write path.
+
+**Hunted, 2026-10-04:** t/029 alone, 40 runs, 0 failures (`pgweave-20261004-222827-e5b4`);
+the full TAP sequence, 8 runs, 0 failures (`pgweave-20261004-224037-52a8`); and a
+direct probe of the leak hypothesis, 20 trials of the exact shape (12 pending pages, VACUUM
+flush, immediate stop, deep check), 0 orphaned pages and 0 violations
+(`pgweave-20261004-224958-f801`). So 68 attempts at a 1-in-1 rate; the 95 % upper bound on
+the per-run rate is now about 4 %.
+
+**The leading hypothesis is a leak, not double counting.** G72 recorded the leak class:
+pages freed after an operation's last record, or written before being linked. The flush's
+pending-page recycling runs AFTER the one atomic record (`weave_free_page()` per page, one
+record each). An immediate stop between the atomic record and the last free leaves pages
+that are unreachable and not flagged freed, which is exactly what
+`pages_reachable_or_freed` reports. A VACUUM issues no XLogFlush unless the transaction
+has an XID, so the free records may simply not be on disk at the stop. If so, this is not a
+new defect but G72's leak class, observed: harmless to answers, reclaimable only by REINDEX.
+The diagnostic above will confirm or refute it. The probe weakens it: if every
+immediate stop after a flush lost the trailing free records, 20 of 20 trials would have
+leaked, and none did. The free records are on disk by the stop, which is what an
+`fsync = off` cluster with a clean-exit `pg_ctl stop -m immediate` would be expected to
+show. So the one failure is either a rarer interleaving or something else entirely.
+**Disposition, G21's: not hunted further until it recurs**, and when it does, the test now
+prints what failed.
+
+### G76 — a gated ORDER BY whose gate admits fewer rows than LIMIT walks the WHOLE HEAP in the padding phase: correct, O(heap), invisible to every counter — **FOUND 2026-10-04 by the v17 agent (`pgweave-20261004-231619`, scifact); FIXED 2026-10-05 for every lexical gate without a NOT (merge of `wt/g76`); docvalues-only and NOT gates still walk the heap, by design, until G77 and G78 are fixed**
+
+When `WHERE body @@@ q ORDER BY fuse(...) LIMIT k` has fewer than k qualifying rows, the
+ranked phase runs out and the G56/G71 padding phase begins (`weave_pad_begin()`),
+which is `table_beginscan()` over the whole heap, handing every row to the executor for
+recheck. On scifact, a lexical gate admitting 5 rows with LIMIT 10 costs **40 ms and 17k
+buffers**, against 0.70 ms with 52 qualifying rows. Locally on 20k rows:
+`Rows Removed by Index Recheck: 19995`, and every fuse/work counter is identical to the
+LIMIT 2 run, so `weave_index_stats()` cannot see it. The vector and edit-distance routes
+pad the same way under a `@@@` restriction.
+
+**Why it is not simply "walk the gate set instead":** see G77. A row whose lexical
+column is NULL is in no index structure at all, so for a gate that does not involve the
+lexical column (a docvalues-only `price < c`) the heap walk is what finds it. A lexical
+gate cannot admit such a row (`NULL @@@ q` is NULL), so for any gate with a lexical key
+the gate set is a complete superset of the qualifying rows, and the padding can walk it.
+
+**Fixed 2026-10-05.** `weave_pad_begin()` fetches the gate set's TIDs through the snapshot
+(`table_index_fetch_tuple()`, as `weave_ord_probe()` does) instead of
+`table_beginscan()`, whenever the gate is COMPLETE: it has a lexical key whose query has no
+NOT (`so->plainGateLex`). Every padding row is still classified exactly as before (partial
+predicate, NULL document, NULL fused column, already ranked). The vector route has no gate
+set of its own, so the padding collects the WHERE query's. So does the lexical-ordering
+route, which keeps the WHERE query in `padWhereQuery` because `so->query` is replaced by
+the ORDER BY query. Two gates keep the heap walk: docvalues-only (G77) and any NOT query
+(G78, which was found because the first version of this fix walked a NOT gate and lost a
+zero-term document).
+
+Pinned by `sql/fuse_gate.sql` section (5): five routes over 3,004 rows with a 21-row gate
+that holds pending rows, a NULL document, a NULL vector, a HOT update, a non-HOT update
+and a delete. Each route's answer equals the heap's, and `Rows Removed by Index Recheck`
+is at most 25 (it was about 2,980). The positive control is a fused NOT gate, which must
+still walk the heap and must keep zero-term document 3004. Mutants, both BUILT (`.so` md5
+changed) and both caught: **M1**, the gate walk disabled, fails all four asserted routes;
+**M2**, NOT gates walked, fails the control's removed count and loses row 3004.
+
+**Not asserted, and why:** the plain vector route's removed count. Its ranked phase applies
+no gate, emitting every live lane in distance order for the executor to filter, so its
+removed count measures the ranked phase rather than the padding. That is rank-then-filter
+by design; `fuse()` is the gated form.
+
+**Owed:** re-measure scifact's 5-row gate at LIMIT 10 (40 ms and 17k buffers before) with
+the v17 harness.
+
+### G77 — a docvalues restriction answered by the index silently DROPS every row whose lexical column is NULL — **FOUND 2026-10-04 while scoping G76; a SILENT WRONG ANSWER on any nullable `wdoc` column with a docvalues key; OPEN**
+
+The build callback and `weave_insert()` both return early when the lexical column is
+NULL (`src/am/ambuild.c`, `if (isnull[lexidx]) return`), so the row gets no docid, no
+docvalue and no vector lane. Each restriction or ordering on another column of the
+index therefore cannot see it. Reproducer (local, 2026-10-04): 2,000 rows plus
+`(9001, NULL, '[1,1,1,1]', 3)` and `(9002, 'common', NULL, 4)`, index
+`USING weave (body, emb, price int8_docval_ops)`:
+
+| query | heap (Seq Scan) | weave (Index Scan, `Index Cond: (price < 6)`) |
+|---|---|---|
+| `WHERE price < 6` | `{1,2,3,4,5,9001,9002}` | `{1,2,3,4,5,9002}`: **9001 missing** |
+| `WHERE price < 6 ORDER BY emb <-> q LIMIT 3` | `{9001,1,2}` | `{1,2,3}`: **9001 missing** |
+| `ORDER BY emb <-> q LIMIT 3` (no WHERE) | `{9001,1,2}` | `{1,2,3}`; 9001 comes out of the padding at +Infinity |
+| `WHERE price < 6 ORDER BY fuse(...)` | 9001 present | 9001 present, **only because** the padding walks the heap (G76) |
+
+The bitmap route answers the same as the index scan. The vector row was already
+recorded as a loss in `sql/vecorderby.sql` ("The ten NULL-DOCUMENT rows are excluded from
+that rank, and they are a loss recorded here rather than a pass"). It was treated as an
+ordering imperfection, but with a docvalues key it is a missing row, because a WHERE
+clause the executor does not recheck is answered from a set that does not contain it.
+
+`sql/docvals.sql` never has a NULL document, which is why nothing caught it. Every
+docvalues fixture has a non-NULL `wdoc`.
+
+**Fix options, owed and a maintainer-visible choice:**
+1. **Index NULL-document rows** with a docid, a docvalue and a lane but no postings, and a
+   per-docid "document is NULL" mark so `@@@` (including `!q`, which an empty document
+   matches and a NULL one must not) excludes them. Correct everywhere; a format change.
+2. **Refuse to serve** a restriction or ordering on a non-lexical column when the lexical
+   column is nullable (`attnotnull` false at plan time). Correct; gives up the docvalues
+   prize on nullable columns.
+3. **Document it** as "the lexical column must be NOT NULL", as G71 did before its fix.
+   Not acceptable as the end state: it is a wrong answer, not a slow one.
+
+### G78 — `@@@ '!q'` omits documents with NO TERMS (empty text, stopwords only), and the omission depends on the plan — **FOUND 2026-10-04 while scoping G76; a SILENT WRONG ANSWER; OPEN, not investigated past the reproducer**
+
+`weave_match(to_wdoc(''), '!common')` is true, as it should be: a document with no terms
+contains no `common`. The index disagrees. 10 `common` rows, `''`, `'the'`, `'rare'` at
+build, then `''` and `'rare pend'` pending (local, 2026-10-04):
+
+| arm | `!common` |
+|---|---|
+| heap, `weave_match()` | `{101,102,103,201,202}` |
+| weave Index Scan | `{102,103,201,202}`: **101 missing** (the built empty doc) |
+| `weave_count()` | 4 |
+| after `VACUUM` (flushed) | `{102,103,202}`: **201 missing too** |
+
+So the NOT universe is built from postings (`weave_universe_bounded()`), and a document
+with no terms has none. The pending path includes the empty doc until it is flushed. On a
+second table (`g76c`, 300 rows plus an empty doc with a vector) the plain Index Scan
+**included** the empty doc and the Bitmap scan **omitted** it, so the answer depends on the
+plan as well. That second observation is unexplained.
+
+`'the'` matches in the index because `to_wdoc('the')` keeps the stopword as a term. Only a
+document with zero terms is affected.
+
+The likely fix is the universe from the doc-length store or the vector warp map (both
+enumerate every docid in a segment, posting-less ones included; the VWARP chain exists
+for exactly this reason, `doc/specs/VECTOR_CHANNEL.md` "warp → docid"), not from postings.
+
+G76's fix does not rely on the universe: a NOT query keeps the heap walk.

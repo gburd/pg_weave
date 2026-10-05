@@ -183,6 +183,8 @@ sets how many bits come out of each lookup, not how many lookups happen. So:
 | rerank window @ 0.99, n = 1M | 25 | 50 |
 | rerank cold p50 | ~100 ms | ~180 ms |
 
+> **CORRECTED 2026-10-04:** the B/vector and × HNSW columns above are CODE BYTES (`bits × dim / 8`), not the built index. Built at 4 bits the index measures 534 / 789 / 789 / 1,045 B/vector at 384 / 768 / 960 / 1,024-d: 0.098× at 960-d and 0.130× at 1,024-d against 8,056, and it FAILS 0.15× below 960-d. Each 32-lane block's centroid strip occupies a whole 8 KB page (256 B/vector at every dim). `bench/RESULTS_VECMAJOR.md`.
+
 Three bits trades 25% of a storage budget that is already met by 2–3× for a
 doubled rerank window, which is real cold I/O. That is a slack constraint bought
 with a binding one. **4 bits stays, now on measured grounds rather than on the
@@ -486,7 +488,7 @@ recall ceiling `R*` = 0.9760.
 All three gate terms still pass, and the margins are smaller than the previous revision
 claimed:
 
-- **storage** 0.064x against a 0.15x bar — unchanged.
+- **storage** 0.064x against a 0.15x bar — unchanged. [**CORRECTED 2026-10-04:** 0.064× is code bytes (`bits × dim / 8`); the built index measures 0.098× at 960-d and 0.130× at 1,024-d against the recorded 8,056 B/vector, and FAILS 0.15× at 384-d (0.261×) and 768-d (0.193×). `bench/RESULTS_VECMAJOR.md`.]
 - **latency at matched recall** `R*` = 0.9760: the cheapest configuration reaching that
   recall is prefix 0.5 / W 8000 at **56.22 ms = 0.76x**. Passes.
 - **recall >= 0.99** at n >= 1M: reached by prefix 0.5 / W 20000 (0.9930) and by the
