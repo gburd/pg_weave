@@ -33,15 +33,18 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
 
-# 8 cycles, cut from 18 on 2026-10-06 (the lead's call, not yet the maintainer's:
-# raised as decision 2 in the G75 report, revert if declined).  The
-# size bound below is a TODO, so its discriminating power no longer needs the long
-# loop, and 18 cycles made the whole installcheck take ~1,900 s instead of ~380 s.
+# 11 cycles, MAINTAINER DECISION 2026-10-06 (G75 decision 2).  18 cycles made the
+# whole TAP run ~1,900 s instead of ~380 s, which is too much; 8 (the lead's interim
+# cut) stopped at cycle 7, one cycle BEFORE the post-crash compaction growth starts,
+# so the size bound below could never fail and prove reported it as "TODO passed".
+# 11 reaches cycles 8-10, where the measured excess (2,626 / 5,299 / 7,972 pages in
+# pgweave-20261006-010652-fb9f) clears the bound, so the TODO is a live signal again.
 # What stays HARD at every cycle -- leaked == 0 after one VACUUM and a clean deep
 # check -- needs only enough crashes that land inside a flush, and the
 # total-stranded assertion below proves they did.  The 1M-row scale run
-# (bench/aws/g75_job.sh, RESULTS_G75.md) is where the long loop lives.
-my $cycles = 8;
+# (bench/aws/g75_job.sh, RESULTS_G75.md) is the long loop.  The growth itself is
+# task L22 in doc/PHASES.md.
+my $cycles = 11;
 my $rows = 30000;
 
 my $node = PostgreSQL::Test::Cluster->new('crashloop');
@@ -208,7 +211,7 @@ note('excess of c_w over its twin per cycle: ' . join(' ', @excess)
 # than loosened.  `prove` reports it as "not ok # TODO" every run.
 TODO:
 {
-	local $TODO = 'G75: crash-loop size bound -- crashed index compacts every cycle, twin does not (open)';
+	local $TODO = 'G75 / L22: crash-loop size bound -- crashed index compacts every cycle, twin does not (open, doc/PHASES.md L22)';
 cmp_ok($worst, '<=', $bound,
 	"at every cycle the crashed index's excess over its twin (worst $worst pages) is at most one crash's stranding ($maxs) + $slack");
 # The discriminating case is accumulation: had nothing been reclaimed, the

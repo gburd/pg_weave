@@ -5088,7 +5088,9 @@ reports it. This is not specific to the reclaim. **Any** bug that frees a live p
 erased from the evidence by the next merge, which is the class G15 and G62 belong to.
 `t/032` now runs the deep check and a per-row posting probe after **every** concurrent
 try, before a later VACUUM can merge. The owed fix is for the merge's chain walkers to
-raise an ERROR, not stop, on a `WEAVE_FREED` page met on a live chain.
+raise an ERROR, not stop, on a `WEAVE_FREED` page met on a live chain. **Superseded
+2026-10-06 by maintainer decision: WARN and skip that merge instead (task L23).** An ERROR
+would make every later VACUUM fail until REINDEX.
 
 **SUPERSEDED 2026-10-06, same branch: the "growth defect" below was the test, not the
 index.** `t/033` gave the crashed index two VACUUMs per cycle and its twin one. From
@@ -5136,6 +5138,12 @@ is that the cleanup's compaction trigger (`freeblks > nblocks / 4`, counted from
 FSM) sees those entries and fires. That is **not demonstrated**. Until it is, the bound is
 a `TODO` in `t/033`: reported as `not ok # TODO` on every run, neither silenced nor
 loosened.
+
+**MAINTAINER DECISIONS 2026-10-06.** (1) The bound stays a visible known failure (`TODO`),
+and the growth is its own task, **L22** in `doc/PHASES.md`. (2) `t/033` runs **11 cycles**:
+the interim cut to 8 stopped one cycle before the growth starts, so the TODO could not fail
+and `prove` reported "TODO passed". (3) The merge's silent stop on a freed page (above) is
+task **L23**: warn and skip that merge rather than raise an ERROR.
 
 **The A/B against the base says the late growth is pre-existing, and that the reclaim
 removes what accumulated** (`pgweave-20261006-010652-fb9f`, `t/033` with the same tests
