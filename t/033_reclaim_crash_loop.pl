@@ -33,7 +33,15 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
 
-my $cycles = 18;
+# 8 cycles, cut from 18 on 2026-10-06 (the lead's call, not yet the maintainer's:
+# raised as decision 2 in the G75 report, revert if declined).  The
+# size bound below is a TODO, so its discriminating power no longer needs the long
+# loop, and 18 cycles made the whole installcheck take ~1,900 s instead of ~380 s.
+# What stays HARD at every cycle -- leaked == 0 after one VACUUM and a clean deep
+# check -- needs only enough crashes that land inside a flush, and the
+# total-stranded assertion below proves they did.  The 1M-row scale run
+# (bench/aws/g75_job.sh, RESULTS_G75.md) is where the long loop lives.
+my $cycles = 8;
 my $rows = 30000;
 
 my $node = PostgreSQL::Test::Cluster->new('crashloop');
