@@ -5715,3 +5715,31 @@ header compared; the cap removed. PG17 and PG18 installcheck 25/25, TAP 33 files
 **Still OWED:** the fused route (`so->fusek`, `weave_fuse_pass()`), whose several ORDER BY
 keys mean the hint has to travel on the `<~>` transport key; and the vector route
 (`so->veck`).
+
+**Measured before building, 2026-10-06 (hard rule 9; `wt/hintfuse`).** Proxy for a hinted
+LIMIT 10: `pg_weave.wand_initial_k = 16`, so the first width is 64, against the default
+32 (width 128). EC2 c7i.4xlarge, PG17, 200k documents, the same lexical corpus as above
+plus a 32-d vector per row (every 997th NULL) that drifts smoothly with the row id,
+LIMIT 10, two runs per arm, median of 25 warm runs. Run `pgweave-20261006-205828-0b58`
+(smoke green on `4c7dcca`). The answers (md5 of the id list) were identical at both widths.
+
+| query | width 128 -> 64: `weave_fuse_stats().scores` | vec_lanes | ms 128 (run 1 / 2) | ms 64 (run 1 / 2) |
+|---|---:|---:|---:|---:|
+| `fuse(d <=> 'a \| b \| c', v <-> q)` | 103,539 -> 80,313 (-22 %) | 199,800 both | 34.1 / 34.0 | 32.8 / 32.6 |
+| `fuse(d <=> 'c', v <-> q)` | 47,833 -> 46,195 (-3 %) | 199,800 both | 24.1 / 24.1 | 23.8 / 23.6 |
+| `fuse(d <=> 'a \| b', d <=> 'c')` | 3,567 -> 1,781 (-50 %) | — | 2.38 / 2.37 | 2.22 / 2.21 |
+| `v <-> q` (vector route) | — | 199,800 both, 0 blocks bound-skipped | 14.0 / 14.0 | 14.0 / 13.7 |
+
+- **Fused: the work moves**, by 3 % to 50 % depending on how much of it is lexical, and the
+  time follows by 1-7 %. The vector channel inside a fused scan scores every lane at both
+  widths here, so the hybrid queries keep most of their cost. Built; see below.
+- **Vector route: NOT HINTABLE WITHOUT A DECISION, and on this corpus the work did not move
+  anyway.** Its ORDER BY argument is a `wvec`, whose only spare field is the `int16 unused`
+  word (`include/weave/vector.h`, "zeroed; reserved for a per-value flag word";
+  `wvec_recv()` rejects a nonzero one). Using it as a planner-only carrier is a format
+  decision, not something this task takes. The measurement also gives no reason to take it:
+  `vec_lanes` was 199,800 at both widths and the block bound skipped nothing, so the
+  first-pass width did not change the work. This corpus is a poor test of the bound (every
+  vector is nearly equidistant from the query, the `bench/RESULTS_BOUND_PRUNING.md`
+  failure mode), so the result is **corpus-limited, not a ceiling**: on a clustered corpus
+  where the block bound prunes, a narrower top-k threshold could prune more. Unmeasured.
