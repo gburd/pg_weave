@@ -5135,7 +5135,24 @@ So a crash leaves the FSM disagreeing with the pages on every cycle. A probable 
 is that the cleanup's compaction trigger (`freeblks > nblocks / 4`, counted from the
 FSM) sees those entries and fires. That is **not demonstrated**. Until it is, the bound is
 a `TODO` in `t/033`: reported as `not ok # TODO` on every run, neither silenced nor
-loosened. The `t/033` A/B against the base is owed (`bench/aws/g75_ab028.sh`, `AB_MARK=40`).
+loosened.
+
+**The A/B against the base says the late growth is pre-existing, and that the reclaim
+removes what accumulated** (`pgweave-20261006-010652-fb9f`, `t/033` with the same tests
+on both arms, base = `18e3f9b`'s C code):
+
+| cycle | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| branch excess | 148 | 255 | 255 | 1016 | 262 | 208 | 255 | 255 | 2626 | 5299 | 7972 | 10641 | 13310 | 15983 | 22478 | 4134 | 13300 | 15970 |
+| base excess | 256 | 845 | 1434 | 2023 | 2612 | 3201 | 3790 | 4379 | 6416 | 7005 | 8937 | 10869 | 12801 | 14733 | 16665 | 7902 | 20529 | 24483 |
+
+The base accumulates about 589 pages per crash from the first cycle onwards, because
+nothing reclaims what is stranded. The branch stays at one crash's stranding until the
+first large merge. From cycle 8 both grow by about a flush per cycle, through the same
+post-merge compaction ratchet, so that part is **not introduced by this branch** and is
+present on `main` today. It is the open item, and it belongs to the compaction trigger
+(L19), not to the reclaim. One run per arm (hard rule 10 wants two). The second run per
+arm is in the same job.
 
 **Costs and limits, recorded as prominently as the fix:**
 - Every VACUUM cleanup now reads every page of the index once, as GIN's and GiST's

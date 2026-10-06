@@ -73,10 +73,13 @@ unmeasured.
   (`pgweave-20261006-001850-1420`, `-010652-fb9f`). This is not stranded pages: every
   cycle is leak-free and deep-clean. From the first large merge onwards, every post-crash
   VACUUM of the crashed index runs the share-lock compaction (`lowfree_reuse` 10k–21k,
-  `extend` 2k–8k), and the twin's never does. The mechanism is not demonstrated. The A/B
-  against the base is in flight (`pgweave-20261006-010652-fb9f`, `AB_MARK=40`) and its
-  result is not in this file yet. A larger index than the never-crashed one can
-  therefore not be ruled out. The scale run's final index was 82,772 pages against
+  `extend` 2k–8k), and the twin's never does. **The A/B against the base**
+  (`pgweave-20261006-010652-fb9f`, one run per arm so far) shows the base accumulating
+  ~589 pages per crash from cycle 1 (excess 256 → 4,379 by cycle 7). The branch stays
+  at 148–1,016 over the same cycles. From the first large merge (cycle 8), both grow by
+  about a flush per cycle, reaching 24,483 on the base and 22,478 on the branch. The late
+  growth is therefore **pre-existing on main**, and it belongs to the compaction trigger
+  (L19); the reclaim removes the accumulating part. The full table is in G75. The scale run's final index was 82,772 pages against
   57,697 for a fresh build of the same rows, but it has no twin, so that ratio is not
   attributable.
 - **RETRACTED (same branch): an allocator change.** Dropping live free-list candidates
