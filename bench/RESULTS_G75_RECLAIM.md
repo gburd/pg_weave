@@ -16,7 +16,7 @@ are under `bench/aws/out/`.
 | concurrency: a reclaim beside a mid-segment writer never frees a page that a later publish links | **PASS** | `t/032` phases A and B, each with evidence that its window was hit (below) |
 | mutant: reclaim ignores the in-progress-writer guard | **PASS (caught)** | `noguard`, `nobarrier`, `nofence` each caught by **corruption** assertions, not only by evidence assertions (below) |
 | hard rule 12, scale: 1M rows, repeated crash-during-flush, VACUUM, deep clean, answers equal the heap | **PASS** | `g75_scale.sh`, two runs (below) |
-| full installcheck + TAP green on the final commit | **PASS** | `pgweave-20261006-010652-fb9f` on `1a174b2`: `make installcheck` exit 0, `regression.diffs` empty, 33 TAP files / 1,258 tests, "All tests successful" (`t/033`'s bound reported `# TODO`) |
+| full installcheck + TAP green on the final commit | **PASS** | `pgweave-20261006-032309-074a` on `8ce1576` (the branch merged with `main` at `1621f44`): `make installcheck` exit 0, `regression.diffs` empty, 33 TAP files / 1,282 tests, "All tests successful" (`t/033`'s bound reported `# TODO`). Before the merge: `pgweave-20261006-010652-fb9f` on `1a174b2` |
 
 ## `t/032`: the window was hit, on the clean tree
 
