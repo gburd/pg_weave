@@ -5630,6 +5630,38 @@ substituted value equals the computed one on every row, both normalizer modes, i
 the padding rows (G56/G71), whose stored distance is +Infinity or NULL. Measure the gain on
 EC2 at two scales first (hard rules 9 and 11).
 
+**Analysis before the port, 2026-10-06 (`wt/g86`).** Four facts that decide the shape of the fix:
+
+- **A scan's target-list entry is RESJUNK only when the scan's list IS the top plan's.**
+  `make_limit()` (and Sort, Incremental Sort) share `lefttree->targetlist`, and
+  `apply_tlist_labeling()` copies `resjunk` onto the top plan's entries, so
+  `Limit -> Index Scan` and a bare top-level Index Scan get it. A scan under a join, an
+  Append child or a projecting node gets its list from `build_path_tlist()` with
+  `resjunk = false` and is never substituted. That is a lost optimization, not a wrong answer.
+- **Who reads the resjunk value.** A plain `Limit -> Index Scan` reads nothing: the value is
+  computed and discarded. The readers are `FETCH ... WITH TIES`, an Incremental Sort over
+  the scan (`ORDER BY d <=> q, id`), and a Sort or Merge above it. So a "returns the
+  previous row's value" bug is invisible to every plain `LIMIT` test. The test has to use one
+  of the readers. In those shapes the substitution also CHANGES what the reader sees, from
+  `weave_distance()`'s N = 1 value to the corpus value the stream is actually ordered by.
+  That makes them consistent where they were not, but it is a behaviour change.
+- **A backend-global current value can be CLOBBERED.** `ExecScan()` fetches the tuple, then
+  evaluates the qual, then projects. A SubPlan in the qual, or a visible column before the
+  resjunk one (a correlated subquery, or a function that runs a ranked query), can run a
+  second weave ordering scan in between. Its `gettuple` overwrites the global, and the outer
+  row's sort key becomes the inner scan's value. pg_fts's zero-argument
+  `fts_current_distance()` has this hazard. The port keys the stored value on (index, heap
+  TID, query) and recomputes the operator's own value on a mismatch, so a clobber costs
+  speed rather than a wrong key.
+- **Which channels' scan values equal the operator's.** Lexical `<=>`: the scan's value is
+  the corpus BM25 distance and `weave_distance()` is the N = 1 one. They are not equal, so
+  only RESJUNK entries may be substituted (pg_fts's rule). Vector `<->`/`<#>`/`<=>`: the
+  scan scores QUANTIZED reconstructions (`<->` returns the square, and see the comment above
+  `weave_vec_pass()`), so the values are not equal and are not substituted (see below for
+  the measured status). `<@>`: under review. `fuse()`: the scan's `-S` sums corpus BM25 and
+  quantized vector scores in a different order from `weave_fuse()` (F5: last-ULP
+  differences), so no bit-identity proof exists and it is not substituted.
+
 ### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`); the fused route is still OWED**
 
 An index AM is not told the LIMIT. pg_weave starts every ordered lexical pass at
