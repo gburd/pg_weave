@@ -5090,6 +5090,21 @@ erased from the evidence by the next merge, which is the class G15 and G62 belon
 try, before a later VACUUM can merge. The owed fix is for the merge's chain walkers to
 raise an ERROR, not stop, on a `WEAVE_FREED` page met on a live chain.
 
+**SUPERSEDED 2026-10-06, same branch: the "growth defect" below was the test, not the
+index.** `t/033` gave the crashed index two VACUUMs per cycle and its twin one. From
+cycle 8 onwards, each crashed-index VACUUM after the restart ran the share-lock
+compaction that cannot reuse its own frees (the L19 ratchet in `weave_vacuumcleanup()`).
+The allocator counters show it: `lowfree_reuse` was 10k–16k and `extend` about 2,080 on
+every such VACUUM (`pgweave-20261005-233440-3d3e`). The allocator arms that seemed to
+cure it were also running ten cycles instead of fourteen, so they never reached cycle 8.
+With the twin on the same schedule (`344c5d7`), the excess stays at or below one
+crash's stranding. The stale-entry clear described below is kept: it is correct and
+cheap, and about 1,340 such entries were seen after each crash. But what it saves is
+**unmeasured**. A further step, taking not-yet-recyclable freed pages *out* of the FSM,
+was aimed at the same non-defect and broke compaction (`weave_vacuum()` stopped
+compacting; `sql/weave.sql` and `sql/chanstats.sql` went red,
+`pgweave-20261005-231415-cab5`). It was reverted. The original text follows.
+
 **A pre-existing growth defect, found by `t/033` once the allocator change above was
 reverted, and FIXED here because the reclaim pass is where it belongs.** A crash
 restores FSM pages that are older than the index pages they describe. So the FSM can

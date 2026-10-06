@@ -1350,17 +1350,18 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 		Page		page;
 
 		/*
-		 * A REACHABLE page the FSM calls free is a stale entry -- a crash
-		 * restored an FSM page older than the page's reuse.  Mark it used.
-		 * Not optional, and measured: the allocator refuses a live candidate,
-		 * RE-RECORDS it and stops reusing for the rest of its allocation
-		 * sequence (weave_new_buffer()), so one such entry makes every later
-		 * flush extend, for as long as the page stays live.  t/033's crashed
-		 * index grew by a whole flush per cycle (~1,900 pages) through five
-		 * cycles in which no crash stranded anything, while its never-crashed
-		 * twin stayed flat.  Safe without the page's lock: the mutex is held,
-		 * so nothing frees a reachable page during this pass, and marking a page
-		 * used never hands it to anyone.
+		 * A REACHABLE page the FSM calls free is a stale entry -- a crash can
+		 * restore an FSM page older than the page's reuse.  Mark it used: the
+		 * allocator refuses a live candidate, re-records it and stops reusing
+		 * for the rest of its allocation sequence (weave_new_buffer()), so the
+		 * entry costs an extension every time it is met.  Safe without the
+		 * page's lock: the mutex is held, so nothing frees a reachable page
+		 * during this pass, and marking a page used hands it to nobody.
+		 *
+		 * Observed in t/033 (about 1,340 such entries after each crash); the
+		 * growth this was first credited with curing was that test's own
+		 * asymmetric VACUUM schedule (doc/GAPS.md G75, SUPERSEDED note), so
+		 * what it saves is unmeasured.
 		 */
 		if (reach[blk] != 0)
 		{
@@ -1414,40 +1415,26 @@ weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel)
 			 WeavePageIsFreed(page)))
 		{
 			/*
-			 * Only a page the allocator would take NOW.  A freed page whose XID
-			 * stamp is not yet past the horizon is left for a later VACUUM, for
-			 * the reason the stranded-page arm below gives: one such entry stops
-			 * every live-FSM allocation at it.  Measured, not a precaution --
-			 * t/033's crashed index grew a flush per cycle until this was added,
-			 * because the VACUUM that crashed had freed the previous crash's
-			 * pages with a stamp of the crash-time next XID, and after restart
-			 * no XID had completed past it.
+			 * RE-RECORD ONLY, and only a page the allocator would take now (a
+			 * freed page whose XID stamp is not past the horizon waits for a
+			 * later pass).  Never REMOVE an FSM entry here: that was tried, to
+			 * keep a crash-restored FSM from offering pages the crashed VACUUM
+			 * had just freed, and it broke compaction -- weave_vacuum_compact()'s
+			 * gates count and probe FSM-free pages, so weave_vacuum() stopped
+			 * compacting and sql/weave.sql's and sql/chanstats.sql's size
+			 * bounds failed (pgweave-20261005-231415-cab5).  It also bought
+			 * nothing: the t/033 growth it was aimed at was that test's own
+			 * asymmetric VACUUM schedule.
 			 */
-			bool		infsm = GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2;
-
-			/*
-			 * BOTH DIRECTIONS.  Recorded only if reusable now, and REMOVED if
-			 * the FSM lists it while it is not: a crash restores FSM pages
-			 * older than the frees they describe, so the FSM can offer a page
-			 * the crashed VACUUM freed a moment before the crash, whose stamp
-			 * is not yet past the horizon.  The first version only added pages
-			 * and t/033's crashed index went on growing a flush per cycle,
-			 * identically, because the flush right after this pass met exactly
-			 * those entries.  The next pass records them once they qualify.
-			 */
-			if (weave_page_reusable_now(index, page))
+			if (GetRecordedFreeSpace(index, blk) < BLCKSZ / 2)
 			{
-				if (!infsm)
+				if (weave_page_reusable_now(index, page))
 				{
 					RecordFreeIndexPage(index, blk);
 					nrecorded++;
 				}
-			}
-			else
-			{
-				if (infsm)
-					RecordUsedIndexPage(index, blk);
-				nnotyet++;
+				else
+					nnotyet++;
 			}
 			UnlockReleaseBuffer(buf);
 			continue;

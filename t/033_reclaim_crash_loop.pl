@@ -33,7 +33,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
 
-my $cycles = 14;
+my $cycles = 18;
 my $rows = 30000;
 
 my $node = PostgreSQL::Test::Cluster->new('crashloop');
@@ -190,8 +190,14 @@ note('excess of c_w over its twin per cycle: ' . join(' ', @excess)
 	  . '; stranded per crash: ' . join(' ', @strand) . "; slack $slack pages");
 cmp_ok($worst, '<=', $bound,
 	"at every cycle the crashed index's excess over its twin (worst $worst pages) is at most one crash's stranding ($maxs) + $slack");
+# The discriminating case is accumulation: had nothing been reclaimed, the
+# excess at the last cycle would be the running sum of the strandings.  So the
+# evidence that this run could tell the two apart is that the sum exceeds the
+# bound.  Measured on runs that passed the bound: sums of 2,846 to 3,446 pages
+# against bounds of 2,200 to 3,000, which is not a wide margin -- so the cycle
+# count was raised, rather than the bound loosened, when one run fell short.
 cmp_ok($sums, '>', $bound,
-	"and the crashes stranded enough in total ($sums pages) that accumulation would exceed that bound");
+	"and the crashes stranded enough in total ($sums pages) that accumulation would exceed that bound ($bound)");
 
 $node->stop;
 done_testing();
