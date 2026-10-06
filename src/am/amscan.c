@@ -474,6 +474,7 @@ typedef struct WeaveScanOpaqueData
 	bool		curdistCbSet;	/* curdistCb is registered on so's context */
 	bool		curdistIsnull;
 	double		curdistValue;
+	uint64		curdistSeq;		/* weave_curdist_seq when it was published */
 	IndexScanDesc curdistScan;	/* the descriptor whose xs_heaptid it is for */
 	dlist_node	curdistNode;
 	MemoryContextCallback curdistCb;
@@ -2653,7 +2654,8 @@ weave_universe_bounded(Relation index, BlockNumber dictstart, double ndocs,
  *
  * WHEN IT ANSWERS.  Every lexical ordering scan that has returned a tuple is
  * in weave_curdist_live with that tuple's value, and the function answers from
- * the one whose index, current heap TID and query all match its arguments.
+ * the one whose index, current heap TID and query all match its arguments
+ * (the latest to publish, if several do).
  * The keying is the clobber guard: ExecScan() fetches a tuple, evaluates the
  * qual, then projects, and a SubPlan in the qual or a visible column ahead of
  * the resjunk one can run a second weave ordering scan in between.  pg_fts's
@@ -2666,6 +2668,7 @@ weave_universe_bounded(Relation index, BlockNumber dictstart, double ndocs,
  * that unwinds without an endscan.  So every entry is a live scan descriptor.
  * --------------------------------------------------------------------------- */
 static dlist_head weave_curdist_live = DLIST_STATIC_INIT(weave_curdist_live);
+static uint64 weave_curdist_seq = 0;
 
 static void
 weave_curdist_forget(WeaveScanOpaque so)
@@ -2710,6 +2713,7 @@ weave_curdist_note(IndexScanDesc scan, WeaveScanOpaque so, double v, bool isnull
 	}
 	so->curdistValue = v;
 	so->curdistIsnull = isnull;
+	so->curdistSeq = ++weave_curdist_seq;
 }
 
 PG_FUNCTION_INFO_V1(weave_current_distance);
@@ -2720,8 +2724,7 @@ weave_current_distance(PG_FUNCTION_ARGS)
 	Oid			indexoid = PG_GETARG_OID(0);
 	ItemPointer tid = PG_GETARG_ITEMPOINTER(1);
 	WeaveQuery	q = NULL;
-	bool		found = false;
-	double		v = 0.0;
+	WeaveScanOpaque best = NULL;
 	dlist_iter	it;
 
 	dlist_foreach(it, &weave_curdist_live)
@@ -2730,7 +2733,7 @@ weave_current_distance(PG_FUNCTION_ARGS)
 											 it.cur);
 		IndexScanDesc scan = so->curdistScan;
 
-		if (so->curdistIsnull || so->query == NULL ||
+		if (so->query == NULL ||
 			RelationGetRelid(scan->indexRelation) != indexoid ||
 			!ItemPointerEquals(&scan->xs_heaptid, tid))
 			continue;
@@ -2738,15 +2741,17 @@ weave_current_distance(PG_FUNCTION_ARGS)
 			q = PG_GETARG_WQUERY(2);
 		if (!weave_query_same(so->query, q))
 			continue;
-		/* two live scans on the same row and query that disagree: ask the operator */
-		if (found && v != so->curdistValue)
-			PG_RETURN_NULL();
-		found = true;
-		v = so->curdistValue;
+		/*
+		 * Two live scans on the same index, query and row (an open cursor and
+		 * this statement, say): the one that published LAST is the one whose
+		 * tuple is being projected, since projection follows the fetch.
+		 */
+		if (best == NULL || so->curdistSeq > best->curdistSeq)
+			best = so;
 	}
-	if (!found)
+	if (best == NULL || best->curdistIsnull)
 		PG_RETURN_NULL();
-	PG_RETURN_FLOAT8(v);
+	PG_RETURN_FLOAT8(best->curdistValue);
 }
 
 IndexScanDesc
