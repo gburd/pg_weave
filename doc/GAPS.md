@@ -5616,7 +5616,7 @@ substituted value equals the computed one on every row, both normalizer modes, i
 the padding rows (G56/G71), whose stored distance is +Infinity or NULL. Measure the gain on
 EC2 at two scales first (hard rules 9 and 11).
 
-### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); MEASURED here; OPEN**
+### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`); the fused route is still OWED**
 
 An index AM is not told the LIMIT. pg_weave starts every ordered lexical pass at
 `weave_ord_width(pg_weave.wand_initial_k)` = `max(4 x 32, 64)` = **128** and widens x4 on
@@ -5648,3 +5648,62 @@ than by index (`weave_ord_pass()`), so the tie-break hazard pg_fts guarded may a
 closed; the test proves it either way. Then measure on EC2 at two scales. The fused route
 has the same constant (`so->fusek`) and gains the most from it, since its
 work is per channel.
+
+**FIXED for the lexical route, 2026-10-06.** A `planner_hook` (`weave_planner()`,
+`src/am/customscan.c`) finds `Limit (constant count [+ constant offset]) -> Index Scan`
+on a weave index with ONE ORDER BY key whose argument is a `wquery` Const, copies the
+Const, and writes `k = count + offset` (at most 65,535) into the copy's header `flags`.
+`weave_ord_first_width()` (`src/am/amscan.c`) uses it for the first pass only:
+`Min(weave_ord_width(k), weave_ord_width(wand_initial_k))`. The ladder is unchanged, so
+every answer is too. `pg_weave.limit_hint = off` restores the old width.
+
+Three things differ from pg_fts, and each was measured or tested:
+
+- **The hinted width is CAPPED at the unhinted one.** pg_fts lets a hint widen the
+  first pass. Here, uncapped, LIMIT 100 ran a 400-wide pass and tripled the BM25 work
+  (2,954 -> 9,206; a single term 0.35 -> 1.43 ms on EC2, `pgweave-20261006-183859-d556`),
+  because one 128-wide pass already returned the 100 rows.
+- **No exact-k pass.** pg_fts skips its x4 over-fetch when `relallvisible` covers 99 % of
+  the heap. Not ported: `weave_ord_width()`'s 64 floor already binds at LIMIT <= 16, which
+  is where the measured win is. Unmeasured beyond that.
+- **No TID tie-break.** `weave_ord_pass()` removes rows already returned by TID, not by
+  position, so a narrow pass need not be a prefix of a wider one. `sql/limit_hint.sql`
+  checks this on a corpus where 140,000 of 200,000 rows (28,000 of 40,000 in the test)
+  share 38 distinct scores, with distinct-id counts so a repeated row cannot hide in an
+  unchanged score multiset.
+
+And one hazard pg_fts did not have: `weave_rescan()` compared the WHERE and ORDER BY
+queries byte for byte to recognize the flagship `WHERE d @@@ q ORDER BY d <=> q`, which
+skips the recheck. The hinted copy differs in `flags`, so the comparison now ignores the
+header (`weave_query_same()`). The test asserts zero `weave_match` recheck calls on the
+flagship, with a control that rechecks.
+
+EC2, c7i.8xlarge, PG17, synthetic corpus (terms in 30/20/10 % of documents), median of 25
+warm runs, two runs per arm, 200k and 1M documents (`pgweave-20261006-190049-6e57`,
+commit `79ff07c`):
+
+| query | n | BM25 contributions off -> on | ms off (run 1 / 2) | ms on (run 1 / 2) |
+|---|---:|---:|---:|---:|
+| `c` LIMIT 10 | 200k | 2,933 -> 1,461 | 0.300 / 0.291 | **0.146 / 0.148** |
+| `c` LIMIT 10 | 1M | 2,933 -> 1,461 | 0.471 / 0.459 | **0.322 / 0.329** |
+| `a \| b \| c` LIMIT 10 | 200k | 3,613 -> 1,799 | 6.245 / 6.244 | 6.059 / 6.070 |
+| `a \| b \| c` LIMIT 10 | 1M | 3,613 -> 1,799 | 29.950 / 29.901 | 29.779 / 29.800 |
+| `a \| b` LIMIT 10 | 1M | 2,954 -> 1,478 | 15.969 / 16.019 | 15.870 / 15.887 |
+| any of the three, LIMIT 100 | both | unchanged | — | within run-to-run spread |
+
+**What this says, stated as a loss where it is one.** The work halves on every LIMIT 10
+query, at both scales. Latency follows only on the single-term query (2.0x at 200k, 1.4x
+at 1M). On the multi-term ORs the time barely moves (3 % and 0.6 %), so **scoring is not
+where those queries spend their time here**. At 30 ms for 1M documents with 1,095 posting
+pages loaded at both widths, the cost is decoding pages, not BM25 contributions. pg_fts's
+45 -> 31 ms is on 2.19M Wikipedia documents, where real term distributions let block-max
+skip pages. This synthetic corpus gives it none to skip, so the OR result is
+corpus-limited, not a ceiling. It needs a re-measure on a real corpus.
+
+Tests: `sql/limit_hint.sql`, with four mutants, each verified to BUILD and then FAIL the
+test (`/scratch/pg_weave/mutlimit.sh`): the hint ignored; no widening past the hint; the
+header compared; the cap removed. PG17 and PG18 installcheck 25/25, TAP 33 files.
+
+**Still OWED:** the fused route (`so->fusek`, `weave_fuse_pass()`), whose several ORDER BY
+keys mean the hint has to travel on the `<~>` transport key; and the vector route
+(`so->veck`).

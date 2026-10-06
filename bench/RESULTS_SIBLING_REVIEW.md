@@ -177,7 +177,7 @@ transfer:
 
 | pg_fts change | what it did there | pg_weave status |
 |---|---|---|
-| (A) LIMIT passed to the ordering scan; exact-k WAND when the heap is all-visible | common k10 45→31 ms, OR3 13.3→5.7 ms | **Measured here, applies: G87.** LIMIT 10 on a 3-term OR does 3,613 BM25 contributions at the default first width 128 against 1,799 at width 64. |
+| (A) LIMIT passed to the ordering scan; exact-k WAND when the heap is all-visible | common k10 45→31 ms, OR3 13.3→5.7 ms | **Measured here, applies: G87. FIXED for the lexical route.** LIMIT 10 work halves (3,613 -> 1,799 on a 3-term OR); latency on EC2 drops 2.0x / 1.4x for a single term at 200k / 1M, and only 0.6-3 % on ORs, whose cost on this corpus is page decoding. Fused and vector routes owed. |
 | `fts_current_distance()`: reuse the scan's distance instead of recomputing `<=>` per returned row | 28% of rare-term CPU | **Measured here, applies: G86.** LIMIT 400 calls `weave_distance` 450 times, and a two-channel `fuse()` 800 times plus 800 `weave_lexscore`, each a detoast and a fresh BM25. |
 | (C2) dense exhaustive scoring for a high-df single term | exact top-k with no WAND overhead | **Candidate**, gated on df |
 | lazy phrase gate for ranked phrase queries | "united states" 110.6→35.4 ms on 2.2M Wikipedia | pg_weave builds the phrase match set first. **Candidate** |
