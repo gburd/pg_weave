@@ -490,6 +490,26 @@ static void weave_docvals_gate(Relation index, WeaveScanOpaque so, TidSet *out);
 static int weave_topk_candidates_guarded(Relation index, WeaveQuery q, int wantk,
 										ScoredTid **out);
 static int weave_ord_width(int k);
+static int weave_ord_first_width(WeaveQuery q);	/* G87: the LIMIT hint */
+
+/*
+ * Two wquery values are the same query.  Byte-for-byte EXCEPT the header's
+ * `flags`, which is the planner's LIMIT hint (doc/GAPS.md G87) and is set on the
+ * ORDER BY copy alone: comparing it would make the flagship
+ * `WHERE d @@@ q ORDER BY d <=> q LIMIT 10` look like two different queries,
+ * costing a recheck per row and a G56 padding walk -- right answers, measured
+ * as a lost fast path.  A false "different" is never a wrong row.
+ */
+static inline bool
+weave_query_same(WeaveQuery a, WeaveQuery b)
+{
+	Size		n = VARSIZE_ANY(a);
+
+	return n == VARSIZE_ANY(b) && a->version == b->version &&
+		memcmp((char *) a + offsetof(WeaveQueryData, nitems),
+			   (char *) b + offsetof(WeaveQueryData, nitems),
+			   n - offsetof(WeaveQueryData, nitems)) == 0;
+}
 static void weave_ord_pass(Relation index, WeaveScanOpaque so);
 static void weave_ord_probe(Relation index, WeaveScanOpaque so, int want);
 static bool weave_ord_grow(Relation index, WeaveScanOpaque so);
@@ -3216,8 +3236,7 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 								 so->queryValid && so->query != NULL &&
 								 !so->unhonoured && !so->cgramScan &&
 								 !so->dvScan &&
-								 VARSIZE_ANY(so->query) == VARSIZE_ANY(oq) &&
-								 memcmp(so->query, oq, VARSIZE_ANY(oq)) == 0);
+								 weave_query_same(so->query, oq));
 			/*
 			 * The weaker fact the G56 padding needs: SOME `@@@` key (the first,
 			 * the one so->query held) is the ORDER BY query, whatever else is
@@ -3225,8 +3244,7 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 			 * can qualify, and a padding walk would return nothing.
 			 */
 			so->ordQueryRestricts = (so->queryValid && so->query != NULL &&
-									 VARSIZE_ANY(so->query) == VARSIZE_ANY(oq) &&
-									 memcmp(so->query, oq, VARSIZE_ANY(oq)) == 0);
+									 weave_query_same(so->query, oq));
 			so->padWhereQuery = (so->queryValid && so->query != NULL) ? so->query : NULL;
 			so->query = oq;
 			so->queryValid = true;
@@ -4158,7 +4176,7 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 			 * guessed at: bench/compete sweeps it and bench/RESULTS_WAND_K.md records
 			 * the frontier the default is chosen from.  See doc/GAPS.md G13.
 			 */
-			so->curk = weave_ord_width(pg_weave_wand_initial_k);
+			so->curk = weave_ord_first_width(so->query);	/* G87 */
 			weave_ord_pass(scan->indexRelation, so);
 			so->ordpos = 0;
 			so->orderInit = true;
@@ -8296,6 +8314,30 @@ weave_ord_width(int k)
 	if (k > WEAVE_ORD_WIDTH_MAX / 4)
 		return WEAVE_ORD_WIDTH_MAX;
 	return Max(k * 4, 64);
+}
+
+/*
+ * The first pass width of an ordering scan whose ORDER BY query carries the
+ * planner's LIMIT hint (doc/GAPS.md G87; WeaveQueryData.flags).  An access
+ * method is not told the LIMIT, so without a hint the first pass is
+ * weave_ord_width(pg_weave.wand_initial_k) -- 128 by default -- and a LIMIT 10
+ * query runs block-max WAND at k = 128, whose threshold is the 128th best score
+ * and prunes far less than the 10th best would: measured at twice the BM25
+ * contributions on a three-term OR.  With a hint of k the first pass is
+ * weave_ord_width(k), keeping the x4 over-fetch MVCC filtering needs.
+ *
+ * ONLY THE FIRST PASS.  The widening ladder is untouched, so a scan pulled past
+ * the hint (a cursor, a qual the executor rejects, a stale plan) still widens
+ * and still returns every row in exact order; the hint can only make the first
+ * pass narrower, never the answer shorter.  A hint wider than the default is
+ * honoured too (LIMIT 500 then skips the 128 and 512 rungs).
+ */
+static int
+weave_ord_first_width(WeaveQuery q)
+{
+	if (pg_weave_limit_hint && q != NULL && q->flags > 0)
+		return weave_ord_width((int) q->flags);
+	return weave_ord_width(pg_weave_wand_initial_k);
 }
 
 /*

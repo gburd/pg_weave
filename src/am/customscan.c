@@ -64,6 +64,7 @@ pg_weave_customscan_dummy(PG_FUNCTION_ARGS)
 
 /* ---- saved previous hooks (chain, do not clobber) ---- */
 static create_upper_paths_hook_type prev_upper_paths_hook = NULL;
+static planner_hook_type prev_planner_hook = NULL;
 
 /* cached OID of the @@@ (wdoc, wquery) operator; resolved lazily */
 static Oid	weave_match_op = InvalidOid;
@@ -423,6 +424,163 @@ WeaveCountReScan(CustomScanState *node)
 
 /* ===== module init ===== */
 
+/* ---------------------------------------------------------------------------
+ * The LIMIT hint (doc/GAPS.md G87), ported from pg_fts 1.9.0's "(A)".
+ *
+ * An index access method is not told the query's LIMIT, so an ordering scan's
+ * first pass runs at pg_weave.wand_initial_k's width (128 by default) whatever
+ * the LIMIT is, and block-max WAND prunes against the 128th-best score where the
+ * 10th would do: twice the BM25 work on a three-term OR at LIMIT 10.  This
+ * planner hook, run once on the finished plan, finds
+ *
+ *     Limit (constant count [+ constant offset]) -> Index Scan on a weave index
+ *        Order By: (d <=> Const)                          -- the lexical route
+ *
+ * and writes k = count + offset into WeaveQueryData.flags of a COPY of that
+ * Const, which the scan reads as its first pass width (weave_ord_first_width()).
+ * The copy replaces only the ORDER BY argument the scan receives; the Const the
+ * user wrote, the plan's other references to it and every visible value are
+ * untouched.  `flags` is planner-only: wquery_in/wquery_recv write 0 and
+ * wquery_send does not send it, so the hint never reaches a client or a table.
+ *
+ * Correctness never depends on it: the scan's widening ladder is unchanged, so
+ * pulling past k (a cursor, a qual the executor rejects, an OFFSET the planner
+ * folded differently) still returns every row in exact order.  The hint can
+ * only make the first pass narrower.  pg_weave.limit_hint = off disables it.
+ *
+ * The fused route is NOT hinted yet: weave_fuse_pass() widens on its own ladder
+ * (so->fusek) and its ORDER BY keys are per channel plus a transport key, so the
+ * hint would have to travel on the transport.  Recorded in G87 as owed.
+ * --------------------------------------------------------------------------- */
+bool		pg_weave_limit_hint = true;
+
+static bool
+weave_limit_const(Node *n, int64 *v)
+{
+	Const	   *c;
+
+	if (n == NULL || !IsA(n, Const))
+		return false;
+	c = (Const *) n;
+	if (c->constisnull || c->consttype != INT8OID)
+		return false;
+	*v = DatumGetInt64(c->constvalue);
+	return true;
+}
+
+static bool
+weave_is_weave_indexscan(IndexScan *scan)
+{
+	Relation	irel;
+	bool		isweave;
+
+	irel = index_open(scan->indexid, NoLock);
+	isweave = (irel->rd_indam != NULL && irel->rd_indam->amgettuple == weave_gettuple);
+	index_close(irel, NoLock);
+	return isweave;
+}
+
+static void
+weave_hint_indexscan(IndexScan *scan, Limit *limit, Oid wqueryoid)
+{
+	int64		count,
+				offset = 0,
+				k;
+	Node	   *expr;
+	OpExpr	   *op;
+	Const	   *orig,
+			   *repl;
+	WeaveQuery	q;
+
+	if (list_length(scan->indexorderby) != 1)
+		return;					/* fused (several keys) or none: not hinted */
+	if (!weave_limit_const(limit->limitCount, &count) || count <= 0)
+		return;
+	if (limit->limitOffset != NULL &&
+		(!weave_limit_const(limit->limitOffset, &offset) || offset < 0))
+		return;
+	k = count + offset;
+	if (k <= 0 || k > PG_UINT16_MAX)
+		return;					/* deep page: leave the default batching alone */
+
+	expr = (Node *) linitial(scan->indexorderby);
+	if (!IsA(expr, OpExpr) || list_length(((OpExpr *) expr)->args) != 2)
+		return;
+	op = (OpExpr *) expr;
+	if (!IsA(lsecond(op->args), Const))
+		return;
+	orig = (Const *) lsecond(op->args);
+	if (orig->constisnull || orig->consttype != wqueryoid)
+		return;
+
+	q = (WeaveQuery) DatumGetPointer(datumCopy(
+		PointerGetDatum(PG_DETOAST_DATUM(orig->constvalue)), false, -1));
+	q->flags = (uint16) k;
+	repl = makeConst(orig->consttype, orig->consttypmod, orig->constcollid,
+					 -1, PointerGetDatum(q), false, false);
+	repl->location = orig->location;
+	lsecond(op->args) = repl;
+}
+
+static void
+weave_hint_walk(Plan *plan, Oid wqueryoid)
+{
+	ListCell   *lc;
+
+	if (plan == NULL)
+		return;
+	if (IsA(plan, Limit) && plan->lefttree != NULL && IsA(plan->lefttree, IndexScan) &&
+		((IndexScan *) plan->lefttree)->indexorderby != NIL &&
+		weave_is_weave_indexscan((IndexScan *) plan->lefttree))
+		weave_hint_indexscan((IndexScan *) plan->lefttree, (Limit *) plan, wqueryoid);
+	weave_hint_walk(plan->lefttree, wqueryoid);
+	weave_hint_walk(plan->righttree, wqueryoid);
+	switch (nodeTag(plan))
+	{
+		case T_Append:
+			foreach(lc, ((Append *) plan)->appendplans)
+				weave_hint_walk(lfirst(lc), wqueryoid);
+			break;
+		case T_MergeAppend:
+			foreach(lc, ((MergeAppend *) plan)->mergeplans)
+				weave_hint_walk(lfirst(lc), wqueryoid);
+			break;
+		case T_SubqueryScan:
+			weave_hint_walk(((SubqueryScan *) plan)->subplan, wqueryoid);
+			break;
+		case T_CustomScan:
+			foreach(lc, ((CustomScan *) plan)->custom_plans)
+				weave_hint_walk(lfirst(lc), wqueryoid);
+			break;
+		default:
+			break;
+	}
+}
+
+static PlannedStmt *
+weave_planner(Query *parse, const char *query_string, int cursorOptions,
+			  ParamListInfo boundParams)
+{
+	PlannedStmt *stmt;
+	Oid			wqueryoid;
+	ListCell   *lc;
+
+	stmt = prev_planner_hook
+		? prev_planner_hook(parse, query_string, cursorOptions, boundParams)
+		: standard_planner(parse, query_string, cursorOptions, boundParams);
+
+	if (!pg_weave_limit_hint)
+		return stmt;
+	/* pg_weave not installed in this database, or not visible: nothing to hint */
+	wqueryoid = TypenameGetTypid("wquery");
+	if (!OidIsValid(wqueryoid))
+		return stmt;
+	weave_hint_walk(stmt->planTree, wqueryoid);
+	foreach(lc, stmt->subplans)
+		weave_hint_walk((Plan *) lfirst(lc), wqueryoid);
+	return stmt;
+}
+
 void		_PG_init(void);
 
 #ifdef WEAVE_TEST_HOOKS
@@ -642,6 +800,16 @@ _PG_init(void)
 
 	prev_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook = weave_create_upper_paths;
+
+	/* G87: the LIMIT hint, a planner_hook over the finished plan (see above) */
+	DefineCustomBoolVariable("pg_weave.limit_hint",
+							 "Pass a constant LIMIT to a weave ordering scan as its first pass width.",
+							 "An index access method is not told the LIMIT, so without this an ORDER BY d <=> q LIMIT 10 scan starts at pg_weave.wand_initial_k's width. Off restores that behaviour; results are identical either way.",
+							 &pg_weave_limit_hint,
+							 true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	prev_planner_hook = planner_hook;
+	planner_hook = weave_planner;
 
 	/*
 	 * F2.2's fused-ORDER-BY pushdown, installed the same way and for the same

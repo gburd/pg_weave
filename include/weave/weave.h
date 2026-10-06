@@ -166,7 +166,15 @@ typedef struct WeaveQueryData
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	uint16		version;		/* format version, currently 1 */
-	uint16		flags;			/* reserved */
+	uint16		flags;			/* PLANNER-ONLY LIMIT hint (doc/GAPS.md G87): the
+								 * query's LIMIT + OFFSET when a planner hook saw a
+								 * constant one above an ordering scan, else 0.
+								 * Never parsed, sent or stored: wquery_in and
+								 * wquery_recv set it to 0 and wquery_send does
+								 * not send it, so it exists only in a plan's
+								 * Const.  A scan that reads it may only use it
+								 * to choose its FIRST pass width -- correctness
+								 * never depends on it (the ladder still widens). */
 	uint32		nitems;			/* number of items in RPN list */
 	WeaveQueryItem items[FLEXIBLE_ARRAY_MEMBER];
 	/* term texts follow items[] */
@@ -250,6 +258,7 @@ extern bool weave_cgram_match(const char *val, int vallen,
 /* pg_weave_am_scan.c -- count entry point reused by the COUNT-pushdown CustomScan */
 extern int64 weave_count_visible_oid(Oid indexoid, WeaveQuery q);
 extern int pg_weave_wand_initial_k;
+extern bool pg_weave_limit_hint;		/* G87, src/am/customscan.c */
 extern int pg_weave_build_collapse_max_mb;
 extern int pg_weave_build_mem_ceiling_mb;
 extern double pg_weave_vacuum_tombstone_frac;
