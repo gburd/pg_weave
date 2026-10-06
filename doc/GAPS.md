@@ -5615,3 +5615,36 @@ the lexical `<=>` case (straightforward), and for `fuse()` only with a test that
 substituted value equals the computed one on every row, both normalizer modes, including
 the padding rows (G56/G71), whose stored distance is +Infinity or NULL. Measure the gain on
 EC2 at two scales first (hard rules 9 and 11).
+
+### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); MEASURED here; OPEN**
+
+An index AM is not told the LIMIT. pg_weave starts every ordered lexical pass at
+`weave_ord_width(pg_weave.wand_initial_k)` = `max(4 x 32, 64)` = **128** and widens x4 on
+demand. A smaller k is a tighter WAND threshold, so it prunes harder. Measured locally,
+200k documents, `WHERE d @@@ 'a | b | c' ORDER BY d <=> 'a | b | c' LIMIT 10` (terms in
+30 / 20 / 10 % of documents), `weave_work_stats()`:
+
+| first pass width | BM25 contributions | posting pages loaded |
+|---|---:|---:|
+| 128 (default) | 3,613 | 1,095 |
+| 64 (`wand_initial_k = 3`, the floor) | **1,799** | 1,095 |
+
+Half the scoring work for the same answer. The page count does not move here because every
+page is touched to decode the postings anyway. A rarer-term query was flat (615 both), as
+expected: when df is below k, the width does not bind.
+
+pg_fts's fix: a planner hook that, for `Limit -> IndexScan(ORDER BY d <=> Const)` with a
+constant LIMIT + OFFSET at most 65,535, writes `k = count + offset` into a planner-only
+`flags` field of the query Const, and the scan uses it as the first pass width. Also an
+exact-k pass (no x4 over-fetch) when `relallvisible` covers 99 % of the heap, and a TID
+tie-break on equal scores so a narrow pass is a prefix of a wider one (required by
+grow-and-resume). pg_weave's `WeaveQueryData.flags` is "reserved", the same slot pg_fts
+used.
+
+**Owed:** port it, with pg_fts's `limit_hint` regression test (every LIMIT/OFFSET window,
+OR/AND, a cursor, an unbounded scan, prepared generic plans, 3,000 equal-score documents,
+verified to FAIL with the tie-break removed). pg_weave already resumes by TID rather
+than by index (`weave_ord_pass()`), so the tie-break hazard pg_fts guarded may already be
+closed; the test proves it either way. Then measure on EC2 at two scales. The fused route
+has the same constant (`so->fusek`) and gains the most from it, since its
+work is per channel.
