@@ -5721,3 +5721,34 @@ header compared; the cap removed. PG17 and PG18 installcheck 25/25, TAP 33 files
 **Still OWED:** the fused route (`so->fusek`, `weave_fuse_pass()`), whose several ORDER BY
 keys mean the hint has to travel on the `<~>` transport key; and the vector route
 (`so->veck`).
+
+### G88 — "approximate regex" is named in the product statement and does not ship: `{~k}` parses and is then ignored — **FOUND 2026-10-06 by the README rewrite; OPEN, needs a maintainer decision**
+
+`AGENTS.md`'s product statement lists "approximate regex" among the six retrieval kinds, and
+`doc/PHASES.md` Phase Z is titled "fuzzy / approximate-regex / prefix / n-gram". What ships is
+exact regex: `body @@@ '/re/'` runs core's ARE engine (`pg_regcomp`/`pg_regexec`,
+`src/am/amscan.c` and `RE_compile_and_execute` in `src/query/doc.c`) over dictionary tokens.
+The pg_tre import has the approximate pieces, but they are not wired:
+
+- `src/query/regex_grammar.y` parses `atom{~k}` into `REGEX_AST_APPROX`, and
+  `src/query/extract.c` then treats it as its child ("Phase 3 (k=0): treat APPROX as its
+  child. Phase 5 reads ast->u.approx.k ..."). Phase 5 does not exist.
+- `src/query/re_match.c` wraps TRE's `tre_reganexec`, and nothing in `src/am/` or the match
+  path calls it.
+- `weave_regex_narrowable()` notes that ARE reads `{~k}` as a literal while pg_tre's tokenizer
+  reads it as an approximate bound, so the two dialects disagree on exactly this syntax today.
+
+So a user writing `'/colou?r{~1}/'` gets ARE's reading of those bytes, not an approximate match.
+Fuzzy TERMS (`term~k`, universal Levenshtein, Z5) do ship and are not this gap.
+
+**Decision needed:** either wire approximate regex (TRE's matcher for the verify step, the
+`{~k}` extraction rules for the trigram prefilter, and a refusal of `{~k}` until then), or
+narrow the product statement and Phase Z's title to "regex". The README says "regular
+expressions over tokens" until this is decided.
+
+The same review found two documents stale against the shipped code, recorded here so they are
+not lost: `doc/PRODUCTION_READINESS.md` "What actually works today" still says vector indexing
+does not exist and fuzzy is unreachable; `doc/ARCHITECTURE.md` §9 claim 3's scope note says the
+only filter pushed into the index is a lexical term, but docvalues have shipped
+(`bench/RESULTS_DOCVALS_PRIZE.md`, `bench/RESULTS_DOCVALS_SCALE.md`).
+
