@@ -627,11 +627,14 @@ weave_reuse_distance(IndexScan *scan, WeaveWalkCtx *cx)
 		weave_reuse_resolve(cx);
 	if (!OidIsValid(cx->curdistfn))
 		return;
-	/* `wdoc <=> wquery` with a query fixed for the scan, as the AM saw it */
+	/*
+	 * `wdoc <=> wquery`.  q may be any expression: an ORDER BY key the index
+	 * accepted is not volatile, so q evaluates to the query the scan was given,
+	 * and the target list was already evaluating it once per row.
+	 */
 	q = (Node *) lsecond(orig->args);
 	if (exprType((Node *) linitial(orig->args)) != cx->wdoc ||
-		exprType(q) != cx->wquery || orig->opresulttype != FLOAT8OID ||
-		!(IsA(q, Const) || IsA(q, Param)))
+		exprType(q) != cx->wquery || orig->opresulttype != FLOAT8OID)
 		return;
 
 	foreach(lc, scan->scan.plan.targetlist)
