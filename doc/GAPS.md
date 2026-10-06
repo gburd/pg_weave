@@ -5121,6 +5121,22 @@ reachable page during the pass, and marking a page used hands it to nobody. On `
 any crash with recent FSM updates can trigger this ratchet. It is not specific to
 pending flushes.
 
+**OPEN: the size bound in a long crash loop.** At 18 cycles (`pgweave-20261006-001850-1420`,
+`057fc9d`), `t/033`'s crashed index ended up as much as 22,476 pages larger than its
+never-crashed twin. That happened on a run where every cycle's stranded pages **were**
+reclaimed: 0 leaked pages and a clean deep check after every VACUUM, both hard
+assertions. The excess is not stranded pages. The allocator counters show where it comes
+from. From the first large merge (cycle 7) onwards, every post-crash VACUUM of the
+crashed index ran the share-lock compaction, with `lowfree_reuse` 10k–21k and `extend`
+2k–8k: the L19 ratchet that `weave_vacuumcleanup()` describes. The twin, on the same
+VACUUM schedule, never compacted. Over the same cycles, every reclaim pass cleared about
+1,340 stale FSM entries for live pages, and about 570 freed pages were not yet recyclable.
+So a crash leaves the FSM disagreeing with the pages on every cycle. A probable mechanism
+is that the cleanup's compaction trigger (`freeblks > nblocks / 4`, counted from the
+FSM) sees those entries and fires. That is **not demonstrated**. Until it is, the bound is
+a `TODO` in `t/033`: reported as `not ok # TODO` on every run, neither silenced nor
+loosened. The `t/033` A/B against the base is owed (`bench/aws/g75_ab028.sh`, `AB_MARK=40`).
+
 **Costs and limits, recorded as prominently as the fix:**
 - Every VACUUM cleanup now reads every page of the index once, as GIN's and GiST's
   cleanups do. Measured at 1M rows in the scale run (below).
