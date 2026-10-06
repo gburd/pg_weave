@@ -5139,7 +5139,8 @@ loosened. The `t/033` A/B against the base is owed (`bench/aws/g75_ab028.sh`, `A
 
 **Costs and limits, recorded as prominently as the fix:**
 - Every VACUUM cleanup now reads every page of the index once, as GIN's and GiST's
-  cleanups do. Measured at 1M rows in the scale run (below).
+  cleanups do. At 1M rows (36,313 pages) that took 16–19 ms with a warm cache; a cold-cache
+  figure is unmeasured (`bench/RESULTS_G75_RECLAIM.md`).
 - An oversized INSERT can now wait for a VACUUM's barrier, and a VACUUM waits for the
   longest oversized INSERT already running.
 - A reclaimed page becomes reusable one VACUUM later than a page freed by a merge.

@@ -1143,7 +1143,7 @@ form of a locking rule was already in this tree and was not followed.
 **Cost.** One reachability walk over every chain and one pass that reads every
 block's buffer, per VACUUM cleanup. That is the same order as GIN's and GiST's
 cleanup, which read every page to recycle them. It is measured at 1M rows in
-`bench/RESULTS_G75_RECLAIM.md` (owed until that run exists). The pass yields to
+`bench/RESULTS_G75_RECLAIM.md`: 16–19 ms over 36,313 pages, warm cache. The pass yields to
 `vacuum_delay_point()` per block.
 
 **What it does not cover.**
