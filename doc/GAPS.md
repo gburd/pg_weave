@@ -5586,3 +5586,32 @@ half, VACUUM, smash the tombstone blob's bytes, and the scan must ERROR, not ret
 **Positive control (`pgweave-20261006-050829-9795`):** with the guard disabled (a separately
 built `.so`, md5 differs) the scan returned **4000**, the resurrected answer, and tests 22-24
 failed; with it they pass.
+
+### G86 — an ordered scan's `d <=> q` (and every channel of a fused `fuse(...)`) is RE-EVALUATED per returned row: a heap detoast plus a fresh BM25, for a value the scan already computed — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 measured it at 28% of rare-term CPU); MEASURED here; OPEN**
+
+The planner keeps the ORDER BY expression in the scan's target list (it feeds the sort key
+and the Limit), so the executor evaluates it for every row the index returns, even though
+the scan ordered on exactly that value. Measured on the local cluster with
+`track_functions = all` and a 50-row seq-scan control that counted exactly 50:
+
+| query (20k long, TOASTed documents) | `weave_distance` calls | rows returned |
+|---|---:|---:|
+| `WHERE d @@@ 'rare7' ORDER BY d <=> 'rare7' LIMIT 400` | **450** | 400 |
+| `ORDER BY fuse(d <=> 'rare7', d <=> 'tok3') LIMIT 400` | **800** (+ 800 `weave_lexscore`) | 400 |
+
+So a fused query pays one detoast-and-rescore per **channel** per returned row. pg_fts's fix
+(`fts_reuse_distance`, `pg_fts_customscan.c`): a planner hook that replaces each RESJUNK
+target-list entry `equal()` to the scan's own `indexorderbyorig` with
+`fts_current_distance()`, which returns the distance the scan stored for the current tuple.
+It replaces only RESJUNK entries, so a user-visible `d <=> q` keeps its own (N = 1)
+semantics.
+
+**For pg_weave the fused case is the larger prize**, and also the subtler one. The RESJUNK
+entry is `fuse(weave_lexscore(d <=> a), weave_lexscore(d <=> b), ...)`, and the scan's
+stored ordering value is the fused distance, with or without the normalizer. Replacing
+it needs the replacement to return exactly what the ORDER BY would have computed, bit for
+bit. Otherwise a Sort or a merge above the scan could reorder. **Owed:** port the hook for
+the lexical `<=>` case (straightforward), and for `fuse()` only with a test that the
+substituted value equals the computed one on every row, both normalizer modes, including
+the padding rows (G56/G71), whose stored distance is +Infinity or NULL. Measure the gain on
+EC2 at two scales first (hard rules 9 and 11).
