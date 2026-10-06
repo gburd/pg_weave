@@ -21,7 +21,10 @@
 #include "access/relscan.h"
 #include "access/table.h"
 #include "catalog/index.h"
+#include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_proc.h"
+#include "commands/extension.h"
 #include "commands/defrem.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
@@ -522,35 +525,177 @@ weave_hint_indexscan(IndexScan *scan, Limit *limit, Oid wqueryoid)
 	lsecond(op->args) = repl;
 }
 
+/* ---------------------------------------------------------------------------
+ * G86: score reuse.  An ordering scan `ORDER BY d <=> q` returns each row with
+ * the distance it ordered on, and the planner ALSO keeps `d <=> q` in the scan's
+ * target list as the RESJUNK sort key, so the executor evaluated
+ * weave_distance() per returned row: a heap detoast and a BM25 for a value the
+ * user never sees.  This rewrites that entry to
+ *
+ *     COALESCE(weave_current_distance(index, ctid, q), d <=> q)
+ *
+ * where weave_current_distance() (src/am/amscan.c) returns the value the scan
+ * published for that very row, or NULL, in which case the operator runs as it
+ * always did.
+ *
+ * WHAT CHANGES, AND WHY ONLY RESJUNK ENTRIES.  The scan's value is the CORPUS
+ * BM25 distance; weave_distance() has no corpus and scores with N = 1 and
+ * avgdl = |D|, so the two are different numbers.  A visible `d <=> q` must keep
+ * the operator's value, or a result column would change with the plan; it is
+ * left alone.  The resjunk copy is read only as a sort key, by FETCH ... WITH
+ * TIES, an Incremental Sort over the scan or a Sort above it, and for those the
+ * substitution makes the key the value the rows are actually ordered by, which
+ * they were not before.  That is a visible change in exactly those shapes (a
+ * WITH TIES set and the tie order of a secondary key can differ), recorded in
+ * doc/GAPS.md G86.
+ *
+ * WHERE IT APPLIES.  A scan's target-list entry is resjunk only when the scan's
+ * list IS the top plan's: Limit, Sort and Incremental Sort share their input's
+ * list and the top one is relabelled by apply_tlist_labeling().  A scan under a
+ * join or an Append gets its own list with resjunk = false and is left alone,
+ * which is a lost optimization and not a wrong answer.  Only the lexical route
+ * qualifies: a vector scan's value is a quantized score and an edit-distance or
+ * fused scan's resjunk entry is not `d <=> q` (doc/GAPS.md G86 has the reasons
+ * per channel).  pg_weave.reuse_distance = off disables it.
+ * --------------------------------------------------------------------------- */
+bool		pg_weave_reuse_distance = true;
+
+typedef struct WeaveWalkCtx
+{
+	Oid			wqueryoid;		/* wquery by search_path, for the LIMIT hint */
+	PlannedStmt *stmt;
+	bool		reuseResolved;	/* the four OIDs below were looked up */
+	Oid			curdistfn;		/* weave_current_distance(regclass, tid, wquery) */
+	Oid			wdoc;			/* in pg_weave's own schema */
+	Oid			wquery;
+	bool		planted;		/* curdistfn was put in this plan */
+} WeaveWalkCtx;
+
+/*
+ * Find weave_current_distance() in pg_weave's own schema and confirm it is a
+ * member of the extension.  InvalidOid when the installed SQL predates 0.29.0
+ * (a new library against an old catalog during an upgrade): reuse is then off.
+ * Resolved by extension schema, never by search_path, so a same-named function
+ * someone else created is never planted.
+ */
 static void
-weave_hint_walk(Plan *plan, Oid wqueryoid)
+weave_reuse_resolve(WeaveWalkCtx *cx)
+{
+	Oid			extoid;
+	Oid			nsp;
+	Oid			fn;
+	Oid			argtypes[3] = {REGCLASSOID, TIDOID, InvalidOid};
+
+	cx->reuseResolved = true;
+	extoid = get_extension_oid("pg_weave", true);
+	if (!OidIsValid(extoid))
+		return;
+	nsp = get_extension_schema(extoid);
+	if (!OidIsValid(nsp))
+		return;
+	cx->wdoc = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+							   PointerGetDatum("wdoc"), ObjectIdGetDatum(nsp));
+	cx->wquery = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+								 PointerGetDatum("wquery"), ObjectIdGetDatum(nsp));
+	if (!OidIsValid(cx->wdoc) || !OidIsValid(cx->wquery))
+		return;
+	argtypes[2] = cx->wquery;
+	fn = GetSysCacheOid3(PROCNAMEARGSNSP, Anum_pg_proc_oid,
+						 CStringGetDatum("weave_current_distance"),
+						 PointerGetDatum(buildoidvector(argtypes, 3)),
+						 ObjectIdGetDatum(nsp));
+	if (!OidIsValid(fn) || get_func_rettype(fn) != FLOAT8OID ||
+		getExtensionOfObject(ProcedureRelationId, fn) != extoid)
+		return;
+	cx->curdistfn = fn;
+}
+
+static void
+weave_reuse_distance(IndexScan *scan, WeaveWalkCtx *cx)
+{
+	OpExpr	   *orig;
+	Node	   *q;
+	ListCell   *lc;
+
+	if (list_length(scan->indexorderbyorig) != 1 ||
+		!IsA(linitial(scan->indexorderbyorig), OpExpr))
+		return;
+	orig = (OpExpr *) linitial(scan->indexorderbyorig);
+	if (list_length(orig->args) != 2)
+		return;
+	if (!cx->reuseResolved)
+		weave_reuse_resolve(cx);
+	if (!OidIsValid(cx->curdistfn))
+		return;
+	/* `wdoc <=> wquery` with a query fixed for the scan, as the AM saw it */
+	q = (Node *) lsecond(orig->args);
+	if (exprType((Node *) linitial(orig->args)) != cx->wdoc ||
+		exprType(q) != cx->wquery || orig->opresulttype != FLOAT8OID ||
+		!(IsA(q, Const) || IsA(q, Param)))
+		return;
+
+	foreach(lc, scan->scan.plan.targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		CoalesceExpr *ce;
+		FuncExpr   *fe;
+		Var		   *ctid;
+
+		if (!tle->resjunk || !equal(tle->expr, orig))
+			continue;
+		ctid = makeVar(scan->scan.scanrelid, SelfItemPointerAttributeNumber,
+					   TIDOID, -1, InvalidOid, 0);
+		fe = makeFuncExpr(cx->curdistfn, FLOAT8OID,
+						  list_make3(makeConst(REGCLASSOID, -1, InvalidOid,
+											   sizeof(Oid),
+											   ObjectIdGetDatum(scan->indexid),
+											   false, true),
+									 ctid, copyObject(q)),
+						  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		ce = makeNode(CoalesceExpr);
+		ce->coalescetype = FLOAT8OID;
+		ce->coalescecollid = InvalidOid;
+		ce->args = list_make2(fe, tle->expr);
+		ce->location = -1;
+		tle->expr = (Expr *) ce;
+		cx->planted = true;
+	}
+}
+
+static void
+weave_hint_walk(Plan *plan, WeaveWalkCtx *cx)
 {
 	ListCell   *lc;
 
 	if (plan == NULL)
 		return;
-	if (IsA(plan, Limit) && plan->lefttree != NULL && IsA(plan->lefttree, IndexScan) &&
+	if (pg_weave_limit_hint && OidIsValid(cx->wqueryoid) &&
+		IsA(plan, Limit) && plan->lefttree != NULL && IsA(plan->lefttree, IndexScan) &&
 		((IndexScan *) plan->lefttree)->indexorderby != NIL &&
 		weave_is_weave_indexscan((IndexScan *) plan->lefttree))
-		weave_hint_indexscan((IndexScan *) plan->lefttree, (Limit *) plan, wqueryoid);
-	weave_hint_walk(plan->lefttree, wqueryoid);
-	weave_hint_walk(plan->righttree, wqueryoid);
+		weave_hint_indexscan((IndexScan *) plan->lefttree, (Limit *) plan, cx->wqueryoid);
+	if (pg_weave_reuse_distance && IsA(plan, IndexScan) &&
+		((IndexScan *) plan)->indexorderbyorig != NIL &&
+		weave_is_weave_indexscan((IndexScan *) plan))
+		weave_reuse_distance((IndexScan *) plan, cx);
+	weave_hint_walk(plan->lefttree, cx);
+	weave_hint_walk(plan->righttree, cx);
 	switch (nodeTag(plan))
 	{
 		case T_Append:
 			foreach(lc, ((Append *) plan)->appendplans)
-				weave_hint_walk(lfirst(lc), wqueryoid);
+				weave_hint_walk(lfirst(lc), cx);
 			break;
 		case T_MergeAppend:
 			foreach(lc, ((MergeAppend *) plan)->mergeplans)
-				weave_hint_walk(lfirst(lc), wqueryoid);
+				weave_hint_walk(lfirst(lc), cx);
 			break;
 		case T_SubqueryScan:
-			weave_hint_walk(((SubqueryScan *) plan)->subplan, wqueryoid);
+			weave_hint_walk(((SubqueryScan *) plan)->subplan, cx);
 			break;
 		case T_CustomScan:
 			foreach(lc, ((CustomScan *) plan)->custom_plans)
-				weave_hint_walk(lfirst(lc), wqueryoid);
+				weave_hint_walk(lfirst(lc), cx);
 			break;
 		default:
 			break;
@@ -562,22 +707,33 @@ weave_planner(Query *parse, const char *query_string, int cursorOptions,
 			  ParamListInfo boundParams)
 {
 	PlannedStmt *stmt;
-	Oid			wqueryoid;
+	WeaveWalkCtx cx = {0};
 	ListCell   *lc;
 
 	stmt = prev_planner_hook
 		? prev_planner_hook(parse, query_string, cursorOptions, boundParams)
 		: standard_planner(parse, query_string, cursorOptions, boundParams);
 
-	if (!pg_weave_limit_hint)
+	if (!pg_weave_limit_hint && !pg_weave_reuse_distance)
 		return stmt;
-	/* pg_weave not installed in this database, or not visible: nothing to hint */
-	wqueryoid = TypenameGetTypid("wquery");
-	if (!OidIsValid(wqueryoid))
+	/* pg_weave not installed in this database, or not visible: nothing to do */
+	cx.wqueryoid = TypenameGetTypid("wquery");
+	if (!OidIsValid(cx.wqueryoid))
 		return stmt;
-	weave_hint_walk(stmt->planTree, wqueryoid);
+	cx.stmt = stmt;
+	weave_hint_walk(stmt->planTree, &cx);
 	foreach(lc, stmt->subplans)
-		weave_hint_walk((Plan *) lfirst(lc), wqueryoid);
+		weave_hint_walk((Plan *) lfirst(lc), &cx);
+	/* a plan naming weave_current_distance() is invalidated if it is dropped */
+	if (cx.planted)
+	{
+		PlanInvalItem *inval = makeNode(PlanInvalItem);
+
+		inval->cacheId = PROCOID;
+		inval->hashValue = GetSysCacheHashValue1(PROCOID,
+												 ObjectIdGetDatum(cx.curdistfn));
+		stmt->invalItems = lappend(stmt->invalItems, inval);
+	}
 	return stmt;
 }
 
@@ -806,6 +962,13 @@ _PG_init(void)
 							 "Pass a constant LIMIT to a weave ordering scan as its first pass width.",
 							 "An index access method is not told the LIMIT, so without this an ORDER BY d <=> q LIMIT 10 scan starts at pg_weave.wand_initial_k's width. Off restores that behaviour; results are identical either way.",
 							 &pg_weave_limit_hint,
+							 true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	/* G86: score reuse, in the same walk (see weave_reuse_distance) */
+	DefineCustomBoolVariable("pg_weave.reuse_distance",
+							 "Reuse a weave ordering scan's distance for its ORDER BY sort key.",
+							 "Replaces the planner's hidden sort-key copy of ORDER BY d <=> q with the value the scan already computed, instead of re-reading and re-scoring each returned row. A column the query selects is never replaced.",
+							 &pg_weave_reuse_distance,
 							 true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	prev_planner_hook = planner_hook;
