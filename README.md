@@ -4,14 +4,14 @@ pg_weave is a PostgreSQL index access method, `weave`. One `CREATE INDEX` gives 
 kinds of retrieval over the same rows: BM25 ranked text search, vector nearest-neighbour
 search, fuzzy (edit-distance) terms, regular expressions over tokens, prefix terms, and
 substring (`LIKE '%...%'`) search through a character n-gram channel. A scalar column can
-be indexed as a facet too. Every channel in a segment shares one document-id space. That
-lets a selective filter, a lexical term or a facet such as `price < 100`, skip vector work
-inside the scan instead of being applied afterwards.
+be indexed as a facet too. Every channel in a segment shares one document-id space, so a
+selective filter (a lexical term, or a facet such as `price < 100`) skips vector work
+inside the scan instead of filtering rows after it.
 
 **Status: 0.28.0, pre-1.0, not production-ready.** All six retrieval kinds ship. The
 fuzzy/n-gram (Z) and vector (V) phase gates are not met, the fused-ranking gate passes two
-of its five rows, and several measured results are losses, listed below. `doc/PRODUCTION_READINESS.md` is the gate list and `doc/GAPS.md` lists the known
-defects.
+of its five rows, and several measured results are losses, listed below.
+`doc/PRODUCTION_READINESS.md` is the gate list and `doc/GAPS.md` lists the known defects.
 
 ## Install
 
@@ -39,9 +39,9 @@ LLVM 19) the default install works.
 
 ## Example
 
-This is `doc/readme_examples.sql`. Its output below comes from running it on PostgreSQL
-17.11 and 18.6 (EC2 run `pgweave-20261006-212542-c6e5`). The two majors produced the same
-output line for line.
+The SQL below is `doc/readme_examples.sql`, and the results in comments come from running
+it on PostgreSQL 17.11 and 18.6 (EC2 run `pgweave-20261006-212542-c6e5`). Both majors
+printed identical output.
 
 ```sql
 CREATE TABLE docs (
@@ -155,8 +155,8 @@ SELECT id, title FROM docs
 -- 1, 2
 ```
 
-To get the fused score, use `weave_fuse_search()`. A `fuse(...)` in the select list is
-recomputed per row from the heap value and is not the score the scan ranked by.
+To get the fused score, call `weave_fuse_search()`. Putting `fuse(...)` in the select list
+recomputes it per row from the heap value, which is not the score the scan ranked by.
 
 ```sql
 SELECT d.id, d.title, round(s.score::numeric, 4) AS score
@@ -171,7 +171,7 @@ SELECT d.id, d.title, round(s.score::numeric, 4) AS score
 SELECT bool_and(ok) AS all_invariants_hold FROM weave_check('docs_weave');   -- t
 ```
 
-Things the example does not show:
+Limits you will meet:
 
 - **Vector order is approximate.** The scan ranks by 4-bit quantized codes and does not
   rerank against the stored floats (the planned rerank is `doc/PHASES.md` V10). For an
@@ -184,17 +184,15 @@ Things the example does not show:
 - **`to_wdoc(text)` only lowercases and splits.** For stemming and stopwords use
   `to_wdoc('english', text)`, or `to_wdoc(tsvector)`. Fuzzy, prefix and regex terms are
   matched literally against whatever tokens the index holds.
-- **`weave_fuse_search()` and `weave_search()` are superuser-only by default**, because they
-  open the index without a privilege check. `GRANT EXECUTE` them to roles that may read
-  the table.
+- **`weave_fuse_search()` and `weave_search()` are revoked from `PUBLIC`**, because they
+  return heap TIDs and scores past table permissions. The owner can `GRANT EXECUTE` them.
 - Index options: `positions`, `trigrams` (speeds up regex and long fuzzy terms), `bits`
   (code width, 2–8, default 4), `metric` (`l2` or `ip`).
 
 ## What it is fast at, and where it loses
 
-Every figure below is quoted from the file named next to it. Losses sit next to wins.
-Each file states its corpus, its host and the scale it was measured at, and most are
-one corpus at one or two scales.
+Each figure below comes from the file named beside it, which also gives the corpus, the
+host and the scale. Most cover one corpus at one or two scales.
 
 **Lexical, against tsvector + GIN** (`bench/RESULTS_LEXICAL.md`, synthetic corpus,
 1M and 4M documents):
@@ -235,16 +233,17 @@ one corpus at one or two scales.
 
 **Vector recall and latency, not yet a win:**
 
-- The index orders by quantized codes and does not rerank against the stored floats. The
-  exact rerank that reaches recall@10 0.9920 at 1M × 960-d was measured as a component
-  (`bench/RESULTS_PHASE_V_COLD.md`) but is not built into the scan (`doc/PHASES.md` V10).
+- The index orders by quantized codes and does not rerank against the stored floats. A
+  standalone measurement of that rerank reached recall@10 0.9920 at 1M × 960-d
+  (`bench/RESULTS_PHASE_V_COLD.md`), but the scan does not do it yet (`doc/PHASES.md` V10).
   The codes alone top out at recall@10 0.9225 (GloVe-200d) and 0.8680 (GIST-960d)
   (`bench/RESULTS_BITWIDTH_SWEEP.md`).
-- No end-to-end vector query has been timed against pgvector. A standalone scan harness
-  measured 1.51× pgvector HNSW's warm p50 at matched recall (`bench/RESULTS_CODE_SCAN.md`);
-  that is not a SQL query, so it is not a comparison you should rely on.
+- No vector SQL query has been timed against pgvector. A standalone harness that also does
+  the exact rerank the index lacks measured 1.02–1.09× pgvector HNSW's warm p50 at
+  recall@10 ≥ 0.99, n = 1M (`bench/RESULTS_CODE_SCAN.md`, "The honest configuration
+  table"). It does no page reads or visibility checks, so do not read it as query latency.
 - The per-block score bound prunes 0.00 % of blocks on real corpora
-  (`bench/RESULTS_CODE_SCAN.md`): every query scores every code.
+  (`bench/RESULTS_CODE_SCAN.md`), so an unfiltered query scores every code.
 
 **Fuzzy, regex, substring** (`bench/RESULTS_FUZZY_REGEX.md`, `bench/RESULTS_CGRAM.md`,
 synthetic 1M rows, one scale):
