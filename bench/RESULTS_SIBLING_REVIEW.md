@@ -105,9 +105,26 @@ synthetic check.
 | all 4, linear model | 1 | 960 | 20 | 74 | **97** | 864 |
 | all 4, linear model | 1 | 384 | 33 | 239 | **427** | 2,210 |
 
-n = 1M: **pending** (`plane_960_1m.txt` and `plane_384_1m.txt` in the same run's
-`remote/`). They are the second scale hard rule 11 requires and will be recorded here when
-they land.
+**n = 1M, the second scale** (hard rule 11). 384-d is from the same run
+(`pgweave-20261006-052912-fab3`). The 960-d arm was lost to a host reboot and re-run
+(`pgweave-20261006-130721-1dd7`) with the probe parallelized over queries. Its output is
+byte-identical to the serial build at 1, 3 and 8 threads, and the re-run's 960-d / 200k arm
+reproduced the original serial run exactly. The control arm needs exactly k in every row:
+
+| first stage | dim | k=10 p50 | p99 | **p99.9** | as % of n | k=100 p99.9 |
+|---|---|---:|---:|---:|---:|---:|
+| sign bit | 960 | 481 | 8,069 | **19,823** | 2.0 % | 48,471 |
+| sign bit | 384 | 4,008 | 51,442 | **83,351** | 8.3 % | 206,262 |
+| top 2 bits | 960 | 874 | 16,812 | 43,381 | 4.3 % | 89,535 |
+| top 2 bits | 384 | 6,041 | 88,301 | 110,311 | 11.0 % | 247,346 |
+| all 4, linear | 960 | 23 | 129 | **214** | 0.02 % | 1,336 |
+| all 4, linear | 384 | 43 | 378 | **723** | 0.07 % | 3,630 |
+
+**It reproduces as a fraction of the corpus, not as a count.** The sign stage needs 2.0 %
+of the corpus at 960-d at both scales (3,997 / 200k, 19,823 / 1M) and 8–10 % at 384-d.
+A shortlist that grows linearly with n is a full scan of a fixed fraction, which is the
+opposite of what a first stage is for. turbovec's 104 at k=10 out of 100K is 0.1 %, which
+is 20x (960-d) to 80x (384-d) below ours.
 
 ### Reading
 
@@ -134,7 +151,7 @@ they land.
 
 ### What this decides for V18
 
-**V18 (bit-plane progressive refinement) is NOT promoted on this evidence, which is PROVISIONAL**: one scale (n = 200k) and one corpus (GIST). Hard rule 11 makes the n = 1M arms the condition for calling it a result. Its gate, "the
+**V18 (bit-plane progressive refinement) is NOT promoted.** Measured at two scales (200k and 1M) and two dimensionalities, on one corpus (GIST); the result reproduces as a fraction of n. Still owed, and the only thing that could reopen it: a real text-embedding corpus. Its gate, "the
 survival fraction measured before anything is built", is now measured, and it fails at
 both dimensionalities on GIST. Two things would reopen it, both owed and cheap:
 - the same probe on a **real text-embedding corpus** (MiniLM or OpenAI), which is
