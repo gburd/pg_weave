@@ -1,0 +1,318 @@
+-- doc/GAPS.md G87, the fused route: the planner's LIMIT hint reaches a fused scan.
+-- A fused plan has one ORDER BY key per channel plus the `<~>` weights transport;
+-- weave_hint_indexscan() (src/am/customscan.c) writes LIMIT + OFFSET into the FIRST
+-- lexical key's wquery `flags`, and weave_gettuple() (src/am/amscan.c) reads it from
+-- the first lexical channel as the first fused pass width.  First pass only, never
+-- wider than the unhinted one, so every answer is unchanged.
+--
+-- What each block guards, and the mutant that proves it can fail:
+--   1. less fused work at LIMIT 10 on three shapes:
+--        lexical first          (mutant: the old one-key-only rule)
+--        vector first           (mutant: hint only the FIRST key)
+--        two lexical channels   (mutants: no `break` in either loop -- the hint
+--                                lands on one key and the scan reads another)
+--      and never MORE at LIMIT 100            (mutant: no cap at the default)
+--   2. exact answers, both pg_weave.fuse_normalize modes, every LIMIT/OFFSET window
+--      below, a filter that pulls far past the hint, NULL vectors padded after
+--      every ranked row (G71), generic plans, a cursor   (mutant: no widening)
+--   3. EXPLAIN VERBOSE prints the query unchanged
+--
+-- The score oracle is weave_fuse_search() (unhinted: it builds its own scan keys),
+-- and every check compares SCORE arrays, so equal scores in either order are right.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+ALTER EXTENSION pg_weave UPDATE;
+RESET client_min_messages;
+SET jit = off;
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE hf (id int, d wdoc, v wvec(4)) WITH (autovacuum_enabled = off);
+INSERT INTO hf SELECT g, to_wdoc('simple',
+   CASE WHEN g % 10 < 3 THEN 'a ' ELSE '' END || CASE WHEN g % 10 >= 7 THEN 'b ' ELSE '' END ||
+   CASE WHEN g % 10 = 5 THEN 'c ' ELSE '' END || repeat('x' || (g % 101) || ' ', 1 + g % 23)),
+   CASE WHEN g % 997 = 0 THEN NULL
+        ELSE ('[' || (g % 97) / 97.0 || ',' || (g % 89) / 89.0 || ',' ||
+              (g % 83) / 83.0 || ',' || (g % 79) / 79.0 || ']')::wvec END
+  FROM generate_series(1, 20000) g;
+CREATE INDEX hf_w ON hf USING weave (d, v);
+VACUUM ANALYZE hf;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_sort = off;
+-- the three shapes; each must be a fused Index Scan with the transport key
+CREATE FUNCTION hf_q(shape text, lim text, filt text DEFAULT 'true') RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+  SELECT format('SELECT ctid AS rowtid FROM hf WHERE %s ORDER BY fuse(%s) %s', filt,
+    CASE shape
+      WHEN 'lv' THEN $s$d <=> 'a | b | c'::wquery, v <-> '[0.3,0.6,0.2,0.9]'::wvec$s$
+      WHEN 'vl' THEN $s$v <-> '[0.3,0.6,0.2,0.9]'::wvec, d <=> 'a | b | c'::wquery$s$
+      WHEN 'll' THEN $s$d <=> 'a | b'::wquery, d <=> 'c'::wquery$s$ END, lim)
+$$;
+SELECT 'lv' AS shape; EXPLAIN (COSTS OFF) SELECT * FROM hf ORDER BY fuse(d <=> 'a | b | c'::wquery, v <-> '[0.3,0.6,0.2,0.9]'::wvec) LIMIT 10;
+ shape 
+-------
+ lv
+(1 row)
+
+                                                            QUERY PLAN                                                             
+-----------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using hf_w on hf
+         Order By: ((d <=> '((''a'' | ''b'') | ''c'')'::wquery) AND (v <-> '[0.3,0.6,0.2,0.9]'::wvec) AND (d <~> '{1,1}'::real[]))
+(3 rows)
+
+SELECT 'vl' AS shape; EXPLAIN (COSTS OFF) SELECT * FROM hf ORDER BY fuse(v <-> '[0.3,0.6,0.2,0.9]'::wvec, d <=> 'a | b | c'::wquery) LIMIT 10;
+ shape 
+-------
+ vl
+(1 row)
+
+                                                            QUERY PLAN                                                             
+-----------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using hf_w on hf
+         Order By: ((v <-> '[0.3,0.6,0.2,0.9]'::wvec) AND (d <=> '((''a'' | ''b'') | ''c'')'::wquery) AND (d <~> '{1,1}'::real[]))
+(3 rows)
+
+SELECT 'll' AS shape; EXPLAIN (COSTS OFF) SELECT * FROM hf ORDER BY fuse(d <=> 'a | b'::wquery, d <=> 'c'::wquery) LIMIT 10;
+ shape 
+-------
+ ll
+(1 row)
+
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using hf_w on hf
+         Order By: ((d <=> '(''a'' | ''b'')'::wquery) AND (d <=> '''c'''::wquery) AND (d <~> '{1,1}'::real[]))
+(3 rows)
+
+-- 1.  The hint reaches the fused scan: fused score() calls, hint off vs on.
+CREATE TEMP TABLE work (shape text, lim int, arm text, passes bigint, scores bigint);
+CREATE FUNCTION hf_work(shape text, lim int, arm text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE format('SET pg_weave.limit_hint = %s', arm);
+  PERFORM weave_fuse_stats_reset();
+  EXECUTE format('SELECT count(*) FROM (%s) s', hf_q(shape, 'LIMIT ' || lim));
+  INSERT INTO work SELECT shape, lim, arm, passes, scores FROM weave_fuse_stats();
+  RESET pg_weave.limit_hint;
+END $$;
+DO $$ DECLARE s text; l int; a text; BEGIN
+  FOREACH s IN ARRAY ARRAY['lv', 'vl', 'll'] LOOP FOREACH l IN ARRAY ARRAY[10, 100] LOOP
+    FOREACH a IN ARRAY ARRAY['off', 'on'] LOOP PERFORM hf_work(s, l, a); END LOOP;
+  END LOOP; END LOOP; END $$;
+SELECT w0.shape, w0.lim, w0.passes > 0 AND w1.passes > 0 AS fused_scan_ran,
+       CASE WHEN w0.lim = 10 THEN w1.scores < w0.scores ELSE w1.scores <= w0.scores END
+         AS less_at_10_never_more_at_100
+  FROM work w0 JOIN work w1 ON w1.shape = w0.shape AND w1.lim = w0.lim AND w1.arm = 'on'
+ WHERE w0.arm = 'off' ORDER BY 1, 2;
+ shape | lim | fused_scan_ran | less_at_10_never_more_at_100 
+-------+-----+----------------+------------------------------
+ ll    |  10 | t              | t
+ ll    | 100 | t              | t
+ lv    |  10 | t              | t
+ lv    | 100 | t              | t
+ vl    |  10 | t              | t
+ vl    | 100 | t              | t
+(6 rows)
+
+-- 2.  Exact answers.  hr_lv / hr_ll: every ranked row's fused score from the oracle
+-- (`vl` sums the same two terms, and a two-term sum is commutative).  A returned
+-- sequence is right when its ranked rows' scores, in output order, equal the exact
+-- top window of the admitted rows sorted descending (order AND multiset in one
+-- comparison, to 1e-6), every row is distinct, and the unranked rows -- NULL vectors, padded
+-- at a NULL fuse() -- all come after every ranked one.
+CREATE TEMP TABLE hr_lv (rowtid tid, score float8, id int);
+CREATE TEMP TABLE hr_ll (rowtid tid, score float8, id int);
+CREATE TEMP TABLE hf_got (rn bigint, rowtid tid);
+CREATE FUNCTION hf_ref() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  TRUNCATE hr_lv, hr_ll;
+  INSERT INTO hr_lv SELECT s.ctid, s.score, h.id
+    FROM weave_fuse_search('hf_w', ARRAY['a | b | c'::wquery], ARRAY['[0.3,0.6,0.2,0.9]'::wvec],
+                           NULL, 100000) s JOIN hf h ON h.ctid = s.ctid;
+  INSERT INTO hr_ll SELECT s.ctid, s.score, h.id
+    FROM weave_fuse_search('hf_w', ARRAY['a | b'::wquery, 'c'::wquery], NULL, NULL, 100000) s
+    JOIN hf h ON h.ctid = s.ctid;
+END $$;
+CREATE FUNCTION hf_chk(q text, ref text, n int, filt text, off int DEFAULT 0) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE got float8[]; want float8[]; nrow int; ndist int; tail_ok bool; nunranked int;
+BEGIN
+  TRUNCATE hf_got;
+  EXECUTE format('INSERT INTO hf_got SELECT row_number() OVER (), rowtid FROM (%s) x', q);
+  SELECT count(*), count(DISTINCT rowtid) INTO nrow, ndist FROM hf_got;
+  EXECUTE format('SELECT array_agg(r.score ORDER BY g.rn) FROM hf_got g JOIN %I r USING (rowtid)', ref)
+    INTO got;
+  EXECUTE format($f$SELECT count(*) FILTER (WHERE r.rowtid IS NULL),
+      coalesce(bool_and(h.v IS NULL) FILTER (WHERE r.rowtid IS NULL), true)
+      AND coalesce(min(g.rn) FILTER (WHERE r.rowtid IS NULL)
+                   > max(g.rn) FILTER (WHERE r.rowtid IS NOT NULL), true)
+      FROM hf_got g JOIN hf h ON h.ctid = g.rowtid LEFT JOIN %I r USING (rowtid)$f$, ref)
+    INTO nunranked, tail_ok;
+  EXECUTE format('SELECT array_agg(score ORDER BY score DESC) FROM (SELECT score FROM %I WHERE %s ORDER BY score DESC LIMIT %s OFFSET %s) z',
+                 ref, filt, n, off) INTO want;
+  -- 1e-6 relative: `vl` sums its channels in another order than the oracle
+  RETURN format('n=%s distinct=%s padded=%s tail_ok=%s exact=%s', nrow, ndist, nunranked, tail_ok,
+    array_length(got, 1) IS NOT DISTINCT FROM array_length(want, 1) AND
+    coalesce((SELECT bool_and(abs(got[i] - want[i]) <= 1e-6 * (1 + abs(want[i])))
+                FROM generate_subscripts(want, 1) i), true));
+END $$;
+CREATE FUNCTION hf_all() RETURNS TABLE (shape text, win text, result text) LANGUAGE plpgsql AS $$
+DECLARE s text; ref text;
+BEGIN
+  PERFORM hf_ref();
+  FOREACH s IN ARRAY ARRAY['lv', 'vl', 'll'] LOOP
+    ref := CASE s WHEN 'll' THEN 'hr_ll' ELSE 'hr_lv' END;
+    shape := s;
+    win := 'LIMIT 10';         result := hf_chk(hf_q(s, 'LIMIT 10'), ref, 10, 'true'); RETURN NEXT;
+    win := 'LIMIT 1';          result := hf_chk(hf_q(s, 'LIMIT 1'), ref, 1, 'true'); RETURN NEXT;
+    win := 'LIMIT 3 OFFSET 7'; result := hf_chk(hf_q(s, 'LIMIT 3 OFFSET 7'), ref, 3, 'true', 7); RETURN NEXT;
+    win := 'LIMIT 10 OFFSET 200';
+    result := hf_chk(hf_q(s, 'LIMIT 10 OFFSET 200'), ref, 10, 'true', 200); RETURN NEXT;
+    win := 'LIMIT 100';        result := hf_chk(hf_q(s, 'LIMIT 100'), ref, 100, 'true'); RETURN NEXT;
+    win := 'LIMIT 300';        result := hf_chk(hf_q(s, 'LIMIT 300'), ref, 300, 'true'); RETURN NEXT;
+    -- not an index key: the executor rejects 96 of every 97 ranked rows
+    win := 'LIMIT 10, id % 97 = 0';
+    result := hf_chk(hf_q(s, 'LIMIT 10', 'id % 97 = 0'), ref, 10, 'id % 97 = 0'); RETURN NEXT;
+    IF s <> 'll' THEN
+      -- every ranked row is rejected: the ladder runs to completion, then pads
+      win := 'LIMIT 10, v IS NULL (padding only)';
+      result := hf_chk(hf_q(s, 'LIMIT 10', 'v IS NULL'), ref, 10, 'false'); RETURN NEXT;
+      -- 21 ranked rows (id % 997 = 1), then 9 padded ones
+      win := 'LIMIT 30, id % 997 IN (0, 1) (ranked, then padded)';
+      result := hf_chk(hf_q(s, 'LIMIT 30', 'id % 997 IN (0, 1)'), ref, 30, 'id % 997 IN (0, 1)'); RETURN NEXT;
+    END IF;
+  END LOOP;
+END $$;
+SET pg_weave.fuse_normalize = off;
+SELECT * FROM hf_all();
+ shape |                        win                         |                    result                     
+-------+----------------------------------------------------+-----------------------------------------------
+ lv    | LIMIT 10                                           | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 1                                            | n=1 distinct=1 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 3 OFFSET 7                                   | n=3 distinct=3 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 10 OFFSET 200                                | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 100                                          | n=100 distinct=100 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 300                                          | n=300 distinct=300 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 10, id % 97 = 0                              | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 10, v IS NULL (padding only)                 | n=10 distinct=10 padded=10 tail_ok=t exact=t
+ lv    | LIMIT 30, id % 997 IN (0, 1) (ranked, then padded) | n=30 distinct=30 padded=9 tail_ok=t exact=t
+ vl    | LIMIT 10                                           | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 1                                            | n=1 distinct=1 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 3 OFFSET 7                                   | n=3 distinct=3 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 10 OFFSET 200                                | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 100                                          | n=100 distinct=100 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 300                                          | n=300 distinct=300 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 10, id % 97 = 0                              | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 10, v IS NULL (padding only)                 | n=10 distinct=10 padded=10 tail_ok=t exact=t
+ vl    | LIMIT 30, id % 997 IN (0, 1) (ranked, then padded) | n=30 distinct=30 padded=9 tail_ok=t exact=t
+ ll    | LIMIT 10                                           | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 1                                            | n=1 distinct=1 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 3 OFFSET 7                                   | n=3 distinct=3 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 10 OFFSET 200                                | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 100                                          | n=100 distinct=100 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 300                                          | n=300 distinct=300 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 10, id % 97 = 0                              | n=10 distinct=10 padded=0 tail_ok=t exact=t
+(25 rows)
+
+SET pg_weave.fuse_normalize = on;
+SELECT * FROM hf_all();
+ shape |                        win                         |                    result                     
+-------+----------------------------------------------------+-----------------------------------------------
+ lv    | LIMIT 10                                           | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 1                                            | n=1 distinct=1 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 3 OFFSET 7                                   | n=3 distinct=3 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 10 OFFSET 200                                | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 100                                          | n=100 distinct=100 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 300                                          | n=300 distinct=300 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 10, id % 97 = 0                              | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ lv    | LIMIT 10, v IS NULL (padding only)                 | n=10 distinct=10 padded=10 tail_ok=t exact=t
+ lv    | LIMIT 30, id % 997 IN (0, 1) (ranked, then padded) | n=30 distinct=30 padded=9 tail_ok=t exact=t
+ vl    | LIMIT 10                                           | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 1                                            | n=1 distinct=1 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 3 OFFSET 7                                   | n=3 distinct=3 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 10 OFFSET 200                                | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 100                                          | n=100 distinct=100 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 300                                          | n=300 distinct=300 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 10, id % 97 = 0                              | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ vl    | LIMIT 10, v IS NULL (padding only)                 | n=10 distinct=10 padded=10 tail_ok=t exact=t
+ vl    | LIMIT 30, id % 997 IN (0, 1) (ranked, then padded) | n=30 distinct=30 padded=9 tail_ok=t exact=t
+ ll    | LIMIT 10                                           | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 1                                            | n=1 distinct=1 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 3 OFFSET 7                                   | n=3 distinct=3 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 10 OFFSET 200                                | n=10 distinct=10 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 100                                          | n=100 distinct=100 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 300                                          | n=300 distinct=300 padded=0 tail_ok=t exact=t
+ ll    | LIMIT 10, id % 97 = 0                              | n=10 distinct=10 padded=0 tail_ok=t exact=t
+(25 rows)
+
+RESET pg_weave.fuse_normalize;
+-- generic plans: a constant LIMIT is hinted at plan time; LIMIT $1 is a Param and
+-- is not.  Both are executed several times from one cached generic plan.
+SELECT hf_ref();
+ hf_ref 
+--------
+ 
+(1 row)
+
+SET plan_cache_mode = force_generic_plan;
+PREPARE hf_c10 AS SELECT row_number() OVER () rn, rowtid
+  FROM (SELECT ctid AS rowtid FROM hf WHERE id % 97 = 0
+         ORDER BY fuse(d <=> 'a | b | c'::wquery, v <-> '[0.3,0.6,0.2,0.9]'::wvec) LIMIT 10) s;
+PREPARE hf_p(int) AS SELECT row_number() OVER () rn, rowtid
+  FROM (SELECT ctid AS rowtid FROM hf WHERE id % 97 = 0
+         ORDER BY fuse(d <=> 'a | b | c'::wquery, v <-> '[0.3,0.6,0.2,0.9]'::wvec) LIMIT $1) s;
+CREATE TEMP TABLE gp1 AS EXECUTE hf_c10;
+CREATE TEMP TABLE gp2 AS EXECUTE hf_c10;
+CREATE TEMP TABLE gp3 AS EXECUTE hf_p(25);
+CREATE TEMP TABLE gp4 AS EXECUTE hf_p(25);
+SELECT 'generic plan, constant LIMIT' AS shape,
+       hf_chk('SELECT rowtid FROM gp1 ORDER BY rn', 'hr_lv', 10, 'id % 97 = 0') AS run1,
+       hf_chk('SELECT rowtid FROM gp2 ORDER BY rn', 'hr_lv', 10, 'id % 97 = 0') AS run2;
+            shape             |                    run1                     |                    run2                     
+------------------------------+---------------------------------------------+---------------------------------------------
+ generic plan, constant LIMIT | n=10 distinct=10 padded=0 tail_ok=t exact=t | n=10 distinct=10 padded=0 tail_ok=t exact=t
+(1 row)
+
+SELECT 'generic plan, LIMIT $1' AS shape,
+       hf_chk('SELECT rowtid FROM gp3 ORDER BY rn', 'hr_lv', 25, 'id % 97 = 0') AS run1,
+       hf_chk('SELECT rowtid FROM gp4 ORDER BY rn', 'hr_lv', 25, 'id % 97 = 0') AS run2;
+         shape          |                    run1                     |                    run2                     
+------------------------+---------------------------------------------+---------------------------------------------
+ generic plan, LIMIT $1 | n=25 distinct=25 padded=0 tail_ok=t exact=t | n=25 distinct=25 padded=0 tail_ok=t exact=t
+(1 row)
+
+DEALLOCATE hf_c10; DEALLOCATE hf_p;
+RESET plan_cache_mode;
+-- a cursor reads the hinted plan a row at a time, past the hint
+BEGIN;
+DECLARE hf_cur CURSOR FOR SELECT ctid FROM hf WHERE id % 97 = 0
+  ORDER BY fuse(d <=> 'a | b | c'::wquery, v <-> '[0.3,0.6,0.2,0.9]'::wvec) LIMIT 10;
+CREATE TEMP TABLE cur_rows (rn serial, rowtid tid);
+DO $$ DECLARE r record; c refcursor := 'hf_cur'; BEGIN
+  LOOP FETCH c INTO r; EXIT WHEN NOT FOUND; INSERT INTO cur_rows (rowtid) VALUES (r.ctid); END LOOP; END $$;
+COMMIT;
+SELECT 'cursor, filtered past the hint' AS shape,
+       hf_chk('SELECT rowtid FROM cur_rows ORDER BY rn', 'hr_lv', 10, 'id % 97 = 0');
+             shape              |                   hf_chk                    
+--------------------------------+---------------------------------------------
+ cursor, filtered past the hint | n=10 distinct=10 padded=0 tail_ok=t exact=t
+(1 row)
+
+-- 3.  Invisible in EXPLAIN.
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM hf ORDER BY fuse(d <=> 'a | b | c'::wquery, v <-> '[0.3,0.6,0.2,0.9]'::wvec) LIMIT 10;
+                                                                      QUERY PLAN                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit
+   Output: id, (fuse(weave_lexscore((d <=> '((''a'' | ''b'') | ''c'')'::wquery)), weave_l2score((v <-> '[0.3,0.6,0.2,0.9]'::wvec)), NULL::real[]))
+   ->  Index Scan using hf_w on public.hf
+         Output: id, fuse(weave_lexscore((d <=> '((''a'' | ''b'') | ''c'')'::wquery)), weave_l2score((v <-> '[0.3,0.6,0.2,0.9]'::wvec)), NULL::real[])
+         Order By: ((hf.d <=> '((''a'' | ''b'') | ''c'')'::wquery) AND (hf.v <-> '[0.3,0.6,0.2,0.9]'::wvec) AND (hf.d <~> '{1,1}'::real[]))
+(5 rows)
+
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort;
+DROP TABLE hf;
+DROP FUNCTION hf_q(text, text, text);
+DROP FUNCTION hf_work(text, int, text);
+DROP FUNCTION hf_ref();
+DROP FUNCTION hf_chk(text, text, int, text, int);
+DROP FUNCTION hf_all();
