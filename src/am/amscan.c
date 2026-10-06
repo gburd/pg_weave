@@ -8080,7 +8080,7 @@ weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
 		}
 		if (gdf == 0)
 			continue;			/* term absent in every segment */
-		idf = log(1.0 + (N - (double) gdf + 0.5) / ((double) gdf + 0.5));
+		idf = weave_index_idf(N, (double) gdf);	/* G83: clamped */
 
 		/* one cursor per segment that contains the term */
 		for (s = 0; s < meta.nsegments; s++)
@@ -10140,7 +10140,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 				if (pd.pmtf[kt[qi].off + t] > mtf[t])
 					mtf[t] = pd.pmtf[kt[qi].off + t];
 				kt[qi].idf[t] = (gdf == 0) ? -1.0
-					: log(1.0 + (N - (double) gdf + 0.5) / ((double) gdf + 0.5));
+					: weave_index_idf(N, (double) gdf);	/* G83: clamped */
 			}
 
 			/*
@@ -11094,7 +11094,7 @@ weave_pending_ranked(Relation index, WeaveQuery q, ScoredTid **out)
 			for (t = 0; t < nterms; t++)
 			{
 				double		df = (double) Max(gdfs[t], (uint64) 1);
-				double		idf = log(1.0 + (N - df + 0.5) / (df + 0.5));
+				double		idf = weave_index_idf(N, df);	/* G83: clamped */
 
 				weave_bm25_factors_init(&fac[t], idf, 1.2, 0.75, avgdl);
 			}
@@ -12164,8 +12164,7 @@ weave_anomalous_docs(PG_FUNCTION_ARGS)
 						continue;
 					}
 
-					idf = log(1.0 + (N - (double) gdf + 0.5) /
-							  ((double) gdf + 0.5));
+					idf = weave_index_idf(N, (double) gdf);	/* G83: clamped */
 
 					np = weave_decode_term(index, de->firstposting,
 										  de->firstoffset, de->df,
