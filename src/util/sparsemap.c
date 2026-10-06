@@ -8192,7 +8192,7 @@ __sm_union_runs(const sm_t *map, const uint64_t *run_lo,
  * small-set mode when the result fits, and frees the scratch buffer).
  */
 static bool
-__sm_add_many_core(sm_t **mapp, const uint64_t *arr, size_t n)
+__sm_add_many_core(sm_t **mapp, const uint64_t *arr, size_t n, bool may_grow)
 {
 	uint64_t *sorted;
 	uint64_t *run_lo;
@@ -8220,6 +8220,22 @@ __sm_add_many_core(sm_t **mapp, const uint64_t *arr, size_t n)
 	__sm_free(run_hi);
 	if (result == NULL)
 		return (false);
+
+	/*
+	 * sm_add_many (may_grow == false) promises not to relocate the
+	 * caller's buffer: it takes an sm_t*, not an sm_t**, so it cannot
+	 * report a moved pointer.  __sm_replace_buffer grows via
+	 * sm_set_data_size, which for an SM_OWNED_CONTIGUOUS map reallocs the
+	 * whole struct+buffer block and frees the original -- leaving the
+	 * caller holding a dangling pointer.  If the merged result does not
+	 * fit in the map's current capacity, free the scratch result and fail
+	 * cleanly, leaving *mapp untouched and valid; the caller must retry
+	 * with sm_add_many_grow.
+	 */
+	if (!may_grow && __sm_cap(*mapp) < result->m_data_used) {
+		sm_free(result);
+		return (false);
+	}
 
 	swapped = __sm_replace_buffer(*mapp, result);
 	if (swapped == NULL)
@@ -8255,7 +8271,7 @@ sm_add_many(sm_t *map, const uint64_t *arr, size_t n)
 	 * sm_add_many_grow.
 	 */
 	m = map;
-	if (!__sm_add_many_core(&m, arr, n))
+	if (!__sm_add_many_core(&m, arr, n, false))
 		return (false);
 	return (m == map);
 }
@@ -8274,7 +8290,7 @@ sm_add_many_grow(sm_t **map, const uint64_t *arr, size_t n)
 		return (true);
 	if (n == 1)
 		return (sm_add_grow(map, arr[0]) != SM_IDX_MAX);
-	return (__sm_add_many_core(map, arr, n));
+	return (__sm_add_many_core(map, arr, n, true));
 }
 
 /*
@@ -8755,7 +8771,7 @@ sm_create_from_array(const uint64_t *arr, size_t n)
 	sm_t *m = sm_create(1024);
 	if (m == NULL)
 		return (NULL);
-	if (!sm_add_many(m, arr, n)) {
+	if (!sm_add_many_grow(&m, arr, n)) {
 		sm_free(m);
 		return (NULL);
 	}
@@ -9156,6 +9172,41 @@ sm_validate(const sm_t *map)
 		if (__sm_chunk_is_rle(&chunk) &&
 		    __sm_chunk_rle_get_length(&chunk) > capacity) {
 			return (false);
+		}
+		/* (f) sparse descriptor shape: every data-bearing slot
+		 * (SM_PAYLOAD_ONES / SM_PAYLOAD_MIXED) must lie within the
+		 * chunk's measured capacity.  __sm_chunk_get_capacity reports
+		 * SM_CHUNK_MAX_CAPACITY minus 64 bits per SM_PAYLOAD_NONE flag
+		 * wherever that flag sits, but the slot-indexed readers (rank /
+		 * cardinality / select / minimum / maximum) place a slot's bits
+		 * at its fixed position slot*64 while the capacity-bounded
+		 * readers (contains / next_member) stop at start+capacity.  When
+		 * a NONE flag sits below a data-bearing slot the two disagree:
+		 * sm_cardinality counts the high slot's bits, sm_next_member /
+		 * sm_contains skip them.  The encoder never emits such a chunk
+		 * (every data-bearing slot it writes fits inside the reduced
+		 * capacity), so reject any crafted buffer that violates this --
+		 * it is the one sparse shape sm_validate used to accept while
+		 * the readers answered inconsistently.  NONE in slot 31 is the
+		 * RLE marker and is handled by the RLE path above. */
+		if (!__sm_chunk_is_rle(&chunk)) {
+			const __sm_bitvec_t desc = chunk.m_data[0];
+			size_t slot;
+			int highest_data = -1;
+			for (slot = 0; slot < SM_FLAGS_PER_INDEX; slot++) {
+				const size_t fl =
+				    (size_t)((desc >> (slot * 2)) &
+				        SM_FLAG_MASK);
+				if (fl == SM_PAYLOAD_ONES ||
+				    fl == SM_PAYLOAD_MIXED) {
+					highest_data = (int)slot;
+				}
+			}
+			if (highest_data >= 0 &&
+			    ((size_t)(highest_data + 1) *
+			            (size_t)SM_BITS_PER_VECTOR) > capacity) {
+				return (false);
+			}
 		}
 		/* (c) [start, start + capacity) must not extend past the
 		 * addressable index space.  A chunk that ends exactly at 2^64

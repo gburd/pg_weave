@@ -5728,6 +5728,17 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		elog(ERROR, "index \"%s\" already contains data",
 			 RelationGetRelationName(index));
 
+	/*
+	 * The SEGMENT-WRITE LOCK for the whole build (include/weave/am.h,
+	 * doc/specs/SEGMENT_FORMAT.md sect. 10).  A plain CREATE INDEX or REINDEX
+	 * holds AccessExclusiveLock on the index and does not need it; CREATE INDEX
+	 * CONCURRENTLY holds only ShareUpdateExclusiveLock, so its pages would
+	 * otherwise be unlicensed for weave_new_buffer().  No VACUUM can run beside
+	 * either (both table locks conflict with VACUUM's), so this costs one
+	 * uncontended lock.  Released by transaction end on an ERROR.
+	 */
+	weave_segwrite_lock(index);
+
 	/* metapage must be block 0 -- write it before workers or the scan touch it */
 	weave_init_metapage(index);
 
@@ -5856,6 +5867,7 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	}
 	PG_END_TRY();
 
+	weave_segwrite_unlock(index);
 	MemoryContextDelete(bs.ctx);
 
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
@@ -6061,8 +6073,19 @@ weave_insert_oversized_as_segment(Relation index, WeaveDoc doc, ItemPointer tid,
 		MemoryContextSwitchTo(old);
 	}
 
-	/* write the one-doc segment (updates corpus N/sumdoclen via add_segment) */
+	/*
+	 * Write the one-doc segment (updates corpus N/sumdoclen via add_segment).
+	 *
+	 * UNDER THE SEGMENT-WRITE LOCK, from the first page to the publish
+	 * (include/weave/am.h).  This is the one writer that builds a whole bolt
+	 * beside a running VACUUM without the maintenance mutex, so it is the writer
+	 * the reclaim's barrier exists for (doc/specs/SEGMENT_FORMAT.md sect. 10).
+	 * An ERROR leaves the lock to transaction end, which is also when its
+	 * unpublished pages become reclaimable.
+	 */
+	weave_segwrite_lock(index);
 	weave_build_flush_segment(index, &bs);
+	weave_segwrite_unlock(index);
 	MemoryContextDelete(bs.ctx);
 
 	/*
@@ -6480,7 +6503,9 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	/* Need a fresh pending page (either none yet, or the tail is full). */
 	if (!appended)
 	{
-		Buffer		newbuf = weave_new_buffer(index);
+		/* _linked: this record writes the page AND links it from the old tail
+		 * or the metapage, so it is never unreachable on disk (am.h) */
+		Buffer		newbuf = weave_new_buffer_linked(index);
 		BlockNumber newblk = BufferGetBlockNumber(newbuf);
 		WeavePendingItem *pi;
 

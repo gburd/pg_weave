@@ -927,8 +927,59 @@ uint64		weave_vecwork_blocks = 0;
 uint64		weave_vecwork_blk_bound = 0;
 uint64		weave_vecwork_shuttles = 0;
 
+/*
+ * Is this backend licensed to allocate a page for an unpublished structure?
+ * doc/specs/SEGMENT_FORMAT.md sect. 10: VACUUM's reclaim frees an unreachable
+ * page unless the writer holds the maintenance mutex, holds the segment-write
+ * lock, or owns the index outright.  A parallel worker writes on behalf of a
+ * leader that holds one of those for the worker's whole life.
+ */
+static bool
+weave_alloc_licensed(Relation index)
+{
+	LOCKTAG		tag;
+
+	if (IsParallelWorker())
+		return true;
+	SET_LOCKTAG_PAGE(tag, index->rd_lockInfo.lockRelId.dbId,
+					 index->rd_lockInfo.lockRelId.relId, WEAVE_METAPAGE_BLKNO);
+	if (LockHeldByMe(&tag, ExclusiveLock, false))
+		return true;
+	SET_LOCKTAG_PAGE(tag, index->rd_lockInfo.lockRelId.dbId,
+					 index->rd_lockInfo.lockRelId.relId, WEAVE_SEGWRITE_LOCKBLK);
+	if (LockHeldByMe(&tag, ShareLock, false))
+		return true;
+	return CheckRelationLockedByMe(index, AccessExclusiveLock, true);
+}
+
+static Buffer weave_new_buffer_internal(Relation index);
+
+/*
+ * Every page of an UNPUBLISHED structure -- a bolt, a merge output, a tombstone
+ * blob -- comes through here, and a page written without the license above is
+ * a page VACUUM's reclaim may free while its writer is still writing it.  So
+ * this is enforced, not documented, for the reason weave_assert_merge_serialized()
+ * gives: elog(ERROR) in every build, on the first allocation, rather than a
+ * corrupted index months later.  The pending append, which links each page in
+ * the record that writes it, uses weave_new_buffer_linked() instead.
+ */
 Buffer
 weave_new_buffer(Relation index)
+{
+	if (unlikely(!weave_alloc_licensed(index)))
+		elog(ERROR, "pg_weave: segment page allocated without the maintenance mutex or the segment-write lock on index \"%s\"",
+			 RelationGetRelationName(index));
+	return weave_new_buffer_internal(index);
+}
+
+Buffer
+weave_new_buffer_linked(Relation index)
+{
+	return weave_new_buffer_internal(index);
+}
+
+static Buffer
+weave_new_buffer_internal(Relation index)
 {
 	Buffer		buffer;
 
@@ -3692,11 +3743,28 @@ void
 weave_free_page(Relation index, BlockNumber blk)
 {
 	Buffer		buf = ReadBuffer(index, blk);
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	weave_free_page_locked(index, buf, true);
+}
+
+/*
+ * The same, for a buffer the caller has exclusively locked (the reclaim frees
+ * under the lock it re-checked the page with).  Releases the buffer.
+ *
+ * `record` false leaves the page OUT of the free space map: flagged, stamped,
+ * free, and not offered to anyone until a later VACUUM's reclaim re-records it
+ * (it is then FREED, unreachable and absent from the FSM, which is the state that
+ * pass looks for).  The reclaim uses it for what it frees, and says why.
+ */
+void
+weave_free_page_locked(Relation index, Buffer buf, bool record)
+{
+	BlockNumber blk = BufferGetBlockNumber(buf);
 	GenericXLogState *state;
 	Page		page;
 	WeavePageOpaque op;
 
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	state = GenericXLogStart(index);
 	page = GenericXLogRegisterBuffer(state, buf, 0);
 	op = WeavePageGetOpaque(page);
@@ -3707,7 +3775,8 @@ weave_free_page(Relation index, BlockNumber blk)
 	op->nextblk = InvalidBlockNumber;
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);
-	RecordFreeIndexPage(index, blk);
+	if (record)
+		RecordFreeIndexPage(index, blk);
 }
 
 /*
@@ -3785,6 +3854,18 @@ weave_page_recyclable(Relation index, Page page)
 			freexid = (TransactionId) op->nextblk;
 		return GlobalVisCheckRemovableXid(NULL, freexid);
 	}
+}
+
+/*
+ * Would the allocator hand out this page NOW?  For the reclaim, which must not
+ * record a page in the FSM that the allocator would refuse: one such entry makes
+ * the live-FSM loop in weave_new_buffer() stop reusing and extend for the rest of
+ * its allocation sequence.  `page` must be pinned and locked.
+ */
+bool
+weave_page_reusable_now(Relation index, Page page)
+{
+	return weave_page_recyclable(index, page);
 }
 
 /* Recycle a chained page list (dict/trigram/posting/data) to the FSM. */

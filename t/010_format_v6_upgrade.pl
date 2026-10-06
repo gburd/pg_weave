@@ -144,7 +144,10 @@ sub read_metapage_version
 # default; PG<=17's harness ignores the unknown key (checksums already off).
 my $node = PostgreSQL::Test::Cluster->new('primary');
 $node->init(no_data_checksums => 1);
-$node->append_conf('postgresql.conf', "maintenance_work_mem = 64MB\n");
+# autovacuum off: section 4 asserts that the orphans this test manufactures are
+# REPORTED, and since doc/GAPS.md G75 any VACUUM reclaims them -- an autovacuum
+# landing before that assertion would make it flaky.
+$node->append_conf('postgresql.conf', "maintenance_work_mem = 64MB\nautovacuum = off\n");
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION pg_weave');
 
@@ -333,16 +336,19 @@ like($node->safe_psql('postgres',
 	qr/^[1-9]\d* self-describing, 0 lexical-only$/,
 	'after a vacuum every bolt self-describes');
 
-# ... but the pages THIS TEST orphaned stay orphaned, and that is the honest
-# result rather than a fixable one: blanking chandesc took those pages off every
-# chain WITHOUT setting WEAVE_FREED, so they are neither reachable nor in the FSM,
-# and nothing short of a REINDEX reclaims a page in that state.  Assert exactly
-# that -- the one violated invariant is the leak, and nothing else regressed.
+# ... and the pages THIS TEST orphaned are reclaimed by that same weave_vacuum().
+# Blanking chandesc took them off every chain WITHOUT setting WEAVE_FREED, so they
+# were neither reachable nor in the FSM.  Until doc/GAPS.md G75 nothing short of a
+# REINDEX reclaimed a page in that state and this assertion said so; the reclaim
+# pass now frees every unreachable page older than its fence, which these are.
+# So the deep check is clean, and that is also a positive control for the reclaim
+# on a page kind (CHANDESC) and a format generation (a v5 image upcast in place)
+# that t/031 does not reach.
 is($node->safe_psql('postgres',
-		q{SELECT string_agg(invariant, ',' ORDER BY invariant)
+		q{SELECT coalesce(string_agg(invariant, ',' ORDER BY invariant), '')
 		    FROM weave_check('docs_weave', true) WHERE NOT ok}),
-	'pages_reachable_or_freed',
-	'the only violated invariant is the leak this test manufactured');
+	'',
+	'weave_vacuum() reclaimed the descriptor pages this test orphaned');
 
 # REINDEX rebuilds from the heap, which is the documented cure.
 $node->safe_psql('postgres', 'REINDEX INDEX docs_weave');
