@@ -35,7 +35,7 @@ with `with_llvm=no`. Otherwise `make install` can fail partway through the bitco
 and leave bitcode behind that the JIT cannot read. That crashes backends later, and the
 crash need not be in a query that touches pg_weave. To repair it, remove
 `$(pg_config --pkglibdir)/bitcode/pg_weave*`. On Debian 13 with PGDG packages (clang 19,
-LLVM 19) the default install works.
+LLVM 19) the default `make install` exits 0; JIT use of its bitcode is not tested.
 
 ## Example
 
