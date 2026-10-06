@@ -56,7 +56,7 @@ sudo pg_ctlcluster 18 main start >> $OUT/apt18.log 2>&1
 p18=$(pg_lsclusters -h | awk '$1==18 {print $3; exit}')
 sudo -u postgres createuser -s -p $p18 $(whoami) >> $OUT/apt18.log 2>&1
 cp -a $SRC /tmp/src18 && cd /tmp/src18 && make -s clean >/dev/null 2>&1
-make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config > $OUT/build18.log 2>&1
+make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config with_llvm=no > $OUT/build18.log 2>&1
 brc=$?
 sudo make install PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config with_llvm=no >> $OUT/build18.log 2>&1
 irc=$?
