@@ -5142,7 +5142,13 @@ loosened.
 **MAINTAINER DECISIONS 2026-10-06.** (1) The bound stays a visible known failure (`TODO`),
 and the growth is its own task, **L22** in `doc/PHASES.md`. (2) `t/033` runs **11 cycles**:
 the interim cut to 8 stopped one cycle before the growth starts, so the TODO could not fail
-and `prove` reported "TODO passed". (3) The merge's silent stop on a freed page (above) is
+and `prove` reported "TODO passed". **Measured at 11 on EC2** (`pgweave-20261006-202448-495c`, c7i.4xlarge,
+two runs): `t/033` takes 82 s and 83 s, and the whole TAP suite 412 s (about 380 s at 8
+cycles, about 1,900 s at 18). In both runs the size bound FAILS as `not ok # TODO`: worst
+excess 7,972 pages against bounds of 2,223 and 2,504, with the excess at cycles 8-10 being
+2,626 / 5,299 / 7,972, identical in both runs. The other assertion in the TODO block (that
+the crashes stranded enough for the bound to discriminate) passes, which is what `prove`'s
+"TODO passed: 27" refers to. (3) The merge's silent stop on a freed page (above) is
 task **L23**: warn and skip that merge rather than raise an ERROR.
 
 **The A/B against the base says the late growth is pre-existing, and that the reclaim
