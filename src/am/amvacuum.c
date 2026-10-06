@@ -964,7 +964,8 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			int			ncarry = 0,
 						carrycap = 0;
 
-			sm_open(&old, (uint8_t *) buf, sg->livedocslen);
+			weave_sm_open_checked(index, sg->livedocs, "tombstone", &old,
+								  (uint8 *) buf, sg->livedocslen);	/* G85 */
 			for (dv = sm_next_member(&old, (uint64_t) -1, &oc);
 				 dv != SM_IDX_MAX;
 				 dv = sm_next_member(&old, dv, &oc))

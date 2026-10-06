@@ -3295,7 +3295,8 @@ merge_source_open(Relation index, const WeaveSegMeta *seg, MergeSource *src,
 	if (seg->livedocs != InvalidBlockNumber && seg->livedocslen > 0)
 	{
 		src->tombbuf = weave_read_blob(index, seg->livedocs, seg->livedocslen);
-		sm_open(&src->tomb, (uint8_t *) src->tombbuf, seg->livedocslen);
+		weave_sm_open_checked(index, seg->livedocs, "tombstone", &src->tomb,
+							  (uint8 *) src->tombbuf, seg->livedocslen);	/* G85 */
 		src->hastomb = true;
 
 		/*

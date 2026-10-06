@@ -253,5 +253,70 @@ my $common_after = $node->safe_psql('postgres',
 	"$q SELECT count(*) FROM docs WHERE to_wdoc('simple', body) \@\@\@ 'common'::wquery");
 is($common_after, 4000, 'REINDEX from heap restores correct answers after corruption');
 
+# ---------------------------------------------------------------------------
+# A corrupt TOMBSTONE blob must be a loud error, never a silent resurrection
+# (doc/GAPS.md G85; ported from pg_fts 1.8.4's identical test).
+#
+# sparsemap 5.6.0 hardened sm_open(): a buffer that fails validation is silently
+# replaced with an EMPTY map (void return, no errno).  For a tombstone map that
+# means "nothing is deleted": every vacuumed document reappears in query results
+# with no error.  weave_sm_open_checked() compares the reopened size with the
+# stored length (equal for any blob this index wrote) and raises
+# ERRCODE_DATA_CORRUPTED instead.  Without the guard this test's scan returns
+# 4000, the resurrected answer.
+# ---------------------------------------------------------------------------
+$node->safe_psql('postgres', q{
+	DELETE FROM docs WHERE id % 2 = 0;
+	VACUUM docs;                 -- bulkdelete writes 2000 tombstones into a livedocs blob
+});
+my $live_before = $node->safe_psql('postgres',
+	"$q SELECT count(*) FROM docs WHERE to_wdoc('simple', body) \@\@\@ 'common'::wquery");
+is($live_before, 2000, 'after deleting half: tombstones hide 2000 of 4000 (pre-corruption)');
+
+# REINDEX above gave the index a NEW relfilenode; re-resolve the file.
+my $relpath2 = $node->safe_psql('postgres', "SELECT pg_relation_filepath('docs_weave')");
+my $abs2 = $node->data_dir . '/' . $relpath2;
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->stop;
+ok(-f $abs2, "re-resolved index file after REINDEX: $abs2");
+{
+	# Smash the CONTENTS of every tombstone-blob page, leaving the page header and
+	# opaque intact so the chain is still followed and read.  weave_write_blob()
+	# lays the livedocs blob on WEAVE_TRGM_DATA pages (legacy one-hot bit 1<<5,
+	# include/weave/pagekind.h); this index was built with trigrams OFF (the
+	# default), so every such page IS a tombstone blob page.
+	my $TRGM_DATA = (1 << 5);
+	open(my $fh, '+<:raw', $abs2) or die "open $abs2: $!";
+	my $size = -s $fh;
+	my $hits = 0;
+	for (my $base = BLCKSZ; $base + BLCKSZ <= $size; $base += BLCKSZ)
+	{
+		my $buf;
+		sysseek($fh, $base + OPAQUE_FLAGS_OFF, 0) or die;
+		sysread($fh, $buf, 2) == 2 or die;
+		my $flags = unpack('v', $buf);
+		next unless $flags & $TRGM_DATA;
+		sysseek($fh, $base + CONTENT_START, 0) or die;
+		syswrite($fh, "\xA5" x 256) == 256 or die;
+		$hits++;
+	}
+	close $fh;
+	ok($hits > 0, "corrupted $hits tombstone (livedocs) page(s)");
+}
+$node->start;
+
+my ($trc, $tout, $terr) = $node->psql('postgres',
+	"$q SELECT count(*) FROM docs WHERE to_wdoc('simple', body) \@\@\@ 'common'::wquery");
+isnt($trc, 0, 'a scan over a corrupt tombstone blob ERRORS rather than answering');
+like($terr, qr/corrupt tombstone bitmap/,
+	'the error names the corrupt tombstone bitmap (not a generic failure)');
+unlike($tout, qr/^\s*4000\s*$/,
+	'and it did NOT silently return 4000 (the resurrected-deletes answer)');
+
+$node->safe_psql('postgres', 'REINDEX INDEX docs_weave');
+my $live_after = $node->safe_psql('postgres',
+	"$q SELECT count(*) FROM docs WHERE to_wdoc('simple', body) \@\@\@ 'common'::wquery");
+is($live_after, 2000, 'REINDEX restores the correct 2000 after tombstone corruption');
+
 $node->stop;
 done_testing();

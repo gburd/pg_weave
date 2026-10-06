@@ -590,7 +590,8 @@ weave_tombstones_load(Relation index, const WeaveMetaPageData *meta, WeaveTombst
 		if (sg->livedocs != InvalidBlockNumber && sg->livedocslen > 0)
 		{
 			t->blobs[s] = weave_read_blob(index, sg->livedocs, sg->livedocslen);
-			sm_open(&t->maps[s], (uint8_t *) t->blobs[s], sg->livedocslen);
+			weave_sm_open_checked(index, sg->livedocs, "tombstone", &t->maps[s],
+								  (uint8 *) t->blobs[s], sg->livedocslen);	/* G85 */
 			t->present[s] = true;
 		}
 	}

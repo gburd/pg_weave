@@ -2198,6 +2198,24 @@ extern bool weave_truncate_sole_writer;
  */
 extern BlockNumber weave_write_blob(Relation index, const uint8 *data, Size len);
 extern uint8 *weave_read_blob(Relation index, BlockNumber blk, Size len);
+/*
+ * Open a STORED sparsemap blob (livedocs tombstones, a trigram entry) and refuse
+ * one that does not reopen exactly as written.  sm_open() of a buffer that fails
+ * validation does not fail: since sparsemap 5.6.0 it silently REPLACES the map
+ * with an EMPTY one.  For a tombstone map "empty" means "nothing is deleted", so a
+ * corrupt livedocs blob would resurrect every vacuumed document in query answers
+ * with no error -- and a recycled ctid would answer as the dead row.  For a
+ * trigram blob it would drop candidates.  Both are plausible wrong answers.
+ * `len` is the stored length; any blob this index wrote reopens at exactly that
+ * size and validates, so a mismatch is corruption: ERRCODE_DATA_CORRUPTED, naming
+ * the index and block, with a REINDEX hint.  pg_fts 1.8.4 found the hazard and
+ * added the same guard (bm25_sm_open_checked); pg_weave forked before it
+ * (doc/GAPS.md G85).
+ */
+/* `map` is an sm_t * (weave/sparsemap.h, which this header does not include:
+ * SPARSEMAP_PREFIX renames the struct, so a forward declaration cannot name it) */
+extern void weave_sm_open_checked(Relation index, BlockNumber blk, const char *what,
+								  void *map, uint8 *buf, Size len);
 extern BlockNumber weave_write_trigrams_iter(Relation index, DictNextFn next,
 											 void *nstate);
 extern bool weave_trgm_ordinals(Relation index, BlockNumber trgmstart,
