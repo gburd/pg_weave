@@ -27,13 +27,168 @@ CREATE EXTENSION pg_weave;
 ```
 
 The extension is `trusted`, so a database owner can create it without superuser.
-It needs no `shared_preload_libraries` entry.
+It needs no `shared_preload_libraries` entry. `make installcheck` runs the regression,
+isolation and TAP suites against the installed server.
 
-TODO(with_llvm): result of the plain-install leg goes here.
+If your `clang` is a newer major than the LLVM your PostgreSQL was built against, install
+with `with_llvm=no`. Otherwise `make install` can fail partway through the bitcode step
+and leave bitcode behind that the JIT cannot read. That crashes backends later, and the
+crash need not be in a query that touches pg_weave. To repair it, remove
+`$(pg_config --pkglibdir)/bitcode/pg_weave*`. On Debian 13 with PGDG packages (clang 19,
+LLVM 19) the default install works.
 
 ## Example
 
-TODO: paste from bench/aws/out/<run>/remote/readme_pg17.out.
+This is `doc/readme_examples.sql`. Its output below comes from running it on PostgreSQL
+17.11 and 18.6 (EC2 run `pgweave-20261006-212542-c6e5`). The two majors produced the same
+output line for line.
+
+```sql
+CREATE TABLE docs (
+    id     int PRIMARY KEY,
+    title  text NOT NULL,
+    body   wdoc GENERATED ALWAYS AS (to_wdoc(title)) STORED,
+    emb    wvec(4),
+    price  int8
+);
+INSERT INTO docs (id, title, emb, price) VALUES
+  (1, 'PostgreSQL streaming replication setup',  '[0.9,0.1,0.0,0.0]', 40),
+  (2, 'Logical replication with publications',   '[0.8,0.2,0.1,0.0]', 25),
+  (3, 'Tuning autovacuum for large tables',       '[0.1,0.9,0.0,0.1]', 60),
+  (4, 'VACUUM FULL versus table rewrites',        '[0.2,0.8,0.1,0.0]', 15),
+  (5, 'Vector similarity search in PostgreSQL',  '[0.0,0.1,0.9,0.2]', 80),
+  (6, 'Full text search ranking with BM25',       '[0.1,0.0,0.8,0.3]', 35),
+  (7, 'WAL archiving and point in time recovery', '[0.7,0.0,0.0,0.6]', 55),
+  (8, 'Monitoring replica lag in PostgreSQL',    '[0.8,0.3,0.0,0.2]', 20);
+-- 20,000 filler rows, so the planner has a reason to use an index.
+INSERT INTO docs (id, title, emb, price)
+SELECT g, 'archived note ' || g,
+       ARRAY[-1, -1, -(g % 10) / 10.0, -(g % 7) / 7.0]::real[],
+       1000 + g
+  FROM generate_series(100, 20099) g;
+
+-- One column per channel: lexical (wdoc), vector (wvec), substring (gram_ops on
+-- the raw text), and one scalar facet (int8_docval_ops).
+CREATE INDEX docs_weave ON docs USING weave
+    (body, emb, title gram_ops, price int8_docval_ops);
+ANALYZE docs;
+```
+
+BM25 ranking, boolean and phrase queries, and index-answered `count(*)`:
+
+```sql
+SELECT id, title FROM docs
+ WHERE body @@@ 'replication'
+ ORDER BY body <=> 'replication'
+ LIMIT 3;
+--  1 | PostgreSQL streaming replication setup
+--  2 | Logical replication with publications
+
+EXPLAIN (COSTS OFF)
+SELECT id FROM docs ORDER BY body <=> 'replication' LIMIT 3;
+--  Limit
+--    ->  Index Scan using docs_weave on docs
+--          Order By: (body <=> '''replication'''::wquery)
+
+SELECT id, title FROM docs WHERE body @@@ 'postgresql & !vector' ORDER BY id;   -- 1, 8
+SELECT id, title FROM docs WHERE body @@@ '"streaming replication"';           -- 1
+SELECT count(*) FROM docs WHERE body @@@ 'postgresql';                         -- 3
+```
+
+Vector nearest neighbours (`<->` is L2; `<#>` is negative inner product, for an index
+built `WITH (metric = 'ip')`):
+
+```sql
+SELECT id, title FROM docs ORDER BY emb <-> '[1,0,0,0]' LIMIT 3;
+--  1 | PostgreSQL streaming replication setup
+--  2 | Logical replication with publications
+--  8 | Monitoring replica lag in PostgreSQL
+```
+
+Fuzzy, prefix, regex, spelling-distance ranking, and substring search:
+
+```sql
+SELECT id, title FROM docs WHERE body @@@ 'replicaton~1' ORDER BY id;   -- 1, 2  (one edit)
+SELECT id, title FROM docs WHERE body @@@ 'vacu*' ORDER BY id;          -- 4
+SELECT id, title FROM docs WHERE body @@@ '/^repl.*n$/' ORDER BY id;    -- 1, 2  (per token)
+SELECT id, title FROM docs ORDER BY body <@> 'replicaton' LIMIT 3;      -- 1, 2, 8
+SELECT id, title FROM docs WHERE title @~ '%al repl%';                  -- 2  (LIKE)
+SELECT id, title FROM docs WHERE title @~* '%postgresql stream%';       -- 1  (ILIKE)
+```
+
+A facet and a lexical term in one index condition:
+
+```sql
+SELECT id, title, price FROM docs
+ WHERE body @@@ 'replication' AND price < 30
+ ORDER BY id;
+--  2 | Logical replication with publications |    25
+```
+
+Hybrid ranking. `fuse()` takes one distance per channel and optional weights. With a
+facet filter it is still one index scan with no Sort:
+
+```sql
+SELECT id, title FROM docs
+ WHERE price < 100
+ ORDER BY fuse(body <=> 'postgresql replication',
+               emb  <-> '[1,0,0,0]',
+               weights => '{0.5,0.5}')
+ LIMIT 5;
+--  1 | PostgreSQL streaming replication setup
+--  2 | Logical replication with publications
+--  8 | Monitoring replica lag in PostgreSQL
+--  7 | WAL archiving and point in time recovery
+--  4 | VACUUM FULL versus table rewrites
+
+-- EXPLAIN (COSTS OFF) of the same query:
+--  Limit
+--    ->  Index Scan using docs_weave on docs
+--          Index Cond: (price < 100)
+--          Order By: ((body <=> '(''postgresql'' & ''replication'')'::wquery) AND
+--                     (emb <-> '[1,0,0,0]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+
+SELECT id, title FROM docs
+ WHERE body @@@ 'replicaton~1'
+ ORDER BY fuse(body <=> 'postgresql', emb <-> '[1,0,0,0]')
+ LIMIT 5;
+-- 1, 2
+```
+
+To get the fused score, use `weave_fuse_search()`. A `fuse(...)` in the select list is
+recomputed per row from the heap value and is not the score the scan ranked by.
+
+```sql
+SELECT d.id, d.title, round(s.score::numeric, 4) AS score
+  FROM weave_fuse_search('docs_weave', ARRAY['postgresql replication'::wquery],
+                         ARRAY['[1,0,0,0]'::wvec], '{0.5,0.5}', 3) s
+  JOIN docs d ON d.ctid = s.ctid
+ ORDER BY s.score DESC;
+--  1 | PostgreSQL streaming replication setup | 0.2582
+--  2 | Logical replication with publications  | 0.1100
+--  8 | Monitoring replica lag in PostgreSQL   | 0.0736
+
+SELECT bool_and(ok) AS all_invariants_hold FROM weave_check('docs_weave');   -- t
+```
+
+Things the example does not show:
+
+- **Vector order is approximate.** The scan ranks by 4-bit quantized codes and does not
+  rerank against the stored floats (the planned rerank is `doc/PHASES.md` V10). For an
+  exact top-k, take a wider index top-k and re-sort it by `emb <-> q` in an outer query.
+- **Cosine is refused.** `WITH (metric = 'cosine')` fails with a hint to normalize the
+  vectors and use `metric = 'ip'`. L1 is refused as well.
+- **An index needs a `wdoc` column**, and holds at most one vector, one `gram_ops` and one
+  docvalues column. Docvalues operator classes exist for `int2`, `int4`, `int8`, `float8`,
+  `date`, `bool` and `text`.
+- **`to_wdoc(text)` only lowercases and splits.** For stemming and stopwords use
+  `to_wdoc('english', text)`, or `to_wdoc(tsvector)`. Fuzzy, prefix and regex terms are
+  matched literally against whatever tokens the index holds.
+- **`weave_fuse_search()` and `weave_search()` are superuser-only by default**, because they
+  open the index without a privilege check. `GRANT EXECUTE` them to roles that may read
+  the table.
+- Index options: `positions`, `trigrams` (speeds up regex and long fuzzy terms), `bits`
+  (code width, 2–8, default 4), `metric` (`l2` or `ip`).
 
 ## What it is fast at, and where it loses
 
