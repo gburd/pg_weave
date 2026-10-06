@@ -73,6 +73,20 @@ CREATE INDEX sr_pt_gist ON sr_pt USING gist (p);
 ANALYZE sr_pt;
 EXPLAIN (VERBOSE, COSTS OFF)
   SELECT id FROM sr_pt ORDER BY p <-> point(3, 3) LIMIT 3;
+-- the other routes are not substituted: a vector scan's value is a quantized
+-- score, and an edit-distance or fused sort key is not `d <=> q` (doc/GAPS.md G86)
+CREATE TABLE sr_v (id int, d wdoc, v wvec(4));
+INSERT INTO sr_v SELECT g, to_wdoc('simple', 'alpha w' || (g % 17)),
+       ('[' || (g % 7) || ',' || (g % 5) || ',' || (g % 3) || ',1]')::wvec
+  FROM generate_series(1, 500) g;
+CREATE INDEX sr_v_w ON sr_v USING weave (d, v);
+ANALYZE sr_v;
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sr_v ORDER BY v <-> '[1,1,1,1]' LIMIT 3;
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sr_v ORDER BY d <@> 'w7x' LIMIT 3;
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sr_v ORDER BY fuse(d <=> 'alpha', v <-> '[1,1,1,1]') LIMIT 3;
 -- not an ordering scan of this index (a Sort over a seq scan): left alone
 RESET enable_seqscan; RESET enable_sort;
 SET enable_indexscan = off;
@@ -122,8 +136,9 @@ SELECT (SELECT array_agg(id) FROM (SELECT id FROM sr WHERE d @@@ 'alpha'
 SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_material = off;
 CREATE TEMP TABLE exg AS
   SELECT o.t, l.id, 1.0 / (1.0 + s.score) AS dist
-  FROM unnest(ARRAY['alpha', 'beta', 'gamma']) o(t),
-       LATERAL weave_search('sr_w', o.t::wquery, 3000) s JOIN sr l ON l.ctid = s.ctid;
+  FROM unnest(ARRAY['alpha', 'beta', 'gamma']) o(t)
+       CROSS JOIN LATERAL weave_search('sr_w', o.t::wquery, 3000) s
+       JOIN sr l ON l.ctid = s.ctid;
 SELECT count(*) AS outer_rows,
        count(*) FILTER (WHERE x.n IS DISTINCT FROM y.n) AS rescan_mismatches
   FROM unnest(ARRAY['alpha', 'beta', 'gamma']) o(t),
@@ -164,31 +179,39 @@ RESET pg_weave.reuse_distance;
 RESET enable_seqscan;
 SET enable_indexscan = off;
 SELECT sr_wd() AS wd2 \gset
-SELECT count(*) FROM (SELECT weave_distance(d, 'alpha') FROM sr WHERE id <= 50) s;
+SELECT sum(weave_distance(d, 'alpha')) > 0 AS evaluated FROM sr WHERE id <= 50;
 SELECT pg_stat_force_next_flush();
 SELECT sr_wd() - :wd2 AS seqscan_control_calls;
 RESET enable_indexscan;
 SET enable_seqscan = off;
 RESET track_functions;
 
--- 7.  A nested ordering scan between the outer fetch and its projection.  The
--- selected subquery runs a second weave ordering scan (another index, another
--- query) for every outer row, before the hidden sort key is evaluated.  The outer
--- WITH TIES must still see the outer scan's values.
+-- 7.  A nested ordering scan between the outer fetch and its projection.  A
+-- correlated subquery in the WHERE clause is the scan's Filter, so it runs a second
+-- weave ordering scan after every outer fetch and before the hidden sort key is
+-- evaluated.  (A volatile or expensive SELECT-list column would not do: the
+-- planner postpones those above the Limit.)  The outer WITH TIES must still see
+-- the outer scan's values, first with the inner scan on another index, then on the
+-- SAME index with the same query, returning a different row.
 CREATE TABLE sr2 (id int, d wdoc) WITH (autovacuum_enabled = off);
 INSERT INTO sr2 SELECT g, to_wdoc('simple', 'beta ' || repeat('y ', 1 + g % 9)) FROM generate_series(1, 300) g;
 CREATE INDEX sr2_w ON sr2 USING weave (d);
 VACUUM ANALYZE sr2;
-SELECT count(*) AS clobber_with_ties,
-       count(*) = (SELECT count(*) FROM ex WHERE dist <= (SELECT dist FROM ex ORDER BY dist LIMIT 1 OFFSET 4))
-       AS clobber_matches_reference
-  FROM (SELECT id, (SELECT i.id FROM sr2 i ORDER BY i.d <=> 'beta' LIMIT 1) AS inner_id
-          FROM sr WHERE d @@@ 'alpha' ORDER BY d <=> 'alpha' FETCH FIRST 5 ROWS WITH TIES) s;
--- and the same with the inner scan on the SAME index and the same query
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sr WHERE d @@@ 'alpha'
+     AND (SELECT i.id FROM sr2 i ORDER BY i.d <=> 'beta' LIMIT 1 OFFSET sr.id % 3) > 0
+   ORDER BY d <=> 'alpha' FETCH FIRST 5 ROWS WITH TIES;
+SELECT count(*) = (SELECT count(*) FROM ex WHERE dist <= (SELECT dist FROM ex ORDER BY dist LIMIT 1 OFFSET 4))
+       AS other_index_clobber_matches_reference
+  FROM (SELECT id FROM sr WHERE d @@@ 'alpha'
+           AND (SELECT i.id FROM sr2 i ORDER BY i.d <=> 'beta' LIMIT 1 OFFSET sr.id % 3) > 0
+         ORDER BY d <=> 'alpha' FETCH FIRST 5 ROWS WITH TIES) s;
 SELECT count(*) = (SELECT count(*) FROM ex WHERE dist <= (SELECT dist FROM ex ORDER BY dist LIMIT 1 OFFSET 4))
        AS same_index_clobber_matches_reference
-  FROM (SELECT id, (SELECT i.id FROM sr i WHERE i.d @@@ 'alpha' ORDER BY i.d <=> 'alpha' LIMIT 1 OFFSET 2) AS inner_id
-          FROM sr WHERE d @@@ 'alpha' ORDER BY d <=> 'alpha' FETCH FIRST 5 ROWS WITH TIES) s;
+  FROM (SELECT id FROM sr WHERE d @@@ 'alpha'
+           AND (SELECT i.id FROM sr i WHERE i.d @@@ 'alpha' ORDER BY i.d <=> 'alpha'
+                LIMIT 1 OFFSET 900 + sr.id % 7) > 0
+         ORDER BY d <=> 'alpha' FETCH FIRST 5 ROWS WITH TIES) s;
 
 -- 8.  Only the extension's own function is planted.  Detached from the extension
 -- it is somebody else's function, and the plan falls back to the operator.
@@ -199,4 +222,4 @@ ALTER EXTENSION pg_weave ADD FUNCTION weave_current_distance(regclass, tid, wque
 
 RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort;
 DROP FUNCTION sr_wd();
-DROP TABLE sr, sr2, sr_pt;
+DROP TABLE sr, sr2, sr_pt, sr_v;
