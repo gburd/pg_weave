@@ -8326,18 +8326,25 @@ weave_ord_width(int k)
  * contributions on a three-term OR.  With a hint of k the first pass is
  * weave_ord_width(k), keeping the x4 over-fetch MVCC filtering needs.
  *
- * ONLY THE FIRST PASS.  The widening ladder is untouched, so a scan pulled past
- * the hint (a cursor, a qual the executor rejects, a stale plan) still widens
- * and still returns every row in exact order; the hint can only make the first
- * pass narrower, never the answer shorter.  A hint wider than the default is
- * honoured too (LIMIT 500 then skips the 128 and 512 rungs).
+ * ONLY THE FIRST PASS, AND ONLY EVER NARROWER.  The widening ladder is
+ * untouched, so a scan pulled past the hint (a cursor, a qual the executor
+ * rejects, a stale plan) still widens and still returns every row in exact
+ * order.  The hinted width is capped at the unhinted one, and that cap is a
+ * measured requirement rather than caution: an uncapped hint gave LIMIT 100 a
+ * first pass of 400, and on EC2 (pgweave-20261006-183859-d556, 200k and 1M
+ * documents, two runs per arm) that tripled the BM25 work (2,954 -> 9,206
+ * contributions) and slowed a single-term query 0.35 -> 1.43 ms, because one
+ * 128-wide pass already returned all 100 rows.  Capped, the hint can only make
+ * the first pass narrower, which can cost an extra pass but never a row.
  */
 static int
 weave_ord_first_width(WeaveQuery q)
 {
+	int			dflt = weave_ord_width(pg_weave_wand_initial_k);
+
 	if (pg_weave_limit_hint && q != NULL && q->flags > 0)
-		return weave_ord_width((int) q->flags);
-	return weave_ord_width(pg_weave_wand_initial_k);
+		return Min(weave_ord_width((int) q->flags), dflt);
+	return dflt;
 }
 
 /*

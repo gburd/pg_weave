@@ -8,6 +8,7 @@
 -- What each block guards, and the mutant that proves it can fail:
 --   1. the GUC exists (an absent GUC reads like an OFF one: AGENTS.md, 12th member)
 --   2. the hint REACHES the scan: less BM25 work at LIMIT 10       (mutant: ignore flags)
+--      and never MORE at LIMIT 100                         (mutant: no cap at the default)
 --   3. answers are exact with the hint on, including when the executor pulls far
 --      past it through a filter the index does not apply     (mutant: no widening past k)
 --   4. the flagship `WHERE d @@@ q ORDER BY d <=> q` still needs no recheck: the
@@ -48,17 +49,31 @@ SELECT count(*) FROM (SELECT id FROM lim WHERE d @@@ 'a | b | c' ORDER BY d <=> 
 INSERT INTO work SELECT 'on', lex_contribs FROM weave_work_stats();
 SELECT (SELECT contribs FROM work WHERE arm = 'on') < (SELECT contribs FROM work WHERE arm = 'off')
        AS hint_reduces_bm25_work;
+-- ... and never INCREASES it.  LIMIT 100 is wider than one unhinted pass needs:
+-- an uncapped hint ran a 400-wide first pass and measured 3x the work on EC2.
+SET pg_weave.limit_hint = off;
+SELECT weave_work_stats_reset();
+SELECT count(*) FROM (SELECT id FROM lim WHERE d @@@ 'a | b | c' ORDER BY d <=> 'a | b | c' LIMIT 100) s;
+INSERT INTO work SELECT 'off100', lex_contribs FROM weave_work_stats();
+SET pg_weave.limit_hint = on;
+SELECT weave_work_stats_reset();
+SELECT count(*) FROM (SELECT id FROM lim WHERE d @@@ 'a | b | c' ORDER BY d <=> 'a | b | c' LIMIT 100) s;
+INSERT INTO work SELECT 'on100', lex_contribs FROM weave_work_stats();
+SELECT (SELECT contribs FROM work WHERE arm = 'on100') <= (SELECT contribs FROM work WHERE arm = 'off100')
+       AS hint_never_adds_work;
 
 -- 3.  Exact answers.  A returned sequence is right when it is non-increasing in the
 -- exact score and its score multiset equals the exact top-n of the rows the query
 -- admits.  (Ties are broad here, so ids are not compared: any tied member is right.)
 CREATE FUNCTION lim_chk(q text, n int, filt text, off int DEFAULT 0) RETURNS text LANGUAGE plpgsql AS $$
-DECLARE got float8[]; want float8[]; ordered bool;
+DECLARE got float8[]; want float8[]; ordered bool; ndistinct int;
 BEGIN
-  EXECUTE format('SELECT array_agg(e.score ORDER BY r.rn) FROM (SELECT row_number() OVER () rn, id FROM (%s) x) r JOIN ex e USING (id)', q) INTO got;
+  EXECUTE format('SELECT array_agg(e.score ORDER BY r.rn), count(DISTINCT r.id) FROM (SELECT row_number() OVER () rn, id FROM (%s) x) r JOIN ex e USING (id)', q) INTO got, ndistinct;
   EXECUTE format('SELECT array_agg(score ORDER BY score DESC) FROM (SELECT score FROM ex WHERE %s ORDER BY score DESC LIMIT %s OFFSET %s) z', filt, n, off) INTO want;
   SELECT bool_and(got[i] >= got[i + 1]) INTO ordered FROM generate_series(1, array_length(got, 1) - 1) i;
-  RETURN format('n=%s ordered=%s exact=%s', array_length(got, 1), coalesce(ordered, true),
+  -- distinct ids: with this many ties a row REPEATED across a widening can leave
+  -- the score multiset unchanged, so the multiset alone cannot see it
+  RETURN format('n=%s distinct=%s ordered=%s exact=%s', array_length(got, 1), ndistinct, coalesce(ordered, true),
      (SELECT array_agg(v ORDER BY v DESC) FROM unnest(got) v) = want);
 END $$;
 SELECT 'LIMIT 10' AS shape, lim_chk($q$SELECT id FROM lim WHERE d @@@ 'a | b | c' ORDER BY d <=> 'a | b | c' LIMIT 10$q$, 10, 'true');
@@ -69,6 +84,26 @@ SELECT 'LIMIT 10, filtered past the hint' AS shape,
        lim_chk($q$SELECT id FROM lim WHERE d @@@ 'a | b | c' AND id % 97 = 0 ORDER BY d <=> 'a | b | c' LIMIT 10$q$, 10, 'id % 97 = 0');
 SELECT 'LIMIT 40, rare term c' AS shape, lim_chk($q$SELECT id FROM lim WHERE d @@@ 'a | b | c' AND d @@@ 'c' ORDER BY d <=> 'a | b | c' LIMIT 40$q$, 40,
        'id IN (SELECT id FROM lim WHERE d @@@ ''c'')');
+
+-- prepared statements.  A constant LIMIT in a generic plan is hinted at plan time;
+-- LIMIT $1 is a Param, not a Const, so it is not hinted.  Both must be exact.
+-- (An SQL function's body is planned once and cached like a prepared statement.)
+SET plan_cache_mode = force_generic_plan;
+CREATE FUNCTION lim_p(n int) RETURNS SETOF int LANGUAGE sql STABLE AS
+  $$ SELECT id FROM lim WHERE d @@@ 'a | b | c' ORDER BY d <=> 'a | b | c' LIMIT n $$;
+CREATE FUNCTION lim_c10() RETURNS SETOF int LANGUAGE sql STABLE AS
+  $$ SELECT id FROM lim WHERE d @@@ 'a | b | c' ORDER BY d <=> 'a | b | c' LIMIT 10 $$;
+SELECT 'generic plan, constant LIMIT' AS shape, lim_chk($q$SELECT id FROM lim_c10() id$q$, 10, 'true');
+SELECT 'generic plan, LIMIT $1' AS shape, lim_chk($q$SELECT id FROM lim_p(25) id$q$, 25, 'true');
+RESET plan_cache_mode;
+-- a cursor reads the hinted plan a row at a time
+BEGIN;
+DECLARE lim_c CURSOR FOR SELECT id FROM lim WHERE d @@@ 'a | b | c' AND id % 97 = 0 ORDER BY d <=> 'a | b | c' LIMIT 10;
+CREATE TEMP TABLE cur_rows (rn serial, id int);
+DO $$ DECLARE r record; c refcursor := 'lim_c'; BEGIN
+  LOOP FETCH c INTO r; EXIT WHEN NOT FOUND; INSERT INTO cur_rows (id) VALUES (r.id); END LOOP; END $$;
+COMMIT;
+SELECT 'cursor, filtered past the hint' AS shape, lim_chk($q$SELECT id FROM cur_rows ORDER BY rn$q$, 10, 'id % 97 = 0');
 
 -- 4.  No recheck on the flagship.  The scan reports xs_recheck = false only when the
 -- WHERE and ORDER BY queries are the same; the executor's recheck calls weave_match.
@@ -96,3 +131,5 @@ RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort;
 DROP TABLE lim;
 DROP FUNCTION lim_chk(text, int, text, int);
 DROP FUNCTION lim_wm();
+DROP FUNCTION lim_p(int);
+DROP FUNCTION lim_c10();
