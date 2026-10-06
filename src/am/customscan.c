@@ -452,8 +452,9 @@ WeaveCountReScan(CustomScanState *node)
  * hinted on the FIRST lexical key's wquery Const, which every fused path has:
  * src/am/fusepath.c refuses a fused path with no lexical channel or with a
  * non-Const wquery.  The transport's real[] has no spare field and changing its
- * type is a catalog change.  The VECTOR route is not hinted: a wvec has no
- * planner-only field (its reserved int16 is a format decision; G87).
+ * type is a catalog change.  weave_fuse_search() builds its own keys and is
+ * not planned, so it is never hinted.  The VECTOR route is not hinted: a wvec
+ * has no planner-only field (its reserved int16 is a format decision; G87).
  * --------------------------------------------------------------------------- */
 bool		pg_weave_limit_hint = true;
 
