@@ -93,6 +93,36 @@
 #ifndef WEAVE_BM25BOUND_H
 #define WEAVE_BM25BOUND_H
 
+#include <math.h>				/* log(): weave_index_idf */
+
+/*
+ * The index side's IDF: Lucene's ln(1 + (N - df + 0.5)/(df + 0.5)) with df
+ * clamped to [1, N], exactly as the heap side's weave_idf() (src/query/rank.c)
+ * clamps it.  ONE definition for every index-side site (src/am/amscan.c), and
+ * the clamp is the reason it exists.
+ *
+ * N is the LIVE corpus size (the metapage's ndocs, tombstones subtracted) but
+ * df is the dictionary df, which still counts a tombstoned document's postings
+ * until a merge rewrites its segment.  After enough deletes df > N for a term
+ * in nearly every document, the unclamped formula goes NEGATIVE, every
+ * contribution flips sign, and block-max WAND -- whose bounds (C2) assume
+ * non-negative contributions -- prunes the best documents and returns the worst
+ * as the top-k.  Found in pg_fts 1.9.0 (its dense_score test: 6,000 docs with
+ * one term in every doc, 1/7 deleted, top-3 came back as the bottom three);
+ * pg_weave forked before the fix and carried the four unclamped sites
+ * (doc/GAPS.md G83).  With the clamp a term in every live document scores
+ * ln(1 + 0.5/(N + 0.5)) > 0, which is what the heap side already said.
+ */
+static inline double
+weave_index_idf(double N, double df)
+{
+	if (df < 1.0)
+		df = 1.0;
+	if (df > N)
+		df = N;
+	return log(1.0 + (N - df + 0.5) / (df + 0.5));
+}
+
 /*
  * The per-(term, segment) constants of the saturation function.  Field names
  * and initialization order are those of the WandCursor fields this replaced

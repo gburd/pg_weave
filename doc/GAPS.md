@@ -5382,3 +5382,54 @@ validated corruption that claims and walks 579 million members.
 Neither is a pg_weave defect today. Both are worth a report and a fix in the sparsemap
 project (same author); the vendored copy then needs a bump (`doc/LICENSING.md` describes
 the manual merge).
+
+### G83 — after deletes, the index-side IDF went NEGATIVE for a term in nearly every document, and block-max WAND returned the WORST documents — **FOUND 2026-10-06 in the sibling pg_fts (1.9.0, its `dense_score` test) during the cross-project review; reproduced in pg_weave; FIXED 2026-10-06 (`wt/idf`)**
+
+`N` is the LIVE corpus size (the metapage's `ndocs`, tombstones subtracted), but a term's
+df is the dictionary df, which keeps counting a tombstoned document's postings until a
+merge rewrites its segment. For a term in nearly every document, deleting a fraction makes
+`df > N`, and the unclamped Lucene `ln(1 + (N - df + 0.5)/(df + 0.5))` goes negative. Every
+contribution flips sign, and block-max WAND, whose bounds (C2) assume non-negative
+contributions, prunes the best documents. The heap-side `weave_idf()` always clamped df to
+`[1, N]`; four index-side sites in `src/am/amscan.c` did not. pg_weave forked from pg_fts
+1.5.8, before the fix.
+
+Reproduced on main `1621f44`, pg_fts's shape (6,000 rows with `com` in every one, 1 in 7
+deleted): `ORDER BY d <=> 'com' LIMIT 3` returned distance **0.776589**, the heap's WORST,
+against the heap's best 0.688671, and `weave_search('com')` scored **-0.1337**.
+
+**Fix:** `weave_index_idf()` in `include/weave/bm25bound.h`, the heap side's clamp, used at
+all four sites. **Pinned** by `sql/idf_deletes.sql`, which compares `weave_search` and the
+ORDER BY's top-10 with `weave_bm25()` fed the index's own N, avgdl and df. **Positive
+control:** on the pre-fix build three of its checks read `f` (scores non-negative,
+weave_search = oracle, ORDER BY = oracle), and all read `t` with the clamp.
+
+### G84 — `trgm_similarity.c` overran a single `pg_wchar` on every character — **FOUND 2026-10-06 in the sibling pg_tre (4.2.0, a stack-protector abort); LATENT in pg_weave; FIXED 2026-10-06 (`wt/idf`)**
+
+`pg_mb2wchar_with_len()` always writes a terminating 0 after what it decodes, so decoding
+one character into `pg_wchar wc` writes one `pg_wchar` past it. pg_tre's report was a
+`SIGABRT` from `tre_trgm_similarity('foo','foobar')` on PG18.6. pg_weave imported the file
+from pg_tre before the fix. **Latent:** none of the file's functions is exposed in SQL today
+(they are carried for M4's pg_trgm compatibility), so no query reaches it. **Fix:** pg_tre's,
+decode into `wbuf[MAX_MULTIBYTE_CHAR_LEN + 1]` and take `wbuf[0]`. The two `amscan.c`
+call sites already sized their buffers for the terminator. **Owed** with M4: the similarity
+functions need pg_tre's `similarity_multibyte` regression before they are exposed.
+
+### G85 — a corrupt stored sparsemap blob opened as an EMPTY map: a corrupt tombstone blob would resurrect every deleted row — **FOUND 2026-10-06 in the sibling pg_fts (1.8.4) during the cross-project review; FIXED 2026-10-06 (`wt/idf`)**
+
+Since sparsemap 5.6.0, `sm_open()` of a buffer that fails validation does not fail: it
+replaces the map with an EMPTY one (void return, no errno). For a tombstone map "empty"
+means "nothing is deleted", so a corrupt livedocs blob returns every vacuumed row in query
+answers with no error, and a recycled ctid answers as the dead row. A corrupt trigram
+blob would silently drop candidates. pg_fts 1.8.4 added `bm25_sm_open_checked()`; pg_weave
+had four unguarded `sm_open()` sites of stored blobs.
+
+**Fix:** `weave_sm_open_checked()` (`src/pages/trgm_page.c`, declared in
+`include/weave/am.h`): open, then require the reopened size to equal the stored length and
+`sm_validate()` to pass, else `ERRCODE_DATA_CORRUPTED` naming the index and block, with a
+REINDEX hint. Used at all four sites (merge tombstones, bulkdelete's carry, the scan's
+tombstones, trigram entries). **Pinned** by `t/003`'s new section, ported from pg_fts: delete
+half, VACUUM, smash the tombstone blob's bytes, and the scan must ERROR, not return 4000.
+**Positive control (`pgweave-20261006-050829-9795`):** with the guard disabled (a separately
+built `.so`, md5 differs) the scan returned **4000**, the resurrected answer, and tests 22-24
+failed; with it they pass.

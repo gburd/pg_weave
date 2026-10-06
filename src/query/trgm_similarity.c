@@ -100,11 +100,20 @@ trgm_set(const char *str, int len)
     while (p < end)
     {
         int         clen = pg_mblen(p);
+        /*
+         * pg_mb2wchar_with_len() always writes a terminating 0 after what it
+         * decodes, so a single pg_wchar is overrun by one on every character:
+         * a stack overwrite that pg_tre 4.2.0 found as a stack-protector abort
+         * (doc/GAPS.md G84).  Decode into a buffer with room for the worst case
+         * and the terminator, and take the first.
+         */
+        pg_wchar    wbuf[MAX_MULTIBYTE_CHAR_LEN + 1];
         pg_wchar    wc;
 
         if (clen <= 0 || p + clen > end)
             clen = 1;
-        (void) pg_mb2wchar_with_len(p, &wc, clen);
+        (void) pg_mb2wchar_with_len(p, wbuf, clen);
+        wc = wbuf[0];
 
         /*
          * Lowercase ASCII A-Z; leave other codepoints as-is
@@ -349,11 +358,20 @@ pos_trgm(const char *str, int len, bool want_bounds)
     while (p < end)
     {
         int         clen = pg_mblen(p);
+        /*
+         * pg_mb2wchar_with_len() always writes a terminating 0 after what it
+         * decodes, so a single pg_wchar is overrun by one on every character:
+         * a stack overwrite that pg_tre 4.2.0 found as a stack-protector abort
+         * (doc/GAPS.md G84).  Decode into a buffer with room for the worst case
+         * and the terminator, and take the first.
+         */
+        pg_wchar    wbuf[MAX_MULTIBYTE_CHAR_LEN + 1];
         pg_wchar    wc;
 
         if (clen <= 0 || p + clen > end)
             clen = 1;
-        (void) pg_mb2wchar_with_len(p, &wc, clen);
+        (void) pg_mb2wchar_with_len(p, wbuf, clen);
+        wc = wbuf[0];
         if (wc >= 'A' && wc <= 'Z')
             wc += ('a' - 'A');
         if (ncp >= cap)

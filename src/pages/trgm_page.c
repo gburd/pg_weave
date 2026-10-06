@@ -120,6 +120,31 @@ weave_write_blob(Relation index, const uint8 *data, Size len)
 }
 
 /* Read `len` bytes starting at data block `blk` into a palloc'd buffer. */
+
+/*
+ * Open a stored sparsemap blob and refuse one that does not reopen as written
+ * (include/weave/am.h has the contract and doc/GAPS.md G85 the reason).
+ * sm_validate() alone is not the check: sm_open() has already replaced an
+ * invalid buffer with an empty map, which validates.  The SIZE is what proves
+ * it -- a blob this index wrote reopens at exactly its stored length.
+ */
+void
+weave_sm_open_checked(Relation index, BlockNumber blk, const char *what,
+					  void *mapp, uint8 *buf, Size len)
+{
+	sm_t	   *map = (sm_t *) mapp;
+
+	sm_open(map, (uint8_t *) buf, len);
+	if (unlikely(sm_get_size(map) != len || !sm_validate(map)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("weave index \"%s\" has a corrupt %s bitmap at block %u",
+						RelationGetRelationName(index), what, blk),
+				 errdetail("Stored %zu bytes; the bitmap reopened as %zu.",
+						   (size_t) len, (size_t) sm_get_size(map)),
+				 errhint("REINDEX the index to rebuild it from the heap.")));
+}
+
 uint8 *
 weave_read_blob(Relation index, BlockNumber blk, Size len)
 {
@@ -409,7 +434,7 @@ weave_trgm_ordinals(Relation index, BlockNumber trgmstart, uint32 trgm,
 			uint64_t	v;
 			int			cap = 0;
 
-			sm_open(&sm, smbuf, smlen);
+			weave_sm_open_checked(index, firstdata, "trigram", &sm, smbuf, smlen);	/* G85 */
 			for (v = sm_next_member(&sm, (uint64_t) -1, &cur);
 				 v != SM_IDX_MAX;
 				 v = sm_next_member(&sm, v, &cur))
