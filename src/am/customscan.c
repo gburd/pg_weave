@@ -448,9 +448,12 @@ WeaveCountReScan(CustomScanState *node)
  * folded differently) still returns every row in exact order.  The hint can
  * only make the first pass narrower.  pg_weave.limit_hint = off disables it.
  *
- * The fused route is NOT hinted yet: weave_fuse_pass() widens on its own ladder
- * (so->fusek) and its ORDER BY keys are per channel plus a transport key, so the
- * hint would have to travel on the transport.  Recorded in G87 as owed.
+ * The FUSED route (fuse(...) -> one key per channel plus the `<~>` transport) is
+ * hinted on the FIRST lexical key's wquery Const, which every fused path has:
+ * src/am/fusepath.c refuses a fused path with no lexical channel or with a
+ * non-Const wquery.  The transport's real[] has no spare field and changing its
+ * type is a catalog change.  The VECTOR route is not hinted: a wvec has no
+ * planner-only field (its reserved int16 is a format decision; G87).
  * --------------------------------------------------------------------------- */
 bool		pg_weave_limit_hint = true;
 
@@ -491,9 +494,8 @@ weave_hint_indexscan(IndexScan *scan, Limit *limit, Oid wqueryoid)
 	Const	   *orig,
 			   *repl;
 	WeaveQuery	q;
+	ListCell   *lc;
 
-	if (list_length(scan->indexorderby) != 1)
-		return;					/* fused (several keys) or none: not hinted */
 	if (!weave_limit_const(limit->limitCount, &count) || count <= 0)
 		return;
 	if (limit->limitOffset != NULL &&
@@ -503,15 +505,25 @@ weave_hint_indexscan(IndexScan *scan, Limit *limit, Oid wqueryoid)
 	if (k <= 0 || k > PG_UINT16_MAX)
 		return;					/* deep page: leave the default batching alone */
 
-	expr = (Node *) linitial(scan->indexorderby);
-	if (!IsA(expr, OpExpr) || list_length(((OpExpr *) expr)->args) != 2)
-		return;
-	op = (OpExpr *) expr;
-	if (!IsA(lsecond(op->args), Const))
-		return;
-	orig = (Const *) lsecond(op->args);
-	if (orig->constisnull || orig->consttype != wqueryoid)
-		return;
+	/* the first key whose argument is a wquery Const: the only key of the
+	 * lexical route, the first lexical channel of a fused one */
+	orig = NULL;
+	foreach(lc, scan->indexorderby)
+	{
+		expr = (Node *) lfirst(lc);
+		if (!IsA(expr, OpExpr) || list_length(((OpExpr *) expr)->args) != 2)
+			continue;
+		op = (OpExpr *) expr;
+		if (IsA(lsecond(op->args), Const) &&
+			!((Const *) lsecond(op->args))->constisnull &&
+			((Const *) lsecond(op->args))->consttype == wqueryoid)
+		{
+			orig = (Const *) lsecond(op->args);
+			break;
+		}
+	}
+	if (orig == NULL)
+		return;					/* e.g. a vector key: nowhere to put k */
 
 	q = (WeaveQuery) DatumGetPointer(datumCopy(
 		PointerGetDatum(PG_DETOAST_DATUM(orig->constvalue)), false, -1));
