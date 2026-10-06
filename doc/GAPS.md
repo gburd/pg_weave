@@ -5499,7 +5499,7 @@ with no terms. That also covers a third shape the entry did not list: a MERGE wh
 posting was tombstoned while zero-term documents survived. `sql/doclist.sql` section (6)
 is both reproducers, each with `weave_check(deep)` clean.
 
-### G82 — two defects in the vendored sparsemap v5.8.0: `sm_create_from_array()` is a use-after-free past 1 KiB, and `sm_cardinality()` can disagree with iteration on a buffer `sm_validate()` accepts — **FOUND 2026-10-05 by `test/hegel/test_doclist.c` (doclist work); NOT REACHABLE from pg_weave (worked around); OPEN UPSTREAM**
+### G82 — two defects in the vendored sparsemap v5.8.0: `sm_create_from_array()` is a use-after-free past 1 KiB, and `sm_cardinality()` can disagree with iteration on a buffer `sm_validate()` accepts — **FOUND 2026-10-05 by `test/hegel/test_doclist.c` (doclist work); NOT REACHABLE from pg_weave (worked around); FIXED UPSTREAM in sparsemap 5.8.1 (`9e72ee4`) and RE-VENDORED 2026-10-06; both reproducers in `/tmp/sparsemap-report/` now pass against it**
 
 Both are recorded in `doc/specs/SEGMENT_FORMAT.md` §6 next to the code that avoids them;
 this entry exists so they are not only in a spec.
