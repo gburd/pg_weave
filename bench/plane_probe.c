@@ -276,9 +276,9 @@ main(int argc, char **argv)
 	}
 
 	/* per query and per stage, the shortlist needed at each k */
-	int		   *need[3][3];			/* [stage][k] -> per-query rank */
+	int		   *need[4][3];			/* [stage][k] -> per-query rank */
 
-	for (int s = 0; s < 3; s++)
+	for (int s = 0; s < 4; s++)
 		for (int k = 0; k < 3; k++)
 			need[s][k] = xmalloc((size_t) nq * sizeof(int));
 
@@ -311,7 +311,7 @@ main(int argc, char **argv)
 		}
 		qsort(ex, n, sizeof(Scored), cmp_desc);
 
-		for (int stage = 0; stage < 3; stage++)
+		for (int stage = 0; stage < 4; stage++)
 		{
 			for (long i = 0; i < n; i++)
 			{
@@ -328,12 +328,14 @@ main(int argc, char **argv)
 						lv = sg * m;
 					else if (stage == 1)
 						lv = alpha1 * sg + beta1 * (((c >> 2) & 1) ? 1.0 : -1.0);
-					else
+					else if (stage == 2)
 					{
 						lv = alpha * sg;
 						for (int b = 0; b < 3; b++)
 							lv += beta[b] * (((c >> b) & 1) ? 1.0 : -1.0);
 					}
+					else
+						lv = C[c];	/* HARNESS CONTROL: the exact level; must need exactly k */
 					acc += qr[j] * lv;
 				}
 				est[i].s = (float) (acc * scales[i]);
@@ -355,12 +357,12 @@ main(int argc, char **argv)
 		free(lut._alloc);
 	}
 
-	static const char *sname[3] = {"sign (1 bit, 1/4 bytes)", "top 2 bits (1/2)", "all 4, linear"};
+	static const char *sname[4] = {"sign (1 bit, 1/4 bytes)", "top 2 bits (1/2)", "all 4, linear", "CONTROL exact (must = k)"};
 
 	printf("\nshortlist needed so the estimate's top-L holds the exact 4-bit top-k, n=%ld nq=%ld dim=%d\n",
 		   n, nq, dim);
 	printf("%-26s %4s %8s %8s %8s %8s %8s\n", "first stage", "k", "p50", "p90", "p99", "p99.9", "max");
-	for (int s = 0; s < 3; s++)
+	for (int s = 0; s < 4; s++)
 		for (int kk = 0; kk < 3; kk++)
 		{
 			int		   *v = need[s][kk];
