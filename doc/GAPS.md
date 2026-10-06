@@ -4790,7 +4790,7 @@ is `{401,1,201}`), at the position an exact oracle gives. Pending row 402 has a 
 and is still padded at NULL, as G71 requires. The mutant that drops that exclusion ranks it
 and pads it, so it appears twice.
 
-### G72 — VACUUM's tombstone swap and its corpus-`ndocs` refresh were two WAL records, so a crash or ERROR between them left BM25's N counting deleted rows; and pages a crash strands between write and link are reclaimed only by REINDEX — **FOUND 2026-10-04 by an audit of every metapage writer, prompted by G65; PRE-EXISTING; the two-record window FIXED 2026-10-04; the leak class OPEN**
+### G72 — VACUUM's tombstone swap and its corpus-`ndocs` refresh were two WAL records, so a crash or ERROR between them left BM25's N counting deleted rows; and pages a crash strands between write and link are reclaimed only by REINDEX — **FOUND 2026-10-04 by an audit of every metapage writer, prompted by G65; PRE-EXISTING; the two-record window FIXED 2026-10-04; the leak class FIXED 2026-10-05 by G75's reclaim**
 
 G65 was one operation written as two GenericXLog records, with recovery able to land
 between them. This entry is the audit that asked where else that happens. It covers every
@@ -4871,7 +4871,9 @@ predicted (4 records; 2800 / 2830 / 2860; sticky 2600 vs 2340).
   build time. That is rare (it needs a pinned horizon during CREATE INDEX), and the result
   is off by that count until a merge rewrites the segment.
 
-**OPEN: the leak class.** Every multi-page structure is written *before* the record that
+**The leak class — FIXED 2026-10-05 by G75's reclaim (see G75 "FIX"); the paragraphs
+below are the analysis as it stood, kept because the fix answers each objection in it.**
+Every multi-page structure is written *before* the record that
 links it (a segment, a merge output, a tombstone blob). Every replaced structure is
 freed *after* the record that unlinks it (merge inputs, folded pending pages, the old
 tombstone blob). Freeing is one record per page (`weave_free_page()`, `am.c:3670`). A crash, or
@@ -4953,7 +4955,7 @@ or document that its `ctid` column is the root and give the join the
 `heap_get_root_tuples()`-equivalent it needs. The same audit is due for `weave_vec_scan()`,
 which returns docids.
 
-### G75 — a crash during a flush LEAKS every page the flush wrote before its publish record (up to 12): harmless to answers, reclaimable only by REINDEX — **FOUND 2026-10-04 by the g46 agent's smoke (`pgweave-20261004-221406`); RECURRED with its diagnostic and MEASURED deterministically by `t/031` on 2026-10-05; mechanism known; OPEN, fix owed (reclaim on recovery or next VACUUM)**
+### G75 — a crash during a flush LEAKS every page the flush wrote before its publish record (up to 12): harmless to answers, reclaimable only by REINDEX — **FOUND 2026-10-04 by the g46 agent's smoke (`pgweave-20261004-221406`); RECURRED with its diagnostic and MEASURED deterministically by `t/031` on 2026-10-05; FIXED 2026-10-05 on `wt/g75` (VACUUM reclaims stranded pages; G72's leak class with it) — see "FIX" at the end of this entry**
 
 t/029 (G65's test) crashes the server immediately after a VACUUM that flushes the pending
 list, restarts it, and asserts `weave_check(fa_w, deep)` has zero violated rows. Once, it
@@ -5024,6 +5026,157 @@ stop lands there. **Fix, owed and not part of this branch:** reclaim on recovery
 the next VACUUM (an unreachable, unfreed page whose LSN is older than the last
 directory change is a leak by construction), or write the bolt's pages under a
 "pending bolt" record that the publish supersedes. Harmless to answers either way.
+
+**FIX, 2026-10-05 (`wt/g75`).** VACUUM reclaims what a crash stranded. The design, the
+concurrency table and the safety argument are in `doc/specs/SEGMENT_FORMAT.md` §10,
+"Pages a crash strands between write and link". In short, at the start of
+`weave_vacuumcleanup()` and `weave_vacuum()`, a pass walks every chain reachable from the
+metapage (the walk `weave_check(deep)` uses, now shared: `weave_reach_map()`) and frees
+every other page. Four kinds of page are reclaimed: written and never linked, unlinked
+and never freed, flagged freed but absent from the FSM, and zero pages from a crashed
+extension. That covers **G72's whole leak class**, not only the flush: merges, tombstone
+swaps and oversized INSERTs.
+
+- **Two writers can run beside the reclaim**, and both are covered. The oversized INSERT
+  writes a whole bolt without the maintenance mutex, so it now holds a new
+  **segment-write lock** (`WEAVE_SEGWRITE_LOCKBLK`, share) from its first page to its
+  publish. The reclaim waits that lock out (a barrier) before taking the mutex. The
+  pending append links each page in the record that writes it. Both are also covered by
+  an **LSN fence**, read before the barrier: no page newer than the fence is freed.
+- **Enforced, not documented.** `weave_new_buffer()` raises `elog(ERROR)` for a caller
+  holding neither the mutex, the segment-write lock nor `AccessExclusiveLock` (parallel
+  workers excepted). A future segment writer that forgets the lock fails its first
+  allocation.
+- **The walk refuses to guess.** Any chain error, unreadable descriptor or weft root, or
+  weft kind it has no arm for marks the map incomplete, and the pass then frees nothing.
+  One real disagreement between the walker and the free path was found and closed while
+  doing this. The free path follows the first dictionary entry with a valid
+  `firstposting`; the walk read only the first entry. They agree on every index the
+  writer produces, but "agree" is now a safety property, so they run the same rule. A
+  second disagreement remains and is fenced: `weave_vec_free_weft()` frees a
+  `calibstart` chain the walk has no kind for. No writer produces one, and a bolt that
+  has one marks the map incomplete.
+- **An allocator change was tried and REVERTED, on measurement.** Making the allocator drop
+  a free-list candidate that turned out to be live (nbtree's rule) made `t/028`'s
+  quiet-VACUUM truncation control fail 3 times in 10 against 0 in 10 on the base, and
+  the arm with only that change removed failed 0 of 8 (branch 3 of 8, base 0 of 8, `pgweave-20261005-212522-de13`). So the allocator is unchanged.
+  The reclaim touches the FSM only under the page's exclusive lock. Correctness never
+  depended on the FSM, because the allocator refuses any initialized page that is not
+  `WEAVE_FREED`. What is left is a narrow window that can produce a stale FSM entry,
+  which costs an extension and nothing else (`SEGMENT_FORMAT.md` §10).
+
+**Two orders were measured wrong before the right one.** `t/033` crashes a flush ten
+times and compares the crashed index with a never-crashed twin. When the pass recorded
+the pages it freed in the FSM immediately, the same VACUUM's flush met them, could not
+reuse them (their XID is still running), and the live-FSM loop extended for the rest of
+the flush. The excess grew 148 → 2,848 pages over eight cycles. When the pass ran after
+the flush instead, the flush faced the stale FSM a crash restores, and the excess grew
+256 → 7,992. What works: run the pass before the flush, free stranded pages *without*
+offering them to the FSM, and let the next VACUUM record them. The excess stays flat at
+or below one crash's stranding, 148–973 pages, against 3,356 pages stranded in total
+(`pgweave-20261005-184549-bb9b`).
+
+**Found while mutation-testing it, NOT fixed here: a merge LAUNDERS a freed live page.**
+The mutant with the barrier removed freed 3,298 pages of an oversized INSERT's
+unpublished bolt (try 1 of `t/032` phase A, run `pgweave-20261005-204622-760e`). The
+INSERT then published that bolt, and the end-of-phase `weave_check(deep)` was *clean*.
+The next VACUUM's merge had read the freed pages, whose contents are intact. Freeing
+resets `nextblk`, so `merge_source_load_page()`'s dictionary walk stopped at the first
+freed page with no check of `WEAVE_FREED`. The merge then wrote a smaller,
+self-consistent bolt and freed its input. The index loses postings and no invariant
+reports it. This is not specific to the reclaim. **Any** bug that frees a live page is
+erased from the evidence by the next merge, which is the class G15 and G62 belong to.
+`t/032` now runs the deep check and a per-row posting probe after **every** concurrent
+try, before a later VACUUM can merge. The owed fix is for the merge's chain walkers to
+raise an ERROR, not stop, on a `WEAVE_FREED` page met on a live chain.
+
+**SUPERSEDED 2026-10-06, same branch: the "growth defect" below was the test, not the
+index.** `t/033` gave the crashed index two VACUUMs per cycle and its twin one. From
+cycle 8 onwards, each crashed-index VACUUM after the restart ran the share-lock
+compaction that cannot reuse its own frees (the L19 ratchet in `weave_vacuumcleanup()`).
+The allocator counters show it: `lowfree_reuse` was 10k–16k and `extend` about 2,080 on
+every such VACUUM (`pgweave-20261005-233440-3d3e`). The allocator arms that seemed to
+cure it were also running ten cycles instead of fourteen, so they never reached cycle 8.
+With the twin on the same schedule (`344c5d7`), the excess stays at or below one
+crash's stranding. The stale-entry clear described below is kept: it is correct and
+cheap, and about 1,340 such entries were seen after each crash. But what it saves is
+**unmeasured**. A further step, taking not-yet-recyclable freed pages *out* of the FSM,
+was aimed at the same non-defect and broke compaction (`weave_vacuum()` stopped
+compacting; `sql/weave.sql` and `sql/chanstats.sql` went red,
+`pgweave-20261005-231415-cab5`). It was reverted. The original text follows.
+
+**A pre-existing growth defect, found by `t/033` once the allocator change above was
+reverted, and FIXED here because the reclaim pass is where it belongs.** A crash
+restores FSM pages that are older than the index pages they describe. So the FSM can
+list as free a page that has since been reused and is live, and is *reachable*, not
+stranded. The allocator refuses that candidate, which is correct, but then re-records it
+and stops reusing for the rest of its allocation sequence (`weave_new_buffer()`, the
+documented `break`). As long as that page stays live, every later flush extends. In
+`t/033` on `3d94f0b` (`pgweave-20261005-221527-9ad3`), the crashed index grew by a whole
+flush, about 1,900 pages, per cycle through five cycles in which nothing was stranded,
+while its never-crashed twin stayed flat: excess 844 → 2,568 → … → 9,707. The
+allocator change had been hiding it. The reclaim pass now marks such an entry used for
+every reachable page the FSM lists as free. This is safe under the mutex: nothing frees a
+reachable page during the pass, and marking a page used hands it to nobody. On `main`,
+any crash with recent FSM updates can trigger this ratchet. It is not specific to
+pending flushes.
+
+**OPEN: the size bound in a long crash loop.** At 18 cycles (`pgweave-20261006-001850-1420`,
+`057fc9d`), `t/033`'s crashed index ended up as much as 22,476 pages larger than its
+never-crashed twin. That happened on a run where every cycle's stranded pages **were**
+reclaimed: 0 leaked pages and a clean deep check after every VACUUM, both hard
+assertions. The excess is not stranded pages. The allocator counters show where it comes
+from. From the first large merge (cycle 7) onwards, every post-crash VACUUM of the
+crashed index ran the share-lock compaction, with `lowfree_reuse` 10k–21k and `extend`
+2k–8k: the L19 ratchet that `weave_vacuumcleanup()` describes. The twin, on the same
+VACUUM schedule, never compacted. Over the same cycles, every reclaim pass cleared about
+1,340 stale FSM entries for live pages, and about 570 freed pages were not yet recyclable.
+So a crash leaves the FSM disagreeing with the pages on every cycle. A probable mechanism
+is that the cleanup's compaction trigger (`freeblks > nblocks / 4`, counted from the
+FSM) sees those entries and fires. That is **not demonstrated**. Until it is, the bound is
+a `TODO` in `t/033`: reported as `not ok # TODO` on every run, neither silenced nor
+loosened.
+
+**The A/B against the base says the late growth is pre-existing, and that the reclaim
+removes what accumulated** (`pgweave-20261006-010652-fb9f`, `t/033` with the same tests
+on both arms, base = `18e3f9b`'s C code):
+
+| cycle | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| branch excess | 148 | 255 | 255 | 1016 | 262 | 208 | 255 | 255 | 2626 | 5299 | 7972 | 10641 | 13310 | 15983 | 22478 | 4134 | 13300 | 15970 |
+| base excess | 256 | 845 | 1434 | 2023 | 2612 | 3201 | 3790 | 4379 | 6416 | 7005 | 8937 | 10869 | 12801 | 14733 | 16665 | 7902 | 20529 | 24483 |
+
+The base accumulates about 589 pages per crash from the first cycle onwards, because
+nothing reclaims what is stranded. The branch stays at one crash's stranding until the
+first large merge. From cycle 8 both grow by about a flush per cycle, through the same
+post-merge compaction ratchet, so that part is **not introduced by this branch** and is
+present on `main` today. It is the open item, and it belongs to the compaction trigger
+(L19), not to the reclaim. Two runs per arm (hard rule 10): run 2 reproduces run 1 to within 2 pages on the branch
+(22,476 vs 22,478, the same sequence) and exactly on the base (24,483).
+
+**Costs and limits, recorded as prominently as the fix:**
+- Every VACUUM cleanup now reads every page of the index once, as GIN's and GiST's
+  cleanups do. At 1M rows (36,313 pages) that took 16–19 ms with a warm cache; a cold-cache
+  figure is unmeasured (`bench/RESULTS_G75_RECLAIM.md`).
+- An oversized INSERT can now wait for a VACUUM's barrier, and a VACUUM waits for the
+  longest oversized INSERT already running.
+- A reclaimed page becomes reusable one VACUUM later than a page freed by a merge.
+- A backend still running a pre-fix `.so` writes without the lock. Restart after
+  upgrading.
+- `weave_vec_weft_root()` and `weave_cgram_weft_root()` can throw on a corrupt descriptor,
+  so on such an index VACUUM now raises that error where it used to complete. `t/003`
+  (VACUUM over a corrupted index) still passes.
+
+**Tests.** `t/031` now asserts at every one of its 14 recovery points that one VACUUM
+leaves 0 leaked pages, a clean `weave_check(deep)` and heap-equal answers. That is the
+brief's gate, and it was red before the fix by construction (leaked 1..12). `t/029` and
+`t/010` were updated: `t/010`'s manufactured orphans are now reclaimed by
+`weave_vacuum()`. `t/032` is the concurrency test, in three phases. Phase 0: a healthy
+index carrying every weft reclaims 0 pages. Phase A: a VACUUM is observed waiting on an
+in-flight oversized INSERT's segment-write lock, through `pg_locks` and `log_lock_waits`.
+Phase B: a writer starting after the barrier writes into pages below the scan's length,
+and the reclaim counts them as newer than the fence and leaves them alone. Every phase
+ends deep-clean and heap-equal. `t/033` is the crash loop.
 
 ### G76 — a gated ORDER BY whose gate admits fewer rows than LIMIT walks the WHOLE HEAP in the padding phase: correct, O(heap), invisible to every counter — **FOUND 2026-10-04 by the v17 agent (`pgweave-20261004-231619`, scifact); FIXED 2026-10-05 for every lexical gate without a NOT (merge of `wt/g76`), and for docvalues-only and NOT gates on a v12-complete index (merge of `wt/g76b`, after G77/G78); an index holding any pre-v12 bolt or pending page keeps the heap walk for those two until REINDEX**
 

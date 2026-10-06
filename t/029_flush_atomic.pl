@@ -94,8 +94,17 @@ my $second = $node->safe_psql('postgres', q{
 	SELECT count(*) FROM fa WHERE d @@@ 'second'});
 is($second, '300', 'every row of the crashed flush is answerable exactly once');
 is($ndocs, $heap, "ndocs equals the heap after recovery ($ndocs vs $heap): no double count");
+# pages_reachable_or_freed is EXEMPT here and asserted after the next VACUUM
+# instead (doc/GAPS.md G75): an immediate stop that lands inside the flush's
+# write-before-publish window strands that flush's pages, and reclaiming them is
+# VACUUM's job, not recovery's.  Every other invariant must hold at once.
+my $leaked_after_crash = $node->safe_psql('postgres', q{
+	SELECT count(*) FROM weave_page_info('fa_w')
+	 WHERE NOT reachable AND coalesce(freed, false) = false AND NOT uninitialized});
+note("pages stranded by the crash: $leaked_after_crash");
 my $bad = $node->safe_psql('postgres',
-	q{SELECT count(*) FROM weave_check('fa_w', true) WHERE NOT ok});
+	q{SELECT count(*) FROM weave_check('fa_w', true)
+	   WHERE NOT ok AND invariant <> 'pages_reachable_or_freed'});
 # A count alone is undiagnosable after the fact (doc/GAPS.md G21's lesson): when
 # this fails, print WHICH invariant and, for a leak, what the orphaned pages are --
 # a leaked page's kind names the write path that left it.
@@ -115,7 +124,7 @@ if ($bad ne '0')
 	diag("G75 relation pages: " . $node->safe_psql('postgres',
 		q{SELECT pg_relation_size('fa_w') / current_setting('block_size')::int}));
 }
-is($bad, '0', 'weave_check(deep) is clean after recovery');
+is($bad, '0', 'weave_check(deep) is clean after recovery, apart from stranded pages');
 
 # and the NEXT flush, which is where a doubly-held document used to become two
 $node->safe_psql('postgres', q{
@@ -126,6 +135,10 @@ $ndocs = $node->safe_psql('postgres',
 	q{SELECT ndocs::bigint FROM weave_index_stats('fa_w')});
 $heap = $node->safe_psql('postgres', q{SELECT count(*) FROM fa});
 is($ndocs, $heap, "ndocs still equals the heap after the next flush ($ndocs vs $heap)");
+is($node->safe_psql('postgres',
+		q{SELECT coalesce(string_agg(invariant || ': ' || coalesce(detail, ''), '; '), '')
+		    FROM weave_check('fa_w', true) WHERE NOT ok}),
+	'', "after the next VACUUM weave_check(deep) is clean ($leaked_after_crash page(s) had been stranded)");
 
 $node->stop;
 done_testing();

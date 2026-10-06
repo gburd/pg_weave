@@ -74,6 +74,20 @@ typedef struct WeaveCheckCtx
 	BlockNumber nblocks;
 	uint8	   *mark;			/* nblocks entries, or NULL when !deep */
 	int64		noverlap;
+
+	/*
+	 * Set by the reachability walk whenever it could not follow something: a
+	 * chain error, an unreadable descriptor or weft root, a weft kind it has no
+	 * arm for.  weave_check() reports those through other invariants and
+	 * ignores this; the VACUUM reclaim (weave_reach_map) must not free a single
+	 * page on a map that has it set, because an unfollowed chain is live pages
+	 * it would otherwise call leaked.  doc/specs/SEGMENT_FORMAT.md sect. 10.
+	 */
+	bool		incomplete;
+
+	/* The pending walk stops after this block (the reclaim's snapshot tail);
+	 * InvalidBlockNumber = walk to the end of the chain. */
+	BlockNumber pendstop;
 } WeaveCheckCtx;
 
 static void
@@ -168,12 +182,14 @@ wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 		{
 			appendStringInfo(err, "block %u is past the end of the relation (%u blocks)",
 							 blk, cx->nblocks);
+			cx->incomplete = true;
 			return -1;
 		}
 		if (n > (int64) cx->nblocks)
 		{
 			appendStringInfo(err, "chain from a %s page exceeds the relation length (cycle?)",
 							 weave_page_kind_name(want));
+			cx->incomplete = true;
 			return -1;
 		}
 
@@ -185,6 +201,7 @@ wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 			UnlockReleaseBuffer(buf);
 			appendStringInfo(err, "block %u is uninitialized but is on a %s chain",
 							 blk, weave_page_kind_name(want));
+			cx->incomplete = true;
 			return -1;
 		}
 		pk = WeavePageGetKind(page);
@@ -194,6 +211,7 @@ wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 			UnlockReleaseBuffer(buf);
 			appendStringInfo(err, "block %u is on a live %s chain but is flagged freed",
 							 blk, weave_page_kind_name(want));
+			cx->incomplete = true;
 			return -1;
 		}
 		if (pk != want && pk != alt && pk != alt2 && pk != alt3 && pk != alt4)
@@ -202,11 +220,14 @@ wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 			appendStringInfo(err, "block %u on a %s chain has kind \"%s\"",
 							 blk, weave_page_kind_name(want),
 							 weave_page_kind_name(pk));
+			cx->incomplete = true;
 			return -1;
 		}
 		UnlockReleaseBuffer(buf);
 		wvck_mark(cx, blk);
 		n++;
+		if (blk == cx->pendstop && want == WEAVE_PK_PENDING)
+			break;				/* the reclaim's snapshot tail: see WeaveCheckCtx */
 		blk = next;
 	}
 	return n;
@@ -218,6 +239,7 @@ wvck_walk_chain(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 {
 	return wvck_walk_chain_5kinds(cx, blk, want, want, want, want, want, err);
 }
+
 
 /*
  * Invariant: every page decodes to a KNOWN kind.
@@ -1567,14 +1589,46 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 		pfree(e.data);
 	}
 
+	if (meta->nsegments > WEAVE_MAX_SEGMENTS)
+		cx->incomplete = true;
 	for (s = 0; s < meta->nsegments && s < WEAVE_MAX_SEGMENTS; s++)
 	{
 		const WeaveSegMeta *seg = &meta->segs[s];
 		BlockNumber postchain = InvalidBlockNumber;
 		StringInfoData e;
+		int64		trgmsteps;
 
 		if (seg->dictstart == InvalidBlockNumber)
 			continue;
+
+		/*
+		 * COMPLETENESS, for the reclaim (WeaveCheckCtx.incomplete).  Every root
+		 * below is located through the non-throwing descriptor read, which
+		 * answers "no such weft" for a descriptor it cannot read -- so an
+		 * unreadable descriptor would silently drop every weft it names from
+		 * the map.  And a weft kind this walk has no arm for is a weft whose
+		 * pages it does not mark: a future kind added to the writer and the free
+		 * path but not here.  Either way the map is not a liveness oracle.
+		 */
+		if (seg->chandesc != InvalidBlockNumber)
+		{
+			WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
+			int			nweft = 0;
+			int			k;
+
+			if (weave_read_chandesc(cx->index, seg->chandesc, weft,
+									WEAVE_MAX_WEFTS, &nweft) != WEAVE_CD_OK)
+				cx->incomplete = true;
+			else
+				for (k = 0; k < nweft; k++)
+					if (weft[k].kind != (uint16) WEAVE_WK_LEXICAL &&
+						weft[k].kind != (uint16) WEAVE_WK_VECTOR &&
+						weft[k].kind != (uint16) WEAVE_WK_FUZZY &&
+						weft[k].kind != (uint16) WEAVE_WK_DOCVALS &&
+						weft[k].kind != (uint16) WEAVE_WK_CGRAM &&
+						weft[k].kind != (uint16) WEAVE_WK_DOCLIST)
+						cx->incomplete = true;
+		}
 
 		initStringInfo(&e);
 		(void) wvck_walk_chain(cx, seg->dictstart, WEAVE_PK_DICT, &e);
@@ -1653,7 +1707,14 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 					if (w.meta.graphstart != InvalidBlockNumber)
 						(void) wvck_walk_chain(cx, w.meta.graphstart,
 											   WEAVE_PK_VGRAPH, &e);
+					/* weave_vec_free_weft() frees a calibration chain too; no
+					 * writer produces one yet, and this walk has no kind for
+					 * it, so a bolt that has one is not mapped completely */
+					if (w.meta.calibstart != InvalidBlockNumber)
+						cx->incomplete = true;
 				}
+				else
+					cx->incomplete = true;
 			}
 		}
 
@@ -1670,11 +1731,33 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 				char	   *ptr = (char *) PageGetContents(page);
 				char	   *end = weave_page_entry_end(page);
 
-				if (ptr < end)
-					postchain = ((WeaveDictEntry *) ptr)->firstposting;
+				/*
+				 * The first entry with a VALID firstposting, exactly as
+				 * weave_free_segment() picks it.  This used to read only the
+				 * first entry; the two agree whenever the writer gives every
+				 * entry a posting, but the reclaim makes "agree" a safety
+				 * property rather than a reporting one, so they now run the
+				 * same rule.
+				 */
+				while (ptr < end && postchain == InvalidBlockNumber)
+				{
+					WeaveDictEntry *de = (WeaveDictEntry *) ptr;
+
+					if (!weave_dict_entry_fits(de, end))
+					{
+						cx->incomplete = true;
+						break;
+					}
+					postchain = de->firstposting;
+					ptr += MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+				}
 			}
+			else
+				cx->incomplete = true;
 			UnlockReleaseBuffer(buf);
 		}
+		else
+			cx->incomplete = true;
 		if (postchain != InvalidBlockNumber)
 			(void) wvck_walk_chain(cx, postchain, WEAVE_PK_POSTING, &e);
 
@@ -1697,7 +1780,9 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 				const char *cwhy = NULL;
 
 				(void) wvck_walk_chain(cx, cgroot, WEAVE_PK_CGRAM, &e);
-				if (weave_cgram_weft_open(cx->index, cgroot, &cw, &cwhy))
+				if (!weave_cgram_weft_open(cx->index, cgroot, &cw, &cwhy))
+					cx->incomplete = true;
+				else
 				{
 					(void) wvck_walk_chain(cx, cw.dictstart,
 										   WEAVE_PK_CGRAM_DICT, &e);
@@ -1713,16 +1798,26 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 
 		/* trigram directory pages plus each entry's sparsemap blob chain */
 		blk = seg->trgmstart;
-		while (blk != InvalidBlockNumber && blk < cx->nblocks)
+		trgmsteps = 0;
+		while (blk != InvalidBlockNumber)
 		{
-			Buffer		buf = ReadBuffer(cx->index, blk);
+			Buffer		buf;
 			Page		page;
 			BlockNumber next = InvalidBlockNumber;
 
 			CHECK_FOR_INTERRUPTS();
+			/* past EOF, or a cycle: more steps than the relation has pages */
+			if (blk >= cx->nblocks || ++trgmsteps > (int64) cx->nblocks)
+			{
+				cx->incomplete = true;
+				break;
+			}
+			buf = ReadBuffer(cx->index, blk);
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
-			if (!PageIsNew(page) && WeavePageHasKind(page, WEAVE_PK_TRGM))
+			if (PageIsNew(page) || !WeavePageHasKind(page, WEAVE_PK_TRGM))
+				cx->incomplete = true;
+			else
 			{
 				char	   *ptr = (char *) PageGetContents(page);
 				char	   *pend = weave_page_entry_end(page);
@@ -1733,17 +1828,24 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 				{
 					BlockNumber db = ((WeaveTrgmEntry *) ptr)->firstdata;
 
-					while (db != InvalidBlockNumber && db < cx->nblocks)
+					while (db != InvalidBlockNumber)
 					{
-						Buffer		dbuf = ReadBuffer(cx->index, db);
+						Buffer		dbuf;
 						Page		dpage;
 						BlockNumber dnext;
 
+						if (db >= cx->nblocks || ++trgmsteps > (int64) cx->nblocks)
+						{
+							cx->incomplete = true;
+							break;
+						}
+						dbuf = ReadBuffer(cx->index, db);
 						LockBuffer(dbuf, BUFFER_LOCK_SHARE);
 						dpage = BufferGetPage(dbuf);
 						if (PageIsNew(dpage))
 						{
 							UnlockReleaseBuffer(dbuf);
+							cx->incomplete = true;
 							break;
 						}
 						dnext = WeavePageGetOpaque(dpage)->nextblk;
@@ -1759,6 +1861,45 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 		}
 		pfree(e.data);
 	}
+}
+
+/*
+ * The reachability map, for the VACUUM reclaim (weave_reclaim_unreachable() in
+ * src/am/amvacuum.c; doc/specs/SEGMENT_FORMAT.md sect. 10, "Pages a crash strands
+ * between write and link").
+ *
+ * Returns one byte per block of `nblocks`, nonzero iff the block is reachable
+ * from `meta`, and sets *complete.  THE SAME WALK weave_check(deep) runs, on
+ * purpose: the reclaim frees what this says is unreachable, and weave_check
+ * reports as a leak what this says is unreachable, so one walk is the only way
+ * the two cannot disagree.  The differences are in what the reclaim needs and
+ * the report does not:
+ *
+ *   - *complete is false if the walk could not follow something
+ *     (WeaveCheckCtx.incomplete) or found two chains sharing a page.  A caller
+ *     must free nothing on an incomplete map.
+ *   - the pending walk stops at meta->pendingtail.  `meta` is the caller's
+ *     snapshot; pages appended after it are past that tail, are not in the
+ *     map, and are protected by the caller's LSN fence instead.
+ *
+ * `nblocks` must be read AFTER `meta`, so that every page `meta` reaches is
+ * below it.  Allocated in CurrentMemoryContext; huge-safe for the reason
+ * wvck_mark_alloc() gives.
+ */
+uint8 *
+weave_reach_map(Relation index, const WeaveMetaPageData *meta,
+				BlockNumber nblocks, bool *complete)
+{
+	WeaveCheckCtx cx;
+
+	MemSet(&cx, 0, sizeof(cx));
+	cx.index = index;
+	cx.nblocks = nblocks;
+	cx.mark = wvck_mark_alloc(nblocks);
+	cx.pendstop = meta->pendingtail;
+	wvck_mark_reachable(&cx, meta);
+	*complete = !cx.incomplete && cx.noverlap == 0;
+	return cx.mark;
 }
 
 /*
@@ -1846,6 +1987,7 @@ weave_check(PG_FUNCTION_ARGS)
 				 errmsg("set-valued function called in context that cannot accept a set")));
 
 	MemSet(&cx, 0, sizeof(cx));
+	cx.pendstop = InvalidBlockNumber;	/* weave_check walks the whole pending chain */
 	if (get_call_result_type(fcinfo, NULL, &cx.tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
@@ -2047,6 +2189,7 @@ weave_page_info(PG_FUNCTION_ARGS)
 				 errmsg("set-valued function called in context that cannot accept a set")));
 
 	MemSet(&cx, 0, sizeof(cx));
+	cx.pendstop = InvalidBlockNumber;	/* weave_check walks the whole pending chain */
 	if (get_call_result_type(fcinfo, NULL, &cx.tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	Assert(cx.tupdesc->natts == WEAVE_PAGE_INFO_NCOLS);
