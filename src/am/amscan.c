@@ -39,6 +39,7 @@
 #include "weave/weave.h"
 #include "weave/am.h"
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
+#include "weave/doclist.h"			/* document-list header (weave_index_v12_complete) */
 #include "weave/edist.h"			/* Z9: the <@> edit-distance shuttle */
 #include "weave/bm25bound.h"		/* F6: the single copy of the BM25 contribution
 									 * and its per-block (C2) bound; this file used
@@ -220,11 +221,13 @@ typedef struct WeaveScanOpaqueData
 	 * of the heap.  True for a lexical key whose query has no NOT: `NULL @@@ q` is
 	 * NULL, so no row outside the index qualifies, and without a NOT a matching
 	 * document holds a posting of some query term, so the collector -- segments
-	 * and pending list -- has it.  Two gates are NOT complete and keep the heap
-	 * walk: a docvalues-only gate, because a row whose lexical column is NULL is
-	 * in no index structure and may still satisfy `price < c` (G77); and a NOT
-	 * query, because its universe is built from postings and a document with no
-	 * terms has none, yet matches `!q` (G78).
+	 * and pending list -- has it.  Two more gates are complete only on an index
+	 * every part of which a v12 writer produced (weave_index_v12_complete()): a
+	 * docvalues-only gate, because before v12 a row whose lexical column was NULL
+	 * was in no index structure and could still satisfy `price < c` (G77); and a
+	 * NOT query, because before v12 its universe came from postings and a
+	 * document with no terms had none, yet matches `!q` (G78).  An index holding
+	 * any pre-v12 bolt or pending page keeps the heap walk for those two.
 	 */
 	bool		plainGateLex;
 	/*
@@ -3285,6 +3288,93 @@ weave_set_itup(IndexScanDesc scan, WeaveScanOpaque so)
 }
 
 /*
+ * Is every row this index can hold present in a v12 structure that enumerates
+ * it?  True when every live bolt carries a document list with the COMPLETE flag
+ * and every pending page is WEAVE_PK_PENDING_V12.  Then the docvalues gate and
+ * the NOT universe, which read those structures, are supersets of what their
+ * predicates can admit, NULL-document and zero-term rows included (doc/GAPS.md
+ * G76, which needs it; G77/G78/G80, which made it true).
+ *
+ * Read under the metapage snapshot the gate set came from: a flush or merge
+ * after it can only ADD complete structures or replace bolts with a merge
+ * whose output is complete iff its inputs were, so a stale `true` stays true.
+ * A stale `false` just keeps the heap walk.  Cost: one descriptor-page and one
+ * list-header read per bolt plus the pending chain's page kinds, paid once per
+ * padding phase, which is the phase that was paying O(heap).
+ */
+static bool
+weave_index_v12_complete(Relation index)
+{
+	WeaveMetaPageData meta;
+	uint32		s;
+	BlockNumber blk;
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	uint32		npages = 0;
+
+	weave_read_meta(index, &meta);
+	for (s = 0; s < meta.nsegments; s++)
+	{
+		const WeaveSegMeta *sg = &meta.segs[s];
+		BlockNumber root;
+		Buffer		buf;
+		Page		page;
+		bool		ok = false;
+
+		if (sg->dictstart == InvalidBlockNumber)
+			continue;			/* consumed slot */
+		root = weave_doclist_root(index, sg);
+		if (root == InvalidBlockNumber || root >= nblocks)
+			return false;		/* a pre-v12 bolt */
+		buf = ReadBuffer(index, root);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!PageIsNew(page) && !WeavePageIsFreed(page) &&
+			WeavePageHasKind(page, WEAVE_PK_DOCLIST) &&
+			weave_page_entry_end(page) - (char *) PageGetContents(page) >=
+			(ptrdiff_t) WEAVE_DOCLIST_HDRSIZE)
+		{
+			WeaveDocListHeader h;
+
+			memcpy(&h, PageGetContents(page), sizeof(h));
+			ok = (h.magic == WEAVE_DOCLIST_MAGIC &&
+				  h.version == WEAVE_DOCLIST_VERSION &&
+				  (h.flags & WEAVE_DOCLIST_F_COMPLETE) != 0);
+		}
+		UnlockReleaseBuffer(buf);
+		if (!ok)
+			return false;
+	}
+
+	/* every pending page must be the v12 kind, which records NULL documents */
+	for (blk = meta.pendinghead; blk != InvalidBlockNumber;)
+	{
+		Buffer		buf;
+		Page		page;
+		bool		v12;
+
+		CHECK_FOR_INTERRUPTS();
+		if (blk >= nblocks || ++npages > nblocks)
+			return false;		/* a stale or broken chain: be conservative */
+		buf = ReadBuffer(index, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!weave_page_is_live_pending(page))
+		{
+			/* the chain moved under us (a flush): the snapshot's pending pages
+			 * are now in a bolt, whose list the loop above did not see */
+			UnlockReleaseBuffer(buf);
+			return false;
+		}
+		v12 = (WeavePageGetKind(page) == WEAVE_PK_PENDING_V12);
+		blk = WeavePageGetOpaque(page)->nextblk;
+		UnlockReleaseBuffer(buf);
+		if (!v12)
+			return false;
+	}
+	return true;
+}
+
+/*
  * Does q contain a NOT anywhere?  Such a query can match a document with no
  * postings at all, which no posting-derived set holds (doc/GAPS.md G78).
  */
@@ -3383,26 +3473,73 @@ weave_pad_begin(IndexScanDesc scan, WeaveScanOpaque so)
 	 * ANDed and every padding row is rechecked.  On the lexical route so->query
 	 * is the ORDER BY query by now; the WHERE one is padWhereQuery.
 	 */
+	/*
+	 * v12 (G76 widened 2026-10-05): on an index whose every bolt and pending page
+	 * a v12 writer produced, a docvalues-only gate and a NOT gate are complete
+	 * too.  Asked lazily, only when the cheap answer above is "no", because it
+	 * reads one page per bolt and walks the pending chain.
+	 */
 	{
 		WeaveQuery	wq = so->vecScan && so->queryValid ? so->query
 			: (!so->vecScan && !so->edistScan && !so->fuseScan) ? so->padWhereQuery
 			: NULL;
+		int			v12 = -1;	/* weave_index_v12_complete(), once: -1 unknown */
 
-	if (!so->plainInit && wq != NULL && !weave_query_has_not(wq))
-	{
-		TidSet		m;
-		bool		recheck;
-		/* the scan's own context: weave_rescan() pfrees plainTids */
-		MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+		if (!so->plainInit && (wq != NULL || so->dvScan))
+		{
+			bool		lexok = (wq != NULL && !weave_query_has_not(wq));
 
-		weave_collect_matches(index, wq, &m, &recheck);
-		MemoryContextSwitchTo(old);
-		so->plainTids = m.tids;
-		so->nplain = m.n;
-		so->plainInit = true;
-		so->plainGateLex = true;
+			if (!lexok)
+				v12 = weave_index_v12_complete(index) ? 1 : 0;
+			if (lexok || v12 == 1)
+			{
+				TidSet		m;
+				bool		recheck;
+				/* the scan's own context: weave_rescan() pfrees plainTids */
+				MemoryContext old = MemoryContextSwitchTo(GetMemoryChunkContext(so));
+
+				if (wq != NULL)
+					weave_collect_matches(index, wq, &m, &recheck);
+				else
+				{
+					m.tids = NULL;
+					m.n = 0;
+				}
+				/*
+				 * The docvalues keys too, when there is no lexical key to stand
+				 * for the gate: keys are ANDed, so either set alone is a
+				 * superset, and one is enough.  Only reached when v12 == 1.
+				 */
+				if (wq == NULL && so->dvScan)
+					weave_docvals_gate(index, so, &m);
+				MemoryContextSwitchTo(old);
+				so->plainTids = m.tids;
+				so->nplain = m.n;
+				so->plainInit = true;
+				so->plainGateLex = true;
+			}
+		}
+		else if (so->plainInit && !so->plainGateLex)
+		{
+			/*
+			 * A pass collected the gate already (fused, edit distance) and it is
+			 * a docvalues-only or a NOT gate.  Its set is the whole conjunction
+			 * the pass applied, so on a v12-complete index it is complete.
+			 */
+			if (weave_index_v12_complete(index))
+				so->plainGateLex = true;
+		}
 	}
-	}
+
+	/*
+	 * Which walk, said at DEBUG1 because no counter can see it (G76 was found
+	 * because the cost was invisible) and because the choice is the thing a test
+	 * of weave_index_v12_complete() must observe: the answer is the same either
+	 * way on most fixtures, so only the choice tells a correct predicate from one
+	 * that is always true.
+	 */
+	elog(DEBUG1, "weave padding walks %s",
+		 (so->plainInit && so->plainGateLex) ? "the gate set" : "the heap");
 
 	if (so->plainInit && so->plainGateLex)
 	{

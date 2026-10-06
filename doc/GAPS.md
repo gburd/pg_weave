@@ -5178,7 +5178,7 @@ Phase B: a writer starting after the barrier writes into pages below the scan's 
 and the reclaim counts them as newer than the fence and leaves them alone. Every phase
 ends deep-clean and heap-equal. `t/033` is the crash loop.
 
-### G76 — a gated ORDER BY whose gate admits fewer rows than LIMIT walks the WHOLE HEAP in the padding phase: correct, O(heap), invisible to every counter — **FOUND 2026-10-04 by the v17 agent (`pgweave-20261004-231619`, scifact); FIXED 2026-10-05 for every lexical gate without a NOT (merge of `wt/g76`); docvalues-only and NOT gates still walk the heap, by design, until G77 and G78 are fixed**
+### G76 — a gated ORDER BY whose gate admits fewer rows than LIMIT walks the WHOLE HEAP in the padding phase: correct, O(heap), invisible to every counter — **FOUND 2026-10-04 by the v17 agent (`pgweave-20261004-231619`, scifact); FIXED 2026-10-05 for every lexical gate without a NOT (merge of `wt/g76`), and for docvalues-only and NOT gates on a v12-complete index (merge of `wt/g76b`, after G77/G78); an index holding any pre-v12 bolt or pending page keeps the heap walk for those two until REINDEX**
 
 When `WHERE body @@@ q ORDER BY fuse(...) LIMIT k` has fewer than k qualifying rows, the
 ranked phase runs out and the G56/G71 padding phase begins (`weave_pad_begin()`),
@@ -5221,6 +5221,23 @@ by design; `fuse()` is the gated form.
 
 **Owed:** re-measure scifact's 5-row gate at LIMIT 10 (40 ms and 17k buffers before) with
 the v17 harness.
+
+**Widened 2026-10-05 (`wt/g76b`).** Once the v12 document list (G77/G78/G80) made the
+docvalues gate hold NULL-document rows and the NOT universe hold zero-term documents,
+both gates became complete, but only where every part of the index was written by v12.
+`weave_index_v12_complete()` checks exactly that: every live bolt's document list carries
+the COMPLETE flag and every pending page is `WEAVE_PK_PENDING_V12`. The padding consults
+it only when the cheap test says no, and logs its choice at DEBUG1 (`weave padding walks
+the gate set` / `the heap`), because no counter can see it and the answer is identical
+either way on most fixtures. Pinned by `sql/fuse_gate.sql` (5), which has four v12 arms
+(fused NOT, and fused, vector and lexical under `price < 25`) whose gates include a NULL
+document and a zero-term document, and by `t/019`, which asserts the CHOICE three times:
+heap while a manufactured v8 pending page exists, heap after the mixed flush (that bolt
+cannot vouch for rows an older binary skipped, so its list is not COMPLETE), and gate set
+on a freshly built index. Mutants, both BUILT: **M1** (predicate always false) flips the
+three asserted v12 arms' removed count; **M2** (always true) fails t/019's two heap
+assertions (`pgweave-20261005-121631-de53`). An index upgraded from before v12 keeps the
+heap walk for these two gates until REINDEX, which is the safe direction.
 
 ### G77 — a docvalues restriction answered by the index silently DROPS every row whose lexical column is NULL — **FOUND 2026-10-04 while scoping G76; a SILENT WRONG ANSWER on any nullable `wdoc` column with a docvalues key; FIXED 2026-10-05 on `wt/doclist` (option 1, format v12) for every index built or REINDEXed by v12**
 
@@ -5481,3 +5498,40 @@ when the state indexed no document (its document list is empty), and
 with no terms. That also covers a third shape the entry did not list: a MERGE whose every
 posting was tombstoned while zero-term documents survived. `sql/doclist.sql` section (6)
 is both reproducers, each with `weave_check(deep)` clean.
+
+### G82 — two defects in the vendored sparsemap v5.8.0: `sm_create_from_array()` is a use-after-free past 1 KiB, and `sm_cardinality()` can disagree with iteration on a buffer `sm_validate()` accepts — **FOUND 2026-10-05 by `test/hegel/test_doclist.c` (doclist work); NOT REACHABLE from pg_weave (worked around); OPEN UPSTREAM**
+
+Both are recorded in `doc/specs/SEGMENT_FORMAT.md` §6 next to the code that avoids them;
+this entry exists so they are not only in a spec.
+
+1. **`sm_create_from_array()`** creates a 1 KiB map and calls the NON-growing
+   `sm_add_many()`. When the result outgrows the buffer, `__sm_replace_buffer()` grows it
+   with `sm_set_data_size()`, the caller's pointer goes stale, `sm_add_many()` returns
+   false because `m != map`, and `sm_create_from_array()` then `sm_free()`s the stale
+   pointer. Reproduced against the upstream checkout (`~/ws/sparsemap`, `72c98c6`) under
+   ASan with 5,000 sparse members: `heap-use-after-free ... in sm_free ... in
+   sm_create_from_array sm.c:8716`. Reproducer: `/scratch/pg_weave/sparsemap-uaf-repro.c`
+   (build: `gcc -g -fsanitize=address -I ~/ws/sparsemap -o r r.c ~/ws/sparsemap/sm.c -lm`).
+   **Fix, upstream:** use `sm_add_many_grow()` there. pg_weave never calls it
+   (`include/weave/doclist.h` builds with `sm_create()` + `sm_add_many_grow()`, the idiom
+   `amvacuum.c` already used).
+2. **`sm_cardinality()` vs `sm_next_member()`**: one flipped byte in a serialized map that
+   `sm_validate()` still accepts gave cardinality 1,973 against a walk of 1,909.
+   pg_weave's document-list validator counts with the same iteration its decoder uses, so a
+   validated image is a decodable one. The tombstone path reads cardinality nowhere that
+   matters for correctness, but any future validator must not mix the two.
+
+**Reported 2026-10-05:** `/tmp/sparsemap-report/REPORT.md` with one self-contained
+reproducer per finding. Writing it sharpened both: defect 1's root cause is
+`sm_add_many()` itself, which relocates an owned map that must grow, returns `false` and
+leaves the caller holding the freed pointer; `sm_create_from_array()` then double-frees
+it, returns `NULL` and leaks the result (ASan: use-after-free, double-free, 83,896 bytes
+leaked). Defect 2 is `sm_validate()` accepting a `SM_PAYLOAD_NONE` flag before non-NONE
+flags in a sparse chunk descriptor, a shape the encoder never writes: rank/cardinality
+then count 1,936 where the walk and `sm_contains()` find 1,920. A fuzz over 210,596
+single-byte corruptions found 139 such disagreements, all at descriptor offsets, and one
+validated corruption that claims and walks 579 million members.
+
+Neither is a pg_weave defect today. Both are worth a report and a fix in the sparsemap
+project (same author); the vendored copy then needs a bump (`doc/LICENSING.md` describes
+the manual merge).

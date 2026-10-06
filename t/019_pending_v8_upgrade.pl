@@ -239,6 +239,38 @@ is($node->safe_psql('postgres',
 		  SELECT count(*) FROM docs WHERE d @@@ 'pendingdoc'::wquery}),
 	'4', 'all four pending documents answer across the MIXED chain');
 
+# --- 2b. G76: on a mixed chain the padding must keep the heap walk ----------
+# doc/GAPS.md G76 lets the padding phase walk a NOT or docvalues gate's set
+# instead of the heap only when weave_index_v12_complete() holds: every bolt has
+# a COMPLETE document list and every pending page is v12.  The v8 page above is
+# the one state SQL cannot otherwise reach in which that predicate must be FALSE,
+# so this is its positive control.  The choice is observed directly, through the
+# DEBUG1 line weave_pad_begin() emits, because the ANSWER is the same either way
+# on this table and so cannot tell a correct predicate from an always-true one.
+sub padding_walk
+{
+	my ($sql) = @_;
+	my ($stdout, $stderr) = ('', '');
+	$node->psql('postgres', qq{
+		SET client_min_messages = debug1;
+		SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_sort = off;
+		$sql},
+		stdout => \$stdout, stderr => \$stderr);
+	return $stderr =~ /weave padding walks the gate set/ ? 'gate set'
+		 : $stderr =~ /weave padding walks the heap/ ? 'heap' : 'none';
+}
+my $not_q = q{SELECT id FROM docs WHERE d @@@ '!pendingdoc'::wquery
+               ORDER BY fuse(d <=> 'shared'::wquery, v <-> '[0,0,0,0]'::wvec) LIMIT 1000};
+is(padding_walk($not_q), 'heap',
+	'G76: a NOT gate keeps the heap walk while a v8 pending page exists');
+is($node->safe_psql('postgres', qq{
+		SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_sort = off;
+		SELECT count(*) FROM ($not_q) s}),
+	$node->safe_psql('postgres', qq{
+		SET enable_indexscan = off; SET enable_bitmapscan = off;
+		SELECT count(*) FROM ($not_q) s}),
+	'and answers as the heap does');
+
 # weave_check(deep) must accept the MIXED v8 + v11 pending chain: the deep walk
 # validates the pending chain kind-by-kind (amcheck's four-accepted-kinds walk),
 # so a v11 page it did not know about would be reported as a wrong-kind leak.
@@ -268,6 +300,18 @@ is($node->safe_psql('postgres',
 is($node->safe_psql('postgres',
 		"SELECT count(*) FROM weave_check('docs_weave') WHERE NOT ok"),
 	'0', 'every weave_check() invariant holds after the mixed-chain flush');
+
+# --- 4. G76 after the mixed flush: the bolt it wrote is not COMPLETE ----------
+# A flush that folded a v8 page cannot vouch for rows an older binary skipped, so
+# its document list carries no COMPLETE flag, and the padding keeps the heap walk
+# even though no v8 page is left.  The control on the other side: a fresh index
+# over the same table is v12-complete and walks the gate set.
+is(padding_walk($not_q), 'heap',
+	'G76: after the mixed flush the bolt is not COMPLETE, so the heap walk stays');
+$node->safe_psql('postgres', 'CREATE INDEX docs_weave2 ON docs USING weave (d, v)');
+$node->safe_psql('postgres', 'DROP INDEX docs_weave');
+is(padding_walk($not_q), 'gate set',
+	'and a freshly built index is v12-complete and walks the gate set');
 
 $node->stop;
 done_testing();
