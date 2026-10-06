@@ -15,7 +15,7 @@
 CREATE FUNCTION weave_current_distance(index regclass, row_ctid tid, query wquery)
 RETURNS float8
 AS 'MODULE_PATHNAME', 'weave_current_distance'
-LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
 
 COMMENT ON FUNCTION weave_current_distance(regclass, tid, wquery) IS
 'Internal (G86): the <=> distance the live weave ordering scan on the index stored for this '
