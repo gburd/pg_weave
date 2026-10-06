@@ -282,11 +282,24 @@ main(int argc, char **argv)
 		for (int k = 0; k < 3; k++)
 			need[s][k] = xmalloc((size_t) nq * sizeof(int));
 
+	/*
+	 * Queries are independent, so they run in parallel (OpenMP; -fopenmp).  Each
+	 * thread owns its scratch arrays, and every per-query result lands in its own
+	 * slot of need[][][qi], so the output is identical to a serial run's for any
+	 * thread count -- the per-query numbers do not depend on scheduling, and the
+	 * percentiles are taken after the loop.  weave_query_lut_build() reads the
+	 * quantizer and writes only its own stack and its own allocation.  The 960-d,
+	 * n = 1M arm took ~7 h serially (the reason this exists: that arm was lost to
+	 * a host reboot on 2026-10-06 and had to be re-run).
+	 */
+#pragma omp parallel
+	{
 	Scored	   *ex = xmalloc((size_t) n * sizeof(Scored));
 	Scored	   *est = xmalloc((size_t) n * sizeof(Scored));
 	int		   *rank_of = xmalloc((size_t) n * sizeof(int));
 	float	   *qr = xmalloc((size_t) dim * sizeof(float));
 
+#pragma omp for schedule(dynamic, 1)
 	for (long qi = 0; qi < nq; qi++)
 	{
 		WeaveQueryLut lut;
@@ -355,6 +368,11 @@ main(int argc, char **argv)
 			}
 		}
 		free(lut._alloc);
+	}
+	free(ex);
+	free(est);
+	free(rank_of);
+	free(qr);
 	}
 
 	static const char *sname[4] = {"sign (1 bit, 1/4 bytes)", "top 2 bits (1/2)", "all 4, linear", "CONTROL exact (must = k)"};
