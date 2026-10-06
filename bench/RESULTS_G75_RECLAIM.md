@@ -74,7 +74,7 @@ unmeasured.
   cycle is leak-free and deep-clean. From the first large merge onwards, every post-crash
   VACUUM of the crashed index runs the share-lock compaction (`lowfree_reuse` 10k–21k,
   `extend` 2k–8k), and the twin's never does. **The A/B against the base**
-  (`pgweave-20261006-010652-fb9f`, one run per arm so far) shows the base accumulating
+  (`pgweave-20261006-010652-fb9f`, two runs per arm, reproducing to within 2 pages) shows the base accumulating
   ~589 pages per crash from cycle 1 (excess 256 → 4,379 by cycle 7). The branch stays
   at 148–1,016 over the same cycles. From the first large merge (cycle 8), both grow by
   about a flush per cycle, reaching 24,483 on the base and 22,478 on the branch. The late

@@ -5151,8 +5151,8 @@ nothing reclaims what is stranded. The branch stays at one crash's stranding unt
 first large merge. From cycle 8 both grow by about a flush per cycle, through the same
 post-merge compaction ratchet, so that part is **not introduced by this branch** and is
 present on `main` today. It is the open item, and it belongs to the compaction trigger
-(L19), not to the reclaim. One run per arm (hard rule 10 wants two). The second run per
-arm is in the same job.
+(L19), not to the reclaim. Two runs per arm (hard rule 10): run 2 reproduces run 1 to within 2 pages on the branch
+(22,476 vs 22,478, the same sequence) and exactly on the base (24,483).
 
 **Costs and limits, recorded as prominently as the fix:**
 - Every VACUUM cleanup now reads every page of the index once, as GIN's and GiST's
