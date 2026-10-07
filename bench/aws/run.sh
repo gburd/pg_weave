@@ -440,6 +440,16 @@ run_smoke() {
 			src/vector/quantize.c src/vector/pack.c -lm && /tmp/tq' \
 		2>&1 | tee "$OUT/codec.log"
 
+	# G88/G91: the regex trigram prefilter property test (needs server headers,
+	# so it is not in GitHub CI's check-standalone).  Status taken, not piped past.
+	say "regex prefilter property test (G88/G91)"
+	$SSH 'cd pg_weave && make -s check-regex-approx PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/tmp/rxa.log 2>&1
+		  rc=$?; cat /tmp/rxa.log; exit $rc' > "$OUT/regex_prefilter.log" 2>&1 \
+		|| { cat "$OUT/regex_prefilter.log" >&2; die "regex prefilter property test FAILED"; }
+	grep -q "REGEX PREFILTER CHECKS PASSED" "$OUT/regex_prefilter.log" \
+		|| die "regex prefilter property test printed no pass marker"
+	tail -4 "$OUT/regex_prefilter.log"
+
 	say "installcheck (regression + isolation)"
 	# THE STATUS IS TAKEN, NOT PIPED PAST.  Until 2026-09-23 the remote command
 	# ended in `| tail -30` and the local one in `| tee`, so BOTH exit statuses

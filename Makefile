@@ -487,6 +487,30 @@ check-standalone:
 	tail -1 $$tmp/rxdash.log; \
 	echo "== ALL STANDALONE CHECKS PASSED =="
 
+# G88/G91: the regex trigram prefilter never drops a token the matcher accepts
+# (test/hegel/test_regex_approx.c).  It links the SHIPPED parser and extractor,
+# which need the server headers, so it is not in check-standalone (whose CI leg
+# has no PostgreSQL); the EC2 smoke runs it.  Two legs: the exact dialect,
+# cross-checked against glibc's POSIX regexec, and the approximate one ({~k}).
+REGEX_APPROX_SRCS = src/query/extract.c src/query/parser.c src/query/regex_ast.c \
+	src/query/regex_grammar.c src/query/regex_tokens.c src/query/re_match.c \
+	$(TRE_OBJS:.o=.c)
+.PHONY: check-regex-approx
+check-regex-approx:
+	@set -e; \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	$(CHECK_CC) -O2 -w -DHAVE_CONFIG_H -I include -I src/query \
+		-I vendor/tre -I vendor/tre/lib -I vendor/tre/local_includes \
+		-I $$($(PG_CONFIG) --includedir-server) \
+		-o $$tmp/rxa test/hegel/test_regex_approx.c $(REGEX_APPROX_SRCS); \
+	echo "== G91 regex prefilter, exact dialect (oracles: TRE and glibc POSIX) =="; \
+	$$tmp/rxa 20000 exact > $$tmp/exact.log 2>&1 || { tail -30 $$tmp/exact.log; exit 1; }; \
+	tail -1 $$tmp/exact.log; \
+	echo "== G88 regex prefilter, approximate atoms {~k} (oracle: TRE) =="; \
+	$$tmp/rxa 20000 > $$tmp/approx.log 2>&1 || { tail -30 $$tmp/approx.log; exit 1; }; \
+	tail -1 $$tmp/approx.log; \
+	echo "== REGEX PREFILTER CHECKS PASSED =="
+
 # The INT_MAX crash fix (pg_tre 1521662 / upstream ad26b6d) needs an actual
 # buffer bigger than INT_MAX bytes (~2 GiB) plus a guard page to reproduce
 # deterministically -- ~10s and ~2 GiB resident, not appropriate for the

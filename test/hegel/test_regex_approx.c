@@ -33,6 +33,7 @@
 #include "postgres.h"
 
 #include <setjmp.h>
+#include <regex.h>
 #include <stdarg.h>
 
 #include "miscadmin.h"
@@ -586,6 +587,7 @@ main(int argc, char **argv)
 		WeaveParseCtx ctx;
 		TrigramQuery q;
 		void	   *h;
+		regex_t		posix;
 		sigjmp_buf	jb;
 		bool		ok;
 		int			ntok = 0;
@@ -617,6 +619,14 @@ main(int argc, char **argv)
 			continue;
 		}
 
+		if (exact_only && regcomp(&posix, pat.s, REG_EXTENDED | REG_NOSUB) != 0)
+		{
+			printf("FAIL: POSIX regcomp refused /%s/\n", pat.s);
+			fails++;
+			weave_free_pattern(h);
+			continue;
+		}
+
 		PG_exception_stack = &jb;
 		if (sigsetjmp(jb, 1) == 0)
 			ok = weave_parse_regex(&ctx, pat.s, pat.n) &&
@@ -629,6 +639,8 @@ main(int argc, char **argv)
 			printf("FAIL: pg_tre parser refused /%s/ (%s)\n", pat.s, ctx.errmsg);
 			fails++;
 			weave_free_pattern(h);
+			if (exact_only)
+				regfree(&posix);
 			continue;
 		}
 		if (!q.always_true && q.n > 0)
@@ -662,6 +674,11 @@ main(int argc, char **argv)
 			}
 
 			m = tre_accepts(h, t.s, t.n);
+			if (exact_only && m >= 0 && (regexec(&posix, t.s, 0, NULL, 0) == 0) != (m == 1))
+			{
+				printf("FAIL: TRE and POSIX regexec disagree on '%s' for /%s/\n", t.s, pat.s);
+				fails++;
+			}
 			if (m < 0)
 			{
 				printf("FAIL: TRE error matching /%s/ against '%s'\n", pat.s, t.s);
@@ -689,6 +706,8 @@ main(int argc, char **argv)
 			}
 		}
 		weave_free_pattern(h);
+		if (exact_only)
+			regfree(&posix);
 	}
 
 	printf("%ld checks, %ld TRE-accepted tokens, %ld narrowing patterns, %ld failures\n",
