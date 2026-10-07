@@ -11,6 +11,7 @@ script`. Smoke (regression, isolation, all 33 TAP files) was green before each r
 |---|---|---|
 | `pgweave-20261007-021914-c54f` | `f566bc0` | BEIR x3, enwiki part 1 whole (20,913 articles) and as 400-word chunks, enwiki part 6 (first 20,000 articles) |
 | `pgweave-20261007-031455-7a75` | `4e8a368` | the same plus **known-item title queries with qrels** and a paired bootstrap; part 6 at **60,000** articles (3x); enwiki part 3 (30,000 articles) whole and as 256-word chunks |
+| `pgweave-20261007-041651-d0de` | `1bd452d` | probes only (`BEIR= WIKIS=`), for probe P8 (doclen through wdoc I/O); P1-P7 reproduce runs 1 and 2 |
 
 ## Headline
 
@@ -43,11 +44,16 @@ script`. Smoke (regression, isolation, all 33 TAP files) was green before each r
    is a different ranking. Defining length as **the last position** instead (arm
    `tsvmaxpos`) removes most of the difference: overlap 0.977-0.9997 on chunks, 0.994-0.998
    on whole articles.
-4. **Side finding, a real bug outside M7: a `wdoc` with more than 16,383 tokens cannot be
-   read back.** See "wdoc round trip" below. Every such article fails `d::text::wdoc`: **260 of 260**
+4. **Side finding, a real bug outside M7 (`doc/GAPS.md` G89, data-loss class): a `wdoc`
+   with more than 16,383 tokens cannot be read back.** See "wdoc round trip" below. Every such article fails `d::text::wdoc`: **260 of 260**
    across three Wikipedia parts under `simple` (259 under `english`). Text `COPY` and
    binary `COPY` fail the same way, which means `pg_dump`/restore of a stored `wdoc`
    column breaks on them.
+5. **Second side finding (`doc/GAPS.md` G90): `wdoc` text and binary I/O silently replace
+   the stored length with the sum of tf.** `to_wdoc('english', 'the cat sat on the mat')`
+   has length 6 and reads back as 3, through both `d::text::wdoc` and binary `COPY`, with
+   no error. A dump/restore therefore turns an `exact` column into this measurement's
+   `sumtf` arm.
 
 **Is option 1 sound?** Yes for chunked or short documents, the RAG case. **Not exact**
 for documents over ~16k tokens, and **not exact for tf** once any lexeme in a document
@@ -277,7 +283,7 @@ indexed by default, so the index only sees tf and length.
 - **Index scans actually ran:** `scancheck.tsv` has 0 rows where index scans < queries,
   in either run.
 
-## wdoc round trip (side finding, outside M7, needs a GAPS entry)
+## wdoc round trip (side finding, outside M7: `doc/GAPS.md` G89 and G90)
 
 `to_wdoc(regconfig, text)` stores parsetext's `LIMITPOS`'d positions, so every token past
 16,383 gets position 16383 and a term that recurs there gets **duplicate** positions.
@@ -296,9 +302,20 @@ indexed by default, so the index only sees tf and length.
 **a dump of a table with a stored `to_wdoc(regconfig, text)` column holding one such
 document does not restore**. The same applies to text-format logical replication and
 `COPY`. This is independent of tsvector. It was found because this measurement had to
-build exactly those documents.
+build exactly those documents. All three runs reproduce probe P5.
+
+**The length does not survive I/O either (G90, probe P8, run `pgweave-20261007-041651-d0de`).**
+`wdoc_out` prints no length, and `wdoc_recv` reads the length and discards it
+(`src/query/doc.c:579`). Both inputs rebuild with length = sum of tf.
+`to_wdoc('english', 'the cat sat on the mat')`: stored length 6, after `d::text::wdoc` 3,
+after binary `COPY` 3. Nothing raises an error. Under a stopword config, a restored
+`to_wdoc(regconfig, text)` column ranks like the `sumtf` arm above (top-10 overlap
+0.88-0.96 against the original on BEIR and Wikipedia chunks). The `exact` arm in this
+measurement was built in place and never went through I/O, so it is not affected.
 
 ## What the operator class should do (input to M7 step 2, not decided here)
+
+Items 1 and 2 are **open maintainer decisions**, recorded in `doc/PHASES.md` M7.
 
 1. **Refuse stripped input.** A tsvector with any positionless entry carries no tf, and
    BM25 over it is the `strip` arm: -0.03 to -0.07 nDCG@10 on BEIR, -0.5 on title
@@ -309,7 +326,7 @@ build exactly those documents.
    of 0.89-0.96 on BEIR, quality-neutral either way. The padding-term construction here
    only stands in for it; the opclass would set `doclen` directly. It does change what
    `to_wdoc(tsvector)` means today, so it is a decision.
-3. **Count and expose capped documents**: any lexeme at 255 positions, or any position
+3. **Count and expose capped documents** (already in M7's gate): any lexeme at 255 positions, or any position
    at 16,383. That count is the exact set of documents whose BM25 is approximate. 0 to
    0.002 % on every chunked corpus measured, 5.5-33.5 % of whole Wikipedia articles.
 
