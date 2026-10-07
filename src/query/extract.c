@@ -313,8 +313,24 @@ lin_append_node(LinCtx *lc, const RegexAst *ast)
                  * child m times (capped at 2 to keep the run bounded). */
                 int k = (m > 2) ? 2 : m;
                 int i;
+                int before = lc->run_n;
+
                 for (i = 0; i < k; i++)
                     lin_append_node(lc, ast->u.rep.child);
+
+                /*
+                 * G88: when the match may hold MORE copies than were inlined
+                 * (n unbounded, or n > k), a trigram that runs from the left
+                 * context through every inlined copy into the right context
+                 * is not required: /xa+y/ inlined one `a` and demanded "xay",
+                 * which "xaay" lacks.  Such a trigram exists only if the
+                 * copies added fewer than two codepoints to the run, so end
+                 * the run then.  (A flush inside the copies also lands here,
+                 * harmlessly: the extra flush only costs selectivity.)
+                 */
+                if ((ast->u.rep.max_rep < 0 || ast->u.rep.max_rep > k) &&
+                    lc->run_n < before + 2)
+                    run_flush(lc);
             }
             break;
         }

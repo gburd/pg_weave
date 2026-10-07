@@ -225,6 +225,8 @@ gnew(int kind)
 	return g;
 }
 
+static bool gen_approx = true;	/* false: the exact dialect only (G91 leg) */
+
 /* An atom: something `{~k}`, `?`, `*` may follow. */
 static G *gen_seq(int depth, int len);
 static G *
@@ -279,7 +281,7 @@ gen_piece(int depth)
 	G		   *a = gen_atom(depth);
 	int			r = rnd(12);
 
-	if (r < 2)
+	if (r < 2 && gen_approx)
 	{
 		G		   *x = gnew(6);
 
@@ -569,6 +571,7 @@ int
 main(int argc, char **argv)
 {
 	int			ncases = (argc > 1) ? atoi(argv[1]) : 20000;
+	bool		exact_only = (argc > 2 && strcmp(argv[2], "exact") == 0);
 	long		checks = 0,
 				positives = 0,
 				narrowing = 0,
@@ -587,8 +590,13 @@ main(int argc, char **argv)
 		bool		ok;
 		int			ntok = 0;
 
+		gen_approx = !exact_only;
 		if (i < (int) (sizeof(fixed) / sizeof(fixed[0])))
+		{
+			if (exact_only && strstr(fixed[i].pat, "{~"))
+				continue;
 			put(&pat, fixed[i].pat);
+		}
 		else
 		{
 			/* TRE refuses (and pattern_cache.c rejects) more than three approx atoms */
