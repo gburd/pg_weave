@@ -5984,7 +5984,7 @@ The vector `<->`/`<#>` route stays unhinted: see the measurement above. A decisi
 needed to use `wvec`'s reserved `int16` as a planner-only carrier, and on the corpus
 measured it would not have changed the work.
 
-### G88 — "approximate regex" is named in the product statement and does not ship: `{~k}` parses and is then ignored — **FOUND 2026-10-06 by the README rewrite; OPEN, needs a maintainer decision**
+### G88 — "approximate regex" is named in the product statement and does not ship: `{~k}` parses and is then ignored — **FOUND 2026-10-06 by the README rewrite; BUILT 2026-10-07 on `wt/g88` (maintainer decision: build it); see "What ships" at the end of this entry**
 
 `AGENTS.md`'s product statement lists "approximate regex" among the six retrieval kinds, and
 `doc/PHASES.md` Phase Z is titled "fuzzy / approximate-regex / prefix / n-gram". What ships is
@@ -6019,6 +6019,49 @@ a true match even at k = 0 (hard rule 1). The tiles it then forms also overlap i
 the pigeonhole argument either. `regex_extract_query()` (`src/query/extract.c`) calls it for
 every `max_cost > 0`; nothing in `src/am/` reaches that path today, which is the only reason it
 has not produced a wrong answer.
+
+The tiling was **deleted**, not repaired (a global edit budget now yields `always_true`; nothing
+needed it: approximation is per atom).
+
+**What ships (2026-10-07, `wt/g88`).** Specified in `doc/specs/FUZZY_CHANNEL.md` §2.1.
+
+- *The rule.* A `/re/` containing `{~` is approximate and is decided by TRE end to end, on the
+  index (`weave_regex_terms()`) and on the heap (`weave_doc_has_regex()`), with one compiled
+  handle and one matcher (`weave_match_wide()`, TRE's wide API over `pg_wchar`, not its
+  locale-dependent narrow one). Every other pattern is core's ARE, unchanged.
+- *Semantics.* TRE's per-atom `atom{~k}`: up to k insertions, deletions or substitutions (1
+  each) inside the atom, exact outside it; `{~0}` is the exact atom; unanchored like `~`; over
+  dictionary tokens. Accepted syntax is ERE plus `{~k}`; TRE's other bound forms (`{~}`,
+  `{~n,m}`, `{+n}`, `{#n}`, cost expressions) are refused. At most three approximate atoms (G92).
+- *Prefilter.* An approximate atom is opaque to the k = 0 trigram extractor; literal runs outside
+  it still narrow. A nullable approximate atom disables extraction (TRE leaks its budget past
+  it, below). The narrowing refuses any backslash in an approximate pattern.
+- *Bounds.* A presence filter: no score, no block-max bound; in `fuse()` it is a gate (F9), as
+  exact regex is.
+
+**Two TRE behaviours that are now part of the semantics** (index and heap agree on both,
+because both are TRE): no insertion after an approximate atom's last character when nothing
+follows (`^(abc){~1}$` rejects `abcd`, accepts `xabc`); and a nullable approximate atom leaks
+its budget to what follows (`(a?){~1}bcd` matches `bd`). Neither is fixed in TRE. `term~k`
+remains the operator for whole-token edit distance.
+
+**Evidence.** `make check-regex-approx` (`test/hegel/test_regex_approx.c`, in the EC2 smoke):
+20,000 random patterns per leg, 1.2 M token checks each, 0 dropped tokens. Positive controls,
+each built and then failing: the pre-G88 APPROX-as-child rule (2,183 drops / 3,000 cases), no
+nullable-atom giveup (72 / 20,000). `sql/regex_approx.sql`: 15 approximate patterns whose
+expected id lists were computed with TRE standalone before the SQL ran; heap, `weave_count()`
+and the planner's index answer on a `trigrams = on` and a `trigrams = off` index all agree;
+`{~0}` equals the exact pattern; seven exact patterns still equal core's `~`. A randomized
+sweep (`pgweave-20261007-162141-2b73`): 400 generated approximate patterns and 400 exact ones
+over 18,000 tokens, 0 disagreements among both indexes, `weave_count()` and the heap (and
+`~` for the exact ones). Six SQL-level mutants, each built and installed, each changing the
+regression output: G91 reverted, verify via ARE, heap via ARE, k off by one (TRE's parser
+`limit_err + 1`), APPROX as its child, no nullable giveup. Full EC2 smoke green on `654da61`
+(`pgweave-20261007-163427-da3f`: regression, isolation, 34 TAP files / 1,314 tests).
+
+**Does not ship.** A global edit budget over a whole pattern (`(pat){~k}` is the way to say
+it); TRE's cost syntax; more than three approximate atoms; narrowing for a nullable approximate
+atom or any escape in an approximate pattern (both walk the whole dictionary, correctly).
 
 The same review found two documents stale against the shipped code, recorded here so they are
 not lost: `doc/PRODUCTION_READINESS.md` "What actually works today" still says vector indexing
