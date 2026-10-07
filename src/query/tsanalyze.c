@@ -227,10 +227,40 @@ PG_FUNCTION_INFO_V1(to_wdoc_from_tsvector);
  * positions are >= 1, ascending and distinct within an entry, and
  * weave_doc_build re-validates at the trust boundary.
  */
-Datum
-to_wdoc_from_tsvector(PG_FUNCTION_ARGS)
+uint32
+weave_tsvector_flags(const void *tsvp)
 {
-	TSVector	tsv = PG_GETARG_TSVECTOR(0);
+	TSVector	tsv = (TSVector) tsvp;
+	WordEntry  *we = ARRPTR(tsv);
+	uint32		flags = 0;
+	int			i;
+
+	for (i = 0; i < tsv->size; i++)
+	{
+		int			np = POSDATALEN(tsv, &we[i]);
+		WordEntryPos *pv;
+
+		if (np <= 0)
+		{
+			flags |= WEAVE_TSV_POSITIONLESS;
+			continue;
+		}
+		/* core keeps at most MAXNUMPOS - 1 positions per lexeme (uniquePos) */
+		if (np >= MAXNUMPOS - 1)
+			flags |= WEAVE_TSV_CAPPED;
+		/* LIMITPOS: every token past 16,383 collapsed onto it; positions
+		 * ascend, so the last one is the largest */
+		pv = POSDATAPTR(tsv, &we[i]);
+		if (WEP_GETPOS(pv[np - 1]) >= MAXENTRYPOS - 1)
+			flags |= WEAVE_TSV_CAPPED;
+	}
+	return flags;
+}
+
+WeaveDoc
+weave_doc_from_tsvector(const void *tsvp, uint32 *tsvflags)
+{
+	TSVector	tsv = (TSVector) tsvp;
 	int			n = tsv->size;
 	WordEntry  *we = ARRPTR(tsv);
 	char	   *lexbase = STRPTR(tsv);
@@ -241,14 +271,12 @@ to_wdoc_from_tsvector(PG_FUNCTION_ARGS)
 	bool		has_pos;
 	uint64		npos = 0;
 	int			i;
-	WeaveDoc		doc;
+	WeaveDoc	doc;
 
+	if (tsvflags)
+		*tsvflags = weave_tsvector_flags(tsv);
 	if (n == 0)
-	{
-		doc = weave_doc_build(0, NULL, NULL, NULL, false, NULL, -1, "wdoc");
-		PG_FREE_IF_COPY(tsv, 0);
-		PG_RETURN_WDOC(doc);
-	}
+		return weave_doc_build(0, NULL, NULL, NULL, false, NULL, -1, "wdoc");
 
 	/* first pass: positions-on unless every entry is positionless */
 	has_pos = false;
@@ -296,7 +324,21 @@ to_wdoc_from_tsvector(PG_FUNCTION_ARGS)
 	}
 
 	doc = weave_doc_build((uint32) n, terms, lens, tfs, has_pos, positions,
-						-1, "wdoc");
+						  -1, "wdoc");
+	pfree(terms);
+	pfree(lens);
+	pfree(tfs);
+	if (positions)
+		pfree(positions);
+	return doc;
+}
+
+Datum
+to_wdoc_from_tsvector(PG_FUNCTION_ARGS)
+{
+	TSVector	tsv = PG_GETARG_TSVECTOR(0);
+	WeaveDoc	doc = weave_doc_from_tsvector(tsv, NULL);
+
 	PG_FREE_IF_COPY(tsv, 0);
 	PG_RETURN_WDOC(doc);
 }
@@ -375,4 +417,39 @@ weave_normalize_term(Oid cfgId, const char *term, int len, int *outlen)
 	if (prs.words)
 		pfree(prs.words);
 	return result;
+}
+
+/*
+ * The tsvector_lex_ops operators (doc/PHASES.md M7, ext 0.30.0):
+ * `tsvector @@@ wquery` and `tsvector <=> wquery` (and the commutators) are
+ * defined as the wdoc operators applied to to_wdoc(tsvector), so a heap
+ * recheck, a sequential scan and the index all answer the same question.
+ * The distance pair lives in rank.c beside weave_distance.
+ */
+PG_FUNCTION_INFO_V1(weave_tsv_match);
+PG_FUNCTION_INFO_V1(weave_tsv_match_commutator);
+
+static bool
+tsv_match(Datum tsvd, WeaveQuery q)
+{
+	TSVector	tsv = DatumGetTSVector(tsvd);
+	WeaveDoc	doc = weave_doc_from_tsvector(tsv, NULL);
+	bool		res = weave_doc_matches(doc, q);
+
+	pfree(doc);
+	if ((Pointer) tsv != DatumGetPointer(tsvd))
+		pfree(tsv);
+	return res;
+}
+
+Datum
+weave_tsv_match(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(tsv_match(PG_GETARG_DATUM(0), PG_GETARG_WQUERY(1)));
+}
+
+Datum
+weave_tsv_match_commutator(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(tsv_match(PG_GETARG_DATUM(1), PG_GETARG_WQUERY(0)));
 }

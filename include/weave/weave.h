@@ -217,6 +217,14 @@ extern WeaveDoc weave_doc_build(uint32 nterms, char **terms, const int *lens,
 							const uint32 *tfs, bool has_pos,
 							const uint32 *positions, int64 doclen,
 							const char *errctx);
+/* to_wdoc(tsvector) and the tsvector_lex_ops index boundary (tsanalyze.c);
+ * the argument is a detoasted TSVector, void here so this header does not
+ * pull in tsearch/ts_type.h (core's TSVectorData has no struct tag) */
+#define WEAVE_TSV_POSITIONLESS	0x01	/* some lexeme has no positions */
+#define WEAVE_TSV_CAPPED		0x02	/* some lexeme at 255 positions, or a
+										 * position at 16,383 */
+extern WeaveDoc weave_doc_from_tsvector(const void *tsv, uint32 *tsvflags);
+extern uint32 weave_tsvector_flags(const void *tsv);
 extern uint64 weave_doc_default_len(uint32 nterms, const uint32 *tfs, bool has_pos,
 									 const uint32 *positions);
 extern uint64 weave_doc_default_len_of(WeaveDoc doc);

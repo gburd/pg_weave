@@ -76,7 +76,7 @@ SELECT amvalidate(oid) FROM pg_opclass
   WHERE opcname = 'wi_bogus_ops' AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'weave');
 ERROR:  operator family "wi_bogus_ops" is not a pg_weave channel family
 DETAIL:  The "weave" access method routes each index column to a retrieval channel by its operator class.
-HINT:  Use wdoc_lex_ops for a wdoc column, wvec_weave_ops for a wvec column, or gram_ops for a text column.
+HINT:  Use wdoc_lex_ops for a wdoc column, tsvector_lex_ops for a tsvector column, wvec_weave_ops for a wvec column, or gram_ops for a text column.
 -- ... and the two real ones validate.
 SELECT opcname, amvalidate(oid) FROM pg_opclass
   WHERE opcmethod = (SELECT oid FROM pg_am WHERE amname = 'weave') AND opcname <> 'wi_bogus_ops'
@@ -91,15 +91,16 @@ SELECT opcname, amvalidate(oid) FROM pg_opclass
  int4_docval_ops   | t
  int8_docval_ops   | t
  text_docval_ops   | t
+ tsvector_lex_ops  | t
  wdoc_lex_ops      | t
  wvec_weave_ops    | t
-(10 rows)
+(11 rows)
 
 -- An index built on it is refused too, by the same registry lookup.
 CREATE INDEX vi_bad ON vi USING weave (d, id wi_bogus_ops);
 ERROR:  operator family "wi_bogus_ops" is not a pg_weave channel family
 DETAIL:  The "weave" access method routes each index column to a retrieval channel by its operator class.
-HINT:  Use wdoc_lex_ops for a wdoc column, wvec_weave_ops for a wvec column, or gram_ops for a text column.
+HINT:  Use wdoc_lex_ops for a wdoc column, tsvector_lex_ops for a tsvector column, wvec_weave_ops for a wvec column, or gram_ops for a text column.
 DROP OPERATOR CLASS wi_bogus_ops USING weave;
 -- ---- the build callback found the wdoc ---------------------------------
 -- 300 documents indexed through a two-column index whose FIRST column is the

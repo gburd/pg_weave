@@ -222,6 +222,14 @@ typedef struct WeaveBuildState
 	 * sorted once before the dictionary is written */
 	double		ndocs;
 	double		sumdoclen;
+	/*
+	 * M7: live documents of a tsvector_lex_ops column with a positionless
+	 * lexeme (stripped or mixed), for the one WARNING CREATE INDEX gives.  Set
+	 * only by the two heap-scan paths (weave_build and the parallel worker);
+	 * NOT reset by a segment flush, which is why they are not beside the
+	 * per-segment ndocs above in the reset either.
+	 */
+	double		tsv_positionless;
 	Size		flush_budget;	/* current in-memory budget before a segment is
 								 * flushed; grows as this participant flushes more,
 								 * so the flush count stays far under
@@ -978,6 +986,7 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 	WeaveTermEntry *entries;
 	uint32		i;
 	MemoryContext old;
+	uint32		tsvflags;
 
 	bool		nulldoc;
 
@@ -1094,7 +1103,7 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 		return;					/* no postings, and not a BM25 document */
 	}
 
-	doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
+	doc = weave_index_lexdoc(index, bs->lexattno, values[lexidx], &tsvflags);
 	entries = WEAVE_DOC_ENTRIES(doc);
 
 	for (i = 0; i < doc->nterms; i++)
@@ -1126,6 +1135,8 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 	{
 		bs->ndocs += 1.0;
 		bs->sumdoclen += doc->doclen;
+		if (tsvflags & WEAVE_TSV_POSITIONLESS)
+			bs->tsv_positionless += 1.0;
 	}
 
 	/*
@@ -5347,6 +5358,7 @@ typedef struct WeaveShared
 	slock_t		mutex;
 	int			nparticipantsdone;
 	double		reltuples;
+	double		tsv_positionless;	/* M7: summed WeaveBuildState counts */
 	/* ParallelTableScanDescData follows (alignment: allocated separately) */
 }			WeaveShared;
 
@@ -5434,6 +5446,7 @@ weave_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 
 	pscan = ParallelTableScanFromBM25Shared(weaveshared);
 
+	bs.tsv_positionless = 0;
 	bs.ctx = AllocSetContextCreate(CurrentMemoryContext, "weave parallel worker",
 								   ALLOCSET_DEFAULT_SIZES);
 	bs.want_positions = weave_index_wants_positions(index);
@@ -5479,6 +5492,7 @@ weave_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	SpinLockAcquire(&weaveshared->mutex);
 	weaveshared->nparticipantsdone++;
 	weaveshared->reltuples += reltuples;
+	weaveshared->tsv_positionless += bs.tsv_positionless;
 	SpinLockRelease(&weaveshared->mutex);
 	ConditionVariableSignal(&weaveshared->workersdonecv);
 
@@ -5557,6 +5571,7 @@ weave_begin_parallel(Relation heap, Relation index, bool isconcurrent,
 	weaveshared->isconcurrent = isconcurrent;
 	weaveshared->nparticipantsdone = 0;
 	weaveshared->reltuples = 0.0;
+	weaveshared->tsv_positionless = 0.0;
 	ConditionVariableInit(&weaveshared->workersdonecv);
 	SpinLockInit(&weaveshared->mutex);
 
@@ -5609,7 +5624,7 @@ weave_begin_parallel(Relation heap, Relation index, bool isconcurrent,
  * the DSM before it is unmapped).
  */
 static double
-weave_end_parallel(WeaveLeader *weaveleader)
+weave_end_parallel(WeaveLeader *weaveleader, double *tsv_positionless)
 {
 	int			i;
 	double		worker_tuples;
@@ -5621,6 +5636,7 @@ weave_end_parallel(WeaveLeader *weaveleader)
 
 	/* read the workers' accumulated tuple count while the DSM is still mapped */
 	worker_tuples = weaveleader->weaveshared->reltuples;
+	*tsv_positionless += weaveleader->weaveshared->tsv_positionless;
 
 	if (IsMVCCSnapshot(weaveleader->snapshot))
 		UnregisterSnapshot(weaveleader->snapshot);
@@ -5748,6 +5764,7 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		weaveleader = weave_begin_parallel(heap, index, indexInfo->ii_Concurrent,
 										 indexInfo->ii_ParallelWorkers);
 
+	bs.tsv_positionless = 0;
 	bs.ctx = AllocSetContextCreate(CurrentMemoryContext, "weave build",
 								   ALLOCSET_DEFAULT_SIZES);
 	bs.want_positions = weave_index_wants_positions(index);
@@ -5797,7 +5814,7 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		weave_build_flush_segment(index, &bs);
 
 		/* add the workers' tuple counts BEFORE tearing down the DSM */
-		reltuples += weave_end_parallel(weaveleader);
+		reltuples += weave_end_parallel(weaveleader, &bs.tsv_positionless);
 
 		/*
 		 * Finalize the participants' segments.  Rather than always collapsing to
@@ -5870,6 +5887,20 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	weave_segwrite_unlock(index);
 	MemoryContextDelete(bs.ctx);
+
+	/*
+	 * M7 decision 1 (maintainer, 2026-10-07): a stripped or mixed tsvector is
+	 * ACCEPTED -- GIN accepts it, and refusing would make INSERTs fail once the
+	 * index exists -- but CREATE INDEX and REINDEX say so, once, with the count.
+	 * Never per INSERT; weave_index_tsvector_stats() reports the live count.
+	 */
+	if (bs.tsv_positionless > 0)
+		ereport(WARNING,
+				(errcode(ERRCODE_WARNING),
+				 errmsg("%.0f documents indexed by \"%s\" have lexemes without positions",
+						bs.tsv_positionless, RelationGetRelationName(index)),
+				 errdetail("Such a lexeme is indexed with term frequency 1 and matches no phrase, so BM25 ranking of these documents is approximate."),
+				 errhint("A tsvector loses its positions through strip() or by concatenating a positionless value; weave_index_tsvector_stats() counts the affected documents.")));
 
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
 	result->heap_tuples = reltuples;
@@ -6284,7 +6315,7 @@ weave_insert(Relation index, Datum *values, bool *isnull,
 	}
 	else
 	{
-		doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
+		doc = weave_index_lexdoc(index, layout.lexattno, values[lexidx], NULL);
 		doclen = VARSIZE(doc);
 	}
 
