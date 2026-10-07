@@ -62,6 +62,11 @@ SELECT (to_wdoc(tsv) || to_wdoc(tsv))::text AS twice FROM mix;
 SELECT to_wdoc(tsv) || to_wdoc(tsv) @@@ 'tag <-> quick'::tsquery::wquery AS tag_quick,
 	   to_wdoc(tsv) || to_wdoc(tsv) @@@ 'fox <-> quick'::tsquery::wquery AS fox_quick
   FROM mix;
+-- both round-trip through the text form (the unknown position prints as @0)
+SELECT wdoc_send(to_wdoc(tsv)::text::wdoc) = wdoc_send(to_wdoc(tsv)) AS mixed_rt,
+	   wdoc_send((to_wdoc(tsv) || to_wdoc(tsv))::text::wdoc)
+		 = wdoc_send(to_wdoc(tsv) || to_wdoc(tsv)) AS twice_rt
+  FROM mix;
 -- a weight zone never contains an unknown position (a positionless document
 -- matches no zone either; core matches any weight there -- a recorded
 -- divergence).  wquery's own term:A syntax: the tsquery cast drops weights.
@@ -156,6 +161,8 @@ RESET enable_seqscan;
 -- the statistic before and after DELETE + VACUUM: the stripped row 3, the
 -- capped row 5 and the late stripped row 201 leave it
 DELETE FROM tsi WHERE id IN (3, 5, 201);
+-- exact under MVCC: they leave it at commit, before any VACUUM
+SELECT * FROM weave_index_tsvector_stats('tsi_ix');
 VACUUM tsi;
 SELECT * FROM weave_index_tsvector_stats('tsi_ix');
 SELECT ndocs FROM weave_index_stats('tsi_ix');
