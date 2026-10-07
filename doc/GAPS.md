@@ -5654,6 +5654,27 @@ EC2 at two scales first (hard rules 9 and 11).
   and the function looks it up by (index, heap TID, query), so a nested scan cannot
   overwrite the outer one's.
 
+**THE BAR, corrected by the lead on 2026-10-07.** The substituted value is EXACTLY THE VALUE THE
+SCAN ORDERED THE STREAM BY: its own `xs_orderbyvals` entry, or its padding value. Only
+RESJUNK entries are touched. It is not "what the ORDER BY expression would compute", which
+for `<=>` is the N = 1 `weave_distance()` and differs from the corpus value the stream is
+in. The lexical route ships on that bar. `sql/score_reuse.sql` §4 checks it per row
+against `weave_search()`'s distance, and §5 checks it through every reader.
+
+**`fuse()` qualifies under the corrected bar and is OWED, not done.** Its resjunk entry
+is `fuse(weave_lexscore(d <=> a), ...)`, and the scan's slot-0 value is the fused `-S` it
+ordered by (`weave_fuse_pass()`). Substituting needs:
+(1) the fused score published per row, from the ranked emission and from
+`weave_pad_emit()`'s fused padding value (`-0` lexical-only, `+Infinity` with a vector
+key, NULL for a row with a NULL channel, G56/G71/G76);
+(2) a matcher for the resjunk `fuse()` against the scan's ORDER BY list (several keys plus
+the `<~>` transport, where the lexical route has one key);
+(3) tests through the readers: `WITH TIES` and an Incremental Sort over a fused scan,
+against `weave_fuse_search()`'s scores, under both `pg_weave.fuse_normalize` modes and
+with padding rows in the window;
+(4) its own EC2 measurement. Its prize is larger than the lexical one's (one detoast and
+rescore per CHANNEL per row: 800 `weave_distance` + 800 `weave_lexscore` at LIMIT 400).
+
 **FIXED for the lexical route, 2026-10-07 (`wt/g86`).** `weave_planner()`'s plan walk
 (`src/am/customscan.c`, the same walk as the G87 hint) gained `weave_reuse_distance()`. It
 runs on an Index Scan on a weave index with ONE ORDER BY key `wdoc <=> wquery`. Each
@@ -5661,7 +5682,8 @@ RESJUNK target-list entry `equal()` to that key becomes
 
     COALESCE(weave_current_distance(index, ctid, q), d <=> q)
 
-`weave_current_distance(regclass, tid, wquery)` (new in **0.29.0**, `src/am/amscan.c`) returns
+`weave_current_distance(regclass, tid, wquery)` (new in **0.29.0**, `src/am/amscan.c`; the name
+is a LEAD DECISION, 2026-10-07) returns
 the value the live lexical ordering scan on that index published for that heap TID under
 that query, and NULL otherwise. NULL is also its answer outside any scan, so on a miss the
 operator runs exactly as before. `pg_weave.reuse_distance = off` disables it.
@@ -5677,7 +5699,12 @@ How it differs from pg_fts's `efca0cf`, and why:
   every row, on another index and on the same index and query, and checks the outer
   `WITH TIES` set against the reference.
 - **A miss falls back to the operator rather than to a stale or NULL key**, through the
-  COALESCE.
+  COALESCE. The lead approved a four-argument form, `(regclass, tid, wdoc, wquery)`, that
+  calls `weave_distance(d, q)` itself on a mismatch. The shipped form keeps that fallback
+  in the plan instead, for two reasons. The function then answers NULL outside a scan, as
+  the brief required. And every fallback call is a real `weave_distance` call that
+  `track_functions` counts, which is what lets `sql/score_reuse.sql` §6 show the hit rate.
+  The two forms give the same value on every row.
 - **The function is found by syscache, in the wquery type's schema, and must be C with link
   symbol `weave_current_distance`.** pg_fts's rule. A same-named SQL function is never
   planted (tested), and a catalog that predates 0.29.0 has none, so reuse is off there. A
@@ -5728,13 +5755,21 @@ a 400-row ranked query on long text from 9 ms into 0.2 ms (46x), and a two-term 
 15.3 into 6.6 ms. The corpus is synthetic, so this is a mechanism measurement and not a
 real-corpus claim.
 
-Tests: `sql/score_reuse.sql`, with mutants each verified to BUILD and then FAIL it: a
-visible entry substituted too; the previous row's value published; the AM and type guards
-removed (any ordering scan substituted). A fourth, with only the AM guard removed,
-**survives, and is equivalent**: the `wdoc <=> wquery` type test already excludes every
-other access method, because no other AM orders by that operator. The brief's "substitute
-when the scan is not a weave scan" mutant is therefore the AM-and-type one. The fifth
-mutant, the unkeyed global, is in the second EC2 job; see the results file.
+Tests: `sql/score_reuse.sql`. Mutants ran on EC2 (`pgweave-20261007-002744-3074`, job
+script stage C), each built and installed, then run against the committed expected output.
+**Killed:** a visible entry substituted too (500 of 500 visible values changed); the
+previous row's value published (9 wrong row values, `WITH TIES` 173 not 172, all three
+rescans mismatched); the AM and type guards removed (GiST `<->` and vector `<->`
+substituted); the unkeyed global, pg_fts's design with the index, TID and query checks
+removed (both §7 clobber checks false). **Survived, and equivalent:** the AM guard alone
+removed. The `wdoc <=> wquery` type test already excludes every other access method,
+because no other AM orders by that operator. The brief's "substitute when the scan is not
+a weave scan" mutant is therefore the AM-and-type one.
+
+PG17 smoke on `b5e1beb` (`pgweave-20261007-002744-3074`): regression 26/26, isolation
+2/2, TAP 33 files / 1,275 tests. `expected/limit_hint.out` changed by exactly the two
+substituted `Output:` lines and the header padding they widen. That is semantic, intended,
+and inspected line by line (hard rule 3).
 - **Which channels' scan values equal the operator's.** Lexical `<=>`: the scan's value is
   the corpus BM25 distance and `weave_distance()` is the N = 1 one. They are not equal, so
   only RESJUNK entries may be substituted (pg_fts's rule). Vector `<->`/`<#>`/`<=>`: the
@@ -5748,10 +5783,9 @@ mutant, the unkeyed global, is in the second EC2 job; see the results file.
   `fuse()`: the scan's `-S` sums CORPUS BM25 and quantized vector scores in a different
   order from `weave_fuse()` (F5: last-ULP differences), and the resjunk `fuse()` evaluates
   each `d <=> q` at N = 1. So the substituted value would differ from the computed one by
-  far more than an ULP, exactly as the lexical one does. The brief's bar was bit-for-bit,
-  it is not met, and `fuse()` is not substituted. Under the lexical case's actual rule
-  ("a hidden sort key gets the value the stream is ordered by"), fuse() would qualify.
-  That decision is the maintainer's.
+  far more than an ULP, exactly as the lexical one does. So "bit for bit equal to what
+  the ORDER BY expression computes" is met by NEITHER, and was the wrong bar (see the
+  corrected one below).
 
 ### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`); the fused route is still OWED**
 
