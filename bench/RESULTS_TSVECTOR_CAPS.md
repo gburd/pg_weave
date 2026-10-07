@@ -224,8 +224,8 @@ the gap (p1: 0.9951) and cannot recover the rest, because tf itself is capped.
 
 ## Measure 3: heap bytes
 
-Run 2 (run 1 is byte-identical on every corpus both ran). Per-value `pg_column_size`
-averaged, and `pg_total_relation_size` of a two-column (id, value) table holding that
+Run 2. Run 1 gives identical per-value averages on every corpus both runs measured,
+and table sizes within 0.6 %. Per-value `pg_column_size` averaged, and `pg_total_relation_size` of a two-column (id, value) table holding that
 representation. TOAST compression `pglz`.
 
 | corpus / cfg | text bytes (raw / stored) | tsvector | wdoc (with positions) | wdoc, no positions | table: text / tsvector / wdoc / wdoc no-pos (MB) |
@@ -252,7 +252,7 @@ the tsvector the user already had. Run 1, wiki1 simple: 454 MB of tsvector inste
 454 MB plus 728 MB of wdoc.
 
 The weave index itself is the same size whichever representation it was built from
-(`idxsize.tsv`: `ix_tsv` within 0.1 % of `ix_exact` on every corpus). Positions are not
+(`idxsize.tsv`: `ix_tsv` within 0.06 % of `ix_exact` on every corpus). Positions are not
 indexed by default, so the index only sees tf and length.
 
 ## Controls, and what they rule out
@@ -265,7 +265,7 @@ indexed by default, so the index only sees tf and length.
   harness can see a tf loss.
 - **Between runs (hard rule 10):** for the same arm, BEIR nDCG@10 differs between run 1
   and run 2 by at most 0.0002 (`exact`, nfcorpus) and MRR@10 by at most 0.0062 (`strip`,
-  nfcorpus). Heap sizes are byte-identical between the runs. The most likely cause is the parallel `CREATE TABLE AS` that builds each
+  nfcorpus). Per-value sizes are identical between the runs, and table sizes agree within 0.6 %. The most likely cause is the parallel `CREATE TABLE AS` that builds each
   table: physical row order, and so docid order, differs between runs, and docid breaks
   BM25 score ties. Within a run, `exact2` shows the scan itself is deterministic. A
   cross-run difference smaller than this floor is not a result.
