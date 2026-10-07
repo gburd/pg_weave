@@ -245,3 +245,57 @@ the conservative read given hard rule 10.
   and the postings unioned across them) rather than automaton stepping, based on a
   dev-box read; this run does not re-derive that diagnosis, only the for-the-record
   latency number.
+
+## G88: approximate regex `atom{~k}`, measured (2026-10-07)
+
+Harness: `bench/fuzzy.sh` extended with six `{~k}` patterns (`APPROX_LABELS`), via
+`bench/aws/run.sh c7i.4xlarge fuzzy`. Commit under test: `584c19d` (`wt/g88`). Raw log:
+`bench/aws/out/pgweave-20261007-165303-a2f7/fuzzy.log`. Same host shape, corpus, method and
+two passes per arm as above; PostgreSQL 17.11 on Debian 13. The smoke ran first and passed
+(regression, isolation, `Files=34, Tests=1254 ... Result: PASS`).
+
+**Correctness first.** The oracle for an approximate pattern is TRE itself, so the reference is
+the heap predicate (`to_wdoc('simple', body) @@@ '/re/'` per row, a no-index plan), not `~`.
+Every index count equalled it in both arms: `^(t123456){~1}$` 1,484 rows, `^(t123456){~2}$`
+34,680, `^t1234(56){~1}$` 588, `^t123(456){~2}$` 8,932, `^e12(34){~1}$` 1,900,
+`(e1234){~2}` 348,008. No pattern was empty (the harness refuses one).
+
+p50 ms, pass A / pass B (p99 within 1 ms of p50 everywhere):
+
+| pattern | what it is | `trigrams = off` | `trigrams = on` | terms TRE accepted | dict pages, off / on |
+|---|---|---|---|---|---|
+| `^(t123456){~1}$` | whole token, k = 1 | 96.49 / 96.40 | 96.30 / 96.17 | 53 | 1020 / 1020 |
+| `^(t123456){~2}$` | whole token, k = 2 | 138.65 / 139.06 | 138.93 / 138.71 | 1,241 | 1020 / 1020 |
+| `^t1234(56){~1}$` | literal prefix outside the atom | 72.33 / 72.12 | **0.64 / 0.67** | 21 | 1020 / 142 |
+| `^t123(456){~2}$` | same, k = 2 | 70.83 / 71.73 | **2.62 / 2.61** | 319 | 1020 / 167 |
+| `^e12(34){~1}$` | id vocabulary, prefix outside | 54.82 / 54.75 | **0.17 / 0.18** | 19 | 1020 / 6 |
+| `(e1234){~2}` | id vocabulary, whole, unanchored | 257.89 / 257.38 | 259.37 / 257.87 | 10,887 | 1020 / 1020 |
+
+For comparison on the same run: `t123456~1` 97.2-97.5 ms, `t123456~2` 339.3-340.0 ms (the
+fuzzy channel), `/e12[0-9]{2}/` 53.9-54.6 ms off and 1.19-1.20 ms on.
+
+**Against Z5's 200 ms gate for fuzzy terms:** five of six patterns are under it in both arms.
+The whole-token `{~1}` and `{~2}` patterns (96 and 139 ms) cost the same as one dictionary walk
+running TRE over the ~250,000-term vocabulary (all 1020 dictionary pages). `{~2}` on a whole
+token is *faster* than `t123456~2` (139 vs 340 ms) even though it reads more pages (1020 vs
+983); the two routes accept different term sets (TRE's insertion rule, `FUZZY_CHANNEL.md`
+§2.1) and their per-term costs were not profiled, so the cause is **unmeasured**. A literal
+outside the approximate atom lets the weft narrow, and that is the large win: 72 ms to
+0.65 ms, 55 ms to 0.17 ms.
+
+**Loss, recorded as prominently:** `(e1234){~2}` is **258 ms in both arms, over the 200 ms
+gate.** Unanchored, it accepts 10,887 dictionary terms (id-shaped ones and filler
+tokens containing a near-`e1234` substring, e.g. `t1234...`) and 348,008 rows (35 % of the
+table), so the time is posting decode and merge for a third of the corpus, the same fanout wall
+`/e[0-9]{4}/` hits at 326 ms and `term~2` hits at 340 ms. The narrowing cannot help (no literal
+outside the atom), and no prefilter could: the answer is a third of the table. As for the other
+two, the lever is a bounded top-k (Phase F), not a better filter.
+
+**Also a loss:** the whole-token patterns get nothing from `trigrams = on` (identical latency,
+`regex_trgm = 0`). That is the extractor being sound, not lazy: an edit anywhere in the atom can
+destroy any trigram, so none is required. A (k+1)-pigeonhole prefilter over the literal child of
+an atom would narrow these; the imported one was unsound and was deleted (`doc/GAPS.md` G88),
+and a correct one is not built. Unmeasured: whether it would beat the 96 ms walk.
+
+Provisional in hard rule 11's sense: one scale (1M rows), two passes on one host.
+
