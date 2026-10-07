@@ -410,7 +410,6 @@ SELECT regex_trgm > 0 AS the_narrowing_was_applied FROM weave_channel_stats();
 (1 row)
 
 DROP TABLE rg;
-
 RESET enable_seqscan;
 DROP TABLE rd;
 DROP TABLE rdo;
