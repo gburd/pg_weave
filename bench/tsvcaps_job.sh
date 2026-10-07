@@ -472,7 +472,8 @@ SELECT wdoc_length(to_wdoc('english'::regconfig, 'the cat sat on the mat')) AS e
 SQL
 cat "$OUT/probes.txt"
 # The NOTICE, not the text: psql -e echoes the statement, which contains the same words.
-grep -q 'NOTICE:  P5 binary round trip' "$OUT/probes.txt" || die "probes did not run to the end"
+grep -q 'NOTICE:  P5 binary round trip' "$OUT/probes.txt" \
+	|| { echo "PROBES did not run to the end" | tee -a "$OUT/failed.txt"; FAILED=1; }
 
 
 printf 'corpus\tcfg\tndocs\tn_tsv_error\tn_tf_cap_reached\tn_pos_cap_reached\tn_tf_wrong\tn_len_b_wrong\tn_len_c_wrong\tn_len_gt_16383\tn_len_c_selfcheck_fail\tavg_len\tp50_len\tp90_len\tp99_len\tmax_len\tsum_len_a\tsum_tf_a\tsum_len_b\tsum_len_c\tlong_avg_len_b_over_a\tlong_avg_len_c_over_a\tn_rt_checked\tn_rt_fail\n' > "$OUT/caps.tsv"
