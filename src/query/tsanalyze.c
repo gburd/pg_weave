@@ -86,8 +86,11 @@ cmp_tsword(const void *a, const void *b)
 /*
  * Build an wdoc from the words produced by parsetext() (called with
  * prs->pos = WEAVE_PRS_POS_BASE).  The words are not sorted and may contain
- * duplicates and several variants per position.  doclen is the number of token
- * positions, stopwords included.  A dictionary can emit the same lexeme twice
+ * duplicates and several variants per position.  doclen is the number of
+ * tokens that produced at least one lexeme (weave_doc_default_len: stopwords do
+ * not count, a token with two lexemes counts once).  ntok, every token
+ * including stopwords, is only the G89 bookkeeping check's bound.  A
+ * dictionary can emit the same lexeme twice
  * for one token (ispell: 'footballklubber' -> ...klubber...klubber); like
  * to_tsvector, that counts once, so tf is the term's number of distinct
  * positions and positions stay strictly ascending.
@@ -105,10 +108,11 @@ wdoc_from_parsed(ParsedText *prs, uint8 label)
 	uint32		nterms = 0;
 	uint32		npos = 0;
 	uint32		last = 1;
+	int64		nlexpos = 0;	/* tokens with >= 1 lexeme: the doclen */
 	int			i;
 
 	if (nw == 0)
-		return weave_doc_build(0, NULL, NULL, NULL, true, NULL, ntok, "wdoc");
+		return weave_doc_build(0, NULL, NULL, NULL, true, NULL, 0, "wdoc");
 
 	/*
 	 * prs->words is one plain repalloc'd array of 24-byte entries, so nw is
@@ -120,6 +124,9 @@ wdoc_from_parsed(ParsedText *prs, uint8 label)
 		uint32		r = prs->words[i].pos.pos;	/* true ordinal mod 65536 */
 
 		last += (r - last) & 0xFFFF;
+		/* words come in token order, so a new ordinal is a new token */
+		if (i == 0 || last != tw[i - 1].pos)
+			nlexpos++;
 		tw[i].word = prs->words[i].word;
 		tw[i].len = prs->words[i].len;
 		tw[i].pos = last;
@@ -158,7 +165,7 @@ wdoc_from_parsed(ParsedText *prs, uint8 label)
 		positions[npos++] = WEAVE_POS_MAKE(tw[i].pos, label);
 	}
 
-	return weave_doc_build(nterms, terms, lens, tfs, true, positions, ntok,
+	return weave_doc_build(nterms, terms, lens, tfs, true, positions, nlexpos,
 						   "wdoc");
 }
 

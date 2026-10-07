@@ -67,9 +67,10 @@ typedef struct WeaveDocData
 	uint16		version;		/* format version, currently 3 */
 	uint16		flags;			/* WEAVE_DOCF_* */
 	uint32		nterms;			/* number of distinct terms */
-	uint32		doclen;			/* BM25 length: tokens, stopwords included, for a
-								 * regconfig analyzer; else the sum of tf.  Always
-								 * >= every tf (doc/GAPS.md G90) */
+	uint32		doclen;			/* BM25 length: the number of tokens that produced
+								 * a lexeme, on every input path (doc/PHASES.md M7;
+								 * weave_doc_default_len).  Always >= every tf
+								 * (doc/GAPS.md G90) */
 	uint32		lexbytes;		/* total bytes of lexemes[] (to find positions[]) */
 	WeaveTermEntry entries[FLEXIBLE_ARRAY_MEMBER];
 } WeaveDocData;
@@ -216,6 +217,9 @@ extern WeaveDoc weave_doc_build(uint32 nterms, char **terms, const int *lens,
 							const uint32 *tfs, bool has_pos,
 							const uint32 *positions, int64 doclen,
 							const char *errctx);
+extern uint64 weave_doc_default_len(uint32 nterms, const uint32 *tfs, bool has_pos,
+									 const uint32 *positions);
+extern uint64 weave_doc_default_len_of(WeaveDoc doc);
 extern char *weave_normalize_term(Oid cfgId, const char *term, int len, int *outlen);
 
 /* pg_weave_query.c -- parse query text into an wquery */
