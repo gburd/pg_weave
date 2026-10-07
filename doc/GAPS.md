@@ -5630,7 +5630,7 @@ substituted value equals the computed one on every row, both normalizer modes, i
 the padding rows (G56/G71), whose stored distance is +Infinity or NULL. Measure the gain on
 EC2 at two scales first (hard rules 9 and 11).
 
-### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`); the fused route is still OWED**
+### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`) and the fused `fuse()` route (`wt/hintfuse`); the vector `<->`/`<#>` route is NOT HINTABLE without a format decision**
 
 An index AM is not told the LIMIT. pg_weave starts every ordered lexical pass at
 `weave_ord_width(pg_weave.wand_initial_k)` = `max(4 x 32, 64)` = **128** and widens x4 on
@@ -5721,6 +5721,111 @@ header compared; the cap removed. PG17 and PG18 installcheck 25/25, TAP 33 files
 **Still OWED:** the fused route (`so->fusek`, `weave_fuse_pass()`), whose several ORDER BY
 keys mean the hint has to travel on the `<~>` transport key; and the vector route
 (`so->veck`).
+
+**Measured before building, 2026-10-06 (hard rule 9; `wt/hintfuse`).** Proxy for a hinted
+LIMIT 10: `pg_weave.wand_initial_k = 16`, so the first width is 64, against the default
+32 (width 128). EC2 c7i.4xlarge, PG17, 200k documents, the same lexical corpus as above
+plus a 32-d vector per row (every 997th NULL) that drifts smoothly with the row id,
+LIMIT 10, two runs per arm, median of 25 warm runs. Run `pgweave-20261006-205828-0b58`
+(smoke green on `4c7dcca`). The answers (md5 of the id list) were identical at both widths.
+
+| query | width 128 -> 64: `weave_fuse_stats().scores` | vec_lanes | ms 128 (run 1 / 2) | ms 64 (run 1 / 2) |
+|---|---:|---:|---:|---:|
+| `fuse(d <=> 'a \| b \| c', v <-> q)` | 103,539 -> 80,313 (-22 %) | 199,800 both | 34.1 / 34.0 | 32.8 / 32.6 |
+| `fuse(d <=> 'c', v <-> q)` | 47,833 -> 46,195 (-3 %) | 199,800 both | 24.1 / 24.1 | 23.8 / 23.6 |
+| `fuse(d <=> 'a \| b', d <=> 'c')` | 3,567 -> 1,781 (-50 %) | — | 2.38 / 2.37 | 2.22 / 2.21 |
+| `v <-> q` (vector route) | — | 199,800 both, 0 blocks bound-skipped | 14.0 / 14.0 | 14.0 / 13.7 |
+
+- **Fused: the work moves**, by 3 % to 50 % depending on how much of it is lexical, and the
+  time follows by 1-7 %. The vector channel inside a fused scan scores every lane at both
+  widths here, so the hybrid queries keep most of their cost. Built; see below.
+- **Vector route: NOT HINTABLE WITHOUT A DECISION, and on this corpus the work did not move
+  anyway.** Its ORDER BY argument is a `wvec`, whose only spare field is the `int16 unused`
+  word (`include/weave/vector.h`, "zeroed; reserved for a per-value flag word";
+  `wvec_recv()` rejects a nonzero one). Using it as a planner-only carrier is a format
+  decision, not something this task takes. The measurement also gives no reason to take it:
+  `vec_lanes` was 199,800 at both widths and the block bound skipped nothing, so the
+  first-pass width did not change the work. This corpus is a poor test of the bound (every
+  vector is nearly equidistant from the query, the `bench/RESULTS_BOUND_PRUNING.md`
+  failure mode), so the result is **corpus-limited, not a ceiling**: on a clustered corpus
+  where the block bound prunes, a narrower top-k threshold could prune more. Unmeasured.
+
+**FIXED for the fused route, 2026-10-06 (`wt/hintfuse`).** `weave_hint_indexscan()` no longer
+requires exactly one ORDER BY key. It hints the FIRST key whose argument is a `wquery` Const.
+Only `<=>` takes a `wquery`, so that is the only key of a lexical scan and the first lexical
+channel of a fused one. `weave_gettuple()` sets the fused first width from the first
+`WEAVE_STRAT_DISTANCE` channel through the same `weave_ord_first_width()`: first pass only,
+capped at the unhinted width, ladder unchanged.
+
+- **The carrier covers every fused shape the planner builds.** `src/am/fusepath.c` builds
+  no fused path without a channel on the lexical column (the transport key has to hang off
+  it), and refuses a parameterized `wquery`. So every planned fused scan has a lexical
+  wquery Const. A fused shape with no lexical channel (two vector keys) gets no fused path
+  at all, so it has nothing to hint. The `<~>` transport (`real[]`) was not used: it has no
+  spare field, and changing its type is a catalog change.
+- **`weave_fuse_search()` is not hinted.** It builds its own scan keys, there is no
+  planner, and its `k` already says how many rows it wants. It also serves as the test's
+  unhinted oracle.
+
+Tests: `sql/limit_hint_fuse.sql`, expected output from the full EC2 installcheck of
+`e4cc7c5` (`pgweave-20261006-230743-c6e1`, every self-check `t`). It covers three shapes
+(lexical + vector, vector + lexical, two lexical), both `fuse_normalize` modes, LIMIT
+1 / 10 / 100 / 300, OFFSET 7 and 200, a filter that rejects 96 of 97 ranked rows, NULL
+vectors padded after every ranked row (G71) both alone and after ranked rows, generic plans
+(constant LIMIT and `LIMIT $1`, two executions each) and a cursor. Answers are compared as
+score arrays against `weave_fuse_search()`. Seven mutants, each verified on EC2 to BUILD,
+install and then FAIL the test, with the unmutated tree passing solo before and after
+(`pgweave-20261006-231740-d74a`, `mut/summary.txt`):
+
+| mutant | caught by |
+|---|---|
+| the old one-key-only rule | less work at LIMIT 10, all three shapes |
+| hint only the first key | less work, vector-first shape |
+| no `break` in the planner's key loop | ERROR: the hint landed on the transport's operand slot |
+| no `break` in the scan's channel loop | less work, two-lexical shape |
+| the scan ignores the hint | less work, all three shapes |
+| no cap at the unhinted width | never more at LIMIT 100, all three shapes |
+| no widening past the first pass | padded rows ahead of ranked ones (`tail_ok=f`) |
+
+Full smoke on `f5b7673`: regression + isolation 28/28, TAP 33 files PASS. (`check-rename`
+FAILs on this host on `4c7dcca` too, before any change here.)
+
+EC2 c7i.8xlarge, PG17, the lexical corpus above plus a uniformly random 32-d vector per row
+(every 997th NULL), median of 25 warm runs, two runs per arm, 200k and 1M documents
+(`pgweave-20261006-231740-d74a`, commit `f5b7673`). The id list (md5) was identical with the
+hint on and off in every cell. `scores` is `weave_fuse_stats().scores`.
+
+| query, LIMIT 10 | n | scores off -> on | ms off (run 1 / 2) | ms on (run 1 / 2) |
+|---|---:|---:|---:|---:|
+| `fuse(d <=> 'a \| b', d <=> 'c')` | 200k | 3,567 -> 1,781 | 2.144 / 2.145 | **1.959 / 1.962** |
+| `fuse(d <=> 'a \| b', d <=> 'c')` | 1M | 3,567 -> 1,781 | 9.432 / 9.497 | **9.295 / 9.335** |
+| `fuse(d <=> 'a \| b \| c', v <-> q)` | 200k | 388,914 -> 379,254 | 36.435 / 36.400 | 35.983 / 35.994 |
+| `fuse(d <=> 'a \| b \| c', v <-> q)` | 1M | 1,845,322 -> 1,809,468 | 181.607 / 181.823 | 180.470 / 180.544 |
+| `fuse(d <=> 'c', v <-> q)` | 200k | 62,513 -> 60,632 | 19.487 / 19.514 | 19.401 / 19.402 |
+| `fuse(d <=> 'c', v <-> q)` | 1M | 214,571 -> 207,971 | 91.876 / 92.040 | 91.391 / 91.292 |
+| any of the three, LIMIT 100 | both | unchanged | — | within run-to-run spread |
+
+**What this says, stated as the loss it mostly is.** On every LIMIT 10 query the hint
+lowers the work and the time, at both scales, by more than the run-to-run spread. But the
+win is small everywhere except the pure-lexical fusion, and it shrinks with n:
+
+- **Two lexical channels:** the work halves, and the time drops 8.6 % at 200k but only
+  1.6 % at 1M. This is the lexical route's result again: on this synthetic corpus the time
+  goes to decoding posting pages, not to BM25 contributions.
+- **Lexical + vector, the flagship shape:** the work drops 2-3 % and the time 0.5-1.2 %.
+  The vector channel's share of `scores` (`vec_scores`, 917,372 of 1,845,322 at 1M) is
+  about one per document at both widths. **On random vectors the fused scan scores almost
+  every lane whatever its threshold**, so a narrower first pass has almost nothing to prune.
+  That is the `bench/RESULTS_BOUND_PRUNING.md` finding showing up in the fused route: the
+  hint is limited by how well the vector bound prunes, not by its own width. On a corpus
+  where the block bound prunes (real embeddings in docid-coherent order), the hint should
+  matter more. **Unmeasured**, and it should be re-measured on `bench/fuse.sh`'s BEIR
+  corpora before anyone quotes this as the hint's value.
+- **LIMIT 100:** unchanged work by construction (the cap), and time within spread.
+
+The vector `<->`/`<#>` route stays unhinted: see the measurement above. A decision would be
+needed to use `wvec`'s reserved `int16` as a planner-only carrier, and on the corpus
+measured it would not have changed the work.
 
 ### G88 — "approximate regex" is named in the product statement and does not ship: `{~k}` parses and is then ignored — **FOUND 2026-10-06 by the README rewrite; OPEN, needs a maintainer decision**
 
