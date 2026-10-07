@@ -78,9 +78,247 @@ BEIR=${BEIR:-scifact nfcorpus fiqa}
 CFGS=${CFGS:-simple english}
 # A tsvector over this many bytes of text MIGHT exceed the 1 MB limit, so those rows
 # go through an exception-catching wrapper (serial).  Below it the limit cannot be
-# reached: a tsvector spends at most ~3 bytes per byte of text (a 1-byte lexeme + its
-# separator costs 1 lexeme byte, <=1 alignment byte, 2 count bytes, 2 position bytes).
-BIGTXT=250000
+# reached: the limit is on the lexeme+position area (MAXSTRPOS, 1 MB - 1), which spends
+# at most 3 bytes per byte of text (a 1-byte lexeme + its 1-byte separator costs 1
+# lexeme byte, <=1 alignment byte, 2 count bytes, 2 position bytes = 6 per 2), and the
+# margin covers case folding that lengthens a UTF-8 sequence.
+BIGTXT=200000
+
+# ---------------------------------------------------------------------------
+# One (corpus, config): build the representations, measure, query every arm.
+#   $1 corpus name (table docs_$1 must exist)   $2 regconfig   $3 beir|wiki
+# ---------------------------------------------------------------------------
+one() {
+	local C=$1 G=$2 K=$3 tag="$1_$2"
+	say "$tag: representations"
+	$PSQL <<SQL
+SET max_parallel_workers_per_gather = 8;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+DROP TABLE IF EXISTS t0, t, q, st, h_text, h_tsv, h_wdoc, h_wdocnp, h_wdoctsv;
+CREATE TABLE t0 AS
+SELECT id, body,
+       CASE WHEN octet_length(body) <= $BIGTXT THEN to_tsvector('$G', body) END AS tsv,
+       octet_length(body) > $BIGTXT AS big,
+       to_wdoc('$G'::regconfig, body) AS a
+  FROM docs_$C;
+UPDATE t0 SET tsv = safe_tsv('$G', body) WHERE big;
+CREATE TABLE t AS
+SELECT t0.id, t0.body, t0.tsv, t0.a,
+       t0.a || to_wdoc(''::tsvector) AS x,
+       to_wdoc(t0.tsv) AS b,
+       CASE WHEN t0.tsv IS NULL THEN NULL
+            WHEN k.maxpos > k.npos
+            THEN to_wdoc(t0.tsv) || format('''zzpadzz'':%s', k.maxpos - k.npos)::wdoc
+            ELSE to_wdoc(t0.tsv) END AS c,
+       to_wdoc(strip(t0.tsv)) AS s,
+       k.maxnp, k.maxpos, k.npos, k.nlex,
+       wdoc_length(t0.a) AS len_a,
+       wdoc_length(t0.a || to_wdoc(''::tsvector)) AS sumtf_a,
+       wdoc_length(to_wdoc(t0.tsv)) AS len_b,
+       greatest(k.maxpos, k.npos) AS len_c
+  FROM t0, LATERAL tsv_caps(t0.tsv) k;
+DROP TABLE t0;
+VACUUM ANALYZE t;
+SQL
+
+	say "$tag: measure 1 (caps)"
+	$PSQL -At -F $'\t' >> "$OUT/caps.tsv" <<SQL
+SELECT '$C', '$G', count(*),
+       count(*) FILTER (WHERE tsv IS NULL),
+       count(*) FILTER (WHERE maxnp >= 255),
+       count(*) FILTER (WHERE maxpos >= 16383),
+       count(*) FILTER (WHERE tsv IS NOT NULL AND sumtf_a <> len_b),
+       count(*) FILTER (WHERE tsv IS NOT NULL AND len_a <> len_b),
+       count(*) FILTER (WHERE tsv IS NOT NULL AND len_a <> len_c),
+       count(*) FILTER (WHERE len_a > 16383),
+       count(*) FILTER (WHERE c IS NOT NULL AND wdoc_length(c) <> len_c),
+       round(avg(len_a)),
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY len_a),
+       percentile_disc(0.9) WITHIN GROUP (ORDER BY len_a),
+       percentile_disc(0.99) WITHIN GROUP (ORDER BY len_a),
+       max(len_a),
+       sum(len_a), sum(sumtf_a), sum(len_b), sum(len_c),
+       (SELECT count(*) FROM (SELECT a FROM t WHERE len_a > 16383 ORDER BY id LIMIT 200) z),
+       (SELECT count(*) FROM (SELECT a FROM t WHERE len_a > 16383 ORDER BY id LIMIT 200) z WHERE NOT rt_ok(a))
+  FROM t;
+SQL
+	tail -1 "$OUT/caps.tsv"
+
+	say "$tag: measure 3 (heap bytes)"
+	$PSQL -At -F $'\t' >> "$OUT/heap.tsv" <<SQL
+SELECT '$C', '$G', count(*),
+       round(avg(octet_length(body))),
+       round(avg(pg_column_size(body))),
+       round(avg(pg_column_size(tsv))),
+       round(avg(pg_column_size(a))),
+       round(avg(pg_column_size(x))),
+       round(avg(pg_column_size(b))),
+       round(avg(pg_column_size(s)))
+  FROM t;
+SQL
+	$PSQL <<SQL
+CREATE TABLE h_text AS SELECT id, body FROM t;
+CREATE TABLE h_tsv AS SELECT id, tsv FROM t;
+CREATE TABLE h_wdoc AS SELECT id, a FROM t;
+CREATE TABLE h_wdocnp AS SELECT id, x FROM t;
+CREATE TABLE h_wdoctsv AS SELECT id, b FROM t;
+VACUUM h_text, h_tsv, h_wdoc, h_wdocnp, h_wdoctsv;
+SQL
+	$PSQL -At -F $'\t' >> "$OUT/heaptab.tsv" <<SQL
+SELECT '$C', '$G',
+       pg_total_relation_size('h_text'), pg_total_relation_size('h_tsv'),
+       pg_total_relation_size('h_wdoc'), pg_total_relation_size('h_wdocnp'),
+       pg_total_relation_size('h_wdoctsv');
+DROP TABLE h_text, h_tsv, h_wdoc, h_wdocnp, h_wdoctsv;
+SQL
+
+	say "$tag: indexes"
+	$PSQL <<SQL
+CREATE INDEX ix_a ON t USING weave (a);
+CREATE INDEX ix_x ON t USING weave (x);
+CREATE INDEX ix_b ON t USING weave (b);
+CREATE INDEX ix_c ON t USING weave (c);
+CREATE INDEX ix_s ON t USING weave (s);
+SQL
+
+	$PSQL -At -F $'\t' -c "SELECT '$C', '$G', pg_relation_size('ix_a'), pg_relation_size('ix_x'),
+	        pg_relation_size('ix_b'), pg_relation_size('ix_c'), pg_relation_size('ix_s')" >> "$OUT/idxsize.tsv"
+
+	say "$tag: queries"
+	if [ "$K" = beir ]; then
+		# fuse.sh's rule: lower, split on non-alphanumerics, drop length <= 2 and
+		# the three operator words, de-duplicate, first 20, OR-joined; then the
+		# config normalizes each term.  A query that normalizes to nothing is
+		# dropped (and counted) for every arm alike.
+		$PSQL <<SQL
+CREATE TABLE q AS
+WITH tk AS (
+    SELECT q.qid, s.tok, min(s.ord) AS ord
+      FROM qtext_$C q,
+           LATERAL unnest(regexp_split_to_array(lower(q.txt), '[^a-z0-9]+'))
+                   WITH ORDINALITY AS s(tok, ord)
+     WHERE length(s.tok) > 2 AND s.tok NOT IN ('and', 'or', 'not', 'near')
+     GROUP BY q.qid, s.tok
+), r AS (
+    SELECT qid, tok, row_number() OVER (PARTITION BY qid ORDER BY ord) AS rn FROM tk
+), j AS (
+    SELECT qid, string_agg(tok, ' | ' ORDER BY rn) AS terms FROM r WHERE rn <= 20 GROUP BY qid
+)
+SELECT qid::text AS qid, 'beir'::text AS grp,
+       format('to_wquery(%L::regconfig, %L)', '$G', terms) AS qexpr
+  FROM j
+ WHERE to_wquery('$G'::regconfig, terms)::text <> '';
+SQL
+		echo -e "$tag\tqueries_total\t$($PSQL -At -c "SELECT count(*) FROM qtext_$C")\tqueries_run\t$($PSQL -At -c "SELECT count(*) FROM q")" >> "$OUT/queries.tsv"
+	else
+		# No qrels: queries are drawn from the corpus vocabulary by document
+		# frequency band, 25 queries each of 1, 2 and 3 OR-ed terms per band, in a
+		# deterministic md5 order.  Plus `captf`: 50 single-term queries on lexemes
+		# that reach the 255-position cap in at least one document, which is where
+		# a tf-cap effect has to show if it shows anywhere.
+		$PSQL <<SQL
+CREATE TABLE st AS
+SELECT word, ndoc FROM ts_stat('SELECT tsv FROM t WHERE tsv IS NOT NULL')
+ WHERE word ~ '^[a-z][a-z0-9]{2,19}$' AND word NOT IN ('and', 'or', 'not', 'near');
+CREATE TABLE q AS
+WITH n AS (SELECT count(*)::float8 AS n FROM t),
+b AS (
+    SELECT word,
+           CASE WHEN ndoc BETWEEN 2 AND 10 THEN 'rare'
+                WHEN ndoc >= 0.001 * n AND ndoc < 0.01 * n THEN 'mid'
+                WHEN ndoc >= 0.01 * n AND ndoc < 0.1 * n THEN 'common'
+                WHEN ndoc >= 0.1 * n THEN 'vcommon' END AS band
+      FROM st, n
+), r AS (
+    SELECT word, band, row_number() OVER (PARTITION BY band ORDER BY md5(word)) - 1 AS rn
+      FROM b WHERE band IS NOT NULL
+), s AS (
+    SELECT bb.band, nt, k, (CASE nt WHEN 1 THEN 0 WHEN 2 THEN 25 ELSE 75 END) + k * nt AS lo
+      FROM (SELECT DISTINCT band FROM r) bb, generate_series(1, 3) nt, generate_series(0, 24) k
+)
+SELECT format('%s_%s_%s', s.band, s.nt, s.k) AS qid, s.band || '_' || s.nt AS grp,
+       quote_literal(string_agg(r.word, ' | ' ORDER BY r.rn)) || '::wquery' AS qexpr
+  FROM s JOIN r ON r.band = s.band AND r.rn >= s.lo AND r.rn < s.lo + s.nt
+ GROUP BY s.band, s.nt, s.k
+HAVING count(*) = s.nt;
+INSERT INTO q
+SELECT 'captf_' || row_number() OVER (ORDER BY md5(word)), 'captf', quote_literal(word) || '::wquery'
+  FROM (SELECT word FROM (SELECT DISTINCT u.lexeme AS word
+                            FROM t, unnest(t.tsv) u
+                           WHERE t.maxnp >= 255 AND cardinality(u.positions) >= 255) d
+         WHERE word ~ '^[a-z][a-z0-9]{2,19}$' AND word NOT IN ('and', 'or', 'not', 'near')
+         ORDER BY md5(word) LIMIT 50) z;
+SQL
+		$PSQL -At -F $'\t' -c "SELECT '$tag', grp, count(*) FROM q GROUP BY grp ORDER BY grp" >> "$OUT/queries.tsv"
+	fi
+	$PSQL -c "\\copy (SELECT qid, grp FROM q ORDER BY qid) TO '$OUT/runs/${tag}_groups.tsv'"
+
+	$PSQL -c "TRUNCATE runs" >/dev/null
+	local arm col ix res nq ns qx
+	qx=$($PSQL -At -c "SELECT qexpr FROM q ORDER BY qid LIMIT 1")
+	for spec in exact:a:ix_a exact2:a:ix_a sumtf:x:ix_x tsv:b:ix_b tsvmaxpos:c:ix_c strip:s:ix_s; do
+		IFS=: read -r arm col ix <<< "$spec"
+		if [ "$arm" = exact2 ]; then
+			$PSQL -c "REINDEX INDEX ix_a" >/dev/null
+		fi
+		# The plan of one query per arm, ASSERTED: the weave index answering with
+		# an ordering scan.  A Seq Scan + Sort would give the same rows by a path
+		# that measures nothing about the index.
+		{
+			echo "== $tag $arm"
+			$PSQL -c "SET enable_seqscan = off; SET enable_bitmapscan = off;
+			          SET max_parallel_workers_per_gather = 0;
+			          EXPLAIN (COSTS OFF) SELECT id FROM t WHERE $col @@@ $qx ORDER BY $col <=> $qx LIMIT 100"
+		} > "$W/plan.txt" 2>&1
+		cat "$W/plan.txt" >> "$OUT/plans.txt"
+		grep -q "Index Scan using $ix on t" "$W/plan.txt" && grep -q 'Order By:' "$W/plan.txt" \
+			|| die "$tag $arm: plan is not an ordering scan of $ix (see plans.txt)"
+		local t0 t1
+		t0=$(date +%s.%N)
+		res=$($PSQL -At -c "SET enable_seqscan = off; SET enable_bitmapscan = off;
+		                    SET max_parallel_workers_per_gather = 0;
+		                    SELECT tc_run('$arm', '$col', '$ix')" | tail -1)
+		t1=$(date +%s.%N)
+		nq=${res%%$'\t'*}
+		ns=${res##*$'\t'}
+		printf '%s\t%s\t%s\t%s\t%s\n' "$tag" "$arm" "$nq" "$ns" "$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')" >> "$OUT/scancheck.tsv"
+		if [ "$ns" -lt "$nq" ]; then
+			echo "SCANCHECK FAIL: $tag $arm ran $nq queries but $ix counted $ns scans" | tee -a "$OUT/scancheck.tsv"
+			FAILED=1
+		fi
+		$PSQL -c "\\copy (SELECT qid, id, o FROM runs, unnest(ids) WITH ORDINALITY u(id, o) WHERE arm = '$arm' ORDER BY qid, o) TO '$OUT/runs/${tag}_${arm}.tsv'"
+	done
+
+	say "$tag: scoring"
+	for arm in exact exact2 sumtf tsv tsvmaxpos strip; do
+		if [ "$K" = beir ]; then
+			python3 bench/ndcg.py --qrels "$W/beir/$C/qrels.tsv" --run "$OUT/runs/${tag}_${arm}.tsv" \
+				--k 10 --label "$tag/$arm" 2>> "$OUT/ndcg.stderr" | grep -v '^label' >> "$OUT/quality.tsv"
+		fi
+		python3 bench/tsvcaps.py agree "$OUT/runs/${tag}_exact.tsv" "$OUT/runs/${tag}_${arm}.tsv" \
+			--groups "$OUT/runs/${tag}_groups.tsv" --label "$tag/$arm" >> "$OUT/agree.tsv"
+	done
+	# The CAP effect alone: tsv against sumtf.  Both define doclen as the sum of tf,
+	# so the only difference left between them is what the caps did to tf and length.
+	python3 bench/tsvcaps.py agree "$OUT/runs/${tag}_sumtf.tsv" "$OUT/runs/${tag}_tsv.tsv" \
+		--groups "$OUT/runs/${tag}_groups.tsv" --label "$tag/tsv_vs_sumtf" >> "$OUT/agree.tsv"
+	grep "^$tag/" "$OUT/quality.tsv" 2>/dev/null || true
+	grep "^$tag/.*	all	" "$OUT/agree.tsv"
+	$PSQL -c "DROP TABLE t, q; DROP TABLE IF EXISTS st;" >/dev/null
+}
+
+# Each (corpus, config) runs in its own bash process, so a failure in one is
+# recorded and the rest still run, while `set -e` keeps its meaning inside it.
+if [ "${1:-}" = unit ]; then
+	shift
+	one "$@"
+	exit "$FAILED"
+fi
+unit() {
+	bash "$0" unit "$@" || { echo "UNIT FAILED: $*" | tee -a "$OUT/failed.txt"; FAILED=1; }
+}
 
 # Start the Wikipedia fetch + strip now, in the background, so it overlaps BEIR.
 # Sequential inside the subshell: dumps.wikimedia.org allows two connections per IP.
@@ -157,7 +395,7 @@ SQL
 # measured on this server and not quoted from a header.
 # ---------------------------------------------------------------------------
 say "probes"
-$PSQL -e > "$OUT/probes.txt" 2>&1 <<'SQL'
+psql -X -q -e > "$OUT/probes.txt" 2>&1 <<'SQL'
 \echo P1 tf cap: one lexeme repeated 1000 times
 SELECT cardinality(positions) AS tsv_npos,
        wdoc_length(to_wdoc(to_tsvector('simple', repeat('x ', 1000)))) AS from_tsv_len,
@@ -229,229 +467,14 @@ SQL
 cat "$OUT/probes.txt"
 grep -q 'P5 binary round trip' "$OUT/probes.txt" || die "probes did not run to the end"
 
-# ---------------------------------------------------------------------------
-# One (corpus, config): build the representations, measure, query every arm.
-#   $1 corpus name (table docs_$1 must exist)   $2 regconfig   $3 beir|wiki
-# ---------------------------------------------------------------------------
-one() {
-	local C=$1 G=$2 K=$3 tag="$1_$2"
-	say "$tag: representations"
-	$PSQL <<SQL
-SET max_parallel_workers_per_gather = 8;
-SET parallel_setup_cost = 0;
-SET parallel_tuple_cost = 0;
-SET min_parallel_table_scan_size = 0;
-DROP TABLE IF EXISTS t0, t, q, st, h_text, h_tsv, h_wdoc, h_wdocnp, h_wdoctsv;
-CREATE TABLE t0 AS
-SELECT id, body,
-       CASE WHEN octet_length(body) <= $BIGTXT THEN to_tsvector('$G', body) END AS tsv,
-       octet_length(body) > $BIGTXT AS big,
-       to_wdoc('$G'::regconfig, body) AS a
-  FROM docs_$C;
-UPDATE t0 SET tsv = safe_tsv('$G', body) WHERE big;
-CREATE TABLE t AS
-SELECT t0.id, t0.body, t0.tsv, t0.a,
-       t0.a || to_wdoc(''::tsvector) AS x,
-       to_wdoc(t0.tsv) AS b,
-       CASE WHEN t0.tsv IS NULL THEN NULL
-            WHEN k.maxpos > k.npos
-            THEN to_wdoc(t0.tsv) || format('''zzpadzz'':%s', k.maxpos - k.npos)::wdoc
-            ELSE to_wdoc(t0.tsv) END AS c,
-       to_wdoc(strip(t0.tsv)) AS s,
-       k.maxnp, k.maxpos, k.npos, k.nlex
-  FROM t0, LATERAL tsv_caps(t0.tsv) k;
-DROP TABLE t0;
-ALTER TABLE t ADD COLUMN len_a int, ADD COLUMN sumtf_a int, ADD COLUMN len_b int,
-              ADD COLUMN len_c int;
-UPDATE t SET len_a = wdoc_length(a), sumtf_a = wdoc_length(x), len_b = wdoc_length(b),
-             len_c = wdoc_length(c);
-VACUUM t;
-SQL
 
-	say "$tag: measure 1 (caps)"
-	$PSQL -At -F $'\t' >> "$OUT/caps.tsv" <<SQL
-SELECT '$C', '$G', count(*),
-       count(*) FILTER (WHERE tsv IS NULL),
-       count(*) FILTER (WHERE maxnp >= 255),
-       count(*) FILTER (WHERE maxpos >= 16383),
-       count(*) FILTER (WHERE tsv IS NOT NULL AND sumtf_a <> len_b),
-       count(*) FILTER (WHERE tsv IS NOT NULL AND len_a <> len_b),
-       count(*) FILTER (WHERE tsv IS NOT NULL AND len_a <> len_c),
-       count(*) FILTER (WHERE len_a > 16383),
-       round(avg(len_a)),
-       percentile_disc(0.5) WITHIN GROUP (ORDER BY len_a),
-       percentile_disc(0.9) WITHIN GROUP (ORDER BY len_a),
-       percentile_disc(0.99) WITHIN GROUP (ORDER BY len_a),
-       max(len_a),
-       sum(len_a), sum(sumtf_a), sum(len_b), sum(len_c),
-       (SELECT count(*) FROM (SELECT a FROM t WHERE len_a > 16383 ORDER BY id LIMIT 200) z),
-       (SELECT count(*) FROM (SELECT a FROM t WHERE len_a > 16383 ORDER BY id LIMIT 200) z WHERE NOT rt_ok(a))
-  FROM t;
-SQL
-	tail -1 "$OUT/caps.tsv"
-
-	say "$tag: measure 3 (heap bytes)"
-	$PSQL -At -F $'\t' >> "$OUT/heap.tsv" <<SQL
-SELECT '$C', '$G', count(*),
-       round(avg(octet_length(body))),
-       round(avg(pg_column_size(body))),
-       round(avg(pg_column_size(tsv))),
-       round(avg(pg_column_size(a))),
-       round(avg(pg_column_size(x))),
-       round(avg(pg_column_size(b))),
-       round(avg(pg_column_size(s)))
-  FROM t;
-SQL
-	$PSQL <<SQL
-CREATE TABLE h_text AS SELECT id, body FROM t;
-CREATE TABLE h_tsv AS SELECT id, tsv FROM t;
-CREATE TABLE h_wdoc AS SELECT id, a FROM t;
-CREATE TABLE h_wdocnp AS SELECT id, x FROM t;
-CREATE TABLE h_wdoctsv AS SELECT id, b FROM t;
-VACUUM h_text, h_tsv, h_wdoc, h_wdocnp, h_wdoctsv;
-SQL
-	$PSQL -At -F $'\t' >> "$OUT/heaptab.tsv" <<SQL
-SELECT '$C', '$G',
-       pg_total_relation_size('h_text'), pg_total_relation_size('h_tsv'),
-       pg_total_relation_size('h_wdoc'), pg_total_relation_size('h_wdocnp'),
-       pg_total_relation_size('h_wdoctsv');
-DROP TABLE h_text, h_tsv, h_wdoc, h_wdocnp, h_wdoctsv;
-SQL
-
-	say "$tag: indexes"
-	$PSQL <<SQL
-CREATE INDEX ix_a ON t USING weave (a);
-CREATE INDEX ix_x ON t USING weave (x);
-CREATE INDEX ix_b ON t USING weave (b);
-CREATE INDEX ix_c ON t USING weave (c);
-CREATE INDEX ix_s ON t USING weave (s);
-SQL
-
-	say "$tag: queries"
-	if [ "$K" = beir ]; then
-		# fuse.sh's rule: lower, split on non-alphanumerics, drop length <= 2 and
-		# the three operator words, de-duplicate, first 20, OR-joined; then the
-		# config normalizes each term.  A query that normalizes to nothing is
-		# dropped (and counted) for every arm alike.
-		$PSQL <<SQL
-CREATE TABLE q AS
-WITH tk AS (
-    SELECT q.qid, s.tok, min(s.ord) AS ord
-      FROM qtext_$C q,
-           LATERAL unnest(regexp_split_to_array(lower(q.txt), '[^a-z0-9]+'))
-                   WITH ORDINALITY AS s(tok, ord)
-     WHERE length(s.tok) > 2 AND s.tok NOT IN ('and', 'or', 'not', 'near')
-     GROUP BY q.qid, s.tok
-), r AS (
-    SELECT qid, tok, row_number() OVER (PARTITION BY qid ORDER BY ord) AS rn FROM tk
-), j AS (
-    SELECT qid, string_agg(tok, ' | ' ORDER BY rn) AS terms FROM r WHERE rn <= 20 GROUP BY qid
-)
-SELECT qid::text AS qid, 'beir'::text AS grp,
-       format('to_wquery(%L::regconfig, %L)', '$G', terms) AS qexpr
-  FROM j
- WHERE to_wquery('$G'::regconfig, terms)::text <> '';
-SQL
-		echo -e "$tag\tqueries_total\t$($PSQL -At -c "SELECT count(*) FROM qtext_$C")\tqueries_run\t$($PSQL -At -c "SELECT count(*) FROM q")" >> "$OUT/queries.tsv"
-	else
-		# No qrels: queries are drawn from the corpus vocabulary by document
-		# frequency band, 25 queries each of 1, 2 and 3 OR-ed terms per band, in a
-		# deterministic md5 order.  Plus `captf`: 50 single-term queries on lexemes
-		# that reach the 255-position cap in at least one document, which is where
-		# a tf-cap effect has to show if it shows anywhere.
-		$PSQL <<SQL
-CREATE TABLE st AS
-SELECT word, ndoc FROM ts_stat('SELECT tsv FROM t WHERE tsv IS NOT NULL')
- WHERE word ~ '^[a-z][a-z0-9]{2,19}$' AND word NOT IN ('and', 'or', 'not', 'near');
-CREATE TABLE q AS
-WITH n AS (SELECT count(*)::float8 AS n FROM t),
-b AS (
-    SELECT word,
-           CASE WHEN ndoc BETWEEN 2 AND 10 THEN 'rare'
-                WHEN ndoc >= 0.001 * n AND ndoc < 0.01 * n THEN 'mid'
-                WHEN ndoc >= 0.01 * n AND ndoc < 0.1 * n THEN 'common'
-                WHEN ndoc >= 0.1 * n THEN 'vcommon' END AS band
-      FROM st, n
-), r AS (
-    SELECT word, band, row_number() OVER (PARTITION BY band ORDER BY md5(word)) - 1 AS rn
-      FROM b WHERE band IS NOT NULL
-), s AS (
-    SELECT bb.band, nt, k, (CASE nt WHEN 1 THEN 0 WHEN 2 THEN 25 ELSE 75 END) + k * nt AS lo
-      FROM (SELECT DISTINCT band FROM r) bb, generate_series(1, 3) nt, generate_series(0, 24) k
-)
-SELECT format('%s_%s_%s', s.band, s.nt, s.k) AS qid, s.band || '_' || s.nt AS grp,
-       quote_literal(string_agg(r.word, ' | ' ORDER BY r.rn)) || '::wquery' AS qexpr
-  FROM s JOIN r ON r.band = s.band AND r.rn >= s.lo AND r.rn < s.lo + s.nt
- GROUP BY s.band, s.nt, s.k
-HAVING count(*) = s.nt;
-INSERT INTO q
-SELECT 'captf_' || row_number() OVER (ORDER BY md5(word)), 'captf', quote_literal(word) || '::wquery'
-  FROM (SELECT word FROM (SELECT DISTINCT u.lexeme AS word
-                            FROM t, unnest(t.tsv) u
-                           WHERE cardinality(u.positions) >= 255) d
-         WHERE word ~ '^[a-z][a-z0-9]{2,19}$' AND word NOT IN ('and', 'or', 'not', 'near')
-         ORDER BY md5(word) LIMIT 50) z;
-SQL
-		$PSQL -At -F $'\t' -c "SELECT '$tag', grp, count(*) FROM q GROUP BY grp ORDER BY grp" >> "$OUT/queries.tsv"
-	fi
-	$PSQL -c "\\copy (SELECT qid, grp FROM q ORDER BY qid) TO '$OUT/runs/${tag}_groups.tsv'"
-
-	$PSQL -c "TRUNCATE runs" >/dev/null
-	local arm col ix res nq ns qx
-	qx=$($PSQL -At -c "SELECT qexpr FROM q ORDER BY qid LIMIT 1")
-	for spec in exact:a:ix_a exact2:a:ix_a sumtf:x:ix_x tsv:b:ix_b tsvmaxpos:c:ix_c strip:s:ix_s; do
-		IFS=: read -r arm col ix <<< "$spec"
-		if [ "$arm" = exact2 ]; then
-			$PSQL -c "REINDEX INDEX ix_a" >/dev/null
-		fi
-		# The plan of one query per arm, ASSERTED: the weave index answering with
-		# an ordering scan.  A Seq Scan + Sort would give the same rows by a path
-		# that measures nothing about the index.
-		{
-			echo "== $tag $arm"
-			$PSQL -c "SET enable_seqscan = off; SET enable_bitmapscan = off;
-			          SET max_parallel_workers_per_gather = 0;
-			          EXPLAIN (COSTS OFF) SELECT id FROM t WHERE $col @@@ $qx ORDER BY $col <=> $qx LIMIT 100"
-		} > "$W/plan.txt" 2>&1
-		cat "$W/plan.txt" >> "$OUT/plans.txt"
-		grep -q "Index Scan using $ix on t" "$W/plan.txt" && grep -q 'Order By:' "$W/plan.txt" \
-			|| die "$tag $arm: plan is not an ordering scan of $ix (see plans.txt)"
-		local t0 t1
-		t0=$(date +%s.%N)
-		res=$($PSQL -At -c "SET enable_seqscan = off; SET enable_bitmapscan = off;
-		                    SET max_parallel_workers_per_gather = 0;
-		                    SELECT tc_run('$arm', '$col', '$ix')" | tail -1)
-		t1=$(date +%s.%N)
-		nq=${res%%$'\t'*}
-		ns=${res##*$'\t'}
-		printf '%s\t%s\t%s\t%s\t%.1f\n' "$tag" "$arm" "$nq" "$ns" "$(echo "$t1 - $t0" | bc)" >> "$OUT/scancheck.tsv"
-		if [ "$ns" -lt "$nq" ]; then
-			echo "SCANCHECK FAIL: $tag $arm ran $nq queries but $ix counted $ns scans" | tee -a "$OUT/scancheck.tsv"
-			FAILED=1
-		fi
-		$PSQL -c "\\copy (SELECT qid, id, o FROM runs, unnest(ids) WITH ORDINALITY u(id, o) WHERE arm = '$arm' ORDER BY qid, o) TO '$OUT/runs/${tag}_${arm}.tsv'"
-	done
-
-	say "$tag: scoring"
-	for arm in exact exact2 sumtf tsv tsvmaxpos strip; do
-		if [ "$K" = beir ]; then
-			python3 bench/ndcg.py --qrels "$W/beir/$C/qrels.tsv" --run "$OUT/runs/${tag}_${arm}.tsv" \
-				--k 10 --label "$tag/$arm" 2>> "$OUT/ndcg.stderr" | grep -v '^label' >> "$OUT/quality.tsv"
-		fi
-		python3 bench/tsvcaps.py agree "$OUT/runs/${tag}_exact.tsv" "$OUT/runs/${tag}_${arm}.tsv" \
-			--groups "$OUT/runs/${tag}_groups.tsv" --label "$tag/$arm" >> "$OUT/agree.tsv"
-	done
-	grep "^$tag/" "$OUT/quality.tsv" 2>/dev/null || true
-	grep "^$tag/.*	all	" "$OUT/agree.tsv"
-	$PSQL -c "DROP TABLE t, q; DROP TABLE IF EXISTS st;" >/dev/null
-}
-
-printf 'corpus\tcfg\tndocs\tn_tsv_error\tn_tf_cap_reached\tn_pos_cap_reached\tn_tf_wrong\tn_len_b_wrong\tn_len_c_wrong\tn_len_gt_16383\tavg_len\tp50_len\tp90_len\tp99_len\tmax_len\tsum_len_a\tsum_tf_a\tsum_len_b\tsum_len_c\tn_rt_checked\tn_rt_fail\n' > "$OUT/caps.tsv"
+printf 'corpus\tcfg\tndocs\tn_tsv_error\tn_tf_cap_reached\tn_pos_cap_reached\tn_tf_wrong\tn_len_b_wrong\tn_len_c_wrong\tn_len_gt_16383\tn_len_c_selfcheck_fail\tavg_len\tp50_len\tp90_len\tp99_len\tmax_len\tsum_len_a\tsum_tf_a\tsum_len_b\tsum_len_c\tn_rt_checked\tn_rt_fail\n' > "$OUT/caps.tsv"
 printf 'corpus\tcfg\tndocs\tavg_text_octets\tavg_text\tavg_tsv\tavg_wdoc\tavg_wdoc_nopos\tavg_wdoc_from_tsv\tavg_wdoc_strip\n' > "$OUT/heap.tsv"
 printf 'corpus\tcfg\ttext\ttsvector\twdoc\twdoc_nopos\twdoc_from_tsv\n' > "$OUT/heaptab.tsv"
 printf 'label\tnqueries_scored\tndcg@10\trecall@100\tmrr@10\n' > "$OUT/quality.tsv"
 printf 'label\tgroup\tnq\tov10\tov100\tsame10\n' > "$OUT/agree.tsv"
 printf 'tag\tarm\tqueries\tindex_scans\tseconds\n' > "$OUT/scancheck.tsv"
+printf 'corpus\tcfg\tix_exact\tix_sumtf\tix_tsv\tix_tsvmaxpos\tix_strip\n' > "$OUT/idxsize.tsv"
 
 # ---------------------------------------------------------------------------
 # BEIR (chunked passages, with qrels).  --embed hash: the vectors are not used.
@@ -470,7 +493,7 @@ CREATE TABLE docs_$D AS SELECT docid AS id, txt AS body FROM stage_c;
 CREATE TABLE qtext_$D AS SELECT qid, txt FROM stage_q;
 DROP TABLE stage_c, stage_q;
 SQL
-	for G in $CFGS; do one "$D" "$G" beir; done
+	for G in $CFGS; do unit "$D" "$G" beir; done
 	$PSQL -c "DROP TABLE docs_$D, qtext_$D" >/dev/null
 done
 
@@ -486,7 +509,7 @@ DROP TABLE IF EXISTS docs_$D;
 CREATE TABLE docs_$D (id bigint, body text);
 \copy docs_$D FROM '$W/$D.tsv' WITH (FORMAT csv, DELIMITER E'\t', QUOTE E'\b')
 SQL
-	for G in $CFGS; do one "$D" "$G" wiki; done
+	for G in $CFGS; do unit "$D" "$G" wiki; done
 	$PSQL -c "DROP TABLE docs_$D" >/dev/null
 done
 
