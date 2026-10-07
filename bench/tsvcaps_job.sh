@@ -71,8 +71,8 @@ FAILED=0
 WIKIDATE=${WIKIDATE:-20260901}
 WBASE=https://dumps.wikimedia.org/enwiki/$WIKIDATE
 # name|part file suffix|article limit (0 = whole part)|chunk words (0 = none)
-WIKIS=${WIKIS:-"wiki1|1.xml-p1p41242|0|400 wiki6|6.xml-p958046p1483661|60000|0 wiki3|3.xml-p151574p311329|30000|256"}
-BEIR=${BEIR:-scifact nfcorpus fiqa}
+WIKIS=${WIKIS-"wiki1|1.xml-p1p41242|0|400 wiki6|6.xml-p958046p1483661|60000|0 wiki3|3.xml-p151574p311329|30000|256"}
+BEIR=${BEIR-scifact nfcorpus fiqa}
 CFGS=${CFGS:-simple english}
 # A tsvector over this many bytes of text MIGHT exceed the 1 MB limit, so those rows
 # go through an exception-catching wrapper (serial).  Below it the limit cannot be
@@ -510,6 +510,16 @@ SELECT wdoc_length('''zzpadzz'':5'::wdoc) AS pad5,
        wdoc_length(to_wdoc(to_tsvector('simple', 'a b c')) || '''zzpadzz'':5'::wdoc) AS three_plus5,
        wdoc_length(to_wdoc('simple'::regconfig, 'the the cat') || to_wdoc(''::tsvector)) AS simple_sumtf,
        wdoc_length(to_wdoc('english'::regconfig, 'the the cat') || to_wdoc(''::tsvector)) AS english_sumtf;
+\echo P8 doclen through the wdoc text and binary I/O (the pg_dump / COPY path)
+CREATE TEMP TABLE p8 (d wdoc);
+INSERT INTO p8 VALUES (to_wdoc('english'::regconfig, 'the cat sat on the mat'));
+COPY p8 TO '/tmp/tsvcaps_p8.bin' (FORMAT binary);
+CREATE TEMP TABLE p8b (d wdoc);
+COPY p8b FROM '/tmp/tsvcaps_p8.bin' (FORMAT binary);
+SELECT wdoc_length(d) AS stored_len,
+       wdoc_length(d::text::wdoc) AS after_text_io,
+       (SELECT wdoc_length(d) FROM p8b) AS after_binary_io
+  FROM p8;
 \echo P7 doclen definitions under a stopword list
 SELECT wdoc_length(to_wdoc('english'::regconfig, 'the cat sat on the mat')) AS exact_len,
        wdoc_length(to_wdoc(to_tsvector('english', 'the cat sat on the mat'))) AS from_tsv_len,
