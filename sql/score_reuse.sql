@@ -22,7 +22,7 @@
 --   6. the operator is no longer called per row, with a control that counts
 --   7. a nested ordering scan between fetch and projection does not clobber it
 --                                  (mutant: an unkeyed global, pg_fts's design)
---   8. no substitution when the function is not the extension's
+--   8. no substitution when the function is not the library's C function
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 SET jit = off;
 SET max_parallel_workers_per_gather = 0;
@@ -213,12 +213,25 @@ SELECT count(*) = (SELECT count(*) FROM ex WHERE dist <= (SELECT dist FROM ex OR
                 LIMIT 1 OFFSET 900 + sr.id % 7) > 0
          ORDER BY d <=> 'alpha' FETCH FIRST 5 ROWS WITH TIES) s;
 
--- 8.  Only the extension's own function is planted.  Detached from the extension
--- it is somebody else's function, and the plan falls back to the operator.
+-- 8.  Only the library's own C function is planted.  A same-named SQL function
+-- (a decoy, or a catalog that predates 0.29.0 with something else in its place)
+-- is not, and the plan keeps the operator.  The extension's function is restored
+-- by recreating it exactly as the upgrade script does.
 ALTER EXTENSION pg_weave DROP FUNCTION weave_current_distance(regclass, tid, wquery);
+DROP FUNCTION weave_current_distance(regclass, tid, wquery);
 EXPLAIN (VERBOSE, COSTS OFF)
   SELECT id FROM sr WHERE d @@@ 'alpha' ORDER BY d <=> 'alpha' LIMIT 3;
+CREATE FUNCTION weave_current_distance(regclass, tid, wquery) RETURNS float8
+  LANGUAGE sql AS $$ SELECT 0.5::float8 $$;
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sr WHERE d @@@ 'alpha' ORDER BY d <=> 'alpha' LIMIT 3;
+DROP FUNCTION weave_current_distance(regclass, tid, wquery);
+CREATE FUNCTION weave_current_distance(index regclass, row_ctid tid, query wquery)
+  RETURNS float8 AS '$libdir/pg_weave', 'weave_current_distance'
+  LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
 ALTER EXTENSION pg_weave ADD FUNCTION weave_current_distance(regclass, tid, wquery);
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sr WHERE d @@@ 'alpha' ORDER BY d <=> 'alpha' LIMIT 3;
 
 RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort;
 DROP FUNCTION sr_wd();

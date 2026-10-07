@@ -21,10 +21,9 @@
 #include "access/relscan.h"
 #include "access/table.h"
 #include "catalog/index.h"
-#include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_language.h"
 #include "catalog/pg_proc.h"
-#include "commands/extension.h"
 #include "commands/defrem.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
@@ -562,52 +561,67 @@ bool		pg_weave_reuse_distance = true;
 
 typedef struct WeaveWalkCtx
 {
-	Oid			wqueryoid;		/* wquery by search_path, for the LIMIT hint */
+	Oid			wqueryoid;		/* wquery by search_path */
 	PlannedStmt *stmt;
-	bool		reuseResolved;	/* the four OIDs below were looked up */
+	bool		reuseResolved;	/* the three OIDs below were looked up */
 	Oid			curdistfn;		/* weave_current_distance(regclass, tid, wquery) */
-	Oid			wdoc;			/* in pg_weave's own schema */
+	Oid			wdoc;			/* in wquery's schema */
 	Oid			wquery;
 	bool		planted;		/* curdistfn was put in this plan */
 } WeaveWalkCtx;
 
 /*
- * Find weave_current_distance() in pg_weave's own schema and confirm it is a
- * member of the extension.  InvalidOid when the installed SQL predates 0.29.0
- * (a new library against an old catalog during an upgrade): reuse is then off.
- * Resolved by extension schema, never by search_path, so a same-named function
- * someone else created is never planted.
+ * Find weave_current_distance(regclass, tid, wquery) in the schema of the
+ * wquery type the query resolved, and accept it only if it is THIS library's C
+ * function: language C and link symbol 'weave_current_distance'.  Creating a C
+ * function needs superuser, so a same-named function someone else created is
+ * never planted.  InvalidOid when the installed SQL predates 0.29.0 (a new
+ * library against an old catalog during an upgrade): reuse is then off.
+ * Syscache lookups only, because this runs for every planned weave ordering
+ * scan.
  */
 static void
 weave_reuse_resolve(WeaveWalkCtx *cx)
 {
-	Oid			extoid;
+	HeapTuple	tup;
 	Oid			nsp;
 	Oid			fn;
 	Oid			argtypes[3] = {REGCLASSOID, TIDOID, InvalidOid};
+	bool		ok = false;
 
 	cx->reuseResolved = true;
-	extoid = get_extension_oid("pg_weave", true);
-	if (!OidIsValid(extoid))
+	cx->wquery = cx->wqueryoid;
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(cx->wquery));
+	if (!HeapTupleIsValid(tup))
 		return;
-	nsp = get_extension_schema(extoid);
-	if (!OidIsValid(nsp))
-		return;
+	nsp = ((Form_pg_type) GETSTRUCT(tup))->typnamespace;
+	ReleaseSysCache(tup);
 	cx->wdoc = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
 							   PointerGetDatum("wdoc"), ObjectIdGetDatum(nsp));
-	cx->wquery = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
-								 PointerGetDatum("wquery"), ObjectIdGetDatum(nsp));
-	if (!OidIsValid(cx->wdoc) || !OidIsValid(cx->wquery))
+	if (!OidIsValid(cx->wdoc))
 		return;
 	argtypes[2] = cx->wquery;
 	fn = GetSysCacheOid3(PROCNAMEARGSNSP, Anum_pg_proc_oid,
 						 CStringGetDatum("weave_current_distance"),
 						 PointerGetDatum(buildoidvector(argtypes, 3)),
 						 ObjectIdGetDatum(nsp));
-	if (!OidIsValid(fn) || get_func_rettype(fn) != FLOAT8OID ||
-		getExtensionOfObject(ProcedureRelationId, fn) != extoid)
+	if (!OidIsValid(fn))
 		return;
-	cx->curdistfn = fn;
+	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn));
+	if (HeapTupleIsValid(tup))
+	{
+		Form_pg_proc p = (Form_pg_proc) GETSTRUCT(tup);
+		bool		isnull;
+		Datum		src = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosrc,
+										  &isnull);
+
+		ok = (p->prolang == ClanguageId && p->prorettype == FLOAT8OID &&
+			  !isnull &&
+			  strcmp(TextDatumGetCString(src), "weave_current_distance") == 0);
+		ReleaseSysCache(tup);
+	}
+	if (ok)
+		cx->curdistfn = fn;
 }
 
 static void
