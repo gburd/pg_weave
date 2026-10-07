@@ -355,6 +355,13 @@ unit() {
 	bash "$0" unit "$@" || { echo "UNIT FAILED: $*" | tee -a "$OUT/failed.txt"; FAILED=1; }
 }
 
+# A marker left by an earlier run on the same host would let the main loop start on a
+# part while this run's prep is still REWRITING it -- the titles file is written in
+# place, not renamed -- and it did: M7 step 2's second run (pgweave-20261007-221700-55a5)
+# read a half-written titles file and drew 35 of its 200 title queries from a
+# different pool.  The download cache stays; only the markers go.
+find "$W" -maxdepth 1 \( -name '*.done' -o -name '*.failed' \) -delete
+
 # Start the Wikipedia fetch + strip now, in the background, so it overlaps BEIR.
 # Sequential inside the subshell: dumps.wikimedia.org allows two connections per IP.
 # Each part's files appear atomically (renamed into place), with a .done marker

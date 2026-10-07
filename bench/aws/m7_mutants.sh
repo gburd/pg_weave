@@ -26,8 +26,10 @@ M1_mixed_drops_positions)
 M2_doclen_counts_stopwords)
 	sub src/query/tsanalyze.c 'positions, nlexpos,' 'positions, ntok,' ;;
 M3_warning_count_off_by_one)
-	sub src/am/ambuild.c '						bs.tsv_positionless, RelationGetRelationName(index)),' \
-		'						bs.tsv_positionless + 1, RelationGetRelationName(index)),' ;;
+	sub src/am/ambuild.c '							   (unsigned long) bs.tsv_positionless,
+							   RelationGetRelationName(index)),' \
+		'							   (unsigned long) bs.tsv_positionless + 1,
+							   RelationGetRelationName(index)),' ;;
 M4_stat_not_decremented)
 	sub src/am/amscan.c '	scan = table_beginscan(heap, GetActiveSnapshot(), 0, NULL);
 

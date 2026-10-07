@@ -5905,8 +5905,11 @@ weave_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	if (bs.tsv_positionless > 0)
 		ereport(WARNING,
 				(errcode(ERRCODE_WARNING),
-				 errmsg("%.0f documents indexed by \"%s\" have lexemes without positions",
-						bs.tsv_positionless, RelationGetRelationName(index)),
+				 errmsg_plural("%lu document indexed by \"%s\" has lexemes without positions",
+							   "%lu documents indexed by \"%s\" have lexemes without positions",
+							   (unsigned long) bs.tsv_positionless,
+							   (unsigned long) bs.tsv_positionless,
+							   RelationGetRelationName(index)),
 				 errdetail("Such a lexeme is indexed with term frequency 1 and matches no phrase, so BM25 ranking of these documents is approximate."),
 				 errhint("A tsvector loses its positions through strip() or by concatenating a positionless value; weave_index_tsvector_stats() counts the affected documents.")));
 
