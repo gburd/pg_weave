@@ -24,3 +24,4 @@ isolation_output/
 # this project, and `git add -A` swept it into a commit until the dump-guard hook refused
 # it.  Ignored rather than deleted because the tool recreates it on demand.
 .zvec-grep/
+/STATUS.md

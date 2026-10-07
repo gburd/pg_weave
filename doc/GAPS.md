@@ -5142,7 +5142,13 @@ loosened.
 **MAINTAINER DECISIONS 2026-10-06.** (1) The bound stays a visible known failure (`TODO`),
 and the growth is its own task, **L22** in `doc/PHASES.md`. (2) `t/033` runs **11 cycles**:
 the interim cut to 8 stopped one cycle before the growth starts, so the TODO could not fail
-and `prove` reported "TODO passed". (3) The merge's silent stop on a freed page (above) is
+and `prove` reported "TODO passed". **Measured at 11 on EC2** (`pgweave-20261006-202448-495c`, c7i.4xlarge,
+two runs): `t/033` takes 82 s and 83 s, and the whole TAP suite 412 s (about 380 s at 8
+cycles, about 1,900 s at 18). In both runs the size bound FAILS as `not ok # TODO`: worst
+excess 7,972 pages against bounds of 2,223 and 2,504, with the excess at cycles 8-10 being
+2,626 / 5,299 / 7,972, identical in both runs. The other assertion in the TODO block (that
+the crashes stranded enough for the bound to discriminate) passes, which is what `prove`'s
+"TODO passed: 27" refers to. (3) The merge's silent stop on a freed page (above) is
 task **L23**: warn and skip that merge rather than raise an ERROR.
 
 **The A/B against the base says the late growth is pre-existing, and that the reclaim
@@ -5820,3 +5826,34 @@ win is small everywhere except the pure-lexical fusion, and it shrinks with n:
 The vector `<->`/`<#>` route stays unhinted: see the measurement above. A decision would be
 needed to use `wvec`'s reserved `int16` as a planner-only carrier, and on the corpus
 measured it would not have changed the work.
+
+### G88 — "approximate regex" is named in the product statement and does not ship: `{~k}` parses and is then ignored — **FOUND 2026-10-06 by the README rewrite; OPEN, needs a maintainer decision**
+
+`AGENTS.md`'s product statement lists "approximate regex" among the six retrieval kinds, and
+`doc/PHASES.md` Phase Z is titled "fuzzy / approximate-regex / prefix / n-gram". What ships is
+exact regex: `body @@@ '/re/'` runs core's ARE engine (`pg_regcomp`/`pg_regexec`,
+`src/am/amscan.c` and `RE_compile_and_execute` in `src/query/doc.c`) over dictionary tokens.
+The pg_tre import has the approximate pieces, but they are not wired:
+
+- `src/query/regex_grammar.y` parses `atom{~k}` into `REGEX_AST_APPROX`, and
+  `src/query/extract.c` then treats it as its child ("Phase 3 (k=0): treat APPROX as its
+  child. Phase 5 reads ast->u.approx.k ..."). Phase 5 does not exist.
+- `src/query/re_match.c` wraps TRE's `tre_reganexec`, and nothing in `src/am/` or the match
+  path calls it.
+- `weave_regex_narrowable()` notes that ARE reads `{~k}` as a literal while pg_tre's tokenizer
+  reads it as an approximate bound, so the two dialects disagree on exactly this syntax today.
+
+So a user writing `'/colou?r{~1}/'` gets ARE's reading of those bytes, not an approximate match.
+Fuzzy TERMS (`term~k`, universal Levenshtein, Z5) do ship and are not this gap.
+
+**Decision needed:** either wire approximate regex (TRE's matcher for the verify step, the
+`{~k}` extraction rules for the trigram prefilter, and a refusal of `{~k}` until then), or
+narrow the product statement and Phase Z's title to "regex". The README says "regular
+expressions over tokens" until this is decided.
+
+The same review found two documents stale against the shipped code, recorded here so they are
+not lost: `doc/PRODUCTION_READINESS.md` "What actually works today" still says vector indexing
+does not exist and fuzzy is unreachable; `doc/ARCHITECTURE.md` §9 claim 3's scope note says the
+only filter pushed into the index is a lexical term, but docvalues have shipped
+(`bench/RESULTS_DOCVALS_PRIZE.md`, `bench/RESULTS_DOCVALS_SCALE.md`).
+
