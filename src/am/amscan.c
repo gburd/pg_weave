@@ -2659,8 +2659,8 @@ weave_universe_bounded(Relation index, BlockNumber dictstart, double ndocs,
  * (the latest to publish, if several do).
  * The keying is the clobber guard: ExecScan() fetches a tuple, evaluates the
  * qual, then projects, and a SubPlan in the qual or a visible column ahead of
- * the resjunk one can run a second weave ordering scan in between.  pg_fts's
- * zero-argument fts_current_distance() reads a single global, which that
+ * the resjunk one can run a second weave ordering scan in between.  The sibling
+ * project's zero-argument current-distance function reads a single global, which that
  * second scan overwrites.  Here it publishes into its own entry, and the outer
  * row still finds its own.
  *
