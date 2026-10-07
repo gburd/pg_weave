@@ -475,6 +475,7 @@ typedef struct WeaveScanOpaqueData
 	bool		curdistIsnull;
 	double		curdistValue;
 	uint64		curdistSeq;		/* weave_curdist_seq when it was published */
+	Oid			curdistIndex;	/* the index, so the list never reads a Relation */
 	IndexScanDesc curdistScan;	/* the descriptor whose xs_heaptid it is for */
 	dlist_node	curdistNode;
 	MemoryContextCallback curdistCb;
@@ -2665,7 +2666,13 @@ weave_universe_bounded(Relation index, BlockNumber dictstart, double ndocs,
  *
  * LIFETIME.  An entry leaves the list at weave_rescan(), at weave_endscan(),
  * and in a reset callback on the scan's memory context, which covers an error
- * that unwinds without an endscan.  So every entry is a live scan descriptor.
+ * that unwinds without an endscan.  So every entry's memory is live; the list
+ * never dereferences the index Relation, which an abort may have closed first.
+ *
+ * WHAT THE VALUE IS.  The distance the stream is ordered by: the corpus BM25
+ * distance on a ranked row, and the G56 padding value (1.0, or NULL for a NULL
+ * document) on a padded one.  Not weave_distance()'s N = 1 value, which is why
+ * only a hidden sort key may be substituted (src/am/customscan.c).
  * --------------------------------------------------------------------------- */
 static dlist_head weave_curdist_live = DLIST_STATIC_INIT(weave_curdist_live);
 static uint64 weave_curdist_seq = 0;
@@ -2708,6 +2715,7 @@ weave_curdist_note(IndexScanDesc scan, WeaveScanOpaque so, double v, bool isnull
 			so->curdistCbSet = true;
 		}
 		so->curdistScan = scan;
+		so->curdistIndex = RelationGetRelid(scan->indexRelation);
 		dlist_push_head(&weave_curdist_live, &so->curdistNode);
 		so->curdistLive = true;
 	}
@@ -2733,8 +2741,7 @@ weave_current_distance(PG_FUNCTION_ARGS)
 											 it.cur);
 		IndexScanDesc scan = so->curdistScan;
 
-		if (so->query == NULL ||
-			RelationGetRelid(scan->indexRelation) != indexoid ||
+		if (so->query == NULL || so->curdistIndex != indexoid ||
 			!ItemPointerEquals(&scan->xs_heaptid, tid))
 			continue;
 		if (q == NULL)
@@ -3816,7 +3823,7 @@ weave_pad_emit(IndexScanDesc scan, WeaveScanOpaque so, ItemPointer tid,
 		: 1.0;
 	dist[0].isnull = nulldist;
 	index_store_float8_orderby_distances(scan, typ, dist, false);
-	/* 1.0 is exactly weave_distance() of a document no term of q is in */
+	/* the value the stream orders this row at, which is what a sort key reads */
 	if (weave_curdist_lexical(scan, so))
 		weave_curdist_note(scan, so, dist[0].value, dist[0].isnull);
 }
