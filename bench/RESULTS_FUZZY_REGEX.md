@@ -297,5 +297,10 @@ destroy any trigram, so none is required. A (k+1)-pigeonhole prefilter over the 
 an atom would narrow these; the imported one was unsound and was deleted (`doc/GAPS.md` G88),
 and a correct one is not built. Unmeasured: whether it would beat the 96 ms walk.
 
+**Drift in the unchanged queries, not explained:** on this run `t123456~2` is 339-340 ms and
+`t204711~1` 106 ms, against 292.77 ms and 92.92 ms in the 2026-09-20 run above. The two runs differ in
+OS image (Debian 13 vs Ubuntu 24.04), in three weeks of code, and in host, so this is not an A/B
+and no cause is claimed. The fuzzy `term~k` route was not touched by G88.
+
 Provisional in hard rule 11's sense: one scale (1M rows), two passes on one host.
 
