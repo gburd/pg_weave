@@ -22,6 +22,7 @@
 #include "postgres.h"
 
 #include "miscadmin.h"
+#include "mb/pg_wchar.h"
 #include "utils/memutils.h"
 
 #include "weave/pattern_cache.h"
@@ -135,7 +136,18 @@ weave_cache_lookup_internal(const char *pattern, int pattern_len, bool pin)
     pg_weave_arm_compile_deadline(0);
     PG_TRY();
     {
-        compiled = weave_compile_pattern(pattern, pattern_len, &weave_err);
+        /*
+         * TRE gets the pattern in the server's pg_wchar form (what the
+         * matched terms are converted to), never through its own mbrtowc()
+         * decoding, which follows the C library locale rather than the
+         * server encoding.
+         */
+        pg_wchar   *wpat = palloc((pattern_len + 1) * sizeof(pg_wchar));
+        int         wlen = pg_mb2wchar_with_len(pattern, wpat, pattern_len);
+
+        compiled = weave_compile_pattern((const unsigned int *) wpat, wlen,
+                                         &weave_err);
+        pfree(wpat);
     }
     PG_FINALLY();
     {

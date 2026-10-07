@@ -79,8 +79,15 @@ int tre_compile_progress_check(void);
  * Compile a regex pattern. Returns opaque handle on success, NULL on
  * failure (with errcode set to a TRE error code).
  */
-void *weave_compile_pattern(const char *pattern, int pattern_len,
+void *weave_compile_pattern(const unsigned int *wpattern, int wlen,
                           int *errcode);
+
+/*
+ * Match a compiled pattern against a wide-character string with TRE's own
+ * per-atom approximate semantics.  1 match, 0 no match, -1 progress-hook
+ * abort, -2 other TRE failure.
+ */
+int weave_match_wide(void *compiled, const unsigned int *wstr, int wlen);
 
 /* Free a compiled pattern returned by weave_compile_pattern. */
 void weave_free_pattern(void *compiled);

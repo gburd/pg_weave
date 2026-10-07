@@ -20,6 +20,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 #include "tre.h"
 #include "tre-internal.h"
@@ -86,8 +87,17 @@ tre_progress_check(void)
     return 0;
 }
 
+/*
+ * Compile a pattern given as WIDE characters (the server's pg_wchar form,
+ * passed as unsigned int because this file does not see postgres.h).  The
+ * narrow tre_regncomp() decodes through mbrtowc() and the C locale, which is
+ * not the server encoding; the wide entry point takes the characters as they
+ * are, the same form the matched terms are handed over in.
+ */
+typedef char weave_wchar_is_32bit[sizeof(wchar_t) == sizeof(unsigned int) ? 1 : -1];
+
 void *
-weave_compile_pattern(const char *pattern, int pattern_len, int *errcode_out)
+weave_compile_pattern(const unsigned int *wpattern, int wlen, int *errcode_out)
 {
     regex_t *preg;
 
@@ -99,8 +109,8 @@ weave_compile_pattern(const char *pattern, int pattern_len, int *errcode_out)
     }
     memset(preg, 0, sizeof(regex_t));
 
-    *errcode_out = tre_regncomp(preg, pattern, (size_t) pattern_len,
-                                REG_EXTENDED);
+    *errcode_out = tre_regwncomp(preg, (const wchar_t *) wpattern,
+                                 (size_t) wlen, REG_EXTENDED);
     if (*errcode_out != REG_OK)
     {
         free(preg);
@@ -108,6 +118,34 @@ weave_compile_pattern(const char *pattern, int pattern_len, int *errcode_out)
     }
 
     return preg;
+}
+
+/*
+ * Match a compiled pattern against a whole string of wide characters, with
+ * TRE's own semantics: an `atom{~k}` may cost up to k edits (insert, delete,
+ * substitute, 1 each), everything outside such an atom matches exactly.  No
+ * caller-side cost parameters: tre_regwnexec() runs the approximate matcher
+ * with max_cost 0 outside the approximate atoms, which is the whole point --
+ * weave_do_match() clamps the in-atom limits to its max_cost and so cannot
+ * express "exact here, k edits there".  Returns 1 match, 0 no match, -1 the
+ * progress hook aborted the match, -2 any other TRE failure (REG_ESPACE).
+ */
+int
+weave_match_wide(void *compiled, const unsigned int *wstr, int wlen)
+{
+    int     ret;
+
+    progress_aborted = 0;
+    ret = tre_regwnexec((regex_t *) compiled, (const wchar_t *) wstr,
+                        (size_t) wlen, 0, NULL, 0);
+    if (progress_aborted)
+    {
+        progress_aborted = 0;
+        return -1;
+    }
+    if (ret == REG_OK)
+        return 1;
+    return (ret == REG_NOMATCH) ? 0 : -2;
 }
 
 void
