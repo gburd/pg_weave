@@ -4,14 +4,15 @@
 STDLIB ONLY, for the same reason as bench/prepdata.py: it runs on a bare
 Debian instance.
 
-  tsvcaps.py wiki URL OUT [--limit N] [--chunk W] [--cache DIR]
+  tsvcaps.py wiki URL OUT [--limit N] [--chunk W --chunk-out OUT2] [--cache DIR]
   tsvcaps.py agree RUN_A RUN_B [--groups QID_GROUP.tsv] [--label L]
 
 Downloads one enwiki `pages-articles-multistream<k>.xml-p<a>p<b>.bz2` part
 (cached under --cache), keeps main-namespace non-redirect pages, strips the
 wikitext with regular expressions, and writes `id<TAB>text` lines to OUT.
-With --chunk W each article is cut into consecutive W-word windows instead,
-one line per window, so the same text can be measured whole and chunked.
+With --chunk W --chunk-out OUT2 each article is ALSO cut into consecutive
+W-word windows written to OUT2 (row id = pageid*10000 + window), so the same
+text is measured whole and chunked from one pass over the dump.
 
 The strip is regex-based and deliberately crude (templates, tables, refs,
 tags, link syntax, emphasis quotes, headings).  What it leaves is prose plus
@@ -114,26 +115,28 @@ def pages(path):
 
 def cmd_wiki(a):
     path = fetch(a.url, a.cache)
-    n = nout = 0
+    n = nchunk = 0
+    cf = open(a.chunk_out + ".part", "w", encoding="utf-8", newline="\n") if a.chunk else None
     with open(a.out + ".part", "w", encoding="utf-8", newline="\n") as out:
         for pid, wt in pages(path):
             body = strip_wikitext(wt)
             if not body:
                 continue
             n += 1
-            if a.chunk:
+            out.write("%d\t%s\n" % (pid, body))
+            if cf:
                 words = body.split(" ")
                 for k in range(0, len(words), a.chunk):
-                    nout += 1
-                    out.write("%d\t%s\n" % (pid * 10000 + k // a.chunk,
-                                            " ".join(words[k:k + a.chunk])))
-            else:
-                nout += 1
-                out.write("%d\t%s\n" % (pid, body))
+                    nchunk += 1
+                    cf.write("%d\t%s\n" % (pid * 10000 + k // a.chunk,
+                                           " ".join(words[k:k + a.chunk])))
             if a.limit and n >= a.limit:
                 break
     os.replace(a.out + ".part", a.out)
-    print("articles=%d rows=%d -> %s" % (n, nout, a.out), file=sys.stderr)
+    if cf:
+        cf.close()
+        os.replace(a.chunk_out + ".part", a.chunk_out)
+    print("articles=%d chunks=%d -> %s" % (n, nchunk, a.out), file=sys.stderr)
 
 
 def read_run(path):
@@ -185,6 +188,7 @@ def main():
     w.add_argument("out")
     w.add_argument("--limit", type=int, default=0)
     w.add_argument("--chunk", type=int, default=0)
+    w.add_argument("--chunk-out", default="")
     w.add_argument("--cache", default="/scratch/tsvcaps/_cache")
     g = sp.add_parser("agree")
     g.add_argument("run_a")
@@ -195,8 +199,10 @@ def main():
     if a.cmd == "agree":
         cmd_agree(a)
     if a.cmd == "wiki":
-        if a.chunk and a.chunk >= 10000:
-            die("--chunk must be < 10000 (it is packed into the row id)")
+        if a.chunk and not a.chunk_out:
+            die("--chunk needs --chunk-out")
+        if a.chunk and a.chunk < 10:
+            die("--chunk must be >= 10 words (window index is packed into the row id)")
         cmd_wiki(a)
 
 
