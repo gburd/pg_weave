@@ -6221,3 +6221,46 @@ decision 2026-10-07).
   collapsed, trailing ` |N` removed) found the other 8 changed lines to be psql column
   padding, with no other difference (hard rule 3).
 - Evidence and mutants: see G89's "Fix".
+
+
+### G91 — WRONG ANSWER on main: the regex trigram narrowing (Z6, `trigrams = on`) drops true matches of a pattern with a variable-count repetition — `/xa+y/` requires the trigram `xay` and loses the token `xaay` — **FOUND 2026-10-07 by the G88 prefilter property test; FIXED 2026-10-07 on `wt/g88`**
+
+**Cause.** `lin_append_node()` (`src/query/extract.c`), the k = 0 trigram extractor that
+`weave_regex_narrow()` (`src/am/amscan.c`) trusts to say which dictionary terms can match,
+handles `REP(x, m, n)` with `m >= 1` by inlining `x` `min(m, 2)` times into the surrounding
+literal run and *keeping the run open*. When the repetition can match more copies than were
+inlined (`+`, `{1,}`, `{1,3}`, `{2,}`, ...), a trigram running from the left context through
+the inlined copies into the right context is not something every match contains: `/xa+y/`
+linearizes to `xay`, and `xaay` has no `xay`. `/abc+d/` requires `bcd`, which `abccd` lacks.
+The narrowing then never shows those terms to the engine, and the regex route has no
+recheck to restore them (it is exact by design), so the rows are missing from the answer
+with no error. Without `trigrams = on` the walk runs the engine over every term and is
+correct, which is why `sql/regexdict.sql`'s `x+y` row (a run of two, no trigram) never saw it.
+
+**Fix.** After inlining, if the repetition is variable-count (`max_rep` unbounded or greater
+than the inlined count) and the inlined copies added fewer than two codepoints to the run,
+end the run: only then can a trigram straddle the copies, and a copy of two or more
+codepoints already contains every trigram that crosses one of its edges. A flush inside the
+copies also satisfies the test harmlessly (it only costs selectivity).
+
+**Evidence.** `test/hegel/test_regex_approx.c`, exact-dialect leg (`exact` argument): random
+patterns over `abcd` with `.`, classes, groups, alternation, `? * + {m,n}`, run through the
+shipped parser and extractor; random tokens, sampled from the pattern and mutated; the property
+is "every token the matcher accepts satisfies the extracted CNF". Before the fix, 3,000 cases:
+737 dropped tokens (`xaay` for `/xa+y/`, `accb` for `/ac+b/`, ...); after, 20,000 cases,
+1.2 M checks, 0. The oracle there is TRE, which agrees with ARE on this POSIX subset; the
+SQL reproducer in `sql/regexdict.sql` (G91 block) checks the index against core's `~` itself.
+
+### G92 — BACKEND CRASH: TRE asserts (or, built with NDEBUG, writes out of bounds) on a pattern with more than three approximate atoms, e.g. `a{~1}b{~1}c{~1}d{~1}` — **FOUND 2026-10-07 while building G88; FIXED 2026-10-07 on `wt/g88` by refusing the pattern**
+
+TRE's compiler numbers parameter scopes with `params_depth`, which it increments for every
+`atom{~k}` it expands and never decrements (`vendor/tre/lib/tre-compile.c`, `params_depth++`
+after the parameter nodes are built), so the "depth" is really the count of approximate atoms.
+The approximate matcher keeps per-depth costs in a fixed `costs[TRE_M_MAX_DEPTH + 1]` array
+with `TRE_M_MAX_DEPTH = 3` and checks it only with `assert(value <= TRE_M_MAX_DEPTH)`
+(`tre-match-approx.c` `tre_set_params`). A fourth approximate atom anywhere in the pattern
+therefore aborts the backend under assertions, or indexes past the array without them.
+Nothing reached this before G88 (no SQL path ran TRE). Not fixed in TRE: the compiled
+handle's `params_depth` is checked after compile (`src/query/pattern_cache.c`) and a pattern
+over three is refused with `ERRCODE_PROGRAM_LIMIT_EXCEEDED` before it is cached or matched.
+
