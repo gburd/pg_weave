@@ -160,6 +160,14 @@ typedef struct WeaveQueryItem
 #define WEAVE_POS_LABEL(p)	((uint8) ((p) >> WEAVE_POS_LABEL_SHIFT))	/* 0..3 */
 #define WEAVE_POS_ORD(p)		((p) & WEAVE_POS_ORD_MASK)
 #define WEAVE_POS_MAKE(ord, lbl)	(((uint32)(lbl) << WEAVE_POS_LABEL_SHIFT) | ((ord) & WEAVE_POS_ORD_MASK))
+/*
+ * Ordinal 0 is "this occurrence's position is unknown" (doc/PHASES.md M7): what
+ * a positionless entry of a MIXED tsvector becomes, so the rest of the document
+ * keeps its positions.  Analyzers number tokens from 1, so 0 is free.  It sorts
+ * first in a term's list and may repeat (a || of two such terms), it never
+ * takes part in adjacency, and it is in no weight zone.
+ */
+#define WEAVE_POS_UNKNOWN		0u
 /* Map a weight char A/B/C/D (any case) to its 0..3 label; D/unknown -> 0. */
 #define WEAVE_WEIGHT_LABEL(c) \
 	(((c)=='A'||(c)=='a') ? 3 : ((c)=='B'||(c)=='b') ? 2 : ((c)=='C'||(c)=='c') ? 1 : 0)

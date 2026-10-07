@@ -213,7 +213,12 @@ weave_doc_build(uint32 nterms, char **terms, const int *lens, const uint32 *tfs,
 
 			for (k = 0; k < tfs[i]; k++, p++)
 			{
-				if (k > 0 && WEAVE_POS_ORD(positions[p]) <= WEAVE_POS_ORD(positions[p - 1]))
+				/* strictly ascending, except that the unknown position 0 may
+				 * repeat (WEAVE_POS_UNKNOWN: a || of two such occurrences) */
+				if (k > 0 &&
+					(WEAVE_POS_ORD(positions[p]) < WEAVE_POS_ORD(positions[p - 1]) ||
+					 (WEAVE_POS_ORD(positions[p]) == WEAVE_POS_ORD(positions[p - 1]) &&
+					  WEAVE_POS_ORD(positions[p]) != WEAVE_POS_UNKNOWN)))
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 							 errmsg("invalid %s: positions must be ascending within a term", errctx)));
@@ -1189,6 +1194,9 @@ wdoc_concat(PG_FUNCTION_ARGS)
 		WeaveTermEntry *eb = WEAVE_DOC_ENTRIES(b);
 
 #define ATERM(x) WEAVE_DOC_TERMTEXT(a, &ea[x])
+		/* shift B's ordinal past A, but an unknown position stays unknown */
+#define REBASE(x) (WEAVE_POS_ORD(x) == WEAVE_POS_UNKNOWN ? (x) : \
+				   WEAVE_POS_MAKE(WEAVE_POS_ORD(x) + abase, WEAVE_POS_LABEL(x)))
 #define BTERM(x) WEAVE_DOC_TERMTEXT(b, &eb[x])
 		while (ia < na || ib < nb)
 		{
@@ -1227,8 +1235,7 @@ wdoc_concat(PG_FUNCTION_ARGS)
 				tfs[nout] = eb[ib].tf;
 				if (has_pos)
 					for (k = 0; k < eb[ib].tf; k++)
-						positions[pc++] = WEAVE_POS_MAKE(WEAVE_POS_ORD(bp[k]) + abase,
-													   WEAVE_POS_LABEL(bp[k]));
+						positions[pc++] = REBASE(bp[k]);
 				nout++; ib++;
 			}
 			else					/* term in BOTH: sum tf, positions A then re-based B */
@@ -1241,17 +1248,25 @@ wdoc_concat(PG_FUNCTION_ARGS)
 				tfs[nout] = ea[ia].tf + eb[ib].tf;
 				if (has_pos)
 				{
-					for (k = 0; k < ea[ia].tf; k++)
+					uint32		za = 0,
+								zb = 0;
+
+					/* unknown positions (ordinal 0) sort first: A's, then B's */
+					while (za < ea[ia].tf && WEAVE_POS_ORD(ap[za]) == WEAVE_POS_UNKNOWN)
+						positions[pc++] = ap[za++];
+					while (zb < eb[ib].tf && WEAVE_POS_ORD(bp[zb]) == WEAVE_POS_UNKNOWN)
+						positions[pc++] = bp[zb++];
+					for (k = za; k < ea[ia].tf; k++)
 						positions[pc++] = ap[k];
-					for (k = 0; k < eb[ib].tf; k++)
-						positions[pc++] = WEAVE_POS_MAKE(WEAVE_POS_ORD(bp[k]) + abase,
-													   WEAVE_POS_LABEL(bp[k]));
+					for (k = zb; k < eb[ib].tf; k++)
+						positions[pc++] = REBASE(bp[k]);
 				}
 				nout++; ia++; ib++;
 			}
 		}
 #undef ATERM
 #undef BTERM
+#undef REBASE
 		ntot = nout;
 	}
 

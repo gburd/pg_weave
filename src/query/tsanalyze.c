@@ -204,14 +204,21 @@ PG_FUNCTION_INFO_V1(to_wdoc_from_tsvector);
  * on-ramp for a table that already materializes a tsvector column.
  *
  * Positions: a tsvector entry may be positionless (haspos=0, e.g. after
- * strip()) or carry positions.  wdoc positions are all-or-nothing per doc, so
- * we keep positions ONLY if EVERY entry has them; if any entry is positionless
- * we build a positions-off wdoc (tf = max(npos,1)), matching how a stripped
- * tsvector degrades.  A tsvector position of 0 ("unknown") is treated as
- * positionless for that entry.  Positions are taken via WEP_GETPOS (the 14-bit
- * position, weight bits dropped) and are already ascending + distinct within an
- * entry per tsvector's own invariants; weave_doc_build re-validates at the trust
- * boundary.
+ * strip(), or `tsv || 'tag'::tsvector`) or carry positions.  A document is
+ * positions-off only when NO entry has positions (a stripped tsvector: tf = 1
+ * per lexeme, as core's ts_rank treats it).  A MIXED document keeps the
+ * positions it has, and a positionless entry gets tf = 1 and the one position
+ * ordinal 0 -- "occurs, position unknown", core's POSNULL convention
+ * (tsrank.c).  Ordinal 0 never takes part in adjacency (weave_phrase_step_pos)
+ * and is never in a weight zone (term_positions), so a phrase over such an
+ * entry is false, as core's `@@` answers it (checkclass_str returns TS_MAYBE,
+ * which TS_execute turns into false at the topmost phrase operator), while a
+ * phrase over the positioned entries of the same document still matches.  It
+ * used to drop the positions of the WHOLE document when any one entry lacked
+ * them, which made every phrase on it false.  Positions are taken via
+ * WEP_GETPOS (the 14-bit position, weight bits mapped to our label); tsvector
+ * positions are >= 1, ascending and distinct within an entry, and
+ * weave_doc_build re-validates at the trust boundary.
  */
 Datum
 to_wdoc_from_tsvector(PG_FUNCTION_ARGS)
@@ -224,7 +231,7 @@ to_wdoc_from_tsvector(PG_FUNCTION_ARGS)
 	int		   *lens;
 	uint32	   *tfs;
 	uint32	   *positions = NULL;
-	bool		has_pos = true;
+	bool		has_pos;
 	uint64		npos = 0;
 	int			i;
 	WeaveDoc		doc;
@@ -236,13 +243,14 @@ to_wdoc_from_tsvector(PG_FUNCTION_ARGS)
 		PG_RETURN_WDOC(doc);
 	}
 
-	/* first pass: decide positions-on/off + total position count */
+	/* first pass: positions-on unless every entry is positionless */
+	has_pos = false;
 	for (i = 0; i < n; i++)
 	{
 		int			np = POSDATALEN(tsv, &we[i]);
 
-		if (np <= 0)
-			has_pos = false;
+		if (np > 0)
+			has_pos = true;
 		npos += (np > 0) ? (uint64) np : 1;
 	}
 
@@ -274,6 +282,8 @@ to_wdoc_from_tsvector(PG_FUNCTION_ARGS)
 				for (k = 0; k < np; k++)
 					positions[p++] = WEAVE_POS_MAKE(WEP_GETPOS(pv[k]),
 												  WEP_GETWEIGHT(pv[k]));
+				if (np <= 0)
+					positions[p++] = WEAVE_POS_UNKNOWN;	/* mixed doc: see above */
 			}
 		}
 	}

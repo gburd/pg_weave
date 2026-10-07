@@ -129,8 +129,12 @@ term_positions(WeaveDoc doc, const char *term, int termlen, uint16 flags,
 							n = 0;
 				bool		any = false;
 
+				/* an unknown position (ordinal 0) is in no zone, for the
+				 * reason a positionless document is in none */
+#define IN_ZONE(x) ((wmask & (1u << WEAVE_POS_LABEL(x))) != 0 && \
+					WEAVE_POS_ORD(x) != WEAVE_POS_UNKNOWN)
 				for (j = 0; j < v.npos; j++)
-					if ((wmask & (1u << WEAVE_POS_LABEL(v.pos[j]))) != 0)
+					if (IN_ZONE(v.pos[j]))
 						any = true;
 				v.present = any;
 				/* compact in-zone positions in place (order preserved) */
@@ -139,8 +143,9 @@ term_positions(WeaveDoc doc, const char *term, int termlen, uint16 flags,
 					uint32	   *keep = (uint32 *) palloc((Size) v.npos * sizeof(uint32));
 
 					for (j = 0; j < v.npos; j++)
-						if ((wmask & (1u << WEAVE_POS_LABEL(v.pos[j]))) != 0)
+						if (IN_ZONE(v.pos[j]))
 							keep[n++] = v.pos[j];
+#undef IN_ZONE
 					v.pos = keep;
 					v.npos = n;
 				}
@@ -173,9 +178,19 @@ weave_phrase_step_pos(const uint32 *left, int nleft,
 				ri,
 				k = 0;
 
+	/*
+	 * Ordinal 0 (WEAVE_POS_UNKNOWN) is an occurrence whose position is unknown,
+	 * and it sorts first.  It is adjacent to nothing: as a left position it
+	 * would otherwise "precede" every right position <= distance.
+	 */
+	while (li < nleft && WEAVE_POS_ORD(left[li]) == WEAVE_POS_UNKNOWN)
+		li++;
 	for (ri = 0; ri < nright; ri++)
 	{
 		uint32		p = WEAVE_POS_ORD(right[ri]);	/* ordinal only; ignore label bits */
+
+		if (p == WEAVE_POS_UNKNOWN)
+			continue;
 
 		/* advance li to the first left position that could be in range */
 		while (li < nleft && WEAVE_POS_ORD(left[li]) + distance < p)
