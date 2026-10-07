@@ -2263,8 +2263,8 @@ extern uint8 *weave_read_blob(Relation index, BlockNumber blk, Size len);
  * trigram blob it would drop candidates.  Both are plausible wrong answers.
  * `len` is the stored length; any blob this index wrote reopens at exactly that
  * size and validates, so a mismatch is corruption: ERRCODE_DATA_CORRUPTED, naming
- * the index and block, with a REINDEX hint.  pg_fts 1.8.4 found the hazard and
- * added the same guard (bm25_sm_open_checked); pg_weave forked before it
+ * the index and block, with a REINDEX hint.  The sibling project found the hazard
+ * in 1.8.4 and added the same guard; pg_weave forked before it
  * (doc/GAPS.md G85).
  */
 /* `map` is an sm_t * (weave/sparsemap.h, which this header does not include:

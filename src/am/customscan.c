@@ -425,7 +425,7 @@ WeaveCountReScan(CustomScanState *node)
 /* ===== module init ===== */
 
 /* ---------------------------------------------------------------------------
- * The LIMIT hint (doc/GAPS.md G87), ported from pg_fts 1.9.0's "(A)".
+ * The LIMIT hint (doc/GAPS.md G87), ported from the sibling project's 1.9.0 "(A)".
  *
  * An index access method is not told the query's LIMIT, so an ordering scan's
  * first pass runs at pg_weave.wand_initial_k's width (128 by default) whatever
