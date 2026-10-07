@@ -6057,7 +6057,11 @@ over 18,000 tokens, 0 disagreements among both indexes, `weave_count()` and the 
 `~` for the exact ones). Six SQL-level mutants, each built and installed, each changing the
 regression output: G91 reverted, verify via ARE, heap via ARE, k off by one (TRE's parser
 `limit_err + 1`), APPROX as its child, no nullable giveup. Full EC2 smoke green on `654da61`
-(`pgweave-20261007-163427-da3f`: regression, isolation, 34 TAP files / 1,314 tests).
+(`pgweave-20261007-163427-da3f`: regression, isolation, 34 TAP files / 1,314 tests) and again
+on the final code-and-docs commit `3159176` (`pgweave-20261007-171600-1770`: lint 3/3,
+prefilter test, regression with an empty diff, TAP 34 files PASS, and
+`doc/readme_examples.sql` on PostgreSQL 17 and 18 with identical output, the `{~1}` example
+returning row 4).
 
 **Does not ship.** A global edit budget over a whole pattern (`(pat){~k}` is the way to say
 it); TRE's cost syntax; more than three approximate atoms; narrowing for a nullable approximate
