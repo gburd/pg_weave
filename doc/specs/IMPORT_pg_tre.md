@@ -38,8 +38,8 @@ below for what is done and what remains.
 | `include/pg_tre/uleven.h` | `include/weave/uleven.h` |
 | `src/query/regex_ast.c` | `src/query/regex_ast.c` |
 | `include/pg_tre/regex_ast.h` | `include/weave/regex_ast.h` |
-| `src/query/tiling.c` | `src/query/tiling.c` |
-| `include/pg_tre/tiling.h` | `include/weave/tiling.h` |
+| `src/query/tiling.c` | deleted by G88 (unsound; `doc/GAPS.md` G88) |
+| `include/pg_tre/tiling.h` | deleted by G88 |
 | `src/query/like_translate.c` | `src/query/like_translate.c` |
 | `include/pg_tre/like_translate.h` | `include/weave/like_translate.h` |
 | `src/util/utf8.c` | `src/util/utf8.c` |

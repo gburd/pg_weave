@@ -75,7 +75,6 @@ FUZZY_OBJS = \
 	src/query/regex_tokens.o \
 	src/query/parser.o \
 	src/query/extract.o \
-	src/query/tiling.o \
 	src/query/like_translate.o \
 	src/query/pattern_cache.o \
 	src/query/trgm_similarity.o \
