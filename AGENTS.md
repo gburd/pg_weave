@@ -516,7 +516,7 @@ just worker count) and make the guard sweep *that* axis, first.
 | lexical channel: parse, analyze, rank, match | `src/query/` | forked; see `doc/ARCHITECTURE.md` §4 |
 | FOR codec | `include/weave/for.h` | — |
 | page readers/writers | `src/pages/` | `doc/specs/SEGMENT_FORMAT.md` |
-| fuzzy/regex/prefix (imported, unwired) | `src/query/{surf,uleven,regex_ast,tiling,like_translate}.c` | `doc/specs/FUZZY_CHANNEL.md`, `doc/specs/IMPORT_pg_tre.md` |
+| fuzzy/regex/prefix (imported; regex AST + extractor wired, TRE matcher wired for `{~k}` by G88) | `src/query/{surf,uleven,regex_ast,extract,re_match,like_translate}.c` | `doc/specs/FUZZY_CHANNEL.md`, `doc/specs/IMPORT_pg_tre.md` |
 | vector codec (implemented) | `src/vector/{quantize,pack}.c` | `doc/specs/VECTOR_CHANNEL.md` |
 | vector storage, kernels, graph (stubs) | `src/vector/{vector,kernels,graph}.c` | `doc/specs/VECTOR_CHANNEL.md` |
 | fused scorer (unimplemented) | `src/am/fuse.c` | `doc/specs/FUSED_TOPK.md` |

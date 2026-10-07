@@ -107,6 +107,26 @@ regex_pattern() {
 }
 REGEX_LABELS=(class_e12 class_e34 class_e56 literal_e1234 literal_e5678 anchored_e12 fanout_all)
 
+# G88: approximate regex, `atom{~k}`.  The "whole" patterns approximate a whole
+# filler token (no literal outside the atom, so the weft cannot narrow and the
+# walk runs TRE over the ~250k-term vocabulary: the shape to hold against Z5's
+# 200 ms gate for term~k); the "tail" ones keep a literal prefix outside the atom,
+# which the weft narrows on; the "id" ones land in the 10k id-shaped vocabulary.
+# Their reference is the HEAP predicate (to_wdoc() of the body per row, TRE),
+# because TRE is the oracle for the approximate dialect; there is no core engine
+# to compare with.
+approx_pattern() {
+    case $1 in
+        approx1_whole) printf '^(t123456){~1}$' ;;
+        approx2_whole) printf '^(t123456){~2}$' ;;
+        approx1_tail)  printf '^t1234(56){~1}$' ;;
+        approx2_tail)  printf '^t123(456){~2}$' ;;
+        approx1_id)    printf '^e12(34){~1}$' ;;
+        approx2_id)    printf '(e1234){~2}' ;;
+    esac
+}
+APPROX_LABELS=(approx1_whole approx2_whole approx1_tail approx2_tail approx1_id approx2_id)
+
 idx_sql() {                      # idx_sql <kind> <arg> <k-or-empty>
     case $1 in
         fuzzy) printf "SELECT count(*) FROM fz WHERE d @@@ '%s~%s'::wquery" "$2" "$3" ;;
@@ -117,6 +137,7 @@ ref_sql() {                      # ref_sql <kind> <arg> <k-or-empty>
     case $1 in
         fuzzy) printf "SELECT count(*) FROM fz WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body,' ')) x WHERE levenshtein_less_equal(x, '%s', %s) <= %s)" "$2" "$3" "$3" ;;
         regex) printf "SELECT count(*) FROM fz WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(body,' ')) x WHERE x ~ '%s')" "$2" ;;
+        approx) printf "SELECT count(*) FROM fz WHERE to_wdoc('simple', body) @@@ '/%s/'::wquery" "$2" ;;
     esac
 }
 
@@ -163,7 +184,7 @@ build() {                        # build <ddl>
     t0=$(date +%s.%N)
     $PSQL -c "$ddl" >/dev/null
     t1=$(date +%s.%N)
-    echo "$t1-$t0" | bc
+    awk -v a="$t1" -v b="$t0" 'BEGIN { printf "%.3f\n", a - b }'	# no bc on the Debian 13 image
 }
 
 # ---------------------------------------------------------------------------
@@ -211,6 +232,21 @@ run_arm() {                      # run_arm <arm-name> <index-ddl-suffix>
             printf '  ok regex %s (/%s/): %s rows (index and reference agree)\n' "$label" "$pat" "$iv"
         fi
     done
+    for label in "${APPROX_LABELS[@]}"; do
+        local pat iv rv
+        pat=$(approx_pattern "$label")
+        iv=$($PSQL -t -A -c "$(idx_sql regex "$pat")")
+        rv=$($PSQL -t -A -c "$(ref_sql approx "$pat")")
+        if [ "$iv" != "$rv" ]; then
+            printf '  MISMATCH approx %s (/%s/) index=%s heap=%s\n' "$label" "$pat" "$iv" "$rv"
+            fail=1
+        elif [ "$iv" = 0 ]; then
+            printf '  EMPTY approx %s (/%s/): 0 rows -- a benchmark of nothing\n' "$label" "$pat"
+            fail=1
+        else
+            printf '  ok approx %s (/%s/): %s rows (index and heap agree)\n' "$label" "$pat" "$iv"
+        fi
+    done
     [ "$fail" = 0 ] || { echo "ABORT: correctness failed on arm $arm; latency numbers would be meaningless" >&2; exit 1; }
 
     for pass in A B; do
@@ -224,6 +260,9 @@ run_arm() {                      # run_arm <arm-name> <index-ddl-suffix>
             done
             for label in "${REGEX_LABELS[@]}"; do
                 printf 'regex_%s\t%s\n' "$label" "$(warmq "$(idx_sql regex "$(regex_pattern "$label")")")"
+            done
+            for label in "${APPROX_LABELS[@]}"; do
+                printf '%s\t%s\n' "$label" "$(warmq "$(idx_sql regex "$(approx_pattern "$label")")")"
             done
         } | column -t
         printf 'PASS\t%s\t%s\tdone\n' "$arm" "$pass"
@@ -239,6 +278,9 @@ run_arm() {                      # run_arm <arm-name> <index-ddl-suffix>
         done
         for label in "${REGEX_LABELS[@]}"; do
             printf 'regex_%s\t%s\n' "$label" "$(chanstats "$(idx_sql regex "$(regex_pattern "$label")")")"
+        done
+        for label in "${APPROX_LABELS[@]}"; do
+            printf '%s\t%s\n' "$label" "$(chanstats "$(idx_sql regex "$(approx_pattern "$label")")")"
         done
     } | column -t
 }

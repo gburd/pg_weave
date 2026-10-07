@@ -5984,7 +5984,7 @@ The vector `<->`/`<#>` route stays unhinted: see the measurement above. A decisi
 needed to use `wvec`'s reserved `int16` as a planner-only carrier, and on the corpus
 measured it would not have changed the work.
 
-### G88 — "approximate regex" is named in the product statement and does not ship: `{~k}` parses and is then ignored — **FOUND 2026-10-06 by the README rewrite; OPEN, needs a maintainer decision**
+### G88 — "approximate regex" is named in the product statement and does not ship: `{~k}` parses and is then ignored — **FOUND 2026-10-06 by the README rewrite; BUILT 2026-10-07 on `wt/g88` (maintainer decision: build it); see "What ships" at the end of this entry**
 
 `AGENTS.md`'s product statement lists "approximate regex" among the six retrieval kinds, and
 `doc/PHASES.md` Phase Z is titled "fuzzy / approximate-regex / prefix / n-gram". What ships is
@@ -6007,6 +6007,65 @@ Fuzzy TERMS (`term~k`, universal Levenshtein, Z5) do ship and are not this gap.
 `{~k}` extraction rules for the trigram prefilter, and a refusal of `{~k}` until then), or
 narrow the product statement and Phase Z's title to "regex". The README says "regular
 expressions over tokens" until this is decided.
+
+**Found 2026-10-07 while building it: the imported (k+1)-tiling prefilter is UNSOUND and must
+not be wired as it stands.** `src/query/tiling.c` `linearize_literals()` concatenates the
+literal codepoints of a pattern into one buffer, and its `default:` case (CLASS, ANY, REPEAT,
+ALT, ...) contributes nothing *without ending the run*, so `CONCAT` glues the literals on either
+side of a gap together. For `/ab.cd/` it linearizes to `"abcd"` and emits the trigrams `abc` and
+`bcd`, neither of which occurs in the matching token `abxcd`: a prefilter built from them drops
+a true match even at k = 0 (hard rule 1). The tiles it then forms also overlap in characters
+(consecutive trigrams share two), so "one of k+1 tiles survives k edits" does not follow from
+the pigeonhole argument either. `regex_extract_query()` (`src/query/extract.c`) calls it for
+every `max_cost > 0`; nothing in `src/am/` reaches that path today, which is the only reason it
+has not produced a wrong answer.
+
+The tiling was **deleted**, not repaired (a global edit budget now yields `always_true`; nothing
+needed it: approximation is per atom).
+
+**What ships (2026-10-07, `wt/g88`).** Specified in `doc/specs/FUZZY_CHANNEL.md` §2.1.
+
+- *The rule.* A `/re/` containing `{~` is approximate and is decided by TRE end to end, on the
+  index (`weave_regex_terms()`) and on the heap (`weave_doc_has_regex()`), with one compiled
+  handle and one matcher (`weave_match_wide()`, TRE's wide API over `pg_wchar`, not its
+  locale-dependent narrow one). Every other pattern is core's ARE, unchanged.
+- *Semantics.* TRE's per-atom `atom{~k}`: up to k insertions, deletions or substitutions (1
+  each) inside the atom, exact outside it; `{~0}` is the exact atom; unanchored like `~`; over
+  dictionary tokens. Accepted syntax is ERE plus `{~k}`; TRE's other bound forms (`{~}`,
+  `{~n,m}`, `{+n}`, `{#n}`, cost expressions) are refused. At most three approximate atoms (G92).
+- *Prefilter.* An approximate atom is opaque to the k = 0 trigram extractor; literal runs outside
+  it still narrow. A nullable approximate atom disables extraction (TRE leaks its budget past
+  it, below). The narrowing refuses any backslash in an approximate pattern.
+- *Bounds.* A presence filter: no score, no block-max bound; in `fuse()` it is a gate (F9), as
+  exact regex is.
+
+**Two TRE behaviours that are now part of the semantics** (index and heap agree on both,
+because both are TRE): no insertion after an approximate atom's last character when nothing
+follows (`^(abc){~1}$` rejects `abcd`, accepts `xabc`); and a nullable approximate atom leaks
+its budget to what follows (`(a?){~1}bcd` matches `bd`). Neither is fixed in TRE. `term~k`
+remains the operator for whole-token edit distance.
+
+**Evidence.** `make check-regex-approx` (`test/hegel/test_regex_approx.c`, in the EC2 smoke):
+20,000 random patterns per leg, 1.2 M token checks each, 0 dropped tokens. Positive controls,
+each built and then failing: the pre-G88 APPROX-as-child rule (2,183 drops / 3,000 cases), no
+nullable-atom giveup (72 / 20,000). `sql/regex_approx.sql`: 15 approximate patterns whose
+expected id lists were computed with TRE standalone before the SQL ran; heap, `weave_count()`
+and the planner's index answer on a `trigrams = on` and a `trigrams = off` index all agree;
+`{~0}` equals the exact pattern; seven exact patterns still equal core's `~`. A randomized
+sweep (`pgweave-20261007-162141-2b73`): 400 generated approximate patterns and 400 exact ones
+over 18,000 tokens, 0 disagreements among both indexes, `weave_count()` and the heap (and
+`~` for the exact ones). Six SQL-level mutants, each built and installed, each changing the
+regression output: G91 reverted, verify via ARE, heap via ARE, k off by one (TRE's parser
+`limit_err + 1`), APPROX as its child, no nullable giveup. Full EC2 smoke green on `654da61`
+(`pgweave-20261007-163427-da3f`: regression, isolation, 34 TAP files / 1,314 tests) and again
+on the final code-and-docs commit `3159176` (`pgweave-20261007-171600-1770`: lint 3/3,
+prefilter test, regression with an empty diff, TAP 34 files PASS, and
+`doc/readme_examples.sql` on PostgreSQL 17 and 18 with identical output, the `{~1}` example
+returning row 4).
+
+**Does not ship.** A global edit budget over a whole pattern (`(pat){~k}` is the way to say
+it); TRE's cost syntax; more than three approximate atoms; narrowing for a nullable approximate
+atom or any escape in an approximate pattern (both walk the whole dictionary, correctly).
 
 The same review found two documents stale against the shipped code, recorded here so they are
 not lost: `doc/PRODUCTION_READINESS.md` "What actually works today" still says vector indexing
@@ -6209,3 +6268,54 @@ decision 2026-10-07).
   collapsed, trailing ` |N` removed) found the other 8 changed lines to be psql column
   padding, with no other difference (hard rule 3).
 - Evidence and mutants: see G89's "Fix".
+
+
+### G91 — WRONG ANSWER on main: the regex trigram narrowing (Z6, `trigrams = on`) drops true matches of a pattern with a variable-count repetition — `/xa+y/` requires the trigram `xay` and loses the token `xaay` — **FOUND 2026-10-07 by the G88 prefilter property test; FIXED 2026-10-07 on `wt/g88`**
+
+**Cause.** `lin_append_node()` (`src/query/extract.c`), the k = 0 trigram extractor that
+`weave_regex_narrow()` (`src/am/amscan.c`) trusts to say which dictionary terms can match,
+handles `REP(x, m, n)` with `m >= 1` by inlining `x` `min(m, 2)` times into the surrounding
+literal run and *keeping the run open*. When the repetition can match more copies than were
+inlined (`+`, `{1,}`, `{1,3}`, `{2,}`, ...), a trigram running from the left context through
+the inlined copies into the right context is not something every match contains: `/xa+y/`
+linearizes to `xay`, and `xaay` has no `xay`. `/abc+d/` requires `bcd`, which `abccd` lacks.
+The narrowing then never shows those terms to the engine, and the regex route has no
+recheck to restore them (it is exact by design), so the rows are missing from the answer
+with no error. Without `trigrams = on` the walk runs the engine over every term and is
+correct, which is why `sql/regexdict.sql`'s `x+y` row (a run of two, no trigram) never saw it.
+
+**Fix.** After inlining, if the repetition is variable-count (`max_rep` unbounded or greater
+than the inlined count) and the inlined copies added fewer than two codepoints to the run,
+end the run: only then can a trigram straddle the copies, and a copy of two or more
+codepoints already contains every trigram that crosses one of its edges. A flush inside the
+copies also satisfies the test harmlessly (it only costs selectivity).
+
+**Evidence.** `test/hegel/test_regex_approx.c`, exact-dialect leg (`exact` argument): random
+patterns over `abcd` with `.`, classes, groups, alternation, `? * + {m,n}`, run through the
+shipped parser and extractor; random tokens, sampled from the pattern and mutated; the property
+is "every token the matcher accepts satisfies the extracted CNF". Before the fix, 3,000 cases:
+737 dropped tokens (`xaay` for `/xa+y/`, `accb` for `/ac+b/`, ...); after, 20,000 cases,
+1.2 M checks, 0. The oracle there is TRE, cross-checked against glibc's POSIX `regexec` on
+every token (0 disagreements), and run by `make check-regex-approx` in the EC2 smoke.
+
+At the SQL level, against core's `~` itself (EC2 `pgweave-20261007-162141-2b73`, commit
+`3baf697`): `sql/regexdict.sql`'s G91 block (`weave_count()` on a `trigrams = on` index,
+which has no executor recheck) returns `xa+y` 3, `abc+d` 3, `xa{1,3}y` 3, equal to `~`; with
+the fix reverted (mutant M1, built and installed) it returns **1** for each. A randomized sweep
+of 400 generated exact patterns over an 18,000-token corpus: 0 disagreements between the
+`trigrams = on` index, the `trigrams = off` index, the heap predicate and `~` with the fix;
+**3 of 400** patterns where the `trigrams = on` index loses rows with it reverted.
+
+### G92 — BACKEND CRASH: TRE asserts (or, built with NDEBUG, writes out of bounds) on a pattern with more than three approximate atoms, e.g. `a{~1}b{~1}c{~1}d{~1}` — **FOUND 2026-10-07 while building G88; FIXED 2026-10-07 on `wt/g88` by refusing the pattern**
+
+TRE's compiler numbers parameter scopes with `params_depth`, which it increments for every
+`atom{~k}` it expands and never decrements (`vendor/tre/lib/tre-compile.c`, `params_depth++`
+after the parameter nodes are built), so the "depth" is really the count of approximate atoms.
+The approximate matcher keeps per-depth costs in a fixed `costs[TRE_M_MAX_DEPTH + 1]` array
+with `TRE_M_MAX_DEPTH = 3` and checks it only with `assert(value <= TRE_M_MAX_DEPTH)`
+(`tre-match-approx.c` `tre_set_params`). A fourth approximate atom anywhere in the pattern
+therefore aborts the backend under assertions, or indexes past the array without them.
+Nothing reached this before G88 (no SQL path ran TRE). Not fixed in TRE: the compiled
+handle's `params_depth` is checked after compile (`src/query/pattern_cache.c`) and a pattern
+over three is refused with `ERRCODE_PROGRAM_LIMIT_EXCEEDED` before it is cached or matched.
+

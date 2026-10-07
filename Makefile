@@ -75,7 +75,6 @@ FUZZY_OBJS = \
 	src/query/regex_tokens.o \
 	src/query/parser.o \
 	src/query/extract.o \
-	src/query/tiling.o \
 	src/query/like_translate.o \
 	src/query/pattern_cache.o \
 	src/query/trgm_similarity.o \
@@ -127,7 +126,7 @@ PGFILEDESC = "pg_weave - unified lexical + vector + fuzzy retrieval in one index
 # --inputdir=$(srcdir) for pg_regress), so plain REGRESS with no REGRESS_OPTS
 # picks up sql/<name>.sql + expected/<name>.out directly. No relayout fix
 # needed here.
-REGRESS = weave unicode_fold idx_scan_stats wvec orderby chandesc surf vecindex vecscan vecorderby pendingvec chanstats fuzzyuleven regexdict edist cgram fuse_fallback fuse_degenerate fuse_pushdown fuse_gate docvals fusesearch doclist idf_deletes limit_hint limit_hint_fuse score_reuse wdoc_roundtrip
+REGRESS = weave unicode_fold idx_scan_stats wvec orderby chandesc surf vecindex vecscan vecorderby pendingvec chanstats fuzzyuleven regexdict regex_approx edist cgram fuse_fallback fuse_degenerate fuse_pushdown fuse_gate docvals fusesearch doclist idf_deletes limit_hint limit_hint_fuse score_reuse wdoc_roundtrip
 
 # --- Isolation tests -------------------------------------------------------
 # pg_isolation_regress hardcodes its two lookup paths relative to a SINGLE
@@ -487,6 +486,30 @@ check-standalone:
 	$$tmp/rxdash > $$tmp/rxdash.log 2>&1 || { cat $$tmp/rxdash.log; exit 1; }; \
 	tail -1 $$tmp/rxdash.log; \
 	echo "== ALL STANDALONE CHECKS PASSED =="
+
+# G88/G91: the regex trigram prefilter never drops a token the matcher accepts
+# (test/hegel/test_regex_approx.c).  It links the SHIPPED parser and extractor,
+# which need the server headers, so it is not in check-standalone (whose CI leg
+# has no PostgreSQL); the EC2 smoke runs it.  Two legs: the exact dialect,
+# cross-checked against glibc's POSIX regexec, and the approximate one ({~k}).
+REGEX_APPROX_SRCS = src/query/extract.c src/query/parser.c src/query/regex_ast.c \
+	src/query/regex_grammar.c src/query/regex_tokens.c src/query/re_match.c \
+	$(TRE_OBJS:.o=.c)
+.PHONY: check-regex-approx
+check-regex-approx:
+	@set -e; \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	$(CHECK_CC) -O2 -w -DHAVE_CONFIG_H -I include -I src/query \
+		-I vendor/tre -I vendor/tre/lib -I vendor/tre/local_includes \
+		-I $$($(PG_CONFIG) --includedir-server) \
+		-o $$tmp/rxa test/hegel/test_regex_approx.c $(REGEX_APPROX_SRCS); \
+	echo "== G91 regex prefilter, exact dialect (oracles: TRE and glibc POSIX) =="; \
+	$$tmp/rxa 20000 exact > $$tmp/exact.log 2>&1 || { tail -30 $$tmp/exact.log; exit 1; }; \
+	tail -1 $$tmp/exact.log; \
+	echo "== G88 regex prefilter, approximate atoms {~k} (oracle: TRE) =="; \
+	$$tmp/rxa 20000 > $$tmp/approx.log 2>&1 || { tail -30 $$tmp/approx.log; exit 1; }; \
+	tail -1 $$tmp/approx.log; \
+	echo "== REGEX PREFILTER CHECKS PASSED =="
 
 # The INT_MAX crash fix (pg_tre 1521662 / upstream ad26b6d) needs an actual
 # buffer bigger than INT_MAX bytes (~2 GiB) plus a guard page to reproduce

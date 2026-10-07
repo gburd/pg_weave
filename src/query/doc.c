@@ -48,6 +48,7 @@
 #include "weave/am.h"			/* WEAVE_ALLOC_MAYBE_HUGE / WEAVE_REALLOC_MAYBE_HUGE */
 #include "weave/docvalid.h"
 #include "weave/edist.h"		/* weave_doc_min_edist: the <@> operator's value */
+#include "weave/pattern_cache.h"	/* G88: approximate regex via TRE */
 #include "catalog/pg_collation.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
@@ -1010,9 +1011,40 @@ bool
 weave_doc_has_regex(WeaveDoc doc, const char *re, int relen)
 {
 	WeaveTermEntry *entries = WEAVE_DOC_ENTRIES(doc);
-	text	   *repat = cstring_to_text_with_len(re, relen);
+	text	   *repat;
 	uint32		i;
 	bool		found = false;
+
+	/*
+	 * G88: an approximate pattern ("{~" anywhere) is TRE's, here exactly as in
+	 * weave_regex_terms(), so the heap and the index agree on every row.
+	 */
+	if (weave_regex_is_approx(re, relen))
+	{
+		void	   *h = weave_cache_lookup(re, relen);
+		pg_wchar   *wbuf = NULL;
+		int			wcap = 0;
+
+		for (i = 0; i < doc->nterms && !found; i++)
+		{
+			int			len = entries[i].len;
+
+			if (len + 1 > wcap)
+			{
+				if (wbuf)
+					pfree(wbuf);
+				wcap = Max(len + 1, 64);
+				wbuf = palloc(wcap * sizeof(pg_wchar));	/* alloc-ok: one term's characters, bounded by the term's own byte length */
+			}
+			found = weave_approx_regex_match(h, WEAVE_DOC_TERMTEXT(doc, &entries[i]),
+											 len, wbuf);
+		}
+		if (wbuf)
+			pfree(wbuf);
+		return found;
+	}
+
+	repat = cstring_to_text_with_len(re, relen);
 
 	for (i = 0; i < doc->nterms; i++)
 	{

@@ -99,7 +99,6 @@ sources = files(
   'src/query/regex_tokens.c',
   'src/query/parser.c',
   'src/query/extract.c',
-  'src/query/tiling.c',
   'src/query/like_translate.c',
   'src/query/pattern_cache.c',
   'src/query/trgm_similarity.c',

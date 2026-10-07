@@ -238,6 +238,28 @@ SELECT regex_dict > 0 AS the_dictionary_walk_served_it,
        regex_trgm = 0 AS and_nothing_to_narrow_on
   FROM weave_channel_stats();
 
+-- ---- G91: A VARIABLE-COUNT REPETITION MUST NOT CONTRIBUTE A SPANNING TRIGRAM --
+-- The extractor used to inline a repetition's child into the surrounding literal
+-- run, so /xa+y/ required the trigram "xay" and the narrowing dropped "xaay"; the
+-- regex route has no recheck, so those rows were simply missing.  weave_count()
+-- enters the scan machinery directly, with no executor recheck that could repair
+-- the answer by another path; regex_trgm > 0 shows the narrowing was applied.
+CREATE TABLE rg (id serial, body text, d wdoc);
+INSERT INTO rg(body) VALUES ('xay'), ('xaay'), ('xaaay'), ('abcd'), ('abccd'),
+  ('abcccd'), ('pqqr'), ('pqqqr');
+INSERT INTO rg(body) SELECT 'filler' || g FROM generate_series(1, 500) g;
+UPDATE rg SET d = to_wdoc('simple', body);
+CREATE INDEX rg_on ON rg USING weave (d) WITH (trigrams = on);
+SELECT weave_channel_stats_reset();
+SELECT p,
+       weave_count('rg_on', ('/' || p || '/')::wquery) AS from_the_index,
+       (SELECT count(*) FROM rg WHERE body ~ p) AS from_core_regex
+  FROM (VALUES ('xa+y'), ('xa{1,3}y'), ('abc+d'), ('abc{1,}d'), ('pq{2,}r'),
+               ('pq{2,3}r'), ('xa{2}y')) v(p)
+  ORDER BY p COLLATE "C";
+SELECT regex_trgm > 0 AS the_narrowing_was_applied FROM weave_channel_stats();
+DROP TABLE rg;
+
 RESET enable_seqscan;
 DROP TABLE rd;
 DROP TABLE rdo;

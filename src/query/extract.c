@@ -38,8 +38,8 @@
  *   REP(x, m, n)        : if m == 0: contribute nothing (could match empty)
  *                         if m >= 1: contribute x's trigrams
  *                         (m-fold concat handled implicitly)
- *   APPROX(sub, k)      : for k=0 extraction: treat as sub.  (Phase 5
- *                         will add edit budget to weaken contributions.)
+ *   APPROX(sub, k)      : opaque, like CLASS: breaks the run, contributes
+ *                         nothing (edits inside it can destroy any trigram)
  *
  * This is conservative: we may fail to extract trigrams that an ideal
  * algorithm could find, but we never require trigrams that a matching
@@ -50,11 +50,8 @@
  * Phase 3 is ASCII-only (byte trigrams).  Phase 3.5 extends to UTF-8
  * codepoint trigrams.
  *
- * Phase 5 extends this file to handle:
- *   - global max_cost > 0 via Navarro's (k+1)-tiling
- *   - positional constraints (min_offset / max_offset)
- *   - universal-Levenshtein expansion for near-literal patterns
- *   - fanout cap via pg_weave_max_extraction_fanout
+ * A global max_cost > 0 yields always_true (no sound extraction); the
+ * fanout is capped by pg_weave_max_extraction_fanout.
  */
 
 #include "postgres.h"
@@ -67,8 +64,6 @@
 #include "weave/hash.h"
 #include "weave/weave.h"
 #include "weave/regex_ast.h"
-#include "weave/tiling.h"
-#include "weave/uleven.h"
 #include "weave/utf8.h"
 
 /*
@@ -166,7 +161,39 @@ typedef struct LinCtx
     int         run_cap;
     TrigramAccum *acc;
     MemoryContext cxt;
+    bool       *giveup;  /* shared by branch copies: no sound extraction */
 } LinCtx;
+
+/*
+ * Can `ast` match the empty string?  Anchors are zero-width, so they count.
+ */
+static bool
+ast_nullable(const RegexAst *ast)
+{
+    if (ast == NULL)
+        return true;
+    check_stack_depth();
+    switch (ast->kind)
+    {
+        case REGEX_AST_LITERAL:
+        case REGEX_AST_ANY:
+        case REGEX_AST_CLASS:
+            return false;
+        case REGEX_AST_ANCHOR:
+            return true;
+        case REGEX_AST_CONCAT:
+            return ast_nullable(ast->u.concat.left) &&
+                ast_nullable(ast->u.concat.right);
+        case REGEX_AST_ALT:
+            return ast_nullable(ast->u.alt.left) ||
+                ast_nullable(ast->u.alt.right);
+        case REGEX_AST_REP:
+            return ast->u.rep.min_rep == 0 || ast_nullable(ast->u.rep.child);
+        case REGEX_AST_APPROX:
+            return ast_nullable(ast->u.approx.child);
+    }
+    return true;
+}
 
 static void lin_append_node(LinCtx *lc, const RegexAst *ast);
 
@@ -318,16 +345,51 @@ lin_append_node(LinCtx *lc, const RegexAst *ast)
                  * child m times (capped at 2 to keep the run bounded). */
                 int k = (m > 2) ? 2 : m;
                 int i;
+                int before = lc->run_n;
+
                 for (i = 0; i < k; i++)
                     lin_append_node(lc, ast->u.rep.child);
+
+                /*
+                 * G88: when the match may hold MORE copies than were inlined
+                 * (n unbounded, or n > k), a trigram that runs from the left
+                 * context through every inlined copy into the right context
+                 * is not required: /xa+y/ inlined one `a` and demanded "xay",
+                 * which "xaay" lacks.  Such a trigram exists only if the
+                 * copies added fewer than two codepoints to the run, so end
+                 * the run then.  (A flush inside the copies also lands here,
+                 * harmlessly: the extra flush only costs selectivity.)
+                 */
+                if ((ast->u.rep.max_rep < 0 || ast->u.rep.max_rep > k) &&
+                    lc->run_n < before + 2)
+                    run_flush(lc);
             }
             break;
         }
 
         case REGEX_AST_APPROX:
-            /* Phase 3 (k=0): treat APPROX as its child.  Phase 5 reads
-             * ast->u.approx.k and weakens the contribution. */
-            lin_append_node(lc, ast->u.approx.child);
+            /*
+             * OPAQUE, like a class: an approximate atom (TRE's `atom{~k}`)
+             * contributes no trigram and ends the literal run on both sides.
+             * Edits inside the atom can destroy any trigram of its child, and
+             * a trigram straddling its boundary is not required either.  Even
+             * at k = 0 nothing is taken from it: the prefilter loses a little
+             * selectivity on a pattern nobody needs to write, and gains one
+             * rule with no exceptions.  (G88: the imported (k+1)-tiling that
+             * used to be the k > 0 route glued literals across gaps and could
+             * drop true matches; it is deleted.)
+             */
+            run_flush(lc);
+
+            /*
+             * TRE LEAKS THE EDIT BUDGET of an approximate atom that can match
+             * empty: when the empty path is taken, the scope's parameters are
+             * not restored, so up to k edits apply to whatever FOLLOWS --
+             * /(a?){~1}bcd/ matches "bd" and "zbd" (doc/GAPS.md G88).  The
+             * trigrams after it are then not required either; no extraction.
+             */
+            if (ast_nullable(ast->u.approx.child))
+                *lc->giveup = true;
             break;
     }
 }
@@ -395,7 +457,7 @@ accum_to_query(const TrigramAccum *a, int32 max_cost, TrigramQuery *out,
  * these codepoints, so its first indexed trigram hashes/keys to exactly K.
  * If the index contains no trigram with key K, no row can match -> safe to
  * reject.  (At k>0 the leading bytes may be edited, so we do NOT set a range
- * there; the tiling path leaves has_surf_range false.)
+ * there; the k > 0 path returns always_true before reaching this.)
  */
 static bool
 extract_anchored_prefix_key(const RegexAst *root, uint64 *lo, uint64 *hi)
@@ -472,29 +534,22 @@ regex_extract_query(WeaveParseCtx *ctx, int32 max_cost, TrigramQuery *out)
 {
     TrigramAccum acc;
     LinCtx       lc;
+    bool         giveup = false;
     int          i;
 
     memset(out, 0, sizeof(*out));
 
-    /* Phase 5: handle k > 0 via Navarro tiling */
+    /*
+     * A GLOBAL edit budget has no sound extraction here: k edits anywhere can
+     * destroy every trigram of a literal run.  Approximation is per atom
+     * (`atom{~k}`, handled above as opaque), so callers pass 0.
+     */
     if (max_cost > 0)
     {
-        /* Use tiling for k > 0: partition the pattern's trigram spine
-         * into k+1 tiles; at least one must match exactly.
-         * Phase 5.1: tiling now includes uleven expansion per tile. */
-        if (pg_weave_tile_query(ctx->root, max_cost, out, ctx->mcxt))
-        {
-            /* Tiling succeeded with uleven expansion */
-            return true;
-        }
-        else
-        {
-            /* Tiling failed (pattern too short, no spine, etc.); fall back to always_true */
-            out->always_true = true;
-            out->global_max_cost = max_cost;
-            out->mode = TRIGRAM_QUERY_CNF;
-            return true;
-        }
+        out->always_true = true;
+        out->global_max_cost = max_cost;
+        out->mode = TRIGRAM_QUERY_CNF;
+        return true;
     }
 
     /* Phase 3 path: k=0 exact extraction */
@@ -503,6 +558,7 @@ regex_extract_query(WeaveParseCtx *ctx, int32 max_cost, TrigramQuery *out)
     memset(&lc, 0, sizeof(lc));
     lc.cxt = ctx->mcxt;
     lc.acc = &acc;
+    lc.giveup = &giveup;
     lc.run = NULL;
     lc.run_n = 0;
     lc.run_cap = 0;
@@ -513,6 +569,8 @@ regex_extract_query(WeaveParseCtx *ctx, int32 max_cost, TrigramQuery *out)
     for (i = 0; i + 3 <= lc.run_n; i++)
         accum_add(&acc, &lc.run[i], ctx->mcxt);
 
+    if (giveup)
+        acc.overflowed = true;  /* accum_to_query: always_true */
     accum_to_query(&acc, max_cost, out, ctx->mcxt);
     out->mode = TRIGRAM_QUERY_CNF;  /* k=0 uses CNF */
 

@@ -22,6 +22,7 @@
 #include "postgres.h"
 
 #include "miscadmin.h"
+#include "mb/pg_wchar.h"
 #include "utils/memutils.h"
 
 #include "weave/pattern_cache.h"
@@ -93,6 +94,89 @@ evict_slot(WeaveCacheSlot *slot)
  * cache it (out_uncached set to the fresh handle); the caller is
  * responsible for freeing such a handle via weave_cache_release().
  */
+/*
+ * G88: the approximate dialect is POSIX ERE plus `atom{~k}`, k a decimal
+ * integer, and nothing else of TRE's bound syntax.  TRE also reads `{~}` as
+ * UNBOUNDED edits and has {+n}, {-n}, {#n}, {~n,m} and cost expressions such
+ * as {1i+1d<3}; accepting them would make each of those product syntax by
+ * accident.  Every unescaped `{` outside a bracket expression must open
+ * `{m}`, `{m,}`, `{m,n}` or `{~k}`.  The bracket scan follows POSIX: a `]`
+ * first (after an optional `^`) is a member, and `[:`, `[.`, `[=` open
+ * sub-elements closed by the matching `:]`, `.]`, `=]`.
+ */
+static void
+weave_approx_validate(const char *re, int len)
+{
+    int         i = 0;
+
+    while (i < len)
+    {
+        char        c = re[i];
+
+        if (c == '\\')
+        {
+            i += 2;
+            continue;
+        }
+        if (c == '[')
+        {
+            i++;
+            if (i < len && re[i] == '^')
+                i++;
+            if (i < len && re[i] == ']')
+                i++;
+            while (i < len && re[i] != ']')
+            {
+                if (re[i] == '[' && i + 1 < len &&
+                    (re[i + 1] == ':' || re[i + 1] == '.' || re[i + 1] == '='))
+                {
+                    char        d = re[i + 1];
+
+                    i += 2;
+                    while (i + 1 < len && !(re[i] == d && re[i + 1] == ']'))
+                        i++;
+                    i += 2;
+                    continue;
+                }
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (c == '{')
+        {
+            int         j = i + 1;
+            int         nd;
+            bool        ok;
+
+            if (j < len && re[j] == '~')
+            {
+                for (j++, nd = 0; j < len && re[j] >= '0' && re[j] <= '9'; j++)
+                    nd++;
+                ok = nd > 0 && j < len && re[j] == '}';
+            }
+            else
+            {
+                for (nd = 0; j < len && re[j] >= '0' && re[j] <= '9'; j++)
+                    nd++;
+                ok = nd > 0;
+                if (ok && j < len && re[j] == ',')
+                    for (j++; j < len && re[j] >= '0' && re[j] <= '9'; j++)
+                        ;
+                ok = ok && j < len && re[j] == '}';
+            }
+            if (!ok)
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
+                         errmsg("invalid bound in approximate regular expression at offset %d", i),
+                         errhint("An approximate pattern accepts {m}, {m,}, {m,n} and {~k}, with k a non-negative integer.")));
+            i = j + 1;
+            continue;
+        }
+        i++;
+    }
+}
+
 static void *
 weave_cache_lookup_internal(const char *pattern, int pattern_len, bool pin)
 {
@@ -128,6 +212,8 @@ weave_cache_lookup_internal(const char *pattern, int pattern_len, bool pin)
         }
     }
 
+    weave_approx_validate(pattern, pattern_len);
+
     /* Cache miss: compile pattern.  Arm a wall-clock compile deadline
      * (pg_weave.compile_timeout_ms) so a pathological bounded-repetition
      * pattern cannot spin the backend uninterruptibly inside TRE's AST
@@ -135,7 +221,18 @@ weave_cache_lookup_internal(const char *pattern, int pattern_len, bool pin)
     pg_weave_arm_compile_deadline(0);
     PG_TRY();
     {
-        compiled = weave_compile_pattern(pattern, pattern_len, &weave_err);
+        /*
+         * TRE gets the pattern in the server's pg_wchar form (what the
+         * matched terms are converted to), never through its own mbrtowc()
+         * decoding, which follows the C library locale rather than the
+         * server encoding.
+         */
+        pg_wchar   *wpat = palloc((pattern_len + 1) * sizeof(pg_wchar));
+        int         wlen = pg_mb2wchar_with_len(pattern, wpat, pattern_len);
+
+        compiled = weave_compile_pattern((const unsigned int *) wpat, wlen,
+                                         &weave_err);
+        pfree(wpat);
     }
     PG_FINALLY();
     {
@@ -190,6 +287,16 @@ weave_cache_lookup_internal(const char *pattern, int pattern_len, bool pin)
                      errhint("Simplify the pattern or raise "
                              "pg_weave.max_nfa_states.")));
         }
+    }
+
+    /* G92: TRE cannot match more than three approximate atoms safely. */
+    if (weave_pattern_approx_depth(compiled) > WEAVE_TRE_MAX_APPROX_DEPTH)
+    {
+        weave_free_pattern(compiled);
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("pg_weave: a regular expression may contain at most %d approximate atoms ({~k})",
+                        WEAVE_TRE_MAX_APPROX_DEPTH)));
     }
 
     /*
@@ -287,4 +394,44 @@ weave_cache_release(void *compiled)
 
     /* Not cached: an uncached handle handed out under all-pinned. */
     weave_free_pattern(compiled);
+}
+
+/*
+ * G88: the approximate-regex dialect.  A `/re/` whose text contains the two
+ * bytes "{~" anywhere is an approximate pattern and is decided by TRE (POSIX
+ * ERE plus `atom{~k}`) end to end, on the index and on the heap; every other
+ * pattern keeps core's ARE engine, unchanged.  ARE reads "{~" as literal
+ * characters, which no analyzer emits inside a token, so no pattern that
+ * matched a token before matches differently now.
+ */
+bool
+weave_regex_is_approx(const char *re, int relen)
+{
+    int         i;
+
+    for (i = 0; i + 1 < relen; i++)
+        if (re[i] == '{' && re[i + 1] == '~')
+            return true;
+    return false;
+}
+
+/*
+ * Does the compiled approximate pattern `h` (from weave_cache_lookup) match
+ * anywhere in the term?  `wbuf` must hold len + 1 pg_wchars; the caller owns
+ * it so a dictionary walk does not allocate per term.  The match is
+ * unanchored, as `~` is.  TRE has no deadline armed here: per-term work is
+ * bounded by pg_weave.max_nfa_states times the term length, and the callers
+ * check for interrupts between pages or documents.
+ */
+bool
+weave_approx_regex_match(void *h, const char *term, int len, pg_wchar *wbuf)
+{
+    int         wlen = pg_mb2wchar_with_len(term, wbuf, len);
+    int         rc = weave_match_wide(h, (const unsigned int *) wbuf, wlen);
+
+    if (rc < 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
+                 errmsg("approximate regular expression failed (TRE status %d)", rc)));
+    return rc == 1;
 }

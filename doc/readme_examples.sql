@@ -71,6 +71,7 @@ SELECT id, title FROM docs ORDER BY emb <-> '[1,0,0,0]' LIMIT 3;
 SELECT id, title FROM docs WHERE body @@@ 'replicaton~1' ORDER BY id;   -- 1 edit
 SELECT id, title FROM docs WHERE body @@@ 'vacu*' ORDER BY id;          -- prefix
 SELECT id, title FROM docs WHERE body @@@ '/^repl.*n$/' ORDER BY id;    -- regex, per token
+SELECT id, title FROM docs WHERE body @@@ '/^(vacum){~1}$/' ORDER BY id; -- approximate regex: 1 edit in the group
 
 -- Rank by spelling distance.
 SELECT id, title FROM docs ORDER BY body <@> 'replicaton' LIMIT 3;

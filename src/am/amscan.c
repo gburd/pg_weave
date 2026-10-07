@@ -41,6 +41,7 @@
 #include "weave/sparsemap.h"			/* namespaced sparsemap (tombstones, trigrams) */
 #include "weave/doclist.h"			/* document-list header (weave_index_v12_complete) */
 #include "weave/edist.h"			/* Z9: the <@> edit-distance shuttle */
+#include "weave/pattern_cache.h"	/* G88: approximate regex via TRE */
 #include "weave/bm25bound.h"		/* F6: the single copy of the BM25 contribution
 									 * and its per-block (C2) bound; this file used
 									 * to carry a transcription of both */
@@ -2139,7 +2140,7 @@ weave_fuzzy_terms(Relation index, const WeaveSegMeta *seg,
  * keys the weft never stored.  ASCII round-trips through every server encoding.
  */
 static bool
-weave_regex_narrowable(const char *re, int relen)
+weave_regex_narrowable(const char *re, int relen, bool approx)
 {
 	bool		utf8 = (GetDatabaseEncoding() == PG_UTF8);
 	int			i;
@@ -2158,6 +2159,13 @@ weave_regex_narrowable(const char *re, int relen)
 		switch (c)
 		{
 			case '\\':
+				/*
+				 * The engine of an approximate pattern is TRE, whose ERE reads a
+				 * backslash inside a bracket as a member where pg_tre's tokenizer
+				 * reads an escape, so no escape is trusted there at all.
+				 */
+				if (approx)
+					return false;
 				/* the escapes both dialects read as "that character, literally" */
 				if (n == 0 || strchr("\\.[](){}|*+?^$-", n) == NULL)
 					return false;
@@ -2175,7 +2183,24 @@ weave_regex_narrowable(const char *re, int relen)
 				break;
 			case '{':
 				if (n == '~')
-					return false;
+				{
+					int			j = i + 2;
+
+					/*
+					 * ARE reads `{~` as literal text, so an exact pattern is
+					 * never narrowed on it.  In an approximate pattern it must
+					 * be TRE's and pg_tre's shared `{~DIGITS}`, nothing else
+					 * (TRE also has {+n}, {#n}, {~n,m} and cost forms the
+					 * extractor does not read).
+					 */
+					if (!approx)
+						return false;
+					while (j < relen && re[j] >= '0' && re[j] <= '9')
+						j++;
+					if (j == i + 2 || j >= relen || re[j] != '}')
+						return false;
+					i = j;		/* consumed through the closing brace */
+				}
 				break;
 			default:
 				break;
@@ -2269,7 +2294,7 @@ weave_regex_narrow(Relation index, const WeaveSegMeta *seg,
 
 	*cands = NULL;
 	*ncands = 0;
-	if (!weave_regex_narrowable(re, relen))
+	if (!weave_regex_narrowable(re, relen, weave_regex_is_approx(re, relen)))
 		return false;
 
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "weave regex narrowing",
@@ -2400,6 +2425,7 @@ weave_regex_terms(Relation index, const WeaveSegMeta *seg,
 	uint64	   *cands = NULL;	/* candidate ordinals, or NULL: every term */
 	int			ncands = 0;
 	bool		narrowed = false;
+	void	   *approx = NULL;	/* G88: TRE's handle when the pattern is approximate */
 
 	out->tids = NULL;
 	out->n = 0;
@@ -2407,14 +2433,29 @@ weave_regex_terms(Relation index, const WeaveSegMeta *seg,
 		return false;
 
 	/*
-	 * Compile ONCE per (segment, leaf), not once per term: 260k terms is 260k
-	 * compiles otherwise, and core's own cache (RE_compile_and_cache) is not
-	 * reachable from here without going through text datums per term.
+	 * G88: an approximate pattern is TRE's, from the same cache and with the
+	 * same matcher weave_doc_has_regex() uses on the heap.  PINNED, because
+	 * the narrowing below can parse and the walk can re-enter the cache; the
+	 * pin is released in the PG_FINALLY.
 	 */
-	wpat = (pg_wchar *) palloc((relen + 1) * sizeof(pg_wchar));
-	wpatlen = pg_mb2wchar_with_len(re, wpat, relen);
-	rc = pg_regcomp(&cre, wpat, wpatlen, REG_ADVANCED, C_COLLATION_OID);
-	pfree(wpat);
+	if (weave_regex_is_approx(re, relen))
+	{
+		approx = weave_cache_lookup_pinned(re, relen);
+		rc = REG_OKAY;
+	}
+	else
+	{
+		/*
+		 * Compile ONCE per (segment, leaf), not once per term: 260k terms is
+		 * 260k compiles otherwise, and core's own cache (RE_compile_and_cache)
+		 * is not reachable from here without going through text datums per
+		 * term.
+		 */
+		wpat = (pg_wchar *) palloc((relen + 1) * sizeof(pg_wchar));
+		wpatlen = pg_mb2wchar_with_len(re, wpat, relen);
+		rc = pg_regcomp(&cre, wpat, wpatlen, REG_ADVANCED, C_COLLATION_OID);
+		pfree(wpat);
+	}
 	if (rc != REG_OKAY)
 	{
 		char		errMsg[100];
@@ -2485,6 +2526,14 @@ weave_regex_terms(Relation index, const WeaveSegMeta *seg,
 				ci++;
 			}
 
+			if (approx)
+			{
+				if (!weave_approx_regex_match(approx, term, (int) len, wterm))
+					continue;
+				weave_chan_terms_expanded++;
+				weave_termruns_add_current(&h);
+				continue;
+			}
 			wlen = pg_mb2wchar_with_len(term, wterm, (int) len);
 			rc = pg_regexec(&cre, wterm, wlen, 0, NULL, 0, NULL, 0);
 			if (rc == REG_NOMATCH)
@@ -2514,7 +2563,10 @@ weave_regex_terms(Relation index, const WeaveSegMeta *seg,
 		 * of the query.
 		 */
 		weave_dictvocab_release(&dv);
-		pg_regfree(&cre);
+		if (approx)
+			weave_cache_release(approx);
+		else
+			pg_regfree(&cre);
 	}
 	PG_END_TRY();
 	pfree(wterm);
