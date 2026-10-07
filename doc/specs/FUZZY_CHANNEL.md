@@ -56,7 +56,7 @@ pattern
   ├─ anchored / prefix / range ──▶ SuRF trie over the bolt vocabulary
   ├─ fuzzy  term~k ──────────────▶ universal-Levenshtein neighbourhood expansion
   │                                over the vocabulary trigram map
-  ├─ regex  /re/ ────────────────▶ regex AST ──▶ Navarro trigram tiling
+  ├─ regex  /re/ ────────────────▶ regex AST ──▶ required trigrams (CNF)
   │                                          ──▶ vocabulary candidates
   └─ LIKE ───────────────────────▶ translate to one of the above
   │
@@ -74,16 +74,76 @@ pattern
 | fuzzy neighbourhood | universal Levenshtein (Mihov–Schulz) | `src/query/uleven.c` | pg_tre |
 | fuzzy verification | bounded Levenshtein automaton | `src/query/lev.c` | pg_fts |
 | regex parse | LALR grammar → AST | `src/query/regex_grammar.c`, `regex_ast.c` | pg_tre |
-| regex → trigrams | Navarro-style tiling | `src/query/tiling.c` | pg_tre |
+| regex → trigrams | required-trigram CNF; an `atom{~k}` is opaque (§2.1) | `src/query/extract.c` | pg_tre (the (k+1)-tiling was deleted by G88: unsound) |
 | LIKE → pattern | translation | `src/query/like_translate.c` | pg_tre |
 | trigram → terms | vocabulary trigram sparsemap | `src/query/trgm.c`, `src/pages/trgm_page.c` | pg_fts |
-| exact verification | TRE regex matcher | `src/query/re_match.c` + vendored TRE | pg_tre + BSD-2 |
+| regex verification | core's ARE (`pg_regexec`) for an exact pattern; TRE (`weave_match_wide`) for an approximate one (§2.1) | `src/am/amscan.c`, `src/query/doc.c`, `src/query/re_match.c` + vendored TRE | core; pg_tre + BSD-2 |
 
 Two implementations of Levenshtein coexist on purpose and it is not redundancy:
 `uleven.c` *expands* a pattern into the trigram neighbourhood that could contain a
 match within edit distance k (a generator), and `lev.c` *decides* whether a
 specific candidate term is within k (an acceptor). Using the generator as an
 acceptor would be slow; using the acceptor as a generator is impossible.
+
+### 2.1 Approximate regex, `atom{~k}` — G88
+
+**The rule that picks the engine.** A `/re/` whose text contains the two bytes `{~`
+anywhere is an *approximate pattern*. It is decided by TRE end to end: on the index
+(`weave_regex_terms()`, the dictionary walk) and on the heap (`weave_doc_has_regex()`),
+with one compiled handle from `src/query/pattern_cache.c` and one matcher,
+`weave_match_wide()`. Every other pattern is core's ARE, unchanged. ARE reads `{~` as two
+literal characters, which no analyzer emits inside a token, so no pattern that matched a
+token before G88 matches differently after it.
+
+**What `{~k}` means.** It is TRE's per-atom approximation, and it binds like a quantifier:
+to the atom immediately before it. `colou?r{~1}` allows one edit on the final `r` only;
+`(colour){~1}` allows one edit anywhere in the word. Inside the atom up to `k` edits are
+allowed, each an insertion, deletion or substitution of one character at cost 1. Outside
+every approximate atom the match is exact. `{~0}` is the exact atom. Like `~`, the match is
+unanchored: `(hello){~1}` matches inside a longer token. It matches TOKENS (the analyzed,
+folded dictionary terms), never raw document text, exactly like the exact regex channel.
+
+**The accepted syntax** is POSIX ERE plus `{~k}` with `k` a decimal integer. Everything else
+TRE reads inside braces is refused with `invalid bound in approximate regular expression`:
+`{~}` (TRE: unbounded edits), `{~n,m}`, `{+n}`, `{-n}`, `{#n}`, and cost expressions such as
+`{1i+1d<3}`. Accepting them would have made each one product syntax by accident. At most
+three approximate atoms per pattern (G92: TRE's matcher sizes its per-scope cost table for
+three and only asserts the bound); a fourth is refused with `ERRCODE_PROGRAM_LIMIT_EXCEEDED`.
+
+**Two TRE behaviours that are part of the semantics, because index and heap both have them:**
+
+- *No insertion after the atom's last character when nothing follows it.* `^(abc){~1}$`
+  rejects `abcd` but accepts `xabc`, `abd`, `ab`. An insertion is modelled as a self-loop on
+  a state of the atom, and the final state has none. `term~k` (the fuzzy channel) is the
+  operator for whole-token edit distance; `{~k}` is not a substitute for it.
+- *A nullable approximate atom leaks its budget.* When `(a?){~1}` takes its empty path, TRE
+  does not restore the outer (exact) parameters, so up to `k` edits apply to what follows:
+  `(a?){~1}bcd` matches `bd` and `zbd`. The extractor treats such a pattern as giving no
+  required trigrams (below), so the index still agrees with the heap; the leak is TRE's
+  answer, not a disagreement.
+
+**The prefilter.** With `trigrams = on`, `weave_regex_narrow()` asks the k = 0 extractor for
+trigrams every match must contain, and the walk runs the matcher only over terms that have
+them. For an approximate pattern the extractor treats each `atom{~k}` as opaque, like a
+character class: it contributes nothing and ends the literal run on both sides, because an
+edit inside it can destroy any trigram of its child and any trigram straddling its edge.
+Literal runs *outside* the approximate atoms still narrow: `^fla(vou){~1}r$` narrows on
+`fla`. If any approximate atom can match empty, the whole pattern yields no trigrams (the
+leak above). The narrowing whitelist (`weave_regex_narrowable(..., approx = true)`) also
+refuses any backslash, because TRE's ERE and pg_tre's tokenizer read escapes inside brackets
+differently. `test/hegel/test_regex_approx.c` (`make check-regex-approx`, run in the EC2
+smoke) is the gate: random patterns through the shipped parser and extractor, random tokens,
+and "every token TRE accepts satisfies the extracted trigrams".
+
+**A presence filter, not a ranking.** `/re{~k}/` contributes no score, so no block-max bound
+is involved; in `fuse()` it is a gate (F9), exactly as an exact regex is. It does not set a
+SuRF range (that is computed only for an anchored literal prefix at k = 0, and an approximate
+atom is never part of one).
+
+**What was there before.** The pg_tre import carried a Navarro (k+1)-tiling for a *global*
+edit budget (`tiling.c`), reachable from `regex_extract_query(ctx, max_cost > 0)`. It glued
+literals across gaps (`/ab.cd/` produced `abc` and `bcd`, neither in `abxcd`) and was deleted;
+a global budget now yields `always_true`. Nothing in `src/am/` had ever called it.
 
 ## 3. SuRF over the vocabulary — task Z3
 
