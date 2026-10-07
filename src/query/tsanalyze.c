@@ -51,10 +51,11 @@
  * 65536; and d_i - d_(i-1) = (t_i - t_(i-1)) - (u_i - u_(i-1)) > -65536, so d is
  * non-decreasing.  The true count N (prs->pos - PG_INT32_MIN) bounds t_last, so
  * N - u_last < 65536 forces d_last = 0 and with it every d_i = 0: every
- * position is exact.  The check fails only when the document holds a run of at
- * least 65,535 consecutive tokens that produce no lexeme (stopwords), where a
- * gap of 65,536 cannot be told from a gap of 0; that document is refused rather
- * than stored at a wrong position.  sql/wdoc_roundtrip.sql tests both sides.
+ * position is exact.  Conversely the check fails exactly when the document has
+ * 65,535 or more consecutive lexeme-less tokens (stopwords) between two
+ * lexemes, or 65,536 or more at its start or end: there a gap of 65,536 cannot
+ * be told from a gap of 0, so the document is refused rather than stored with
+ * a wrong position.  sql/wdoc_roundtrip.sql tests both sides of the boundary.
  */
 #define WEAVE_PRS_POS_BASE	PG_INT32_MIN
 

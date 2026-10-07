@@ -67,7 +67,9 @@ typedef struct WeaveDocData
 	uint16		version;		/* format version, currently 3 */
 	uint16		flags;			/* WEAVE_DOCF_* */
 	uint32		nterms;			/* number of distinct terms */
-	uint32		doclen;			/* total token count (sum of tf); needed by BM25 */
+	uint32		doclen;			/* BM25 length: tokens, stopwords included, for a
+								 * regconfig analyzer; else the sum of tf.  Always
+								 * >= every tf (doc/GAPS.md G90) */
 	uint32		lexbytes;		/* total bytes of lexemes[] (to find positions[]) */
 	WeaveTermEntry entries[FLEXIBLE_ARRAY_MEMBER];
 } WeaveDocData;
