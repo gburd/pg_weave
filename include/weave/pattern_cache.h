@@ -20,6 +20,8 @@
 #ifndef WEAVE_CACHE_H
 #define WEAVE_CACHE_H
 
+#include "mb/pg_wchar.h"
+
 /*
  * Initialize the cache (idempotent, called from _PG_init or on first use).
  */
@@ -44,5 +46,12 @@ void *weave_cache_lookup_pinned(const char *pattern, int pattern_len);
  * identity; a NULL handle is a no-op.
  */
 void weave_cache_release(void *compiled);
+
+/*
+ * G88: a pattern containing "{~" is approximate and is matched by TRE; see
+ * weave_regex_is_approx() in src/query/pattern_cache.c for the rule.
+ */
+bool weave_regex_is_approx(const char *re, int relen);
+bool weave_approx_regex_match(void *h, const char *term, int len, pg_wchar *wbuf);
 
 #endif /* WEAVE_CACHE_H */

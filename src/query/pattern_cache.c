@@ -310,3 +310,43 @@ weave_cache_release(void *compiled)
     /* Not cached: an uncached handle handed out under all-pinned. */
     weave_free_pattern(compiled);
 }
+
+/*
+ * G88: the approximate-regex dialect.  A `/re/` whose text contains the two
+ * bytes "{~" anywhere is an approximate pattern and is decided by TRE (POSIX
+ * ERE plus `atom{~k}`) end to end, on the index and on the heap; every other
+ * pattern keeps core's ARE engine, unchanged.  ARE reads "{~" as literal
+ * characters, which no analyzer emits inside a token, so no pattern that
+ * matched a token before matches differently now.
+ */
+bool
+weave_regex_is_approx(const char *re, int relen)
+{
+    int         i;
+
+    for (i = 0; i + 1 < relen; i++)
+        if (re[i] == '{' && re[i + 1] == '~')
+            return true;
+    return false;
+}
+
+/*
+ * Does the compiled approximate pattern `h` (from weave_cache_lookup) match
+ * anywhere in the term?  `wbuf` must hold len + 1 pg_wchars; the caller owns
+ * it so a dictionary walk does not allocate per term.  The match is
+ * unanchored, as `~` is.  TRE has no deadline armed here: per-term work is
+ * bounded by pg_weave.max_nfa_states times the term length, and the callers
+ * check for interrupts between pages or documents.
+ */
+bool
+weave_approx_regex_match(void *h, const char *term, int len, pg_wchar *wbuf)
+{
+    int         wlen = pg_mb2wchar_with_len(term, wbuf, len);
+    int         rc = weave_match_wide(h, (const unsigned int *) wbuf, wlen);
+
+    if (rc < 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
+                 errmsg("approximate regular expression failed (TRE status %d)", rc)));
+    return rc == 1;
+}
