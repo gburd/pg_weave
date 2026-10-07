@@ -70,6 +70,7 @@
 #include "executor/executor.h"
 #include "executor/instrument.h"
 #include "funcapi.h"
+#include "lib/ilist.h"
 #include "mb/pg_wchar.h"		/* pg_database_encoding_max_length: the fuzzy edit unit */
 #include "miscadmin.h"
 #include "nodes/pathnodes.h"
@@ -468,6 +469,16 @@ typedef struct WeaveScanOpaqueData
 	int			npadNulls;
 	int			capPadNulls;
 	int			padNullPos;
+	/* G86: the value weave_curdist_note() published for the current tuple */
+	bool		curdistLive;	/* curdistNode is in weave_curdist_live */
+	bool		curdistCbSet;	/* curdistCb is registered on so's context */
+	bool		curdistIsnull;
+	double		curdistValue;
+	uint64		curdistSeq;		/* weave_curdist_seq when it was published */
+	Oid			curdistIndex;	/* the index, so the list never reads a Relation */
+	IndexScanDesc curdistScan;	/* the descriptor whose xs_heaptid it is for */
+	dlist_node	curdistNode;
+	MemoryContextCallback curdistCb;
 } WeaveScanOpaqueData;
 
 typedef WeaveScanOpaqueData *WeaveScanOpaque;
@@ -2627,6 +2638,129 @@ weave_universe_bounded(Relation index, BlockNumber dictstart, double ndocs,
 	return u;
 }
 
+/* ---------------------------------------------------------------------------
+ * G86: score reuse -- the lexical ordering scan's value, read back by the
+ * target list.
+ *
+ * The planner keeps the ORDER BY expression `d <=> q` in the scan's target list
+ * as a RESJUNK sort key, so without this the executor evaluated weave_distance()
+ * once per returned row: a heap detoast and a BM25 for a value nobody shows the
+ * user.  weave_reuse_distance() (src/am/customscan.c) replaces that entry with
+ *
+ *     COALESCE(weave_current_distance(index, ctid, q), d <=> q)
+ *
+ * and weave_current_distance() answers from the value below, or NULL, which
+ * makes COALESCE compute the operator exactly as before.  A miss therefore
+ * costs what the query cost before this existed.  It is never a wrong value.
+ *
+ * WHEN IT ANSWERS.  Every lexical ordering scan that has returned a tuple is
+ * in weave_curdist_live with that tuple's value, and the function answers from
+ * the one whose index, current heap TID and query all match its arguments
+ * (the latest to publish, if several do).
+ * The keying is the clobber guard: ExecScan() fetches a tuple, evaluates the
+ * qual, then projects, and a SubPlan in the qual or a visible column ahead of
+ * the resjunk one can run a second weave ordering scan in between.  The sibling
+ * project's zero-argument current-distance function reads a single global, which that
+ * second scan overwrites.  Here it publishes into its own entry, and the outer
+ * row still finds its own.
+ *
+ * LIFETIME.  An entry leaves the list at weave_rescan(), at weave_endscan(),
+ * and in a reset callback on the scan's memory context, which covers an error
+ * that unwinds without an endscan.  So every entry's memory is live; the list
+ * never dereferences the index Relation, which an abort may have closed first.
+ *
+ * WHAT THE VALUE IS.  The distance the stream is ordered by: the corpus BM25
+ * distance on a ranked row, and the G56 padding value (1.0, or NULL for a NULL
+ * document) on a padded one.  Not weave_distance()'s N = 1 value, which is why
+ * only a hidden sort key may be substituted (src/am/customscan.c).
+ * --------------------------------------------------------------------------- */
+static dlist_head weave_curdist_live = DLIST_STATIC_INIT(weave_curdist_live);
+static uint64 weave_curdist_seq = 0;
+
+static void
+weave_curdist_forget(WeaveScanOpaque so)
+{
+	if (!so->curdistLive)
+		return;
+	so->curdistLive = false;
+	dlist_delete(&so->curdistNode);
+}
+
+static void
+weave_curdist_reset_cb(void *arg)
+{
+	weave_curdist_forget((WeaveScanOpaque) arg);
+}
+
+/* Is this a lexical `<=>` ordering scan, the one shape whose value is reused? */
+static inline bool
+weave_curdist_lexical(IndexScanDesc scan, WeaveScanOpaque so)
+{
+	return scan->numberOfOrderBys == 1 && !so->vecScan && !so->edistScan &&
+		!so->fuseScan && so->query != NULL;
+}
+
+/* publish the ordering value of the tuple this scan is returning */
+static void
+weave_curdist_note(IndexScanDesc scan, WeaveScanOpaque so, double v, bool isnull)
+{
+	if (!so->curdistLive)
+	{
+		if (!so->curdistCbSet)
+		{
+			so->curdistCb.func = weave_curdist_reset_cb;
+			so->curdistCb.arg = so;
+			MemoryContextRegisterResetCallback(GetMemoryChunkContext(so),
+											   &so->curdistCb);
+			so->curdistCbSet = true;
+		}
+		so->curdistScan = scan;
+		so->curdistIndex = RelationGetRelid(scan->indexRelation);
+		dlist_push_head(&weave_curdist_live, &so->curdistNode);
+		so->curdistLive = true;
+	}
+	so->curdistValue = v;
+	so->curdistIsnull = isnull;
+	so->curdistSeq = ++weave_curdist_seq;
+}
+
+PG_FUNCTION_INFO_V1(weave_current_distance);
+
+Datum
+weave_current_distance(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	ItemPointer tid = PG_GETARG_ITEMPOINTER(1);
+	WeaveQuery	q = NULL;
+	WeaveScanOpaque best = NULL;
+	dlist_iter	it;
+
+	dlist_foreach(it, &weave_curdist_live)
+	{
+		WeaveScanOpaque so = dlist_container(WeaveScanOpaqueData, curdistNode,
+											 it.cur);
+		IndexScanDesc scan = so->curdistScan;
+
+		if (so->query == NULL || so->curdistIndex != indexoid ||
+			!ItemPointerEquals(&scan->xs_heaptid, tid))
+			continue;
+		if (q == NULL)
+			q = PG_GETARG_WQUERY(2);
+		if (!weave_query_same(so->query, q))
+			continue;
+		/*
+		 * Two live scans on the same index, query and row (an open cursor and
+		 * this statement, say): the one that published LAST is the one whose
+		 * tuple is being projected, since projection follows the fetch.
+		 */
+		if (best == NULL || so->curdistSeq > best->curdistSeq)
+			best = so;
+	}
+	if (best == NULL || best->curdistIsnull)
+		PG_RETURN_NULL();
+	PG_RETURN_FLOAT8(best->curdistValue);
+}
+
 IndexScanDesc
 weave_beginscan(Relation r, int nkeys, int norderbys)
 {
@@ -2697,6 +2831,7 @@ weave_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 {
 	WeaveScanOpaque so = (WeaveScanOpaque) scan->opaque;
 
+	weave_curdist_forget(so);	/* G86: the published value was the last scan's */
 	if (scankey && scan->numberOfKeys > 0)
 		memmove(scan->keyData, scankey,
 				scan->numberOfKeys * sizeof(ScanKeyData));
@@ -3688,6 +3823,9 @@ weave_pad_emit(IndexScanDesc scan, WeaveScanOpaque so, ItemPointer tid,
 		: 1.0;
 	dist[0].isnull = nulldist;
 	index_store_float8_orderby_distances(scan, typ, dist, false);
+	/* the value the stream orders this row at, which is what a sort key reads */
+	if (weave_curdist_lexical(scan, so))
+		weave_curdist_note(scan, so, dist[0].value, dist[0].isnull);
 }
 
 /*
@@ -4087,7 +4225,18 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 				else
 					so->maxhits += N;
 			}
+			/*
+			 * G87: the planner's LIMIT hint rides on the FIRST lexical key's
+			 * wquery (weave_hint_indexscan(), src/am/customscan.c), the same
+			 * first-pass-only, never-wider rule as the lexical route.
+			 */
 			so->fusek = weave_ord_width(pg_weave_wand_initial_k);
+			for (qi = 0; qi < so->nfuse; qi++)
+				if (so->fuseStrat[qi] == WEAVE_STRAT_DISTANCE)
+				{
+					so->fusek = weave_ord_first_width(so->fuseQ[qi]);
+					break;
+				}
 			weave_fuse_pass(scan->indexRelation, so);
 			so->ordpos = 0;
 			so->orderInit = true;
@@ -4332,6 +4481,8 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 		dist[0].value = so->ordered[so->ordpos].score;
 		dist[0].isnull = false;
 		index_store_float8_orderby_distances(scan, typ, dist, false);
+		if (weave_curdist_lexical(scan, so))
+			weave_curdist_note(scan, so, dist[0].value, false);
 	}
 	so->ordpos++;
 	return true;
@@ -6247,6 +6398,7 @@ weave_endscan(IndexScanDesc scan)
 	 * Memory is freed with the scan's context, but a G56 padding walk holds a
 	 * heap scan (buffer pins), a slot, an EState and a relation reference.
 	 */
+	weave_curdist_forget((WeaveScanOpaque) scan->opaque);
 	weave_pad_end((WeaveScanOpaque) scan->opaque);
 }
 

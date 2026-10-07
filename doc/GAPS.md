@@ -5601,7 +5601,7 @@ half, VACUUM, smash the tombstone blob's bytes, and the scan must ERROR, not ret
 built `.so`, md5 differs) the scan returned **4000**, the resurrected answer, and tests 22-24
 failed; with it they pass.
 
-### G86 — an ordered scan's `d <=> q` (and every channel of a fused `fuse(...)`) is RE-EVALUATED per returned row: a heap detoast plus a fresh BM25, for a value the scan already computed — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 measured it at 28% of rare-term CPU); MEASURED here; OPEN**
+### G86 — an ordered scan's `d <=> q` (and every channel of a fused `fuse(...)`) is RE-EVALUATED per returned row: a heap detoast plus a fresh BM25, for a value the scan already computed — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 measured it at 28% of rare-term CPU); FIXED 2026-10-07 for the lexical `<=>` route (`wt/g86`, ext 0.29.0); vector, `<@>` and `fuse()` deliberately NOT substituted (reasons below)**
 
 The planner keeps the ORDER BY expression in the scan's target list (it feeds the sort key
 and the Limit), so the executor evaluates it for every row the index returns, even though
@@ -5630,7 +5630,164 @@ substituted value equals the computed one on every row, both normalizer modes, i
 the padding rows (G56/G71), whose stored distance is +Infinity or NULL. Measure the gain on
 EC2 at two scales first (hard rules 9 and 11).
 
-### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`); the fused route is still OWED**
+**Analysis before the port, 2026-10-06 (`wt/g86`).** Four facts that decide the shape of the fix:
+
+- **A scan's target-list entry is RESJUNK only when the scan's list IS the top plan's.**
+  `make_limit()` (and Sort, Incremental Sort) share `lefttree->targetlist`, and
+  `apply_tlist_labeling()` copies `resjunk` onto the top plan's entries, so
+  `Limit -> Index Scan` and a bare top-level Index Scan get it. A scan under a join, an
+  Append child or a projecting node gets its list from `build_path_tlist()` with
+  `resjunk = false` and is never substituted. That is a lost optimization, not a wrong answer.
+- **Who reads the resjunk value.** A plain `Limit -> Index Scan` reads nothing: the value is
+  computed and discarded. The readers are `FETCH ... WITH TIES`, an Incremental Sort over
+  the scan (`ORDER BY d <=> q, id`), and a Sort or Merge above it. So a "returns the
+  previous row's value" bug is invisible to every plain `LIMIT` test. The test has to use one
+  of the readers. In those shapes the substitution also CHANGES what the reader sees, from
+  `weave_distance()`'s N = 1 value to the corpus value the stream is actually ordered by.
+  That makes them consistent where they were not, but it is a behaviour change.
+- **A backend-global current value can be CLOBBERED.** `ExecScan()` fetches the tuple, then
+  evaluates the qual, then projects. A SubPlan in the qual, or a visible column before the
+  resjunk one (a correlated subquery, or a function that runs a ranked query), can run a
+  second weave ordering scan in between. Its `gettuple` overwrites the global, and the outer
+  row's sort key becomes the inner scan's value. pg_fts's zero-argument
+  `fts_current_distance()` has this hazard. The port keeps one published value PER SCAN,
+  and the function looks it up by (index, heap TID, query), so a nested scan cannot
+  overwrite the outer one's.
+
+**THE BAR, corrected by the lead on 2026-10-07.** The substituted value is EXACTLY THE VALUE THE
+SCAN ORDERED THE STREAM BY: its own `xs_orderbyvals` entry, or its padding value. Only
+RESJUNK entries are touched. It is not "what the ORDER BY expression would compute", which
+for `<=>` is the N = 1 `weave_distance()` and differs from the corpus value the stream is
+in. The lexical route ships on that bar. `sql/score_reuse.sql` §4 checks it per row
+against `weave_search()`'s distance, and §5 checks it through every reader.
+
+**`fuse()` qualifies under the corrected bar and is OWED, not done.** Its resjunk entry
+is `fuse(weave_lexscore(d <=> a), ...)`, and the scan's slot-0 value is the fused `-S` it
+ordered by (`weave_fuse_pass()`). Substituting needs:
+(1) the fused score published per row, from the ranked emission and from
+`weave_pad_emit()`'s fused padding value (`-0` lexical-only, `+Infinity` with a vector
+key, NULL for a row with a NULL channel, G56/G71/G76);
+(2) a matcher for the resjunk `fuse()` against the scan's ORDER BY list (several keys plus
+the `<~>` transport, where the lexical route has one key);
+(3) tests through the readers: `WITH TIES` and an Incremental Sort over a fused scan,
+against `weave_fuse_search()`'s scores, under both `pg_weave.fuse_normalize` modes and
+with padding rows in the window;
+(4) its own EC2 measurement. Its prize is larger than the lexical one's (one detoast and
+rescore per CHANNEL per row: 800 `weave_distance` + 800 `weave_lexscore` at LIMIT 400).
+
+**FIXED for the lexical route, 2026-10-07 (`wt/g86`).** `weave_planner()`'s plan walk
+(`src/am/customscan.c`, the same walk as the G87 hint) gained `weave_reuse_distance()`. It
+runs on an Index Scan on a weave index with ONE ORDER BY key `wdoc <=> wquery`. Each
+RESJUNK target-list entry `equal()` to that key becomes
+
+    COALESCE(weave_current_distance(index, ctid, q), d <=> q)
+
+`weave_current_distance(regclass, tid, wquery)` (new in **0.29.0**, `src/am/amscan.c`; the name
+is a LEAD DECISION, 2026-10-07) returns
+the value the live lexical ordering scan on that index published for that heap TID under
+that query, and NULL otherwise. NULL is also its answer outside any scan, so on a miss the
+operator runs exactly as before. `pg_weave.reuse_distance = off` disables it.
+
+How it differs from pg_fts's `efca0cf`, and why:
+
+- **Keyed, not a backend global.** Every lexical ordering scan that has returned a row is
+  on a list (`weave_curdist_live`) with that row's value. An entry leaves at rescan,
+  endscan, or a reset callback on the scan's memory context, which covers an error. The
+  lookup matches index, `xs_heaptid` (after the heap fetch, so a HOT member's TID matches)
+  and `weave_query_same()`. The latest publication wins when several match.
+  `sql/score_reuse.sql` §7 runs a second weave ordering scan in the outer scan's Filter on
+  every row, on another index and on the same index and query, and checks the outer
+  `WITH TIES` set against the reference.
+- **A miss falls back to the operator rather than to a stale or NULL key**, through the
+  COALESCE. The lead approved a four-argument form, `(regclass, tid, wdoc, wquery)`, that
+  calls `weave_distance(d, q)` itself on a mismatch. The shipped form keeps that fallback
+  in the plan instead, for two reasons. The function then answers NULL outside a scan, as
+  the brief required. And every fallback call is a real `weave_distance` call that
+  `track_functions` counts, which is what lets `sql/score_reuse.sql` §6 show the hit rate.
+  The two forms give the same value on every row.
+- **The function is found by syscache, in the wquery type's schema, and must be C with link
+  symbol `weave_current_distance`.** pg_fts's rule. A same-named SQL function is never
+  planted (tested), and a catalog that predates 0.29.0 has none, so reuse is off there. A
+  `PlanInvalItem` on the function invalidates a cached plan that names it.
+
+**A VISIBLE BEHAVIOUR CHANGE, and the one place it shows.** The hidden sort key's readers
+now see the corpus distance the rows are ordered by, instead of the N = 1 distance. In
+`sql/score_reuse.sql`'s corpus every 'alpha' document has tf = 1, so the operator gives all
+1,000 of them ONE distance while the index gives ten:
+`ORDER BY d <=> 'alpha' FETCH FIRST 5 ROWS WITH TIES` returned **1,000 rows before and
+172 now**. 172 is the reference (`weave_search()`'s ranking). An
+`ORDER BY d <=> q, id` Incremental Sort now orders by (index distance, id), which also
+matches the reference. Before, it ordered the stream by id within one giant tie. Plain
+`LIMIT` and a selected `d <=> q` are unchanged (tested: 500 of 500 visible values equal
+`weave_distance()`).
+
+**Where it does not apply.** A scan's entry is resjunk only when the scan's target list IS
+the top plan's (`Limit`, `Sort` and `Incremental Sort` share it, and
+`apply_tlist_labeling()` copies `resjunk`). Under a join, an Append or a projecting node the
+entry is not resjunk and is left alone. That should include a query whose SELECT list has a
+volatile or expensive column. `make_sort_input_target()` postpones that column into a
+projection above the Limit, and the scan's list is then built by `build_path_tlist()` with
+`resjunk = false`. This comes from reading the planner and is untested. These are lost
+optimizations, not wrong answers.
+
+**Measured on EC2,** c7i.8xlarge, PG17, `pgweave-20261007-001351-226c` (commit `78a2870`):
+synthetic corpus as G87's ('a' 30 %, 'b' 20 %, 'c' 10 %, 'rare' 0.2 %), median of 25 warm
+runs, two runs per arm. `weave_distance` calls per query were counted with
+`track_functions`: **0 with reuse on, one per returned row with it off**, in every cell.
+`bench/RESULTS_G86_SCORE_REUSE.md` has the full table.
+
+| corpus | query | LIMIT | ms off (run 1 / 2) | ms on (run 1 / 2) |
+|---|---|---:|---:|---:|
+| long (11 KB, TOASTed), 200k | `c` | 400 | 8.963 / 8.979 | **0.195 / 0.196** |
+| long, 200k | `rare` | 400 | 9.338 / 9.300 | **0.234 / 0.233** |
+| long, 200k | `a \| b` | 400 | 15.272 / 15.274 | **6.645 / 6.635** |
+| long, 200k | `c` | 10 | 0.263 / 0.263 | **0.056 / 0.056** |
+| long, 50k | `c` | 400 | 8.934 / 8.939 | **0.131 / 0.131** |
+| short (100 B), 200k | `rare` | 400 | 0.353 / 0.356 | 0.328 / 0.328 |
+| short, 1M | `rare` | 400 | 1.849 / 1.810 | 1.797 / 1.817 |
+| short, 200k and 1M | `c`, `a \| b` | 10, 400 | — | within run-to-run spread |
+
+**Stated as a loss where it is one:** on SHORT inline documents it buys almost nothing. One
+cell (200k, `rare`, 7 %) clears its spread and does not reproduce at 1M, and the rest
+overlap. A 100-byte `weave_distance()` costs too little to see next to the scan. The
+win is the detoast: about 22 µs per returned row on an 11 KB TOASTed document, which turns
+a 400-row ranked query on long text from 9 ms into 0.2 ms (46x), and a two-term OR from
+15.3 into 6.6 ms. The corpus is synthetic, so this is a mechanism measurement and not a
+real-corpus claim.
+
+Tests: `sql/score_reuse.sql`. Mutants ran on EC2 (`pgweave-20261007-002744-3074`, job
+script stage C), each built and installed, then run against the committed expected output.
+**Killed:** a visible entry substituted too (500 of 500 visible values changed); the
+previous row's value published (9 wrong row values, `WITH TIES` 173 not 172, all three
+rescans mismatched); the AM and type guards removed (GiST `<->` and vector `<->`
+substituted); the unkeyed global, pg_fts's design with the index, TID and query checks
+removed (both §7 clobber checks false). **Survived, and equivalent:** the AM guard alone
+removed. The `wdoc <=> wquery` type test already excludes every other access method,
+because no other AM orders by that operator. The brief's "substitute when the scan is not
+a weave scan" mutant is therefore the AM-and-type one.
+
+PG17 smoke on `b5e1beb` (`pgweave-20261007-002744-3074`): regression 26/26, isolation
+2/2, TAP 33 files / 1,275 tests. `expected/limit_hint.out` changed by exactly the two
+substituted `Output:` lines and the header padding they widen. That is semantic, intended,
+and inspected line by line (hard rule 3).
+- **Which channels' scan values equal the operator's.** Lexical `<=>`: the scan's value is
+  the corpus BM25 distance and `weave_distance()` is the N = 1 one. They are not equal, so
+  only RESJUNK entries may be substituted (pg_fts's rule). Vector `<->`/`<#>`/`<=>`: the
+  scan scores QUANTIZED reconstructions, and for `<->` returns the SQUARED distance (see
+  the comment above `weave_vec_pass()`), so the values differ and are not substituted.
+  `<@>`: the scan's value IS bit-identical to the operator's. It is the integer
+  `weave_doc_min_edist()` result as a float8, from the same function, and `sql/edist.sql`
+  asserts zero mismatches over every row. So reuse would be exact, but it is not done:
+  `weave_edist()` is a min over the document's terms, not a BM25, and nothing measured
+  says it is worth a second SQL-visible function. Owed if a profile says otherwise.
+  `fuse()`: the scan's `-S` sums CORPUS BM25 and quantized vector scores in a different
+  order from `weave_fuse()` (F5: last-ULP differences), and the resjunk `fuse()` evaluates
+  each `d <=> q` at N = 1. So the substituted value would differ from the computed one by
+  far more than an ULP, exactly as the lexical one does. So "bit for bit equal to what
+  the ORDER BY expression computes" is met by NEITHER, and was the wrong bar (see the
+  corrected one below).
+
+### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`) and the fused `fuse()` route (`wt/hintfuse`); the vector `<->`/`<#>` route is NOT HINTABLE without a format decision**
 
 An index AM is not told the LIMIT. pg_weave starts every ordered lexical pass at
 `weave_ord_width(pg_weave.wand_initial_k)` = `max(4 x 32, 64)` = **128** and widens x4 on
@@ -5721,3 +5878,139 @@ header compared; the cap removed. PG17 and PG18 installcheck 25/25, TAP 33 files
 **Still OWED:** the fused route (`so->fusek`, `weave_fuse_pass()`), whose several ORDER BY
 keys mean the hint has to travel on the `<~>` transport key; and the vector route
 (`so->veck`).
+
+**Measured before building, 2026-10-06 (hard rule 9; `wt/hintfuse`).** Proxy for a hinted
+LIMIT 10: `pg_weave.wand_initial_k = 16`, so the first width is 64, against the default
+32 (width 128). EC2 c7i.4xlarge, PG17, 200k documents, the same lexical corpus as above
+plus a 32-d vector per row (every 997th NULL) that drifts smoothly with the row id,
+LIMIT 10, two runs per arm, median of 25 warm runs. Run `pgweave-20261006-205828-0b58`
+(smoke green on `4c7dcca`). The answers (md5 of the id list) were identical at both widths.
+
+| query | width 128 -> 64: `weave_fuse_stats().scores` | vec_lanes | ms 128 (run 1 / 2) | ms 64 (run 1 / 2) |
+|---|---:|---:|---:|---:|
+| `fuse(d <=> 'a \| b \| c', v <-> q)` | 103,539 -> 80,313 (-22 %) | 199,800 both | 34.1 / 34.0 | 32.8 / 32.6 |
+| `fuse(d <=> 'c', v <-> q)` | 47,833 -> 46,195 (-3 %) | 199,800 both | 24.1 / 24.1 | 23.8 / 23.6 |
+| `fuse(d <=> 'a \| b', d <=> 'c')` | 3,567 -> 1,781 (-50 %) | — | 2.38 / 2.37 | 2.22 / 2.21 |
+| `v <-> q` (vector route) | — | 199,800 both, 0 blocks bound-skipped | 14.0 / 14.0 | 14.0 / 13.7 |
+
+- **Fused: the work moves**, by 3 % to 50 % depending on how much of it is lexical, and the
+  time follows by 1-7 %. The vector channel inside a fused scan scores every lane at both
+  widths here, so the hybrid queries keep most of their cost. Built; see below.
+- **Vector route: NOT HINTABLE WITHOUT A DECISION, and on this corpus the work did not move
+  anyway.** Its ORDER BY argument is a `wvec`, whose only spare field is the `int16 unused`
+  word (`include/weave/vector.h`, "zeroed; reserved for a per-value flag word";
+  `wvec_recv()` rejects a nonzero one). Using it as a planner-only carrier is a format
+  decision, not something this task takes. The measurement also gives no reason to take it:
+  `vec_lanes` was 199,800 at both widths and the block bound skipped nothing, so the
+  first-pass width did not change the work. This corpus is a poor test of the bound (every
+  vector is nearly equidistant from the query, the `bench/RESULTS_BOUND_PRUNING.md`
+  failure mode), so the result is **corpus-limited, not a ceiling**: on a clustered corpus
+  where the block bound prunes, a narrower top-k threshold could prune more. Unmeasured.
+
+**FIXED for the fused route, 2026-10-06 (`wt/hintfuse`).** `weave_hint_indexscan()` no longer
+requires exactly one ORDER BY key. It hints the FIRST key whose argument is a `wquery` Const.
+Only `<=>` takes a `wquery`, so that is the only key of a lexical scan and the first lexical
+channel of a fused one. `weave_gettuple()` sets the fused first width from the first
+`WEAVE_STRAT_DISTANCE` channel through the same `weave_ord_first_width()`: first pass only,
+capped at the unhinted width, ladder unchanged.
+
+- **The carrier covers every fused shape the planner builds.** `src/am/fusepath.c` builds
+  no fused path without a channel on the lexical column (the transport key has to hang off
+  it), and refuses a parameterized `wquery`. So every planned fused scan has a lexical
+  wquery Const. A fused shape with no lexical channel (two vector keys) gets no fused path
+  at all, so it has nothing to hint. The `<~>` transport (`real[]`) was not used: it has no
+  spare field, and changing its type is a catalog change.
+- **`weave_fuse_search()` is not hinted.** It builds its own scan keys, there is no
+  planner, and its `k` already says how many rows it wants. It also serves as the test's
+  unhinted oracle.
+
+Tests: `sql/limit_hint_fuse.sql`, expected output from the full EC2 installcheck of
+`e4cc7c5` (`pgweave-20261006-230743-c6e1`, every self-check `t`). It covers three shapes
+(lexical + vector, vector + lexical, two lexical), both `fuse_normalize` modes, LIMIT
+1 / 10 / 100 / 300, OFFSET 7 and 200, a filter that rejects 96 of 97 ranked rows, NULL
+vectors padded after every ranked row (G71) both alone and after ranked rows, generic plans
+(constant LIMIT and `LIMIT $1`, two executions each) and a cursor. Answers are compared as
+score arrays against `weave_fuse_search()`. Seven mutants, each verified on EC2 to BUILD,
+install and then FAIL the test, with the unmutated tree passing solo before and after
+(`pgweave-20261006-231740-d74a`, `mut/summary.txt`):
+
+| mutant | caught by |
+|---|---|
+| the old one-key-only rule | less work at LIMIT 10, all three shapes |
+| hint only the first key | less work, vector-first shape |
+| no `break` in the planner's key loop | ERROR: the hint landed on the transport's operand slot |
+| no `break` in the scan's channel loop | less work, two-lexical shape |
+| the scan ignores the hint | less work, all three shapes |
+| no cap at the unhinted width | never more at LIMIT 100, all three shapes |
+| no widening past the first pass | padded rows ahead of ranked ones (`tail_ok=f`) |
+
+Full smoke on `f5b7673`: regression + isolation 28/28, TAP 33 files PASS. (`check-rename`
+FAILs on this host on `4c7dcca` too, before any change here.)
+
+EC2 c7i.8xlarge, PG17, the lexical corpus above plus a uniformly random 32-d vector per row
+(every 997th NULL), median of 25 warm runs, two runs per arm, 200k and 1M documents
+(`pgweave-20261006-231740-d74a`, commit `f5b7673`). The id list (md5) was identical with the
+hint on and off in every cell. `scores` is `weave_fuse_stats().scores`.
+
+| query, LIMIT 10 | n | scores off -> on | ms off (run 1 / 2) | ms on (run 1 / 2) |
+|---|---:|---:|---:|---:|
+| `fuse(d <=> 'a \| b', d <=> 'c')` | 200k | 3,567 -> 1,781 | 2.144 / 2.145 | **1.959 / 1.962** |
+| `fuse(d <=> 'a \| b', d <=> 'c')` | 1M | 3,567 -> 1,781 | 9.432 / 9.497 | **9.295 / 9.335** |
+| `fuse(d <=> 'a \| b \| c', v <-> q)` | 200k | 388,914 -> 379,254 | 36.435 / 36.400 | 35.983 / 35.994 |
+| `fuse(d <=> 'a \| b \| c', v <-> q)` | 1M | 1,845,322 -> 1,809,468 | 181.607 / 181.823 | 180.470 / 180.544 |
+| `fuse(d <=> 'c', v <-> q)` | 200k | 62,513 -> 60,632 | 19.487 / 19.514 | 19.401 / 19.402 |
+| `fuse(d <=> 'c', v <-> q)` | 1M | 214,571 -> 207,971 | 91.876 / 92.040 | 91.391 / 91.292 |
+| any of the three, LIMIT 100 | both | unchanged | — | within run-to-run spread |
+
+**What this says, stated as the loss it mostly is.** On every LIMIT 10 query the hint
+lowers the work and the time, at both scales, by more than the run-to-run spread. But the
+win is small everywhere except the pure-lexical fusion, and it shrinks with n:
+
+- **Two lexical channels:** the work halves, and the time drops 8.6 % at 200k but only
+  1.6 % at 1M. This is the lexical route's result again: on this synthetic corpus the time
+  goes to decoding posting pages, not to BM25 contributions.
+- **Lexical + vector, the flagship shape:** the work drops 2-3 % and the time 0.5-1.2 %.
+  The vector channel's share of `scores` (`vec_scores`, 917,372 of 1,845,322 at 1M) is
+  about one per document at both widths. **On random vectors the fused scan scores almost
+  every lane whatever its threshold**, so a narrower first pass has almost nothing to prune.
+  That is the `bench/RESULTS_BOUND_PRUNING.md` finding showing up in the fused route: the
+  hint is limited by how well the vector bound prunes, not by its own width. On a corpus
+  where the block bound prunes (real embeddings in docid-coherent order), the hint should
+  matter more. **Unmeasured**, and it should be re-measured on `bench/fuse.sh`'s BEIR
+  corpora before anyone quotes this as the hint's value.
+- **LIMIT 100:** unchanged work by construction (the cap), and time within spread.
+
+The vector `<->`/`<#>` route stays unhinted: see the measurement above. A decision would be
+needed to use `wvec`'s reserved `int16` as a planner-only carrier, and on the corpus
+measured it would not have changed the work.
+
+### G88 — "approximate regex" is named in the product statement and does not ship: `{~k}` parses and is then ignored — **FOUND 2026-10-06 by the README rewrite; OPEN, needs a maintainer decision**
+
+`AGENTS.md`'s product statement lists "approximate regex" among the six retrieval kinds, and
+`doc/PHASES.md` Phase Z is titled "fuzzy / approximate-regex / prefix / n-gram". What ships is
+exact regex: `body @@@ '/re/'` runs core's ARE engine (`pg_regcomp`/`pg_regexec`,
+`src/am/amscan.c` and `RE_compile_and_execute` in `src/query/doc.c`) over dictionary tokens.
+The pg_tre import has the approximate pieces, but they are not wired:
+
+- `src/query/regex_grammar.y` parses `atom{~k}` into `REGEX_AST_APPROX`, and
+  `src/query/extract.c` then treats it as its child ("Phase 3 (k=0): treat APPROX as its
+  child. Phase 5 reads ast->u.approx.k ..."). Phase 5 does not exist.
+- `src/query/re_match.c` wraps TRE's `tre_reganexec`, and nothing in `src/am/` or the match
+  path calls it.
+- `weave_regex_narrowable()` notes that ARE reads `{~k}` as a literal while pg_tre's tokenizer
+  reads it as an approximate bound, so the two dialects disagree on exactly this syntax today.
+
+So a user writing `'/colou?r{~1}/'` gets ARE's reading of those bytes, not an approximate match.
+Fuzzy TERMS (`term~k`, universal Levenshtein, Z5) do ship and are not this gap.
+
+**Decision needed:** either wire approximate regex (TRE's matcher for the verify step, the
+`{~k}` extraction rules for the trigram prefilter, and a refusal of `{~k}` until then), or
+narrow the product statement and Phase Z's title to "regex". The README says "regular
+expressions over tokens" until this is decided.
+
+The same review found two documents stale against the shipped code, recorded here so they are
+not lost: `doc/PRODUCTION_READINESS.md` "What actually works today" still says vector indexing
+does not exist and fuzzy is unreachable; `doc/ARCHITECTURE.md` §9 claim 3's scope note says the
+only filter pushed into the index is a lexical term, but docvalues have shipped
+(`bench/RESULTS_DOCVALS_PRIZE.md`, `bench/RESULTS_DOCVALS_SCALE.md`).
+

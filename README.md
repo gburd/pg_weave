@@ -1,170 +1,278 @@
 # pg_weave
 
-**One PostgreSQL index for BM25 text, vector similarity, fuzzy, regex, and facet
-search — with a single fused top-k threshold across all of them.**
+pg_weave is a PostgreSQL index access method, `weave`. One `CREATE INDEX` gives you six
+kinds of retrieval over the same rows: BM25 ranked text search, vector nearest-neighbour
+search, fuzzy (edit-distance) terms, regular expressions over tokens, prefix terms, and
+substring (`LIKE '%...%'`) search through a character n-gram channel. A scalar column can
+be indexed as a facet too. Every channel in a segment shares one document-id space, so a
+selective filter (a lexical term, or a facet such as `price < 100`) skips vector work
+inside the scan instead of filtering rows after it.
 
-Status: **0.3.0, early. Not production-ready** — see
-`doc/PRODUCTION_READINESS.md`. The lexical channel works and is measured; the
-`wvec` type exists but the index does not accept it yet; the fuzzy channel is
-imported and unwired; the fused scorer is specified and unimplemented.
-`doc/GAPS.md` is the measured list of what stands between here and competitive,
-and `doc/PHASES.md` is the task plan.
+**Status: 0.29.0, pre-1.0, not production-ready.** All six retrieval kinds ship. The
+fuzzy/n-gram (Z) and vector (V) phase gates are not met, the fused-ranking gate passes two
+of its five rows, and several measured results are losses, listed below.
+`doc/PRODUCTION_READINESS.md` is the gate list and `doc/GAPS.md` lists the known defects.
 
-**Measured today** against tsvector + GIN, 1M documents (`bench/RESULTS_LEXICAL.md`):
-winning 8.2–19× on common-term ranked, **595×** on `count(*)`, 3.8–7.7× on prefix
-counting. Losing 1.7× on rare and mid ranked latency, 1.7–1.9× on index size, and
-carrying one silent 7,000× cliff on `ORDER BY <=> LIMIT` without a `WHERE` clause
-(gap G1, task L7 — the highest priority in the project).
+## Install
 
-## The idea
+PostgreSQL 17 or 18, built with PGXS:
 
-`weave` is one index access method. A single index can carry several *channels*
-over the same set of rows:
+```sh
+make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+```
 
 ```sql
-CREATE INDEX docs_weave ON docs USING weave (
-    body      lex_ops   (positions, trigrams, analyzer = 'english'),
-    embedding vec_cosine_ops (bits = 4, graph = on),
-    sku       gram_ops
+CREATE EXTENSION pg_weave;
+```
+
+The extension is `trusted`, so a database owner can create it without superuser.
+It needs no `shared_preload_libraries` entry. `make installcheck` runs the regression,
+isolation and TAP suites against the installed server.
+
+If your `clang` is a newer major than the LLVM your PostgreSQL was built against, install
+with `with_llvm=no`. Otherwise `make install` can fail partway through the bitcode step
+and leave bitcode behind that the JIT cannot read. That crashes backends later, and the
+crash need not be in a query that touches pg_weave. To repair it, remove
+`$(pg_config --pkglibdir)/bitcode/pg_weave*`. On Debian 13 with PGDG packages (clang 19,
+LLVM 19) the default `make install` exits 0; JIT use of its bitcode is not tested.
+
+## Example
+
+The SQL below is `doc/readme_examples.sql`, and the results in comments come from running
+it on PostgreSQL 17.11 and 18.6 (EC2 run `pgweave-20261006-212542-c6e5`). Both majors
+printed identical output.
+
+```sql
+CREATE TABLE docs (
+    id     int PRIMARY KEY,
+    title  text NOT NULL,
+    body   wdoc GENERATED ALWAYS AS (to_wdoc(title)) STORED,
+    emb    wvec(4),
+    price  int8
 );
+INSERT INTO docs (id, title, emb, price) VALUES
+  (1, 'PostgreSQL streaming replication setup',  '[0.9,0.1,0.0,0.0]', 40),
+  (2, 'Logical replication with publications',   '[0.8,0.2,0.1,0.0]', 25),
+  (3, 'Tuning autovacuum for large tables',       '[0.1,0.9,0.0,0.1]', 60),
+  (4, 'VACUUM FULL versus table rewrites',        '[0.2,0.8,0.1,0.0]', 15),
+  (5, 'Vector similarity search in PostgreSQL',  '[0.0,0.1,0.9,0.2]', 80),
+  (6, 'Full text search ranking with BM25',       '[0.1,0.0,0.8,0.3]', 35),
+  (7, 'WAL archiving and point in time recovery', '[0.7,0.0,0.0,0.6]', 55),
+  (8, 'Monitoring replica lag in PostgreSQL',    '[0.8,0.3,0.0,0.2]', 20);
+-- 20,000 filler rows, so the planner has a reason to use an index.
+INSERT INTO docs (id, title, emb, price)
+SELECT g, 'archived note ' || g,
+       ARRAY[-1, -1, -(g % 10) / 10.0, -(g % 7) / 7.0]::real[],
+       1000 + g
+  FROM generate_series(100, 20099) g;
+
+-- One column per channel: lexical (wdoc), vector (wvec), substring (gram_ops on
+-- the raw text), and one scalar facet (int8_docval_ops).
+CREATE INDEX docs_weave ON docs USING weave
+    (body, emb, title gram_ops, price int8_docval_ops);
+ANALYZE docs;
 ```
 
-and one query can rank across them under one threshold:
+BM25 ranking, boolean and phrase queries, and index-answered `count(*)`:
 
 ```sql
-SELECT id, score()
-  FROM docs
- WHERE body @@@ 'postgres AND replication'   -- lexical predicate
-   AND tenant_id = 42                        -- scalar predicate
- ORDER BY fuse(body      <=> 'postgres replication'::wquery,
-               embedding <=> $1::wvec,
-               weights => '{0.4, 0.6}')
- LIMIT 10;
+SELECT id, title FROM docs
+ WHERE body @@@ 'replication'
+ ORDER BY body <=> 'replication'
+ LIMIT 3;
+--  1 | PostgreSQL streaming replication setup
+--  2 | Logical replication with publications
+
+EXPLAIN (COSTS OFF)
+SELECT id FROM docs ORDER BY body <=> 'replication' LIMIT 3;
+--  Limit
+--    ->  Index Scan using docs_weave on docs
+--          Order By: (body <=> '''replication'''::wquery)
+
+SELECT id, title FROM docs WHERE body @@@ 'postgresql & !vector' ORDER BY id;   -- 1, 8
+SELECT id, title FROM docs WHERE body @@@ '"streaming replication"';           -- 1
+SELECT count(*) FROM docs WHERE body @@@ 'postgresql';                         -- 3
 ```
 
-Fuzzy, prefix and regex terms join a fused ranking as **filters**, not as scored
-channels: they decide which rows are ranked, and `fuse()` decides the order.
+Vector nearest neighbours (`<->` is L2; `<#>` is negative inner product, for an index
+built `WITH (metric = 'ip')`):
 
 ```sql
-SELECT id FROM docs
- WHERE body @@@ 'protien~2'                  -- within 2 edits; or 'prot*', '/^prot.*n$/'
- ORDER BY fuse(body      <=> 'alpha'::wquery,
-               embedding <-> $1::wvec)
- LIMIT 10;                                   -- one fused Index Scan
+SELECT id, title FROM docs ORDER BY emb <-> '[1,0,0,0]' LIMIT 3;
+--  1 | PostgreSQL streaming replication setup
+--  2 | Logical replication with publications
+--  8 | Monitoring replica lag in PostgreSQL
 ```
 
-A closer spelling does not rank higher there. To rank by spelling closeness, use
-`ORDER BY body <@> 'protien'` on its own. `fuse(..., body <@> 'protien')` is accepted
-and correct but not fused (a Sort). `doc/specs/FUSED_TOPK.md` §7d has the decision.
+Fuzzy, prefix, regex, spelling-distance ranking, and substring search:
 
-The reason to put these in one index is not code reuse. It is that all channels
-in a segment share one dense document-id space, so a bound derived in one channel
-can skip work in another. Post-filtering an ANN search by a lexical or scalar
-predicate is the single biggest pain point in real pgvector deployments; here the
-predicate is evaluated into a bitmap and pushed *into* the graph traversal and
-into the SIMD block mask. Selective predicates make the query faster instead of
-collapsing recall.
-
-`doc/ARCHITECTURE.md` §3 is the full argument, including why this is impossible
-across three separate extensions.
-
-## What it claims
-
-Four things, deliberately:
-
-1. Lexical, vector, fuzzy, regex, and facet queries from **one** index — one WAL
-   stream, one vacuum, one visibility rule.
-2. **Fused-threshold top-k** instead of over-fetch-plus-RRF: one threshold, no
-   over-fetch, and a score that means something. `doc/specs/FUSED_TOPK.md`.
-3. Queries that get **faster** as predicates get more selective.
-4. C, PostgreSQL-licensed, MVCC/WAL-native, `trusted`, no external storage engine
-   — therefore on the contrib track.
-
-## What it does not claim
-
-- **Exact recall, sublinear latency, and minimal storage simultaneously.** Pick
-  two. `weave.vec_recall = exact` costs a scan; the graph is approximate the same
-  way HNSW is.
-- **Beating `pg_trgm` on index size for unanchored cross-token substring search.**
-  Our trigrams are inverted over the *vocabulary*, which is asymptotically
-  smaller but token-aligned and cannot answer `LIKE '%tion refu%'`. There is an
-  opt-in corpus-level channel for that, and with it enabled we are not smaller
-  than GIN. `doc/ARCHITECTURE.md` §7.
-- **Operational simplicity.** pgvector is small and boring; this is not. No
-  technical fix exists, only a drop-in compatibility surface and per-channel
-  opt-in.
-
-`doc/ARCHITECTURE.md` §8 lists every dimension where pg_weave loses, and which
-of those are fundamental versus merely unbuilt.
-
-## Provenance
-
-pg_weave is mostly not new code, and saying which parts are matters:
-
-| subsystem | origin | status |
-|---|---|---|
-| segment engine, WAL, vacuum, MVCC, CIC, lexical BM25 channel | `pg_fts` 1.5.8 (PostgreSQL license) | forked wholesale, field-tested |
-| SuRF trie, universal-Levenshtein, regex→trigram tiling | `pg_tre` 3.2.1 (MIT, relicensed) | imported, **not wired** |
-| quantizer: rotation, Lloyd–Max codebook, renormalization scale | `turbovec` 1.0.0 (MIT) | **reimplemented in C**, tested |
-| Vamana graph over quantized codes; filter-in-traversal | `pg_turbovec`, `zvec` | ideas only; **no zvec code copied** |
-| fused-threshold top-k | new | specified, unimplemented |
-
-`ci/fork-rename.sh` is the exact, reviewable transformation that produced the
-lexical channel. `doc/LICENSING.md` has the per-file table and the rule for
-contributions.
-
-## Building
-
-```sh
-make PG_CONFIG=$(command -v pg_config)
-make install
-make installcheck
+```sql
+SELECT id, title FROM docs WHERE body @@@ 'replicaton~1' ORDER BY id;   -- 1, 2  (one edit)
+SELECT id, title FROM docs WHERE body @@@ 'vacu*' ORDER BY id;          -- 4
+SELECT id, title FROM docs WHERE body @@@ '/^repl.*n$/' ORDER BY id;    -- 1, 2  (per token)
+SELECT id, title FROM docs ORDER BY body <@> 'replicaton' LIMIT 3;      -- 1, 2, 8
+SELECT id, title FROM docs WHERE title @~ '%al repl%';                  -- 2  (LIKE)
+SELECT id, title FROM docs WHERE title @~* '%postgresql stream%';       -- 1  (ILIKE)
 ```
 
-Requires PostgreSQL 17 or later. With Nix:
+A facet and a lexical term in one index condition:
 
-```sh
-nix build .#pg17                                   # build
-nix build .#checks.x86_64-linux.installcheck-pg17  # regression + isolation
-nix build .#checks.x86_64-linux.tap-pg17           # TAP
+```sql
+SELECT id, title, price FROM docs
+ WHERE body @@@ 'replication' AND price < 30
+ ORDER BY id;
+--  2 | Logical replication with publications |    25
 ```
 
-Current state on PG 17.11 and PG 18: 3 regression tests, 2 isolation tests, and
-61 TAP tests green; clean build under clang with PostgreSQL's warning set, zero
-warnings. The standalone codec test runs 17,741 property checks with no backend:
+Hybrid ranking. `fuse()` takes one distance per channel and optional weights. With a
+facet filter it is still one index scan with no Sort:
 
-```sh
-gcc -O2 -I include -o /tmp/tq test/hegel/test_quantize.c \
-    src/vector/quantize.c src/vector/pack.c -lm && /tmp/tq
+```sql
+SELECT id, title FROM docs
+ WHERE price < 100
+ ORDER BY fuse(body <=> 'postgresql replication',
+               emb  <-> '[1,0,0,0]',
+               weights => '{0.5,0.5}')
+ LIMIT 5;
+--  1 | PostgreSQL streaming replication setup
+--  2 | Logical replication with publications
+--  8 | Monitoring replica lag in PostgreSQL
+--  7 | WAL archiving and point in time recovery
+--  4 | VACUUM FULL versus table rewrites
+
+-- EXPLAIN (COSTS OFF) of the same query:
+--  Limit
+--    ->  Index Scan using docs_weave on docs
+--          Index Cond: (price < 100)
+--          Order By: ((body <=> '(''postgresql'' & ''replication'')'::wquery) AND
+--                     (emb <-> '[1,0,0,0]'::wvec) AND (body <~> '{0.5,0.5}'::real[]))
+
+SELECT id, title FROM docs
+ WHERE body @@@ 'replicaton~1'
+ ORDER BY fuse(body <=> 'postgresql', emb <-> '[1,0,0,0]')
+ LIMIT 5;
+-- 1, 2
 ```
 
-## A finding worth reading before you contribute
+To get the fused score, call `weave_fuse_search()`. Putting `fuse(...)` in the select list
+recomputes it per row from the heap value, which is not the score the scan ranked by.
 
-`bench/RESULTS_BOUND_PRUNING.md` records a measurement taken before the fused
-scorer was written. The block bound originally specified for the vector channel —
-the obvious analogue of block-max WAND's `max_tf` — prunes **0.0 %** of blocks. A
-centroid-plus-radius bound prunes **99.6 %**, but only if the document-id space
-is ordered so that code blocks are spatially coherent; in heap order it prunes
-0.0 % again.
+```sql
+SELECT d.id, d.title, round(s.score::numeric, 4) AS score
+  FROM weave_fuse_search('docs_weave', ARRAY['postgresql replication'::wquery],
+                         ARRAY['[1,0,0,0]'::wvec], '{0.5,0.5}', 3) s
+  JOIN docs d ON d.ctid = s.ctid
+ ORDER BY s.score DESC;
+--  1 | PostgreSQL streaming replication setup | 0.2582
+--  2 | Logical replication with publications  | 0.1100
+--  8 | Monitoring replica lag in PostgreSQL   | 0.0736
 
-Both facts are invisible to correctness tests. Both would have surfaced months
-into implementation. That is the standard this project holds itself to: measure
-the thing the design depends on before building on top of it, and write down the
-negative result.
+SELECT bool_and(ok) AS all_invariants_hold FROM weave_check('docs_weave');   -- t
+```
 
-## Documentation
+Limits you will meet:
+
+- **Vector order is approximate.** The scan ranks by 4-bit quantized codes and does not
+  rerank against the stored floats (the planned rerank is `doc/PHASES.md` V10). For an
+  exact top-k, take a wider index top-k and re-sort it by `emb <-> q` in an outer query.
+- **Cosine is refused.** `WITH (metric = 'cosine')` fails with a hint to normalize the
+  vectors and use `metric = 'ip'`. L1 is refused as well.
+- **An index needs a `wdoc` column**, and holds at most one vector, one `gram_ops` and one
+  docvalues column. Docvalues operator classes exist for `int2`, `int4`, `int8`, `float8`,
+  `date`, `bool` and `text`.
+- **`to_wdoc(text)` only lowercases and splits.** For stemming and stopwords use
+  `to_wdoc('english', text)`, or `to_wdoc(tsvector)`. Fuzzy, prefix and regex terms are
+  matched literally against whatever tokens the index holds.
+- **`weave_fuse_search()` and `weave_search()` are revoked from `PUBLIC`**, because they
+  return heap TIDs and scores past table permissions. The owner can `GRANT EXECUTE` them.
+- Index options: `positions`, `trigrams` (speeds up regex and long fuzzy terms), `bits`
+  (code width, 2–8, default 4), `metric` (`l2` or `ip`).
+
+## What it is fast at, and where it loses
+
+Each figure below comes from the file named beside it, which also gives the corpus, the
+host and the scale. Most cover one corpus at one or two scales.
+
+**Lexical, against tsvector + GIN** (`bench/RESULTS_LEXICAL.md`, synthetic corpus,
+1M and 4M documents):
+
+- Wins: common-term ranked top-10 is 20.5× (1M) and 29.4× (4M) faster, mid-frequency
+  4.5× and 3.9×, index-answered `count(*)` 133× and 144×, prefix `count(*)` 4.9× and 7.1×.
+  The index is 1.73–1.79× smaller and builds 1.03–1.46× faster.
+- Losses: rare-term ranked top-10 is 1.33× (1M) and 1.67× (4M) slower, 0.04 ms against
+  0.03 ms. Against pg_fts, the extension this one was forked from, the build is 1.08×
+  slower at 4M.
+
+**Fused hybrid ranking, against RRF over-fetch on the same index**
+(`bench/RESULTS_FUSE.md`, BEIR scifact / nfcorpus / fiqa, 384-d MiniLM embeddings):
+
+- Win: nDCG@10 is 1.053× / 1.010× / 1.114× RRF's, and recall against an exhaustive fused
+  scan is 1.000.
+- Losses: p50 latency is 0.710× / 0.827× / **1.172×** RRF's, so on fiqa the fused query is
+  slower than the RRF query it is meant to replace. p99 misses its gate on two of three
+  corpora. The fused scan reads every vector code block (1.000×), so it does not do less
+  vector work than RRF. On nfcorpus, recall@100 and MRR@10 are slightly below RRF.
+
+**Filters inside the fused scan** (`bench/RESULTS_GATE_SWEEP.md`, the same three corpora):
+
+- Win: with a lexical filter matching 0.1 % of rows, the fused query is 5.7× to 13.8×
+  faster than with no filter, at p50 and at p99. Against the same index answering in vector
+  order and rechecking the filter afterwards, it reads 97–158× fewer buffers and discards
+  no candidates.
+- Loss: with no filter the fused path is about 30 % more expensive (0.7–0.8×). The
+  crossover is between 10 % and 1 % selectivity.
+- A scalar facet (`price < x`) cuts vector work the same way: 517× (fiqa) and 648×
+  (scifact) fewer code blocks at 0.001 selectivity than an executor filter
+  (`bench/RESULTS_DOCVALS_PRIZE.md`), and the fall reproduces at 1M rows
+  (`bench/RESULTS_DOCVALS_SCALE.md`). These are work counters, not latencies.
+
+**Vector storage** (`bench/RESULTS_VECMAJOR.md`, built index, 4-bit codes): 278 / 533 /
+533 / 789 bytes per vector at 384 / 768 / 960 / 1,024 dimensions. That is 0.136× / 0.130× /
+0.065× / 0.096× the size of a pgvector HNSW index built in the same run.
+
+**Vector recall and latency, not yet a win:**
+
+- The index orders by quantized codes and does not rerank against the stored floats. A
+  standalone measurement of that rerank reached recall@10 0.9920 at 1M × 960-d
+  (`bench/RESULTS_PHASE_V_COLD.md`), but the scan does not do it yet (`doc/PHASES.md` V10).
+  The codes alone top out at recall@10 0.9225 (GloVe-200d) and 0.8680 (GIST-960d)
+  (`bench/RESULTS_BITWIDTH_SWEEP.md`).
+- No vector SQL query has been timed against pgvector. A standalone harness that also does
+  the exact rerank the index lacks measured 1.02–1.09× pgvector HNSW's warm p50 at
+  recall@10 ≥ 0.99, n = 1M (`bench/RESULTS_CODE_SCAN.md`, "The honest configuration
+  table"). It does no page reads or visibility checks, so do not read it as query latency.
+- The per-block score bound prunes 0.00 % of blocks on real corpora
+  (`bench/RESULTS_CODE_SCAN.md`), so an unfiltered query scores every code.
+
+**Fuzzy, regex, substring** (`bench/RESULTS_FUZZY_REGEX.md`, `bench/RESULTS_CGRAM.md`,
+synthetic 1M rows, one scale):
+
+- `term~1` is 93 ms p50, inside its 200 ms gate. `term~2` is 293 ms and misses it.
+- A character-class regex is 50 ms with the default index and 1.1 ms with
+  `WITH (trigrams = on)`. A regex matching every row is 317 ms.
+- Substring search with `gram_ops` makes the index 1.67× the size of `pg_trgm`'s GIN index
+  on the same column, and it is 2.0–2.4× slower than `pg_trgm` on five of six patterns
+  (faster on one). Two unselective patterns are slower than a sequential scan. Without
+  `gram_ops` the index is 0.54× `pg_trgm`'s size but cannot answer `LIKE '%...%'`.
+
+**Permanent trade-offs** (`doc/ARCHITECTURE.md` §8): no parallel ranked scan; positions
+cost storage roughly in proportion to token count; exact recall, low latency and small
+storage cannot all be had at once; and one extension carrying seven channel kinds is harder
+to operate and to trust than pgvector.
+
+## Read next
 
 | file | what |
 |---|---|
-| `doc/ARCHITECTURE.md` | the thesis, the vocabulary, provenance, and what we lose |
-| `doc/PHASES.md` | the build-out contract: tasks, specs, and gates |
-| `doc/specs/FUSED_TOPK.md` | the novel algorithm and its correctness argument |
-| `doc/specs/VECTOR_CHANNEL.md` | quantizer, bound, kernels, graph |
-| `doc/specs/FUZZY_CHANNEL.md` | the vocabulary funnel |
-| `doc/specs/SEGMENT_FORMAT.md` | on-disk format and invariants |
-| `doc/LICENSING.md` | provenance and license analysis |
-| `AGENTS.md` | orientation for coding agents, including the hard rules |
+| `doc/ARCHITECTURE.md` | the design, the vocabulary, the four claims (§9) and the losses (§8) |
+| `doc/PHASES.md` | every task, its spec and its gate |
+| `doc/GAPS.md` | known defects and measured shortfalls |
+| `doc/PRODUCTION_READINESS.md` | what has to be true before you should use it |
+| `doc/specs/` | `FUSED_TOPK.md`, `VECTOR_CHANNEL.md`, `FUZZY_CHANNEL.md`, `SEGMENT_FORMAT.md` |
+| `doc/CONVENTIONS.md`, `doc/TESTING.md` | how the code is written and tested |
+| `AGENTS.md` | orientation for contributors, including the hard rules |
 
 ## License
 
-PostgreSQL License. See `LICENSE`.
+PostgreSQL License. See `LICENSE`. Provenance per file is in `doc/LICENSING.md`.
