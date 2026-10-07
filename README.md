@@ -2,8 +2,9 @@
 
 pg_weave is a PostgreSQL index access method, `weave`. One `CREATE INDEX` gives you six
 kinds of retrieval over the same rows: BM25 ranked text search, vector nearest-neighbour
-search, fuzzy (edit-distance) terms, regular expressions over tokens, prefix terms, and
-substring (`LIKE '%...%'`) search through a character n-gram channel. A scalar column can
+search, fuzzy (edit-distance) terms, regular expressions over tokens (exact, or approximate
+with `atom{~k}`), prefix terms, and substring (`LIKE '%...%'`) search through a character
+n-gram channel. A scalar column can
 be indexed as a facet too. Every channel in a segment shares one document-id space, so a
 selective filter (a lexical term, or a facet such as `price < 100`) skips vector work
 inside the scan instead of filtering rows after it.
@@ -111,6 +112,7 @@ Fuzzy, prefix, regex, spelling-distance ranking, and substring search:
 SELECT id, title FROM docs WHERE body @@@ 'replicaton~1' ORDER BY id;   -- 1, 2  (one edit)
 SELECT id, title FROM docs WHERE body @@@ 'vacu*' ORDER BY id;          -- 4
 SELECT id, title FROM docs WHERE body @@@ '/^repl.*n$/' ORDER BY id;    -- 1, 2  (per token)
+SELECT id, title FROM docs WHERE body @@@ '/^(vacum){~1}$/' ORDER BY id; -- 4  (approximate regex)
 SELECT id, title FROM docs ORDER BY body <@> 'replicaton' LIMIT 3;      -- 1, 2, 8
 SELECT id, title FROM docs WHERE title @~ '%al repl%';                  -- 2  (LIKE)
 SELECT id, title FROM docs WHERE title @~* '%postgresql stream%';       -- 1  (ILIKE)
@@ -184,6 +186,10 @@ Limits you will meet:
 - **`to_wdoc(text)` only lowercases and splits.** For stemming and stopwords use
   `to_wdoc('english', text)`, or `to_wdoc(tsvector)`. Fuzzy, prefix and regex terms are
   matched literally against whatever tokens the index holds.
+- **A regex containing `{~` is approximate**, matched by TRE (POSIX ERE plus `atom{~k}`:
+  up to k one-character edits inside that atom, exact elsewhere, at most three such atoms).
+  Every other regex is PostgreSQL's own ARE engine. Semantics and limits are in
+  `doc/specs/FUZZY_CHANNEL.md` §2.1.
 - **`weave_fuse_search()` and `weave_search()` are revoked from `PUBLIC`**, because they
   return heap TIDs and scores past table permissions. The owner can `GRANT EXECUTE` them.
 - Index options: `positions`, `trigrams` (speeds up regex and long fuzzy terms), `bits`
