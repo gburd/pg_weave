@@ -138,7 +138,8 @@ wdoc_from_parsed(ParsedText *prs, uint8 label)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("document has a run of 65535 or more consecutive tokens that produce no lexeme"),
-				 errdetail("Token positions after such a run cannot be determined exactly.")));
+				 errdetail("Token positions after such a run cannot be determined exactly."),
+				 errhint("Split the document, or analyze it with a text search configuration that has no stopwords.")));
 
 	qsort(tw, nw, sizeof(TsWord), cmp_tsword);
 
