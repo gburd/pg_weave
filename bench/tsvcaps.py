@@ -4,7 +4,8 @@
 STDLIB ONLY, for the same reason as bench/prepdata.py: it runs on a bare
 Debian instance.
 
-  tsvcaps.py wiki URL OUT [--limit N] [--chunk W --chunk-out OUT2] [--cache DIR]
+  tsvcaps.py wiki URL OUT [--limit N] [--chunk W --chunk-out OUT2]
+                  [--titles-out TITLES] [--cache DIR]
   tsvcaps.py agree RUN_A RUN_B [--groups QID_GROUP.tsv] [--label L]
   tsvcaps.py paired QRELS RUN_A RUN_B [--label L]
 
@@ -88,14 +89,14 @@ def strip_wikitext(t):
 
 
 def pages(path):
-    """Yield (pageid, wikitext) for ns=0 non-redirect pages."""
+    """Yield (pageid, title, wikitext) for ns=0 non-redirect pages."""
     with bz2.BZ2File(path) as f:   # multistream: BZ2File reads all streams
         ctx = ET.iterparse(f, events=("end",))
         for _, el in ctx:
             tag = el.tag.rsplit("}", 1)[-1]
             if tag != "page":
                 continue
-            ns = pid = text = None
+            ns = pid = text = title = None
             redirect = False
             for c in el:
                 ct = c.tag.rsplit("}", 1)[-1]
@@ -103,6 +104,8 @@ def pages(path):
                     ns = c.text
                 elif ct == "id":
                     pid = c.text
+                elif ct == "title":
+                    title = c.text
                 elif ct == "redirect":
                     redirect = True
                 elif ct == "revision":
@@ -111,7 +114,7 @@ def pages(path):
                             text = r.text or ""
             el.clear()
             if ns == "0" and not redirect and pid and text:
-                yield int(pid), text
+                yield int(pid), RE_CTRL.sub(" ", title or ""), text
 
 
 def cmd_wiki(a):
@@ -119,12 +122,15 @@ def cmd_wiki(a):
     n = nchunk = 0
     cf = open(a.chunk_out + ".part", "w", encoding="utf-8", newline="\n") if a.chunk else None
     with open(a.out + ".part", "w", encoding="utf-8", newline="\n") as out:
-        for pid, wt in pages(path):
+        tf = open(a.titles_out, "w", encoding="utf-8", newline="\n") if a.titles_out else None
+        for pid, title, wt in pages(path):
             body = strip_wikitext(wt)
             if not body:
                 continue
             n += 1
             out.write("%d\t%s\n" % (pid, body))
+            if tf:
+                tf.write("%d\t%s\n" % (pid, title))
             if cf:
                 words = body.split(" ")
                 for k in range(0, len(words), a.chunk):
@@ -133,6 +139,8 @@ def cmd_wiki(a):
                                            " ".join(words[k:k + a.chunk])))
             if a.limit and n >= a.limit:
                 break
+    if tf:
+        tf.close()
     os.replace(a.out + ".part", a.out)
     if cf:
         cf.close()
@@ -212,6 +220,7 @@ def main():
     w.add_argument("--limit", type=int, default=0)
     w.add_argument("--chunk", type=int, default=0)
     w.add_argument("--chunk-out", default="")
+    w.add_argument("--titles-out", default="")
     w.add_argument("--cache", default="/scratch/tsvcaps/_cache")
     g = sp.add_parser("agree")
     g.add_argument("run_a")
