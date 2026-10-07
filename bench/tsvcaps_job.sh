@@ -6,7 +6,7 @@
 #
 # Run on EC2 as a SCRIPT job (it needs the extension installed, which smoke does):
 #
-#   VOLGB=150 SCRIPT=bench/tsvcaps_job.sh bench/aws/run.sh c7i.4xlarge script
+#   SCRIPT=bench/tsvcaps_job.sh bench/aws/run.sh c7i.4xlarge script
 #
 # Every corpus is downloaded ON THE INSTANCE (BEIR through bench/prepdata.py,
 # Wikipedia through bench/tsvcaps.py).  Nothing is cached in the repository.
@@ -295,7 +295,9 @@ SQL
 	for arm in exact exact2 sumtf tsv tsvmaxpos strip; do
 		if [ "$K" = beir ]; then
 			python3 bench/ndcg.py --qrels "$W/beir/$C/qrels.tsv" --run "$OUT/runs/${tag}_${arm}.tsv" \
-				--k 10 --label "$tag/$arm" 2>> "$OUT/ndcg.stderr" | grep -v '^label' >> "$OUT/quality.tsv"
+				--k 10 --label "$tag/$arm" > "$W/ndcg.out" 2>> "$OUT/ndcg.stderr" \
+				|| { echo "NDCG FAILED: $tag/$arm" | tee -a "$OUT/failed.txt"; FAILED=1; }
+			grep -v '^label' "$W/ndcg.out" >> "$OUT/quality.tsv" || true
 		fi
 		python3 bench/tsvcaps.py agree "$OUT/runs/${tag}_exact.tsv" "$OUT/runs/${tag}_${arm}.tsv" \
 			--groups "$OUT/runs/${tag}_groups.tsv" --label "$tag/$arm" >> "$OUT/agree.tsv"
@@ -305,7 +307,7 @@ SQL
 	python3 bench/tsvcaps.py agree "$OUT/runs/${tag}_sumtf.tsv" "$OUT/runs/${tag}_tsv.tsv" \
 		--groups "$OUT/runs/${tag}_groups.tsv" --label "$tag/tsv_vs_sumtf" >> "$OUT/agree.tsv"
 	grep "^$tag/" "$OUT/quality.tsv" 2>/dev/null || true
-	grep "^$tag/.*	all	" "$OUT/agree.tsv"
+	grep "^$tag/" "$OUT/agree.tsv" | grep -P '\tall\t' || true
 	$PSQL -c "DROP TABLE t, q; DROP TABLE IF EXISTS st;" >/dev/null
 }
 
@@ -425,8 +427,9 @@ SELECT to_wdoc(strip(to_tsvector('simple', 'a a a b')))::text AS stripped,
 DO $$
 DECLARE
 	d	wdoc;
+	n	int;
 BEGIN
-	FOR n IN 5000, 10000 LOOP
+	FOREACH n IN ARRAY ARRAY[5000, 10000] LOOP
 		d := to_wdoc('simple'::regconfig, repeat('a b ', n));
 		BEGIN
 			PERFORM d::text::wdoc;
@@ -465,7 +468,8 @@ SELECT wdoc_length(to_wdoc('english'::regconfig, 'the cat sat on the mat')) AS e
        to_tsvector('english', 'the cat sat on the mat')::text AS tsv;
 SQL
 cat "$OUT/probes.txt"
-grep -q 'P5 binary round trip' "$OUT/probes.txt" || die "probes did not run to the end"
+# The NOTICE, not the text: psql -e echoes the statement, which contains the same words.
+grep -q 'NOTICE:  P5 binary round trip' "$OUT/probes.txt" || die "probes did not run to the end"
 
 
 printf 'corpus\tcfg\tndocs\tn_tsv_error\tn_tf_cap_reached\tn_pos_cap_reached\tn_tf_wrong\tn_len_b_wrong\tn_len_c_wrong\tn_len_gt_16383\tn_len_c_selfcheck_fail\tavg_len\tp50_len\tp90_len\tp99_len\tmax_len\tsum_len_a\tsum_tf_a\tsum_len_b\tsum_len_c\tn_rt_checked\tn_rt_fail\n' > "$OUT/caps.tsv"
