@@ -5787,7 +5787,7 @@ and inspected line by line (hard rule 3).
   the ORDER BY expression computes" is met by NEITHER, and was the wrong bar (see the
   corrected one below).
 
-### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`) and the fused `fuse()` route (`wt/hintfuse`); the vector `<->`/`<#>` route is NOT HINTABLE without a format decision**
+### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`) and the fused `fuse()` route (`wt/hintfuse`); the vector `<->`/`<#>` route is DEFERRED by maintainer decision 2026-10-07 (do not spend `wvec`'s reserved `int16` until a clustered corpus shows the first-pass width changes vector work)**
 
 An index AM is not told the LIMIT. pg_weave starts every ordered lexical pass at
 `weave_ord_width(pg_weave.wand_initial_k)` = `max(4 x 32, 64)` = **128** and widens x4 on
@@ -6003,7 +6003,7 @@ The pg_tre import has the approximate pieces, but they are not wired:
 So a user writing `'/colou?r{~1}/'` gets ARE's reading of those bytes, not an approximate match.
 Fuzzy TERMS (`term~k`, universal Levenshtein, Z5) do ship and are not this gap.
 
-**Decision needed:** either wire approximate regex (TRE's matcher for the verify step, the
+**MAINTAINER DECISION 2026-10-07: BUILD IT** (brief `/scratch/pg_weave/brief-g88.md`, branch `wt/g88`). The original question was: either wire approximate regex (TRE's matcher for the verify step, the
 `{~k}` extraction rules for the trigram prefilter, and a refusal of `{~k}` until then), or
 narrow the product statement and Phase Z's title to "regex". The README says "regular
 expressions over tokens" until this is decided.
@@ -6027,7 +6027,7 @@ only filter pushed into the index is a lexical term, but docvalues have shipped
 (`bench/RESULTS_DOCVALS_PRIZE.md`, `bench/RESULTS_DOCVALS_SCALE.md`).
 
 
-### G89 — DATA-LOSS CLASS: a stored `wdoc` built by `to_wdoc(regconfig, text)` from a document over 16,383 tokens cannot be read back, so `pg_dump`/restore and text-format logical replication of the column fail at restore — **FOUND 2026-10-07 by the M7 tsvector measurement (`bench/RESULTS_TSVECTOR_CAPS.md`); MEASURED on EC2; OPEN, not fixed**
+### G89 — DATA-LOSS CLASS: a stored `wdoc` built by `to_wdoc(regconfig, text)` from a document over 16,383 tokens cannot be read back, so `pg_dump`/restore and text-format logical replication of the column fail at restore — **FOUND 2026-10-07 by the M7 tsvector measurement (`bench/RESULTS_TSVECTOR_CAPS.md`); MEASURED on EC2; FIXED 2026-10-07 on `wt/g89` (see "Fix" at the end of this entry)**
 
 **Cause.** `to_wdoc(regconfig, text)` (`to_wdoc_byid` -> `wdoc_from_parsed`,
 `src/query/tsanalyze.c`) stores each token's position as `parsetext()` filled it in, and
@@ -6079,7 +6079,91 @@ leaves duplicates that phrase matching must tolerate. Whichever it is, it needs 
 regression test that round-trips a >16,383-token `to_wdoc(regconfig, text)` through
 text and binary I/O, and a mutation check that the test fails on today's code.
 
-### G90 — `wdoc` text and binary I/O silently replace the stored document length with the sum of tf: a `to_wdoc(regconfig, text)` value under a stopword config changes its BM25 length on dump/restore — **FOUND 2026-10-07 by the M7 tsvector measurement (probe P8, run `pgweave-20261007-041651-d0de`); OPEN, not fixed**
+**Fix (2026-10-07, `wt/g89`, with G90).** The first direction: positions in a wdoc built
+from text are the true token ordinal, and every wdoc any SQL function returns now
+round-trips through text and binary I/O to identical `wdoc_send` bytes.
+
+- *How the true ordinal is recovered without copying `parsetext()`.* The loop that
+  produces it (`LexizeInit`/`LexizeExec`) is `static` in `ts_parse.c`, so it cannot be
+  re-run. `parsetext()` keeps an unclamped `int32` counter in `prs->pos` and stores
+  `LIMITPOS(prs->pos)` in a `uint16`. `weave_analyze_with_config` now starts that counter
+  at `PG_INT32_MIN` instead of 0: it stays negative, so `LIMITPOS` never clamps, and
+  because `PG_INT32_MIN` is a multiple of 65536 the stored `uint16` is the true ordinal
+  mod 65536. `wdoc_from_parsed` unwraps it in token order (each word's position is the
+  smallest value >= the previous word's that is congruent to the stored one).
+- *Exactness, proved and enforced.* Write t_i for the true ordinal and u_i for the
+  unwrapped one. Then u_i <= t_i, d_i = t_i - u_i is a multiple of 65536, and d is
+  non-decreasing. The true count N (`prs->pos - PG_INT32_MIN`) bounds t_last, so
+  N - u_last < 65536 forces d_last = 0, and with it every d_i = 0. The builder checks
+  that condition. It fails exactly when the document has 65,535 or more consecutive
+  lexeme-less tokens (stopwords) between two lexemes, or 65,536 or more at its start or
+  end. **Such a document is now REFUSED** (`document has a run of 65535 or more
+  consecutive tokens that produce no lexeme`) rather than stored at a wrong position.
+  `sql/wdoc_roundtrip.sql` tests both sides of the boundary: a gap of 65,535 positions is
+  exact, a trailing run of 65,535 is exact, and a gap of 65,536 is refused. Before the
+  fix, the same document stored `dog` at 16383 instead of 65536. Before the fix that
+  document could be stored; now it cannot. **This is a new refusal**, and it has not been
+  measured against real data. A stopword run that long seems unlikely outside
+  adversarial input, but that is unmeasured.
+- *Same-token duplicate lexemes.* An ispell dictionary can emit one lexeme twice for one
+  token (`ispell_sample`: `footballklubber` -> `{...,klubber,...,klubber}`). That gave
+  equal positions within a term at ANY length. It was a second instance of this gap, below
+  16,383 tokens. It now counts once, as in `to_tsvector`, so tf is the number of distinct
+  positions.
+- `wdoc_from_parsed` no longer lays out the varlena itself. It goes through
+  `weave_doc_build`, the function both readers use, so the reader's invariants are checked
+  where the value is made, not only where it is read.
+- **`||` had two further defects, found while auditing the other producers.** (1) It
+  shifted the right operand by the left operand's length. A `to_wdoc(tsvector)` value's
+  length is the sum of tf, which is smaller than its last position whenever the source had
+  stopwords, so `to_wdoc(to_tsvector('english','the cat sat on the mat')) ||
+  to_wdoc('english','mat')` raised `positions must be ascending`. It now shifts by
+  max(length, last position). (2) It sized its position buffer from the two LENGTHS, but a
+  dictionary that emits two lexemes per token (`booking` -> `{booking,book}`) gives a
+  document more positions than length. **That was a heap buffer overflow**:
+  `to_wdoc(cfg,'booking') || to_wdoc(cfg,'booking')` wrote 4 positions into a 2-slot
+  buffer, and the pre-fix arm printed `'booking':2@131,576` where `@1,2` is right. Those are
+bytes from outside the buffer. It is
+  now sized from the position counts.
+- Two smaller asymmetries. An empty document is now canonically position-bearing, because
+  `to_wdoc('simple','')` had no positions flag while `''::wdoc` did, so they differed after
+  a text round trip. `wdoc_recv` now verifies term bytes against the database encoding,
+  because a term containing NUL could be received but not printed back.
+
+**Positions in an index.** The posting-list position column stores the wdoc's 30-bit
+ordinal as deltas (`src/am/ambuild.c`, "positions are ascending within a posting;
+delta-code"). The format does not change and has no 14-bit assumption. What changes is
+which positions a stored `to_wdoc(regconfig, text)` document past 16,383 tokens holds.
+Values made before the fix keep their clamped positions, and so does an index built from
+them. **REINDEX** (and, for a stored column, recompute it) to get exact phrase/NEAR on
+those documents. Nothing is released, so this note is the whole migration story. Two
+comments that call tf "bounded by the analyzer's MAXENTRYPOS cap" (`src/am/ambuild.c`
+near `add_posting`, and `src/am/amscan.c` above `WEAVE_PHRASE_POSBUF`) were already
+wrong, since the cap was on positions, not on tf. They are not edited here: `amscan.c`
+belongs to another workstream. A phrase term with tf > 16,384 in one document takes the
+recheck path that comment describes, and that path is correct.
+
+**Evidence** (EC2 Debian 13, PG 17): run `pgweave-20261007-140258-8e42`.
+`sql/wdoc_roundtrip.sql` covers every producer (`to_wdoc(text)`, `to_wdoc(regconfig,
+text)`, weighted, `||`, `setwdocweight`, `to_wdoc(tsvector)` plain, stripped and
+weighted, and ispell), at 0, short, 16,383, 16,384, 16,385, 20,000 and 40,000 tokens.
+All 22 rows are `same` for text and binary, and a whole-table text `COPY` gives 22 of 22
+identical. A **pre-fix arm** (`main`'s three files, same test, same host) produced zero
+rows from the producer table. The INSERT itself failed: the clamped 20,000-token left
+operand of row 16's `||` has duplicate positions, and `||` re-validates through
+`weave_doc_build`. It also gave `"alpha beta"` = f and `NEAR(beta gamma, 101)` = f on a 17,000-token
+document. **Both are true after the fix**, from `@@@` and from the index's positional
+postings (`weave_count`). The pre-fix arm also stored `dog` at 16383 in the 65,536-gap
+case. `t/034_wdoc_dump_restore.pl` (19 of 19) dumps a table of stopword-config,
+>16,383-token and weighted-concat documents with a `positions = on` weave index, with
+both `-Fp` and `-Fc`. Each restore gives byte-identical values, the same
+`ORDER BY d <=> q` rows and scores through the restored index, and the same phrase count.
+**Mutants**, each verified to BUILD (distinct installed `.so` md5) and then to fail
+`wdoc_roundtrip`: revert the position fix, drop doclen from out, drop it from recv, skip
+the doclen validation, skip the unwrap-exactness check, concat shifting by length, and no
+same-token dedupe. **7 of 7 caught.**
+
+### G90 — `wdoc` text and binary I/O silently replace the stored document length with the sum of tf: a `to_wdoc(regconfig, text)` value under a stopword config changes its BM25 length on dump/restore — **FOUND 2026-10-07 by the M7 tsvector measurement (probe P8, run `pgweave-20261007-041651-d0de`); FIXED 2026-10-07 on `wt/g89` with G89 (see "Fix" there)**
 
 `wdoc_out` prints terms, tf and positions, but not `doclen`. `wdoc_send` sends `doclen`,
 and `wdoc_recv` reads it and discards it (`(void) doclen; /* recomputed from tf in
@@ -6109,3 +6193,31 @@ canonical text form that is a grammar change (`wdoc_in(wdoc_out(x)) = x` is a st
 invariant in `doc.c`'s header that this violates); `wdoc_recv` already receives the
 value. Either way, values dumped by today's code have already lost their length, so a
 release note is owed as well as a fix.
+
+**Fix (2026-10-07, `wt/g89`).** `doclen` is carried through both forms and validated.
+Nothing is released, so there is no release note and no reader for old dumps (maintainer
+decision 2026-10-07).
+
+- Text: `wdoc_out` appends ` |N` **only when the length differs from the sum of tf**, so
+  every document whose two definitions agree renders exactly as before. That covers
+  `to_wdoc(text)`, `to_wdoc(tsvector)`, and `simple`-config documents.
+  `to_wdoc('english','the cat sat on the mat')` renders `'cat':1@2 'mat':1@6 'sat':1@3 |6`.
+  An empty document of nonzero length renders as `|N` alone, e.g. an all-stopword
+  `english` document. `wdoc_in` parses both forms. **Side effect:** the raw string `'|4'`
+  cast to `wdoc` is now an empty document of length 4, where it used to be analyzed as raw
+  text into zero terms with length 0. A raw `'|4 more text'` is still analyzed.
+- Binary: `wdoc_recv` passes the received `doclen` to `weave_doc_build`. The wire format
+  is unchanged; it always carried the length.
+- `weave_doc_build` takes the length (-1 means the sum of tf). **The enforced invariant is
+  max(tf) <= doclen <= INT32_MAX**, which every producer guarantees. `doclen >= sum(tf)`
+  was considered and rejected: an ispell document has more lexemes than tokens
+  (`booking` -> `{booking,book}`, length 1, sum of tf 2). `doclen >= last position` was
+  also rejected, because `to_wdoc(tsvector)` sets its length to the sum of tf, and M7's
+  open decision 2 is exactly whether to change that.
+- `||` now keeps the sum of the two lengths. Before, it rebuilt the length as the sum of
+  tf, which was this same defect in a third place.
+- `expected/weave.out` changes on four values, each gaining ` |N`: three `english`
+  documents and one `english` concat. A normalized comparison (runs of spaces and dashes
+  collapsed, trailing ` |N` removed) found the other 8 changed lines to be psql column
+  padding, with no other difference (hard rule 3).
+- Evidence and mutants: see G89's "Fix".
