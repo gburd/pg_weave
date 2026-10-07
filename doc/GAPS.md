@@ -5716,11 +5716,13 @@ runs, two runs per arm. `weave_distance` calls per query were counted with
 | long, 200k | `a \| b` | 400 | 15.272 / 15.274 | **6.645 / 6.635** |
 | long, 200k | `c` | 10 | 0.263 / 0.263 | **0.056 / 0.056** |
 | long, 50k | `c` | 400 | 8.934 / 8.939 | **0.131 / 0.131** |
-| short (100 B), 200k | any | 10, 400 | — | within run-to-run spread |
-| short, 1M | any | 10, 400 | — | within run-to-run spread |
+| short (100 B), 200k | `rare` | 400 | 0.353 / 0.356 | 0.328 / 0.328 |
+| short, 1M | `rare` | 400 | 1.849 / 1.810 | 1.797 / 1.817 |
+| short, 200k and 1M | `c`, `a \| b` | 10, 400 | — | within run-to-run spread |
 
-**Stated as a loss where it is one:** on SHORT inline documents it buys nothing measurable at
-either scale. A 100-byte `weave_distance()` costs too little to see next to the scan. The
+**Stated as a loss where it is one:** on SHORT inline documents it buys almost nothing. One
+cell (200k, `rare`, 7 %) clears its spread and does not reproduce at 1M, and the rest
+overlap. A 100-byte `weave_distance()` costs too little to see next to the scan. The
 win is the detoast: about 22 µs per returned row on an 11 KB TOASTed document, which turns
 a 400-row ranked query on long text from 9 ms into 0.2 ms (46x), and a two-term OR from
 15.3 into 6.6 ms. The corpus is synthetic, so this is a mechanism measurement and not a
