@@ -6248,8 +6248,16 @@ patterns over `abcd` with `.`, classes, groups, alternation, `? * + {m,n}`, run 
 shipped parser and extractor; random tokens, sampled from the pattern and mutated; the property
 is "every token the matcher accepts satisfies the extracted CNF". Before the fix, 3,000 cases:
 737 dropped tokens (`xaay` for `/xa+y/`, `accb` for `/ac+b/`, ...); after, 20,000 cases,
-1.2 M checks, 0. The oracle there is TRE, which agrees with ARE on this POSIX subset; the
-SQL reproducer in `sql/regexdict.sql` (G91 block) checks the index against core's `~` itself.
+1.2 M checks, 0. The oracle there is TRE, cross-checked against glibc's POSIX `regexec` on
+every token (0 disagreements), and run by `make check-regex-approx` in the EC2 smoke.
+
+At the SQL level, against core's `~` itself (EC2 `pgweave-20261007-162141-2b73`, commit
+`3baf697`): `sql/regexdict.sql`'s G91 block (`weave_count()` on a `trigrams = on` index,
+which has no executor recheck) returns `xa+y` 3, `abc+d` 3, `xa{1,3}y` 3, equal to `~`; with
+the fix reverted (mutant M1, built and installed) it returns **1** for each. A randomized sweep
+of 400 generated exact patterns over an 18,000-token corpus: 0 disagreements between the
+`trigrams = on` index, the `trigrams = off` index, the heap predicate and `~` with the fix;
+**3 of 400** patterns where the `trigrams = on` index loses rows with it reverted.
 
 ### G92 — BACKEND CRASH: TRE asserts (or, built with NDEBUG, writes out of bounds) on a pattern with more than three approximate atoms, e.g. `a{~1}b{~1}c{~1}d{~1}` — **FOUND 2026-10-07 while building G88; FIXED 2026-10-07 on `wt/g88` by refusing the pattern**
 
