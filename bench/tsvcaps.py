@@ -162,13 +162,11 @@ def cmd_agree(a):
         with open(a.groups, encoding="utf-8") as f:
             for line in f:
                 q, g = line.rstrip("\n").split("\t")
-                groups[q] = g
+                groups.setdefault(q, []).append(g)   # a query may be in several
     acc = {}
     for q, la in ra.items():
         lb = rb.get(q, [])
-        for g in ("all", groups.get(q)):
-            if g is None:
-                continue
+        for g in ["all"] + groups.get(q, []):
             s = acc.setdefault(g, [0, 0.0, 0.0, 0])
             s[0] += 1
             s[1] += len(set(la[:10]) & set(lb[:10])) / len(la[:10])
