@@ -6014,3 +6014,86 @@ does not exist and fuzzy is unreachable; `doc/ARCHITECTURE.md` §9 claim 3's sco
 only filter pushed into the index is a lexical term, but docvalues have shipped
 (`bench/RESULTS_DOCVALS_PRIZE.md`, `bench/RESULTS_DOCVALS_SCALE.md`).
 
+
+### G89 — DATA-LOSS CLASS: a stored `wdoc` built by `to_wdoc(regconfig, text)` from a document over 16,383 tokens cannot be read back, so `pg_dump`/restore and text-format logical replication of the column fail at restore — **FOUND 2026-10-07 by the M7 tsvector measurement (`bench/RESULTS_TSVECTOR_CAPS.md`); MEASURED on EC2; OPEN, not fixed**
+
+**Cause.** `to_wdoc(regconfig, text)` (`to_wdoc_byid` -> `wdoc_from_parsed`,
+`src/query/tsanalyze.c`) stores each token's position as `parsetext()` filled it in, and
+`parsetext()` applies core's `LIMITPOS()`, which clamps every position at or past
+`MAXENTRYPOS - 1` = **16383**. So in a document longer than 16,383 tokens, every
+occurrence of a term past that point is stored at position 16383, and a term that recurs
+there gets **duplicate** positions. `wdoc_from_parsed` builds the varlena directly and
+never validates. The two input functions both go through `weave_doc_build`
+(`src/query/doc.c:165`), which rejects a position list that is not strictly ascending:
+`wdoc_in`'s canonical parse (`invalid wdoc: positions must be ascending within a term`)
+and `wdoc_recv` (`invalid binary wdoc: ...`). The value can be written but not read back.
+`to_wdoc(text)` (the built-in analyzer, `src/query/analyze.c`) does not clamp, and is not
+affected.
+
+**Measured** (EC2 Debian 13, PG 17.11, extension 0.28.0; probe P5 of
+`bench/tsvcaps_job.sh`; runs `pgweave-20261007-021914-c54f`, `pgweave-20261007-031455-7a75`,
+`pgweave-20261007-041651-d0de`, the same result in all three):
+
+| document | `d::text::wdoc` | text `COPY` out + in | binary `COPY` out + in |
+|---|---|---|---|
+| `to_wdoc('simple', repeat('a b ', 5000))`, 10,000 tokens | OK | (not run) | (not run) |
+| `to_wdoc('simple', repeat('a b ', 10000))`, 20,000 tokens | **ERROR** | **ERROR** | **ERROR** |
+| `to_wdoc(repeat('a b ', 10000))`, 20,000 tokens, built-in analyzer | OK | (not run) | (not run) |
+
+On real data, every article over 16,383 tokens fails `d::text::wdoc`:
+
+| corpus | articles | over 16,383 tokens | fail the text round trip (`simple` / `english`) |
+|---|---:|---:|---|
+| enwiki part 1, whole | 20,913 | 172 | 172 / 171 |
+| enwiki part 3, first 30,000 | 30,000 | 56 | 56 / 56 |
+| enwiki part 6, first 60,000 | 60,000 | 32 | 32 / 32 |
+
+(The one `english` survivor in part 1 is presumably a document whose post-16,383 tail
+holds no repeated non-stopword. That was not checked.)
+
+**Consequence.** `pg_dump` writes a `wdoc` column through `wdoc_out` and restores it
+through `wdoc_in`. **A dump of any table with a stored `to_wdoc(regconfig, text)` column
+that holds one such document fails at restore**, on that table's `COPY`. Text-format
+logical replication, `COPY TO` + `COPY FROM`, and binary `COPY` have the same failure.
+The live table and its index keep working. The failure appears only when the data is
+moved, which is when a user can least afford it. A generated or expression column that
+recomputes the value is not exposed; a stored column is.
+
+**Fix direction (not decided, not done).** Either `wdoc_from_parsed` stops storing clamped
+positions (assign positions from its own uncapped ordinal, as `analyze.c` does, which also
+removes the 16,383 ceiling from phrase/NEAR on this path), or `weave_doc_build` accepts
+non-decreasing positions. The second keeps every existing on-disk value readable but
+leaves duplicates that phrase matching must tolerate. Whichever it is, it needs a
+regression test that round-trips a >16,383-token `to_wdoc(regconfig, text)` through
+text and binary I/O, and a mutation check that the test fails on today's code.
+
+### G90 — `wdoc` text and binary I/O silently replace the stored document length with the sum of tf: a `to_wdoc(regconfig, text)` value under a stopword config changes its BM25 length on dump/restore — **FOUND 2026-10-07 by the M7 tsvector measurement (probe P8, run `pgweave-20261007-041651-d0de`); OPEN, not fixed**
+
+`wdoc_out` prints terms, tf and positions, but not `doclen`. `wdoc_send` sends `doclen`,
+and `wdoc_recv` reads it and discards it (`(void) doclen; /* recomputed from tf in
+weave_doc_build */`, `src/query/doc.c:579`). Both inputs then rebuild through
+`weave_doc_build`, which sets `doclen = sum of tf`. For `to_wdoc(regconfig, text)`,
+`doclen` is every token **including stopwords** (`prs->pos`), so under any config with a
+stopword list the value read back differs from the value written:
+
+| probe P8 | `wdoc_length` |
+|---|---:|
+| `to_wdoc('english', 'the cat sat on the mat')` as stored | 6 |
+| after `d::text::wdoc` | **3** |
+| after binary `COPY` out + in | **3** |
+
+No error is raised. After a `pg_dump`/restore or a logical-replication copy, BM25 ranks the
+restored rows with a different length normalization than the source: this is the `sumtf`
+arm of `bench/RESULTS_TSVECTOR_CAPS.md`, and on `english` corpora it changes 4-12 % of
+top-10 results (overlap 0.88-0.96 on BEIR and Wikipedia chunks). The index on the restored
+table is rebuilt from the restored values, so it agrees with them, but not with the source.
+
+Not affected: `to_wdoc(text)` and `to_wdoc(tsvector)` (their `doclen` already equals the
+sum of tf), and `simple`-config values whose positions are all below 16,384 (no stopwords,
+so the two definitions coincide).
+
+**Fix direction (not decided, not done):** carry `doclen` through both I/O paths. For the
+canonical text form that is a grammar change (`wdoc_in(wdoc_out(x)) = x` is a stated
+invariant in `doc.c`'s header that this violates); `wdoc_recv` already receives the
+value. Either way, values dumped by today's code have already lost their length, so a
+release note is owed as well as a fix.
