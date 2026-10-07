@@ -5697,9 +5697,11 @@ matches the reference. Before, it ordered the stream by id within one giant tie.
 **Where it does not apply.** A scan's entry is resjunk only when the scan's target list IS
 the top plan's (`Limit`, `Sort` and `Incremental Sort` share it, and
 `apply_tlist_labeling()` copies `resjunk`). Under a join, an Append or a projecting node the
-entry is not resjunk and is left alone. The planner also postpones a volatile or expensive
-SELECT-list column above the Limit (`make_sort_input_target()`), which still leaves the
-scan's sort key resjunk and substituted. These are lost optimizations, not wrong answers.
+entry is not resjunk and is left alone. That should include a query whose SELECT list has a
+volatile or expensive column. `make_sort_input_target()` postpones that column into a
+projection above the Limit, and the scan's list is then built by `build_path_tlist()` with
+`resjunk = false`. This comes from reading the planner and is untested. These are lost
+optimizations, not wrong answers.
 
 **Measured on EC2,** c7i.8xlarge, PG17, `pgweave-20261007-001351-226c` (commit `78a2870`):
 synthetic corpus as G87's ('a' 30 %, 'b' 20 %, 'c' 10 %, 'rare' 0.2 %), median of 25 warm
