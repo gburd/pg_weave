@@ -1140,6 +1140,14 @@ weave_build_callback(Relation index, ItemPointer tid, Datum *values,
 	}
 
 	/*
+	 * A converted (tsvector_lex_ops) or detoasted document is a copy in
+	 * bs->ctx; the postings above copied what they need, so free it rather
+	 * than let it count against the flush budget until the next flush.
+	 */
+	if ((Pointer) doc != DatumGetPointer(values[lexidx]))
+		pfree(doc);
+
+	/*
 	 * Coarse progress heartbeat.  On a heavy corpus the per-document analysis
 	 * dominates and a whole budget of documents accumulates between segment
 	 * flushes (minutes of apparent silence); a periodic LOG line shows the scan
