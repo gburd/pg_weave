@@ -184,7 +184,7 @@ build() {                        # build <ddl>
     t0=$(date +%s.%N)
     $PSQL -c "$ddl" >/dev/null
     t1=$(date +%s.%N)
-    echo "$t1-$t0" | bc
+    awk -v a="$t1" -v b="$t0" 'BEGIN { printf "%.3f\n", a - b }'	# no bc on the Debian 13 image
 }
 
 # ---------------------------------------------------------------------------
