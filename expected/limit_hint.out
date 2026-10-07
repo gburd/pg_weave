@@ -260,12 +260,12 @@ RESET track_functions;
 -- 5.  Invisible in EXPLAIN.
 EXPLAIN (VERBOSE, COSTS OFF)
   SELECT id FROM lim WHERE d @@@ 'a | b | c' ORDER BY d <=> 'a | b | c' LIMIT 10;
-                             QUERY PLAN                              
----------------------------------------------------------------------
+                                                                           QUERY PLAN                                                                            
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
  Limit
-   Output: id, ((d <=> '((''a'' | ''b'') | ''c'')'::wquery))
+   Output: id, (COALESCE(weave_current_distance('lim_w'::regclass, ctid, '((''a'' | ''b'') | ''c'')'::wquery), (d <=> '((''a'' | ''b'') | ''c'')'::wquery)))
    ->  Index Scan using lim_w on public.lim
-         Output: id, (d <=> '((''a'' | ''b'') | ''c'')'::wquery)
+         Output: id, COALESCE(weave_current_distance('lim_w'::regclass, ctid, '((''a'' | ''b'') | ''c'')'::wquery), (d <=> '((''a'' | ''b'') | ''c'')'::wquery))
          Index Cond: (lim.d @@@ '((''a'' | ''b'') | ''c'')'::wquery)
          Order By: (lim.d <=> '((''a'' | ''b'') | ''c'')'::wquery)
 (6 rows)
