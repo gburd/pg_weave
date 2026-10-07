@@ -204,6 +204,16 @@ weave_cache_lookup_internal(const char *pattern, int pattern_len, bool pin)
         }
     }
 
+    /* G92: TRE cannot match more than three approximate atoms safely. */
+    if (weave_pattern_approx_depth(compiled) > WEAVE_TRE_MAX_APPROX_DEPTH)
+    {
+        weave_free_pattern(compiled);
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("pg_weave: a regular expression may contain at most %d approximate atoms ({~k})",
+                        WEAVE_TRE_MAX_APPROX_DEPTH)));
+    }
+
     /*
      * Find an empty slot, or the LRU slot for eviction.  Pinned slots
      * are skipped: their compiled handle is live in some scan loop and

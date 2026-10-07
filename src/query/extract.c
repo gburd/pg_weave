@@ -161,7 +161,39 @@ typedef struct LinCtx
     int         run_cap;
     TrigramAccum *acc;
     MemoryContext cxt;
+    bool       *giveup;  /* shared by branch copies: no sound extraction */
 } LinCtx;
+
+/*
+ * Can `ast` match the empty string?  Anchors are zero-width, so they count.
+ */
+static bool
+ast_nullable(const RegexAst *ast)
+{
+    if (ast == NULL)
+        return true;
+    check_stack_depth();
+    switch (ast->kind)
+    {
+        case REGEX_AST_LITERAL:
+        case REGEX_AST_ANY:
+        case REGEX_AST_CLASS:
+            return false;
+        case REGEX_AST_ANCHOR:
+            return true;
+        case REGEX_AST_CONCAT:
+            return ast_nullable(ast->u.concat.left) &&
+                ast_nullable(ast->u.concat.right);
+        case REGEX_AST_ALT:
+            return ast_nullable(ast->u.alt.left) ||
+                ast_nullable(ast->u.alt.right);
+        case REGEX_AST_REP:
+            return ast->u.rep.min_rep == 0 || ast_nullable(ast->u.rep.child);
+        case REGEX_AST_APPROX:
+            return ast_nullable(ast->u.approx.child);
+    }
+    return true;
+}
 
 static void lin_append_node(LinCtx *lc, const RegexAst *ast);
 
@@ -348,6 +380,16 @@ lin_append_node(LinCtx *lc, const RegexAst *ast)
              * drop true matches; it is deleted.)
              */
             run_flush(lc);
+
+            /*
+             * TRE LEAKS THE EDIT BUDGET of an approximate atom that can match
+             * empty: when the empty path is taken, the scope's parameters are
+             * not restored, so up to k edits apply to whatever FOLLOWS --
+             * /(a?){~1}bcd/ matches "bd" and "zbd" (doc/GAPS.md G88).  The
+             * trigrams after it are then not required either; no extraction.
+             */
+            if (ast_nullable(ast->u.approx.child))
+                *lc->giveup = true;
             break;
     }
 }
@@ -492,6 +534,7 @@ regex_extract_query(WeaveParseCtx *ctx, int32 max_cost, TrigramQuery *out)
 {
     TrigramAccum acc;
     LinCtx       lc;
+    bool         giveup = false;
     int          i;
 
     memset(out, 0, sizeof(*out));
@@ -515,6 +558,7 @@ regex_extract_query(WeaveParseCtx *ctx, int32 max_cost, TrigramQuery *out)
     memset(&lc, 0, sizeof(lc));
     lc.cxt = ctx->mcxt;
     lc.acc = &acc;
+    lc.giveup = &giveup;
     lc.run = NULL;
     lc.run_n = 0;
     lc.run_cap = 0;
@@ -525,6 +569,8 @@ regex_extract_query(WeaveParseCtx *ctx, int32 max_cost, TrigramQuery *out)
     for (i = 0; i + 3 <= lc.run_n; i++)
         accum_add(&acc, &lc.run[i], ctx->mcxt);
 
+    if (giveup)
+        acc.overflowed = true;  /* accum_to_query: always_true */
     accum_to_query(&acc, max_cost, out, ctx->mcxt);
     out->mode = TRIGRAM_QUERY_CNF;  /* k=0 uses CNF */
 

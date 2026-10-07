@@ -100,6 +100,14 @@ void weave_free_pattern(void *compiled);
 int weave_pattern_num_states(void *compiled);
 
 /*
+ * The number of approximate atoms TRE compiled; a handle over
+ * WEAVE_TRE_MAX_APPROX_DEPTH must not be matched with (doc/GAPS.md G92:
+ * TRE_M_MAX_DEPTH in vendor/tre/lib/tre-match-approx.c, guarded by assert only).
+ */
+#define WEAVE_TRE_MAX_APPROX_DEPTH 3
+int weave_pattern_approx_depth(void *compiled);
+
+/*
  * Run approximate matching of a compiled pattern against a string.
  * All cost and limit parameters correspond to TRE's regaparams_t fields.
  */

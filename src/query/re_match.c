@@ -176,6 +176,23 @@ weave_pattern_num_states(void *compiled)
     return tnfa->num_states;
 }
 
+/*
+ * The number of approximate (`atom{~k}`) scopes TRE compiled, or -1 for a NULL
+ * handle.  TRE increments params_depth once per approximate atom and never
+ * decrements it, while its matcher sizes per-depth costs for at most
+ * WEAVE_TRE_MAX_APPROX_DEPTH and only asserts the bound (doc/GAPS.md G92), so a
+ * caller must refuse a handle over that before matching with it.
+ */
+int
+weave_pattern_approx_depth(void *compiled)
+{
+    regex_t *preg = (regex_t *) compiled;
+
+    if (preg == NULL || preg->value == NULL)
+        return -1;
+    return ((tre_tnfa_t *) preg->value)->params_depth;
+}
+
 WeaveMatchResult
 weave_do_match(void *compiled, const char *str, int str_len,
              int max_cost, int cost_ins, int cost_del,
