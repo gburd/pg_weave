@@ -124,7 +124,8 @@ wdoc_from_parsed(ParsedText *prs, uint8 label)
 		tw[i].len = prs->words[i].len;
 		tw[i].pos = last;
 	}
-	if (last > ntok)
+	/* last <= ntok is the invariant above; a 1 GB text has < 2^30 tokens */
+	if (last > ntok || ntok > WEAVE_POS_ORD_MASK)
 		elog(ERROR, "parsetext() position bookkeeping is not what to_wdoc() expects");
 	if (ntok - last >= 65536)
 		ereport(ERROR,
