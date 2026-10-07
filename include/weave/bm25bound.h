@@ -107,7 +107,7 @@
  * in nearly every document, the unclamped formula goes NEGATIVE, every
  * contribution flips sign, and block-max WAND -- whose bounds (C2) assume
  * non-negative contributions -- prunes the best documents and returns the worst
- * as the top-k.  Found in pg_fts 1.9.0 (its dense_score test: 6,000 docs with
+ * as the top-k.  Found by the sibling project in 1.9.0 (its dense_score test: 6,000 docs with
  * one term in every doc, 1/7 deleted, top-3 came back as the bottom three);
  * pg_weave forked before the fix and carried the four unclamped sites
  * (doc/GAPS.md G83).  With the clamp a term in every live document scores

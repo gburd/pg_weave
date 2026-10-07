@@ -4225,7 +4225,18 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 				else
 					so->maxhits += N;
 			}
+			/*
+			 * G87: the planner's LIMIT hint rides on the FIRST lexical key's
+			 * wquery (weave_hint_indexscan(), src/am/customscan.c), the same
+			 * first-pass-only, never-wider rule as the lexical route.
+			 */
 			so->fusek = weave_ord_width(pg_weave_wand_initial_k);
+			for (qi = 0; qi < so->nfuse; qi++)
+				if (so->fuseStrat[qi] == WEAVE_STRAT_DISTANCE)
+				{
+					so->fusek = weave_ord_first_width(so->fuseQ[qi]);
+					break;
+				}
 			weave_fuse_pass(scan->indexRelation, so);
 			so->ordpos = 0;
 			so->orderInit = true;
