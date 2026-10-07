@@ -70,10 +70,8 @@ FAILED=0
 # identical text.
 WIKIDATE=${WIKIDATE:-20260901}
 WBASE=https://dumps.wikimedia.org/enwiki/$WIKIDATE
-WIKI1=$WBASE/enwiki-$WIKIDATE-pages-articles-multistream1.xml-p1p41242.bz2
-WIKI6=$WBASE/enwiki-$WIKIDATE-pages-articles-multistream6.xml-p958046p1483661.bz2
-WIKI6_LIMIT=${WIKI6_LIMIT:-20000}
-CHUNK=${CHUNK:-400}
+# name|part file suffix|article limit (0 = whole part)|chunk words (0 = none)
+WIKIS=${WIKIS:-"wiki1|1.xml-p1p41242|0|400 wiki6|6.xml-p958046p1483661|60000|0 wiki3|3.xml-p151574p311329|30000|256"}
 BEIR=${BEIR:-scifact nfcorpus fiqa}
 CFGS=${CFGS:-simple english}
 # A tsvector over this many bytes of text MIGHT exceed the 1 MB limit, so those rows
@@ -140,6 +138,8 @@ SELECT '$C', '$G', count(*),
        percentile_disc(0.99) WITHIN GROUP (ORDER BY len_a),
        max(len_a),
        sum(len_a), sum(sumtf_a), sum(len_b), sum(len_c),
+       max(pg_column_size(tsv)),
+       max(octet_length(body)),
        round(avg(len_b::numeric / len_a) FILTER (WHERE len_a > 16383), 4),
        round(avg(len_c::numeric / len_a) FILTER (WHERE len_a > 16383), 4),
        (SELECT count(*) FROM (SELECT a FROM t WHERE len_a > 16383 ORDER BY id LIMIT 200) z),
@@ -252,7 +252,30 @@ SELECT 'captf_' || row_number() OVER (ORDER BY md5(word)), 'captf', quote_litera
                            WHERE t.maxnp >= 255 AND cardinality(u.positions) >= 255) d
          WHERE word ~ '^[a-z][a-z0-9]{2,19}$' AND word NOT IN ('and', 'or', 'not', 'near')
          ORDER BY md5(word) LIMIT 50) z;
+-- Known-item: an article's title, OR-ed, finds the article.  Built like a BEIR
+-- query (same tokenizing rule), judged by construction.
+CREATE TABLE tq AS
+WITH pick AS (
+    SELECT pageid, title FROM titles_$C
+     WHERE array_length(regexp_split_to_array(trim(title), '\s+'), 1) BETWEEN 2 AND 6
+     ORDER BY md5(pageid::text) LIMIT 200
+), tk AS (
+    SELECT p.pageid, s.tok, min(s.ord) AS ord
+      FROM pick p, LATERAL unnest(regexp_split_to_array(lower(p.title), '[^a-z0-9]+'))
+                   WITH ORDINALITY AS s(tok, ord)
+     WHERE length(s.tok) > 2 AND s.tok NOT IN ('and', 'or', 'not', 'near')
+     GROUP BY p.pageid, s.tok
+)
+SELECT pageid, string_agg(tok, ' | ' ORDER BY ord) AS terms FROM tk GROUP BY pageid;
+INSERT INTO q
+SELECT 'title_' || pageid, 'title', format('to_wquery(%L::regconfig, %L)', '$G', terms)
+  FROM tq WHERE to_wquery('$G'::regconfig, terms)::text <> '';
 SQL
+		# A chunked corpus is named <part>c and its row ids are pageid * 10000 + k.
+		local jcond="t.id = tq.pageid"
+		case "$C" in *c) jcond="t.id / 10000 = tq.pageid" ;; esac
+		$PSQL -c "\copy (SELECT 'title_' || tq.pageid, t.id, 1 FROM tq JOIN t ON $jcond WHERE 'title_' || tq.pageid IN (SELECT qid FROM q) ORDER BY 1, 2) TO '$W/qrels_title.tsv'"
+		$PSQL -c "DROP TABLE tq" >/dev/null
 		$PSQL -At -F $'\t' -c "SELECT '$tag', grp, count(*) FROM q GROUP BY grp ORDER BY grp" >> "$OUT/queries.tsv"
 	fi
 	$PSQL -c "\\copy (SELECT qid, grp FROM q ORDER BY qid) TO '$OUT/runs/${tag}_groups.tsv'"
@@ -295,13 +318,19 @@ SQL
 	done
 
 	say "$tag: scoring"
+	local QR
+	if [ "$K" = beir ]; then QR=$W/beir/$C/qrels.tsv; else QR=$W/qrels_title.tsv; fi
+	cp "$QR" "$OUT/runs/${tag}_qrels.tsv"
 	for arm in exact exact2 sumtf tsv tsvmaxpos strip; do
-		if [ "$K" = beir ]; then
-			python3 bench/ndcg.py --qrels "$W/beir/$C/qrels.tsv" --run "$OUT/runs/${tag}_${arm}.tsv" \
-				--k 10 --label "$tag/$arm" > "$W/ndcg.out" 2>> "$OUT/ndcg.stderr" \
-				|| { echo "NDCG FAILED: $tag/$arm" | tee -a "$OUT/failed.txt"; FAILED=1; }
-			grep -v '^label' "$W/ndcg.out" >> "$OUT/quality.tsv" || true
-		fi
+		# For the wiki corpora only the title queries are judged; ndcg.py scores
+		# the qids in qrels, so the band queries in the same run file are ignored.
+		python3 bench/ndcg.py --qrels "$QR" --run "$OUT/runs/${tag}_${arm}.tsv" \
+			--k 10 --label "$tag/$arm" > "$W/ndcg.out" 2>> "$OUT/ndcg.stderr" \
+			|| { echo "NDCG FAILED: $tag/$arm" | tee -a "$OUT/failed.txt"; FAILED=1; }
+		grep -v '^label' "$W/ndcg.out" >> "$OUT/quality.tsv" || true
+		python3 bench/tsvcaps.py paired "$QR" "$OUT/runs/${tag}_exact.tsv" "$OUT/runs/${tag}_${arm}.tsv" \
+			--label "$tag/$arm" >> "$OUT/paired.tsv" \
+			|| { echo "PAIRED FAILED: $tag/$arm" | tee -a "$OUT/failed.txt"; FAILED=1; }
 		python3 bench/tsvcaps.py agree "$OUT/runs/${tag}_exact.tsv" "$OUT/runs/${tag}_${arm}.tsv" \
 			--groups "$OUT/runs/${tag}_groups.tsv" --label "$tag/$arm" >> "$OUT/agree.tsv"
 	done
@@ -310,6 +339,7 @@ SQL
 	python3 bench/tsvcaps.py agree "$OUT/runs/${tag}_sumtf.tsv" "$OUT/runs/${tag}_tsv.tsv" \
 		--groups "$OUT/runs/${tag}_groups.tsv" --label "$tag/tsv_vs_sumtf" >> "$OUT/agree.tsv"
 	grep "^$tag/" "$OUT/quality.tsv" 2>/dev/null || true
+	grep "^$tag/" "$OUT/paired.tsv" 2>/dev/null || true
 	grep "^$tag/" "$OUT/agree.tsv" | grep -P '\tall\t' || true
 	$PSQL -c "DROP TABLE t, q; DROP TABLE IF EXISTS st;" >/dev/null
 }
@@ -327,11 +357,17 @@ unit() {
 
 # Start the Wikipedia fetch + strip now, in the background, so it overlaps BEIR.
 # Sequential inside the subshell: dumps.wikimedia.org allows two connections per IP.
+# Each part's files appear atomically (renamed into place), with a .done marker
+# after the last one, so the main loop can start on a part while the next downloads.
 (
-	python3 bench/tsvcaps.py wiki "$WIKI1" "$W/wiki1.tsv" --chunk "$CHUNK" \
-		--chunk-out "$W/wiki1c.tsv" --cache "$W/_cache" &&
-	python3 bench/tsvcaps.py wiki "$WIKI6" "$W/wiki6.tsv" --limit "$WIKI6_LIMIT" \
-		--cache "$W/_cache"
+	for spec in $WIKIS; do
+		IFS='|' read -r name part limit chunk <<< "$spec"
+		args=(--limit "$limit" --titles-out "$W/${name}_titles.tsv" --cache "$W/_cache")
+		[ "$chunk" -gt 0 ] && args+=(--chunk "$chunk" --chunk-out "$W/${name}c.tsv")
+		python3 bench/tsvcaps.py wiki "$WBASE/enwiki-$WIKIDATE-pages-articles-multistream$part.bz2" \
+			"$W/$name.tsv" "${args[@]}" || { touch "$W/$name.failed"; continue; }
+		touch "$W/$name.done"
+	done
 ) > "$OUT/wikiprep.log" 2>&1 &
 WIKIPID=$!
 
@@ -452,6 +488,15 @@ END $$;
 CREATE TEMP TABLE p5 (d wdoc);
 INSERT INTO p5 SELECT to_wdoc('simple'::regconfig, repeat('a b ', 10000));
 COPY p5 TO '/tmp/tsvcaps_p5.bin' (FORMAT binary);
+COPY p5 TO '/tmp/tsvcaps_p5.txt';
+CREATE TEMP TABLE p5t (d wdoc);
+DO $$
+BEGIN
+	COPY p5t FROM '/tmp/tsvcaps_p5.txt';
+	RAISE NOTICE 'P5 text COPY round trip OK';
+EXCEPTION WHEN others THEN
+	RAISE NOTICE 'P5 text COPY round trip ERROR %', SQLERRM;
+END $$;
 CREATE TEMP TABLE p5b (d wdoc);
 DO $$
 BEGIN
@@ -476,11 +521,12 @@ grep -q 'NOTICE:  P5 binary round trip' "$OUT/probes.txt" \
 	|| { echo "PROBES did not run to the end" | tee -a "$OUT/failed.txt"; FAILED=1; }
 
 
-printf 'corpus\tcfg\tndocs\tn_tsv_error\tn_tf_cap_reached\tn_pos_cap_reached\tn_tf_wrong\tn_len_b_wrong\tn_len_c_wrong\tn_len_gt_16383\tn_len_c_selfcheck_fail\tavg_len\tp50_len\tp90_len\tp99_len\tmax_len\tsum_len_a\tsum_tf_a\tsum_len_b\tsum_len_c\tlong_avg_len_b_over_a\tlong_avg_len_c_over_a\tn_rt_checked\tn_rt_fail\n' > "$OUT/caps.tsv"
+printf 'corpus\tcfg\tndocs\tn_tsv_error\tn_tf_cap_reached\tn_pos_cap_reached\tn_tf_wrong\tn_len_b_wrong\tn_len_c_wrong\tn_len_gt_16383\tn_len_c_selfcheck_fail\tavg_len\tp50_len\tp90_len\tp99_len\tmax_len\tsum_len_a\tsum_tf_a\tsum_len_b\tsum_len_c\tmax_tsv_bytes\tmax_text_octets\tlong_avg_len_b_over_a\tlong_avg_len_c_over_a\tn_rt_checked\tn_rt_fail\n' > "$OUT/caps.tsv"
 printf 'corpus\tcfg\tndocs\tavg_text_octets\tavg_text\tavg_tsv\tavg_wdoc\tavg_wdoc_nopos\tavg_wdoc_from_tsv\tavg_wdoc_strip\n' > "$OUT/heap.tsv"
 printf 'corpus\tcfg\ttext\ttsvector\twdoc\twdoc_nopos\twdoc_from_tsv\n' > "$OUT/heaptab.tsv"
 printf 'label\tnqueries_scored\tndcg@10\trecall@100\tmrr@10\n' > "$OUT/quality.tsv"
 printf 'label\tgroup\tnq\tov10\tov100\tsame10\n' > "$OUT/agree.tsv"
+printf 'label\tnq\tnq_changed\tdelta_ndcg10_vs_exact\tci95_lo\tci95_hi\n' > "$OUT/paired.tsv"
 printf 'tag\tarm\tqueries\tindex_scans\tseconds\n' > "$OUT/scancheck.tsv"
 printf 'corpus\tcfg\tix_exact\tix_sumtf\tix_tsv\tix_tsvmaxpos\tix_strip\n' > "$OUT/idxsize.tsv"
 
@@ -508,17 +554,33 @@ done
 # ---------------------------------------------------------------------------
 # Wikipedia (long whole documents, no qrels), then the same text chunked.
 # ---------------------------------------------------------------------------
-say "waiting for the Wikipedia preparation"
-wait "$WIKIPID" || { cat "$OUT/wikiprep.log"; die "wikipedia preparation failed"; }
-cat "$OUT/wikiprep.log"
-for D in wiki1 wiki1c wiki6; do
-	$PSQL <<SQL
-DROP TABLE IF EXISTS docs_$D;
+for spec in $WIKIS; do
+	IFS='|' read -r name part limit chunk <<< "$spec"
+	say "waiting for $name"
+	while [ ! -e "$W/$name.done" ] && [ ! -e "$W/$name.failed" ]; do
+		kill -0 "$WIKIPID" 2>/dev/null || break
+		sleep 10
+	done
+	if [ ! -e "$W/$name.done" ]; then
+		cat "$OUT/wikiprep.log"
+		echo "WIKI PREP FAILED: $name" | tee -a "$OUT/failed.txt"; FAILED=1; continue
+	fi
+	tail -1 "$OUT/wikiprep.log"
+	D_LIST=$name; [ "$chunk" -gt 0 ] && D_LIST="$name ${name}c"
+	for D in $D_LIST; do
+		# Known-item title queries: the article's own title must find the
+		# article (whole corpus) or any of its chunks (chunked corpus, row id =
+		# pageid * 10000 + window).  200 titles, md5 order, 2-6 words long.
+		$PSQL <<SQL
+DROP TABLE IF EXISTS docs_$D, titles_$D;
 CREATE TABLE docs_$D (id bigint, body text);
 \copy docs_$D FROM '$W/$D.tsv' WITH (FORMAT csv, DELIMITER E'\t', QUOTE E'\b')
+CREATE TABLE titles_$D (pageid bigint, title text);
+\copy titles_$D FROM '$W/${name}_titles.tsv' WITH (FORMAT csv, DELIMITER E'\t', QUOTE E'\b')
 SQL
-	for G in $CFGS; do unit "$D" "$G" wiki; done
-	$PSQL -c "DROP TABLE docs_$D" >/dev/null
+		for G in $CFGS; do unit "$D" "$G" wiki; done
+		$PSQL -c "DROP TABLE docs_$D, titles_$D" >/dev/null
+	done
 done
 
 say "done (FAILED=$FAILED)"
