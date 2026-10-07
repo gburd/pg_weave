@@ -173,6 +173,36 @@ SELECT * FROM weave_index_tsvector_stats('tsi_ix');
 CREATE INDEX tsi_part ON tsi USING weave (tsv tsvector_lex_ops) WHERE id > 100;
 SELECT * FROM weave_index_tsvector_stats('tsi_part');
 
+-- WITH (positions = on): the phrase is answered from the postings' positions,
+-- where the unknown position 0 is stored too; same answers as the heap
+CREATE INDEX tsi_pos ON tsi USING weave (tsv tsvector_lex_ops) WITH (positions = on);
+SELECT q, weave_count('tsi_pos', q::wquery) AS ix_pos,
+	   (SELECT count(*) FROM tsi WHERE weave_tsv_match(tsv, q::wquery)) AS heap
+  FROM (VALUES ('"quick brown"'), ('"brown fox"'), ('"fox tag"'), ('"tag quick"'),
+			   ('tag')) v(q);
+DROP INDEX tsi_pos;
+
+-- a parallel build sums the participants' counts.  Every 1000th pad row is
+-- stripped, so the positionless rows are spread over the whole heap and land
+-- in workers' slices as well as the leader's: the WARNING must say 31 (30 + row
+-- 4) however the blocks were divided.
+INSERT INTO tsi SELECT g, 'pad', CASE WHEN g % 1000 = 0
+		THEN strip(to_tsvector('simple', 'pad row ' || g))
+		ELSE to_tsvector('simple', 'pad row ' || g) END
+  FROM generate_series(1000, 30999) g;
+ALTER TABLE tsi SET (parallel_workers = 4);
+SET max_parallel_maintenance_workers = 4;
+SET min_parallel_table_scan_size = 0;
+SET maintenance_work_mem = '64MB';
+CREATE INDEX tsi_par ON tsi USING weave (tsv tsvector_lex_ops);
+RESET maintenance_work_mem;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_maintenance_workers;
+ALTER TABLE tsi RESET (parallel_workers);
+SELECT * FROM weave_index_tsvector_stats('tsi_par');
+DROP INDEX tsi_par;
+DELETE FROM tsi WHERE id >= 1000;
+
 -- a tsvector column with no positionless document builds with no WARNING
 CREATE TABLE tsi_clean AS SELECT id, tsv FROM tsi WHERE id NOT IN (4);
 CREATE INDEX tsi_clean_ix ON tsi_clean USING weave (tsv tsvector_lex_ops);
