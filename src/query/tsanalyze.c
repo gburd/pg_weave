@@ -28,163 +28,136 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 
-/* qsort_arg comparator: elements are indices into a ParsedWord array (arg).
- * Ties on (text, len) break by token position so a distinct-term run comes out
- * with its positions ascending -- phrase_step requires each term's position
- * list to be ascending (this mirrors cmp_rawterm in pg_weave_analyze.c). */
-static int
-cmp_word_idx(const void *a, const void *b, void *arg)
+/*
+ * Token positions without core's 16,383 clamp (doc/GAPS.md G89).
+ *
+ * parsetext() keeps an unclamped int32 token counter in prs->pos, but stores
+ * each word's position as LIMITPOS(prs->pos) in a uint16, so every word past
+ * token 16,383 used to get position 16,383: a term recurring there had
+ * duplicate positions, which weave_doc_build() (wdoc_in, wdoc_recv) rejects, so
+ * the value could not be dumped and restored.  The tokenizer and dictionary
+ * loop that produces the true ordinal (LexizeInit/LexizeExec) is static in
+ * ts_parse.c, so it cannot be re-run here without copying it.
+ *
+ * Instead the counter starts at PG_INT32_MIN.  It then stays negative for any
+ * document a varlena can hold, so LIMITPOS() never clamps, and because
+ * PG_INT32_MIN is a multiple of 65536 the stored uint16 is the true 1-based
+ * ordinal t mod 65536.  The words come out in token order, so t is
+ * non-decreasing along the array, and the builder unwraps it: u_0 is the
+ * smallest value >= 1 congruent to r_0, and u_i the smallest >= u_(i-1)
+ * congruent to r_i.
+ *
+ * Exactness.  By induction u_i <= t_i and d_i = t_i - u_i is a multiple of
+ * 65536; and d_i - d_(i-1) = (t_i - t_(i-1)) - (u_i - u_(i-1)) > -65536, so d is
+ * non-decreasing.  The true count N (prs->pos - PG_INT32_MIN) bounds t_last, so
+ * N - u_last < 65536 forces d_last = 0 and with it every d_i = 0: every
+ * position is exact.  The check fails only when the document holds a run of at
+ * least 65,535 consecutive tokens that produce no lexeme (stopwords), where a
+ * gap of 65,536 cannot be told from a gap of 0; that document is refused rather
+ * than stored at a wrong position.  sql/wdoc_roundtrip.sql tests both sides.
+ */
+#define WEAVE_PRS_POS_BASE	PG_INT32_MIN
+
+typedef struct TsWord
 {
-	ParsedWord *words = (ParsedWord *) arg;
-	ParsedWord *wa = &words[*(const int *) a];
-	ParsedWord *wb = &words[*(const int *) b];
-	int			min = Min(wa->len, wb->len);
-	int			c = memcmp(wa->word, wb->word, min);
+	const char *word;
+	int			len;
+	uint32		pos;			/* true 1-based token ordinal */
+} TsWord;
+
+/* sort by (text, len, pos) so a term's positions come out ascending */
+static int
+cmp_tsword(const void *a, const void *b)
+{
+	const TsWord *wa = (const TsWord *) a;
+	const TsWord *wb = (const TsWord *) b;
+	int			c = memcmp(wa->word, wb->word, Min(wa->len, wb->len));
 
 	if (c != 0)
 		return c;
 	if (wa->len != wb->len)
 		return wa->len - wb->len;
-	/* same term: order by position so positions come out ascending.
-	 * parsetext() fills pos.pos with a plain 1-based token ordinal via
-	 * LIMITPOS() (no weight bits, capped at MAXENTRYPOS-1); alen==0 so the
-	 * apos array form is never used on this path. */
-	if (wa->pos.pos < wb->pos.pos)
-		return -1;
-	if (wa->pos.pos > wb->pos.pos)
-		return 1;
+	if (wa->pos != wb->pos)
+		return wa->pos < wb->pos ? -1 : 1;
 	return 0;
 }
 
 /*
- * Build an wdoc from the words produced by parsetext().  The words are not
- * sorted and may contain duplicates and multiple variants per position, so we
- * sort, deduplicate and count term frequency, exactly like the simple
- * analyzer.  doclen is the number of token positions, which parsetext tracks
- * in prs->pos.  Per-token positions are stored (WEAVE_DOCF_POSITIONS) so phrase
- * and NEAR queries enforce adjacency on this path too; parsetext() fills each
- * ParsedWord.pos.pos with a 1-based token ordinal.
+ * Build an wdoc from the words produced by parsetext() (called with
+ * prs->pos = WEAVE_PRS_POS_BASE).  The words are not sorted and may contain
+ * duplicates and several variants per position.  doclen is the number of token
+ * positions, stopwords included.  A dictionary can emit the same lexeme twice
+ * for one token (ispell: 'footballklubber' -> ...klubber...klubber); like
+ * to_tsvector, that counts once, so tf is the term's number of distinct
+ * positions and positions stay strictly ascending.
  */
 static WeaveDoc
 wdoc_from_parsed(ParsedText *prs, uint8 label)
 {
 	int			nw = prs->curwords;
-	ParsedWord *words = prs->words;
-	int		   *order;
-	int			i;
-	int			ndistinct = 0;
-	Size		lexbytes = 0;
-	WeaveDoc		doc;
-	Size		posbase;
-	Size		total;
-	int			npos;
-	WeaveTermEntry *entries;
-	char	   *lexemes;
+	int64		ntok = (int64) prs->pos - WEAVE_PRS_POS_BASE;
+	TsWord	   *tw;
+	char	  **terms;
+	int		   *lens;
+	uint32	   *tfs;
 	uint32	   *positions;
-	uint32		off;
-	uint32		pidx;
+	uint32		nterms = 0;
+	uint32		npos = 0;
+	uint32		last = 1;
+	int			i;
 
 	if (nw == 0)
-	{
-		total = WEAVE_DOC_HDRSIZE;
-		doc = (WeaveDoc) palloc0(total);
-		SET_VARSIZE(doc, total);
-		doc->version = WEAVE_DOC_VERSION;
-		doc->flags = 0;
-		doc->nterms = 0;
-		doc->doclen = 0;
-		doc->lexbytes = 0;
-		return doc;
-	}
+		return weave_doc_build(0, NULL, NULL, NULL, true, NULL, ntok, "wdoc");
 
-	/* index-sort words by (text, len, pos) without disturbing the array */
-	order = (int *) palloc(nw * sizeof(int));
+	/*
+	 * prs->words is one plain repalloc'd array of 24-byte entries, so nw is
+	 * below MaxAllocSize / 24 and each array here fits a plain palloc.
+	 */
+	tw = (TsWord *) palloc(nw * sizeof(TsWord));	/* alloc-ok: nw < MaxAllocSize/sizeof(ParsedWord) */
 	for (i = 0; i < nw; i++)
-		order[i] = i;
-	qsort_arg(order, nw, sizeof(int), cmp_word_idx, words);
-
-	for (i = 0; i < nw;)
 	{
-		int			run = 1;
-		ParsedWord *w = &words[order[i]];
+		uint32		r = prs->words[i].pos.pos;	/* true ordinal mod 65536 */
 
-		while (i + run < nw)
-		{
-			ParsedWord *n = &words[order[i + run]];
-			int			min = Min(w->len, n->len);
-			int			c = memcmp(w->word, n->word, min);
-
-			if (c == 0)
-				c = w->len - n->len;
-			if (c != 0)
-				break;
-			run++;
-		}
-		lexbytes += w->len;
-		ndistinct++;
-		i += run;
+		last += (r - last) & 0xFFFF;
+		tw[i].word = prs->words[i].word;
+		tw[i].len = prs->words[i].len;
+		tw[i].pos = last;
 	}
-
-	total = WEAVE_DOC_HDRSIZE +
-		(Size) ndistinct * sizeof(WeaveTermEntry) + lexbytes;
-	/* one stored position per token; npos == nw (sum of tf over all terms) */
-	npos = nw;
-	posbase = MAXALIGN(total);
-	total = posbase + (Size) npos * sizeof(uint32);
-	if (total > MaxAllocSize)
+	if (last > ntok)
+		elog(ERROR, "parsetext() position bookkeeping is not what to_wdoc() expects");
+	if (ntok - last >= 65536)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("wdoc document is too large"),
-				 errdetail("An wdoc value is limited to %zu bytes; this document needs %zu.",
-						   (Size) MaxAllocSize, total)));
-	doc = (WeaveDoc) palloc0(total);
-	SET_VARSIZE(doc, total);
-	doc->version = WEAVE_DOC_VERSION;
-	doc->flags = WEAVE_DOCF_POSITIONS;
-	doc->nterms = ndistinct;
-	doc->doclen = (uint32) prs->pos;
-	doc->lexbytes = lexbytes;
+				 errmsg("document has a run of 65535 or more consecutive tokens that produce no lexeme"),
+				 errdetail("Token positions after such a run cannot be determined exactly.")));
 
-	entries = WEAVE_DOC_ENTRIES(doc);
-	lexemes = WEAVE_DOC_LEXEMES(doc);
-	positions = WEAVE_DOC_POSITIONS(doc);
-	off = 0;
-	pidx = 0;
-	ndistinct = 0;
-	for (i = 0; i < nw;)
+	qsort(tw, nw, sizeof(TsWord), cmp_tsword);
+
+	terms = (char **) palloc(nw * sizeof(char *));	/* alloc-ok: see tw */
+	lens = (int *) palloc(nw * sizeof(int));	/* alloc-ok: see tw */
+	tfs = (uint32 *) palloc(nw * sizeof(uint32));	/* alloc-ok: see tw */
+	positions = (uint32 *) palloc(nw * sizeof(uint32));	/* alloc-ok: see tw */
+	for (i = 0; i < nw; i++)
 	{
-		int			run = 1;
-		int			k;
-		ParsedWord *w = &words[order[i]];
-
-		while (i + run < nw)
+		if (i > 0 && tw[i].len == tw[i - 1].len &&
+			memcmp(tw[i].word, tw[i - 1].word, tw[i].len) == 0)
 		{
-			ParsedWord *n = &words[order[i + run]];
-			int			min = Min(w->len, n->len);
-			int			c = memcmp(w->word, n->word, min);
-
-			if (c == 0)
-				c = w->len - n->len;
-			if (c != 0)
-				break;
-			run++;
+			if (tw[i].pos == tw[i - 1].pos)
+				continue;		/* the same lexeme twice for one token */
+			tfs[nterms - 1]++;
 		}
-		entries[ndistinct].off = off;
-		entries[ndistinct].len = w->len;
-		entries[ndistinct].tf = run;
-		entries[ndistinct].posoff = pidx;
-		memcpy(lexemes + off, w->word, w->len);
-		off += w->len;
-		/* cmp_word_idx broke ties by pos, so this run is already ascending */
-		for (k = 0; k < run; k++)
-			positions[pidx++] = WEAVE_POS_MAKE(words[order[i + k]].pos.pos, label);
-		ndistinct++;
-		i += run;
+		else
+		{
+			terms[nterms] = (char *) tw[i].word;
+			lens[nterms] = tw[i].len;
+			tfs[nterms] = 1;
+			nterms++;
+		}
+		positions[npos++] = WEAVE_POS_MAKE(tw[i].pos, label);
 	}
-	if (label != 0)
-		doc->flags |= WEAVE_DOCF_WEIGHTS;
 
-	return doc;
+	return weave_doc_build(nterms, terms, lens, tfs, true, positions, ntok,
+						   "wdoc");
 }
 
 /*
@@ -199,7 +172,7 @@ weave_analyze_with_config(Oid cfgId, const char *str, int len, uint8 label)
 
 	prs.lenwords = Max(len / 6, 16);
 	prs.curwords = 0;
-	prs.pos = 0;
+	prs.pos = WEAVE_PRS_POS_BASE;	/* see wdoc_from_parsed */
 	prs.words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs.lenwords);
 
 	/* parsetext wants a writable buffer */
@@ -256,7 +229,7 @@ to_wdoc_from_tsvector(PG_FUNCTION_ARGS)
 
 	if (n == 0)
 	{
-		doc = weave_doc_build(0, NULL, NULL, NULL, false, NULL, "wdoc");
+		doc = weave_doc_build(0, NULL, NULL, NULL, false, NULL, -1, "wdoc");
 		PG_FREE_IF_COPY(tsv, 0);
 		PG_RETURN_WDOC(doc);
 	}
@@ -304,7 +277,7 @@ to_wdoc_from_tsvector(PG_FUNCTION_ARGS)
 	}
 
 	doc = weave_doc_build((uint32) n, terms, lens, tfs, has_pos, positions,
-						"wdoc");
+						-1, "wdoc");
 	PG_FREE_IF_COPY(tsv, 0);
 	PG_RETURN_WDOC(doc);
 }

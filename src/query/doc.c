@@ -11,10 +11,11 @@
  * document carries token positions, each term's positions, in a stable,
  * human-readable form.  The canonical grammar is:
  *
- *	  doc     := token ( ' ' token )*
+ *	  doc     := token ( ' ' token )* [ ' ' len ] | len
  *	  token   := qterm ':' tf [ '@' pos ( ',' pos )* ]
+ *	  len     := '|' doclen
  *	  qterm   := '\'' ( any char, with '\'' and '\\' backslash-escaped )* '\''
- *	  tf, pos := unsigned decimal integer
+ *	  tf, pos, doclen := unsigned decimal integer
  *
  * Examples:
  *
@@ -22,7 +23,10 @@
  *	  with positions: 'brown':1@3 'fox':2@2,5 'quick':1@1
  *
  * The '@positions' suffix appears only when the document has stored positions;
- * a term's position count equals its tf.  This mirrors tsvector's rendering
+ * a term's position count equals its tf.  The '|doclen' suffix (the BM25 length)
+ * appears only when the length differs from the sum of tf, as it does for a
+ * stopword config ('the cat sat' has length 3 and one term); an empty document
+ * of nonzero length renders as just '|doclen'.  This mirrors tsvector's rendering
  * closely enough to be familiar while making the (BM25-relevant) term frequency
  * explicit, which tsvector's output hides.
  *
@@ -123,10 +127,12 @@ weave_doc_is_valid(const WeaveDocData *doc, Size sz)
  */
 WeaveDoc
 weave_doc_build(uint32 nterms, char **terms, const int *lens, const uint32 *tfs,
-			  bool has_pos, const uint32 *positions, const char *errctx)
+			  bool has_pos, const uint32 *positions, int64 doclen_in,
+			  const char *errctx)
 {
 	Size		lexbytes = 0;
 	uint64		doclen = 0;
+	uint32		maxtf = 0;
 	uint64		npos = 0;
 	Size		posbase;
 	Size		total;
@@ -160,7 +166,40 @@ weave_doc_build(uint32 nterms, char **terms, const int *lens, const uint32 *tfs,
 		lexbytes += lens[i];
 		doclen += tfs[i];
 		npos += tfs[i];
+		maxtf = Max(maxtf, tfs[i]);
 	}
+
+	/*
+	 * The length (doc/GAPS.md G90).  -1 means the sum of tf, which is what the
+	 * built-in analyzer and to_wdoc(tsvector) mean by it.  A regconfig analyzer
+	 * counts every token, stopwords included, so its length can exceed the sum;
+	 * a dictionary that emits several lexemes per token makes it smaller.  What
+	 * every producer guarantees, and so what is enforced, is that no term occurs
+	 * more often than the document has tokens.  The upper bound is wdoc_length's
+	 * int32.
+	 */
+	if (doclen_in >= 0)
+	{
+		if (doclen_in < (int64) maxtf || doclen_in > PG_INT32_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid %s: document length " INT64_FORMAT " is out of range", errctx, doclen_in),
+					 errdetail("The length must be at least every term frequency (here %u) and at most %d.",
+							   maxtf, PG_INT32_MAX)));
+		doclen = (uint64) doclen_in;
+	}
+	else if (doclen > PG_INT32_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("invalid %s: document length exceeds %d", errctx, PG_INT32_MAX)));
+
+	/*
+	 * An empty document has every one of its positions, so it is canonically
+	 * position-bearing: its text form cannot say otherwise, and || keeps the
+	 * other operand's positions only when both sides have them.
+	 */
+	if (nterms == 0)
+		has_pos = true;
 
 	/* validate positions strictly ascending within each term */
 	if (has_pos)
@@ -219,7 +258,8 @@ weave_doc_build(uint32 nterms, char **terms, const int *lens, const uint32 *tfs,
 		uint32	   *dst = WEAVE_DOC_POSITIONS(doc);
 		uint32		j;
 
-		memcpy(dst, positions, (Size) npos * sizeof(uint32));
+		if (npos > 0)
+			memcpy(dst, positions, (Size) npos * sizeof(uint32));
 		/* record whether any position carries a non-D weight label (v4) */
 		for (j = 0; j < (uint32) npos; j++)
 			if (WEAVE_POS_LABEL(dst[j]) != 0)
@@ -261,6 +301,7 @@ weave_doc_parse_canonical(const char *in)
 	uint32	   *positions = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE((Size) poscap * sizeof(uint32));
 	bool		has_pos = false;
 	bool		seen_any = false;
+	int64		doclen = -1;
 	WeaveDoc		result;
 
 	initStringInfo(&term);
@@ -280,6 +321,27 @@ weave_doc_parse_canonical(const char *in)
 			p++;
 		if (*p == '\0')
 			break;
+
+		/* '|doclen' ends the document (on its own: an empty one of that length) */
+		if (*p == '|' && p[1] >= '0' && p[1] <= '9')
+		{
+			const char *q = p + 1;
+			int64		v = 0;
+
+			for (; *q >= '0' && *q <= '9'; q++)
+				if (v <= PG_INT32_MAX)
+					v = v * 10 + (*q - '0');
+			if (*q != '\0' && !seen_any)
+				return NULL;	/* e.g. '|1 2': raw text */
+			if (*q != '\0' || v > PG_INT32_MAX)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("malformed wdoc literal"),
+						 errdetail("expected a document length and the end of the value at \"%s\".", p)));
+			doclen = v;
+			seen_any = true;
+			break;
+		}
 
 		/* a token must begin with a quote to be canonical */
 		if (*p != '\'')
@@ -458,7 +520,8 @@ weave_doc_parse_canonical(const char *in)
 	if (!seen_any)
 		return NULL;
 
-	result = weave_doc_build(nterms, terms, lens, tfs, has_pos, positions, "wdoc");
+	result = weave_doc_build(nterms, terms, lens, tfs, has_pos, positions,
+							 doclen, "wdoc");
 	pfree(term.data);
 	return result;
 }
@@ -499,6 +562,7 @@ wdoc_out(PG_FUNCTION_ARGS)
 	WeaveDoc		doc = PG_GETARG_WDOC(0);
 	WeaveTermEntry *entries = WEAVE_DOC_ENTRIES(doc);
 	StringInfoData buf;
+	uint64		sumtf = 0;
 	uint32		i;
 
 	initStringInfo(&buf);
@@ -509,6 +573,7 @@ wdoc_out(PG_FUNCTION_ARGS)
 		append_quoted_term(&buf, WEAVE_DOC_TERMTEXT(doc, &entries[i]),
 						   entries[i].len);
 		appendStringInfo(&buf, ":%u", entries[i].tf);
+		sumtf += entries[i].tf;
 		if (WEAVE_DOC_HAS_POS(doc))
 		{
 			const uint32 *pos = WEAVE_DOC_TERMPOS(doc, &entries[i]);
@@ -527,6 +592,9 @@ wdoc_out(PG_FUNCTION_ARGS)
 			}
 		}
 	}
+	/* the length, when it is not the sum of tf (doc/GAPS.md G90) */
+	if (doc->doclen != sumtf)
+		appendStringInfo(&buf, doc->nterms > 0 ? " |%u" : "|%u", doc->doclen);
 
 	PG_FREE_IF_COPY(doc, 0);
 	PG_RETURN_CSTRING(buf.data);
@@ -576,7 +644,6 @@ wdoc_recv(PG_FUNCTION_ARGS)
 	nterms = (uint32) pq_getmsgint(buf, 4);
 	doclen = (uint32) pq_getmsgint(buf, 4);
 	has_pos = (version >= 3) ? (uint8) pq_getmsgint(buf, 1) : 0;
-	(void) doclen;				/* recomputed from tf in weave_doc_build */
 
 	/*
 	 * Guard against a hostile/corrupt binary message: each term contributes at
@@ -604,6 +671,8 @@ wdoc_recv(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
 					 errmsg("invalid wdoc term length")));
 		t = pq_getmsgbytes(buf, lens[i]);
+		/* the text form cannot carry a NUL or a byte the encoding rejects */
+		(void) pg_verify_mbstr(GetDatabaseEncoding(), t, lens[i], false);
 		terms[i] = (char *) palloc(Max(lens[i], 1));
 		memcpy(terms[i], t, lens[i]);
 		npos += tfs[i];
@@ -633,7 +702,7 @@ wdoc_recv(PG_FUNCTION_ARGS)
 	/* weave_doc_build enforces sorted/distinct terms, tf >= 1 and ascending
 	 * positions -- the same guards as the text input path. */
 	doc = weave_doc_build(nterms, terms, lens, tfs, has_pos != 0, positions,
-						"binary wdoc");
+						(int64) doclen, "binary wdoc");
 
 	PG_RETURN_WDOC(doc);
 }
@@ -1017,8 +1086,10 @@ PG_FUNCTION_INFO_V1(wdoc_concat);
  * wdoc || wdoc -> wdoc
  * Concatenate two documents into one, as though their source texts were joined
  * (right after left).  The right operand's token ordinals are re-based by the
- * left operand's doclen so positions stay globally ascending; each side keeps
- * its own weight labels.  Terms are merged (a term in both sides sums its tf
+ * left operand's extent -- its length, or its last position when that is larger,
+ * as it is for a to_wdoc(tsvector) value whose length is the sum of tf -- so
+ * positions stay globally ascending; each side keeps its own weight labels.  The
+ * length is the sum of the two lengths.  Terms are merged (a term in both sides sums its tf
  * and interleaves positions).  Used to build a multi-field document, e.g.
  *   to_wdoc('english', subject, 'A') || to_wdoc('english', body, 'C')
  * so a query term can restrict to a field zone (term:A).  If either side lacks
@@ -1031,6 +1102,8 @@ wdoc_concat(PG_FUNCTION_ARGS)
 	WeaveDoc		b = PG_GETARG_WDOC(1);
 	bool		has_pos = WEAVE_DOC_HAS_POS(a) && WEAVE_DOC_HAS_POS(b);
 	uint32		abase = a->doclen;		/* right ordinals shift past the left doc */
+	uint32		bmax = 0;
+	uint64		npos = 0;
 	uint32		na = a->nterms,
 				nb = b->nterms;
 	uint32		ntot = na + nb;
@@ -1048,8 +1121,34 @@ wdoc_concat(PG_FUNCTION_ARGS)
 	lens = (int *) palloc(sizeof(int) * Max(ntot, 1));
 	tfs = (uint32 *) palloc(sizeof(uint32) * Max(ntot, 1));
 	if (has_pos)
-		positions = (uint32 *) palloc(sizeof(uint32) *
-									  Max(a->doclen + b->doclen, 1u));
+	{
+		const uint32 *ap = WEAVE_DOC_POSITIONS(a);
+		const uint32 *bp = WEAVE_DOC_POSITIONS(b);
+		uint64		napos = 0,
+					nbpos = 0;
+		uint64		k;
+
+		for (k = 0; k < na; k++)
+			napos += WEAVE_DOC_ENTRIES(a)[k].tf;
+		for (k = 0; k < nb; k++)
+			nbpos += WEAVE_DOC_ENTRIES(b)[k].tf;
+		for (k = 0; k < napos; k++)
+			abase = Max(abase, WEAVE_POS_ORD(ap[k]));
+		for (k = 0; k < nbpos; k++)
+			bmax = Max(bmax, WEAVE_POS_ORD(bp[k]));
+		if ((uint64) abase + bmax > WEAVE_POS_ORD_MASK)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("wdoc || result has a token position beyond %u",
+							WEAVE_POS_ORD_MASK)));
+		/*
+		 * Sized from the operands' own position counts, NOT their lengths: a
+		 * dictionary that emits two lexemes for one token gives a document
+		 * more positions than length.
+		 */
+		npos = napos + nbpos;
+		positions = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE(Max(npos, 1) * sizeof(uint32));
+	}
 	{
 		uint32		ia = 0,
 					ib = 0,
@@ -1124,7 +1223,9 @@ wdoc_concat(PG_FUNCTION_ARGS)
 		ntot = nout;
 	}
 
-	out = weave_doc_build(ntot, terms, lens, tfs, has_pos, positions, "wdoc ||");
+	Assert(pc == npos);
+	out = weave_doc_build(ntot, terms, lens, tfs, has_pos, positions,
+						  (int64) a->doclen + b->doclen, "wdoc ||");
 	PG_FREE_IF_COPY(a, 0);
 	PG_FREE_IF_COPY(b, 1);
 	PG_RETURN_WDOC(out);

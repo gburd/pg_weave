@@ -204,7 +204,8 @@ extern int pg_weave_test_pause_advisory_key;
 #endif
 extern WeaveDoc weave_doc_build(uint32 nterms, char **terms, const int *lens,
 							const uint32 *tfs, bool has_pos,
-							const uint32 *positions, const char *errctx);
+							const uint32 *positions, int64 doclen,
+							const char *errctx);
 extern char *weave_normalize_term(Oid cfgId, const char *term, int len, int *outlen);
 
 /* pg_weave_query.c -- parse query text into an wquery */
