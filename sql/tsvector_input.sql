@@ -63,10 +63,11 @@ SELECT to_wdoc(tsv) || to_wdoc(tsv) @@@ 'tag <-> quick'::tsquery::wquery AS tag_
 	   to_wdoc(tsv) || to_wdoc(tsv) @@@ 'fox <-> quick'::tsquery::wquery AS fox_quick
   FROM mix;
 -- a weight zone never contains an unknown position (a positionless document
--- matches no zone either; core matches any weight there -- a recorded divergence)
-SELECT to_wdoc(setweight(tsv, 'A')) @@@ 'tag:A'::tsquery::wquery AS tag_a,
-	   to_wdoc(setweight(tsv, 'A')) @@@ 'fox:A'::tsquery::wquery AS fox_a
-  FROM mix;
+-- matches no zone either; core matches any weight there -- a recorded
+-- divergence).  wquery's own term:A syntax: the tsquery cast drops weights.
+SELECT q, tsv_a @@ q::tsquery AS core, to_wdoc(tsv_a) @@@ q::wquery AS wdoc_expr
+  FROM (SELECT setweight(tsv, 'A') AS tsv_a FROM mix) m,
+	   (VALUES ('tag:A'), ('fox:A'), ('fox:B')) v(q);
 -- a wholly stripped tsvector has no positions at all, as before
 SELECT to_wdoc(strip(tsv))::text AS stripped FROM mix;
 
@@ -101,7 +102,6 @@ REINDEX INDEX tsi_ix;
 -- index against index, not two sequential scans.
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-CREATE TEMP TABLE arms (q text, arm text, ids int[]);
 CREATE FUNCTION pg_temp.arm_ids(qq text, expr bool) RETURNS int[] LANGUAGE plpgsql AS $$
 DECLARE r int[];
 BEGIN
@@ -123,10 +123,10 @@ EXPLAIN (COSTS OFF) SELECT id FROM tsi WHERE tsv @@@ 'jump'::wquery
 EXPLAIN (COSTS OFF) SELECT id FROM tsi WHERE to_wdoc(tsv) @@@ 'jump'::wquery
 	ORDER BY to_wdoc(tsv) <=> 'jump'::wquery LIMIT 10;
 SELECT q, cardinality(pg_temp.arm_ids(q, false)) AS n,
-	   pg_temp.arm_ids(q, false) = pg_temp.arm_ids(q, true) AS same
+	   pg_temp.arm_ids(q, false) IS NOT DISTINCT FROM pg_temp.arm_ids(q, true) AS same
   FROM (VALUES ('jump'), ('quick'), ('fox | sleep'), ('quick & !hide'),
 			   ('"quick brown"'), ('"brown quick"'), ('spam'), ('tag'),
-			   ('numb & doc')) v(q);
+			   ('number & doc')) v(q);
 -- the plain restriction and the phrase on the mixed row, through the index:
 -- id 4 ('tag' positionless) keeps its phrase answers
 SELECT id FROM tsi WHERE tsv @@@ '"quick brown"'::wquery AND id < 6 ORDER BY id;
@@ -148,7 +148,7 @@ INSERT INTO tsi VALUES (201, 'late', strip(to_tsvector('english', 'quick late fo
 SELECT * FROM weave_index_tsvector_stats('tsi_ix');
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SELECT q, pg_temp.arm_ids(q, false) = pg_temp.arm_ids(q, true) AS same
+SELECT q, pg_temp.arm_ids(q, false) IS NOT DISTINCT FROM pg_temp.arm_ids(q, true) AS same
   FROM (VALUES ('quick'), ('late'), ('"quick brown"')) v(q);
 RESET enable_bitmapscan;
 RESET enable_seqscan;

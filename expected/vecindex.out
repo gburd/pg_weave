@@ -15,7 +15,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.29.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.30.0" of extension "pg_weave" is already installed
 -- doc/GAPS.md G60: a VACUUM only reclaims (tombstones) rows deleted before the
 -- oldest snapshot in this database; an autovacuum ANALYZE starting at the same
 -- moment can hold one.  Wait for every same-database snapshot older than now.

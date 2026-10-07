@@ -75,7 +75,7 @@ INSERT INTO rtd VALUES
 	(22, 'ispell booking',        to_wdoc('wrt_cfg', 'booking booking'));
 
 -- length and the round trips, per producer.  wdoc_length is the BM25 length:
--- every token position for a regconfig analyzer, stopwords included.
+-- the tokens that produced a lexeme (doc/PHASES.md M7), stopwords excluded.
 SELECT id, what, wdoc_length(d) AS len,
 	   pg_temp.text_rt(d) AS text_rt, pg_temp.bin_rt(id) AS bin_rt
 FROM rtd ORDER BY id;
