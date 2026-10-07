@@ -5787,7 +5787,7 @@ and inspected line by line (hard rule 3).
   the ORDER BY expression computes" is met by NEITHER, and was the wrong bar (see the
   corrected one below).
 
-### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`) and the fused `fuse()` route (`wt/hintfuse`); the vector `<->`/`<#>` route is NOT HINTABLE without a format decision**
+### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`) and the fused `fuse()` route (`wt/hintfuse`); the vector `<->`/`<#>` route is DEFERRED by maintainer decision 2026-10-07 (do not spend `wvec`'s reserved `int16` until a clustered corpus shows the first-pass width changes vector work)**
 
 An index AM is not told the LIMIT. pg_weave starts every ordered lexical pass at
 `weave_ord_width(pg_weave.wand_initial_k)` = `max(4 x 32, 64)` = **128** and widens x4 on
@@ -6003,7 +6003,7 @@ The pg_tre import has the approximate pieces, but they are not wired:
 So a user writing `'/colou?r{~1}/'` gets ARE's reading of those bytes, not an approximate match.
 Fuzzy TERMS (`term~k`, universal Levenshtein, Z5) do ship and are not this gap.
 
-**Decision needed:** either wire approximate regex (TRE's matcher for the verify step, the
+**MAINTAINER DECISION 2026-10-07: BUILD IT** (brief `/scratch/pg_weave/brief-g88.md`, branch `wt/g88`). The original question was: either wire approximate regex (TRE's matcher for the verify step, the
 `{~k}` extraction rules for the trigram prefilter, and a refusal of `{~k}` until then), or
 narrow the product statement and Phase Z's title to "regex". The README says "regular
 expressions over tokens" until this is decided.
