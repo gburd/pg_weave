@@ -5601,7 +5601,7 @@ half, VACUUM, smash the tombstone blob's bytes, and the scan must ERROR, not ret
 built `.so`, md5 differs) the scan returned **4000**, the resurrected answer, and tests 22-24
 failed; with it they pass.
 
-### G86 — an ordered scan's `d <=> q` (and every channel of a fused `fuse(...)`) is RE-EVALUATED per returned row: a heap detoast plus a fresh BM25, for a value the scan already computed — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 measured it at 28% of rare-term CPU); MEASURED here; OPEN**
+### G86 — an ordered scan's `d <=> q` (and every channel of a fused `fuse(...)`) is RE-EVALUATED per returned row: a heap detoast plus a fresh BM25, for a value the scan already computed — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 measured it at 28% of rare-term CPU); FIXED 2026-10-07 for the lexical `<=>` route (`wt/g86`, ext 0.29.0); vector, `<@>` and `fuse()` deliberately NOT substituted (reasons below)**
 
 The planner keeps the ORDER BY expression in the scan's target list (it feeds the sort key
 and the Limit), so the executor evaluates it for every row the index returns, even though
@@ -5650,17 +5650,104 @@ EC2 at two scales first (hard rules 9 and 11).
   resjunk one (a correlated subquery, or a function that runs a ranked query), can run a
   second weave ordering scan in between. Its `gettuple` overwrites the global, and the outer
   row's sort key becomes the inner scan's value. pg_fts's zero-argument
-  `fts_current_distance()` has this hazard. The port keys the stored value on (index, heap
-  TID, query) and recomputes the operator's own value on a mismatch, so a clobber costs
-  speed rather than a wrong key.
+  `fts_current_distance()` has this hazard. The port keeps one published value PER SCAN,
+  and the function looks it up by (index, heap TID, query), so a nested scan cannot
+  overwrite the outer one's.
+
+**FIXED for the lexical route, 2026-10-07 (`wt/g86`).** `weave_planner()`'s plan walk
+(`src/am/customscan.c`, the same walk as the G87 hint) gained `weave_reuse_distance()`. It
+runs on an Index Scan on a weave index with ONE ORDER BY key `wdoc <=> wquery`. Each
+RESJUNK target-list entry `equal()` to that key becomes
+
+    COALESCE(weave_current_distance(index, ctid, q), d <=> q)
+
+`weave_current_distance(regclass, tid, wquery)` (new in **0.29.0**, `src/am/amscan.c`) returns
+the value the live lexical ordering scan on that index published for that heap TID under
+that query, and NULL otherwise. NULL is also its answer outside any scan, so on a miss the
+operator runs exactly as before. `pg_weave.reuse_distance = off` disables it.
+
+How it differs from pg_fts's `efca0cf`, and why:
+
+- **Keyed, not a backend global.** Every lexical ordering scan that has returned a row is
+  on a list (`weave_curdist_live`) with that row's value. An entry leaves at rescan,
+  endscan, or a reset callback on the scan's memory context, which covers an error. The
+  lookup matches index, `xs_heaptid` (after the heap fetch, so a HOT member's TID matches)
+  and `weave_query_same()`. The latest publication wins when several match.
+  `sql/score_reuse.sql` §7 runs a second weave ordering scan in the outer scan's Filter on
+  every row, on another index and on the same index and query, and checks the outer
+  `WITH TIES` set against the reference.
+- **A miss falls back to the operator rather than to a stale or NULL key**, through the
+  COALESCE.
+- **The function is found by syscache, in the wquery type's schema, and must be C with link
+  symbol `weave_current_distance`.** pg_fts's rule. A same-named SQL function is never
+  planted (tested), and a catalog that predates 0.29.0 has none, so reuse is off there. A
+  `PlanInvalItem` on the function invalidates a cached plan that names it.
+
+**A VISIBLE BEHAVIOUR CHANGE, and the one place it shows.** The hidden sort key's readers
+now see the corpus distance the rows are ordered by, instead of the N = 1 distance. In
+`sql/score_reuse.sql`'s corpus every 'alpha' document has tf = 1, so the operator gives all
+1,000 of them ONE distance while the index gives ten:
+`ORDER BY d <=> 'alpha' FETCH FIRST 5 ROWS WITH TIES` returned **1,000 rows before and
+172 now**. 172 is the reference (`weave_search()`'s ranking). An
+`ORDER BY d <=> q, id` Incremental Sort now orders by (index distance, id), which also
+matches the reference. Before, it ordered the stream by id within one giant tie. Plain
+`LIMIT` and a selected `d <=> q` are unchanged (tested: 500 of 500 visible values equal
+`weave_distance()`).
+
+**Where it does not apply.** A scan's entry is resjunk only when the scan's target list IS
+the top plan's (`Limit`, `Sort` and `Incremental Sort` share it, and
+`apply_tlist_labeling()` copies `resjunk`). Under a join, an Append or a projecting node the
+entry is not resjunk and is left alone. The planner also postpones a volatile or expensive
+SELECT-list column above the Limit (`make_sort_input_target()`), which still leaves the
+scan's sort key resjunk and substituted. These are lost optimizations, not wrong answers.
+
+**Measured on EC2,** c7i.8xlarge, PG17, `pgweave-20261007-001351-226c` (commit `78a2870`):
+synthetic corpus as G87's ('a' 30 %, 'b' 20 %, 'c' 10 %, 'rare' 0.2 %), median of 25 warm
+runs, two runs per arm. `weave_distance` calls per query were counted with
+`track_functions`: **0 with reuse on, one per returned row with it off**, in every cell.
+`bench/RESULTS_G86_SCORE_REUSE.md` has the full table.
+
+| corpus | query | LIMIT | ms off (run 1 / 2) | ms on (run 1 / 2) |
+|---|---|---:|---:|---:|
+| long (11 KB, TOASTed), 200k | `c` | 400 | 8.963 / 8.979 | **0.195 / 0.196** |
+| long, 200k | `rare` | 400 | 9.338 / 9.300 | **0.234 / 0.233** |
+| long, 200k | `a \| b` | 400 | 15.272 / 15.274 | **6.645 / 6.635** |
+| long, 200k | `c` | 10 | 0.263 / 0.263 | **0.056 / 0.056** |
+| long, 50k | `c` | 400 | 8.934 / 8.939 | **0.131 / 0.131** |
+| short (100 B), 200k | any | 10, 400 | — | within run-to-run spread |
+| short, 1M | any | 10, 400 | — | within run-to-run spread |
+
+**Stated as a loss where it is one:** on SHORT inline documents it buys nothing measurable at
+either scale. A 100-byte `weave_distance()` costs too little to see next to the scan. The
+win is the detoast: about 22 µs per returned row on an 11 KB TOASTed document, which turns
+a 400-row ranked query on long text from 9 ms into 0.2 ms (46x), and a two-term OR from
+15.3 into 6.6 ms. The corpus is synthetic, so this is a mechanism measurement and not a
+real-corpus claim.
+
+Tests: `sql/score_reuse.sql`, with mutants each verified to BUILD and then FAIL it: a
+visible entry substituted too; the previous row's value published; the AM and type guards
+removed (any ordering scan substituted). A fourth, with only the AM guard removed,
+**survives, and is equivalent**: the `wdoc <=> wquery` type test already excludes every
+other access method, because no other AM orders by that operator. The brief's "substitute
+when the scan is not a weave scan" mutant is therefore the AM-and-type one. The fifth
+mutant, the unkeyed global, is in the second EC2 job; see the results file.
 - **Which channels' scan values equal the operator's.** Lexical `<=>`: the scan's value is
   the corpus BM25 distance and `weave_distance()` is the N = 1 one. They are not equal, so
   only RESJUNK entries may be substituted (pg_fts's rule). Vector `<->`/`<#>`/`<=>`: the
-  scan scores QUANTIZED reconstructions (`<->` returns the square, and see the comment above
-  `weave_vec_pass()`), so the values are not equal and are not substituted (see below for
-  the measured status). `<@>`: under review. `fuse()`: the scan's `-S` sums corpus BM25 and
-  quantized vector scores in a different order from `weave_fuse()` (F5: last-ULP
-  differences), so no bit-identity proof exists and it is not substituted.
+  scan scores QUANTIZED reconstructions, and for `<->` returns the SQUARED distance (see
+  the comment above `weave_vec_pass()`), so the values differ and are not substituted.
+  `<@>`: the scan's value IS bit-identical to the operator's. It is the integer
+  `weave_doc_min_edist()` result as a float8, from the same function, and `sql/edist.sql`
+  asserts zero mismatches over every row. So reuse would be exact, but it is not done:
+  `weave_edist()` is a min over the document's terms, not a BM25, and nothing measured
+  says it is worth a second SQL-visible function. Owed if a profile says otherwise.
+  `fuse()`: the scan's `-S` sums CORPUS BM25 and quantized vector scores in a different
+  order from `weave_fuse()` (F5: last-ULP differences), and the resjunk `fuse()` evaluates
+  each `d <=> q` at N = 1. So the substituted value would differ from the computed one by
+  far more than an ULP, exactly as the lexical one does. The brief's bar was bit-for-bit,
+  it is not met, and `fuse()` is not substituted. Under the lexical case's actual rule
+  ("a hidden sort key gets the value the stream is ordered by"), fuse() would qualify.
+  That decision is the maintainer's.
 
 ### G87 — the ordering scan does not know the query's LIMIT, so a LIMIT 10 query runs WAND at k = 128 and does ~2x the BM25 work it needs — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 "(A)": common k10 45 -> 31 ms, OR3 13.3 -> 5.7 ms on 2.19M Wikipedia); FIXED 2026-10-06 for the lexical `<=>` route (`wt/limit`); the fused route is still OWED**
 
