@@ -6008,6 +6008,18 @@ Fuzzy TERMS (`term~k`, universal Levenshtein, Z5) do ship and are not this gap.
 narrow the product statement and Phase Z's title to "regex". The README says "regular
 expressions over tokens" until this is decided.
 
+**Found 2026-10-07 while building it: the imported (k+1)-tiling prefilter is UNSOUND and must
+not be wired as it stands.** `src/query/tiling.c` `linearize_literals()` concatenates the
+literal codepoints of a pattern into one buffer, and its `default:` case (CLASS, ANY, REPEAT,
+ALT, ...) contributes nothing *without ending the run*, so `CONCAT` glues the literals on either
+side of a gap together. For `/ab.cd/` it linearizes to `"abcd"` and emits the trigrams `abc` and
+`bcd`, neither of which occurs in the matching token `abxcd`: a prefilter built from them drops
+a true match even at k = 0 (hard rule 1). The tiles it then forms also overlap in characters
+(consecutive trigrams share two), so "one of k+1 tiles survives k edits" does not follow from
+the pigeonhole argument either. `regex_extract_query()` (`src/query/extract.c`) calls it for
+every `max_cost > 0`; nothing in `src/am/` reaches that path today, which is the only reason it
+has not produced a wrong answer.
+
 The same review found two documents stale against the shipped code, recorded here so they are
 not lost: `doc/PRODUCTION_READINESS.md` "What actually works today" still says vector indexing
 does not exist and fuzzy is unreachable; `doc/ARCHITECTURE.md` §9 claim 3's scope note says the
