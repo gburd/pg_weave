@@ -208,7 +208,7 @@ SELECT ra_heap('^(abc){~1}$') @> '{21}' AS abcd_matches,
 -- ---- errors -----------------------------------------------------------------
 -- more than three approximate atoms: refused (G92: TRE would assert)
 SELECT count(*) FROM ra WHERE d @@@ '/a{~1}b{~1}c{~1}d{~1}/'::wquery;
-ERROR:  pg_weave: a regular expression may contain at most 3 approximate atoms ({~k})
+ERROR:  a regular expression may contain at most 3 approximate atoms ({~k})
 -- three is fine
 SELECT count(*) FROM ra WHERE d @@@ '/a{~1}b{~1}c{~1}/'::wquery;
  count 

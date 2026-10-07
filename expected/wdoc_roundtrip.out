@@ -191,6 +191,7 @@ SELECT wdoc_length(to_wdoc('english', 'cat ' || repeat('the ', 65535))) AS tail_
 SELECT wdoc_out(to_wdoc('english', 'cat ' || repeat('the ', 65535) || 'dog')) AS gap_65536;
 ERROR:  document has a run of 65535 or more consecutive tokens that produce no lexeme
 DETAIL:  Token positions after such a run cannot be determined exactly.
+HINT:  Split the document, or analyze it with a text search configuration that has no stopwords.
 -- || used to shift the right side by the left side's length, which is wrong
 -- for a tsvector-derived left side whose positions exceed its length.
 SELECT (to_wdoc(to_tsvector('english', 'the cat sat on the mat'))

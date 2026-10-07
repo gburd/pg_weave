@@ -295,7 +295,7 @@ weave_cache_lookup_internal(const char *pattern, int pattern_len, bool pin)
         weave_free_pattern(compiled);
         ereport(ERROR,
                 (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                 errmsg("pg_weave: a regular expression may contain at most %d approximate atoms ({~k})",
+                 errmsg("a regular expression may contain at most %d approximate atoms ({~k})",
                         WEAVE_TRE_MAX_APPROX_DEPTH)));
     }
 
