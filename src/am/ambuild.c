@@ -683,9 +683,10 @@ build_term_append(WeaveBuildState *bs, BuildTerm *bt,
 	bt->doclens[bt->nposts] = doclen;
 	/*
 	 * Carry positions when the index wants them and the caller supplied a full
-	 * set (npos == tf).  A per-(term,doc) position count is bounded by the
-	 * analyzer's MAXENTRYPOS cap, so appending tf values here cannot blow up a
-	 * single posting; the segment total is bounded by the build memory budget
+	 * set (npos == tf).  A per-(term,doc) position count is NOT capped by the
+	 * analyzer (core's MAXENTRYPOS caps a tsvector POSITION, never tf, and
+	 * since doc/GAPS.md G89 a wdoc keeps true positions past 16,383); one
+	 * posting is bounded only by its document, and the segment total by the build memory budget
 	 * (checked between tuples in weave_build_callback), which flushes before the
 	 * arena grows unbounded -- so this never materializes the whole corpus'
 	 * positions in one array.

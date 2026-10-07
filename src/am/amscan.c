@@ -132,9 +132,10 @@ weave_scan_readbuf(Relation index, BlockNumber blk)
 
 /* Max terms in a phrase chain we evaluate positionally, and the per-docid
  * position scratch bound.  A phrase with more terms, or a per-(term,doc) tf
- * beyond WEAVE_PHRASE_POSBUF, falls back to the (correct) recheck path.  16383
- * matches the analyzer's MAXENTRYPOS cap, so a well-formed posting never
- * exceeds it. */
+ * beyond WEAVE_PHRASE_POSBUF, falls back to the (correct) recheck path.  The
+ * size is a scratch budget, not a bound on tf: a term can recur more than 16,384
+ * times in one document (tf is never capped, and since doc/GAPS.md G89 neither are
+ * positions), and the npos checks in the phrase walk route that case to recheck. */
 #define WEAVE_QUERY_MAX_PHRASE_TERMS 32
 #define WEAVE_PHRASE_POSBUF 16384
 
