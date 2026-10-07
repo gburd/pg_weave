@@ -94,6 +94,89 @@ evict_slot(WeaveCacheSlot *slot)
  * cache it (out_uncached set to the fresh handle); the caller is
  * responsible for freeing such a handle via weave_cache_release().
  */
+/*
+ * G88: the approximate dialect is POSIX ERE plus `atom{~k}`, k a decimal
+ * integer, and nothing else of TRE's bound syntax.  TRE also reads `{~}` as
+ * UNBOUNDED edits and has {+n}, {-n}, {#n}, {~n,m} and cost expressions such
+ * as {1i+1d<3}; accepting them would make each of those product syntax by
+ * accident.  Every unescaped `{` outside a bracket expression must open
+ * `{m}`, `{m,}`, `{m,n}` or `{~k}`.  The bracket scan follows POSIX: a `]`
+ * first (after an optional `^`) is a member, and `[:`, `[.`, `[=` open
+ * sub-elements closed by the matching `:]`, `.]`, `=]`.
+ */
+static void
+weave_approx_validate(const char *re, int len)
+{
+    int         i = 0;
+
+    while (i < len)
+    {
+        char        c = re[i];
+
+        if (c == '\\')
+        {
+            i += 2;
+            continue;
+        }
+        if (c == '[')
+        {
+            i++;
+            if (i < len && re[i] == '^')
+                i++;
+            if (i < len && re[i] == ']')
+                i++;
+            while (i < len && re[i] != ']')
+            {
+                if (re[i] == '[' && i + 1 < len &&
+                    (re[i + 1] == ':' || re[i + 1] == '.' || re[i + 1] == '='))
+                {
+                    char        d = re[i + 1];
+
+                    i += 2;
+                    while (i + 1 < len && !(re[i] == d && re[i + 1] == ']'))
+                        i++;
+                    i += 2;
+                    continue;
+                }
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (c == '{')
+        {
+            int         j = i + 1;
+            int         nd;
+            bool        ok;
+
+            if (j < len && re[j] == '~')
+            {
+                for (j++, nd = 0; j < len && re[j] >= '0' && re[j] <= '9'; j++)
+                    nd++;
+                ok = nd > 0 && j < len && re[j] == '}';
+            }
+            else
+            {
+                for (nd = 0; j < len && re[j] >= '0' && re[j] <= '9'; j++)
+                    nd++;
+                ok = nd > 0;
+                if (ok && j < len && re[j] == ',')
+                    for (j++; j < len && re[j] >= '0' && re[j] <= '9'; j++)
+                        ;
+                ok = ok && j < len && re[j] == '}';
+            }
+            if (!ok)
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
+                         errmsg("invalid bound in approximate regular expression at offset %d", i),
+                         errhint("An approximate pattern accepts {m}, {m,}, {m,n} and {~k}, with k a non-negative integer.")));
+            i = j + 1;
+            continue;
+        }
+        i++;
+    }
+}
+
 static void *
 weave_cache_lookup_internal(const char *pattern, int pattern_len, bool pin)
 {
@@ -128,6 +211,8 @@ weave_cache_lookup_internal(const char *pattern, int pattern_len, bool pin)
             return slot->compiled;
         }
     }
+
+    weave_approx_validate(pattern, pattern_len);
 
     /* Cache miss: compile pattern.  Arm a wall-clock compile deadline
      * (pg_weave.compile_timeout_ms) so a pathological bounded-repetition

@@ -573,6 +573,7 @@ main(int argc, char **argv)
 {
 	int			ncases = (argc > 1) ? atoi(argv[1]) : 20000;
 	bool		exact_only = (argc > 2 && strcmp(argv[2], "exact") == 0);
+	bool		print_only = (argc > 3 && strcmp(argv[3], "print") == 0);	/* for SQL sweeps */
 	long		checks = 0,
 				positives = 0,
 				narrowing = 0,
@@ -609,6 +610,13 @@ main(int argc, char **argv)
 				g = gen_seq(2, 1 + rnd(6));
 				render(&pat, g);
 			} while (count_approx(pat.s) > 3);
+		}
+
+		if (print_only)
+		{
+			if (g)
+				printf("%s\n", pat.s);
+			continue;
 		}
 
 		h = compile(pat.s);
@@ -710,6 +718,8 @@ main(int argc, char **argv)
 			regfree(&posix);
 	}
 
+	if (print_only)
+		return 0;
 	printf("%ld checks, %ld TRE-accepted tokens, %ld narrowing patterns, %ld failures\n",
 		   checks, positives, narrowing, fails);
 	if (positives < checks / 20 || narrowing < ncases / 10)
