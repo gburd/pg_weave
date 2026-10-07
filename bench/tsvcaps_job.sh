@@ -140,6 +140,8 @@ SELECT '$C', '$G', count(*),
        percentile_disc(0.99) WITHIN GROUP (ORDER BY len_a),
        max(len_a),
        sum(len_a), sum(sumtf_a), sum(len_b), sum(len_c),
+       round(avg(len_b::numeric / len_a) FILTER (WHERE len_a > 16383), 4),
+       round(avg(len_c::numeric / len_a) FILTER (WHERE len_a > 16383), 4),
        (SELECT count(*) FROM (SELECT a FROM t WHERE len_a > 16383 ORDER BY id LIMIT 200) z),
        (SELECT count(*) FROM (SELECT a FROM t WHERE len_a > 16383 ORDER BY id LIMIT 200) z WHERE NOT rt_ok(a))
   FROM t;
@@ -284,6 +286,7 @@ SQL
 		nq=${res%%$'\t'*}
 		ns=${res##*$'\t'}
 		printf '%s\t%s\t%s\t%s\t%s\n' "$tag" "$arm" "$nq" "$ns" "$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')" >> "$OUT/scancheck.tsv"
+		case "$nq$ns" in ''|*[!0-9]*) die "$tag $arm: tc_run returned '$res'" ;; esac
 		if [ "$ns" -lt "$nq" ]; then
 			echo "SCANCHECK FAIL: $tag $arm ran $nq queries but $ix counted $ns scans" | tee -a "$OUT/scancheck.tsv"
 			FAILED=1
@@ -472,7 +475,7 @@ cat "$OUT/probes.txt"
 grep -q 'NOTICE:  P5 binary round trip' "$OUT/probes.txt" || die "probes did not run to the end"
 
 
-printf 'corpus\tcfg\tndocs\tn_tsv_error\tn_tf_cap_reached\tn_pos_cap_reached\tn_tf_wrong\tn_len_b_wrong\tn_len_c_wrong\tn_len_gt_16383\tn_len_c_selfcheck_fail\tavg_len\tp50_len\tp90_len\tp99_len\tmax_len\tsum_len_a\tsum_tf_a\tsum_len_b\tsum_len_c\tn_rt_checked\tn_rt_fail\n' > "$OUT/caps.tsv"
+printf 'corpus\tcfg\tndocs\tn_tsv_error\tn_tf_cap_reached\tn_pos_cap_reached\tn_tf_wrong\tn_len_b_wrong\tn_len_c_wrong\tn_len_gt_16383\tn_len_c_selfcheck_fail\tavg_len\tp50_len\tp90_len\tp99_len\tmax_len\tsum_len_a\tsum_tf_a\tsum_len_b\tsum_len_c\tlong_avg_len_b_over_a\tlong_avg_len_c_over_a\tn_rt_checked\tn_rt_fail\n' > "$OUT/caps.tsv"
 printf 'corpus\tcfg\tndocs\tavg_text_octets\tavg_text\tavg_tsv\tavg_wdoc\tavg_wdoc_nopos\tavg_wdoc_from_tsv\tavg_wdoc_strip\n' > "$OUT/heap.tsv"
 printf 'corpus\tcfg\ttext\ttsvector\twdoc\twdoc_nopos\twdoc_from_tsv\n' > "$OUT/heaptab.tsv"
 printf 'label\tnqueries_scored\tndcg@10\trecall@100\tmrr@10\n' > "$OUT/quality.tsv"
