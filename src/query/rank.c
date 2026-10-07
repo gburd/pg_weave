@@ -509,3 +509,36 @@ weave_distance_commutator(PG_FUNCTION_ARGS)
 	PG_FREE_IF_COPY(doc, 1);
 	PG_RETURN_FLOAT8(1.0 / (1.0 + score));
 }
+
+/* tsvector <=> wquery and its commutator (tsvector_lex_ops, doc/PHASES.md M7) */
+PG_FUNCTION_INFO_V1(weave_tsv_distance);
+PG_FUNCTION_INFO_V1(weave_tsv_distance_commutator);
+
+static double
+tsv_distance(Datum tsvd, WeaveQuery q)
+{
+	struct varlena *tsv = PG_DETOAST_DATUM(tsvd);
+	WeaveDoc	doc = weave_doc_from_tsvector(tsv, NULL);
+	double		score;
+
+	/* as weave_distance: N=1, avgdl=|D|, so the length term is neutral */
+	score = weave_bm25_score(doc, q, 1.0, (double) doc->doclen, NULL,
+							 WEAVE_DEFAULT_K1, WEAVE_DEFAULT_B, WEAVE_LUCENE);
+	pfree(doc);
+	if ((Pointer) tsv != DatumGetPointer(tsvd))
+		pfree(tsv);
+	return 1.0 / (1.0 + score);
+}
+
+
+Datum
+weave_tsv_distance(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_FLOAT8(tsv_distance(PG_GETARG_DATUM(0), PG_GETARG_WQUERY(1)));
+}
+
+Datum
+weave_tsv_distance_commutator(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_FLOAT8(tsv_distance(PG_GETARG_DATUM(1), PG_GETARG_WQUERY(0)));
+}

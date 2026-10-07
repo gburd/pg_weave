@@ -2199,6 +2199,21 @@ extern void weave_index_layout(Relation index, WeaveIndexLayout *out);
 extern bool weave_index_dv_is_text(Relation index);
 
 /*
+ * The lexical column's index datum as a wdoc (doc/PHASES.md M7).  A
+ * tsvector_lex_ops column holds a tsvector, converted HERE, at the index
+ * boundary, by the function to_wdoc(tsvector) uses, so the pending list, flush,
+ * merge and scoring see the wdoc bytes an expression index on to_wdoc(tsv)
+ * would.  Every reader of a lexical index datum -- the build callback,
+ * weave_insert() and the heap recheck -- goes through this one function.  For a
+ * wdoc column it is PG_DETOAST_DATUM.  *tsvflags (may be NULL) receives
+ * weave_tsvector_flags(), or 0 for a wdoc column.  The result is palloc'd when
+ * it differs from the datum's own pointer.
+ */
+extern WeaveDoc weave_index_lexdoc(Relation index, AttrNumber lexattno,
+								   Datum value, uint32 *tsvflags);
+extern bool weave_index_lex_is_tsvector(Relation index, AttrNumber lexattno);
+
+/*
  * src/am/ambuild.c -- ambuild/aminsert, the segment writers, and the size-tiered
  * merge.  weave_build/_buildempty/_insert are consumed by am.c (the amhandler
  * fills them in); the merge entry points are also consumed by amvacuum.c, which

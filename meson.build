@@ -236,5 +236,6 @@ install_data(
   'sql/pg_weave--0.26.0--0.27.0.sql',
   'sql/pg_weave--0.27.0--0.28.0.sql',
   'sql/pg_weave--0.28.0--0.29.0.sql',
+  'sql/pg_weave--0.29.0--0.30.0.sql',
   install_dir: pg_extension_dir,
 )

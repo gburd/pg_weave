@@ -112,6 +112,77 @@ weave_doc_is_valid(const WeaveDocData *doc, Size sz)
 }
 
 
+static int
+cmp_ord(const void *a, const void *b)
+{
+	uint32		x = WEAVE_POS_ORD(*(const uint32 *) a);
+	uint32		y = WEAVE_POS_ORD(*(const uint32 *) b);
+
+	return (x > y) - (x < y);
+}
+
+/*
+ * The document length when none is given: THE doclen convention (doc/PHASES.md
+ * M7, maintainer decision 2026-10-07), the number of tokens that produced at
+ * least one lexeme -- Lucene's default.  With positions that is the number of
+ * DISTINCT position ordinals (a token that yields two lexemes, ispell's
+ * booking -> {booking, book}, has one position and counts once; a stopword has
+ * none and counts zero), plus one per unknown position (ordinal 0: a
+ * positionless entry of a mixed tsvector counts 1, as core's ts_rank length
+ * does).  Without positions nothing better is known than the sum of tf.
+ *
+ * Every producer that sets the length explicitly sets this same value, so
+ * wdoc_out prints `|len` exactly when a length was supplied that differs from
+ * it (doc/GAPS.md G90) and the default here is what reads it back.
+ */
+uint64
+weave_doc_default_len(uint32 nterms, const uint32 *tfs, bool has_pos,
+					  const uint32 *positions)
+{
+	uint64		npos = 0;
+	uint64		n = 0;
+	uint64		i;
+	uint32	   *ord;
+
+	for (i = 0; i < nterms; i++)
+		npos += tfs[i];
+	if (!has_pos || npos == 0)
+		return npos;
+
+	ord = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE((Size) npos * sizeof(uint32));
+	memcpy(ord, positions, (Size) npos * sizeof(uint32));
+	qsort(ord, (size_t) npos, sizeof(uint32), cmp_ord);
+	for (i = 0; i < npos; i++)
+		if (WEAVE_POS_ORD(ord[i]) == WEAVE_POS_UNKNOWN ||
+			i == 0 || WEAVE_POS_ORD(ord[i]) != WEAVE_POS_ORD(ord[i - 1]))
+			n++;
+	pfree(ord);
+	return n;
+}
+
+/* weave_doc_default_len() of a built document */
+uint64
+weave_doc_default_len_of(WeaveDoc doc)
+{
+	WeaveTermEntry *e = WEAVE_DOC_ENTRIES(doc);
+	uint64		n = 0;
+	uint32	   *tfs;
+	uint32		i;
+
+	if (!WEAVE_DOC_HAS_POS(doc))
+	{
+		for (i = 0; i < doc->nterms; i++)
+			n += e[i].tf;
+		return n;
+	}
+	tfs = (uint32 *) WEAVE_ALLOC_MAYBE_HUGE(Max((Size) doc->nterms, 1) * sizeof(uint32));
+	for (i = 0; i < doc->nterms; i++)
+		tfs[i] = e[i].tf;
+	n = weave_doc_default_len(doc->nterms, tfs, true, WEAVE_DOC_POSITIONS(doc));
+	pfree(tfs);
+	return n;
+}
+
 /*
  * weave_doc_build -- assemble an WeaveDoc from parallel term arrays.
  *
@@ -171,13 +242,11 @@ weave_doc_build(uint32 nterms, char **terms, const int *lens, const uint32 *tfs,
 	}
 
 	/*
-	 * The length (doc/GAPS.md G90).  -1 means the sum of tf, which is what the
-	 * built-in analyzer and to_wdoc(tsvector) mean by it.  A regconfig analyzer
-	 * counts every token, stopwords included, so its length can exceed the sum;
-	 * a dictionary that emits several lexemes per token makes it smaller.  What
-	 * every producer guarantees, and so what is enforced, is that no term occurs
-	 * more often than the document has tokens.  The upper bound is wdoc_length's
-	 * int32.
+	 * The length (doc/GAPS.md G90).  -1 means weave_doc_default_len(), the one
+	 * convention every producer follows (distinct positions; see there).  An
+	 * explicit length is a caller's (wdoc_in's `|len`, wdoc_recv, ||), and
+	 * what is enforced of it is that no term occurs more often than the
+	 * document has tokens.  The upper bound is wdoc_length's int32.
 	 */
 	if (doclen_in >= 0)
 	{
@@ -189,7 +258,8 @@ weave_doc_build(uint32 nterms, char **terms, const int *lens, const uint32 *tfs,
 							   maxtf, PG_INT32_MAX)));
 		doclen = (uint64) doclen_in;
 	}
-	else if (doclen > PG_INT32_MAX)
+	else if ((doclen = (nterms == 0 ? 0 :
+						weave_doc_default_len(nterms, tfs, has_pos, positions))) > PG_INT32_MAX)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("invalid %s: document length exceeds %d", errctx, PG_INT32_MAX)));
@@ -213,7 +283,12 @@ weave_doc_build(uint32 nterms, char **terms, const int *lens, const uint32 *tfs,
 
 			for (k = 0; k < tfs[i]; k++, p++)
 			{
-				if (k > 0 && WEAVE_POS_ORD(positions[p]) <= WEAVE_POS_ORD(positions[p - 1]))
+				/* strictly ascending, except that the unknown position 0 may
+				 * repeat (WEAVE_POS_UNKNOWN: a || of two such occurrences) */
+				if (k > 0 &&
+					(WEAVE_POS_ORD(positions[p]) < WEAVE_POS_ORD(positions[p - 1]) ||
+					 (WEAVE_POS_ORD(positions[p]) == WEAVE_POS_ORD(positions[p - 1]) &&
+					  WEAVE_POS_ORD(positions[p]) != WEAVE_POS_UNKNOWN)))
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 							 errmsg("invalid %s: positions must be ascending within a term", errctx)));
@@ -563,7 +638,6 @@ wdoc_out(PG_FUNCTION_ARGS)
 	WeaveDoc		doc = PG_GETARG_WDOC(0);
 	WeaveTermEntry *entries = WEAVE_DOC_ENTRIES(doc);
 	StringInfoData buf;
-	uint64		sumtf = 0;
 	uint32		i;
 
 	initStringInfo(&buf);
@@ -574,7 +648,6 @@ wdoc_out(PG_FUNCTION_ARGS)
 		append_quoted_term(&buf, WEAVE_DOC_TERMTEXT(doc, &entries[i]),
 						   entries[i].len);
 		appendStringInfo(&buf, ":%u", entries[i].tf);
-		sumtf += entries[i].tf;
 		if (WEAVE_DOC_HAS_POS(doc))
 		{
 			const uint32 *pos = WEAVE_DOC_TERMPOS(doc, &entries[i]);
@@ -593,8 +666,9 @@ wdoc_out(PG_FUNCTION_ARGS)
 			}
 		}
 	}
-	/* the length, when it is not the sum of tf (doc/GAPS.md G90) */
-	if (doc->doclen != sumtf)
+	/* the length, when it is not the default (doc/GAPS.md G90) */
+	if (doc->doclen != (doc->nterms == 0 ? 0 :
+						weave_doc_default_len_of(doc)))
 		appendStringInfo(&buf, doc->nterms > 0 ? " |%u" : "|%u", doc->doclen);
 
 	PG_FREE_IF_COPY(doc, 0);
@@ -1189,6 +1263,9 @@ wdoc_concat(PG_FUNCTION_ARGS)
 		WeaveTermEntry *eb = WEAVE_DOC_ENTRIES(b);
 
 #define ATERM(x) WEAVE_DOC_TERMTEXT(a, &ea[x])
+		/* shift B's ordinal past A, but an unknown position stays unknown */
+#define REBASE(x) (WEAVE_POS_ORD(x) == WEAVE_POS_UNKNOWN ? (x) : \
+				   WEAVE_POS_MAKE(WEAVE_POS_ORD(x) + abase, WEAVE_POS_LABEL(x)))
 #define BTERM(x) WEAVE_DOC_TERMTEXT(b, &eb[x])
 		while (ia < na || ib < nb)
 		{
@@ -1227,8 +1304,7 @@ wdoc_concat(PG_FUNCTION_ARGS)
 				tfs[nout] = eb[ib].tf;
 				if (has_pos)
 					for (k = 0; k < eb[ib].tf; k++)
-						positions[pc++] = WEAVE_POS_MAKE(WEAVE_POS_ORD(bp[k]) + abase,
-													   WEAVE_POS_LABEL(bp[k]));
+						positions[pc++] = REBASE(bp[k]);
 				nout++; ib++;
 			}
 			else					/* term in BOTH: sum tf, positions A then re-based B */
@@ -1241,17 +1317,25 @@ wdoc_concat(PG_FUNCTION_ARGS)
 				tfs[nout] = ea[ia].tf + eb[ib].tf;
 				if (has_pos)
 				{
-					for (k = 0; k < ea[ia].tf; k++)
+					uint32		za = 0,
+								zb = 0;
+
+					/* unknown positions (ordinal 0) sort first: A's, then B's */
+					while (za < ea[ia].tf && WEAVE_POS_ORD(ap[za]) == WEAVE_POS_UNKNOWN)
+						positions[pc++] = ap[za++];
+					while (zb < eb[ib].tf && WEAVE_POS_ORD(bp[zb]) == WEAVE_POS_UNKNOWN)
+						positions[pc++] = bp[zb++];
+					for (k = za; k < ea[ia].tf; k++)
 						positions[pc++] = ap[k];
-					for (k = 0; k < eb[ib].tf; k++)
-						positions[pc++] = WEAVE_POS_MAKE(WEAVE_POS_ORD(bp[k]) + abase,
-													   WEAVE_POS_LABEL(bp[k]));
+					for (k = zb; k < eb[ib].tf; k++)
+						positions[pc++] = REBASE(bp[k]);
 				}
 				nout++; ia++; ib++;
 			}
 		}
 #undef ATERM
 #undef BTERM
+#undef REBASE
 		ntot = nout;
 	}
 

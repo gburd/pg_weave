@@ -13,6 +13,74 @@ script`. Smoke (regression, isolation, all 33 TAP files) was green before each r
 | `pgweave-20261007-031455-7a75` | `4e8a368` | the same plus **known-item title queries with qrels** and a paired bootstrap; part 6 at **60,000** articles (3x); enwiki part 3 (30,000 articles) whole and as 256-word chunks |
 | `pgweave-20261007-041651-d0de` | `1bd452d` | probes only (`BEIR= WIKIS=`), for probe P8 (doclen through wdoc I/O); P1-P7 reproduce runs 1 and 2 |
 
+## M7 step 2: the re-run after the doclen convention (2026-10-07)
+
+> **Read this before the step-1 numbers below.** Step 2 (`doc/PHASES.md` M7) changed
+> what `to_wdoc(regconfig, text)` stores as the length: it now counts the tokens that
+> produced a lexeme, as a tsvector-derived length does, instead of every token. So the
+> `exact` arm below is no longer "every token, stopwords included" and the step-1
+> **headline 3** (the length-definition effect under `english`) **no longer exists in
+> the product**: it was a disagreement between two input paths, and they now agree. The
+> step-1 tables stand as measurements of the code before step 2.
+
+Run `pgweave-20261007-221700-55a5`, commit `13f675d` (the final C code; later commits on
+`wt/m7` change tests, docs and job scripts only), `c7i.4xlarge`, PostgreSQL 17.11,
+pg_weave 0.30.0, harness `bench/tsvcaps_job.sh` run twice on one host by
+`bench/aws/m7_tsvcaps.sh` (scifact, and enwiki part 6 whole, first 20,000 articles:
+step-1 run 1's sample). Smoke was green on that commit first (regression, isolation, all
+34 TAP files).
+
+**Prediction, written down before the data** (`STATUS.md` on `wt/m7`): with one length
+convention, `tsv` against `exact` must equal step 1's `tsv_vs_sumtf` (the caps alone):
+1.0000 on scifact under both configs, about 0.99 on part 6 whole under `simple`, and
+the stopword-config gap (step 1: 0.9517 scifact, 0.9422 part 6) must close to the caps-only
+figure (step 1: 1.0000 and 0.9965). `sumtf` must now equal `exact` (`||` keeps the
+operands' lengths, and they already agree). `tsvmaxpos`, which pads the length up to the
+last position, must now be the arm that disagrees under `english`.
+
+Top-10 overlap with `exact`, every query (`agree.tsv`, group `all`):
+
+| corpus / cfg | queries | `tsv` run 1 / run 2 | step 1 `tsv` | step 1 `tsv_vs_sumtf` (caps only) | `tsvmaxpos` run 1 / run 2 | `sumtf` | `exact2` | `strip` |
+|---|---:|---|---:|---:|---|---:|---:|---:|
+| scifact / simple | 300 | **1.0000 / 1.0000** | 1.0000 | 1.0000 | 1.0000 / 1.0000 | 1.0000 | 1.0000 | 0.692 / 0.691 |
+| scifact / english | 300 | **1.0000 / 1.0000** | 0.9517 | 1.0000 | 0.9520 / 0.9523 | 1.0000 | 1.0000 | 0.675 / 0.676 |
+| enwiki p6 whole / simple | 550 | **0.9918 / 0.9907** | 0.9916 (60k) | 0.9916 (60k) | 0.9960 / 0.9964 | 1.0000 | 1.0000 | 0.480 / 0.477 |
+| enwiki p6 whole / english | 550 | **0.9965 / 0.9958** | 0.9422 (60k) | 0.9965 (60k) | 0.9436 / 0.9433 | 1.0000 | 1.0000 | 0.456 / 0.455 |
+
+The prediction holds on every row. `tsv` and `tsv_vs_sumtf` are now the same number in
+every group of both runs, because the two arms now define the length the same way. What
+is left is the caps: on whole Wikipedia articles a `tsvector` column ranks at 0.991-0.997
+top-10 overlap with the exact text-derived ranking, and identically on scifact. Paired
+nDCG@10 delta of `tsv` against `exact` (`paired.tsv`): scifact 0 queries changed under
+both configs; p6 +0.0002 (simple) and +0.0003 (english), 1 query changed each, the same in
+both runs.
+
+**What this costs, hard rule 8.** `tsvmaxpos` was step 1's recommended fix for the length
+gap. Under the convention it pads a stopword-free length up to the last position, and so
+it is now the arm that ranks differently under `english` (0.952 scifact, 0.943 p6). The
+maintainer's choice of convention (count lexeme-bearing tokens, Lucene's default) over
+step 1's recommendation (count to the last position) is what makes the two input paths
+agree. Neither arm moves nDCG on scifact beyond its CI.
+
+**Between runs (hard rule 10).** scifact: every arm identical to four decimals in both
+runs, except `strip` (±0.001). p6: `tsv` 0.9918 / 0.9907 under simple and 0.9965 / 0.9958
+under english, and nDCG@10 for `exact` 0.9221 / 0.9115. That spread is not the scan:
+`exact2` is 1.0000 in both runs. **It is the harness, and it was found here:** run 2 reused
+run 1's `.done` marker on the same host, so it read the titles file while the background
+prep was rewriting it in place, and 35 of its 200 title queries came from a different
+article pool (run 1's highest title page id 1,041,588, run 2's 1,022,159). The 350
+df-band and `captf` queries are identical between runs, and on them the spread is
+`tsv` 0.9900 / 0.9886 (simple) and 0.9954 / 0.9943 (english), which is the floor from
+physical row order (step 1, "Between runs"). **Fixed in the harness**: `tsvcaps_job.sh` now
+deletes stale `.done`/`.failed` markers before it starts. Title-query numbers from run 2 are
+from a partly different query set and are not a reproduction; the df-band/`captf` numbers
+and every scifact number are.
+
+Caps measured on the same data (`caps.tsv`, identical in both runs): p6 at 20,000 articles,
+`simple`, 1,124 documents (5.6 %) reach the 255-position tf cap and 12 (0.06 %) the
+16,383-position cap, as in step 1 run 1 (5.58 % / 0.060 %). These are the documents
+`weave_index_tsvector_stats()` counts as `ncapped`.
+
 ## Headline
 
 1. **Chunked corpora lose nothing. The conjecture holds.** On five chunked corpora (scifact,
@@ -318,6 +386,14 @@ after binary `COPY` 3. Nothing raises an error. Under a stopword config, a resto
 measurement was built in place and never went through I/O, so it is not affected.
 
 ## What the operator class should do (input to M7 step 2, not decided here)
+
+> **SUPERSEDED 2026-10-07 by the maintainer's decisions** (`doc/PHASES.md` M7 step 2):
+> item 1 was decided the other way -- stripped and mixed tsvectors are ACCEPTED, with one
+> WARNING at CREATE INDEX and a count from `weave_index_tsvector_stats()`, because
+> refusing would make INSERTs fail once the index exists; item 2 was decided the other
+> way too -- the length counts lexeme-bearing tokens on every path (to_wdoc(regconfig,
+> text) changed to match the tsvector, not the reverse), which the re-run above measures.
+> Item 3 is built. The recommendation is left as written.
 
 Items 1 and 2 are **open maintainer decisions**, recorded in `doc/PHASES.md` M7.
 

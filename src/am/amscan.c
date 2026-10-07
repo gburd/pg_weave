@@ -5561,7 +5561,8 @@ weave_recheck_exact(Relation index, WeaveQuery query, TidSet *set)
 			FormIndexDatum(indexInfo, slot, estate, values, isnull);
 			if (!isnull[lexidx])
 			{
-				doc = (WeaveDoc) PG_DETOAST_DATUM(values[lexidx]);
+				doc = weave_index_lexdoc(index, layout.lexattno,
+										 values[lexidx], NULL);
 				if (weave_doc_matches(doc, query))
 					set->tids[keep++] = set->tids[i];
 			}
@@ -6689,6 +6690,115 @@ weave_index_stats(PG_FUNCTION_ARGS)
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+PG_FUNCTION_INFO_V1(weave_index_tsvector_stats);
+
+/*
+ * weave_index_tsvector_stats(regclass) -> (ndocs, ncapped, npositionless)
+ * (doc/PHASES.md M7).  Over the rows of a tsvector_lex_ops index visible to the
+ * caller's snapshot: how many documents there are, how many reached a core
+ * tsvector cap (a lexeme at 255 positions, or a position at 16,383 -- the exact
+ * set whose BM25 tf or length is approximate, bench/RESULTS_TSVECTOR_CAPS.md),
+ * and how many have a lexeme without positions (stripped or mixed).
+ *
+ * WHY A HEAP SCAN AND NOT A COUNTER.  A counter kept in the index would have to
+ * be decremented when VACUUM tombstones a document, and VACUUM sees a docid and
+ * a "dead" verdict, never the document -- so it cannot know whether the row it
+ * removes was capped, short of storing a per-docid flag that every bolt, merge
+ * and pending page would have to carry (a format change for a diagnostic).
+ * Scanning the heap through the index's own expression and predicate
+ * (FormIndexDatum, the same conversion the build ran) is exact under MVCC by
+ * construction: a deleted row is gone from the answer the moment its delete
+ * commits, before any VACUUM.  The cost is O(heap), which is what an occasional
+ * diagnostic may cost.  ndocs counts non-NULL documents, so it equals the
+ * index's BM25 N once VACUUM has removed the dead rows.
+ */
+Datum
+weave_index_tsvector_stats(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	Relation	index;
+	Relation	heap;
+	WeaveIndexLayout layout;
+	IndexInfo  *indexInfo;
+	EState	   *estate;
+	ExprContext *econtext;
+	ExprState  *pred;
+	TupleTableSlot *slot;
+	TableScanDesc scan;
+	TupleDesc	tupdesc;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	Datum		out[3];
+	bool		outnull[3] = {false, false, false};
+	int64		ndocs = 0,
+				ncapped = 0,
+				nposless = 0;
+	int			lexidx;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	index = index_open(indexoid, AccessShareLock);
+	if (index->rd_rel->relam != get_index_am_oid("weave", true))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a weave index",
+						RelationGetRelationName(index))));
+	weave_index_layout(index, &layout);
+	if (!weave_index_lex_is_tsvector(index, layout.lexattno))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("index \"%s\" does not index a tsvector column",
+						RelationGetRelationName(index)),
+				 errhint("weave_index_tsvector_stats() applies to an index whose lexical column uses tsvector_lex_ops.")));
+	lexidx = layout.lexattno - 1;
+
+	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+	indexInfo = BuildIndexInfo(index);
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	slot = table_slot_create(heap, NULL);
+	econtext->ecxt_scantuple = slot;
+	pred = indexInfo->ii_Predicate != NIL
+		? ExecPrepareQual(indexInfo->ii_Predicate, estate) : NULL;
+	scan = table_beginscan(heap, GetActiveSnapshot(), 0, NULL);
+
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (pred == NULL || ExecQual(pred, econtext))
+		{
+			FormIndexDatum(indexInfo, slot, estate, values, isnull);
+			if (!isnull[lexidx])
+			{
+				struct varlena *tsv = PG_DETOAST_DATUM(values[lexidx]);
+				uint32		f = weave_tsvector_flags(tsv);
+
+				ndocs++;
+				if (f & WEAVE_TSV_CAPPED)
+					ncapped++;
+				if (f & WEAVE_TSV_POSITIONLESS)
+					nposless++;
+				if ((Pointer) tsv != DatumGetPointer(values[lexidx]))
+					pfree(tsv);
+			}
+		}
+		ResetExprContext(econtext);
+	}
+
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+	table_close(heap, AccessShareLock);
+	index_close(index, AccessShareLock);
+
+	out[0] = Int64GetDatum(ndocs);
+	out[1] = Int64GetDatum(ncapped);
+	out[2] = Int64GetDatum(nposless);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, out, outnull)));
 }
 
 PG_FUNCTION_INFO_V1(weave_index_df);

@@ -91,7 +91,7 @@ DROP TABLE docs;
 SELECT to_wdoc('english'::regconfig, 'running the races quickly');
 -- stopwords ('the','a','of') are removed by the english dictionary
 SELECT to_wdoc('english'::regconfig, 'the cat and a dog');
--- doclen counts positions produced by the parser (stopwords still counted)
+-- doclen counts tokens that produced a lexeme (stopwords do not count, M7)
 SELECT wdoc_length(to_wdoc('english'::regconfig, 'the quick brown fox'));
 -- stemming makes a query match across inflections
 SELECT to_wdoc('english'::regconfig, 'the foxes were running')

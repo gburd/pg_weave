@@ -67,9 +67,10 @@ typedef struct WeaveDocData
 	uint16		version;		/* format version, currently 3 */
 	uint16		flags;			/* WEAVE_DOCF_* */
 	uint32		nterms;			/* number of distinct terms */
-	uint32		doclen;			/* BM25 length: tokens, stopwords included, for a
-								 * regconfig analyzer; else the sum of tf.  Always
-								 * >= every tf (doc/GAPS.md G90) */
+	uint32		doclen;			/* BM25 length: the number of tokens that produced
+								 * a lexeme, on every input path (doc/PHASES.md M7;
+								 * weave_doc_default_len).  Always >= every tf
+								 * (doc/GAPS.md G90) */
 	uint32		lexbytes;		/* total bytes of lexemes[] (to find positions[]) */
 	WeaveTermEntry entries[FLEXIBLE_ARRAY_MEMBER];
 } WeaveDocData;
@@ -160,6 +161,14 @@ typedef struct WeaveQueryItem
 #define WEAVE_POS_LABEL(p)	((uint8) ((p) >> WEAVE_POS_LABEL_SHIFT))	/* 0..3 */
 #define WEAVE_POS_ORD(p)		((p) & WEAVE_POS_ORD_MASK)
 #define WEAVE_POS_MAKE(ord, lbl)	(((uint32)(lbl) << WEAVE_POS_LABEL_SHIFT) | ((ord) & WEAVE_POS_ORD_MASK))
+/*
+ * Ordinal 0 is "this occurrence's position is unknown" (doc/PHASES.md M7): what
+ * a positionless entry of a MIXED tsvector becomes, so the rest of the document
+ * keeps its positions.  Analyzers number tokens from 1, so 0 is free.  It sorts
+ * first in a term's list and may repeat (a || of two such terms), it never
+ * takes part in adjacency, and it is in no weight zone.
+ */
+#define WEAVE_POS_UNKNOWN		0u
 /* Map a weight char A/B/C/D (any case) to its 0..3 label; D/unknown -> 0. */
 #define WEAVE_WEIGHT_LABEL(c) \
 	(((c)=='A'||(c)=='a') ? 3 : ((c)=='B'||(c)=='b') ? 2 : ((c)=='C'||(c)=='c') ? 1 : 0)
@@ -208,6 +217,17 @@ extern WeaveDoc weave_doc_build(uint32 nterms, char **terms, const int *lens,
 							const uint32 *tfs, bool has_pos,
 							const uint32 *positions, int64 doclen,
 							const char *errctx);
+/* to_wdoc(tsvector) and the tsvector_lex_ops index boundary (tsanalyze.c);
+ * the argument is a detoasted TSVector, void here so this header does not
+ * pull in tsearch/ts_type.h (core's TSVectorData has no struct tag) */
+#define WEAVE_TSV_POSITIONLESS	0x01	/* some lexeme has no positions */
+#define WEAVE_TSV_CAPPED		0x02	/* some lexeme at 255 positions, or a
+										 * position at 16,383 */
+extern WeaveDoc weave_doc_from_tsvector(const void *tsv, uint32 *tsvflags);
+extern uint32 weave_tsvector_flags(const void *tsv);
+extern uint64 weave_doc_default_len(uint32 nterms, const uint32 *tfs, bool has_pos,
+									 const uint32 *positions);
+extern uint64 weave_doc_default_len_of(WeaveDoc doc);
 extern char *weave_normalize_term(Oid cfgId, const char *term, int len, int *outlen);
 
 /* pg_weave_query.c -- parse query text into an wquery */

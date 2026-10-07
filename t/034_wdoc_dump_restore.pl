@@ -29,24 +29,25 @@ $node->start;
 $node->safe_psql('postgres', 'CREATE DATABASE src');
 $node->safe_psql('src', 'CREATE EXTENSION pg_weave');
 
-# Short english docs (stopwords: length != sum of tf), long docs past 16,383
+# Short english docs with stopwords, long docs past 16,383 lexeme-bearing
 # tokens with recurring terms (the G89 shape), weighted concatenations.  Every
-# document has a distinct length, so no two BM25 scores tie and the top-k order
-# is fully determined.
+# document has a distinct length (doclen counts tokens that produced a lexeme,
+# doc/PHASES.md M7: g + g % 5 is injective), so no two BM25 scores tie and the
+# top-k order is fully determined.
 $node->safe_psql('src', q{
 	CREATE TABLE docs (id int PRIMARY KEY, d wdoc);
 	INSERT INTO docs
 	  SELECT g, to_wdoc('english',
-	                    'the vacuum of the ' || repeat('the ', g) || repeat('lock ', g % 5)
+	                    'the vacuum of the ' || repeat('the bolt ', g) || repeat('lock ', g % 5)
 	                    || 'is a common' || (g % 7) || ' tag' || g)
 	    FROM generate_series(1, 300) g;
 	INSERT INTO docs
 	  SELECT 1000 + g, to_wdoc('english',
-	                    repeat('the vacuum runs on a lock ', 3000 + 400 * g))
+	                    repeat('the vacuum runs on a lock ', 6000 + 400 * g))
 	    FROM generate_series(1, 4) g;
 	INSERT INTO docs
 	  SELECT 2000 + g, to_wdoc('english', 'vacuum lock ' || g, 'A')
-	                   || to_wdoc('english', repeat('the vacuum ', 9000 + g), 'C')
+	                   || to_wdoc('english', repeat('the vacuum ', 17000 + g), 'C')
 	    FROM generate_series(1, 3) g;
 	CREATE INDEX docs_w ON docs USING weave (d) WITH (positions = on);
 });
@@ -57,7 +58,7 @@ is($nlong, '7', 'control: seven source documents are longer than 16,383 tokens')
 my $nstop = $node->safe_psql('src',
 	q{SELECT count(*) FROM docs WHERE id <= 300
 	   AND wdoc_length(d) <> wdoc_length(d::text::wdoc)});
-is($nstop, '0', 'the text form keeps the stopword-inclusive length (G90)');
+is($nstop, '0', 'the text form keeps the length (G90)');
 
 # What the source answers, before anything moves.
 my $fingerprint = q{

@@ -4371,6 +4371,13 @@ static const struct
 	WeaveWeftKind kind;
 }			weave_opfamily_kinds[] = {
 	{"wdoc_lex_ops", WEAVE_WK_LEXICAL},
+	/*
+	 * M7 (ext 0.30.0): the same lexical channel over a tsvector column.  The
+	 * value is converted to a wdoc at the index boundary (weave_index_lexdoc),
+	 * so nothing past that point knows the column was a tsvector.  Named for
+	 * the type, like the docval families, because what differs is the input.
+	 */
+	{"tsvector_lex_ops", WEAVE_WK_LEXICAL},
 	{"wvec_weave_ops", WEAVE_WK_VECTOR},
 	/*
 	 * Z8.  `gram_ops` keeps the short name rather than becoming
@@ -4452,7 +4459,7 @@ weave_opfamily_kind(Oid opfamilyoid)
 				 errmsg("operator family \"%s\" is not a pg_weave channel family",
 						opfname),
 				 errdetail("The \"weave\" access method routes each index column to a retrieval channel by its operator class."),
-				 errhint("Use wdoc_lex_ops for a wdoc column, wvec_weave_ops for a wvec column, or gram_ops for a text column.")));
+				 errhint("Use wdoc_lex_ops for a wdoc column, tsvector_lex_ops for a tsvector column, wvec_weave_ops for a wvec column, or gram_ops for a text column.")));
 	return kind;
 }
 
@@ -4580,6 +4587,32 @@ weave_index_layout(Relation index, WeaveIndexLayout *out)
 				 errmsg("a weave index requires a lexical column"),
 				 errdetail("Every channel shares the document-id space that the lexical column's build assigns."),
 				 errhint("Add a wdoc column with wdoc_lex_ops as the first index column.")));
+}
+
+/* See the declarations in weave/am.h. */
+bool
+weave_index_lex_is_tsvector(Relation index, AttrNumber lexattno)
+{
+	return TupleDescAttr(RelationGetDescr(index), lexattno - 1)->atttypid ==
+		TSVECTOROID;
+}
+
+WeaveDoc
+weave_index_lexdoc(Relation index, AttrNumber lexattno, Datum value,
+				   uint32 *tsvflags)
+{
+	if (weave_index_lex_is_tsvector(index, lexattno))
+	{
+		struct varlena *tsv = PG_DETOAST_DATUM(value);
+		WeaveDoc	doc = weave_doc_from_tsvector(tsv, tsvflags);
+
+		if ((Pointer) tsv != DatumGetPointer(value))
+			pfree(tsv);
+		return doc;
+	}
+	if (tsvflags)
+		*tsvflags = 0;
+	return (WeaveDoc) PG_DETOAST_DATUM(value);
 }
 
 /*

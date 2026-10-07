@@ -240,23 +240,23 @@ DROP TABLE docs;
 -- analyzer reusing an installed text search configuration.
 -- english config stems and drops stopwords: 'running the races' -> run, race
 SELECT to_wdoc('english'::regconfig, 'running the races quickly');
-               to_wdoc               
--------------------------------------
- 'quick':1@4 'race':1@3 'run':1@1 |4
+             to_wdoc              
+----------------------------------
+ 'quick':1@4 'race':1@3 'run':1@1
 (1 row)
 
 -- stopwords ('the','a','of') are removed by the english dictionary
 SELECT to_wdoc('english'::regconfig, 'the cat and a dog');
-        to_wdoc         
-------------------------
- 'cat':1@2 'dog':1@5 |5
+       to_wdoc       
+---------------------
+ 'cat':1@2 'dog':1@5
 (1 row)
 
--- doclen counts positions produced by the parser (stopwords still counted)
+-- doclen counts tokens that produced a lexeme (stopwords do not count, M7)
 SELECT wdoc_length(to_wdoc('english'::regconfig, 'the quick brown fox'));
  wdoc_length 
 -------------
-           4
+           3
 (1 row)
 
 -- stemming makes a query match across inflections
@@ -4447,9 +4447,9 @@ SELECT wdoc_length(to_wdoc('short ' || repeat('x', 3000))) AS long_token_dropped
 -- simple vs english analyzer differ on stemming/stopwords
 SELECT to_wdoc('simple','The Running Foxes')::text AS simple_doc,
        to_wdoc('english','The Running Foxes')::text AS english_doc;
-             simple_doc              |      english_doc       
--------------------------------------+------------------------
- 'foxes':1@3 'running':1@2 'the':1@1 | 'fox':1@3 'run':1@2 |3
+             simple_doc              |     english_doc     
+-------------------------------------+---------------------
+ 'foxes':1@3 'running':1@2 'the':1@1 | 'fox':1@3 'run':1@2
 (1 row)
 
 -- ============================================================================
@@ -5702,9 +5702,9 @@ SELECT to_wdoc('english','Vacuum contention','A')::text AS subj_A;
 (1 row)
 
 SELECT (to_wdoc('english','vacuum lock','A') || to_wdoc('english','the vacuum runs','C'))::text AS concat_shared;
-               concat_shared                
---------------------------------------------
- 'lock':1@2A 'run':1@5C 'vacuum':2@1A,4C |5
+              concat_shared              
+-----------------------------------------
+ 'lock':1@2A 'run':1@5C 'vacuum':2@1A,4C
 (1 row)
 
 SELECT setwdocweight(to_wdoc('english','vacuum'),'B')::text AS relabelled;

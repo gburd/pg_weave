@@ -6319,3 +6319,18 @@ Nothing reached this before G88 (no SQL path ran TRE). Not fixed in TRE: the com
 handle's `params_depth` is checked after compile (`src/query/pattern_cache.c`) and a pattern
 over three is refused with `ERRCODE_PROGRAM_LIMIT_EXCEEDED` before it is cached or matched.
 
+
+### G93 — the `tsquery -> wquery` cast drops a lexeme's weight restriction and its prefix flag: `'fox:A'::tsquery::wquery` matches `fox` in every zone, and `'fo:*'::tsquery::wquery` asks for the exact term `fo` — **FOUND 2026-10-07 by M7 step 2's `sql/tsvector_input.sql` (a weight test written through the cast answered `t` where `term:A` answers `f`); OPEN**
+
+`tsquery_to_wquery()` (`src/util/migrate.c`, `mig_walk`) copies each `QueryOperand`'s
+lexeme and ignores `weight` and `prefix`. So the cast is lossy in both directions: a
+weighted lexeme OVER-matches (every zone instead of one), and a prefix lexeme
+UNDER-matches (one exact term instead of every completion). The second is a silently
+dropped row, the hard-rule-1 class. Neither is reported. Found because the M7 test first
+wrote its weight-zone check as `'tag:A'::tsquery::wquery` and got `t` on a document whose
+`tag` has no zone; rewritten with wquery's own `'tag:A'::wquery`, which answers `f`.
+
+Fix: map `weight` to `WEAVE_QF_WEIGHTED` with the mask in `distance` (the native parser's
+encoding, `src/query/parse.c` near "weightmask"), and `prefix` to `WEAVE_QF_PREFIX`, or
+refuse either with an error rather than drop it. Not done on `wt/m7`: it is outside M7 and
+the cast is M3's surface (core's `@@` with tsquery).
