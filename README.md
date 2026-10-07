@@ -9,7 +9,7 @@ be indexed as a facet too. Every channel in a segment shares one document-id spa
 selective filter (a lexical term, or a facet such as `price < 100`) skips vector work
 inside the scan instead of filtering rows after it.
 
-**Status: 0.29.0, pre-1.0, not production-ready.** All six retrieval kinds ship. The
+**Status: 0.30.0, pre-1.0, not production-ready.** All six retrieval kinds ship. The
 fuzzy/n-gram (Z) and vector (V) phase gates are not met, the fused-ranking gate passes two
 of its five rows, and several measured results are losses, listed below.
 `doc/PRODUCTION_READINESS.md` is the gate list and `doc/GAPS.md` lists the known defects.
@@ -180,8 +180,12 @@ Limits you will meet:
   exact top-k, take a wider index top-k and re-sort it by `emb <-> q` in an outer query.
 - **Cosine is refused.** `WITH (metric = 'cosine')` fails with a hint to normalize the
   vectors and use `metric = 'ip'`. L1 is refused as well.
-- **An index needs a `wdoc` column**, and holds at most one vector, one `gram_ops` and one
-  docvalues column. Docvalues operator classes exist for `int2`, `int4`, `int8`, `float8`,
+- **An index needs a lexical column**: a `wdoc`, or an existing `tsvector` with
+  `tsv tsvector_lex_ops` (converted at the index boundary; query it with `'...'::wquery`, since
+  core's deprecated `@@@ (tsvector, tsquery)` makes a bare literal ambiguous). BM25 from a
+  tsvector is exact below its caps (255 positions per lexeme, position 16,383);
+  `weave_index_tsvector_stats()` counts the documents above them. It holds at most one
+  vector, one `gram_ops` and one docvalues column. Docvalues operator classes exist for `int2`, `int4`, `int8`, `float8`,
   `date`, `bool` and `text`.
 - **`to_wdoc(text)` only lowercases and splits.** For stemming and stopwords use
   `to_wdoc('english', text)`, or `to_wdoc(tsvector)`. Fuzzy, prefix and regex terms are
