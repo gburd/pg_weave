@@ -6,6 +6,7 @@ Debian instance.
 
   tsvcaps.py wiki URL OUT [--limit N] [--chunk W --chunk-out OUT2] [--cache DIR]
   tsvcaps.py agree RUN_A RUN_B [--groups QID_GROUP.tsv] [--label L]
+  tsvcaps.py paired QRELS RUN_A RUN_B [--label L]
 
 Downloads one enwiki `pages-articles-multistream<k>.xml-p<a>p<b>.bz2` part
 (cached under --cache), keeps main-namespace non-redirect pages, strips the
@@ -178,6 +179,30 @@ def cmd_agree(a):
               % (a.label, g, n, o10 / n, o100 / n, same / n))
 
 
+def cmd_paired(a):
+    """Per-query nDCG@10 difference B - A, with a seeded paired bootstrap 95 %
+    interval over queries.  Uses bench/ndcg.py's own metric, so the number is
+    the one quality.tsv reports, only paired."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ndcg
+    import random
+    qrels = ndcg.read_qrels(a.qrels)
+    ra, rb = ndcg.read_run(a.run_a), ndcg.read_run(a.run_b)
+    d = []
+    for q, j in qrels.items():
+        if not any(r > 0 for r in j.values()):
+            continue
+        xa = ndcg.ndcg_at_k([x for _, x in ra.get(q, [])], j, 10)
+        xb = ndcg.ndcg_at_k([x for _, x in rb.get(q, [])], j, 10)
+        d.append(xb - xa)
+    n = len(d)
+    rng = random.Random(1)
+    means = sorted(sum(rng.choice(d) for _ in range(n)) / n for _ in range(2000))
+    print("%s\t%d\t%d\t%+.4f\t%+.4f\t%+.4f"
+          % (a.label, n, sum(1 for x in d if x != 0), sum(d) / n,
+             means[49], means[1949]))
+
+
 def main():
     p = argparse.ArgumentParser()
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -193,7 +218,14 @@ def main():
     g.add_argument("run_b")
     g.add_argument("--groups", default="")
     g.add_argument("--label", default="agree")
+    pr = sp.add_parser("paired")
+    pr.add_argument("qrels")
+    pr.add_argument("run_a")
+    pr.add_argument("run_b")
+    pr.add_argument("--label", default="paired")
     a = p.parse_args()
+    if a.cmd == "paired":
+        cmd_paired(a)
     if a.cmd == "agree":
         cmd_agree(a)
     if a.cmd == "wiki":
