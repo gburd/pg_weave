@@ -285,6 +285,10 @@ indexed by default, so the index only sees tf and length.
 
 ## wdoc round trip (side finding, outside M7: `doc/GAPS.md` G89 and G90)
 
+> **FIXED 2026-10-07 on `wt/g89`** (both gaps; run `pgweave-20261007-140258-8e42`). The
+> measurements below are of the code before that fix and stand as written. See the "Fix"
+> notes in `doc/GAPS.md` G89 and G90.
+
 `to_wdoc(regconfig, text)` stores parsetext's `LIMITPOS`'d positions, so every token past
 16,383 gets position 16383 and a term that recurs there gets **duplicate** positions.
 `weave_doc_build` (`src/query/doc.c:165`) rejects a non-ascending position list. Both
