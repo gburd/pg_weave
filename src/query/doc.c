@@ -1033,8 +1033,8 @@ weave_doc_has_regex(WeaveDoc doc, const char *re, int relen)
 			{
 				if (wbuf)
 					pfree(wbuf);
-				wcap = Max(len + 1, 64);	/* alloc-ok: one term, bounded by the varlena */
-				wbuf = palloc(wcap * sizeof(pg_wchar));
+				wcap = Max(len + 1, 64);
+				wbuf = palloc(wcap * sizeof(pg_wchar));	/* alloc-ok: one term's characters, bounded by the term's own byte length */
 			}
 			found = weave_approx_regex_match(h, WEAVE_DOC_TERMTEXT(doc, &entries[i]),
 											 len, wbuf);
