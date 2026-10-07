@@ -15,39 +15,45 @@ script`. Smoke (regression, isolation, all 33 TAP files) was green before each r
 ## Headline
 
 1. **Chunked corpora lose nothing. The conjecture holds.** On five chunked corpora (scifact,
-   nfcorpus, fiqa, Wikipedia in 400-word windows, Wikipedia in 256-word windows), the
-   caps bite on at most 1 document in 57,600 (fiqa) and 1 in 195,069 (Wikipedia chunks).
-   Under the `simple` config the tsvector-derived ranking is the exact ranking: top-10
-   overlap 1.0000 on scifact and nfcorpus, 0.9995 on fiqa and 0.9993 on Wikipedia chunks,
-   and nDCG@10 is identical to four decimals.
-2. **Whole long documents lose, and how often depends on the corpus.** Whole Wikipedia
-   articles: **33.5 %** of enwiki part 1 (old, long, heavily edited articles) and **5.5 %**
-   of part 6 have a lexeme past the 255-position tf cap. **0.82 %** and **0.05 %** pass
-   position 16,383, and for those documents a tsvector-derived length averages **0.82x**
-   (part 1) and **0.76x** (part 6) of the true length. Top-10 overlap with exact BM25 falls
-   to **0.978** (part 1) and **0.989** (part 6). Only 38 % and 68 % of queries keep an
-   identical top-10. On known-item title queries the nDCG@10 cost is **-0.0048** (95 %
-   CI -0.014 .. +0.001, 4 of 199 queries changed): visible in the ranking, but within
-   noise for that query set.
+   nfcorpus, fiqa, Wikipedia part 1 in 400-word windows, Wikipedia part 3 in 256-word
+   windows), the caps bite on at most 1 document in 57,600 (fiqa), 1 in 195,069 (400-word
+   chunks) and 0 in 257,686 (256-word chunks). Under the `simple` config the
+   tsvector-derived ranking is the exact ranking: top-10 overlap 1.0000 on scifact,
+   nfcorpus and 256-word chunks, 0.9994 on fiqa and 0.9992 on 400-word chunks, and the
+   paired nDCG@10 delta is 0.0000 on all five.
+2. **Whole long documents lose, and how often depends on the corpus.** Of whole Wikipedia
+   articles (`simple`), **33.5 %** of enwiki part 1 (old, long, heavily edited articles),
+   **16.9 %** of part 3 and **5.5 %** of part 6 have a lexeme that hits the 255-position tf
+   cap. **0.82 % / 0.19 % / 0.05 %** pass position 16,383, and for those documents a
+   tsvector-derived length averages **0.76-0.82x** of the true length. Top-10 overlap with
+   exact BM25 falls to **0.976 / 0.985 / 0.992**, and only **36 % / 56 % / 71 %** of
+   queries keep an identical top-10. On known-item title queries the nDCG@10 change is
+   **-0.0048** on part 1 (95 % CI -0.014 .. +0.001, 4 of 199 queries changed), and
+   -0.0002 and +0.0013 on parts 6 and 3. Every CI spans zero. **The loss shows in the
+   ranking but not in a quality metric**, at the 200-query resolution this measurement
+   has. That is the hard-rule-8 headline: tsvector input is inexact on whole long
+   documents, and nobody can tell that from nDCG alone.
 3. **Under a stopword config the biggest effect is not a cap.** It is the definition of
    document length. `to_wdoc(regconfig, text)` counts every token, stopwords included.
    A tsvector cannot: it stores no length, and `to_wdoc(tsvector)` uses the sum of
    position counts, which leaves stopwords out (`english`: stopwords are 32 % of tokens
-   on scifact and 48 % on fiqa). That changes top-10 on **4-11 % of the results** even on short
-   passages (overlap 0.89-0.96). It is **quality-neutral** on all three BEIR sets
-   (paired nDCG delta +0.0005 / -0.0014 / +0.0004, every CI spans 0), but it is a
-   different ranking. Defining length as **the last position** instead (arm
-   `tsvmaxpos`) removes almost all of the difference: overlap 0.994-0.9997.
+   on scifact and 48 % on fiqa). That changes **4-12 % of top-10 results** even on short
+   passages and chunks (overlap 0.88-0.96). It is **quality-neutral** on all five chunked
+   corpora (paired nDCG@10 delta between -0.0014 and +0.0048, every CI spans 0), but it
+   is a different ranking. Defining length as **the last position** instead (arm
+   `tsvmaxpos`) removes most of the difference: overlap 0.977-0.9997 on chunks, 0.994-0.998
+   on whole articles.
 4. **Side finding, a real bug outside M7: a `wdoc` with more than 16,383 tokens cannot be
-   read back.** See "wdoc round trip" below. **172 of 172** such articles in enwiki
-   part 1 fail `d::text::wdoc`, and so do text `COPY` and binary `COPY`, which means
-   `pg_dump`/restore of a stored `wdoc` column breaks on them.
+   read back.** See "wdoc round trip" below. Every such article fails `d::text::wdoc`: **260 of 260**
+   across three Wikipedia parts under `simple` (259 under `english`). Text `COPY` and
+   binary `COPY` fail the same way, which means `pg_dump`/restore of a stored `wdoc`
+   column breaks on them.
 
 **Is option 1 sound?** Yes for chunked or short documents, the RAG case. **Not exact**
 for documents over ~16k tokens, and **not exact for tf** once any lexeme in a document
 repeats more than 255 times, which happens in Wikipedia-length articles (>2,000
 tokens) and not in chunks. A stripped tsvector is unsound for BM25 (positive control
-below: -0.03 to -0.07 nDCG@10 on BEIR, -0.49 on title queries). The operator class
+below: -0.03 to -0.07 nDCG@10 on BEIR, -0.24 to -0.52 on title queries). The operator class
 should do three things: (a) **refuse** a stripped tsvector, or a mixed one with some
 positionless entries, because it cannot carry tf; (b) **count and expose** documents
 where a lexeme reached 255 positions or a position reached 16,383, since only those are
@@ -105,8 +111,7 @@ anywhere.
 
 ## Measure 1: how often a cap bites
 
-Run 2 (part 6 at 60k; run 1's 20k sample gave 5.58 % / 0.060 %, the same to two
-significant figures):
+Run 2 (part 6 at 60k articles; run 1's 20k sample gave 5.58 % / 0.060 %):
 
 | corpus | docs | tokens/doc avg / p99 / max | any lexeme at 255 positions (`simple`) | any position at 16,383 | `to_tsvector` errors (1 MB) | largest tsvector |
 |---|---:|---|---:|---:|---:|---:|
@@ -114,17 +119,17 @@ significant figures):
 | nfcorpus | 3,633 | 245 / 463 / 1,544 | 0 | 0 | 0 | 12 kB |
 | fiqa | 57,600 | 137 / 662 / 3,091 | **1** (0.002 %) | 0 | 0 | 15 kB |
 | enwiki p1, 400-word chunks | 195,069 | 387 / 454 / 1,315 | **1** (0.0005 %) | 0 | 0 | 6.6 kB |
+| enwiki p3, 256-word chunks | 257,686 | 246 / 295 / 790 | 0 | 0 | 0 | 5.4 kB |
 | enwiki p1, whole | 20,913 | 3,606 / 16,023 / 34,276 | **6,998 (33.5 %)** | **172 (0.82 %)** | 0 | 132 kB |
-| enwiki p6, whole | 60,000 | 1,139 (run 1) / 7,404 (run 1) / 26,942 (run 1) | **3,306 (5.5 %)** | **32 (0.053 %)** | 0 | 207 kB |
+| enwiki p3, whole (first 30,000) | 30,000 | 2,116 / 11,339 / 48,143 | **5,067 (16.9 %)** | **56 (0.19 %)** | 0 | 139 kB |
+| enwiki p6, whole (first 60,000) | 60,000 | 1,116 / 7,346 / 43,291 | **3,306 (5.5 %)** | **32 (0.053 %)** | 0 | 207 kB |
 
-PART 3 ROWS: TO FILL FROM RUN 2.
-
-Under `english` the tf cap bites less (7.1 % / 0.37 %), because the lexemes that
-repeat 255 times are mostly stopwords. The position cap is the same, because positions
+Under `english` the tf cap bites less (7.1 % / 1.5 % / 0.37 % on p1 / p3 / p6), because
+the lexemes that repeat 255 times are mostly stopwords. The position cap is the same, because positions
 count stopwords.
 
 **The 1 MB limit was never reached.** The largest tsvector on any corpus was 207 kB,
-from a 291 kB article. Probe P3 shows where the limit is: 40,000 distinct 32-character
+from a 291 kB article (p6). Probe P3 shows where the limit is: 40,000 distinct 32-character
 tokens (1.45 MB of lexeme and position data) fail with `string is too long for tsvector
 (1450948 bytes, max 1048575 bytes)`. Positions per lexeme are capped, and past 16,383
 they collapse, so a real document reaches the limit mainly through distinct-lexeme bytes:
@@ -132,9 +137,9 @@ it needs a vocabulary of about 1 MB in one document. No article came within 5x o
 any document that large has long since crossed the position cap.
 
 **Past 16,383 tokens the length is wrong by a lot.** Averaged over the documents that
-cross it, `to_wdoc(tsv)` reports 0.82x (p1) and 0.76x (p6) of the true length under
-`simple`, and 0.58x / 0.57x under `english`. With `tsvmaxpos` it is 0.89x / 0.82x: the
-last position is 16,383 no matter how long the document is, so beyond that point no
+cross it, `to_wdoc(tsv)` reports 0.82x / 0.78x / 0.76x (p1 / p3 / p6) of the true length under
+`simple`, and 0.58x / 0.56x / 0.57x under `english`. With `tsvmaxpos` it is 0.89x / 0.84x
+/ 0.82x: the last position is 16,383 no matter how long the document is, so beyond that point no
 derivation can recover the length. Probe P2 (30,000 tokens, 1,000 words x 30): the
 tsvector keeps 17,382 positions. That is 16,383 real ones plus one collapsed
 occurrence per lexeme, and every lexeme's tf comes out as 17 or 18 instead of 30.
@@ -161,47 +166,66 @@ Recall@100 behaves the same way (`quality.tsv`): `tsv` within 0.003 of exact eve
 |---|---:|---:|---|---|---|
 | enwiki p1 whole / simple | 0.8904 | 0.8856 | -0.0048 (-0.0141 .. +0.0010), 4 | -0.0036 (-0.0117 .. +0.0011) | **-0.491** (-0.551 .. -0.430) |
 | enwiki p1 whole / english | 0.8808 | 0.8735 | -0.0074 (-0.0184 .. +0.0006), 7 | -0.0036 (-0.0117 .. +0.0011) | **-0.524** (-0.584 .. -0.460) |
+| enwiki p3 whole / simple | 0.8555 | 0.8568 | +0.0013 (-0.0001 .. +0.0034), 4 | 0 | **-0.424** (-0.487 .. -0.361) |
+| enwiki p3 whole / english | 0.8448 | 0.8465 | +0.0017 (-0.0076 .. +0.0103), 12 | 0 | **-0.455** (-0.523 .. -0.390) |
+| enwiki p6 whole / simple | 0.9320 | 0.9318 | -0.0002 (-0.0006 .. 0), 1 | 0 | **-0.283** (-0.336 .. -0.231) |
+| enwiki p6 whole / english | 0.9082 | 0.9125 | +0.0043 (0 .. +0.0100), 3 | 0 | **-0.296** (-0.349 .. -0.245) |
+| enwiki p1 400-word chunks / simple | 0.6784 | 0.6784 | 0 (0 changed) | 0 | **-0.331** (-0.373 .. -0.293) |
+| enwiki p1 400-word chunks / english | 0.6833 | 0.6841 | +0.0008 (-0.0048 .. +0.0066), 83 | -0.0009 (-0.0031 .. +0.0012) | **-0.352** (-0.393 .. -0.311) |
+| enwiki p3 256-word chunks / simple | 0.6591 | 0.6591 | 0 (0 changed) | 0 | **-0.248** (-0.285 .. -0.212) |
+| enwiki p3 256-word chunks / english | 0.6473 | 0.6521 | +0.0048 (-0.0025 .. +0.0115), 85 | -0.0002 (-0.0019 .. +0.0014) | **-0.236** (-0.273 .. -0.200) |
 
-P6, P1-CHUNKS, P3 ROWS: TO FILL FROM RUN 2.
+(A chunked corpus scores lower because every chunk of the article counts as relevant, so
+the ideal top-10 is ten chunks of one article, which BM25 on a title rarely returns.)
 
-The direction is consistently negative on whole long documents, and no CI excludes
-zero at 199 queries. Known-item title queries are a forgiving test: the article that
+The sign is negative only on part 1, the corpus where the caps bite most, and no CI
+excludes zero at about 200 queries. p6 / english's lower bound is exactly 0, which
+means a *gain* of 0.0043 from 3 changed queries. Known-item title queries are a forgiving test: the article that
 carries the title usually wins by a wide margin, so a rank change below position 1
 rarely moves nDCG. The overlap numbers below show how much the ranking actually moves.
 
-### Rank agreement with `exact` (no qrels; every query), run 1
+### Rank agreement with `exact` (no qrels; every query), run 2
 
 `ov10` = mean |top-10 ∩ exact top-10| / 10, `same10` = share of queries whose top-10
-is the same list in the same order.
+is the same list in the same order. On Wikipedia the query set is the df-band queries,
+`captf`, and the title queries (`agree.tsv` has every group separately).
 
 | corpus / cfg | queries | `tsv` ov10 / same10 | `tsv_vs_sumtf` (caps only) ov10 | `tsvmaxpos` ov10 / same10 | `strip` ov10 | `exact2` ov10 |
 |---|---:|---|---:|---|---:|---:|
 | scifact / simple | 300 | 1.0000 / 1.000 | 1.0000 | 1.0000 / 1.000 | 0.691 | 1.0000 |
-| scifact / english | 300 | 0.9517 / 0.107 | 1.0000 | 0.9997 / 0.997 | 0.672 | 1.0000 |
-| nfcorpus / simple | 296 | 1.0000 / 1.000 | 1.0000 | 1.0000 / 1.000 | 0.637 | 1.0000 |
-| nfcorpus / english | 306 | 0.9624 / 0.232 | 1.0000 | 0.9997 / 0.987 | 0.635 | 1.0000 |
-| fiqa / simple | 648 | 0.9995 / 0.982 | 0.9995 | 1.0000 / 1.000 | 0.543 | 1.0000 |
-| fiqa / english | 648 | 0.8903 / 0.006 | 1.0000 | 0.9940 / 0.816 | 0.489 | 1.0000 |
-| enwiki p1 400-word chunks / simple | 300 | 0.9993 / 0.963 | 0.9993 | 1.0000 / 1.000 | 0.353 | 1.0000 |
-| enwiki p1 400-word chunks / english | 300 | 0.9013 / 0.047 | 1.0000 | 0.9760 / 0.523 | 0.329 | 1.0000 |
-| **enwiki p1 whole / simple** | 350 | **0.9783 / 0.380** | **0.9783** | 0.9946 / 0.823 | 0.429 | 1.0000 |
-| **enwiki p1 whole / english** | 350 | **0.9506 / 0.163** | **0.9934** | 0.9949 / 0.797 | 0.406 | 1.0000 |
-| **enwiki p6 whole / simple** | 350 | **0.9894 / 0.677** | **0.9894** | 0.9954 / 0.883 | 0.459 | 1.0000 |
-| **enwiki p6 whole / english** | 350 | **0.9394 / 0.163** | **0.9951** | 0.9957 / 0.851 | 0.439 | 1.0000 |
+| scifact / english | 300 | 0.9517 / 0.107 | 1.0000 | 0.9997 / 0.997 | 0.670 | 1.0000 |
+| nfcorpus / simple | 296 | 1.0000 / 1.000 | 1.0000 | 1.0000 / 1.000 | 0.638 | 1.0000 |
+| nfcorpus / english | 306 | 0.9634 / 0.255 | 1.0000 | 0.9997 / 0.987 | 0.633 | 1.0000 |
+| fiqa / simple | 648 | 0.9994 / 0.982 | 0.9994 | 1.0000 / 1.000 | 0.543 | 1.0000 |
+| fiqa / english | 648 | 0.8904 / 0.006 | 1.0000 | 0.9944 / 0.810 | 0.490 | 1.0000 |
+| enwiki p1 400-word chunks / simple | 499 | 0.9992 / 0.978 | 0.9992 | 1.0000 / 1.000 | 0.369 | 1.0000 |
+| enwiki p1 400-word chunks / english | 499 | 0.9100 / 0.054 | 1.0000 | 0.9820 / 0.573 | 0.342 | 1.0000 |
+| enwiki p3 256-word chunks / simple | 483 | 1.0000 / 1.000 | 1.0000 | 1.0000 / 1.000 | 0.418 | 1.0000 |
+| enwiki p3 256-word chunks / english | 475 | 0.8834 / 0.038 | 1.0000 | 0.9768 / 0.497 | 0.399 | 1.0000 |
+| **enwiki p1 whole / simple** | 549 | **0.9763 / 0.357** | **0.9763** | 0.9951 / 0.825 | 0.426 | 1.0000 |
+| **enwiki p1 whole / english** | 549 | **0.9501 / 0.151** | **0.9945** | 0.9958 / 0.820 | 0.400 | 1.0000 |
+| **enwiki p3 whole / simple** | 549 | **0.9847 / 0.556** | **0.9847** | 0.9960 / 0.842 | 0.446 | 1.0000 |
+| **enwiki p3 whole / english** | 549 | **0.9423 / 0.126** | **0.9945** | 0.9945 / 0.822 | 0.409 | 1.0000 |
+| **enwiki p6 whole / simple** | 550 | **0.9916 / 0.713** | **0.9916** | 0.9978 / 0.871 | 0.434 | 1.0000 |
+| **enwiki p6 whole / english** | 550 | **0.9422 / 0.175** | **0.9965** | 0.9975 / 0.875 | 0.400 | 1.0000 |
 
-(Run 1's part 6 is the 20,000-article sample. RUN 2's 60,000 ROW AND PART 3: TO FILL.)
+Reproduction (run 1, df-band and `captf` queries only, 350 per corpus): p1 whole /
+simple `tsv` 0.9783 / 0.380 (run 2, the same query groups: 0.9794 / 0.377), `tsvmaxpos`
+0.9946 (run 2: 0.9946). p6 whole / simple at 20k articles: 0.9894 (run 2 at 60k: 0.9916).
+BEIR and the 400-word chunks: identical to four decimals between the runs, except fiqa
+`tsv` 0.9995 against 0.9994.
 
 On whole Wikipedia under `simple` the caps cost the most on the most common terms
 (part 1, `vcommon` 3-term queries: ov10 0.948, same10 0.00) and nothing on rare ones
-(`rare_1`: 1.0000). That fits the mechanism: only a term that repeats 255+ times in
-one document gets capped. `captf` (terms that actually hit the cap) gives 0.982. The
-padding term in `tsvmaxpos` recovers about three quarters of the gap (0.9946) and
-cannot recover the rest, because tf itself is capped.
+(`rare_1`: 1.0000 on all three parts). That fits the mechanism: only a term that
+repeats 255+ times in one document gets capped. `captf` (terms that actually hit the
+cap) gives 0.982-0.984 on all three parts. `tsvmaxpos` recovers about three quarters of
+the gap (p1: 0.9951) and cannot recover the rest, because tf itself is capped.
 
 ## Measure 3: heap bytes
 
-Run 1 (run 2 matches it on the corpora both ran). Per-value `pg_column_size` averaged,
-and `pg_total_relation_size` of a two-column (id, value) table holding that
+Run 2 (run 1 is byte-identical on every corpus both ran). Per-value `pg_column_size`
+averaged, and `pg_total_relation_size` of a two-column (id, value) table holding that
 representation. TOAST compression `pglz`.
 
 | corpus / cfg | text bytes (raw / stored) | tsvector | wdoc (with positions) | wdoc, no positions | table: text / tsvector / wdoc / wdoc no-pos (MB) |
@@ -210,13 +234,16 @@ representation. TOAST compression `pglz`.
 | scifact / english | 1,501 / 1,062 | 1,496 | 1,682 | 1,320 | 6.2 / 8.9 / 9.9 / 7.7 |
 | nfcorpus / english | 1,593 / 1,120 | 1,589 | 1,783 | 1,395 | 4.7 / 6.6 / 7.7 / 5.6 |
 | fiqa / english | 769 / 667 | 768 | 889 | 717 | 41.7 / 48.2 / 56.2 / 45.0 |
-| enwiki p1 chunks / english | 2,404 / 1,708 | 2,492 | 2,755 | 2,149 | 368 / 546 / 614 / 484 |
+| enwiki p1 400-word chunks / english | 2,404 / 1,708 | 2,492 | 2,755 | 2,149 | 368 / 546 / 614 / 484 |
+| enwiki p3 256-word chunks / english | 1,513 / 1,290 | 1,667 | 1,849 | 1,495 | 358 / 483 / 549 / 423 |
 | enwiki p1 whole / simple | 22,433 / 12,041 | 21,034 | **34,249** | 14,278 | 265 / 454 / **728** / 313 |
 | enwiki p1 whole / english | 22,433 / 12,041 | 15,189 | **23,520** | 11,334 | 265 / 332 / **505** / 251 |
-| enwiki p6 whole / english | 6,970 / 3,974 | 5,643 | 7,589 | 4,520 | 87 / 123 / 163 / 100 |
+| enwiki p3 whole / english | 13,006 / 7,200 | 9,749 | 13,876 | 7,572 | 233 / 312 / 436 / 246 |
+| enwiki p6 whole / english | 6,823 / 3,902 | 5,538 | 7,430 | 4,441 | 258 / 363 / 478 / 294 |
 
-A `wdoc` with positions is **8-16 % larger than a tsvector** on short passages and **1.3-1.6x
-larger** on long whole articles. On long articles it is **1.9-2.8x the stored text**. Two
+A `wdoc` with positions is **8-16 % larger than a tsvector** on short passages and chunks,
+and **1.3-1.6x larger** on long whole articles. On long articles it is **1.9-2.8x the
+stored text**. Two
 causes: a wdoc stores 4 bytes per position where a tsvector stores 2, and a long
 document's position list compresses poorly. A wdoc without positions (`sumtf`'s
 column: tf only) is smaller than the tsvector everywhere. Converting at the index
@@ -225,7 +252,7 @@ the tsvector the user already had. Run 1, wiki1 simple: 454 MB of tsvector inste
 454 MB plus 728 MB of wdoc.
 
 The weave index itself is the same size whichever representation it was built from
-(`idxsize.tsv`: `ix_tsv` within 0.1 % of `ix_exact` everywhere). Positions are not
+(`idxsize.tsv`: `ix_tsv` within 0.1 % of `ix_exact` on every corpus). Positions are not
 indexed by default, so the index only sees tf and length.
 
 ## Controls, and what they rule out
@@ -234,18 +261,21 @@ indexed by default, so the index only sees tf and length.
   same10 1.000 on every corpus and config in both runs, and paired Δ is exactly 0. So
   any disagreement in the other arms is the representation, not the scan.
 - **Positive control (`strip`):** loses on every corpus, with every CI excluding zero
-  (-0.028 to -0.071 nDCG@10 on BEIR, -0.49 on title queries; ov10 0.33-0.69). The
+  (-0.028 to -0.071 nDCG@10 on BEIR, -0.24 to -0.52 on title queries; ov10 0.34-0.69). The
   harness can see a tf loss.
 - **Between runs (hard rule 10):** for the same arm, BEIR nDCG@10 differs between run 1
   and run 2 by at most 0.0002 (`exact`, nfcorpus) and MRR@10 by at most 0.0062 (`strip`,
-  nfcorpus). The most likely cause is the parallel `CREATE TABLE AS` that builds each
+  nfcorpus). Heap sizes are byte-identical between the runs. The most likely cause is the parallel `CREATE TABLE AS` that builds each
   table: physical row order, and so docid order, differs between runs, and docid breaks
   BM25 score ties. Within a run, `exact2` shows the scan itself is deterministic. A
   cross-run difference smaller than this floor is not a result.
 - **Second scale / second corpus (hard rule 11):** the chunked "nothing lost" result
-  holds on five chunked corpora across two runs. The whole-document result holds on
-  two disjoint Wikipedia parts (p1, p6), and the p6 rate is the same at 20k and 60k
-  articles (5.58 % / 5.51 % tf-capped, 0.060 % / 0.053 % position-capped).
+  holds on five chunked corpora (two chunk sizes) across two runs. The whole-document
+  result holds on three disjoint Wikipedia parts (p1, p3, p6). The p6 rate is the same
+  at 20k and 60k articles (5.58 % / 5.51 % tf-capped, 0.060 % / 0.053 %
+  position-capped), and p1's overlap reproduces between runs (0.9783 / 0.9794).
+- **Index scans actually ran:** `scancheck.tsv` has 0 rows where index scans < queries,
+  in either run.
 
 ## wdoc round trip (side finding, outside M7, needs a GAPS entry)
 
@@ -258,8 +288,9 @@ indexed by default, so the index only sees tf and length.
   positions must be ascending within a term`; text `COPY TO` + `COPY FROM`: **ERROR**;
   binary `COPY`: **ERROR** `invalid binary wdoc: ...`. 10,000 tokens: OK.
   `to_wdoc(text)` (the built-in analyzer, uncapped positions) at 20,000 tokens: OK;
-- on real data: **172 of 172** enwiki p1 articles over 16,383 tokens fail the text round
-  trip under `simple` (171 under `english`), and **32 of 32** in p6.
+- on real data, every article over 16,383 tokens fails the text round trip: **172 of 172**
+  in enwiki p1 under `simple` (171 under `english`), **56 of 56** in p3, **32 of 32** in
+  p6.
 
 `pg_dump` writes a `wdoc` column through `wdoc_out` and restores it through `wdoc_in`, so
 **a dump of a table with a stored `to_wdoc(regconfig, text)` column holding one such
@@ -279,8 +310,8 @@ build exactly those documents.
    only stands in for it; the opclass would set `doclen` directly. It does change what
    `to_wdoc(tsvector)` means today, so it is a decision.
 3. **Count and expose capped documents**: any lexeme at 255 positions, or any position
-   at 16,383. That count is the exact set of documents whose BM25 is approximate. Zero
-   on every chunked corpus measured, 5-34 % of whole Wikipedia articles.
+   at 16,383. That count is the exact set of documents whose BM25 is approximate. 0 to
+   0.002 % on every chunked corpus measured, 5.5-33.5 % of whole Wikipedia articles.
 
 Not measured: PostgreSQL 18 (its tsvector caps are unchanged in the source), corpora of
 whole documents other than Wikipedia (the pgsql-hackers archive's mbox downloads
