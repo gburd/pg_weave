@@ -218,6 +218,16 @@ SELECT a.q, wquery_send(b.w) = wquery_send(a.w) AS binary_same, b.w::text AS rec
 	   (SELECT count(*) FROM tc WHERE tsv @@ a.q::tsquery) AS core_rows
   FROM wqa a JOIN wqb b USING (id) ORDER BY id;
 
+-- PRE-EXISTING, recorded not fixed: wquery_out's text does not parse back.
+-- wquery_in reads '<' and '>' as separators and the '-' of '<->' as NOT, and
+-- drops a suffix after a quoted term, so each rendering below re-parses to a
+-- different query.  (Binary send/recv above is exact.)
+SELECT w::text AS rendered, w::text::wquery::text AS reparsed,
+	   w::text::wquery::text = w::text AS round_trips
+  FROM (VALUES ('quick <-> brown'::tsquery::wquery), ('quick <2> brown'::tsquery::wquery),
+			   ('fo:*'::tsquery::wquery), ('fox:A'::tsquery::wquery),
+			   ('"quick brown"'::wquery)) v(w);
+
 -- the ranked arm really is an index scan with the ranking pass
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
