@@ -684,7 +684,6 @@ double		pg_weave_vacuum_tombstone_frac = 0.2;
  * conditional in weave_vacuum_compact() that states the condition, not a GUC
  * defaulted the other way. */
 bool		pg_weave_vacuum_vacate = true;
-bool		pg_weave_l22_drop_deferred = false;	/* L22 diagnostic, temporary */
 
 /* GUC: per-participant flush-budget growth ceiling, in MB.  0 = keep the safe
  * default ceiling of 2 * maintenance_work_mem (unchanged behavior).  When set
@@ -979,10 +978,19 @@ weave_new_buffer_linked(Relation index)
 	return weave_new_buffer_internal(index);
 }
 
+/*
+ * How many not-yet-recyclable freed pages one allocation may take out of the
+ * FSM before it gives up on the map and extends.  It bounds what a single call
+ * reads, because a merge can free most of the index under one xid.  A batch of
+ * allocations still drains such a run, at this many pages per call.
+ */
+#define WEAVE_FSM_DROP_MAX 64
+
 static Buffer
 weave_new_buffer_internal(Relation index)
 {
 	Buffer		buffer;
+	int			ndropped = 0;
 
 	/*
 	 * Low-bias reuse: during a compaction, prefer the lowest free block so
@@ -1065,25 +1073,38 @@ weave_new_buffer_internal(Relation index)
 		{
 			if (!weave_page_recyclable(index, BufferGetPage(buffer)))
 			{
-				if (pg_weave_l22_drop_deferred &&
+				/*
+				 * A FREED PAGE THAT IS NOT YET RECYCLABLE IS DROPPED, NOT RE-QUEUED
+				 * (task L22), up to WEAVE_FSM_DROP_MAX per call.  GetFreeIndexPage()
+				 * has already taken it out of the map.  The next VACUUM's reclaim puts
+				 * it back: a page that is FREED, unreachable, absent from the FSM
+				 * and reusable now is the state that pass re-records
+				 * (weave_reclaim_unreachable()).  So skipping it costs at most one
+				 * VACUUM of delay, and the loop can move on to the next candidate.
+				 *
+				 * MEASURED at 1M rows (bench/aws/l22_scale_ablate.sh, arm `drop`).
+				 * The first INSERT after a VACUUM runs under the xid that VACUUM
+				 * stamped on its frees.  With the re-queue-and-break below, every one
+				 * of its 1,177 allocations met the same refused page and extended, on
+				 * every other cycle: the crashed index grew 1,177 -> 2,354 -> 3,531
+				 * over its twin.  With the drop it stayed at 1,177.  Pages that are
+				 * NOT freed (a stale entry for a live page) keep the old rule:
+				 * dropping those failed t/028's truncation control (SEGMENT_FORMAT.md
+				 * sect. 10, the superseded allocator change).
+				 */
+				if (ndropped < WEAVE_FSM_DROP_MAX &&
 					!PageIsNew(BufferGetPage(buffer)) &&
 					WeavePageIsFreed(BufferGetPage(buffer)))
 				{
-					static bool said = false;
-
-					/* L22 DIAGNOSTIC: GetFreeIndexPage() removed it; leave it out */
-					if (!said)
-						elog(LOG, "pg_weave L22 drop_deferred fired on block %u of \"%s\"",
-							 blk, RelationGetRelationName(index));
-					said = true;
 					weave_alloc_fsm_defer++;
+					ndropped++;
 					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 					ReleaseBuffer(buffer);
 					continue;
 				}
 				/*
-				 * Not yet safe to reuse (a concurrent scan could still be reading
-				 * it): re-record it so a later allocation gets it, and STOP.
+				 * A live page with a stale entry, or the drop budget is spent:
+				 * re-record it so a later allocation gets it, and STOP.
 				 *
 				 * THE `break` IS DELIBERATE AND ITS COST IS REAL.  This used to say
 				 * "and try the next free page", which is not what the code does and

@@ -105,6 +105,7 @@ sumstranded=0
 maxst=0
 worst=-1000000000
 exs=
+strs=
 for c in $(seq 1 $CYCLES); do
 	lo=$((N + (c - 1) * BATCH + 1)); hi=$((N + c * BATCH))
 	# each INSERT bracketed by the allocator counters, in its own session
@@ -128,6 +129,7 @@ for c in $(seq 1 $CYCLES); do
 	st=$(leaked)
 	sumstranded=$((sumstranded + st))
 	[ "$st" -gt "$maxst" ] && maxst=$st
+	strs="$strs $st"
 	# the twin's schedule mirrors t/033's: one VACUUM where s had the crashed one,
 	# s's post-crash VACUUM, then one more
 	[ $TWIN = 1 ] && q "VACUUM u" > /dev/null
@@ -154,14 +156,30 @@ done
 
 # a never-crashed reference for the same row count: REINDEX is the minimum
 pf=$(pages)
-q "CREATE INDEX s_ref ON s USING weave (body, emb, price int8_docval_ops)" > /dev/null
-pr=$(q "SELECT pg_relation_size('s_ref') / 8192")
+pr=skipped
+if [ "${G75_REF:-1}" = 1 ]; then
+	q "CREATE INDEX s_ref ON s USING weave (body, emb, price int8_docval_ops)" > /dev/null
+	pr=$(q "SELECT pg_relation_size('s_ref') / 8192")
+fi
 log "SCALE end: s_w=$pf pages, freshly built reference=$pr pages, total stranded by $CYCLES crashes=$sumstranded"
 [ "$sumstranded" -gt 0 ] || { log "SCALE: no crash stranded anything -- the window was never hit"; fail=1; }
 if [ $TWIN = 1 ]; then
 	bound=$((maxst + 64 + $(pages u_w) / 20))
 	log "SCALE twin: excess of s_w over u_w per cycle:$exs; worst $worst, bound $bound (max stranding $maxst + 64 + 5% of twin)"
 	[ "$worst" -le "$bound" ] || { log "SCALE twin: BOUND FAILED"; fail=1; }
+	# AND IT STOPS GROWING (task L22).  The bound above passed at 14 cycles while the
+	# excess climbed 1,177 pages every two cycles, so a bound alone is not evidence of
+	# boundedness.  Over the last four cycles the excess may rise by at most what
+	# those cycles' crashes stranded, plus 64 pages plus 1 % of the twin.
+	set -- $exs
+	if [ $# -ge 6 ]; then
+		eval "elast=\${$#}"; eval "ewin=\${$(($# - 4))}"
+		set -- $strs; wmax=0; i=0
+		for x in "$@"; do i=$((i + 1)); [ $i -gt $(($# - 4)) ] && [ "$x" -gt "$wmax" ] && wmax=$x; done
+		gslack=$((wmax + 64 + $(pages u_w) / 100))
+		log "SCALE twin growth over the last 4 cycles: $((elast - ewin)) pages, allowed $gslack (stranded in them $wmax + 64 + 1% of twin)"
+		[ $((elast - ewin)) -le $gslack ] || { log "SCALE twin: STILL GROWING"; fail=1; }
+	fi
 fi
 
 $BIN/pg_ctl -D $D -m fast stop > /dev/null 2>&1

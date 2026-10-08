@@ -36,11 +36,13 @@ nofence)
 	sub $f '		if (PageGetLSN(page) > fence)' '		if (false && PageGetLSN(page) > fence)	/* MUTANT nofence */' ;;
 noguard)
 	"$0" nobarrier; "$0" nofence ;;
+nodrop)	# L22: the FSM loop re-queues a freed, not-yet-recyclable page and stops again
+	sub src/am/am.c '				if (ndropped < WEAVE_FSM_DROP_MAX &&' '				if (false && ndropped < WEAVE_FSM_DROP_MAX &&	/* MUTANT nodrop */' ;;
 nofit)	# L22: the share-lock pass is gated by the recyclability probe alone again
 	sub $f '			 !weave_pack_fits_reusable(index)))' '			 !weave_any_free_page_recyclable(index)))	/* MUTANT nofit */' ;;
 *) echo "unknown mutant $m"; exit 2 ;;
 esac
-grep -c MUTANT $f
+grep -c MUTANT $f src/am/am.c
 MUTEOF
 chmod +x $OUT/apply.sh
 
@@ -129,7 +131,7 @@ if [[ " $PHASES " == *" scale "* ]]; then
 	if [ -f $SRC/bench/aws/g75_scale.sh ]; then
 		bash $SRC/bench/aws/g75_scale.sh > $OUT/scale.log 2>&1
 		src=$?
-		log "SCALE exit=$src: $(grep -E '^(SCALE|RESULT)' $OUT/scale.log | tr '\n' ' ')"
+		log "SCALE exit=$src: $(grep -hE '(SCALE twin|SCALE end|RESULT)' $OUT/scale_progress.log | tr '\n' ' ')"
 		[ $src = 0 ] || ok=0
 	else
 		log "SCALE: no bench/aws/g75_scale.sh in this tree"; ok=0
@@ -145,9 +147,11 @@ if [[ " $PHASES " == *" scalemut "* ]]; then
 	if (cd $D && bash $OUT/apply.sh $m > $OUT/apply-scale-$m.log 2>&1) && install_tree $D scale-$m; then
 		md5=$(md5sum $LIB/pg_weave.so | cut -d' ' -f1)
 		[ -n "$CLEAN_MD5" ] && [ "$md5" = "$CLEAN_MD5" ] && { log "SCALEMUT $m: .so is the CLEAN one"; ok=0; }
-		mkdir -p $OUT/scalemut; OUT=$OUT/scalemut bash $SRC/bench/aws/g75_scale.sh > $OUT/scalemut/scale.log 2>&1
+		mkdir -p $OUT/scalemut; OUT=$OUT/scalemut G75_REF=0 bash $SRC/bench/aws/g75_scale.sh > $OUT/scalemut/scale.log 2>&1
 		src=$?
-		log "SCALEMUT $m (so=$md5) exit=$src: $(grep -E '^(SCALE twin|RESULT)' $OUT/scalemut/scale.log | tr '\n' ' ')"
+		# expected to FAIL; a pass means the scale run cannot see this mutant
+		[ $src = 0 ] && log "SCALEMUT $m: SURVIVED the scale run"
+		log "SCALEMUT $m (so=$md5) exit=$src: $(grep -hE '(SCALE twin|RESULT)' $OUT/scalemut/scale_progress.log | tr '\n' ' ')"
 	else
 		log "SCALEMUT $m: did not apply/build -- not counted"; ok=0
 	fi

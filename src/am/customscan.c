@@ -886,12 +886,6 @@ _PG_init(void)
 							 &pg_weave_vacuum_vacate,
 							 true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
-	DefineCustomBoolVariable("pg_weave.l22_drop_deferred",
-							 "L22 diagnostic: the FSM loop drops a freed, not-yet-recyclable candidate and continues.",
-							 NULL,
-							 &pg_weave_l22_drop_deferred,
-							 false,
-							 PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * THE (C2) CHECK, AVAILABLE IN A RELEASE BUILD, and it is diagnostics rather
