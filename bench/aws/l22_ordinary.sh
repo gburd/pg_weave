@@ -88,7 +88,7 @@ ref() {	# the fresh-build size of every cycle's live row set, both shapes
 	mkcluster ref $port "autovacuum = off" || { echo "ref: cluster failed" >> $L; return 1; }
 	$PSQL -c "CREATE EXTENSION pg_weave" > /dev/null
 	for c in $(seq 0 $CYC); do
-		for kind in ab c; do
+		for kind in ${REFKINDS:-ab c}; do
 			local lo=$((c * B + 1))
 			[ $kind = c ] && lo=1
 			p=$(echo "DROP TABLE IF EXISTS r; CREATE TABLE r (id bigint, body wdoc, emb wvec(4), price int8);
