@@ -5831,8 +5831,9 @@ published value NULL).
 the 'alpha'/'beta' corpus) was meant to show the operator's N = 1 key tying a different set.
 It returned 16, exactly the reference's tie group: the N = 1 values happen to tie the same
 rows there. It was replaced by a control on two tf = 1 terms, where the operator ties every
-matching row and the index does not. **Before 0.31.0 that shape's `WITH TIES` returned every
-ranked row.** That, and the `ORDER BY fuse(d <=> 'alpha', v <-> q)` over a pending vector of
+matching row and the index does not: `FETCH FIRST 5 ROWS WITH TIES` returns **200 rows with
+reuse off, every row matching either term, and 18 with it on, the reference's tie group**
+(run `pgweave-20261008-080505-9ac2`). That 200 is what the shape returned before 0.31.0. That, and the `ORDER BY fuse(d <=> 'alpha', v <-> q)` over a pending vector of
 the wrong dimension (which raised "different wvec dimensions 3 and 4" through the hidden key
 and now returns the row last), are the **visible behaviour changes**. They are the lexical
 route's change applied to the fused key: a reader of the key now sees the value the stream
