@@ -11,7 +11,7 @@
 #      no-growth assertion, expected to FAIL it
 set -u
 cd $HOME/pg_weave
-PHASES=scale G75_CYCLES=${G75_CYCLES:-14} bash bench/aws/g75_job.sh
+PHASES=scale G75_REF=${G75_REF:-0} G75_CYCLES=${G75_CYCLES:-14} bash bench/aws/g75_job.sh
 rc0=$?
 mkdir -p /tmp/out/scale1 && mv /tmp/out/scale*.log /tmp/out/scale_post* /tmp/out/scale_vac* /tmp/out/scale_quiet* /tmp/out/scale1/ 2>/dev/null
 ARMS="base noskip" L22N=${N028:-10} TESTS=t/028_vacuum_truncate_race.pl bash bench/aws/l22_job.sh
