@@ -1843,8 +1843,9 @@ wvck_mark_bolt(WeaveCheckCtx *cx, const WeaveSegMeta *seg, StringInfo e)
 		cx->seekblk = lastposting;
 		cx->seekhit = false;
 		cx->lastblk = InvalidBlockNumber;
-		(void) wvck_walk_chain(cx, postchain, WEAVE_PK_POSTING, e);
-		if (lastposting != InvalidBlockNumber && !cx->seekhit)
+		/* a walk that stopped on a fault has already said where */
+		if (wvck_walk_chain(cx, postchain, WEAVE_PK_POSTING, e) >= 0 &&
+			lastposting != InvalidBlockNumber && !cx->seekhit)
 		{
 			wvck_sep(e);
 			appendStringInfo(e, "the shared posting chain ends at block %u and does not reach block %u, where the last term's postings start",
