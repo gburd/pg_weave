@@ -6701,3 +6701,19 @@ are unchanged.
 - **The padding's first-row cost is O(match set)** (above). Cheaper would be a streaming
   walk of the gate set that skips ranked TIDs without materializing it -- the G76 walk
   already streams its emission; it is the collection that is whole. Not done.
+
+### G95 — an uncovered NOT / prefix / fuzzy / regex ranked scan costs O(match set) before its first padded row — **ACCEPTED FOR NOW by maintainer decision 2026-10-08; REVISIT when a streaming padding walk exists**
+
+G94's fix pads the ranked scan with every match that holds no literal term, and
+`weave_pad_begin()` collects q's WHOLE match set before emitting the first padded row. So the
+cost is linear in the match set and independent of LIMIT: `!w1` LIMIT 10 is 32 ms at 200k rows
+and 159 ms at 1M (`pgweave-20261008-134841-4ce2`, two runs per arm), where before G94 it took
+0.8 / 4.0 ms and returned **0 rows**. Correctness first was the right order; the cost is the
+recorded loss.
+
+**The revisit:** a streaming padding walk -- iterate the match set in docid order and emit
+padded rows as they are found (they all share distance 1.0, so any order among them is a valid
+tie order), stopping when the executor stops pulling -- would make `LIMIT 10` cost O(10 / match
+density) instead of O(match set). When that exists, re-measure this entry's two queries at the
+same two scales and close it. Covered queries (`fox & !dog`) never pad and are unaffected.
+
