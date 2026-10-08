@@ -76,10 +76,10 @@ SELECT count(*) FROM lh WHERE d @@@ 'zzz';
 CREATE TEMP TABLE pl(l text);
 DO \$\$ DECLARE r record; BEGIN FOR r IN EXECUTE \$q\$EXPLAIN (VERBOSE, COSTS OFF) $fq\$q\$ LOOP INSERT INTO pl VALUES (r."QUERY PLAN"); END LOOP; END \$\$;
 SELECT 'fused_plan', count(*) FROM pl WHERE l LIKE '%<~>%';
-CREATE TEMP TABLE tids AS SELECT ctid AS t FROM ($fq) s0, lh WHERE lh.id = s0.id;
+CREATE TEMP TABLE tids AS SELECT ctid AS t FROM lh ORDER BY $fx LIMIT $lim;
 SELECT 'rows', count(*) FROM tids;
 CREATE TEMP TABLE pl2(l text);
-DO \$\$ DECLARE r record; BEGIN FOR r IN EXPLAIN (COSTS OFF) SELECT count(id) FROM lh WHERE ctid = ANY(ARRAY(SELECT t FROM tids)) LOOP INSERT INTO pl2 VALUES (r."QUERY PLAN"); END LOOP; END \$\$;
+DO \$\$ DECLARE r record; BEGIN FOR r IN EXECUTE \$q\$EXPLAIN (COSTS OFF) SELECT count(id) FROM lh WHERE ctid = ANY(ARRAY(SELECT t FROM tids))\$q\$ LOOP INSERT INTO pl2 VALUES (r."QUERY PLAN"); END LOOP; END \$\$;
 SELECT 'tid_plan', count(*) FROM pl2 WHERE l LIKE '%Tid Scan%';
 SET track_functions = 'all'; SET stats_fetch_consistency = none;
 SELECT pg_stat_force_next_flush();
@@ -99,7 +99,7 @@ SQL
 					{
 						echo "SET jit = off; SET max_parallel_workers_per_gather = 0;"
 						echo "SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_sort = off;"
-						echo "CREATE TEMP TABLE tids AS SELECT ctid AS t FROM ($fq) s0, lh WHERE lh.id = s0.id;"
+						echo "CREATE TEMP TABLE tids AS SELECT ctid AS t FROM lh ORDER BY $fx LIMIT $lim;"
 						timeit "$ap"
 					} | $P > $f.$an 2>&1
 				done
