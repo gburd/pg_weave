@@ -616,46 +616,6 @@ weave_low_free_fits_live(Relation index)
 	return freebelow >= livebelow;
 }
 
-/*
- * Would a pack-only pass fit in the pages it may reuse NOW?  Supply: pages the
- * free space map offers (weave_alloc_begin() gathers from it) that are new or
- * WEAVE_FREED and that weave_page_recyclable() would hand out.  Live: every
- * initialized page that is not WEAVE_FREED, counted from the pages and not from
- * the free space map, which is not crash-safe.  Reads every page, as the reclaim
- * pass earlier in the same cleanup does.  Task L22; the caller says why.
- */
-static bool
-weave_pack_fits_reusable(Relation index)
-{
-	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
-	BlockNumber blk;
-	BlockNumber live = 0;
-	BlockNumber supply = 0;
-
-	for (blk = 1; blk < nblocks; blk++)
-	{
-		Buffer		buf;
-		Page		page;
-
-		CHECK_FOR_INTERRUPTS();	/* no buffer lock held here */
-		buf = ReadBuffer(index, blk);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		if (PageIsNew(page) ||
-			(PageGetSpecialSize(page) == MAXALIGN(sizeof(WeavePageOpaqueData)) &&
-			 WeavePageIsFreed(page)))
-		{
-			if (GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2 &&
-				weave_page_reusable_now(index, page))
-				supply++;
-		}
-		else
-			live++;
-		UnlockReleaseBuffer(buf);
-	}
-	return supply >= live;
-}
-
 bool
 weave_vacuum_compact(Relation index)
 {
@@ -788,36 +748,8 @@ weave_vacuum_compact(Relation index)
 		 * t/015 requires a shrink on the horizon-advancing arm, so a regression
 		 * into permanent skipping fails a test rather than silently stopping work.
 		 */
-		/*
-		 * AND SKIP A PASS THAT CANNOT FIT IN WHAT IS REUSABLE NOW (task L22).
-		 * "Some page is recyclable" was not enough, measured.  A share-lock pass is
-		 * pack-only; if the reusable supply is smaller than the live data it packs
-		 * that supply, EXTENDS the rest onto the tail, and frees the old copy under
-		 * its own xid, so nothing is truncatable and the next VACUUM finds the same
-		 * shortfall.  t/033 (pgweave-20261008-014427-e5f8): supply 10,244 against
-		 * 12,033 live, 1,782 extends, and about two flushes more every cycle after
-		 * (excess 2,626 / 5,299 / 10,776 pages).  With this predicate the excess
-		 * was 589 / 0 / 0, two runs.
-		 *
-		 * The sibling's count-based skip stalled because it took the live size from
-		 * stale free-space records.  This one counts live pages from the pages, so a
-		 * stale entry cannot inflate it, and the supply grows on its own as the
-		 * horizon passes the freeing xid.  What it gives up: a VACUUM no longer
-		 * spends one pass extending in the hope that the NEXT one fits.  That
-		 * two-VACUUM shape never shrank in t/033, and the floor stays a
-		 * weave_vacuum() outcome, as G47 already records.
-		 *
-		 * ponytail: with tombstones the pass shrinks the live data as it goes, so
-		 * the page count overstates what it must place (term (4) of
-		 * weave_index_is_compacted() measured a 409-page error in the dangerous
-		 * direction).  That case keeps the probe alone, and the ratchet is still
-		 * possible on a delete-bearing index.  The upgrade is a tombstone-aware
-		 * estimate of the pass's output.
-		 */
 		if (!CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&
-			(weave_tombstone_frac(index) > 0.0 ?
-			 !weave_any_free_page_recyclable(index) :
-			 !weave_pack_fits_reusable(index)))
+			!weave_any_free_page_recyclable(index))
 		{
 			nblocks = weave_truncate_free_tail(index);
 			if (nblocks < prevblocks)
@@ -1301,14 +1233,12 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			 * t/015_alloc_outcomes.pl asserts the no-ratchet property, so adding
 			 * the term fails loudly instead of shipping.
 			 *
-			 * THE FSM COUNT BELOW IS NOT WHAT DECIDES WHETHER A PASS RUNS (task L22,
-			 * measured).  After a crash the map can list live pages as free, but
-			 * the reclaim at the top of this function has already marked them used
-			 * by the time this runs, and counting free pages from the pages instead
-			 * changed nothing in t/033.  Once an index is a quarter free this fires
-			 * on every VACUUM.  What stops a pass that can only grow the file is
-			 * the check inside weave_vacuum_compact() for whether the live data fits
-			 * in pages reusable now.
+			 * THE FSM COUNT BELOW DOES NOT MISFIRE AFTER A CRASH (task L22,
+			 * measured).  The stale entries a crash leaves for live pages are
+			 * marked used by the reclaim above before this reads the map.
+			 * Counting free pages from the pages changed nothing in t/033.  The
+			 * growth L22 measured is inside weave_vacuum_compact(), in a pass that
+			 * starts with fewer reusable pages than live ones; doc/PHASES.md L22.
 			 */
 			{
 				BlockNumber nblocks = RelationGetNumberOfBlocks(info->index);

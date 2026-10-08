@@ -5123,16 +5123,23 @@ reachable page during the pass, and marking a page used hands it to nobody. On `
 any crash with recent FSM updates can trigger this ratchet. It is not specific to
 pending flushes.
 
-**CLOSED 2026-10-08 by L22 (`wt/l22`): the size bound below.** The "probable mechanism" in
-this paragraph is **REFUTED**, and so is the assumption that the crash causes the growth.
-Both were tested by ablation on EC2. The reclaim clears the stale entries before the trigger
-reads the map. The trigger fired on the twin too, and the twin's pass was stopped by the
-recyclability probe. Swapping the insert order moved the growth to the never-crashed twin.
-The growth came from share-lock compaction passes that started with fewer reusable pages
-than live ones. The scale run's twin then exposed a second growth with a separate cause. The first INSERT after a VACUUM runs under the xid that VACUUM stamped on its frees, and the allocator's FSM loop re-queued the first refused page and extended the whole batch. That is fixed too. The fixes and the measurements are in `doc/PHASES.md` L22 and
-`bench/RESULTS_G75_RECLAIM.md` "L22". The text below is the record as it stood before L22.
+**STILL OPEN, MECHANISMS KNOWN (L22, 2026-10-08, `wt/l22`).** The "probable mechanism"
+below is **REFUTED**, and so is the assumption that the crash causes the growth. Both were
+tested by ablation on EC2 (`pgweave-20261008-005536-eed3`, `pgweave-20261008-014427-e5f8`).
+The reclaim clears the stale entries before the trigger reads the map, and the trigger
+fires on the twin too; the twin's pass is stopped by the recyclability probe. The
+crashed index's pass starts with fewer reusable pages than live ones and extends the
+shortfall, and swapping the insert order moved the growth to the never-crashed twin. The
+scale run's twin then exposed a second growth with another cause
+(`pgweave-20261008-063547-9cdb`). The first INSERT after a VACUUM runs under the xid
+that VACUUM stamped on its frees, and the allocator's FSM loop re-queued the first
+refused page and extended the whole batch. A fix for each was built and measured. **Both
+were REVERTED** because they regress `t/028`'s truncation control: 0/10 with neither fix,
+2/10 and 3/10 with each alone, and 3/10 with both (`pgweave-20261008-090818-c96f`). The
+bound below is a `TODO` again. `doc/PHASES.md` L22 and `bench/RESULTS_G75_RECLAIM.md`
+"L22" have the runs and the follow-ups. The text below is the record as it stood before L22.
 
-**OPEN (until L22): the size bound in a long crash loop.** At 18 cycles (`pgweave-20261006-001850-1420`,
+**OPEN: the size bound in a long crash loop.** At 18 cycles (`pgweave-20261006-001850-1420`,
 `057fc9d`), `t/033`'s crashed index ended up as much as 22,476 pages larger than its
 never-crashed twin. That happened on a run where every cycle's stranded pages **were**
 reclaimed: 0 leaked pages and a clean deep check after every VACUUM, both hard
