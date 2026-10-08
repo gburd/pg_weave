@@ -155,7 +155,7 @@ typedef struct ScoredTid
 static int weave_topk_visible(Relation index, WeaveQuery q, int k,
 							 bool as_distance, ScoredTid **out);
 static int weave_topk_pad(Relation index, WeaveQuery q, int k, bool as_distance,
-						  ScoredTid *results, int nvis);
+						  ScoredTid **results, int nvis);
 static int weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
 									  uint64 docid_lo, uint64 docid_hi,
 									  ScoredTid **out);
@@ -8823,7 +8823,7 @@ weave_topk_visible(Relation index, WeaveQuery q, int k, bool as_distance,
 	 * a literal term may still be unranked, and padding would put a 0 above it.
 	 */
 	if (nvis < k && ncand < wantk && !weave_query_lit_covered(q))
-		nvis = weave_topk_pad(index, q, k, as_distance, results, nvis);
+		nvis = weave_topk_pad(index, q, k, as_distance, &results, nvis);
 
 	*out = results;
 	return nvis;
@@ -8843,7 +8843,7 @@ weave_topk_visible(Relation index, WeaveQuery q, int k, bool as_distance,
  */
 static int
 weave_topk_pad(Relation index, WeaveQuery q, int k, bool as_distance,
-			   ScoredTid *results, int nvis)
+			   ScoredTid **results, int nvis)
 {
 	TidSet		m;
 	bool		recheck;
@@ -8854,7 +8854,7 @@ weave_topk_pad(Relation index, WeaveQuery q, int k, bool as_distance,
 	weave_collect_matches(index, q, &m, &recheck);
 	seen = (ItemPointerData *) palloc(Max(nvis, 1) * sizeof(ItemPointerData));	/* alloc-ok: nvis < k, and results is k wide already */
 	for (i = 0; i < nvis; i++)
-		seen[i] = results[i].tid;
+		seen[i] = (*results)[i].tid;
 	qsort(seen, nvis, sizeof(ItemPointerData), cmp_tid);
 	for (i = 0; i < m.n; i++)
 		if (nvis == 0 ||
@@ -8862,10 +8862,12 @@ weave_topk_pad(Relation index, WeaveQuery q, int k, bool as_distance,
 			m.tids[n++] = m.tids[i];
 	m.n = n;
 	weave_recheck_exact(index, q, &m, k - nvis);
+	/* sized to what it holds, not to k: the caller allocated k */
+	*results = (ScoredTid *) repalloc(*results, Max(nvis + m.n, 1) * sizeof(ScoredTid));	/* alloc-ok: nvis + m.n <= k, the caller's own size */
 	for (i = 0; i < m.n; i++)
 	{
-		results[nvis].tid = m.tids[i];
-		results[nvis].score = as_distance ? 1.0 : 0.0;
+		(*results)[nvis].tid = m.tids[i];
+		(*results)[nvis].score = as_distance ? 1.0 : 0.0;
 		nvis++;
 	}
 	pfree(seen);
