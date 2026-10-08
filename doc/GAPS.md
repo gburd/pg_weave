@@ -5788,8 +5788,8 @@ documents, two lexical channels at LIMIT 400 took 18 ms, and 17.6 ms of that was
   index and current heap TID match, and whose own copies of those keys (`fuseQ`, `fuseV`,
   `fuseW`) are byte-equal to the arguments. Each argument's type must be the key's
   `sk_subtype`, so a hand-written call can never get a datum read as the wrong type. It
-  answers NULL otherwise, which includes every call outside a scan. **The name is
-  provisional and awaits a lead decision** (the lexical function's name was one).
+  answers NULL otherwise, which includes every call outside a scan. **The name is a
+  LEAD DECISION, 2026-10-08**, as the lexical function's was.
 - **Route separation, the one new hazard.** A fused scan's `so->query` can hold its WHERE
   clause's `@@@` query. So a lexical lookup that keyed only on (index, TID, query) would
   answer from a fused scan nested in its Filter. `weave_current_distance()` now skips
@@ -5862,8 +5862,10 @@ vector key, half the long-document time remains: the vector channel's own scan.
   list above assumed one. `weave_fuse_pathkey_call()` offers the fused path only when
   `fuse()` is the WHOLE sort key (`list_length(root->query_pathkeys) == 1`). So
   `ORDER BY fuse(...), id` is a Sort over a seq scan that evaluates `fuse()` per row, which
-  `sql/score_reuse.sql` 9a shows as a plan. Offering the fused path with a prefix pathkey
-  is a separate planner change, not taken here.
+  `sql/score_reuse.sql` 9a shows as a plan. **Lead decision 2026-10-08:** fusepath.c is left
+  alone, and offering the fused path with `fuse()` as a pathkey PREFIX is recorded as an owed
+  pg_weave planner change in `doc/PHASES.md` row F2. It is not a core candidate: the rule
+  that blocks it is pg_weave's.
 - `weave_fuse_search()` builds its scan keys without a subtype, so no hidden key can match
   it. Nothing evaluates a target list while it runs anyway.
 - As for the lexical route: a scan under a join, an Append or a projecting node has no
