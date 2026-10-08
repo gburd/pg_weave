@@ -6398,8 +6398,10 @@ with NOT.** `WHERE d @@@ '!fox' ORDER BY d <=> '!fox'` generates candidates only
 query's positive literal terms (WAND cursors), so a row that matches only through a NOT
 is never ranked, and the G56 padding phase is skipped because the restriction IS the
 ORDER BY query (`weave_pad_wanted()`: "no padding row could pass it" -- false for a query
-with NOT). 11 of 11 random NOT-bearing converted queries and every hand-written one whose
-match set includes rows without a positive term returned a strict subset. The code
+with NOT). Run `pgweave-20261008-021816-1bca`: of 160 converted random queries the
+ranked scan matched core on 125 and returned a strict subset on 35, every one of which
+has a prefix or a NOT; hand-written `!fox`, `!fox & !dog`, `!(fox | dog)`, `!zzz` and
+`!(quick <-> brown)` are subsets too. The code
 comment at the ranked collect site says "PHRASE/NEAR/boolean are exact"; for NOT it is
 not. Prefix is the same shape and is documented (G1's risk note). The likely fix is to pad
 when `ordSameQuery` and the query has a NOT or an expanding leaf; it touches the G56/G86
