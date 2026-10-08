@@ -88,6 +88,26 @@ typedef struct WeaveCheckCtx
 	/* The pending walk stops after this block (the reclaim's snapshot tail);
 	 * InvalidBlockNumber = walk to the end of the chain. */
 	BlockNumber pendstop;
+
+	/*
+	 * L23: a chain walk sets seekhit when it visits seekblk.  The bolt check
+	 * uses it to ask whether the shared posting chain still reaches the LAST
+	 * term's first block -- a chain cut short without a FREED flag on the cut
+	 * page is otherwise invisible to a walk that only checks the pages it
+	 * reaches.  InvalidBlockNumber = not seeking.
+	 */
+	BlockNumber seekblk;
+	bool		seekhit;
+
+	/*
+	 * L23: also check each bolt's RECORDED LENGTHS -- the dictionary's entry
+	 * count against WeaveSegMeta.nterms, and that the shared posting chain
+	 * reaches the last term's postings.  A chain whose nextblk was cut on a page
+	 * that is not flagged freed passes every per-page test; only a length says
+	 * it is short.  Off for the reclaim's map, which runs on every VACUUM and
+	 * needs only the pages.
+	 */
+	bool		strict;
 } WeaveCheckCtx;
 
 static void
@@ -148,6 +168,14 @@ wvck_mark_alloc(BlockNumber nblocks)
 	return mark;
 }
 
+/* Separate a second chain error from the first in one detail string. */
+static void
+wvck_sep(StringInfo err)
+{
+	if (err->len > 0)
+		appendStringInfoString(err, "; ");
+}
+
 /*
  * Walk a nextblk chain from `blk`, marking each page, and verify every page on it
  * decodes as `want` or as `alt`.  Returns the number of pages, or -1 on a
@@ -180,6 +208,7 @@ wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 		CHECK_FOR_INTERRUPTS();
 		if (blk >= cx->nblocks)
 		{
+			wvck_sep(err);
 			appendStringInfo(err, "block %u is past the end of the relation (%u blocks)",
 							 blk, cx->nblocks);
 			cx->incomplete = true;
@@ -187,6 +216,7 @@ wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 		}
 		if (n > (int64) cx->nblocks)
 		{
+			wvck_sep(err);
 			appendStringInfo(err, "chain from a %s page exceeds the relation length (cycle?)",
 							 weave_page_kind_name(want));
 			cx->incomplete = true;
@@ -199,6 +229,7 @@ wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 		if (PageIsNew(page))
 		{
 			UnlockReleaseBuffer(buf);
+			wvck_sep(err);
 			appendStringInfo(err, "block %u is uninitialized but is on a %s chain",
 							 blk, weave_page_kind_name(want));
 			cx->incomplete = true;
@@ -209,6 +240,7 @@ wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 		if (WeavePageIsFreed(page))
 		{
 			UnlockReleaseBuffer(buf);
+			wvck_sep(err);
 			appendStringInfo(err, "block %u is on a live %s chain but is flagged freed",
 							 blk, weave_page_kind_name(want));
 			cx->incomplete = true;
@@ -217,6 +249,7 @@ wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 		if (pk != want && pk != alt && pk != alt2 && pk != alt3 && pk != alt4)
 		{
 			UnlockReleaseBuffer(buf);
+			wvck_sep(err);
 			appendStringInfo(err, "block %u on a %s chain has kind \"%s\"",
 							 blk, weave_page_kind_name(want),
 							 weave_page_kind_name(pk));
@@ -225,6 +258,8 @@ wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 		}
 		UnlockReleaseBuffer(buf);
 		wvck_mark(cx, blk);
+		if (blk == cx->seekblk)
+			cx->seekhit = true;
 		n++;
 		if (blk == cx->pendstop && want == WEAVE_PK_PENDING)
 			break;				/* the reclaim's snapshot tail: see WeaveCheckCtx */
@@ -1555,6 +1590,382 @@ wvck_segments(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 }
 
 /*
+ * L23, strict mode: count the bolt's dictionary entries and find the last term's
+ * first posting block.  Follows nextblk over DICT pages and stops at anything
+ * else; the per-page faults are wvck_walk_chain()'s to report, so this reports
+ * only what a page-by-page walk cannot see -- a count that disagrees with
+ * WeaveSegMeta.nterms (the writer gives every term an entry, and the SuRF
+ * invariant above already relies on the two agreeing) and an entry that runs
+ * past its page.
+ */
+static BlockNumber
+wvck_bolt_dict_count(WeaveCheckCtx *cx, const WeaveSegMeta *seg, StringInfo e)
+{
+	BlockNumber blk = seg->dictstart;
+	BlockNumber lastposting = InvalidBlockNumber;
+	int64		npages = 0;
+	uint64		nent = 0;
+
+	while (blk != InvalidBlockNumber && blk < cx->nblocks &&
+		   npages++ <= (int64) cx->nblocks)
+	{
+		Buffer		buf;
+		Page		page;
+		char	   *ptr;
+		char	   *end;
+		BlockNumber next;
+
+		CHECK_FOR_INTERRUPTS();
+		buf = ReadBuffer(cx->index, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (PageIsNew(page) || !WeavePageHasKind(page, WEAVE_PK_DICT))
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+		ptr = (char *) PageGetContents(page);
+		end = weave_page_entry_end(page);
+		next = WeavePageGetOpaque(page)->nextblk;
+		while (ptr < end)
+		{
+			WeaveDictEntry *de = (WeaveDictEntry *) ptr;
+
+			if (!weave_dict_entry_fits(de, end))
+			{
+				wvck_sep(e);
+				appendStringInfo(e, "a dictionary entry on block %u runs past its page",
+								 blk);
+				break;
+			}
+			nent++;
+			if (de->firstposting != InvalidBlockNumber)
+				lastposting = de->firstposting;
+			ptr += MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+		}
+		UnlockReleaseBuffer(buf);
+		blk = next;
+	}
+	if (nent != (uint64) seg->nterms)
+	{
+		wvck_sep(e);
+		appendStringInfo(e, "the dictionary chain holds %llu terms but the bolt directory says %u",
+						 (unsigned long long) nent, seg->nterms);
+		cx->incomplete = true;	/* the pages past a cut are live, not leaked */
+	}
+	return lastposting;
+}
+
+/*
+ * Walk every chain of ONE bolt, marking each page in cx->mark (when there is a
+ * map) and appending a description of every chain fault to `e`.  The body of
+ * wvck_mark_reachable()'s per-bolt loop, split out by task L23 so the merge can
+ * run the same walk over its inputs before it writes anything
+ * (weave_bolt_damage() below).  One walk again, for the reason the caller's
+ * comment gives: the merge must refuse exactly what weave_check(deep) reports.
+ */
+static void
+wvck_mark_bolt(WeaveCheckCtx *cx, const WeaveSegMeta *seg, StringInfo e)
+{
+	BlockNumber postchain = InvalidBlockNumber;
+	BlockNumber blk;
+	int64		trgmsteps;
+
+	if (seg->dictstart == InvalidBlockNumber)
+		return;
+
+	/*
+	 * COMPLETENESS, for the reclaim (WeaveCheckCtx.incomplete).  Every root
+	 * below is located through the non-throwing descriptor read, which
+	 * answers "no such weft" for a descriptor it cannot read -- so an
+	 * unreadable descriptor would silently drop every weft it names from
+	 * the map.  And a weft kind this walk has no arm for is a weft whose
+	 * pages it does not mark: a future kind added to the writer and the free
+	 * path but not here.  Either way the map is not a liveness oracle.
+	 */
+	if (seg->chandesc != InvalidBlockNumber)
+	{
+		WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
+		int			nweft = 0;
+		int			k;
+
+		if (weave_read_chandesc(cx->index, seg->chandesc, weft,
+								WEAVE_MAX_WEFTS, &nweft) != WEAVE_CD_OK)
+			cx->incomplete = true;
+		else
+			for (k = 0; k < nweft; k++)
+				if (weft[k].kind != (uint16) WEAVE_WK_LEXICAL &&
+					weft[k].kind != (uint16) WEAVE_WK_VECTOR &&
+					weft[k].kind != (uint16) WEAVE_WK_FUZZY &&
+					weft[k].kind != (uint16) WEAVE_WK_DOCVALS &&
+					weft[k].kind != (uint16) WEAVE_WK_CGRAM &&
+					weft[k].kind != (uint16) WEAVE_WK_DOCLIST)
+					cx->incomplete = true;
+	}
+
+	(void) wvck_walk_chain(cx, seg->dictstart, WEAVE_PK_DICT, e);
+	(void) wvck_walk_chain(cx, seg->dictindexstart, WEAVE_PK_DICTINDEX, e);
+	(void) wvck_walk_chain(cx, seg->doclenstart, WEAVE_PK_DOCLEN, e);
+	(void) wvck_walk_chain(cx, seg->livedocs, WEAVE_PK_TRGM_DATA, e);
+	if (seg->chandesc != InvalidBlockNumber)
+		(void) wvck_walk_chain(cx, seg->chandesc, WEAVE_PK_CHANDESC, e);
+
+	/*
+	 * v7: every weft the DESCRIPTOR names that is not already covered by a
+	 * WeaveSegMeta field.  Marking these is not optional bookkeeping -- an
+	 * unmarked surf chain would be reported by pages_reachable_or_freed as a
+	 * leak of the entire trie, which is both a false alarm and, if it were
+	 * ever silenced by exempting the kind instead, exactly the hole that would
+	 * hide a REAL leak of the same chain.
+	 */
+	if (seg->chandesc != InvalidBlockNumber)
+	{
+		BlockNumber surfroot = wvck_surf_root(cx, seg);
+		BlockNumber vecroot = weave_vec_weft_root(cx->index, seg);
+
+		if (surfroot != InvalidBlockNumber)
+			(void) wvck_walk_chain(cx, surfroot, WEAVE_PK_SURF, e);
+
+		/*
+		 * The DOCVALS weft is ONE nextblk-linked chain (the surf blob-chain
+		 * shape), so a single walk marks it -- unlike the vector and cgram
+		 * wefts below, whose root names several sub-chains.  Marking it is not
+		 * optional: an unmarked docvalues chain would be reported by
+		 * pages_reachable_or_freed as a leak of the whole store, and
+		 * weave_free_segment() frees it through the same default arm, so if
+		 * the two ever disagree this invariant is what says so.
+		 */
+		{
+			AttrNumber	dvattno;
+			BlockNumber dvroot = weave_docvals_root_for_segment(cx->index,
+																seg, &dvattno);
+
+			if (dvroot != InvalidBlockNumber)
+				(void) wvck_walk_chain(cx, dvroot, WEAVE_PK_DOCVALS, e);
+		}
+
+		/* v12: the document list is one nextblk chain, freed by
+		 * weave_free_segment()'s default arm; marked for the same reason */
+		{
+			BlockNumber dlroot = weave_doclist_root(cx->index, seg);
+
+			if (dlroot != InvalidBlockNumber)
+				(void) wvck_walk_chain(cx, dlroot, WEAVE_PK_DOCLIST, e);
+		}
+
+		/*
+		 * The vector weft is FOUR chains and the descriptor names only the
+		 * first: the WEAVE_VMETA page, which names the directory, the code
+		 * strips and the warp map.  Marking only the root would report every
+		 * strip page as a leak -- and, worse, "fixing" that by exempting the
+		 * kind instead of following the chains is precisely the hole that
+		 * would then hide a REAL leak of the same pages.
+		 * weave_free_segment() follows the same four, through
+		 * weave_vec_free_weft(); if the two ever disagree, this invariant is
+		 * what says so -- and since the merge producer landed it says so on
+		 * the first merge instead of never (doc/GAPS.md G24).
+		 */
+		if (vecroot != InvalidBlockNumber)
+		{
+			WeaveVecWeft w;
+			const char *why = NULL;
+
+			(void) wvck_walk_chain(cx, vecroot, WEAVE_PK_VMETA, e);
+			if (weave_vec_weft_open(cx->index, vecroot, &w, &why))
+			{
+				(void) wvck_walk_chain(cx, w.meta.dirstart, WEAVE_PK_VDIR, e);
+				(void) wvck_walk_chain(cx, w.meta.codestart, WEAVE_PK_VCODES, e);
+				(void) wvck_walk_chain(cx, w.meta.warpstart, WEAVE_PK_VWARP, e);
+				if (w.meta.graphstart != InvalidBlockNumber)
+					(void) wvck_walk_chain(cx, w.meta.graphstart,
+										   WEAVE_PK_VGRAPH, e);
+				/* weave_vec_free_weft() frees a calibration chain too; no
+				 * writer produces one yet, and this walk has no kind for
+				 * it, so a bolt that has one is not mapped completely */
+				if (w.meta.calibstart != InvalidBlockNumber)
+					cx->incomplete = true;
+			}
+			else
+				cx->incomplete = true;
+		}
+	}
+
+	/* the shared posting chain: named by the first dict entry */
+	if (seg->dictstart < cx->nblocks)
+	{
+		Buffer		buf = ReadBuffer(cx->index, seg->dictstart);
+		Page		page;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!PageIsNew(page) && WeavePageHasKind(page, WEAVE_PK_DICT))
+		{
+			char	   *ptr = (char *) PageGetContents(page);
+			char	   *end = weave_page_entry_end(page);
+
+			/*
+			 * The first entry with a VALID firstposting, exactly as
+			 * weave_free_segment() picks it.  This used to read only the
+			 * first entry; the two agree whenever the writer gives every
+			 * entry a posting, but the reclaim makes "agree" a safety
+			 * property rather than a reporting one, so they now run the
+			 * same rule.
+			 */
+			while (ptr < end && postchain == InvalidBlockNumber)
+			{
+				WeaveDictEntry *de = (WeaveDictEntry *) ptr;
+
+				if (!weave_dict_entry_fits(de, end))
+				{
+					cx->incomplete = true;
+					break;
+				}
+				postchain = de->firstposting;
+				ptr += MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
+			}
+		}
+		else
+			cx->incomplete = true;
+		UnlockReleaseBuffer(buf);
+	}
+	else
+		cx->incomplete = true;
+	if (postchain != InvalidBlockNumber)
+	{
+		BlockNumber lastposting = InvalidBlockNumber;
+
+		if (cx->strict)
+			lastposting = wvck_bolt_dict_count(cx, seg, e);
+		cx->seekblk = lastposting;
+		cx->seekhit = false;
+		(void) wvck_walk_chain(cx, postchain, WEAVE_PK_POSTING, e);
+		if (lastposting != InvalidBlockNumber && !cx->seekhit)
+		{
+			wvck_sep(e);
+			appendStringInfo(e, "the shared posting chain does not reach block %u, where the last term's postings start",
+							 lastposting);
+			cx->incomplete = true;
+		}
+		cx->seekblk = InvalidBlockNumber;
+	}
+	else if (cx->strict)
+		(void) wvck_bolt_dict_count(cx, seg, e);
+
+	/*
+	 * Z8: the cgram weft is FOUR chains behind one root page, and the
+	 * descriptor names only the root.  Marking the root alone would report
+	 * the entire trigram dictionary and every cgram posting page as a leak --
+	 * and, worse, "fixing" that by exempting the kinds instead of following
+	 * the chains is exactly the hole that would then hide a REAL leak of the
+	 * same pages.  weave_cgram_free_weft() follows the same four; if the two
+	 * ever disagree, this invariant is what says so.
+	 */
+	if (seg->chandesc != InvalidBlockNumber)
+	{
+		BlockNumber cgroot = weave_cgram_weft_root(cx->index, seg);
+
+		if (cgroot != InvalidBlockNumber)
+		{
+			WeaveCgramWeft cw;
+			const char *cwhy = NULL;
+
+			(void) wvck_walk_chain(cx, cgroot, WEAVE_PK_CGRAM, e);
+			if (!weave_cgram_weft_open(cx->index, cgroot, &cw, &cwhy))
+				cx->incomplete = true;
+			else
+			{
+				(void) wvck_walk_chain(cx, cw.dictstart,
+									   WEAVE_PK_CGRAM_DICT, e);
+				if (cw.dictindexstart != InvalidBlockNumber)
+					(void) wvck_walk_chain(cx, cw.dictindexstart,
+										   WEAVE_PK_CGRAM_DICTINDEX, e);
+				if (cw.postingstart != InvalidBlockNumber)
+					(void) wvck_walk_chain(cx, cw.postingstart,
+										   WEAVE_PK_CGRAM_POST, e);
+			}
+		}
+	}
+
+	/* trigram directory pages plus each entry's sparsemap blob chain */
+	blk = seg->trgmstart;
+	trgmsteps = 0;
+	while (blk != InvalidBlockNumber)
+	{
+		Buffer		buf;
+		Page		page;
+		BlockNumber next = InvalidBlockNumber;
+
+		CHECK_FOR_INTERRUPTS();
+		/* past EOF, or a cycle: more steps than the relation has pages */
+		if (blk >= cx->nblocks || ++trgmsteps > (int64) cx->nblocks)
+		{
+			cx->incomplete = true;
+			break;
+		}
+		buf = ReadBuffer(cx->index, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (PageIsNew(page) || !WeavePageHasKind(page, WEAVE_PK_TRGM))
+			cx->incomplete = true;
+		else
+		{
+			char	   *ptr = (char *) PageGetContents(page);
+			char	   *pend = weave_page_entry_end(page);
+
+			if (WeavePageIsFreed(page))
+			{
+				wvck_sep(e);
+				appendStringInfo(e, "block %u is on a live trigram_dir chain but is flagged freed",
+								 blk);
+				cx->incomplete = true;
+			}
+			next = WeavePageGetOpaque(page)->nextblk;
+			wvck_mark(cx, blk);
+			while (ptr + sizeof(WeaveTrgmEntry) <= pend)
+			{
+				BlockNumber db = ((WeaveTrgmEntry *) ptr)->firstdata;
+
+				while (db != InvalidBlockNumber)
+				{
+					Buffer		dbuf;
+					Page		dpage;
+					BlockNumber dnext;
+
+					if (db >= cx->nblocks || ++trgmsteps > (int64) cx->nblocks)
+					{
+						cx->incomplete = true;
+						break;
+					}
+					dbuf = ReadBuffer(cx->index, db);
+					LockBuffer(dbuf, BUFFER_LOCK_SHARE);
+					dpage = BufferGetPage(dbuf);
+					if (PageIsNew(dpage))
+					{
+						UnlockReleaseBuffer(dbuf);
+						cx->incomplete = true;
+						break;
+					}
+					if (WeavePageIsFreed(dpage))
+					{
+						wvck_sep(e);
+						appendStringInfo(e, "block %u is on a live trigram_data chain but is flagged freed",
+										 db);
+						cx->incomplete = true;
+					}
+					dnext = WeavePageGetOpaque(dpage)->nextblk;
+					UnlockReleaseBuffer(dbuf);
+					wvck_mark(cx, db);
+					db = dnext;
+				}
+				ptr += MAXALIGN(sizeof(WeaveTrgmEntry));
+			}
+		}
+		UnlockReleaseBuffer(buf);
+		blk = next;
+	}
+}
+
+/*
  * Mark every page reachable from the metapage in cx->mark.
  *
  * Split out of wvck_reachable() -- which is now only the report -- because
@@ -1568,10 +1979,10 @@ wvck_segments(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
  * and if the two ever disagree the leak shows up in the caller.
  */
 static void
-wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
+wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta,
+					StringInfo report)
 {
 	uint32		s;
-	BlockNumber blk;
 
 	wvck_mark(cx, WEAVE_METAPAGE_BLKNO);
 
@@ -1593,272 +2004,14 @@ wvck_mark_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 		cx->incomplete = true;
 	for (s = 0; s < meta->nsegments && s < WEAVE_MAX_SEGMENTS; s++)
 	{
-		const WeaveSegMeta *seg = &meta->segs[s];
-		BlockNumber postchain = InvalidBlockNumber;
 		StringInfoData e;
-		int64		trgmsteps;
-
-		if (seg->dictstart == InvalidBlockNumber)
-			continue;
-
-		/*
-		 * COMPLETENESS, for the reclaim (WeaveCheckCtx.incomplete).  Every root
-		 * below is located through the non-throwing descriptor read, which
-		 * answers "no such weft" for a descriptor it cannot read -- so an
-		 * unreadable descriptor would silently drop every weft it names from
-		 * the map.  And a weft kind this walk has no arm for is a weft whose
-		 * pages it does not mark: a future kind added to the writer and the free
-		 * path but not here.  Either way the map is not a liveness oracle.
-		 */
-		if (seg->chandesc != InvalidBlockNumber)
-		{
-			WeaveChannelDesc weft[WEAVE_MAX_WEFTS];
-			int			nweft = 0;
-			int			k;
-
-			if (weave_read_chandesc(cx->index, seg->chandesc, weft,
-									WEAVE_MAX_WEFTS, &nweft) != WEAVE_CD_OK)
-				cx->incomplete = true;
-			else
-				for (k = 0; k < nweft; k++)
-					if (weft[k].kind != (uint16) WEAVE_WK_LEXICAL &&
-						weft[k].kind != (uint16) WEAVE_WK_VECTOR &&
-						weft[k].kind != (uint16) WEAVE_WK_FUZZY &&
-						weft[k].kind != (uint16) WEAVE_WK_DOCVALS &&
-						weft[k].kind != (uint16) WEAVE_WK_CGRAM &&
-						weft[k].kind != (uint16) WEAVE_WK_DOCLIST)
-						cx->incomplete = true;
-		}
 
 		initStringInfo(&e);
-		(void) wvck_walk_chain(cx, seg->dictstart, WEAVE_PK_DICT, &e);
-		(void) wvck_walk_chain(cx, seg->dictindexstart, WEAVE_PK_DICTINDEX, &e);
-		(void) wvck_walk_chain(cx, seg->doclenstart, WEAVE_PK_DOCLEN, &e);
-		(void) wvck_walk_chain(cx, seg->livedocs, WEAVE_PK_TRGM_DATA, &e);
-		if (seg->chandesc != InvalidBlockNumber)
-			(void) wvck_walk_chain(cx, seg->chandesc, WEAVE_PK_CHANDESC, &e);
-
-		/*
-		 * v7: every weft the DESCRIPTOR names that is not already covered by a
-		 * WeaveSegMeta field.  Marking these is not optional bookkeeping -- an
-		 * unmarked surf chain would be reported by pages_reachable_or_freed as a
-		 * leak of the entire trie, which is both a false alarm and, if it were
-		 * ever silenced by exempting the kind instead, exactly the hole that would
-		 * hide a REAL leak of the same chain.
-		 */
-		if (seg->chandesc != InvalidBlockNumber)
-		{
-			BlockNumber surfroot = wvck_surf_root(cx, seg);
-			BlockNumber vecroot = weave_vec_weft_root(cx->index, seg);
-
-			if (surfroot != InvalidBlockNumber)
-				(void) wvck_walk_chain(cx, surfroot, WEAVE_PK_SURF, &e);
-
-			/*
-			 * The DOCVALS weft is ONE nextblk-linked chain (the surf blob-chain
-			 * shape), so a single walk marks it -- unlike the vector and cgram
-			 * wefts below, whose root names several sub-chains.  Marking it is not
-			 * optional: an unmarked docvalues chain would be reported by
-			 * pages_reachable_or_freed as a leak of the whole store, and
-			 * weave_free_segment() frees it through the same default arm, so if
-			 * the two ever disagree this invariant is what says so.
-			 */
-			{
-				AttrNumber	dvattno;
-				BlockNumber dvroot = weave_docvals_root_for_segment(cx->index,
-																	seg, &dvattno);
-
-				if (dvroot != InvalidBlockNumber)
-					(void) wvck_walk_chain(cx, dvroot, WEAVE_PK_DOCVALS, &e);
-			}
-
-			/* v12: the document list is one nextblk chain, freed by
-			 * weave_free_segment()'s default arm; marked for the same reason */
-			{
-				BlockNumber dlroot = weave_doclist_root(cx->index, seg);
-
-				if (dlroot != InvalidBlockNumber)
-					(void) wvck_walk_chain(cx, dlroot, WEAVE_PK_DOCLIST, &e);
-			}
-
-			/*
-			 * The vector weft is FOUR chains and the descriptor names only the
-			 * first: the WEAVE_VMETA page, which names the directory, the code
-			 * strips and the warp map.  Marking only the root would report every
-			 * strip page as a leak -- and, worse, "fixing" that by exempting the
-			 * kind instead of following the chains is precisely the hole that
-			 * would then hide a REAL leak of the same pages.
-			 * weave_free_segment() follows the same four, through
-			 * weave_vec_free_weft(); if the two ever disagree, this invariant is
-			 * what says so -- and since the merge producer landed it says so on
-			 * the first merge instead of never (doc/GAPS.md G24).
-			 */
-			if (vecroot != InvalidBlockNumber)
-			{
-				WeaveVecWeft w;
-				const char *why = NULL;
-
-				(void) wvck_walk_chain(cx, vecroot, WEAVE_PK_VMETA, &e);
-				if (weave_vec_weft_open(cx->index, vecroot, &w, &why))
-				{
-					(void) wvck_walk_chain(cx, w.meta.dirstart, WEAVE_PK_VDIR, &e);
-					(void) wvck_walk_chain(cx, w.meta.codestart, WEAVE_PK_VCODES, &e);
-					(void) wvck_walk_chain(cx, w.meta.warpstart, WEAVE_PK_VWARP, &e);
-					if (w.meta.graphstart != InvalidBlockNumber)
-						(void) wvck_walk_chain(cx, w.meta.graphstart,
-											   WEAVE_PK_VGRAPH, &e);
-					/* weave_vec_free_weft() frees a calibration chain too; no
-					 * writer produces one yet, and this walk has no kind for
-					 * it, so a bolt that has one is not mapped completely */
-					if (w.meta.calibstart != InvalidBlockNumber)
-						cx->incomplete = true;
-				}
-				else
-					cx->incomplete = true;
-			}
-		}
-
-		/* the shared posting chain: named by the first dict entry */
-		if (seg->dictstart < cx->nblocks)
-		{
-			Buffer		buf = ReadBuffer(cx->index, seg->dictstart);
-			Page		page;
-
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			page = BufferGetPage(buf);
-			if (!PageIsNew(page) && WeavePageHasKind(page, WEAVE_PK_DICT))
-			{
-				char	   *ptr = (char *) PageGetContents(page);
-				char	   *end = weave_page_entry_end(page);
-
-				/*
-				 * The first entry with a VALID firstposting, exactly as
-				 * weave_free_segment() picks it.  This used to read only the
-				 * first entry; the two agree whenever the writer gives every
-				 * entry a posting, but the reclaim makes "agree" a safety
-				 * property rather than a reporting one, so they now run the
-				 * same rule.
-				 */
-				while (ptr < end && postchain == InvalidBlockNumber)
-				{
-					WeaveDictEntry *de = (WeaveDictEntry *) ptr;
-
-					if (!weave_dict_entry_fits(de, end))
-					{
-						cx->incomplete = true;
-						break;
-					}
-					postchain = de->firstposting;
-					ptr += MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
-				}
-			}
-			else
-				cx->incomplete = true;
-			UnlockReleaseBuffer(buf);
-		}
-		else
-			cx->incomplete = true;
-		if (postchain != InvalidBlockNumber)
-			(void) wvck_walk_chain(cx, postchain, WEAVE_PK_POSTING, &e);
-
-		/*
-		 * Z8: the cgram weft is FOUR chains behind one root page, and the
-		 * descriptor names only the root.  Marking the root alone would report
-		 * the entire trigram dictionary and every cgram posting page as a leak --
-		 * and, worse, "fixing" that by exempting the kinds instead of following
-		 * the chains is exactly the hole that would then hide a REAL leak of the
-		 * same pages.  weave_cgram_free_weft() follows the same four; if the two
-		 * ever disagree, this invariant is what says so.
-		 */
-		if (seg->chandesc != InvalidBlockNumber)
-		{
-			BlockNumber cgroot = weave_cgram_weft_root(cx->index, seg);
-
-			if (cgroot != InvalidBlockNumber)
-			{
-				WeaveCgramWeft cw;
-				const char *cwhy = NULL;
-
-				(void) wvck_walk_chain(cx, cgroot, WEAVE_PK_CGRAM, &e);
-				if (!weave_cgram_weft_open(cx->index, cgroot, &cw, &cwhy))
-					cx->incomplete = true;
-				else
-				{
-					(void) wvck_walk_chain(cx, cw.dictstart,
-										   WEAVE_PK_CGRAM_DICT, &e);
-					if (cw.dictindexstart != InvalidBlockNumber)
-						(void) wvck_walk_chain(cx, cw.dictindexstart,
-											   WEAVE_PK_CGRAM_DICTINDEX, &e);
-					if (cw.postingstart != InvalidBlockNumber)
-						(void) wvck_walk_chain(cx, cw.postingstart,
-											   WEAVE_PK_CGRAM_POST, &e);
-				}
-			}
-		}
-
-		/* trigram directory pages plus each entry's sparsemap blob chain */
-		blk = seg->trgmstart;
-		trgmsteps = 0;
-		while (blk != InvalidBlockNumber)
-		{
-			Buffer		buf;
-			Page		page;
-			BlockNumber next = InvalidBlockNumber;
-
-			CHECK_FOR_INTERRUPTS();
-			/* past EOF, or a cycle: more steps than the relation has pages */
-			if (blk >= cx->nblocks || ++trgmsteps > (int64) cx->nblocks)
-			{
-				cx->incomplete = true;
-				break;
-			}
-			buf = ReadBuffer(cx->index, blk);
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			page = BufferGetPage(buf);
-			if (PageIsNew(page) || !WeavePageHasKind(page, WEAVE_PK_TRGM))
-				cx->incomplete = true;
-			else
-			{
-				char	   *ptr = (char *) PageGetContents(page);
-				char	   *pend = weave_page_entry_end(page);
-
-				next = WeavePageGetOpaque(page)->nextblk;
-				wvck_mark(cx, blk);
-				while (ptr + sizeof(WeaveTrgmEntry) <= pend)
-				{
-					BlockNumber db = ((WeaveTrgmEntry *) ptr)->firstdata;
-
-					while (db != InvalidBlockNumber)
-					{
-						Buffer		dbuf;
-						Page		dpage;
-						BlockNumber dnext;
-
-						if (db >= cx->nblocks || ++trgmsteps > (int64) cx->nblocks)
-						{
-							cx->incomplete = true;
-							break;
-						}
-						dbuf = ReadBuffer(cx->index, db);
-						LockBuffer(dbuf, BUFFER_LOCK_SHARE);
-						dpage = BufferGetPage(dbuf);
-						if (PageIsNew(dpage))
-						{
-							UnlockReleaseBuffer(dbuf);
-							cx->incomplete = true;
-							break;
-						}
-						dnext = WeavePageGetOpaque(dpage)->nextblk;
-						UnlockReleaseBuffer(dbuf);
-						wvck_mark(cx, db);
-						db = dnext;
-					}
-					ptr += MAXALIGN(sizeof(WeaveTrgmEntry));
-				}
-			}
-			UnlockReleaseBuffer(buf);
-			blk = next;
-		}
+		wvck_mark_bolt(cx, &meta->segs[s], &e);
+		if (report != NULL && e.len > 0)
+			appendStringInfo(report, "%sbolt %u (dictionary at block %u): %s",
+							 report->len > 0 ? "; " : "", s,
+							 meta->segs[s].dictstart, e.data);
 		pfree(e.data);
 	}
 }
@@ -1897,9 +2050,57 @@ weave_reach_map(Relation index, const WeaveMetaPageData *meta,
 	cx.nblocks = nblocks;
 	cx.mark = wvck_mark_alloc(nblocks);
 	cx.pendstop = meta->pendingtail;
-	wvck_mark_reachable(&cx, meta);
+	cx.seekblk = InvalidBlockNumber;
+
+	/*
+	 * STRICT FOR THE RECLAIM TOO (L23).  A chain cut short on a page that is not
+	 * flagged freed leaves every page behind the cut unreached, and a non-strict
+	 * map would hand them to the reclaim as leaks -- freeing a live bolt's pages
+	 * before the merge's own check could refuse it.  The recorded lengths are
+	 * what show the cut; their cost is one more pass over each bolt's
+	 * dictionary pages per VACUUM.
+	 */
+	cx.strict = true;
+	wvck_mark_reachable(&cx, meta, NULL);
 	*complete = !cx.incomplete && cx.noverlap == 0;
 	return cx.mark;
+}
+
+/*
+ * L23: is this bolt safe to merge?  NULL when every chain it carries walks to
+ * its end through live pages of the right kind and its recorded lengths agree;
+ * otherwise a palloc'd description naming each fault and its block.
+ *
+ * The merge calls this for every input BEFORE it reads or allocates anything,
+ * because each of its own chain readers stops quietly at a freed page (freeing
+ * resets nextblk) and the merge would then publish a smaller, self-consistent
+ * bolt and free its input -- the postings behind the page gone, and no invariant
+ * left to say so (doc/GAPS.md G75).  Checking up front rather than inside each
+ * reader is deliberate: those readers are shared with scans, which may meet a
+ * page a concurrent merge freed and must not fail on it; and once the merge has
+ * allocated, its own output may already have reused a page the damaged input
+ * still names.  Same walk as weave_check(deep)'s bolt_chains_intact, so the merge
+ * refuses exactly what the check reports.  Never throws on a bad page.
+ */
+char *
+weave_bolt_damage(Relation index, const WeaveSegMeta *seg)
+{
+	WeaveCheckCtx cx;
+	StringInfoData e;
+
+	MemSet(&cx, 0, sizeof(cx));
+	cx.index = index;
+	cx.nblocks = RelationGetNumberOfBlocks(index);
+	cx.seekblk = InvalidBlockNumber;
+	cx.strict = true;
+	initStringInfo(&e);
+	wvck_mark_bolt(&cx, seg, &e);
+	if (e.len == 0)
+	{
+		pfree(e.data);
+		return NULL;
+	}
+	return e.data;
 }
 
 /*
@@ -1923,8 +2124,24 @@ wvck_reachable(WeaveCheckCtx *cx, const WeaveMetaPageData *meta)
 	int64		nleak = 0;
 	BlockNumber firstleak = InvalidBlockNumber;
 	StringInfoData d;
+	StringInfoData chains;
 
-	wvck_mark_reachable(cx, meta);
+	initStringInfo(&chains);
+	cx->strict = true;
+	cx->seekblk = InvalidBlockNumber;
+	wvck_mark_reachable(cx, meta, &chains);
+
+	/*
+	 * L23: every chain of every live bolt, walked to its end, with no page on it
+	 * flagged freed or of the wrong kind, and the recorded lengths agreeing.  The
+	 * walk above always found these faults -- it set `incomplete` for the
+	 * reclaim -- and this row used to discard the description, so a freed LAST
+	 * page of a live chain (reachable, flagged, hence no leak) reported clean.
+	 * The merge refuses exactly what this row reports (weave_bolt_damage()).
+	 */
+	wvck_emit(cx, "bolt_chains_intact", chains.len == 0,
+			  chains.len > 0 ? chains.data : NULL);
+	pfree(chains.data);
 
 	for (blk = 1; blk < cx->nblocks; blk++)
 	{
@@ -2231,7 +2448,8 @@ weave_page_info(PG_FUNCTION_ARGS)
 	UnlockReleaseBuffer(mb);
 
 	cx.mark = wvck_mark_alloc(cx.nblocks);
-	wvck_mark_reachable(&cx, &meta);
+	cx.seekblk = InvalidBlockNumber;
+	wvck_mark_reachable(&cx, &meta, NULL);
 
 	if (oneblock)
 		wvpi_row(&cx, (BlockNumber) want);
