@@ -5123,7 +5123,16 @@ reachable page during the pass, and marking a page used hands it to nobody. On `
 any crash with recent FSM updates can trigger this ratchet. It is not specific to
 pending flushes.
 
-**OPEN: the size bound in a long crash loop.** At 18 cycles (`pgweave-20261006-001850-1420`,
+**CLOSED 2026-10-08 by L22 (`wt/l22`): the size bound below.** The "probable mechanism" in
+this paragraph is **REFUTED**, and so is the assumption that the crash causes the growth.
+Both were tested by ablation on EC2. The reclaim clears the stale entries before the trigger
+reads the map. The trigger fired on the twin too, and the twin's pass was stopped by the
+recyclability probe. Swapping the insert order moved the growth to the never-crashed twin.
+The growth came from share-lock compaction passes that started with fewer reusable pages
+than live ones. The fix and the measurements are in `doc/PHASES.md` L22 and
+`bench/RESULTS_G75_RECLAIM.md` "L22". The text below is the record as it stood before L22.
+
+**OPEN (until L22): the size bound in a long crash loop.** At 18 cycles (`pgweave-20261006-001850-1420`,
 `057fc9d`), `t/033`'s crashed index ended up as much as 22,476 pages larger than its
 never-crashed twin. That happened on a run where every cycle's stranded pages **were**
 reclaimed: 0 leaked pages and a clean deep check after every VACUUM, both hard
