@@ -6883,3 +6883,26 @@ same two scales and close it. Covered queries (`fox & !dog`) never pad and are u
 (`pgweave-20261008-162641-39d3`, two runs per arm). It is the same collection, and the
 streaming walk should serve both. Re-measure it in the same revisit.
 
+### G96 — `wquery_out` text does not parse back: a phrase, prefix, fuzzy or weighted term reloads as a DIFFERENT query — **FOUND 2026-10-08 by the exact-gap phrase work (`wt/phrase`); OPEN, needs a syntax decision**
+
+`wquery_out` prints phrases as `'quick' <-> 'brown'` (and since `wt/phrase`, exact gaps as `<N>`),
+prefixes as `'fo'*`, fuzzy as `'fo'~1` and weights as `'fox':A`. `wquery_in` reads none of these
+back: `<` and `>` are separators and `-` is NOT, and a suffix after a closing quote is dropped or
+split. Pinned by `sql/tsquery_cast.sql`:
+
+| printed | reads back as |
+|---|---|
+| `('quick' <-> 'brown')` | `'quick' & !'brown'` |
+| `'fo'*` | `'fo'` |
+| `'fox':A` | `'fox' & 'a'` |
+
+So a text-format `COPY` / `pg_dump` of a stored `wquery` column, or any client that round-trips
+a wquery through text, silently changes the query. Binary I/O is exact. This is the G89 rule
+(every value a function returns must round-trip) applied to the query type.
+
+**Decision needed (the phrase agent's proposal):** make `wquery_in` accept what `wquery_out`
+prints -- the tsquery operators `<->` / `<N>` between operands and a quoted term followed by `*`,
+`~k` or `:ABCD`. Cost: `a <-> b` today means `a & !b` and `a<2>b` means `a & 2 & b`; both change
+meaning. Nothing is released, so only tests notice. The alternative (print only what today's parser
+reads) cannot express an exact gap, so it does not close the round trip.
+
