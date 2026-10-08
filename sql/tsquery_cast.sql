@@ -35,6 +35,9 @@ SELECT count(*) AS docs, count(*) FILTER (WHERE tsv = strip(tsv) AND length(tsv)
 -- reaches the scan-side recheck rather than an executor recheck (AGENTS.md)
 CREATE INDEX tc_tsv ON tc USING weave (tsv tsvector_lex_ops);
 CREATE INDEX tc_expr ON tc USING weave (to_wdoc(tsv));
+-- positions = on: a pure phrase chain is answered from the postings' positions
+-- (weave_phrase_eval_seg), the other evaluator of an exact gap
+CREATE INDEX tc_pos ON tc USING weave (to_wdoc(tsv)) WITH (positions = on);
 
 -- core's row set, the cast's row set (heap evaluation), the two index counts
 -- (ix_ok), the ranked index scan's relation to core (ranked), or the refusal
@@ -61,7 +64,8 @@ BEGIN
 	SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO weave
 	  FROM tc WHERE to_wdoc(tsv) @@@ wq;
 	ix_ok := weave_count('tc_tsv', wq) = cardinality(core)
-		 AND weave_count('tc_expr', wq) = cardinality(core);
+		 AND weave_count('tc_expr', wq) = cardinality(core)
+		 AND weave_count('tc_pos', wq) = cardinality(core);
 	-- the ranked scan (WHERE @@@ q ORDER BY <=> q).  Its candidates come from
 	-- q's literal terms, so a prefix expansion or a row matching only through
 	-- NOT is reached by the padding phase (doc/GAPS.md G94; it was a SUBSET).
@@ -108,9 +112,16 @@ SELECT q, cardinality(c.core) AS ncore,
 		('quick <-> brown'), ('quick:A <-> brown'), ('quick <-> brown:B'),
 		('(quick <-> brown) <-> fox'), ('(quick <-> brown) & fox'),
 		('!(quick <-> brown)'), ('fox <-> fox'),
-		-- phrase shapes wquery cannot express exactly
+		-- exact gaps (WEAVE_QF_PHRASE_EXACT): <0> is the same position, <N>
+		-- exactly N, a right operand's width adds to the gap
 		('quick <2> brown'), ('quick <0> brown'), ('quick <3> brown'),
-		('quick <-> (brown <-> fox)'), ('quick <-> (brown | fox)'),
+		('fox <0> fox'), ('fox <2> fox'), ('quick <1> brown'), ('quick:A <2> brown:C'),
+		('quick <-> (brown <-> fox)'), ('quick <2> (brown <3> fox)'),
+		('(quick <2> brown) <-> (fox <0> fox)'), ('(quick <0> quick) <2> fox'),
+		('quick <-> (brown <-> (fox <-> dog))'), ('!(quick <2> brown)'),
+		('quick <2> brown | dog <0> dog'), ('quick <2> brown & !fox'),
+		-- phrase shapes wquery cannot express exactly: still refused
+		('quick <-> (brown | fox)'),
 		('quick <-> (brown & fox)'), ('quick <-> !brown'), ('fo:* <-> dog'),
 		('quick <-> fo:*'),
 		-- negation
@@ -170,13 +181,42 @@ SELECT ranked, count(*),
 SELECT count(*) FILTER (WHERE q ~ ':[A-D]+') AS weighted,
 	   count(*) FILTER (WHERE q ~ ':\*') AS prefixed,
 	   count(*) FILTER (WHERE q ~ '<->') AS phrased,
+	   count(*) FILTER (WHERE q ~ '<[0-9]+>') AS exact_gap,
 	   count(*) FILTER (WHERE q ~ '!') AS negated
   FROM rres WHERE refused IS NULL;
 
--- the text form of each mapped shape
+-- the text form of each mapped shape; an exact gap prints as core does
 SELECT q, q::tsquery::wquery::text AS wquery
   FROM (VALUES ('fox:A'), ('fox:BD'), ('fox:ABCD'), ('fo:*'), ('!fox:C'),
-			   ('quick <-> brown <-> fox'), ('fox:A & (dog | la:*)')) v(q);
+			   ('quick <-> brown <-> fox'), ('fox:A & (dog | la:*)'),
+			   ('quick <0> brown'), ('quick <3> brown'), ('quick <-> (brown <2> fox)'),
+			   ('(quick <2> brown) <0> (fox <-> dog)')) v(q);
+
+-- phraseto_tsquery: a stopword leaves a gap, which core spells <N>
+SELECT p, doc, phraseto_tsquery('english', p)::text AS tsquery,
+	   phraseto_tsquery('english', p)::wquery::text AS wquery,
+	   to_tsvector('english', doc) @@ phraseto_tsquery('english', p) AS core,
+	   to_wdoc(to_tsvector('english', doc)) @@@ phraseto_tsquery('english', p)::wquery AS weave
+  FROM (VALUES ('cat in the hat'), ('the cat in the hat'), ('cat hat'), ('cat in hat')) v(p),
+	   (VALUES ('the cat in the hat sat'), ('a cat hat'), ('cat in a hat'),
+			   ('cat in the big hat')) t(doc)
+ ORDER BY 1, 2;
+
+-- the binary form keeps the exact-gap flag: through COPY (FORMAT binary) and
+-- back (wquery_send -> wquery_recv) the value has the same bytes and the
+-- received one answers like core.  Per-backend file name (G60).
+CREATE TEMP TABLE wqa (id int, q text, w wquery);
+CREATE TEMP TABLE wqb (id int, w wquery);
+INSERT INTO wqa SELECT i, q, q::tsquery::wquery
+  FROM unnest(ARRAY['quick <0> brown', 'quick <2> brown', 'quick <-> (brown <2> fox)',
+					'(quick <2> brown) <-> fox', 'fox <0> fox']) WITH ORDINALITY u(q, i);
+SELECT '/tmp/pg_weave_wq_rt_' || pg_backend_pid() || '.bin' AS wqfile \gset
+COPY (SELECT id, w FROM wqa) TO :'wqfile' WITH (FORMAT binary);
+COPY wqb FROM :'wqfile' WITH (FORMAT binary);
+SELECT a.q, wquery_send(b.w) = wquery_send(a.w) AS binary_same, b.w::text AS received,
+	   (SELECT count(*) FROM tc WHERE to_wdoc(tsv) @@@ b.w) AS recv_rows,
+	   (SELECT count(*) FROM tc WHERE tsv @@ a.q::tsquery) AS core_rows
+  FROM wqa a JOIN wqb b USING (id) ORDER BY id;
 
 -- the ranked arm really is an index scan with the ranking pass
 SET enable_seqscan = off;
