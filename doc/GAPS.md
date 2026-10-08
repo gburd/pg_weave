@@ -6363,8 +6363,53 @@ index scan. Hard rule 1's class: plausible answers, rows missing, no message. Fi
 still inexact. Found only because the test compares against core over random queries;
 every hand-written NOT test in the suite negated a plain term.
 
+**Two more pre-existing silent row drops, same family, found by the same test and its probe.**
+
+- *The ranked scan's boolean gate ignored the weight.* `weave_query_is_pure_or()` and
+  `weave_query_is_pure_boolean()` exclude prefix/fuzzy/regex leaves but not
+  `WEAVE_QF_WEIGHTED`, so `WHERE tsv @@@ 'fox:A' ORDER BY tsv <=> 'fox:A'` answered from
+  term presence with `xs_recheck = false` and returned `fox` in every zone -- 22 of the 42
+  hand-written queries disagreed with core on that arm (run `pgweave-20261008-020243-898d`).
+  Both predicates now exclude it, so a weighted query takes collect + recheck + DocidFilter.
+- *Any fuzzy or regex leaf made the collector ignore the rest of the query.* The
+  `has_fuzzy_regex` branch of `weave_collect_matches()` builds its candidate set as the
+  union of the fuzzy/regex leaves' matches and nothing else, which is sound for `a & b~1`
+  and `b~1 | /re/` and wrong for everything else. Measured on 2000 rows, seqscan against
+  `weave_count()` (run `pgweave-20261008-020243-898d`, `remote/probe_fuzzy_bool.out`):
+
+  | query | seqscan | index |
+  |---|---:|---:|
+  | `quick \| brwn~1` | 1113 | 651 |
+  | `!brwn~1` | 1349 | **0** |
+  | `quick & !brwn~1` | 462 | **0** |
+  | `!(quick & brwn~1)` | 1806 | 457 |
+  | `dog \| /fox.*/` | 1399 | 1080 |
+  | `!/fox.*/` | 920 | **0** |
+
+  A bitmap scan goes through the same collector, so a plain `WHERE d @@@ 'a | b~1'` was
+  affected. `weave_query_fr_covered()` now decides whether the leaves cover every match
+  (AND needs one covered arm, OR both, NOT never); when they do not, the existing universe
+  + recheck fallback answers. **That is correct and slow** -- every document in the
+  segment is rechecked for those shapes. Feeding the leaf sets into `weave_eval_query()`
+  instead would make them fast; not done here.
+
+**Still open, recorded rather than fixed: the ranked scan returns a SUBSET for a query
+with NOT.** `WHERE d @@@ '!fox' ORDER BY d <=> '!fox'` generates candidates only from the
+query's positive literal terms (WAND cursors), so a row that matches only through a NOT
+is never ranked, and the G56 padding phase is skipped because the restriction IS the
+ORDER BY query (`weave_pad_wanted()`: "no padding row could pass it" -- false for a query
+with NOT). 11 of 11 random NOT-bearing converted queries and every hand-written one whose
+match set includes rows without a positive term returned a strict subset. The code
+comment at the ranked collect site says "PHRASE/NEAR/boolean are exact"; for NOT it is
+not. Prefix is the same shape and is documented (G1's risk note). The likely fix is to pad
+when `ordSameQuery` and the query has a NOT or an expanding leaf; it touches the G56/G86
+ordering machinery, so it is left for a task of its own. `sql/tsquery_cast.sql` pins
+the current state (`ranked` column: never SUPERSET; subset only with a prefix or a NOT).
+
 Gate: `sql/tsquery_cast.sql` -- 42 hand-written and 400 random tsqueries over one
 200-row weighted table, core `@@` against the cast through the heap, `weave_count()` on a
-`tsvector_lex_ops` index and an expression index, and the ranked index scan. Mutants:
-`bench/aws/g93_mutants.sh`.
+`tsvector_lex_ops` index and an expression index, and the ranked index scan; plus 15
+native fuzzy/regex-under-boolean queries, seqscan against both indexes. Mutants:
+`bench/aws/g93_mutants.sh` (M1-M10, each verified BUILT with an installed `.so` that
+differs from the clean one).
 
