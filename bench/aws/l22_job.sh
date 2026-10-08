@@ -26,6 +26,7 @@ apply() {	# arm -> substitution in the current dir
 	local f=src/am/amvacuum.c from to
 	case $1 in
 	base) return 0 ;;
+	pre)	apply nofit && apply noskip; return $? ;;
 	noskip)	f=src/am/am.c; from='				if (nskipped < WEAVE_FSM_SKIP_MAX &&'; to='				if (false && nskipped < WEAVE_FSM_SKIP_MAX &&	/* ARM */' ;;
 	nofit)	from='			 !weave_pack_fits_reusable(index)))'; to='			 !weave_any_free_page_recyclable(index)))	/* ARM */' ;;
 	fit)	from='!weave_any_free_page_recyclable(index))'; to='!weave_l22_pack_fits(index))	/* ARM */' ;;
@@ -51,6 +52,7 @@ apply() {	# arm -> substitution in the current dir
 		die "arm: pattern matched $n times in $ARGV\n" unless $n == 1;
 		my $t = $ENV{TO}; s/$f/$t/;' $f || return 1
 	echo "$f: $(grep -c 'ARM' $f) ARM line(s)"
+	return 0
 }
 
 install_tree() {	# dir tag
