@@ -616,6 +616,38 @@ weave_low_free_fits_live(Relation index)
 	return freebelow >= livebelow;
 }
 
+/*
+ * L22 ABLATION PROTOTYPE: would a pack-only pass fit in pages reusable NOW,
+ * counted from the pages rather than the FSM?  live = initialized, not freed.
+ */
+static bool
+weave_l22_pack_fits(Relation index)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	BlockNumber b;
+	BlockNumber live = 0,
+				reusable = 0;
+
+	for (b = 1; b < nblocks; b++)
+	{
+		Buffer		buf = ReadBuffer(index, b);
+		Page		page;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (PageIsNew(page) ||
+			(PageGetSpecialSize(page) == MAXALIGN(sizeof(WeavePageOpaqueData)) &&
+			 WeavePageIsFreed(page)))
+			reusable += weave_page_reusable_now(index, page);
+		else
+			live++;
+		UnlockReleaseBuffer(buf);
+	}
+	elog(LOG, "pg_weave L22 fits \"%s\": nblocks=%u live=%u reusable=%u",
+		 RelationGetRelationName(index), nblocks, live, reusable);
+	return reusable >= live;
+}
+
 bool
 weave_vacuum_compact(Relation index)
 {
@@ -708,6 +740,8 @@ weave_vacuum_compact(Relation index)
 		 */
 		if (weave_index_is_compacted(index))
 		{
+			elog(LOG, "pg_weave L22 compact \"%s\" pass %d: is_compacted",
+				 RelationGetRelationName(index), pass);
 			nblocks = weave_truncate_free_tail(index);
 			if (nblocks < prevblocks)
 				didwork = true;
@@ -748,6 +782,11 @@ weave_vacuum_compact(Relation index)
 		 * t/015 requires a shrink on the horizon-advancing arm, so a regression
 		 * into permanent skipping fails a test rather than silently stopping work.
 		 */
+		elog(LOG, "pg_weave L22 compact \"%s\" pass %d: probe=%d fits=%d ael=%d",
+			 RelationGetRelationName(index), pass,
+			 (int) weave_any_free_page_recyclable(index),
+			 (int) weave_l22_pack_fits(index),
+			 (int) CheckRelationLockedByMe(index, AccessExclusiveLock, true));
 		if (!CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&
 			!weave_any_free_page_recyclable(index))
 		{

@@ -12,15 +12,23 @@ mkdir -p $OUT
 PGC=/usr/lib/postgresql/17/bin/pg_config
 LIB=$($PGC --pkglibdir)
 SRC=$HOME/pg_weave
-ARMS="${ARMS:-base trig_pages trig_reusable trig_off}"
+ARMS="${ARMS:-base fit swap xid}"
 L22N="${L22N:-2}"
-TESTS="${TESTS:-t/033_reclaim_crash_loop.pl}"
+TESTS="${TESTS:-t/033_reclaim_crash_loop.pl t/015_alloc_outcomes.pl}"
 log() { echo "$(date +%T) $*" | tee -a $OUT/l22.log; }
 
 apply() {	# arm -> substitution in the current dir
 	local f=src/am/amvacuum.c from to
 	case $1 in
 	base) return 0 ;;
+	fit)	from='!weave_any_free_page_recyclable(index))'; to='!weave_l22_pack_fits(index))	/* ARM */' ;;
+	swap)	f=t/033_reclaim_crash_loop.pl
+			from="\$fill->('c', \$cyc) . '; ' . \$fill->('t', \$cyc));"
+			to="\$fill->('t', \$cyc) . '; ' . \$fill->('c', \$cyc));	# ARM" ;;
+	xid)	f=t/033_reclaim_crash_loop.pl
+			from="safe_psql('postgres', \$fill->('c', \$cyc) . '; '"
+			to="safe_psql('postgres', 'SELECT txid_current(); ' . \$fill->('c', \$cyc) . '; '	# ARM
+				 . ''" ;;
 	trig_pages)		from='if (nblocks > 16 && freeblks > nblocks / 4)'; to='if (nblocks > 16 && pgfree > nblocks / 4)	/* ARM */' ;;
 	trig_reusable)	from='if (nblocks > 16 && freeblks > nblocks / 4)'; to='if (nblocks > 16 && reusable > nblocks / 4)	/* ARM */' ;;
 	trig_off)		from='if (nblocks > 16 && freeblks > nblocks / 4)'; to='if (false && nblocks > 16 && freeblks > nblocks / 4)	/* ARM */' ;;
@@ -35,7 +43,7 @@ apply() {	# arm -> substitution in the current dir
 		my $f = quotemeta($ENV{FROM}); my $n = () = /$f/g;
 		die "arm: pattern matched $n times in $ARGV\n" unless $n == 1;
 		my $t = $ENV{TO}; s/$f/$t/;' $f || return 1
-	grep -c 'ARM' $f
+	echo "$f: $(grep -c 'ARM' $f) ARM line(s)"
 }
 
 install_tree() {	# dir tag
@@ -59,9 +67,13 @@ for arm in $ARMS; do
 		log "$arm: DID NOT BUILD ($(grep -m3 error $OUT/build-$arm.log))"; ok=0; continue
 	fi
 	md5=$(md5sum $LIB/pg_weave.so | cut -d' ' -f1)
-	for a in "${!MD5[@]}"; do
-		[ "${MD5[$a]}" = "$md5" ] && { log "$arm: .so identical to $a's -- arm not counted"; ok=0; }
-	done
+	# a C arm must build a .so of its own; a test-only arm (swap, xid) must not
+	case $(cat $OUT/apply-$arm.log) in *t/0*) testarm=1 ;; *) testarm=0 ;; esac
+	if [ $testarm = 0 ]; then
+		for a in "${!MD5[@]}"; do
+			[ "${MD5[$a]}" = "$md5" ] && { log "$arm: .so identical to $a's -- arm not counted"; ok=0; }
+		done
+	fi
 	MD5[$arm]=$md5
 	for r in $(seq 1 $L22N); do
 		tag=$arm-$r
