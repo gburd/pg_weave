@@ -6573,6 +6573,36 @@ when `ordSameQuery` and the query has a NOT or an expanding leaf; it touches the
 ordering machinery, so it is left for a task of its own. `sql/tsquery_cast.sql` pins
 the current state (`ranked` column: never SUPERSET; subset only with a prefix or a NOT).
 
+**EXACT-GAP PHRASE, 2026-10-08 (`wt/phrase`, maintainer decision 2026-10-08: format change OK).**
+Design, written before the code:
+
+- *Core's semantics* (`TS_phrase_execute` / `TS_phrase_output`, `tsvector_op.c`). Every
+  match is reported at its END position plus a static `width` (lexemes - 1): a lexeme has
+  width 0, `L <N> R` has width `N + width(L) + width(R)`, NOT keeps its operand's width,
+  AND/OR take the max (and OR takes the surviving side's width when the other side fails,
+  so it is not static). `L <N> R` matches at `p` iff `R` ends at `p` and `L` ends at
+  `p - N - width(R)` -- gap EXACTLY `N + width(R)` between the two end positions. So
+  `<0>` is "same position", and a right-nested `a <1> (b <1> c)` is `end(a) + 2 == end(c)`.
+- *wquery representation: a flag, not an op code.* `WEAVE_QF_PHRASE_EXACT` on a
+  `WEAVE_OP_PHRASE` item (`flags` is 0 on every OPR item every producer emits today), with
+  `distance` = the exact end-to-end gap the cast computes as `N + width(R)`. Chosen over a
+  new op code because every site that does not EVALUATE adjacency (candidate AND in
+  `weave_eval_query`, the inexact flag, the pure-boolean / pure-OR gates, `has_phrase`)
+  must treat the exact form exactly like PHRASE, and a flag gets that for free; a new op
+  code would fall into the "else = OR" arm of `weave_eval_query` wherever a site was
+  missed. The two sites that DO evaluate adjacency share `weave_phrase_step_pos()`, which
+  gains an `exact` argument, so the compiler finds every caller.
+- *Mapped by the cast once both evaluators read the flag:* `<0>`, `<N>`, left-nested,
+  right-nested and phrase-of-phrase chains of lexemes (weighted lexemes included), hence
+  `phraseto_tsquery` with stopword gaps. *Still refused:* `&`, `|`, `!` and `lex:*` inside a
+  phrase -- core evaluates those positionally with negated position sets and
+  width alignment (`TSPO_L_ONLY`/`R_ONLY`, `negate`), which neither wquery evaluator models.
+- *Found while designing, pre-existing:* `wquery_out` output does not re-parse. The lexer
+  treats `<` and `>` as separators and `-` as NOT, so `('a' <-> 'b')` reads back as
+  `'a' & !'b'`; `'a'*`, `'a'~1` and `'a':A` lose the suffix after the quote. Binary
+  send/recv round-trips every field (flags included). A text form that round-trips needs
+  new `wquery_in` syntax, which is a decision (see the report on `wt/phrase`).
+
 Gate: `sql/tsquery_cast.sql` -- 42 hand-written and 400 random tsqueries over one
 200-row weighted table, core `@@` against the cast through the heap, `weave_count()` on a
 `tsvector_lex_ops` index and an expression index, and the ranked index scan; plus 15
