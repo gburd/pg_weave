@@ -1154,6 +1154,59 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 static XLogRecPtr weave_reclaim_prepare(Relation index);
 
+/*
+ * L22 DIAGNOSTIC (doc/PHASES.md L22): the cleanup trigger's input as the FSM
+ * reports it and as the pages report it, logged at each step of the cleanup.
+ * Reads every page; temporary.
+ */
+static void
+weave_l22_census(Relation index, const char *where,
+				 BlockNumber *pgfree_out, BlockNumber *reusable_out)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	BlockNumber b;
+	BlockNumber fsmfree = 0,
+				pgfree = 0,
+				stale = 0,
+				notfsm = 0,
+				reusable = 0,
+				unrec = 0;
+
+	for (b = 1; b < nblocks; b++)
+	{
+		bool		infsm = GetRecordedFreeSpace(index, b) >= BLCKSZ / 2;
+		Buffer		buf = ReadBuffer(index, b);
+		Page		page;
+		bool		isfree;
+		bool		reuse = false;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		isfree = PageIsNew(page) ||
+			(PageGetSpecialSize(page) == MAXALIGN(sizeof(WeavePageOpaqueData)) &&
+			 WeavePageIsFreed(page));
+		if (isfree)
+			reuse = weave_page_reusable_now(index, page);
+		UnlockReleaseBuffer(buf);
+		fsmfree += infsm;
+		pgfree += isfree;
+		reusable += reuse;
+		if (infsm && !isfree)
+			stale++;
+		if (isfree && !infsm)
+			notfsm++;
+		if (infsm && isfree && !reuse)
+			unrec++;
+	}
+	elog(LOG, "pg_weave L22 census \"%s\" %s: nblocks=%u fsm_free=%u page_free=%u reusable_now=%u fsm_stale_live=%u free_not_in_fsm=%u fsm_free_not_reusable=%u quarter=%u",
+		 RelationGetRelationName(index), where, nblocks, fsmfree, pgfree,
+		 reusable, stale, notfsm, unrec, nblocks / 4);
+	if (pgfree_out)
+		*pgfree_out = pgfree;
+	if (reusable_out)
+		*reusable_out = reusable;
+}
+
 IndexBulkDeleteResult *
 weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
@@ -1187,9 +1240,12 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			 * frees (see the free arm there), so this order is right only together
 			 * with that.
 			 */
+			weave_l22_census(info->index, "start", NULL, NULL);
 			(void) weave_reclaim_unreachable(info->index, fence,
 											 info->message_level);
+			weave_l22_census(info->index, "after-reclaim", NULL, NULL);
 			(void) weave_flush_pending(info->index);
+			weave_l22_census(info->index, "after-flush", NULL, NULL);
 			weave_merge_segments(info->index);
 
 			/*
@@ -1236,14 +1292,22 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			{
 				BlockNumber nblocks = RelationGetNumberOfBlocks(info->index);
 				BlockNumber freeblks = 0;
+				BlockNumber pgfree = 0;
+				BlockNumber reusable = 0;
 				BlockNumber b;
 
 				for (b = 1; b < nblocks; b++)
 					if (GetRecordedFreeSpace(info->index, b) >= BLCKSZ / 2)
 						freeblks++;
+				weave_l22_census(info->index, "trigger", &pgfree, &reusable);
 				/* reclaim when >= 25% of the file is free (bloated after merges) */
 				if (nblocks > 16 && freeblks > nblocks / 4)
+				{
 					(void) weave_vacuum_compact(info->index);
+					weave_l22_census(info->index, "after-compact", NULL, NULL);
+				}
+				(void) pgfree;
+				(void) reusable;
 			}
 		}
 		PG_FINALLY();
