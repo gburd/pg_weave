@@ -684,6 +684,7 @@ double		pg_weave_vacuum_tombstone_frac = 0.2;
  * conditional in weave_vacuum_compact() that states the condition, not a GUC
  * defaulted the other way. */
 bool		pg_weave_vacuum_vacate = true;
+bool		pg_weave_l22_drop_deferred = false;	/* L22 diagnostic, temporary */
 
 /* GUC: per-participant flush-budget growth ceiling, in MB.  0 = keep the safe
  * default ceiling of 2 * maintenance_work_mem (unchanged behavior).  When set
@@ -1064,6 +1065,22 @@ weave_new_buffer_internal(Relation index)
 		{
 			if (!weave_page_recyclable(index, BufferGetPage(buffer)))
 			{
+				if (pg_weave_l22_drop_deferred &&
+					!PageIsNew(BufferGetPage(buffer)) &&
+					WeavePageIsFreed(BufferGetPage(buffer)))
+				{
+					static bool said = false;
+
+					/* L22 DIAGNOSTIC: GetFreeIndexPage() removed it; leave it out */
+					if (!said)
+						elog(LOG, "pg_weave L22 drop_deferred fired on block %u of \"%s\"",
+							 blk, RelationGetRelationName(index));
+					said = true;
+					weave_alloc_fsm_defer++;
+					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+					ReleaseBuffer(buffer);
+					continue;
+				}
 				/*
 				 * Not yet safe to reuse (a concurrent scan could still be reading
 				 * it): re-record it so a later allocation gets it, and STOP.

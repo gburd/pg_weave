@@ -51,6 +51,7 @@ wal_writer_delay = 1ms
 wal_writer_flush_after = 0
 log_min_messages = info
 checkpoint_timeout = ${G75_CKPT_TIMEOUT:-5min}
+${G75_EXTRA_CONF:-}
 EOF
 start() { $BIN/pg_ctl -D $D -l $OUT/scale_server.log -w start > /dev/null; }
 start || { log "server did not start"; exit 1; }
