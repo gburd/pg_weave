@@ -6649,10 +6649,18 @@ output, 6/6: exact gap evaluated as at-most in the heap (10 DIFFERENT rows); in 
 positional chain (5); off by one in the shared comparison (18); the cast adding the left
 width instead of the right (3); `wquery_recv` dropping an operator's flag (the binary-COPY
 rows); the cast not setting the flag (10). Clean tree reinstalled after, 0 diff lines.
-PG18 installcheck 32/32 + isolation 2/2 with that run's outputs as expected. **Not tested
-on that run** and added after: `<0>` over tsvectors with two lexemes at one position (the
-random table has none, so every `<0>` there was "no rows" or the same lexeme), and the
-pinned text re-parse failure.
+PG18 installcheck 32/32 + isolation 2/2 with that run's outputs as expected. That run's
+random table has no two lexemes at one position, so every `<0>` in it was "no rows" or
+the same lexeme; run `pgweave-20261008-173959-7e54` on `733e877` adds a six-row table that
+does (what an ispell or thesaurus dictionary produces), nine shapes including `<0>` on both
+sides of a `<2>`: core = heap = all three index arms on every one. Its output differs from
+the first run's only by the added sections (0 removed lines) and is the committed expected
+output; mutants 6/6 again, PG18 32/32 + 2/2 again. It also pins the pre-existing text
+re-parse failure: `('quick' <-> 'brown')` reads back as `('quick' & !'brown')`, `'fo'*` as
+`'fo'`, `'fox':A` as `('fox' & 'a')`.
+
+**No CORE_CANDIDATES row:** core's phrase semantics are what is being matched, and nothing
+in core blocks or would simplify it.
 
 Gate: `sql/tsquery_cast.sql` -- 42 hand-written and 400 random tsqueries over one
 200-row weighted table, core `@@` against the cast through the heap, `weave_count()` on a
