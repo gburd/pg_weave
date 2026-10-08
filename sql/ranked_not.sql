@@ -23,8 +23,12 @@
 --      none extra, none twice, each at its own distance, each at its place
 --                    (mutants: no padding; padding before the ranked phase ends;
 --                     padding at a distance below the ranked ones)
---   2. `!"quick brown"`: a NOT over a phrase is an over-generating gate, so the
---      padding's rows need the executor's recheck  (mutant: padding unrechecked)
+--      and qn 9, `!"quick brown"`: a NOT over a phrase is an over-generating
+--      gate, so the padding's rows need the executor's recheck
+--                    (mutant: padding unrechecked)
+--      and the coverage rule: a prefix leaf is not a literal term, an OR needs
+--      both arms covered    (mutants: prefix covered; OR covered by one arm)
+--   2. a plan check per query: each is answered by the ordering scan
 --   3. a cursor, with MOVE and another ordering scan between fetches
 --   4. a rescan per outer row (a correlated subplan)
 CREATE EXTENSION IF NOT EXISTS pg_weave;
