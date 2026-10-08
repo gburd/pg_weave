@@ -1124,6 +1124,13 @@ weave_new_buffer_internal(Relation index)
 				 * with `continue` and costs one page.  The remaining users of this
 				 * loop are ordinary segment writes, for which one deferred page
 				 * ending the sequence is a bounded cost, not a ratchet.
+				 *
+				 * SUPERSEDED 2026-10-08 FOR FREED PAGES (task L22): it was a ratchet.
+				 * The pending append comes through here, and on a crash loop the
+				 * first INSERT after each VACUUM met its own xid's frees and extended
+				 * its whole batch, about 1,177 pages every second cycle at 1M rows.
+				 * That is why a freed page is dropped above.  The stop remains for a
+				 * live page and for a spent drop budget.
 				 */
 				weave_alloc_fsm_defer++;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
