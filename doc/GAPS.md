@@ -5092,6 +5092,52 @@ raise an ERROR, not stop, on a `WEAVE_FREED` page met on a live chain. **Superse
 2026-10-06 by maintainer decision: WARN and skip that merge instead (task L23).** An ERROR
 would make every later VACUUM fail until REINDEX.
 
+**FIXED 2026-10-08 by L23 (branch `wt/l23`), measured on EC2, `pgweave-20261008-104055-e8bd`.**
+`weave_merge_segments_streaming()` now pre-flights every input before it reads or allocates
+anything: `weave_bolt_damage()` (src/am/amcheck.c) runs the deep check's own per-bolt walk
+and checks the two recorded lengths, the dictionary entry count against `WeaveSegMeta.nterms`
+and that the shared posting chain reaches the last term's first block. A damaged input gets a
+`WARNING` naming the index, the bolt's dictionary block and the damaged block, and nothing is
+written. The tiered selectors leave that bolt out and keep merging the rest. `weave_check(deep)`
+has a new row, `bolt_chains_intact`. `t/035_merge_freed_page.pl` covers ten cases: freed last
+and middle dictionary pages, a cut dictionary, freed last and middle posting pages, a cut
+posting chain, and freed dict-index, doclen, SuRF and doclist pages. Eleven mutants each built
+a distinct `.so` and failed t/035. **The loss is real, not hypothetical:** with the merge
+ignoring the verdict (mutant `publish`), the cut-dictionary case answered 955 of 1,540 probe
+terms after the merge, and the freed-middle-dictionary case answered 1,465. With the fix every
+term is answered at every step. Limits:
+
+- Covered by code but **not by t/035**: the vector, cgram, docvalues, trigram and tombstone
+  chains (the test index has none of them), the parallel merge path (the test runs with
+  `max_parallel_maintenance_workers = 0`), and `weave_compact_to_one()` in amvacuum.c, which
+  calls `weave_merge_selected()` and therefore **stops** at a damaged bolt instead of skipping it.
+  So `weave_vacuum()` does not compact an index that has one.
+- A damaged bolt stays until REINDEX. Every VACUUM repeats the WARNING (seen in round 9), and
+  per code reading the strict reachability map is incomplete, so the stranded-page reclaim is
+  skipped with a LOG on every VACUUM too.
+- Cost **unmeasured**: every merge walks each input's chains once more, and the reclaim's map
+  makes one more pass over each bolt's dictionary pages.
+
+**L23 inventory, 2026-10-07 (code reading, before the fix; unverified by test).** Every
+chain the merge reads from a SOURCE bolt, and what each walker does today on a page that
+is `WEAVE_FREED` (contents intact, `nextblk` reset to Invalid, kind bits kept):
+
+| chain | walker | today on a freed page |
+|---|---|---|
+| dictionary | `merge_source_load_page()` (ambuild.c) | no kind or FREED check; chain ENDS, later terms dropped, merge publishes. **Silent loss** (the reported defect) |
+| postings | `weave_decode_term()` (am.c) | no kind or FREED check; returns `n < df`, merge ignores the shortfall. **Silent loss** |
+| doclen sidecar | `weave_doclens_load()` (ambuild.c) | kind check only, freed page passes; chain ENDS, later docids get doclen 0 in the merged bolt. **Silent wrong BM25** |
+| tombstones | `weave_read_blob()` (trgm_page.c) | no kind or FREED check; stops with the buffer short, then the G85 size check ERRORs. **VACUUM fails** |
+| document list | `weave_segment_docset()` -> `weave_doclist_read()` | rejects FREED, then ERROR. **VACUUM fails** |
+| vector weft | `weave_vec_merge_append()` (vecwrite.c) | kind check only; the geometric chain notices it ends early, abandons with DEBUG1. **Silent skip** |
+| cgram weft | `weave_cgram_merge_append()` (ambuild.c) | dict kind check only; chain ENDS, pairs dropped, returns success. **Silent loss** (cgram false negatives) |
+| docvalues | `weave_docvals_load()` | kind check only; short image, validator ERRORs. **VACUUM fails** |
+| SuRF, trigram dir/data, dict index | not read by the merge | rebuilt from the merged term stream, so the merge cannot meet a freed page on them |
+
+Two recorded lengths exist to cross-check: `WeaveSegMeta.nterms` equals the dictionary entry
+count (already asserted by `weave_check`'s SuRF row), and each dictionary entry's `df` equals
+its posting count.
+
 **SUPERSEDED 2026-10-06, same branch: the "growth defect" below was the test, not the
 index.** `t/033` gave the crashed index two VACUUMs per cycle and its twin one. From
 cycle 8 onwards, each crashed-index VACUUM after the restart ran the share-lock
@@ -5617,7 +5663,7 @@ half, VACUUM, smash the tombstone blob's bytes, and the scan must ERROR, not ret
 built `.so`, md5 differs) the scan returned **4000**, the resurrected answer, and tests 22-24
 failed; with it they pass.
 
-### G86 — an ordered scan's `d <=> q` (and every channel of a fused `fuse(...)`) is RE-EVALUATED per returned row: a heap detoast plus a fresh BM25, for a value the scan already computed — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 measured it at 28% of rare-term CPU); FIXED 2026-10-07 for the lexical `<=>` route (`wt/g86`, ext 0.29.0); vector, `<@>` and `fuse()` deliberately NOT substituted (reasons below)**
+### G86 — an ordered scan's `d <=> q` (and every channel of a fused `fuse(...)`) is RE-EVALUATED per returned row: a heap detoast plus a fresh BM25, for a value the scan already computed — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 measured it at 28% of rare-term CPU); FIXED 2026-10-07 for the lexical `<=>` route (`wt/g86`, ext 0.29.0) and 2026-10-08 for the fused `fuse()` route (`wt/g86f`, ext 0.31.0); vector and `<@>` deliberately NOT substituted (reasons below)**
 
 The planner keeps the ORDER BY expression in the scan's target list (it feeds the sort key
 and the Limit), so the executor evaluates it for every row the index returns, even though
@@ -5677,7 +5723,8 @@ for `<=>` is the N = 1 `weave_distance()` and differs from the corpus value the 
 in. The lexical route ships on that bar. `sql/score_reuse.sql` §4 checks it per row
 against `weave_search()`'s distance, and §5 checks it through every reader.
 
-**`fuse()` qualifies under the corrected bar and is OWED, not done.** Its resjunk entry
+**`fuse()` qualifies under the corrected bar.** (Was OWED; **DONE 2026-10-08**, see "FIXED for
+the fused route" below.) Its resjunk entry
 is `fuse(weave_lexscore(d <=> a), ...)`, and the scan's slot-0 value is the fused `-S` it
 ordered by (`weave_fuse_pass()`). Substituting needs:
 (1) the fused score published per row, from the ranked emission and from
@@ -5786,6 +5833,108 @@ PG17 smoke on `b5e1beb` (`pgweave-20261007-002744-3074`): regression 26/26, isol
 2/2, TAP 33 files / 1,275 tests. `expected/limit_hint.out` changed by exactly the two
 substituted `Output:` lines and the header padding they widen. That is semantic, intended,
 and inspected line by line (hard rule 3).
+**FIXED for the fused route, 2026-10-08 (`wt/g86f`, ext 0.31.0).** Measured first
+(`bench/RESULTS_G86_SCORE_REUSE.md`, run `pgweave-20261008-041234-7383`). On 11 KB TOASTed
+documents, two lexical channels at LIMIT 400 took 18 ms, and 17.6 ms of that was the hidden
+`fuse()`. Short documents spent 0.07 ms on it. Built in four pieces:
+
+- **The scan publishes the value it ordered by**, on the same keyed live list as the lexical
+  route (`weave_curdist_wanted()` in `src/am/amscan.c` now admits a fused scan). That is the
+  ranked `-S` from `weave_gettuple()`, and from `weave_pad_emit()` the fused padding value:
+  `0` lexical-only (fuse() of a row no channel reached is `-(0 + 0)`), `+Infinity` with a
+  vector key, NULL for a row whose fuse() is NULL. The value is `+0`, not the brief's `-0`;
+  the two compare equal, so a sort reads them alike.
+- **`weave_current_fused_distance(regclass, tid, VARIADIC "any")`**, new in 0.31.0. Its
+  arguments after the TID are the right operands of the scan's ORDER BY keys, in key order:
+  each channel's query, then the weights array. It answers from the live fused scan whose
+  index and current heap TID match, and whose own copies of those keys (`fuseQ`, `fuseV`,
+  `fuseW`) are byte-equal to the arguments. Each argument's type must be the key's
+  `sk_subtype`, so a hand-written call can never get a datum read as the wrong type. It
+  answers NULL otherwise, which includes every call outside a scan. **The name is a
+  LEAD DECISION, 2026-10-08**, as the lexical function's was.
+- **Route separation, the one new hazard.** A fused scan's `so->query` can hold its WHERE
+  clause's `@@@` query. So a lexical lookup that keyed only on (index, TID, query) would
+  answer from a fused scan nested in its Filter. `weave_current_distance()` now skips
+  fused publishers, and the fused lookup skips lexical ones (`sql/score_reuse.sql` 9g D;
+  the `noroute` mutant).
+- **The planner match** (`weave_fuse_is_scan_key()` in `src/am/fusepath.c`, called from
+  `weave_reuse_fused()` in `src/am/customscan.c`) replays the path's attribution against
+  `indexorderbyorig`. Channel i, read through a recovery wrapper and with `q <=> col`
+  commuted, must be key i with equal operands. The weights must equal the transport's;
+  NULL weights were transported as all ones. The last key must be `<~>`. Only RESJUNK
+  entries are touched.
+
+Tests, `sql/score_reuse.sql` §9, expected output from a full EC2 installcheck:
+
+- plans: hidden key only, a commutator plus `WHERE @@@` gate, and a visible `fuse()` (same
+  call and another one) left alone;
+- 500 of 500 visible values unchanged;
+- the published value equals `weave_fuse_search()`'s `-score` on 1,000 + 900 rows, in both
+  `fuse_normalize` modes;
+- `WITH TIES` at k = 5 and 40 in both modes and both shapes, a row-by-row cursor, and a
+  nested-loop rescan with a parameterized vector (3 of 3), all against the reference;
+- padding: 100 rows at `0` after every ranked row, 20 NULL-vector rows at NULL after every
+  ranked one, and a +Infinity row (a pending vector of the wrong dimension);
+- zero per-row `weave_distance`, `weave_lexscore`, `fuse` or `wvec_l2_distance` calls, with
+  a control that counts them;
+- four clobber shapes, each reading the published value per row (A–D in 9g);
+- only the library's C function is planted.
+
+**Mutants** (`bench/aws/g86f_job.sh` stage C, run `pgweave-20261008-074244-b985`; each BUILT,
+installed with a different `.so` md5, then run against the solo baseline; the unmutated tree
+passed solo before and after): **8 of 8 killed.**
+`visible` (500 of 500 visible values changed); `prevrow` (59 and 385 wrong fused row values in 9c, and
+the lexical sections' 9; every WITH TIES, rescan and cursor check; the padding values); `padzero` (0 of 100 padded rows at
+0); `padinf` (the +Infinity row published as 0); `unkeyed` (clobber A 14 wrong, B 30 wrong);
+`noweights` (clobber A 14 wrong); `noroute` (clobber D 30 wrong); `nopublish` (every
+published value NULL).
+
+**A test that could not fail, caught by its first run.** The first 9d control (reuse off on
+the 'alpha'/'beta' corpus) was meant to show the operator's N = 1 key tying a different set.
+It returned 16, exactly the reference's tie group: the N = 1 values happen to tie the same
+rows there. It was replaced by a control on two tf = 1 terms, where the operator ties every
+matching row and the index does not: `FETCH FIRST 5 ROWS WITH TIES` returns **200 rows with
+reuse off, every row matching either term, and 18 with it on, the reference's tie group**
+(run `pgweave-20261008-080505-9ac2`). That 200 is what the shape returned before 0.31.0. That, and the `ORDER BY fuse(d <=> 'alpha', v <-> q)` over a pending vector of
+the wrong dimension (which raised "different wvec dimensions 3 and 4" through the hidden key
+and now returns the row last), are the **visible behaviour changes**. They are the lexical
+route's change applied to the fused key: a reader of the key now sees the value the stream
+is ordered by.
+
+**Measured on EC2,** `pgweave-20261008-074244-b985`, two runs per arm at two scales, identical
+md5 of the answer on and off in every cell:
+
+| corpus | query | LIMIT | ms off (run 1 / 2) | ms on (run 1 / 2) |
+|---|---|---:|---:|---:|
+| long, 50k | `fuse(d <=> 'c', d <=> 'rare')` | 400 | 20.199 / 20.194 | **0.256 / 0.254** |
+| long, 200k | same | 400 | 20.279 / 20.925 | **0.416 / 0.414** |
+| long, 200k | same | 10 | 0.609 / 0.608 | **0.125 / 0.127** |
+| long, 50k | `fuse(d <=> 'c', v <-> q)` | 400 | 22.418 / 22.472 | **11.701 / 11.854** |
+| long, 200k | same | 400 | 56.448 / 56.505 | **46.329 / 44.959** |
+| short, 200k / 1M | two lexical | 400 | 2.06 / 2.89 | 2.00 / 2.83 (2-3 %) |
+| short, 200k / 1M | lexical + vector | 10, 400 | — | within run-to-run spread |
+
+**Stated as a loss where it is one:** short documents gain about 0.06 ms per 400 rows. That
+is the hidden key's whole cost there, and it is invisible next to a vector channel. With a
+vector key, half the long-document time remains: the vector channel's own scan.
+
+**Where it does not apply (fused).**
+
+- **An Incremental Sort over a fused scan cannot happen today.** The brief and the "owed"
+  list above assumed one. `weave_fuse_pathkey_call()` offers the fused path only when
+  `fuse()` is the WHOLE sort key (`list_length(root->query_pathkeys) == 1`). So
+  `ORDER BY fuse(...), id` is a Sort over a seq scan that evaluates `fuse()` per row, which
+  `sql/score_reuse.sql` 9a shows as a plan. **Lead decision 2026-10-08:** fusepath.c is left
+  alone, and offering the fused path with `fuse()` as a pathkey PREFIX is recorded as an owed
+  pg_weave planner change in `doc/PHASES.md` row F2. It is not a core candidate: the rule
+  that blocks it is pg_weave's.
+- `weave_fuse_search()` builds its scan keys without a subtype, so no hidden key can match
+  it. Nothing evaluates a target list while it runs anyway.
+- As for the lexical route: a scan under a join, an Append or a projecting node has no
+  RESJUNK entry. A VOLATILE SELECT-list column moves the scan's list below a projection, so
+  the hidden key is not substituted there (9e reads through a STABLE wrapper for that
+  reason).
+
 - **Which channels' scan values equal the operator's.** Lexical `<=>`: the scan's value is
   the corpus BM25 distance and `weave_distance()` is the N = 1 one. They are not equal, so
   only RESJUNK entries may be substituted (pg_fts's rule). Vector `<->`/`<#>`/`<=>`: the
@@ -6336,7 +6485,7 @@ handle's `params_depth` is checked after compile (`src/query/pattern_cache.c`) a
 over three is refused with `ERRCODE_PROGRAM_LIMIT_EXCEEDED` before it is cached or matched.
 
 
-### G93 — the `tsquery -> wquery` cast drops a lexeme's weight restriction and its prefix flag: `'fox:A'::tsquery::wquery` matches `fox` in every zone, and `'fo:*'::tsquery::wquery` asks for the exact term `fo` — **FOUND 2026-10-07 by M7 step 2's `sql/tsvector_input.sql` (a weight test written through the cast answered `t` where `term:A` answers `f`); OPEN**
+### G93 — the `tsquery -> wquery` cast drops a lexeme's weight restriction and its prefix flag: `'fox:A'::tsquery::wquery` matches `fox` in every zone, and `'fo:*'::tsquery::wquery` asks for the exact term `fo` — **FOUND 2026-10-07 by M7 step 2's `sql/tsvector_input.sql` (a weight test written through the cast answered `t` where `term:A` answers `f`); FIXED 2026-10-08 on `wt/g93` -- and the fix's own test found a second, PRE-EXISTING silent row drop in the index's NOT handling**
 
 `tsquery_to_wquery()` (`src/util/migrate.c`, `mig_walk`) copies each `QueryOperand`'s
 lexeme and ignores `weight` and `prefix`. So the cast is lossy in both directions: a
@@ -6350,3 +6499,105 @@ Fix: map `weight` to `WEAVE_QF_WEIGHTED` with the mask in `distance` (the native
 encoding, `src/query/parse.c` near "weightmask"), and `prefix` to `WEAVE_QF_PREFIX`, or
 refuse either with an error rather than drop it. Not done on `wt/m7`: it is outside M7 and
 the cast is M3's surface (core's `@@` with tsquery).
+
+**FIX, 2026-10-08 (`wt/g93`).** The cast now maps every lexeme exactly or refuses the whole
+query with `feature_not_supported` (`src/util/migrate.c`, `mig_walk`):
+
+| tsquery | wquery | why |
+|---|---|---|
+| `lex:ABCD` subset | `WEAVE_QF_WEIGHTED`, mask in `distance` | same bit encoding as core (A = bit 3 .. D = bit 0); all four labels stays a plain term |
+| `lex:*` | `WEAVE_QF_PREFIX` | |
+| `lex:*A` | **refused** | wquery's prefix match has no zones (the native parser refuses `term:A*` too) |
+| `a <-> b`, left-nested `a <-> b <-> c` | phrase, distance 1 | exact |
+| `<0>`, `<N>` with N >= 2, right-nested phrase | **refused** | core's `<N>` is gap EXACTLY N (`end(L) + N + width(R) == end(R)`, `TS_phrase_execute`); wquery's phrase is gap 1..N. The two agree only when `N + width(R) == 1` |
+| `&`, `\|`, `!`, `lex:*` inside a phrase | **refused** | wquery answers a phrase over a boolean false and over a prefix permissively; core evaluates both positionally |
+| unknown operator | ERROR | used to become a silent AND |
+
+The cost of refusing `<N>` is real: `phraseto_tsquery('english', 'cat in the hat')` is
+`'cat' <3> 'hat'` and is now refused where it used to over-match. Mapping it needs an
+exact-gap phrase in wquery, which is a query-format decision and was not taken here.
+
+**The second bug, found by the fix's test and outside the cast.** `weave_eval_query()`
+(`src/am/amscan.c`) answers a weight-restricted leaf with the plain posting list and a
+PHRASE as AND -- supersets for the heap recheck to shrink. AND and OR preserve a
+superset; NOT turns it into a SUBSET, and a recheck can only remove rows. So
+`!over:CD`, `!(quick <-> brown)` and `(!fog:CD | over)` -- native wquery, no cast
+involved -- returned strict subsets of core's answer from `weave_count()` and from an
+index scan. Hard rule 1's class: plausible answers, rows missing, no message. Fixed with an
+`inexact` flag on the evaluator's stack entry: NOT of an inexact entry is every document,
+still inexact. Found only because the test compares against core over random queries;
+every hand-written NOT test in the suite negated a plain term.
+
+**Two more pre-existing silent row drops, same family, found by the same test and its probe.**
+
+- *The ranked scan's boolean gate ignored the weight.* `weave_query_is_pure_or()` and
+  `weave_query_is_pure_boolean()` exclude prefix/fuzzy/regex leaves but not
+  `WEAVE_QF_WEIGHTED`, so `WHERE tsv @@@ 'fox:A' ORDER BY tsv <=> 'fox:A'` answered from
+  term presence with `xs_recheck = false` and returned `fox` in every zone -- 22 of the 42
+  hand-written queries disagreed with core on that arm (run `pgweave-20261008-020243-898d`).
+  Both predicates now exclude it, so a weighted query takes collect + recheck + DocidFilter.
+- *Any fuzzy or regex leaf made the collector ignore the rest of the query.* The
+  `has_fuzzy_regex` branch of `weave_collect_matches()` builds its candidate set as the
+  union of the fuzzy/regex leaves' matches and nothing else, which is sound for `a & b~1`
+  and `b~1 | /re/` and wrong for everything else. Measured on 2000 rows, seqscan against
+  `weave_count()` (run `pgweave-20261008-020243-898d`, `remote/probe_fuzzy_bool.out`):
+
+  | query | seqscan | index |
+  |---|---:|---:|
+  | `quick \| brwn~1` | 1113 | 651 |
+  | `!brwn~1` | 1349 | **0** |
+  | `quick & !brwn~1` | 462 | **0** |
+  | `!(quick & brwn~1)` | 1806 | 457 |
+  | `dog \| /fox.*/` | 1399 | 1080 |
+  | `!/fox.*/` | 920 | **0** |
+
+  A bitmap scan goes through the same collector, so a plain `WHERE d @@@ 'a | b~1'` was
+  affected. `weave_query_fr_covered()` now decides whether the leaves cover every match
+  (AND needs one covered arm, OR both, NOT never); when they do not, the existing universe
+  + recheck fallback answers. **That is correct and slow** -- every document in the
+  segment is rechecked for those shapes. Feeding the leaf sets into `weave_eval_query()`
+  instead would make them fast; not done here.
+
+**Still open, recorded rather than fixed, and now its own entry, G94: the ranked scan returns a SUBSET for a query
+with NOT.** `WHERE d @@@ '!fox' ORDER BY d <=> '!fox'` generates candidates only from the
+query's positive literal terms (WAND cursors), so a row that matches only through a NOT
+is never ranked, and the G56 padding phase is skipped because the restriction IS the
+ORDER BY query (`weave_pad_wanted()`: "no padding row could pass it" -- false for a query
+with NOT). Run `pgweave-20261008-021816-1bca`: of 160 converted random queries the
+ranked scan matched core on 125 and returned a strict subset on 35, every one of which
+has a prefix or a NOT; hand-written `!fox`, `!fox & !dog`, `!(fox | dog)`, `!zzz` and
+`!(quick <-> brown)` are subsets too. The code
+comment at the ranked collect site says "PHRASE/NEAR/boolean are exact"; for NOT it is
+not. Prefix is the same shape and is documented (G1's risk note). The likely fix is to pad
+when `ordSameQuery` and the query has a NOT or an expanding leaf; it touches the G56/G86
+ordering machinery, so it is left for a task of its own. `sql/tsquery_cast.sql` pins
+the current state (`ranked` column: never SUPERSET; subset only with a prefix or a NOT).
+
+Gate: `sql/tsquery_cast.sql` -- 42 hand-written and 400 random tsqueries over one
+200-row weighted table, core `@@` against the cast through the heap, `weave_count()` on a
+`tsvector_lex_ops` index and an expression index, and the ranked index scan; plus 15
+native fuzzy/regex-under-boolean queries, seqscan against both indexes. Mutants:
+`bench/aws/g93_mutants.sh` (M1-M10, each verified BUILT with an installed `.so` that
+differs from the clean one).
+
+### G94 — WRONG ANSWER: the ranked scan `WHERE d @@@ q ORDER BY d <=> q` returns a SUBSET when q contains a NOT (or a prefix) — **FOUND 2026-10-08 by G93's test; OPEN**
+
+Split out of G93 (see its "Still open" paragraph for the evidence). Candidates come only
+from q's positive literal terms (the WAND cursors), so a row that matches q only through a
+NOT is never ranked, and the G56 padding walk is skipped because `weave_pad_wanted()`
+assumes "the restriction IS the ORDER BY query, so no padding row could pass it", which is
+false when q has a NOT. Run `pgweave-20261008-021816-1bca`: 35 of 160 converted random
+queries came back short, every one with a prefix or a NOT; `!fox`, `!fox & !dog`,
+`!(fox | dog)`, `!zzz` and `!(quick <-> brown)` are all subsets. Prefix is the
+already-documented G1 risk; NOT is not documented anywhere. A user writing
+`WHERE body @@@ 'postgres & !mysql' ORDER BY body <=> 'postgres & !mysql' LIMIT 10` is fine
+(every match contains `postgres`), but `'!mysql'` alone, or `'postgres | !mysql'`, loses rows.
+
+Likely fix: when `ordSameQuery`/`ordQueryRestricts` holds and q has a NOT whose complement
+is not covered by a positive conjunct (the same coverage idea as G93's
+`weave_query_fr_covered()`), pad (`weave_pad_wanted()`), rechecking each padding row against
+q; rows matching only through the NOT then come after every ranked row at their own BM25
+distance... which is NOT their correct rank if they score above some ranked row. So a correct
+fix has to either score the padding rows and merge, or refuse to order such a query by index
+(the planner hook could decline). `sql/tsquery_cast.sql` pins today's behaviour.
+

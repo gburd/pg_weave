@@ -1274,6 +1274,9 @@ weave_segwrite_barrier(Relation index)
  * (src/am/amcheck.c says why it must be one walk). */
 extern uint8 *weave_reach_map(Relation index, const WeaveMetaPageData *meta,
 							  BlockNumber nblocks, bool *complete);
+/* L23: NULL if every chain of `seg` is intact, else a palloc'd description.
+ * The merge's pre-flight over its inputs; src/am/amcheck.c says why. */
+extern char *weave_bolt_damage(Relation index, const WeaveSegMeta *seg);
 /* The reclaim itself (src/am/amvacuum.c): returns the pages freed */
 extern int64 weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel);
 /* Allocation for a page linked IN THE SAME RECORD that writes it (the pending
@@ -2390,5 +2393,13 @@ extern void weave_lex_shuttle_end(struct WeaveShuttle *s);
  * am.h is where the other cross-file AM seams are stated.
  * ------------------------------------------------------------------------- */
 extern void weave_fuse_install_pathlist_hook(void);
+
+/*
+ * doc/GAPS.md G86, fused route: src/am/customscan.c's planner hook asks whether
+ * a hidden target-list entry is the fuse() call a fused scan's ORDER BY keys
+ * were built from.  Lives in src/am/fusepath.c because that file owns the
+ * fuse() recognition and the attribution it must replay.
+ */
+extern bool weave_fuse_is_scan_key(Expr *e, List *orderbyorig);
 
 #endif							/* WEAVE_AM_H */

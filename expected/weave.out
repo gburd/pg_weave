@@ -4482,7 +4482,7 @@ SELECT (to_tsquery('english','quick <-> brown'))::wquery::text AS mig_phrase;
 SELECT (to_tsquery('english','quick:*'))::wquery::text AS mig_prefix;
  mig_prefix 
 ------------
- 'quick'
+ 'quick'*
 (1 row)
 
 -- ============================================================================

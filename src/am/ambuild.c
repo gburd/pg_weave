@@ -3663,7 +3663,8 @@ weave_docvals_merge_append(Relation index, const WeaveSegMeta *seg,
  */
 static bool
 weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
-							  uint32 nsel, WeaveBuildState *bs, WeaveSegMeta *seg)
+							  uint32 nsel, WeaveBuildState *bs, WeaveSegMeta *seg,
+							  int *damaged)
 {
 	MergeSource *srcv;
 	WeavePostWriter pw;
@@ -3677,8 +3678,43 @@ weave_merge_segments_streaming(Relation index, const WeaveSegMeta *chosen,
 	BlockNumber dlroot;
 	uint32		nout = 0;
 	uint32		i;
-	MemoryContext old = MemoryContextSwitchTo(bs->ctx);
+	MemoryContext old;
 
+	/*
+	 * L23: EVERY INPUT'S CHAINS ARE WALKED BEFORE ANYTHING IS READ OR WRITTEN.
+	 * Each reader below stops quietly at a page flagged freed, because freeing
+	 * resets nextblk -- so an input with a wrongly freed live page (the G15/G62
+	 * class) used to merge into a smaller, self-consistent bolt whose missing
+	 * postings no invariant could see, and then weave_free_segment() freed the
+	 * input, erasing the evidence (doc/GAPS.md G75).  A damaged input is not
+	 * an ERROR: VACUUM reaches this, and an ERROR here makes every later VACUUM
+	 * fail until REINDEX.  It WARNS and skips the merge with nothing written, so
+	 * the bolt stays live, unmerged and visible to weave_check(deep).
+	 *
+	 * Every chain, not only the ones this merge reads: a committed merge frees
+	 * every chain of its inputs, and freeing a chain that runs through a page
+	 * some other bolt has since reused would free that bolt's live page.
+	 */
+	for (i = 0; i < nsel; i++)
+	{
+		char	   *why = weave_bolt_damage(index, &chosen[i]);
+
+		if (why == NULL)
+			continue;
+		ereport(WARNING,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\": bolt with dictionary at block %u has a damaged chain; skipping its merge",
+						RelationGetRelationName(index), chosen[i].dictstart),
+				 errdetail("%s", why),
+				 errhint("The bolt stays live and unmerged.  weave_check('%s', true) reports it; REINDEX rebuilds it from the heap.",
+						 RelationGetRelationName(index))));
+		pfree(why);
+		if (damaged != NULL)
+			*damaged = (int) i;
+		return false;
+	}
+
+	old = MemoryContextSwitchTo(bs->ctx);
 	srcv = (MergeSource *) palloc0(nsel * sizeof(MergeSource));
 	for (i = 0; i < nsel; i++)
 	{
@@ -4279,7 +4315,7 @@ weave_merge_group_to_seg(Relation index, const WeaveSegMeta *group, uint32 ngrou
 
 	/* Streaming k-way merge (bounded memory); page appends are serialized
 	 * per-page inside weave_new_buffer under the extension lock. */
-	if (!weave_merge_segments_streaming(index, group, ngroup, &bs, out))
+	if (!weave_merge_segments_streaming(index, group, ngroup, &bs, out, NULL))
 	{
 		MemoryContextDelete(bs.ctx);
 		return false;
@@ -4412,8 +4448,17 @@ weave_segs_vec_agree(Relation index, const WeaveMetaPageData *meta)
 	return weave_vec_merge_geom(index, meta->segs, meta->nsegments, &g, &nwith);
 }
 
-bool
-weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
+/*
+ * weave_merge_selected() plus, on a refusal for a damaged input (L23), which
+ * input: *damaged is set to its position in `sel`, and left alone otherwise.
+ * The tiered selectors below use it to leave that bolt out of later candidate
+ * lists and keep compacting the rest -- a bolt that can never merge must not
+ * stop its whole level from merging, or the directory climbs to
+ * WEAVE_MAX_SEGMENTS and INSERTs start failing.
+ */
+static bool
+weave_merge_selected_ex(Relation index, const uint32 *sel, uint32 nsel,
+						int *damaged)
 {
 	WeaveMetaPageData meta;
 	WeaveBuildState bs;
@@ -4533,7 +4578,8 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	 * full compaction of a large index does not buffer the whole index in RAM
 	 * (see weave_merge_segments_streaming).  The vector half is NOT bounded that
 	 * way -- see the memory note in include/weave/vector.h and doc/GAPS.md G25. */
-	if (!weave_merge_segments_streaming(index, chosen, nsel, &bs, &newseg))
+	if (!weave_merge_segments_streaming(index, chosen, nsel, &bs, &newseg,
+										damaged))
 	{
 		MemoryContextDelete(bs.ctx);
 		return false;			/* abandoned before writing a page */
@@ -4637,6 +4683,52 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 			return false;
 		}
 	}
+}
+
+bool
+weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
+{
+	return weave_merge_selected_ex(index, sel, nsel, NULL);
+}
+
+/*
+ * L23: the bolts a merge loop has found damaged, by descriptor.  By CONTENT, not
+ * position, for the reason weave_merge_selected() re-locates its inputs by
+ * content: each merge that commits renumbers the directory.
+ */
+typedef struct MergeSkip
+{
+	WeaveSegMeta seg[WEAVE_MAX_SEGMENTS];
+	int			n;
+} MergeSkip;
+
+static bool
+merge_skipped(const MergeSkip *sk, const WeaveSegMeta *seg)
+{
+	int			i;
+
+	for (i = 0; i < sk->n; i++)
+		if (memcmp(&sk->seg[i], seg, sizeof(WeaveSegMeta)) == 0)
+			return true;
+	return false;
+}
+
+/* Run one selected merge; on a damaged-input refusal, remember that input and
+ * report "try again without it" (true) rather than "stop" (false). */
+static bool
+merge_selected_or_skip(Relation index, const WeaveMetaPageData *meta,
+					   const uint32 *sel, uint32 nsel, MergeSkip *sk,
+					   bool *merged)
+{
+	int			damaged = -1;
+
+	*merged = weave_merge_selected_ex(index, sel, nsel, &damaged);
+	if (*merged)
+		return true;
+	if (damaged < 0 || sk->n >= WEAVE_MAX_SEGMENTS)
+		return false;
+	sk->seg[sk->n++] = meta->segs[sel[damaged]];
+	return true;
 }
 
 /*
@@ -4981,8 +5073,10 @@ weave_merge_all(Relation index, bool try_parallel)
 	bool		didwork = false;
 	int			guard;
 	WeaveAllocScope saved_alloc;
+	MergeSkip	sk;
 
 	weave_assert_merge_serialized(index);
+	sk.n = 0;
 
 	/*
 	 * Try a parallel merge first (unless already inside a parallel operation,
@@ -5057,7 +5151,8 @@ weave_merge_all(Relation index, bool try_parallel)
 		cgramok = weave_segs_cgram_agree(index, meta.segs, meta.nsegments, NULL);
 		for (i = 0; i < meta.nsegments; i++)
 			if (meta.segs[i].dictstart != InvalidBlockNumber &&
-				weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok))
+				weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok) &&
+				!merge_skipped(&sk, &meta.segs[i]))
 			{
 				cand[ncand].idx = i;
 				cand[ncand].size = meta.segs[i].ndocs - meta.segs[i].ndeleted;
@@ -5073,9 +5168,16 @@ weave_merge_all(Relation index, bool try_parallel)
 
 		if (nsel < 2)
 			break;
-		if (!weave_merge_selected(index, sel, nsel))
-			break;				/* directory changed underneath; stop */
-		didwork = true;
+		{
+			bool		merged;
+
+			/* stop when the directory changed underneath; go round again
+			 * without a damaged input (L23) */
+			if (!merge_selected_or_skip(index, &meta, sel, nsel, &sk, &merged))
+				break;
+			if (merged)
+				didwork = true;
+		}
 	}
 	}
 	PG_FINALLY();
@@ -5192,8 +5294,10 @@ weave_merge_segments(Relation index)
 {
 	int			guard;
 	WeaveAllocScope saved_alloc;
+	MergeSkip	sk;
 
 	weave_assert_merge_serialized(index);
+	sk.n = 0;
 
 	/*
 	 * Leveled (HanoiDB/LSM) compaction: each pass, assign every live segment a
@@ -5272,7 +5376,8 @@ weave_merge_segments(Relation index)
 			 * candidate, so it must not count toward a level's occupancy either --
 			 * counting it would select a level whose runs cannot be merged and spin
 			 * the loop until the guard stopped it. */
-			if (!weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok))
+			if (!weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok) ||
+				merge_skipped(&sk, &meta.segs[i]))
 				continue;
 			lvlcount[weave_seg_level(meta.segs[i].ndocs - meta.segs[i].ndeleted)]++;
 		}
@@ -5315,8 +5420,9 @@ weave_merge_segments(Relation index)
 
 				if (meta.segs[i].dictstart == InvalidBlockNumber)
 					continue;
-				if (!weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok))
-					continue;	/* sect. 7.3, and the cgram rule */
+				if (!weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok) ||
+					merge_skipped(&sk, &meta.segs[i]))
+					continue;	/* sect. 7.3, the cgram rule, and L23 */
 				sz = meta.segs[i].ndocs - meta.segs[i].ndeleted;
 				if (weave_seg_level(sz) != target)
 					continue;
@@ -5331,8 +5437,13 @@ weave_merge_segments(Relation index)
 
 		if (nsel < 2)
 			break;				/* nothing to do (shouldn't happen: count >= 2) */
-		if (!weave_merge_selected(index, sel, nsel))
-			break;				/* directory changed underneath */
+		{
+			bool		merged;
+
+			/* directory changed underneath: stop; damaged input: retry without it */
+			if (!merge_selected_or_skip(index, &meta, sel, nsel, &sk, &merged))
+				break;
+		}
 	}
 	}
 	PG_FINALLY();

@@ -9,7 +9,7 @@ be indexed as a facet too. Every channel in a segment shares one document-id spa
 selective filter (a lexical term, or a facet such as `price < 100`) skips vector work
 inside the scan instead of filtering rows after it.
 
-**Status: 0.30.0, pre-1.0, not production-ready.** All six retrieval kinds ship. The
+**Status: 0.31.0, pre-1.0, not production-ready.** All six retrieval kinds ship. The
 fuzzy/n-gram (Z) and vector (V) phase gates are not met, the fused-ranking gate passes two
 of its five rows, and several measured results are losses, listed below.
 `doc/PRODUCTION_READINESS.md` is the gate list and `doc/GAPS.md` lists the known defects.
