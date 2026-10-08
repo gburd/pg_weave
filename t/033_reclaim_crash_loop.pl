@@ -206,9 +206,14 @@ note('excess of c_w over its twin per cycle: ' . join(' ', @excess)
 # growth comes from: from the first large merge on, every post-crash VACUUM of
 # `c` runs the share-lock compaction (lowfree_reuse 10k-21k, extend ~2,080 --
 # the L19 ratchet weave_vacuumcleanup() describes), while the twin, on the same
-# VACUUM schedule, does not compact at all.  Why the trigger fires on one and not
-# the other is NOT yet known, so the bound is kept, visible, as a TODO rather
-# than loosened.  `prove` reports it as "not ok # TODO" every run.
+# VACUUM schedule, does not compact at all.  WHY IS NOW KNOWN (task L22,
+# doc/PHASES.md): the trigger fires on both; the twin's pass is stopped by the
+# recyclability probe, and the crashed index's pass starts with fewer reusable
+# pages than live ones and extends the shortfall.  INSERT order, not the crash,
+# picks the index.  A fix that declines that pass made this bound pass and was
+# REVERTED, because t/028's truncation control needs the same pass.  So the bound
+# stays a visible TODO rather than loosened.  `prove` reports it as
+# "not ok # TODO" every run.
 TODO:
 {
 	local $TODO = 'G75 / L22: crash-loop size bound -- crashed index compacts every cycle, twin does not (open, doc/PHASES.md L22)';

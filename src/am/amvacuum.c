@@ -1232,6 +1232,13 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			 * rewrite-in-place under a share lock, not this one line.
 			 * t/015_alloc_outcomes.pl asserts the no-ratchet property, so adding
 			 * the term fails loudly instead of shipping.
+			 *
+			 * THE FSM COUNT BELOW DOES NOT MISFIRE AFTER A CRASH (task L22,
+			 * measured).  The stale entries a crash leaves for live pages are
+			 * marked used by the reclaim above before this reads the map.
+			 * Counting free pages from the pages changed nothing in t/033.  The
+			 * growth L22 measured is inside weave_vacuum_compact(), in a pass that
+			 * starts with fewer reusable pages than live ones; doc/PHASES.md L22.
 			 */
 			{
 				BlockNumber nblocks = RelationGetNumberOfBlocks(info->index);
