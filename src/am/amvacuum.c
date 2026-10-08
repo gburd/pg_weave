@@ -119,30 +119,47 @@ weave_compact_to_one(Relation index, bool extend_only)
 {
 	bool		didwork = false;
 	int			guard;
+	WeaveMergeSkip sk;
 
 	if (extend_only)
 		weave_alloc_extend_only = true;
 	else
 		weave_alloc_begin(index);	/* gather + hand out lowest free first */
 
+	sk.n = 0;
 	PG_TRY();
 	{
-		/* rewrite all live segments once (relocates their pages) ... */
+		/*
+		 * rewrite all live segments once (relocates their pages) ...
+		 *
+		 * A bolt the merge's pre-flight finds DAMAGED (L23) is left out and the
+		 * rest are tried again, as the leveled merge does: before this, one such
+		 * bolt made both loops stop, so weave_vacuum() compacted nothing at all.
+		 */
+		for (guard = 0; guard < WEAVE_MAX_SEGMENTS; guard++)
 		{
 			WeaveMetaPageData meta;
 			uint32		sel[WEAVE_MAX_SEGMENTS];
 			uint32		nsel = 0;
 			uint32		i;
+			bool		merged;
 			Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
 
 			LockBuffer(mb, BUFFER_LOCK_SHARE);
 			weave_meta_from_page(BufferGetPage(mb), &meta);
 			UnlockReleaseBuffer(mb);
 			for (i = 0; i < meta.nsegments; i++)
-				if (meta.segs[i].dictstart != InvalidBlockNumber)
+				if (meta.segs[i].dictstart != InvalidBlockNumber &&
+					!weave_merge_skipped(&sk, &meta.segs[i]))
 					sel[nsel++] = i;
-			if (nsel >= 1 && weave_merge_selected(index, sel, nsel))
+			if (nsel < 1 ||
+				!weave_merge_selected_or_skip(index, &meta, sel, nsel, &sk, &merged))
+				break;
+			if (merged)
+			{
 				didwork = true;
+				break;
+			}
 		}
 
 		/* ... then coalesce any remaining segments down to one */
@@ -152,6 +169,7 @@ weave_compact_to_one(Relation index, bool extend_only)
 			uint32		sel[WEAVE_MAX_SEGMENTS];
 			uint32		nsel = 0;
 			uint32		i;
+			bool		merged;
 			Buffer		mb;
 
 			CHECK_FOR_INTERRUPTS();	/* between merges (no lock/window held) */
@@ -162,13 +180,15 @@ weave_compact_to_one(Relation index, bool extend_only)
 			if (meta.nsegments <= 1)
 				break;
 			for (i = 0; i < meta.nsegments; i++)
-				if (meta.segs[i].dictstart != InvalidBlockNumber)
+				if (meta.segs[i].dictstart != InvalidBlockNumber &&
+					!weave_merge_skipped(&sk, &meta.segs[i]))
 					sel[nsel++] = i;
 			if (nsel <= 1)
 				break;
-			if (!weave_merge_selected(index, sel, nsel))
+			if (!weave_merge_selected_or_skip(index, &meta, sel, nsel, &sk, &merged))
 				break;
-			didwork = true;
+			if (merged)
+				didwork = true;
 		}
 	}
 	PG_FINALLY();

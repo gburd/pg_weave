@@ -25,6 +25,9 @@
 #     its firstposting directly, so no term is reachable only through it);
 #   round 9 VACUUM: the other eight bolts merge (the damaged one is left out,
 #     not allowed to block its level) -- two bolts remain;
+#   round 10 (no VACUUM) + weave_vacuum(): it flushes a third bolt and compacts
+#     the two healthy ones, the damaged one again left out (its compaction used
+#     to stop there and compact nothing);
 #   REINDEX: one bolt, every invariant holds, every term answered.
 #
 # The cases.  "Freed" is what weave_free_page_locked() writes: the flag, the XID
@@ -87,7 +90,7 @@ sub sql { return $node->safe_psql('postgres', $_[0]); }
 # terms to the case's truth table, then VACUUMs.
 sub round
 {
-	my ($t, $r, $n) = @_;
+	my ($t, $r, $n, $novacuum) = @_;
 	sql(qq{
 		INSERT INTO $t (body)
 		SELECT string_agg('r${r}d' || g || 't' || k, ' ')
@@ -97,7 +100,7 @@ sub round
 		SELECT 'r${r}d' || g || 't' || k
 		  FROM generate_series(1, $n) g, generate_series(1, ${\ NTERMS_PER_DOC}) k;
 	});
-	sql("VACUUM $t");
+	sql("VACUUM $t") unless $novacuum;
 }
 
 # (answered, total): terms the index answers with exactly their one document --
@@ -277,6 +280,20 @@ for my $t (@live)
 		"$t: round 9 met and skipped it again");
 	is(lsns($t, \@r4), $before, "$t: the damaged bolt is still untouched after round 9");
 	like(answers($t), qr{^(\d+)/\1$}, "$t: every term answered after round 9");
+
+	# weave_vacuum()'s compaction (weave_compact_to_one) skips the damaged bolt
+	# too.  Round 10's rows stay pending, so weave_vacuum() itself flushes them
+	# into a third bolt and then compacts; before the skip, both of its loops
+	# stopped at the damaged bolt and it compacted none (three bolts remained).
+	round($t, 10, 100, 1);
+	$logpos = -s $node->logfile;
+	sql("SELECT weave_vacuum('${t}_w')");
+	is(sql("SELECT weave_index_nsegments('${t}_w')"), '2',
+		"$t: weave_vacuum() flushes round 10 and compacts the two healthy bolts around the damaged one");
+	like(slurp_file($node->logfile, $logpos), qr/skipping its merge/,
+		"$t: weave_vacuum() met and skipped it");
+	is(lsns($t, \@r4), $before, "$t: the damaged bolt is still untouched after weave_vacuum()");
+	like(answers($t), qr{^(\d+)/\1$}, "$t: every term answered after weave_vacuum()");
 
 	sql("REINDEX INDEX ${t}_w");
 	is(sql("SELECT weave_index_nsegments('${t}_w')"), '1', "$t: REINDEX rebuilds one bolt");
