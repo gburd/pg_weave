@@ -54,7 +54,7 @@ SELECT q,
 	   to_wdoc(tsv) @@@ q::tsquery::wquery AS wdoc_expr,
 	   tsv @@@ q::tsquery::wquery AS tsv_op
   FROM mix, (VALUES ('quick <-> brown'), ('brown <-> fox'), ('quick <-> fox'),
-					('quick <2> fox'), ('tag <-> quick'), ('fox <-> tag'),
+					('quick <-> brown <-> fox'), ('tag <-> quick'), ('fox <-> tag'),
 					('tag & fox'), ('tag'), ('!tag'), ('tag <-> tag')) v(q);
 -- the positionless entry survives || on either side without being rebased,
 -- and is still adjacent to nothing
@@ -69,8 +69,10 @@ SELECT wdoc_send(to_wdoc(tsv)::text::wdoc) = wdoc_send(to_wdoc(tsv)) AS mixed_rt
   FROM mix;
 -- a weight zone never contains an unknown position (a positionless document
 -- matches no zone either; core matches any weight there -- a recorded
--- divergence).  wquery's own term:A syntax: the tsquery cast drops weights.
-SELECT q, tsv_a @@ q::tsquery AS core, to_wdoc(tsv_a) @@@ q::wquery AS wdoc_expr
+-- divergence).  wquery's own term:A syntax, and the tsquery cast, which maps the
+-- weight since G93 (it used to drop it, so 'tag:A' answered core's t by accident)
+SELECT q, tsv_a @@ q::tsquery AS core, to_wdoc(tsv_a) @@@ q::wquery AS wdoc_expr,
+	   to_wdoc(tsv_a) @@@ q::tsquery::wquery AS cast
   FROM (SELECT setweight(tsv, 'A') AS tsv_a FROM mix) m,
 	   (VALUES ('tag:A'), ('fox:A'), ('fox:B')) v(q);
 -- a wholly stripped tsvector has no positions at all, as before
