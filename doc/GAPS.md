@@ -6320,7 +6320,7 @@ handle's `params_depth` is checked after compile (`src/query/pattern_cache.c`) a
 over three is refused with `ERRCODE_PROGRAM_LIMIT_EXCEEDED` before it is cached or matched.
 
 
-### G93 — the `tsquery -> wquery` cast drops a lexeme's weight restriction and its prefix flag: `'fox:A'::tsquery::wquery` matches `fox` in every zone, and `'fo:*'::tsquery::wquery` asks for the exact term `fo` — **FOUND 2026-10-07 by M7 step 2's `sql/tsvector_input.sql` (a weight test written through the cast answered `t` where `term:A` answers `f`); OPEN**
+### G93 — the `tsquery -> wquery` cast drops a lexeme's weight restriction and its prefix flag: `'fox:A'::tsquery::wquery` matches `fox` in every zone, and `'fo:*'::tsquery::wquery` asks for the exact term `fo` — **FOUND 2026-10-07 by M7 step 2's `sql/tsvector_input.sql` (a weight test written through the cast answered `t` where `term:A` answers `f`); FIXED 2026-10-08 on `wt/g93` -- and the fix's own test found a second, PRE-EXISTING silent row drop in the index's NOT handling**
 
 `tsquery_to_wquery()` (`src/util/migrate.c`, `mig_walk`) copies each `QueryOperand`'s
 lexeme and ignores `weight` and `prefix`. So the cast is lossy in both directions: a
@@ -6334,3 +6334,37 @@ Fix: map `weight` to `WEAVE_QF_WEIGHTED` with the mask in `distance` (the native
 encoding, `src/query/parse.c` near "weightmask"), and `prefix` to `WEAVE_QF_PREFIX`, or
 refuse either with an error rather than drop it. Not done on `wt/m7`: it is outside M7 and
 the cast is M3's surface (core's `@@` with tsquery).
+
+**FIX, 2026-10-08 (`wt/g93`).** The cast now maps every lexeme exactly or refuses the whole
+query with `feature_not_supported` (`src/util/migrate.c`, `mig_walk`):
+
+| tsquery | wquery | why |
+|---|---|---|
+| `lex:ABCD` subset | `WEAVE_QF_WEIGHTED`, mask in `distance` | same bit encoding as core (A = bit 3 .. D = bit 0); all four labels stays a plain term |
+| `lex:*` | `WEAVE_QF_PREFIX` | |
+| `lex:*A` | **refused** | wquery's prefix match has no zones (the native parser refuses `term:A*` too) |
+| `a <-> b`, left-nested `a <-> b <-> c` | phrase, distance 1 | exact |
+| `<0>`, `<N>` with N >= 2, right-nested phrase | **refused** | core's `<N>` is gap EXACTLY N (`end(L) + N + width(R) == end(R)`, `TS_phrase_execute`); wquery's phrase is gap 1..N. The two agree only when `N + width(R) == 1` |
+| `&`, `\|`, `!`, `lex:*` inside a phrase | **refused** | wquery answers a phrase over a boolean false and over a prefix permissively; core evaluates both positionally |
+| unknown operator | ERROR | used to become a silent AND |
+
+The cost of refusing `<N>` is real: `phraseto_tsquery('english', 'cat in the hat')` is
+`'cat' <3> 'hat'` and is now refused where it used to over-match. Mapping it needs an
+exact-gap phrase in wquery, which is a query-format decision and was not taken here.
+
+**The second bug, found by the fix's test and outside the cast.** `weave_eval_query()`
+(`src/am/amscan.c`) answers a weight-restricted leaf with the plain posting list and a
+PHRASE as AND -- supersets for the heap recheck to shrink. AND and OR preserve a
+superset; NOT turns it into a SUBSET, and a recheck can only remove rows. So
+`!over:CD`, `!(quick <-> brown)` and `(!fog:CD | over)` -- native wquery, no cast
+involved -- returned strict subsets of core's answer from `weave_count()` and from an
+index scan. Hard rule 1's class: plausible answers, rows missing, no message. Fixed with an
+`inexact` flag on the evaluator's stack entry: NOT of an inexact entry is every document,
+still inexact. Found only because the test compares against core over random queries;
+every hand-written NOT test in the suite negated a plain term.
+
+Gate: `sql/tsquery_cast.sql` -- 42 hand-written and 400 random tsqueries over one
+200-row weighted table, core `@@` against the cast through the heap, `weave_count()` on a
+`tsvector_lex_ops` index and an expression index, and the ranked index scan. Mutants:
+`bench/aws/g93_mutants.sh`.
+
