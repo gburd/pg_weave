@@ -2391,4 +2391,12 @@ extern void weave_lex_shuttle_end(struct WeaveShuttle *s);
  * ------------------------------------------------------------------------- */
 extern void weave_fuse_install_pathlist_hook(void);
 
+/*
+ * doc/GAPS.md G86, fused route: src/am/customscan.c's planner hook asks whether
+ * a hidden target-list entry is the fuse() call a fused scan's ORDER BY keys
+ * were built from.  Lives in src/am/fusepath.c because that file owns the
+ * fuse() recognition and the attribution it must replay.
+ */
+extern bool weave_fuse_is_scan_key(Expr *e, List *orderbyorig);
+
 #endif							/* WEAVE_AM_H */

@@ -1424,6 +1424,112 @@ weave_fuse_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	}
 }
 
+/*
+ * doc/GAPS.md G86, the fused route: is `e` the fuse() call this fused scan's
+ * ORDER BY keys were built from?  src/am/customscan.c substitutes a hidden
+ * sort-key copy of it with the value the scan ordered the row by, so this must
+ * say yes only to the expression whose pathkey the scan provides.
+ *
+ * It replays weave_fuse_set_rel_pathlist()'s attribution against the plan's
+ * `indexorderbyorig` instead of trusting the shape: channel i of the call (read
+ * through a recovery wrapper, the commutator `q <=> col` normalized exactly as
+ * weave_fuse_attribute() normalizes it) must be key i's operator with equal
+ * operands, the call's weights must be what the transport key carries (a NULL
+ * weights argument was transported as all ones by weave_fuse_weights_expr()),
+ * and the last key must be the transport.  Anything else is a no.
+ */
+static bool
+weave_fuse_is_ones(Node *n, int nscores)
+{
+	ArrayType  *arr;
+	float4	   *w;
+	int			i;
+
+	if (n == NULL || !IsA(n, Const) || ((Const *) n)->constisnull ||
+		((Const *) n)->consttype != FLOAT4ARRAYOID)
+		return false;
+	arr = DatumGetArrayTypeP(((Const *) n)->constvalue);
+	if (ARR_NDIM(arr) != 1 || ARR_HASNULL(arr) || ARR_DIMS(arr)[0] != nscores)
+		return false;
+	w = (float4 *) ARR_DATA_PTR(arr);
+	for (i = 0; i < nscores; i++)
+		if (w[i] != 1.0f)
+			return false;
+	return true;
+}
+
+bool
+weave_fuse_is_scan_key(Expr *e, List *orderbyorig)
+{
+	FuncExpr   *f;
+	OpExpr	   *tr;
+	Node	   *w;
+	int			nscores;
+	int			i;
+
+	if (e == NULL || !IsA(e, FuncExpr))
+		return false;
+	if (!weave_fuse_resolve_oids() || !weave_fuse_path_resolve())
+		return false;
+	f = (FuncExpr *) e;
+	if (!weave_fuse_is_fuse_call(f))
+		return false;
+	nscores = list_length(f->args) - 1;
+	if (nscores < 2 || list_length(orderbyorig) != nscores + 1)
+		return false;
+	tr = (OpExpr *) llast(orderbyorig);
+	if (!IsA(tr, OpExpr) || tr->opno != weave_fuse_path_oids.transport_op ||
+		list_length(tr->args) != 2)
+		return false;
+
+	for (i = 0; i < nscores; i++)
+	{
+		Expr	   *arg = (Expr *) list_nth(f->args, i);
+		OpExpr	   *key = (OpExpr *) list_nth(orderbyorig, i);
+		OpExpr	   *op;
+		Oid			opno;
+		Node	   *lhs;
+		Node	   *rhs;
+
+		if (!IsA(key, OpExpr) || list_length(key->args) != 2)
+			return false;
+		if (IsA(arg, FuncExpr))
+		{
+			FuncExpr   *rf = (FuncExpr *) arg;
+
+			if ((rf->funcid == weave_fuse_oids.lexscore_fn ||
+				 rf->funcid == weave_fuse_oids.cosscore_fn ||
+				 rf->funcid == weave_fuse_oids.l2score_fn ||
+				 rf->funcid == weave_fuse_oids.ipscore_fn ||
+				 rf->funcid == weave_fuse_oids.edistscore_fn) &&
+				list_length(rf->args) == 1)
+				arg = (Expr *) linitial(rf->args);
+		}
+		if (!IsA(arg, OpExpr) || list_length(((OpExpr *) arg)->args) != 2)
+			return false;
+		op = (OpExpr *) arg;
+		opno = op->opno;
+		lhs = linitial(op->args);
+		rhs = lsecond(op->args);
+		if (opno == weave_fuse_path_oids.lex_commop)
+		{
+			lhs = lsecond(op->args);
+			rhs = linitial(op->args);
+			opno = weave_fuse_path_oids.lex_op;
+		}
+		if (opno != key->opno || !equal(lhs, linitial(key->args)) ||
+			!equal(rhs, lsecond(key->args)))
+			return false;
+	}
+
+	w = (Node *) llast(f->args);
+	if (!IsA(w, Const))
+		return false;
+	if (((Const *) w)->constisnull)
+		return weave_fuse_is_ones(lsecond(tr->args), nscores);
+	return equal(w, lsecond(tr->args));
+}
+
 void
 weave_fuse_install_pathlist_hook(void)
 {
