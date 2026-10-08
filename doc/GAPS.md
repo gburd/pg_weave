@@ -6603,6 +6603,57 @@ Design, written before the code:
   send/recv round-trips every field (flags included). A text form that round-trips needs
   new `wquery_in` syntax, which is a decision (see the report on `wt/phrase`).
 
+**Built, 2026-10-08 (`wt/phrase`).** `WEAVE_QF_PHRASE_EXACT` (`include/weave/weave.h`);
+`weave_phrase_step_pos(..., exact, ...)` (`src/query/match.c`) is the one comparison, used
+by the heap matcher's `phrase_step()` and by the index's positional chain
+(`weave_phrase_chain()` records a per-step flag, `weave_phrase_eval_seg()` passes it,
+`src/am/amscan.c`); the candidate AND, the inexact flag and recheck needed no change because
+the item is still `WEAVE_OP_PHRASE`. `mig_walk` sets the flag on every phrase with
+`distance = N + width(R)` (int64, clamped at `UINT32_MAX`). `wquery_out` prints the exact
+form in tsquery's spelling (`<->` for N = 1, `<N>` otherwise, N recovered by subtracting
+the right operand's width) so the cast's output reads as the tsquery it came from. No
+`wquery_in` syntax: the flag is reachable only through the cast and binary input.
+
+Refusals, `sql/tsquery_cast.sql`, same seed, before (`wt/g93`) and after:
+
+| | hand-written (53 now, 42 before) | random 400 converted | random refused |
+|---|---|---|---|
+| before | 4 phrase shapes refused as "not a left-nested chain" | 160 | 240: bool-in-phrase 113, not-a-chain 46, prefix-in-phrase 46, weighted prefix 35 |
+| after | every `<0>` / `<N>` / nested lexeme chain converts and agrees | **182** | **218**: bool-in-phrase 128, prefix-in-phrase 51, weighted prefix 39 |
+
+(The random set is generated before the cast is tried, so the 400 queries are identical;
+a query refused as "not a chain" before now either converts or hits a later refusal deeper
+in the same query, which is why the other buckets grew.) `phraseto_tsquery('english',
+'cat in the hat')` = `'cat' <3> 'hat'` converts and answers like core on four documents,
+gaps 1-3.
+
+**Still refused, and why.** `&`, `|`, `!` inside a phrase. Core evaluates them
+positionally: AND inside a phrase is "both at the same end position after width
+alignment" (`TSPO_BOTH` with offsets `maxwidth - width`), OR is a union whose width is the
+surviving side's (so it is not static, which the cast's width computation needs), and NOT
+is a negated position set (`negate`). wquery's evaluators carry a plain position list per
+operand and drop it at a boolean operator. Modelling core would need a position-set
+algebra with negation in both evaluators -- a larger change than this one, and
+`(brown | fox)` inside a phrase is the shape `phraseto_tsquery` produces only for a
+multi-variant dictionary (ispell, thesaurus). A prefix lexeme inside a phrase: wquery's
+prefix leaf carries no positions. Both are follow-ups if a real query corpus shows them.
+
+Gate evidence (EC2 Debian 13, PG17.11): run `pgweave-20261008-172913-2266` on `b678b5e`:
+the full installcheck differed from expected only in `tsquery_cast` (each change read and
+intended, hard rule 3); solo control twice, 0 diff lines, 0 DIFFERENT rows, full-run =
+solo; 0 disagreements among 182 converted random queries on the heap, a
+`tsvector_lex_ops` index, an expression index and a `positions = on` index (the
+positional chain), and the ranked scan `same` on all 182. Mutants (`bench/aws/phrase_job.sh`),
+each BUILT with an installed `.so` differing from the clean one and then changing the solo
+output, 6/6: exact gap evaluated as at-most in the heap (10 DIFFERENT rows); in the index's
+positional chain (5); off by one in the shared comparison (18); the cast adding the left
+width instead of the right (3); `wquery_recv` dropping an operator's flag (the binary-COPY
+rows); the cast not setting the flag (10). Clean tree reinstalled after, 0 diff lines.
+PG18 installcheck 32/32 + isolation 2/2 with that run's outputs as expected. **Not tested
+on that run** and added after: `<0>` over tsvectors with two lexemes at one position (the
+random table has none, so every `<0>` there was "no rows" or the same lexeme), and the
+pinned text re-parse failure.
+
 Gate: `sql/tsquery_cast.sql` -- 42 hand-written and 400 random tsqueries over one
 200-row weighted table, core `@@` against the cast through the heap, `weave_count()` on a
 `tsvector_lex_ops` index and an expression index, and the ranked index scan; plus 15
