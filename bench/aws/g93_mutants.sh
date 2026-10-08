@@ -44,7 +44,7 @@ M8_index_not_inexact_reverted)
 			{' ;;
 M9_ranked_gate_ignores_weight)
 	perl -0pi -e 's/ \|\n\t\t\t\t\t\t\t WEAVE_QF_WEIGHTED\)\)/))/g' src/am/amscan.c
-	n=$(grep -c 'WEAVE_QF_WEIGHTED))' src/am/amscan.c); [ "$n" = 1 ] || { echo "M9: $n left"; exit 1; } ;;
+	n=$(grep -c 'WEAVE_QF_WEIGHTED))' src/am/amscan.c); [ "$n" = 2 ] || { echo "M9: $n left, want 2 (both gate sites removed)"; exit 1; } ;;
 M7_pre_fix_converter)
 	cp /tmp/out/migrate.c.prefix $F ;;
 *) echo "unknown mutant $m"; exit 2 ;;
