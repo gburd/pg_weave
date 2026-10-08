@@ -5092,6 +5092,32 @@ raise an ERROR, not stop, on a `WEAVE_FREED` page met on a live chain. **Superse
 2026-10-06 by maintainer decision: WARN and skip that merge instead (task L23).** An ERROR
 would make every later VACUUM fail until REINDEX.
 
+**FIXED 2026-10-08 by L23 (branch `wt/l23`), measured on EC2, `pgweave-20261008-104055-e8bd`.**
+`weave_merge_segments_streaming()` now pre-flights every input before it reads or allocates
+anything: `weave_bolt_damage()` (src/am/amcheck.c) runs the deep check's own per-bolt walk
+and checks the two recorded lengths, the dictionary entry count against `WeaveSegMeta.nterms`
+and that the shared posting chain reaches the last term's first block. A damaged input gets a
+`WARNING` naming the index, the bolt's dictionary block and the damaged block, and nothing is
+written. The tiered selectors leave that bolt out and keep merging the rest. `weave_check(deep)`
+has a new row, `bolt_chains_intact`. `t/035_merge_freed_page.pl` covers ten cases: freed last
+and middle dictionary pages, a cut dictionary, freed last and middle posting pages, a cut
+posting chain, and freed dict-index, doclen, SuRF and doclist pages. Eleven mutants each built
+a distinct `.so` and failed t/035. **The loss is real, not hypothetical:** with the merge
+ignoring the verdict (mutant `publish`), the cut-dictionary case answered 955 of 1,540 probe
+terms after the merge, and the freed-middle-dictionary case answered 1,465. With the fix every
+term is answered at every step. Limits:
+
+- Covered by code but **not by t/035**: the vector, cgram, docvalues, trigram and tombstone
+  chains (the test index has none of them), the parallel merge path (the test runs with
+  `max_parallel_maintenance_workers = 0`), and `weave_compact_to_one()` in amvacuum.c, which
+  calls `weave_merge_selected()` and therefore **stops** at a damaged bolt instead of skipping it.
+  So `weave_vacuum()` does not compact an index that has one.
+- A damaged bolt stays until REINDEX. Every VACUUM repeats the WARNING (seen in round 9), and
+  per code reading the strict reachability map is incomplete, so the stranded-page reclaim is
+  skipped with a LOG on every VACUUM too.
+- Cost **unmeasured**: every merge walks each input's chains once more, and the reclaim's map
+  makes one more pass over each bolt's dictionary pages.
+
 **L23 inventory, 2026-10-07 (code reading, before the fix; unverified by test).** Every
 chain the merge reads from a SOURCE bolt, and what each walker does today on a page that
 is `WEAVE_FREED` (contents intact, `nextblk` reset to Invalid, kind bits kept):
