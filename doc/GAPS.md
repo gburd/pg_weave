@@ -6659,6 +6659,9 @@ output; mutants 6/6 again, PG18 32/32 + 2/2 again. It also pins the pre-existing
 re-parse failure: `('quick' <-> 'brown')` reads back as `('quick' & !'brown')`, `'fo'*` as
 `'fo'`, `'fox':A` as `('fox' & 'a')`.
 
+Full strict smoke green on `f0bc290` (`pgweave-20261008-174946-139f`: lint, codec,
+`make installcheck` exit 0 with regression, isolation and TAP 35 files / 1484 tests).
+
 **No CORE_CANDIDATES row:** core's phrase semantics are what is being matched, and nothing
 in core blocks or would simplify it.
 
