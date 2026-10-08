@@ -296,7 +296,7 @@ CLEAN_MD5=$(md5sum $LIB/pg_weave.so | cut -d' ' -f1)
 c1=$(run_t "$SRC" clean1); c2=$(run_t "$SRC" clean2)
 [ "$c1" != RAN_NOTHING ] && [ "$c2" != RAN_NOTHING ] || { log "CONTROL ran nothing"; exit 1; }
 n=$(diff $c1 $c2 | wc -l)
-log "CONTROL clean tree twice: so=$CLEAN_MD5 diff_lines=$n (must be 0); DIFFERENT rows in clean: $(grep -c DIFFERENT $c1) (must be 0)"
+log "CONTROL clean tree twice: so=$CLEAN_MD5 diff_lines=$n (must be 0); DIFFERENT rows in clean: $(grep -cE '\| DIFFERENT +\|' $c1) (must be 0)"
 [ "$n" = 0 ] || { log "CONTROL FAILED"; exit 1; }
 grep -q 'queries' $c1 || { log "CONTROL output lacks the randomized summary"; exit 1; }
 caught=0; total=0
@@ -315,7 +315,7 @@ for m in $MUTS; do
 	o=$(run_t $D $m)
 	if [ "$o" = RAN_NOTHING ]; then log "$m: no results -- not counted"; continue; fi
 	diff $c1 $o > $OUT/$T-$m.diff; n=$(wc -l < $OUT/$T-$m.diff)
-	if [ "$n" -gt 0 ]; then caught=$((caught+1)); log "$m: BUILT (so=$md5) and CAUGHT ($n diff lines, $(grep -c DIFFERENT $o) DIFFERENT rows)"
+	if [ "$n" -gt 0 ]; then caught=$((caught+1)); log "$m: BUILT (so=$md5) and CAUGHT ($n diff lines, $(grep -cE '\| DIFFERENT +\|' $o) DIFFERENT rows)"
 	else log "$m: BUILT (so=$md5) and SURVIVED"; fi
 	wipe $D
 done
