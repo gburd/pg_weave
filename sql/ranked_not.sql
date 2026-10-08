@@ -116,7 +116,7 @@ RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort;
 
 -- one stream, in the scan's order, with the distance the scan published per row
 CREATE TEMP TABLE st (ord int, id int, cur float8);
-CREATE FUNCTION pg_temp.verify(q text, off int, expect int, OUT n int, OUT short int,
+CREATE FUNCTION pg_temp.verify(q text, pos0 int, expect int, OUT n int, OUT short int,
 							   OUT extra int, OUT dup int, OUT wrong_value int,
 							   OUT misplaced int)
 LANGUAGE sql SET enable_seqscan = on SET enable_bitmapscan = on SET enable_sort = on AS $$
@@ -130,7 +130,7 @@ LANGUAGE sql SET enable_seqscan = on SET enable_bitmapscan = on SET enable_sort 
 		   (SELECT count(*)::int FROM st JOIN ex e ON e.q = verify.q AND e.id = st.id
 			 WHERE st.cur IS NULL OR abs(st.cur - e.dist) > 1e-9 * e.dist),
 		   (SELECT count(*)::int FROM st JOIN ex e ON e.q = verify.q AND e.id = st.id
-			  JOIN o ON o.pos = verify.off + st.ord WHERE e.dist <> o.dist)
+			  JOIN o ON o.pos = verify.pos0 + st.ord WHERE e.dist <> o.dist)
 $$;
 CREATE FUNCTION pg_temp.win(q text, lim int, off int) RETURNS text LANGUAGE plpgsql
 SET enable_seqscan = off SET enable_bitmapscan = off SET enable_sort = off AS $$
@@ -148,7 +148,7 @@ BEGIN
 		INSERT INTO st VALUES (i, r.id, r.cur);
 		i := i + 1;
 	END LOOP;
-	v := pg_temp.verify(q, off, greatest(0, least(coalesce(lim, m), m - off)));
+	SELECT * INTO v FROM pg_temp.verify(q, off, greatest(0, least(coalesce(lim, m), m - off)));
 	IF v.short = 0 AND v.extra = 0 AND v.dup = 0 AND v.wrong_value = 0 AND v.misplaced = 0 THEN
 		RETURN NULL;
 	END IF;
@@ -218,7 +218,7 @@ BEGIN
 	END LOOP;
 	CLOSE c;
 	-- the 20 moved rows are positions 3..22; verify() checks the rest in place
-	v := pg_temp.verify(q, 0, least(m, 3) + greatest(0, m - 23));
+	SELECT * INTO v FROM pg_temp.verify(q, 0, least(m, 3) + greatest(0, m - 23));
 	RETURN format('n=%s short=%s extra=%s dup=%s wrong_value=%s misplaced=%s',
 				  v.n, v.short, v.extra, v.dup, v.wrong_value, v.misplaced);
 END $$;
