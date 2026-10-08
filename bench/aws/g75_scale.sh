@@ -22,10 +22,17 @@ mkdir -p $OUT
 N=${G75_N:-1000000}
 CYCLES=${G75_CYCLES:-8}
 TWIN=${G75_TWIN:-1}
+# L22 ablation knobs (doc/PHASES.md L22).  ORDER=us inserts the twin first; BURN=1
+# spends one xid in its own transaction before the INSERT into s; CKPT=1 runs a
+# CHECKPOINT after each cycle's VACUUMs, so a crash cannot revert the free space
+# map past the previous cycle.
+ORDER=${G75_ORDER:-su}
+BURN=${G75_BURN:-0}
+CKPT=${G75_CKPT:-0}
 BATCH=${G75_BATCH:-60000}
 BIN=/usr/lib/postgresql/17/bin
-D=/tmp/g75scale
-PORT=5499
+D=/tmp/g75scale${G75_TAG:-}
+PORT=${G75_PORT:-5499}
 PSQL="psql -X -v ON_ERROR_STOP=1 -h /tmp -p $PORT -d postgres"
 log() { echo "$(date +%T) $*" | tee -a $OUT/scale_progress.log; }
 q() { $PSQL -tAc "$1"; }
@@ -43,6 +50,7 @@ max_wal_size = 8GB
 wal_writer_delay = 1ms
 wal_writer_flush_after = 0
 log_min_messages = info
+checkpoint_timeout = ${G75_CKPT_TIMEOUT:-5min}
 EOF
 start() { $BIN/pg_ctl -D $D -l $OUT/scale_server.log -w start > /dev/null; }
 start || { log "server did not start"; exit 1; }
@@ -98,8 +106,14 @@ worst=-1000000000
 exs=
 for c in $(seq 1 $CYCLES); do
 	lo=$((N + (c - 1) * BATCH + 1)); hi=$((N + c * BATCH))
-	q "INSERT INTO s SELECT g, to_wdoc('simple', 'common cyc$c w' || g), ('[' || (g % 1000) || ',1,1,1]')::wvec, g % 1000 FROM generate_series($lo, $hi) g" > /dev/null
-	[ $TWIN = 1 ] && q "INSERT INTO u SELECT g, to_wdoc('simple', 'common cyc$c w' || g), ('[' || (g % 1000) || ',1,1,1]')::wvec, g % 1000 FROM generate_series($lo, $hi) g" > /dev/null
+	# each INSERT bracketed by the allocator counters, in its own session
+	ins() { q "SELECT weave_alloc_stats_reset(); INSERT INTO $1 SELECT g, to_wdoc('simple', 'common cyc$c w' || g), ('[' || (g % 1000) || ',1,1,1]')::wvec, g % 1000 FROM generate_series($lo, $hi) g; SELECT 'alloc ' || weave_alloc_stats()::text" | grep -o 'alloc (.*' | tail -1; }
+	[ $BURN = 1 ] && q "SELECT txid_current()" > /dev/null
+	if [ "$ORDER" = us ] && [ $TWIN = 1 ]; then
+		ia_u=$(ins u); ia_s=$(ins s)
+	else
+		ia_s=$(ins s); ia_u=; [ $TWIN = 1 ] && ia_u=$(ins u)
+	fi
 	before=$(pages)
 	$PSQL -c "VACUUM s" > $OUT/scale_vac$c.log 2>&1 &
 	inwin=0
@@ -120,6 +134,7 @@ for c in $(seq 1 $CYCLES); do
 		| $PSQL > $OUT/scale_post$c.log 2>&1 \
 		|| { log "VACUUM failed after cycle $c"; fail=1; }
 	[ $TWIN = 1 ] && q "VACUUM u" > /dev/null
+	[ $CKPT = 1 ] && q "CHECKPOINT" > /dev/null
 	rline=$(grep -o 'reclaimed .*' $OUT/scale_post$c.log | tail -1)
 	lk=$(leaked)
 	bad=$(q "SELECT coalesce(string_agg(invariant || ': ' || coalesce(detail,''), '; '), '') FROM weave_check('s_w', true) WHERE NOT ok")
@@ -133,7 +148,7 @@ for c in $(seq 1 $CYCLES); do
 		[ "$ex" -gt "$worst" ] && worst=$ex
 		tline=" twin u_w=$pu excess=$ex"
 	fi
-	log "SCALE cycle $c: in_window=$inwin stranded=$st leaked_after_vacuum=$lk deep_bad='$bad' pages $before -> $(pages)$tline; post-crash VACUUM $aline; $rline"
+	log "SCALE cycle $c: in_window=$inwin stranded=$st leaked_after_vacuum=$lk deep_bad='$bad' pages $before -> $(pages)$tline; post-crash VACUUM $aline; INSERT s $ia_s; INSERT u $ia_u; $rline"
 done
 
 # a never-crashed reference for the same row count: REINDEX is the minimum
