@@ -300,12 +300,12 @@ SELECT 'cursor, filtered past the hint' AS shape,
 -- 3.  Invisible in EXPLAIN.
 EXPLAIN (VERBOSE, COSTS OFF)
   SELECT id FROM hf ORDER BY fuse(d <=> 'a | b | c'::wquery, v <-> '[0.3,0.6,0.2,0.9]'::wvec) LIMIT 10;
-                                                                      QUERY PLAN                                                                       
--------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                               QUERY PLAN                                                                                                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Limit
-   Output: id, (fuse(weave_lexscore((d <=> '((''a'' | ''b'') | ''c'')'::wquery)), weave_l2score((v <-> '[0.3,0.6,0.2,0.9]'::wvec)), NULL::real[]))
+   Output: id, (COALESCE(weave_current_fused_distance('hf_w'::regclass, ctid, '((''a'' | ''b'') | ''c'')'::wquery, '[0.3,0.6,0.2,0.9]'::wvec, '{1,1}'::real[]), fuse(weave_lexscore((d <=> '((''a'' | ''b'') | ''c'')'::wquery)), weave_l2score((v <-> '[0.3,0.6,0.2,0.9]'::wvec)), NULL::real[])))
    ->  Index Scan using hf_w on public.hf
-         Output: id, fuse(weave_lexscore((d <=> '((''a'' | ''b'') | ''c'')'::wquery)), weave_l2score((v <-> '[0.3,0.6,0.2,0.9]'::wvec)), NULL::real[])
+         Output: id, COALESCE(weave_current_fused_distance('hf_w'::regclass, ctid, '((''a'' | ''b'') | ''c'')'::wquery, '[0.3,0.6,0.2,0.9]'::wvec, '{1,1}'::real[]), fuse(weave_lexscore((d <=> '((''a'' | ''b'') | ''c'')'::wquery)), weave_l2score((v <-> '[0.3,0.6,0.2,0.9]'::wvec)), NULL::real[]))
          Order By: ((hf.d <=> '((''a'' | ''b'') | ''c'')'::wquery) AND (hf.v <-> '[0.3,0.6,0.2,0.9]'::wvec) AND (hf.d <~> '{1,1}'::real[]))
 (5 rows)
 

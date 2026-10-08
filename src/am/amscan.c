@@ -2765,12 +2765,19 @@ weave_curdist_reset_cb(void *arg)
 	weave_curdist_forget((WeaveScanOpaque) arg);
 }
 
-/* Is this a lexical `<=>` ordering scan, the one shape whose value is reused? */
+/*
+ * Is this an ordering scan whose value is reused: the lexical `<=>` route, or a
+ * fused one (weave_current_fused_distance() below)?  A fused scan's so->query
+ * may hold its WHERE clause's `@@@` query, so the two lookups tell the routes
+ * apart by so->fuseScan, never by so->query.
+ */
 static inline bool
-weave_curdist_lexical(IndexScanDesc scan, WeaveScanOpaque so)
+weave_curdist_wanted(IndexScanDesc scan, WeaveScanOpaque so)
 {
+	if (so->fuseScan)
+		return true;
 	return scan->numberOfOrderBys == 1 && !so->vecScan && !so->edistScan &&
-		!so->fuseScan && so->query != NULL;
+		so->query != NULL;
 }
 
 /* publish the ordering value of the tuple this scan is returning */
@@ -2814,7 +2821,7 @@ weave_current_distance(PG_FUNCTION_ARGS)
 											 it.cur);
 		IndexScanDesc scan = so->curdistScan;
 
-		if (so->query == NULL || so->curdistIndex != indexoid ||
+		if (so->fuseScan || so->query == NULL || so->curdistIndex != indexoid ||
 			!ItemPointerEquals(&scan->xs_heaptid, tid))
 			continue;
 		if (q == NULL)
@@ -2826,6 +2833,117 @@ weave_current_distance(PG_FUNCTION_ARGS)
 		 * this statement, say): the one that published LAST is the one whose
 		 * tuple is being projected, since projection follows the fetch.
 		 */
+		if (best == NULL || so->curdistSeq > best->curdistSeq)
+			best = so;
+	}
+	if (best == NULL || best->curdistIsnull)
+		PG_RETURN_NULL();
+	PG_RETURN_FLOAT8(best->curdistValue);
+}
+
+/*
+ * Do arguments 2.. of a weave_current_fused_distance() call name exactly the
+ * ORDER BY keys of this fused scan?  Argument 2 + i is key i's right operand, in
+ * the planner's key order: each channel's query, then the weights transport.
+ *
+ * TYPED BY THE SCAN KEY, so a direct SQL call can never get a datum read as the
+ * wrong type: the executor sets an ORDER BY key's sk_subtype to its operator's
+ * right type, and the argument's own type must be that one.  A key without a
+ * subtype -- weave_fuse_search() builds its keys by hand -- never matches, which
+ * costs nothing: that scan runs inside one SRF call and no target list is
+ * evaluated while it is live.  Each value is compared with the scan's own copy
+ * (fuseQ/fuseV/fuseW), not with sk_argument, which belongs to the executor.
+ */
+static bool
+weave_curfuse_keys_match(FunctionCallInfo fcinfo, IndexScanDesc scan,
+						 WeaveScanOpaque so)
+{
+	int			i;
+	int			j = 0;
+
+	for (i = 0; i < scan->numberOfOrderBys; i++)
+	{
+		ScanKey		sk = &scan->orderByData[i];
+		Datum		d = PG_GETARG_DATUM(i + 2);
+
+		if (!OidIsValid(sk->sk_subtype) ||
+			get_fn_expr_argtype(fcinfo->flinfo, i + 2) != sk->sk_subtype)
+			return false;
+		if (sk->sk_strategy == WEAVE_STRAT_FUSE_WEIGHTS)
+		{
+			ArrayType  *a = DatumGetArrayTypeP(d);
+
+			if (ARR_NDIM(a) != 1 || ARR_HASNULL(a) ||
+				ARR_ELEMTYPE(a) != FLOAT4OID || ARR_DIMS(a)[0] != so->nfuse ||
+				memcmp(ARR_DATA_PTR(a), so->fuseW,
+					   so->nfuse * sizeof(float4)) != 0)
+				return false;
+			continue;
+		}
+		if (j >= so->nfuse || so->fuseStrat[j] != sk->sk_strategy)
+			return false;
+		if (so->fuseStrat[j] == WEAVE_STRAT_DISTANCE)
+		{
+			if (!weave_query_same(so->fuseQ[j], DatumGetWQuery(d)))
+				return false;
+		}
+		else
+		{
+			WVec	   *v = DatumGetWVec(d);
+
+			if (VARSIZE_ANY(v) != VARSIZE_ANY(so->fuseV[j]) ||
+				memcmp(v, so->fuseV[j], VARSIZE_ANY(v)) != 0)
+				return false;
+		}
+		j++;
+	}
+	return j == so->nfuse;
+}
+
+/*
+ * weave_current_fused_distance(index regclass, row_ctid tid, VARIADIC "any")
+ * -> float8: the fused route's weave_current_distance() (doc/GAPS.md G86).
+ *
+ * The planner hook (src/am/customscan.c) replaces the hidden sort-key copy of
+ * `ORDER BY fuse(...)` with
+ *
+ *     COALESCE(weave_current_fused_distance(index, ctid, q1, ..., qn, weights),
+ *              fuse(...))
+ *
+ * where q1..qn and weights are the right operands of the scan's ORDER BY keys.
+ * This answers the value the live fused scan on `index` stored for that heap
+ * TID: the fused -S of a ranked row, or the padding value of a padded one (0
+ * lexical-only, +Infinity with a vector key; NULL, and so the fallback, for a
+ * row whose fuse() is NULL).  NULL when no live fused scan has exactly those
+ * keys and that row, which includes every call outside such a scan.
+ */
+PG_FUNCTION_INFO_V1(weave_current_fused_distance);
+
+Datum
+weave_current_fused_distance(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	ItemPointer tid = PG_GETARG_ITEMPOINTER(1);
+	int			nkeys = PG_NARGS() - 2;
+	WeaveScanOpaque best = NULL;
+	dlist_iter	it;
+
+	/* `VARIADIC array` packs the keys into one argument: not the planted form */
+	if (get_fn_expr_variadic(fcinfo->flinfo))
+		PG_RETURN_NULL();
+	dlist_foreach(it, &weave_curdist_live)
+	{
+		WeaveScanOpaque so = dlist_container(WeaveScanOpaqueData, curdistNode,
+											 it.cur);
+		IndexScanDesc scan = so->curdistScan;
+
+		if (!so->fuseScan || so->curdistIndex != indexoid ||
+			scan->numberOfOrderBys != nkeys ||
+			!ItemPointerEquals(&scan->xs_heaptid, tid))
+			continue;
+		if (!weave_curfuse_keys_match(fcinfo, scan, so))
+			continue;
+		/* the latest publication wins, as in weave_current_distance() */
 		if (best == NULL || so->curdistSeq > best->curdistSeq)
 			best = so;
 	}
@@ -3897,7 +4015,7 @@ weave_pad_emit(IndexScanDesc scan, WeaveScanOpaque so, ItemPointer tid,
 	dist[0].isnull = nulldist;
 	index_store_float8_orderby_distances(scan, typ, dist, false);
 	/* the value the stream orders this row at, which is what a sort key reads */
-	if (weave_curdist_lexical(scan, so))
+	if (weave_curdist_wanted(scan, so))
 		weave_curdist_note(scan, so, dist[0].value, dist[0].isnull);
 }
 
@@ -4554,7 +4672,7 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 		dist[0].value = so->ordered[so->ordpos].score;
 		dist[0].isnull = false;
 		index_store_float8_orderby_distances(scan, typ, dist, false);
-		if (weave_curdist_lexical(scan, so))
+		if (weave_curdist_wanted(scan, so))
 			weave_curdist_note(scan, so, dist[0].value, false);
 	}
 	so->ordpos++;
