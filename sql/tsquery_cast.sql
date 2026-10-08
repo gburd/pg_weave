@@ -36,8 +36,8 @@ SELECT count(*) AS docs, count(*) FILTER (WHERE tsv = strip(tsv) AND length(tsv)
 CREATE INDEX tc_tsv ON tc USING weave (tsv tsvector_lex_ops);
 CREATE INDEX tc_expr ON tc USING weave (to_wdoc(tsv));
 
--- core's row set, the cast's row set (heap evaluation), the two index counts,
--- or the cast's refusal
+-- core's row set, the cast's row set (heap evaluation), the two index counts
+-- and the ranked index scan (ix_ok), or the cast's refusal
 CREATE FUNCTION pg_temp.cmp(q text, OUT core int[], OUT weave int[],
 							OUT ix_ok bool, OUT refused text)
 LANGUAGE plpgsql AS $$
@@ -56,6 +56,14 @@ BEGIN
 	  FROM tc WHERE to_wdoc(tsv) @@@ wq;
 	ix_ok := weave_count('tc_tsv', wq) = cardinality(core)
 		 AND weave_count('tc_expr', wq) = cardinality(core);
+	-- the ranked scan: its boolean gate admits rows without a heap recheck
+	SET LOCAL enable_seqscan = off;
+	SET LOCAL enable_bitmapscan = off;
+	ix_ok := ix_ok AND core IS NOT DISTINCT FROM
+		(SELECT coalesce(array_agg(id ORDER BY id), '{}') FROM
+			(SELECT id FROM tc WHERE tsv @@@ wq ORDER BY tsv <=> wq LIMIT 1000) r);
+	SET LOCAL enable_seqscan = on;
+	SET LOCAL enable_bitmapscan = on;
 END $$;
 
 -- ---- hand-written ---------------------------------------------------------
@@ -139,3 +147,11 @@ SELECT count(*) FILTER (WHERE q ~ ':[A-D]+') AS weighted,
 SELECT q, q::tsquery::wquery::text AS wquery
   FROM (VALUES ('fox:A'), ('fox:BD'), ('fox:ABCD'), ('fo:*'), ('!fox:C'),
 			   ('quick <-> brown <-> fox'), ('fox:A & (dog | la:*)')) v(q);
+
+-- the ranked arm really is an index scan with the ranking pass
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM tc WHERE tsv @@@ 'fox:A'::wquery ORDER BY tsv <=> 'fox:A'::wquery LIMIT 1000;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
