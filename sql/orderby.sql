@@ -366,7 +366,9 @@ SELECT to_wdoc(strip(to_tsvector('simple','quick red slow brown')))
 
 -- (c) The fourth route, which no producer-side fix reaches: a boolean
 --     sub-expression under a phrase loses positions from the QUERY SHAPE, on a
---     FULLY POSITIONED document. Reachable through the shipped tsquery cast.
+--     FULLY POSITIONED document. It was reachable through the tsquery cast,
+--     which since G93 REFUSES a boolean under a phrase (core evaluates it
+--     positionally; wquery cannot), so only binary wquery input reaches it now.
 SELECT to_tsvector('simple','fox brown zzz quick') @@ to_tsquery('simple','quick <-> (brown & fox)')
          AS core_bool_under_phrase;
 SELECT to_wdoc('simple','fox brown zzz quick')

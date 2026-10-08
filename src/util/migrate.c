@@ -4,10 +4,10 @@
  *		Migration helpers from the existing tsvector/tsquery stack to pg_weave.
  *
  * Stage 11 of pg_weave.  tsquery_to_wquery() mechanically converts a tsquery
- * into an wquery so existing queries port with minimal churn: & -> AND,
- * | -> OR, ! -> NOT, and the phrase operator <N> (OP_PHRASE) -> wquery
- * WEAVE_OP_PHRASE preserving the token gap, so adjacency is carried over
- * faithfully.
+ * into an wquery: & -> AND, | -> OR, ! -> NOT, <-> -> phrase, lexeme:*
+ * -> prefix, lexeme:ABCD -> weight-restricted term.  The result answers
+ * exactly what core's @@ answers on the same tsvector, or the cast raises
+ * feature_not_supported (G93; see mig_walk for the shapes refused).
  *
  * tsquery is stored in prefix (Polish) order; wquery is postfix (RPN).  We
  * walk the tsquery tree recursively and emit postfix items.
@@ -21,6 +21,7 @@
  */
 #include "postgres.h"
 
+#include "miscadmin.h"
 #include "weave/weave.h"
 #include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
@@ -31,8 +32,9 @@ typedef struct MigItem
 {
 	uint8		type;
 	uint8		op;
-	uint32		distance;		/* max token gap for WEAVE_OP_PHRASE (else unused) */
-	char	   *term;			/* folded term (lowercased) for VAL items */
+	uint16		flags;			/* WEAVE_QF_* for VAL items */
+	uint32		distance;		/* phrase gap, or a VAL's weight mask */
+	char	   *term;			/* lexeme text for VAL items */
 	int			termlen;
 }			MigItem;
 
@@ -46,7 +48,8 @@ typedef struct MigState
 }			MigState;
 
 static void
-mig_emit(MigState *st, uint8 type, uint8 op, uint32 distance, char *term, int termlen)
+mig_emit(MigState *st, uint8 type, uint8 op, uint16 flags, uint32 distance,
+		 char *term, int termlen)
 {
 	if (st->nitems >= st->maxitems)
 	{
@@ -59,69 +62,123 @@ mig_emit(MigState *st, uint8 type, uint8 op, uint32 distance, char *term, int te
 	}
 	st->items[st->nitems].type = type;
 	st->items[st->nitems].op = op;
+	st->items[st->nitems].flags = flags;
 	st->items[st->nitems].distance = distance;
 	st->items[st->nitems].term = term;
 	st->items[st->nitems].termlen = termlen;
 	st->nitems++;
 }
 
-/* Recursively walk the tsquery item at index `pos`, emitting postfix. */
+/*
+ * A tsquery shape wquery cannot answer exactly.  Refused rather than converted
+ * to something close: a near miss here is a row silently added or dropped
+ * (G93), and the caller still has core's @@ for these.
+ */
 static void
-mig_walk(MigState *st, QueryItem *item)
+mig_refuse(const char *what, const char *detail)
 {
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot convert tsquery to wquery: %s", what),
+			 errdetail("%s", detail)));
+}
+
+/*
+ * Walk the tsquery item at `item`, emitting postfix.  `in_phrase` is true when
+ * the item is an operand of a phrase operator, where positions matter.
+ *
+ * Returns the operand's phrase WIDTH in core's sense (TS_phrase_execute): 0
+ * for a lexeme, N + width(left) + width(right) for `left <N> right`.  Core
+ * matches `L <N> R` when end(L) + N + width(R) == end(R) -- an EXACT gap --
+ * where wquery's phrase matches 0 < end(R) - end(L) <= distance.  The two agree
+ * exactly when N + width(R) == 1, which is emitted as distance 1: every
+ * left-nested chain of <-> (the shape `a <-> b <-> c` parses to) and nothing
+ * else.  Any other gap would over-match (<2> accepts gap 1) or never match
+ * (<0>), so it is refused.
+ *
+ * Inside a phrase, wquery's &, | and ! drop positions and make the phrase
+ * false, while core evaluates them positionally; and a prefix lexeme carries
+ * no positions in wquery, which makes the phrase permissive.  Both refused.
+ */
+static int
+mig_walk(MigState *st, QueryItem *item, bool in_phrase)
+{
+	check_stack_depth();
+
 	if (item->type == QI_VAL)
 	{
 		QueryOperand *op = &item->qoperand;
-		char	   *src = st->operands + op->distance;
-		char	   *folded = (char *) palloc(op->length);
-		int			i;
+		char	   *term = (char *) palloc(Max(op->length, 1));
+		uint16		flags = 0;
+		uint32		dist = 0;
 
-		/* tsquery lexemes are already normalized; copy verbatim (they are the
-		 * dictionary output, so no further folding is applied). */
-		for (i = 0; i < (int) op->length; i++)
-			folded[i] = src[i];
-		mig_emit(st, WEAVE_QI_VAL, 0, 0, folded, op->length);
+		/* tsquery lexemes are already normalized: copy verbatim */
+		memcpy(term, st->operands + op->distance, op->length);
+
+		if (op->prefix)
+		{
+			/* wquery's prefix match is presence-only: no zones, no positions */
+			if (op->weight != 0)
+				mig_refuse("a prefix lexeme with a weight restriction",
+						   "A wquery prefix match cannot be restricted to weights.");
+			if (in_phrase)
+				mig_refuse("a prefix lexeme inside a phrase",
+						   "A wquery prefix match carries no positions, so the phrase would match non-adjacent words.");
+			flags = WEAVE_QF_PREFIX;
+		}
+		else if (op->weight != 0 && op->weight != 0xF)
+		{
+			/*
+			 * Same encoding as wquery's mask: bit 3 = A ... bit 0 = D, tested
+			 * against the position's label.  All four labels is no restriction
+			 * at all, so it stays a plain term.
+			 */
+			flags = WEAVE_QF_WEIGHTED;
+			dist = op->weight;
+		}
+		mig_emit(st, WEAVE_QI_VAL, 0, flags, dist, term, op->length);
+		return 0;
 	}
-	else						/* QI_OPR */
+	else if (item->type == QI_OPR)
 	{
 		QueryOperator *op = &item->qoperator;
+		int			wl,
+					wr;
+
+		if (op->oper != OP_PHRASE && in_phrase)
+			mig_refuse("&, | or ! inside a phrase",
+					   "wquery evaluates a phrase over &, | or ! as false; tsquery evaluates it positionally.");
 
 		if (op->oper == OP_NOT)
 		{
 			/* NOT has a single (right) operand at item+1 */
-			mig_walk(st, item + 1);
-			mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_NOT, 0, NULL, 0);
+			mig_walk(st, item + 1, false);
+			mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_NOT, 0, 0, NULL, 0);
+			return 0;
 		}
-		else
+
+		wl = mig_walk(st, item + op->left, op->oper == OP_PHRASE);
+		wr = mig_walk(st, item + 1, op->oper == OP_PHRASE);
+
+		switch (op->oper)
 		{
-			QueryItem  *left = item + op->left;
-			QueryItem  *right = item + 1;
-			uint8		ftop;
-			uint32		dist = 1;
-
-			mig_walk(st, left);
-			mig_walk(st, right);
-
-			switch (op->oper)
-			{
-				case OP_AND:
-					ftop = WEAVE_OP_AND;
-					break;
-				case OP_OR:
-					ftop = WEAVE_OP_OR;
-					break;
-				case OP_PHRASE:
-					/* faithful: tsquery <N> -> wquery phrase with the same gap */
-					ftop = WEAVE_OP_PHRASE;
-					dist = op->distance;
-					break;
-				default:
-					ftop = WEAVE_OP_AND;
-					break;
-			}
-			mig_emit(st, WEAVE_QI_OPR, ftop, dist, NULL, 0);
+			case OP_AND:
+				mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_AND, 0, 1, NULL, 0);
+				return 0;
+			case OP_OR:
+				mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_OR, 0, 1, NULL, 0);
+				return 0;
+			case OP_PHRASE:
+				if (op->distance + wr != 1)
+					mig_refuse("a phrase that is not a left-nested chain of <->",
+							   "tsquery's <N> matches a gap of exactly N tokens; wquery's phrase matches a gap of 1 to N.");
+				mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_PHRASE, 0, 1, NULL, 0);
+				return op->distance + wl + wr;
 		}
+		elog(ERROR, "unrecognized tsquery operator: %d", op->oper);
 	}
+	elog(ERROR, "unrecognized tsquery item type: %d", item->type);
+	return 0;					/* keep compiler quiet */
 }
 
 PG_FUNCTION_INFO_V1(tsquery_to_wquery);
@@ -146,7 +203,7 @@ tsquery_to_wquery(PG_FUNCTION_ARGS)
 	st.maxitems = 0;
 
 	if (query->size > 0)
-		mig_walk(&st, GETQUERY(query));
+		mig_walk(&st, GETQUERY(query), false);
 
 	for (i = 0; i < st.nitems; i++)
 		if (st.items[i].type == WEAVE_QI_VAL)
@@ -166,7 +223,7 @@ tsquery_to_wquery(PG_FUNCTION_ARGS)
 	{
 		items[i].type = st.items[i].type;
 		items[i].op = st.items[i].op;
-		items[i].flags = 0;
+		items[i].flags = st.items[i].flags;
 		items[i].distance = st.items[i].distance;
 		if (st.items[i].type == WEAVE_QI_VAL)
 		{
