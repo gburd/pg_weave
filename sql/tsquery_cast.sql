@@ -202,6 +202,27 @@ SELECT p, doc, phraseto_tsquery('english', p)::text AS tsquery,
 			   ('cat in the big hat')) t(doc)
  ORDER BY 1, 2;
 
+-- <0> where it can match: two lexemes at one position (what an ispell or
+-- thesaurus dictionary produces; a 'simple' tsvector never does).  Core, the
+-- heap, and the three index arms (positions = on answers a pure chain from the
+-- postings) must agree.
+CREATE TEMP TABLE tz (id int, tsv tsvector);
+INSERT INTO tz VALUES (1, 'quick:1 brown:1 fox:2'), (2, 'quick:1 brown:2 fox:3'),
+	(3, 'quick:1,3 brown:3 fox:4 dog:4'), (4, 'brown:1 quick:2 fox:2'),
+	(5, 'quick:5 brown:5 fox:7 dog:9'), (6, 'fox:1 dog:1 quick:3 brown:3');
+CREATE INDEX tz_tsv ON tz USING weave (tsv tsvector_lex_ops);
+CREATE INDEX tz_expr ON tz USING weave (to_wdoc(tsv));
+CREATE INDEX tz_pos ON tz USING weave (to_wdoc(tsv)) WITH (positions = on);
+SELECT q, (SELECT array_agg(id ORDER BY id) FROM tz WHERE tsv @@ q::tsquery) AS core,
+	   (SELECT array_agg(id ORDER BY id) FROM tz WHERE to_wdoc(tsv) @@@ q::tsquery::wquery) AS heap,
+	   weave_count('tz_tsv', q::tsquery::wquery) AS ix_tsv,
+	   weave_count('tz_expr', q::tsquery::wquery) AS ix_expr,
+	   weave_count('tz_pos', q::tsquery::wquery) AS ix_pos
+  FROM (VALUES ('quick <0> brown'), ('brown <0> quick'), ('fox <0> dog'),
+			   ('(quick <0> brown) <-> fox'), ('quick <-> (fox <0> dog)'),
+			   ('(fox <0> dog) <2> (quick <0> brown)'), ('quick <0> brown <2> dog'),
+			   ('quick <2> fox'), ('quick <-> fox')) v(q);
+
 -- the binary form keeps the exact-gap flag: through COPY (FORMAT binary) and
 -- back (wquery_send -> wquery_recv) the value has the same bytes and the
 -- received one answers like core.  Per-backend file name (G60).
