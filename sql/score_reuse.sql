@@ -23,6 +23,13 @@
 --   7. a nested ordering scan between fetch and projection does not clobber it
 --                                  (mutant: an unkeyed global, pg_fts's design)
 --   8. no substitution when the function is not the library's C function
+--   9. the FUSED route, `ORDER BY fuse(...)` (weave_current_fused_distance, 0.31.0):
+--      9a plans (hidden key only; the visible fuse() column and fuse() over another
+--         query untouched), 9b visible values unchanged, 9c the published value is
+--         the current row's against weave_fuse_search(), 9d WITH TIES / cursor /
+--         nested-loop rescan in both fuse_normalize modes, 9e padded rows, 9f the
+--         per-row calls, 9g the clobber case, 9h only the library's C function
+--                  (mutants: visible entry; previous row; wrong pad value; unkeyed)
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 SET jit = off;
 SET max_parallel_workers_per_gather = 0;
@@ -233,6 +240,303 @@ ALTER EXTENSION pg_weave ADD FUNCTION weave_current_distance(regclass, tid, wque
 EXPLAIN (VERBOSE, COSTS OFF)
   SELECT id FROM sr WHERE d @@@ 'alpha' ORDER BY d <=> 'alpha' LIMIT 3;
 
+-- 9.  The FUSED route.  A fused scan orders by -S, the weighted sum of CORPUS
+-- channel scores (normalized by each key's ceiling when pg_weave.fuse_normalize
+-- is on), and its hidden `fuse(...)` sort key used to be re-evaluated per row with
+-- N = 1 BM25s.  sf: tf of 'alpha' and 'beta' and the vector all vary with the
+-- row, so the fused values are many and the operator's differ from them; every
+-- 50th vector is NULL, so those rows are padded (fuse() is NULL for them); 1001..
+-- 1100 match neither query, so with two lexical channels they pad at 0.
+CREATE TABLE sf (id int, d wdoc, v wvec(4)) WITH (autovacuum_enabled = off);
+INSERT INTO sf SELECT g, to_wdoc('simple',
+   repeat('alpha ', 1 + g % 4) || repeat('beta ', 1 + g % 3) || repeat('x ', g % 5) || 'w' || (g % 11)),
+   CASE WHEN g % 50 = 0 THEN NULL
+        ELSE ('[' || (g % 7) * 0.1 || ',' || (g % 5) * 0.1 || ',' || (g % 3) * 0.1 || ',0.5]')::wvec END
+  FROM generate_series(1, 1000) g;
+INSERT INTO sf SELECT g, to_wdoc('simple', 'gamma w' || (g % 11)), '[0.1,0.2,0.3,0.4]'
+  FROM generate_series(1001, 1100) g;
+CREATE INDEX sf_w ON sf USING weave (d, v);
+VACUUM ANALYZE sf;
+-- Reference: weave_fuse_search() drives the same fused scan and returns -value as
+-- its score, for the ranked rows.  dist = -score, the value the stream orders by.
+CREATE FUNCTION sf_ref(norm bool) RETURNS TABLE (shape text, id int, dist float8)
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM set_config('pg_weave.fuse_normalize', norm::text, true);
+  RETURN QUERY SELECT 'll'::text, l.id, -s.score
+    FROM weave_fuse_search('sf_w', ARRAY['alpha'::wquery, 'beta'], NULL, '{1,2}', 5000) s
+    JOIN sf l ON l.ctid = s.ctid;
+  RETURN QUERY SELECT 'lv'::text, l.id, -s.score
+    FROM weave_fuse_search('sf_w', ARRAY['alpha'::wquery], ARRAY['[0.3,0.2,0.1,0.5]'::wvec],
+                           NULL, 5000) s
+    JOIN sf l ON l.ctid = s.ctid;
+END $$;
+CREATE TEMP TABLE fex AS
+  SELECT true AS norm, * FROM sf_ref(true) UNION ALL SELECT false, * FROM sf_ref(false);
+SELECT norm, shape, count(*) AS rows, count(DISTINCT dist) AS index_values,
+       count(*) FILTER (WHERE dist = 0) AS at_zero
+  FROM fex GROUP BY 1, 2 ORDER BY 1, 2;
+
+-- 9a. Plans.  The hidden key is substituted, with the scan's key operands.
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') LIMIT 3;
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', v <-> '[0.3,0.2,0.1,0.5]') LIMIT 3;
+-- the commutator spelling and a WHERE gate: still the scan's own key
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sf WHERE d @@@ 'alpha'
+   ORDER BY fuse('alpha' <=> d, v <-> '[0.3,0.2,0.1,0.5]') LIMIT 3;
+-- a selected fuse(...) is NOT substituted, and neither is a selected fuse() over
+-- other queries, though it sits in the same target list
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id, fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') AS f,
+         fuse(d <=> 'beta', d <=> 'alpha') AS other
+    FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') LIMIT 3;
+-- off: the operator, as before
+SET pg_weave.reuse_distance = off;
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') LIMIT 3;
+RESET pg_weave.reuse_distance;
+-- outside a scan the function answers NULL
+SELECT weave_current_fused_distance('sf_w', '(0,1)', 'alpha'::wquery, 'beta'::wquery,
+                                    '{1,2}'::real[]) IS NULL AS fused_null_outside_a_scan;
+
+-- 9b. A selected fuse(...) keeps the operator's value, row for row.
+SELECT count(*) AS n,
+       count(*) FILTER (WHERE f IS DISTINCT FROM
+                        fuse(weave_lexscore(weave_distance(d, 'alpha')),
+                             weave_lexscore(weave_distance(d, 'beta')), weights => '{1,2}'))
+         AS visible_value_changed
+  FROM (SELECT d, fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') AS f
+          FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') LIMIT 500) s;
+
+-- 9c. The value published for the CURRENT row is the scan's own -S for it, in
+-- both normalizer modes and both shapes.  Selected directly so every row reads it.
+CREATE FUNCTION sf_cur(norm bool) RETURNS TABLE (shape text, n bigint, wrong bigint, nulls bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM set_config('pg_weave.fuse_normalize', norm::text, true);
+  RETURN QUERY SELECT 'll', count(*),
+         count(*) FILTER (WHERE abs(s.cur - e.dist) > 1e-9 * abs(e.dist)),
+         count(*) FILTER (WHERE s.cur IS NULL)
+    FROM (SELECT id, weave_current_fused_distance('sf_w', ctid, 'alpha'::wquery, 'beta'::wquery,
+                                                  '{1,2}'::real[]) AS cur
+            FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') LIMIT 1000) s
+    JOIN fex e ON e.id = s.id AND e.norm = sf_cur.norm AND e.shape = 'll';
+  RETURN QUERY SELECT 'lv', count(*),
+         count(*) FILTER (WHERE abs(s.cur - e.dist) > 1e-9 * abs(e.dist)),
+         count(*) FILTER (WHERE s.cur IS NULL)
+    FROM (SELECT id, weave_current_fused_distance('sf_w', ctid, 'alpha'::wquery,
+                       '[0.3,0.2,0.1,0.5]'::wvec, '{1,1}'::real[]) AS cur
+            FROM sf ORDER BY fuse(d <=> 'alpha', v <-> '[0.3,0.2,0.1,0.5]') LIMIT 900) s
+    JOIN fex e ON e.id = s.id AND e.norm = sf_cur.norm AND e.shape = 'lv';
+END $$;
+SELECT * FROM sf_cur(true) UNION ALL SELECT * FROM sf_cur(false);
+
+-- 9d. The sort key's readers, against the reference, in both modes.  WITH TIES
+-- keeps every row tied with the k-th ON THE KEY: with the scan's values that is
+-- the reference's tie group; with the operator's (reuse off) it is a different
+-- set, because the N = 1 values tie differently.  A cursor fetched row by row and
+-- a nested-loop rescan (a different query vector per outer row) read it too.
+CREATE FUNCTION sf_ties(norm bool, k int) RETURNS TABLE (shape text, got bigint, ref bigint, outside bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM set_config('pg_weave.fuse_normalize', norm::text, true);
+  RETURN QUERY
+  WITH g AS (SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}')
+             FETCH FIRST k ROWS WITH TIES),
+       r AS (SELECT e.id FROM fex e WHERE e.norm = sf_ties.norm AND e.shape = 'll'
+               AND e.dist <= (SELECT x.dist FROM fex x WHERE x.norm = sf_ties.norm AND x.shape = 'll'
+                              ORDER BY x.dist LIMIT 1 OFFSET k - 1))
+  SELECT 'll', (SELECT count(*) FROM g), (SELECT count(*) FROM r),
+         (SELECT count(*) FROM g WHERE g.id NOT IN (SELECT r.id FROM r));
+  RETURN QUERY
+  WITH g AS (SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', v <-> '[0.3,0.2,0.1,0.5]')
+             FETCH FIRST k ROWS WITH TIES),
+       r AS (SELECT e.id FROM fex e WHERE e.norm = sf_ties.norm AND e.shape = 'lv'
+               AND e.dist <= (SELECT x.dist FROM fex x WHERE x.norm = sf_ties.norm AND x.shape = 'lv'
+                              ORDER BY x.dist LIMIT 1 OFFSET k - 1))
+  SELECT 'lv', (SELECT count(*) FROM g), (SELECT count(*) FROM r),
+         (SELECT count(*) FROM g WHERE g.id NOT IN (SELECT r.id FROM r));
+END $$;
+SELECT 'norm' AS mode, * FROM sf_ties(true, 5)
+UNION ALL SELECT 'raw', * FROM sf_ties(false, 5)
+UNION ALL SELECT 'raw k=40', * FROM sf_ties(false, 40);
+-- the control, at top level (a plpgsql function would keep its cached plan
+-- across a GUC change): with reuse off the key is the operator's N = 1 value,
+-- which depends on tf alone, so it ties far more rows than the reference's 'll'
+SET pg_weave.reuse_distance = off; SET pg_weave.fuse_normalize = off;
+SELECT count(*) AS fused_with_ties_reuse_off
+  FROM (SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}')
+        FETCH FIRST 5 ROWS WITH TIES) s;
+RESET pg_weave.reuse_distance; RESET pg_weave.fuse_normalize;
+-- a cursor over a substituted WITH TIES plan, one row at a time
+BEGIN;
+SET LOCAL pg_weave.fuse_normalize = off;
+DECLARE sf_c CURSOR FOR SELECT id FROM sf
+  ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') FETCH FIRST 5 ROWS WITH TIES;
+CREATE TEMP TABLE fcur_rows (rn serial, id int);
+DO $$ DECLARE v int; c refcursor := 'sf_c'; BEGIN
+  LOOP FETCH c INTO v; EXIT WHEN NOT FOUND; INSERT INTO fcur_rows (id) VALUES (v); END LOOP; END $$;
+COMMIT;
+SELECT (SELECT count(*) FROM fcur_rows) = (SELECT ref FROM sf_ties(false, 5) WHERE shape = 'll')
+       AS fused_cursor_matches_reference;
+-- a nested-loop inner side, rescanned per outer row with a different query vector
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_material = off;
+SET pg_weave.fuse_normalize = off;
+CREATE TEMP TABLE fexv AS
+  SELECT o.qv, l.id, -s.score AS dist
+  FROM unnest(ARRAY['[0.3,0.2,0.1,0.5]', '[0.6,0.4,0.2,0.5]', '[0,0,0,0.5]']::wvec[]) o(qv)
+       CROSS JOIN LATERAL weave_fuse_search('sf_w', ARRAY['alpha'::wquery], ARRAY[o.qv], NULL, 5000) s
+       JOIN sf l ON l.ctid = s.ctid;
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT o.qv, i.id
+    FROM unnest(ARRAY['[0.3,0.2,0.1,0.5]', '[0.6,0.4,0.2,0.5]', '[0,0,0,0.5]']::wvec[]) o(qv),
+    LATERAL (SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', v <-> o.qv)
+             FETCH FIRST 5 ROWS WITH TIES) i;
+SELECT count(*) AS outer_rows,
+       count(*) FILTER (WHERE x.n IS DISTINCT FROM y.n) AS fused_rescan_mismatches
+  FROM unnest(ARRAY['[0.3,0.2,0.1,0.5]', '[0.6,0.4,0.2,0.5]', '[0,0,0,0.5]']::wvec[]) o(qv),
+  LATERAL (SELECT count(*) n FROM (SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', v <-> o.qv)
+           FETCH FIRST 5 ROWS WITH TIES) i) x,
+  LATERAL (SELECT count(*) n FROM fexv WHERE fexv.qv::text = o.qv::text AND fexv.dist <=
+           (SELECT dist FROM fexv e2 WHERE e2.qv::text = o.qv::text ORDER BY dist LIMIT 1 OFFSET 4)) y;
+RESET pg_weave.fuse_normalize;
+RESET enable_hashjoin; RESET enable_mergejoin; RESET enable_material;
+
+-- 9e. Padded rows.  Past the ranked rows the scan pads: with a vector key a NULL-
+-- vector row's fuse() is NULL, so it pads at NULL and the function answers NULL
+-- (the operator's NULL is then the key too); with two lexical channels a row that
+-- matches neither pads at 0, which is what the function must answer, and what
+-- fuse() gives it as well (-(0 + 0)).  Every row of the table comes out once.
+CREATE TEMP TABLE fpad AS
+  SELECT row_number() OVER () AS rn, id, cur
+    FROM (SELECT id, weave_current_fused_distance('sf_w', ctid, 'alpha'::wquery, 'beta'::wquery,
+                                                  '{1,1}'::real[]) AS cur
+            FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta') LIMIT 5000) s;
+SELECT count(*) AS rows_out, count(DISTINCT id) AS distinct_rows,
+       count(*) FILTER (WHERE id > 1000) AS padded,
+       count(*) FILTER (WHERE id > 1000 AND cur = 0) AS padded_at_zero,
+       count(*) FILTER (WHERE id > 1000 AND cur IS NULL) AS padded_no_value,
+       count(*) FILTER (WHERE id > 1000 AND rn <= 1000) AS padded_before_a_ranked_row
+  FROM fpad;
+CREATE TEMP TABLE fpadv AS
+  SELECT row_number() OVER () AS rn, id, nullvec, cur
+    FROM (SELECT id, v IS NULL AS nullvec,
+                 weave_current_fused_distance('sf_w', ctid, 'alpha'::wquery,
+                                              '[0.3,0.2,0.1,0.5]'::wvec, '{1,1}'::real[]) AS cur
+            FROM sf ORDER BY fuse(d <=> 'alpha', v <-> '[0.3,0.2,0.1,0.5]') LIMIT 5000) s;
+SELECT count(*) AS rows_out, count(*) FILTER (WHERE nullvec) AS null_vector_rows,
+       count(*) FILTER (WHERE nullvec AND cur IS NOT NULL) AS null_vector_with_value,
+       count(*) FILTER (WHERE nullvec AND rn <= (SELECT count(*) FROM fpadv WHERE NOT nullvec))
+         AS null_vector_before_a_ranked_row
+  FROM fpadv;
+-- The vector route's +Infinity: a row the fused pass cannot rank although its
+-- vector is present -- here a PENDING vector of the wrong dimension (an untyped
+-- wvec column), which the flush would drop (G71).  It pads at +Infinity, last,
+-- and that is the published value.  Before 0.31.0 the hidden fuse() re-evaluated
+-- `v <-> q` for it and raised "different wvec dimensions": that is the control.
+CREATE TABLE sfd (id int, d wdoc, v wvec) WITH (autovacuum_enabled = off);
+INSERT INTO sfd SELECT g, to_wdoc('simple', 'alpha w' || g), ('[' || g * 0.1 || ',0,0,1]')::wvec
+  FROM generate_series(1, 20) g;
+CREATE INDEX sfd_w ON sfd USING weave (d, v);
+INSERT INTO sfd VALUES (21, to_wdoc('simple', 'alpha w21'), '[1,2,3]');
+SELECT array_agg(id ORDER BY rn) FILTER (WHERE rn > 18) AS last_rows,
+       (array_agg(cur ORDER BY rn DESC))[1] AS last_value
+  FROM (SELECT row_number() OVER () AS rn, id, cur
+          FROM (SELECT id, weave_current_fused_distance('sfd_w', ctid, 'alpha'::wquery,
+                                                        '[0,0,0,1]'::wvec, '{1,1}'::real[]) AS cur
+                  FROM sfd ORDER BY fuse(d <=> 'alpha', v <-> '[0,0,0,1]') LIMIT 100) s) t;
+SET pg_weave.reuse_distance = off;
+SELECT count(*) FROM (SELECT id FROM sfd ORDER BY fuse(d <=> 'alpha', v <-> '[0,0,0,1]') LIMIT 100) s;
+RESET pg_weave.reuse_distance;
+-- WITH TIES reaching into the padding: k = every ranked row + 1, so the k-th row
+-- is a padded one and the tie group is the whole padding at that value.  Through
+-- the substituted key it is exactly every row (ranked ones and the 100 at 0).
+SELECT count(*) AS with_ties_into_padding
+  FROM (SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta')
+        FETCH FIRST 1001 ROWS WITH TIES) s;
+
+-- 9f. fuse()'s channels are no longer re-evaluated per row, with the control.
+SET track_functions = 'all';
+CREATE FUNCTION sf_calls() RETURNS bigint LANGUAGE sql AS
+  $$ SELECT coalesce(sum(calls), 0) FROM pg_stat_user_functions
+      WHERE funcname IN ('weave_distance', 'weave_lexscore', 'fuse', 'wvec_l2_distance') $$;
+SELECT pg_stat_force_next_flush();
+SELECT sf_calls() AS fc0 \gset
+SELECT count(*) FROM (SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta') LIMIT 400) s;
+SELECT count(*) FROM (SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', v <-> '[0.3,0.2,0.1,0.5]') LIMIT 400) s;
+SELECT pg_stat_force_next_flush();
+SELECT sf_calls() - :fc0 AS fused_reused_calls;
+SET pg_weave.reuse_distance = off;
+SELECT sf_calls() AS fc1 \gset
+SELECT count(*) FROM (SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta') LIMIT 400) s;
+SELECT pg_stat_force_next_flush();
+SELECT sf_calls() - :fc1 >= 400 * 5 AS fused_control_calls_per_row;
+RESET pg_weave.reuse_distance;
+RESET track_functions;
+
+-- 9g. Clobbering.  A correlated subquery in the scan's Filter runs a second
+-- ordering scan after every outer fetch and before the hidden key is evaluated.
+-- `i.id = sf.id` makes the inner scan stop ON THE OUTER'S ROW, so index and TID
+-- match and only the keys (or the route) tell the two publications apart:
+-- (1) a fused scan on the same index with OTHER weights, on the same row;
+-- (2) the same fused scan, same keys, on another row (only the TID differs);
+-- (3) a lexical scan on the same index and row whose query is the outer's first
+--     channel's; and (4) the reverse, a lexical outer with a fused inner on its
+--     row, whose WHERE `@@@` query IS the outer's query -- a fused scan carries
+--     that in so->query, so only the route check keeps the lexical lookup off it.
+-- The outer WITH TIES set must stay the reference's in every case.
+CREATE TEMP TABLE sfx AS
+  SELECT l.id, 1.0 / (1.0 + s.score) AS dist
+  FROM weave_search('sf_w', 'alpha', 5000) s JOIN sf l ON l.ctid = s.ctid;
+SET pg_weave.fuse_normalize = off;
+SELECT (SELECT count(*) FROM (SELECT id FROM sf
+          WHERE (SELECT i.id FROM sf i WHERE i.id = sf.id
+                 ORDER BY fuse(i.d <=> 'alpha', i.d <=> 'beta', weights => '{2,1}') LIMIT 1) > 0
+          ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') FETCH FIRST 5 ROWS WITH TIES) s)
+       = (SELECT ref FROM sf_ties(false, 5) WHERE shape = 'll') AS other_weights_clobber_ok,
+       (SELECT count(*) FROM (SELECT id FROM sf
+          WHERE (SELECT i.id FROM sf i ORDER BY fuse(i.d <=> 'alpha', i.d <=> 'beta', weights => '{1,2}')
+                 LIMIT 1 OFFSET 900 + sf.id % 7) > 0
+          ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') FETCH FIRST 5 ROWS WITH TIES) s)
+       = (SELECT ref FROM sf_ties(false, 5) WHERE shape = 'll') AS same_keys_clobber_ok,
+       (SELECT count(*) FROM (SELECT id FROM sf
+          WHERE (SELECT i.id FROM sf i WHERE i.d @@@ 'alpha' AND i.id = sf.id
+                 ORDER BY i.d <=> 'alpha' LIMIT 1) > 0
+          ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') FETCH FIRST 5 ROWS WITH TIES) s)
+       = (SELECT ref FROM sf_ties(false, 5) WHERE shape = 'll') AS lexical_inner_clobber_ok,
+       (SELECT count(*) FROM (SELECT id FROM sf
+          WHERE d @@@ 'alpha'
+            AND (SELECT i.id FROM sf i WHERE i.d @@@ 'alpha' AND i.id = sf.id
+                 ORDER BY fuse(i.d <=> 'alpha', i.d <=> 'beta') LIMIT 1) > 0
+          ORDER BY d <=> 'alpha' FETCH FIRST 5 ROWS WITH TIES) s)
+       = (SELECT count(*) FROM sfx WHERE dist <= (SELECT dist FROM sfx ORDER BY dist LIMIT 1 OFFSET 4))
+         AS fused_inner_clobber_ok;
+RESET pg_weave.fuse_normalize;
+
+-- 9h. Only the library's C function is planted (as in 8).
+ALTER EXTENSION pg_weave DROP FUNCTION weave_current_fused_distance(regclass, tid, "any");
+DROP FUNCTION weave_current_fused_distance(regclass, tid, "any");
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta') LIMIT 3;
+-- the decoy is a C function, since only C can take "any", with the WRONG symbol
+CREATE FUNCTION weave_current_fused_distance(regclass, tid, VARIADIC "any") RETURNS float8
+  AS '$libdir/pg_weave', 'weave_current_distance' LANGUAGE C STRICT;
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta') LIMIT 3;
+DROP FUNCTION weave_current_fused_distance(regclass, tid, "any");
+CREATE FUNCTION weave_current_fused_distance(index regclass, row_ctid tid, VARIADIC keys "any")
+  RETURNS float8 AS '$libdir/pg_weave', 'weave_current_fused_distance'
+  LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+ALTER EXTENSION pg_weave ADD FUNCTION weave_current_fused_distance(regclass, tid, "any");
+EXPLAIN (VERBOSE, COSTS OFF)
+  SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta') LIMIT 3;
+
 RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort;
 DROP FUNCTION sr_wd();
-DROP TABLE sr, sr2, sr_pt, sr_v;
+DROP FUNCTION sf_ref(bool);
+DROP FUNCTION sf_cur(bool);
+DROP FUNCTION sf_ties(bool, int);
+DROP FUNCTION sf_calls();
+DROP TABLE sr, sr2, sr_pt, sr_v, sf, sfd;
