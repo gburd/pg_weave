@@ -150,28 +150,59 @@ now. With tombstones, the probe alone still decides.
 | G75's four mutants | CAUGHT, as before |
 | 1M rows, 14 crash cycles, with a twin | numerically PASS (worst 3,531, bound 6,750), **but see the next section** |
 
-### LOSS, OPEN: a second growth at scale, which this fix does not touch
+### A second growth at scale, which the compaction fix does not touch
 
-The scale run's excess of the crashed index over its twin, per cycle:
+The gate's scale run (above) measured this excess of the crashed index over its twin,
+per cycle:
 
     0 2352 851 2672 1171 0 0 0 1177 1177 2354 2354 3531 3531
 
-From cycle 9 the excess grows by 1,177 pages every two cycles. That is one 60k-row
-batch's segment, and the post-crash VACUUMs did **no allocation work at all**
-(`alloc (0,0,0,0,0,0,0)`). The growth is at the crashed table's INSERT, while the twin
-stays at 80,299. It is not the compaction mechanism above: no pass runs. A 14-cycle bound
-that passes is therefore not evidence that the growth is bounded. What the run shows:
+From cycle 9 the excess grew by 1,177 pages every two cycles. That is one 60k-row batch
+of pending pages. The post-crash VACUUMs did **no allocation work at all**, so this is
+not the compaction mechanism above. **The 14-cycle bound passed while the excess was
+still growing**, so the bound alone was not evidence that the size is bounded.
 
-- The reclaim's **stale-entry count grows every cycle**: 2,370, 5,048, 7,726, 10,404,
-  13,082, 15,760. Its re-recorded count tracks the excess exactly: 1,177, 2,354, 2,354,
-  3,531, 3,531, 4,708.
-- The server log shows **no checkpoint between crashes** from 03:06 to 03:57. Each
-  restart's end-of-recovery checkpoint resets the timer, and a cycle (about 4.5 min) is
-  shorter than `checkpoint_timeout` (5 min). Each end-of-recovery checkpoint did write
-  ~11.4k buffers, including FSM pages.
-- **Hypothesis, not demonstrated:** each crash restores a free space map that lists pages
-  since reused and freed again, stamped with an xid the next INSERT then gets. The
-  allocator's FSM loop treats that first non-recyclable candidate as the end of reuse
-  (`weave_new_buffer_internal()`, the deliberate `break`), so the whole batch extends.
-  The ablation that tests it: `bench/aws/l22_scale_ablate.sh`, with arms `swap`, `ckpt`
-  and `burn` beside `base`, results below when run.
+**The scale run did not catch `nofit` either.** On the `nofit` mutant the scale run
+printed the same sequence to the page and passed (`RESULT fail=0`). At 1M rows no
+share-lock compaction pass ever started, so the twin bound there cannot discriminate the
+first fix. `t/033` is what catches `nofit`.
+
+**The ablation** (`pgweave-20261008-063547-9cdb`, `bench/aws/l22_scale_ablate.sh`, five
+clusters on one host and one `.so`, 12 cycles, `checkpoint_timeout` 1h in every arm).
+Each `INSERT` was bracketed by the allocator counters. Excess per cycle, cycles 8–11:
+
+| arm | what it changes | excess | `INSERT s` at cycle 9 (fsm reuse / fsm defer / extend) |
+|---|---|---|---|
+| base | nothing | 0 / 1,177 / 1,177 / 2,354 | 0 / 1,177 / 1,177 |
+| `ckpt` | a CHECKPOINT after each cycle's VACUUMs | 0 / 1,177 / 1,177 / 2,354 | 0 / 1,177 / 1,177 |
+| `burn` | one `txid_current()` before `INSERT s` | 0 / 0 / 0 / 0 | 1,177 / 0 / 0 |
+| `swap` | the twin is inserted first | 0 / 0 / 0 / −1,177 (the twin grows) | 1,177 / 0 / 0 |
+| `drop` | the FSM loop drops a freed, not-yet-recyclable page and continues | 0 / 1,177 / 1,177 / 1,177 | 0 / 21,424 / 1,177 |
+
+- **REFUTED: a crash-reverted free space map causes it.** The run had no checkpoint
+  between crashes, and the reclaim's stale-entry count climbed every cycle (2,370 →
+  15,760). `ckpt` fixed the stale count at 2,678, and the growth was the same.
+- **CONFIRMED: an xid-stamp collision.** VACUUM stamps the pages it frees with
+  `ReadNextTransactionId()`. Nothing assigns an xid before the next `INSERT s`, so that
+  INSERT runs under the stamped xid and can reuse none of those pages. The FSM loop in
+  `weave_new_buffer_internal()` then re-queued the first refused page and stopped, so each
+  of the 1,177 allocations met the same page and extended. `burn` spends that xid
+  elsewhere, and the growth is gone. `swap` hands the collision to the twin.
+- **`drop` is the fix.** The first collision still extends one batch, because every
+  candidate is refused (21,424 dropped, all freed by the cycle-8 merge). After that the
+  excess stays at 1,177, and the base climbs. A dropped page comes back on the next
+  VACUUM through the reclaim's re-record arm.
+
+The crash is not needed for either growth. Both are idle-cluster effects of the recycle
+gate's xid stamp, and the crash loop only provides a schedule where the first transaction
+after a VACUUM is always an INSERT.
+
+**The second fix** (`16d429f`): the FSM loop drops a freed, not-yet-recyclable candidate,
+up to 64 per call, and moves on. A live page with a stale entry keeps the old
+re-queue-and-stop rule. Dropping those is the allocator change G75 retracted, which made
+`t/028` fail 3 in 10. `g75_scale.sh` now also asserts that the excess stops growing over
+the last four cycles: it may rise by at most what those cycles stranded, plus 64 pages
+plus 1 % of the twin. Checked against the gate run's numbers offline, that assertion fails
+the base (2,354 against an allowance of 866) and passes the `drop` arm (0).
+
+Gate for the second fix: `pgweave-20261008-081449-3b76`, `bench/aws/l22_gate2.sh`, results below.
