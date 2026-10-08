@@ -135,6 +135,7 @@ typedef struct WeaveQueryItem
 	uint8		op;				/* WeaveQueryOp, valid when type == WEAVE_QI_OPR */
 	uint16		flags;			/* WEAVE_QF_* flags, valid for WEAVE_QI_VAL */
 	uint32		distance;		/* max token gap for WEAVE_OP_PHRASE (1 = adjacent);
+								 * with WEAVE_QF_PHRASE_EXACT, tsquery's <N> instead;
 								 * on a WEAVE_QI_VAL with WEAVE_QF_WEIGHTED, instead holds
 								 * the weight-label mask (bit L set => match label L,
 								 * L in 0..3 for D,C,B,A) -- a VAL never uses the gap */
@@ -148,6 +149,14 @@ typedef struct WeaveQueryItem
 #define WEAVE_QF_REGEX	0x0004	/* term text is a regular expression (/re/) */
 #define WEAVE_QF_WEIGHTED	0x0008	/* term is weight-restricted (term:ABCD);
 								 * the label mask is in `distance` (see above) */
+/*
+ * On a WEAVE_OP_PHRASE item: tsquery's `L <N> R`, N in `distance` (0 = the same
+ * position).  R must end EXACTLY N + width(R) positions after L ends, where a
+ * term has width 0 and a phrase has width N + width(L) + width(R) -- core's
+ * TS_phrase_execute.  Without the flag a phrase is "gap 1..distance" (NEAR).
+ * Only the tsquery cast produces it; the text parser has no syntax for it.
+ */
+#define WEAVE_QF_PHRASE_EXACT	0x0010
 
 /*
  * Weight labels (field zones), tsvector-compatible ordering D < C < B < A.
@@ -240,7 +249,8 @@ extern bool weave_doc_matches(WeaveDoc doc, WeaveQuery query);
  * truth for the in-memory matcher and the index posting-list phrase eval) */
 extern void weave_phrase_step_pos(const uint32 *left, int nleft,
 								const uint32 *right, int nright,
-								uint32 distance, uint32 *out, int *nout);
+								uint32 distance, bool exact,
+								uint32 *out, int *nout);
 /* shared: binary-search a term in a doc; returns entry or NULL */
 extern WeaveTermEntry *weave_doc_lookup(WeaveDoc doc, const char *term, int termlen);
 

@@ -6573,6 +6573,98 @@ when `ordSameQuery` and the query has a NOT or an expanding leaf; it touches the
 ordering machinery, so it is left for a task of its own. `sql/tsquery_cast.sql` pins
 the current state (`ranked` column: never SUPERSET; subset only with a prefix or a NOT).
 
+**EXACT-GAP PHRASE, 2026-10-08 (`wt/phrase`, maintainer decision 2026-10-08: format change OK).**
+Design, written before the code:
+
+- *Core's semantics* (`TS_phrase_execute` / `TS_phrase_output`, `tsvector_op.c`). Every
+  match is reported at its END position plus a static `width` (lexemes - 1): a lexeme has
+  width 0, `L <N> R` has width `N + width(L) + width(R)`, NOT keeps its operand's width,
+  AND/OR take the max (and OR takes the surviving side's width when the other side fails,
+  so it is not static). `L <N> R` matches at `p` iff `R` ends at `p` and `L` ends at
+  `p - N - width(R)` -- gap EXACTLY `N + width(R)` between the two end positions. So
+  `<0>` is "same position", and a right-nested `a <1> (b <1> c)` is `end(a) + 2 == end(c)`.
+- *wquery representation: a flag, not an op code.* `WEAVE_QF_PHRASE_EXACT` on a
+  `WEAVE_OP_PHRASE` item (`flags` is 0 on every OPR item every producer emits today), with
+  `distance` = the exact end-to-end gap the cast computes as `N + width(R)`. Chosen over a
+  new op code because every site that does not EVALUATE adjacency (candidate AND in
+  `weave_eval_query`, the inexact flag, the pure-boolean / pure-OR gates, `has_phrase`)
+  must treat the exact form exactly like PHRASE, and a flag gets that for free; a new op
+  code would fall into the "else = OR" arm of `weave_eval_query` wherever a site was
+  missed. The two sites that DO evaluate adjacency share `weave_phrase_step_pos()`, which
+  gains an `exact` argument, so the compiler finds every caller.
+- *Mapped by the cast once both evaluators read the flag:* `<0>`, `<N>`, left-nested,
+  right-nested and phrase-of-phrase chains of lexemes (weighted lexemes included), hence
+  `phraseto_tsquery` with stopword gaps. *Still refused:* `&`, `|`, `!` and `lex:*` inside a
+  phrase -- core evaluates those positionally with negated position sets and
+  width alignment (`TSPO_L_ONLY`/`R_ONLY`, `negate`), which neither wquery evaluator models.
+- *Found while designing, pre-existing:* `wquery_out` output does not re-parse. The lexer
+  treats `<` and `>` as separators and `-` as NOT, so `('a' <-> 'b')` reads back as
+  `'a' & !'b'`; `'a'*`, `'a'~1` and `'a':A` lose the suffix after the quote. Binary
+  send/recv round-trips every field (flags included). A text form that round-trips needs
+  new `wquery_in` syntax, which is a decision (see the report on `wt/phrase`).
+
+**Built, 2026-10-08 (`wt/phrase`).** `WEAVE_QF_PHRASE_EXACT` (`include/weave/weave.h`);
+`weave_phrase_step_pos(..., exact, ...)` (`src/query/match.c`) is the one comparison, used
+by the heap matcher's `phrase_step()` and by the index's positional chain
+(`weave_phrase_chain()` records a per-step flag, `weave_phrase_eval_seg()` passes it,
+`src/am/amscan.c`); the candidate AND, the inexact flag and recheck needed no change because
+the item is still `WEAVE_OP_PHRASE`. `mig_walk` sets the flag on every phrase with
+`distance = N + width(R)` (int64, clamped at `UINT32_MAX`). `wquery_out` prints the exact
+form in tsquery's spelling (`<->` for N = 1, `<N>` otherwise, N recovered by subtracting
+the right operand's width) so the cast's output reads as the tsquery it came from. No
+`wquery_in` syntax: the flag is reachable only through the cast and binary input.
+
+Refusals, `sql/tsquery_cast.sql`, same seed, before (`wt/g93`) and after:
+
+| | hand-written (53 now, 42 before) | random 400 converted | random refused |
+|---|---|---|---|
+| before | 4 phrase shapes refused as "not a left-nested chain" | 160 | 240: bool-in-phrase 113, not-a-chain 46, prefix-in-phrase 46, weighted prefix 35 |
+| after | every `<0>` / `<N>` / nested lexeme chain converts and agrees | **182** | **218**: bool-in-phrase 128, prefix-in-phrase 51, weighted prefix 39 |
+
+(The random set is generated before the cast is tried, so the 400 queries are identical;
+a query refused as "not a chain" before now either converts or hits a later refusal deeper
+in the same query, which is why the other buckets grew.) `phraseto_tsquery('english',
+'cat in the hat')` = `'cat' <3> 'hat'` converts and answers like core on four documents,
+gaps 1-3.
+
+**Still refused, and why.** `&`, `|`, `!` inside a phrase. Core evaluates them
+positionally: AND inside a phrase is "both at the same end position after width
+alignment" (`TSPO_BOTH` with offsets `maxwidth - width`), OR is a union whose width is the
+surviving side's (so it is not static, which the cast's width computation needs), and NOT
+is a negated position set (`negate`). wquery's evaluators carry a plain position list per
+operand and drop it at a boolean operator. Modelling core would need a position-set
+algebra with negation in both evaluators -- a larger change than this one, and
+`(brown | fox)` inside a phrase is the shape `phraseto_tsquery` produces only for a
+multi-variant dictionary (ispell, thesaurus). A prefix lexeme inside a phrase: wquery's
+prefix leaf carries no positions. Both are follow-ups if a real query corpus shows them.
+
+Gate evidence (EC2 Debian 13, PG17.11): run `pgweave-20261008-172913-2266` on `b678b5e`:
+the full installcheck differed from expected only in `tsquery_cast` (each change read and
+intended, hard rule 3); solo control twice, 0 diff lines, 0 DIFFERENT rows, full-run =
+solo; 0 disagreements among 182 converted random queries on the heap, a
+`tsvector_lex_ops` index, an expression index and a `positions = on` index (the
+positional chain), and the ranked scan `same` on all 182. Mutants (`bench/aws/phrase_job.sh`),
+each BUILT with an installed `.so` differing from the clean one and then changing the solo
+output, 6/6: exact gap evaluated as at-most in the heap (10 DIFFERENT rows); in the index's
+positional chain (5); off by one in the shared comparison (18); the cast adding the left
+width instead of the right (3); `wquery_recv` dropping an operator's flag (the binary-COPY
+rows); the cast not setting the flag (10). Clean tree reinstalled after, 0 diff lines.
+PG18 installcheck 32/32 + isolation 2/2 with that run's outputs as expected. That run's
+random table has no two lexemes at one position, so every `<0>` in it was "no rows" or
+the same lexeme; run `pgweave-20261008-173959-7e54` on `733e877` adds a six-row table that
+does (what an ispell or thesaurus dictionary produces), nine shapes including `<0>` on both
+sides of a `<2>`: core = heap = all three index arms on every one. Its output differs from
+the first run's only by the added sections (0 removed lines) and is the committed expected
+output; mutants 6/6 again, PG18 32/32 + 2/2 again. It also pins the pre-existing text
+re-parse failure: `('quick' <-> 'brown')` reads back as `('quick' & !'brown')`, `'fo'*` as
+`'fo'`, `'fox':A` as `('fox' & 'a')`.
+
+Full strict smoke green on `f0bc290` (`pgweave-20261008-174946-139f`: lint, codec,
+`make installcheck` exit 0 with regression, isolation and TAP 35 files / 1484 tests).
+
+**No CORE_CANDIDATES row:** core's phrase semantics are what is being matched, and nothing
+in core blocks or would simplify it.
+
 Gate: `sql/tsquery_cast.sql` -- 42 hand-written and 400 random tsqueries over one
 200-row weighted table, core `@@` against the cast through the heap, `weave_count()` on a
 `tsvector_lex_ops` index and an expression index, and the ranked index scan; plus 15

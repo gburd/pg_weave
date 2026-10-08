@@ -4743,7 +4743,8 @@ typedef struct PosTermList
  * step; we carry each step's distance in *dist[].
  */
 static bool
-weave_phrase_chain(WeaveQuery q, int *termidx, uint32 *stepdist, int *nterms)
+weave_phrase_chain(WeaveQuery q, int *termidx, uint32 *stepdist,
+				   bool *stepexact, int *nterms)
 {
 	int			nt = 0;
 	uint32		i;
@@ -4784,6 +4785,7 @@ weave_phrase_chain(WeaveQuery q, int *termidx, uint32 *stepdist, int *nterms)
 				return false;
 			/* step k joins term (nt-1) to its predecessor: record its distance */
 			stepdist[nt - 2] = it->distance;
+			stepexact[nt - 2] = (it->flags & WEAVE_QF_PHRASE_EXACT) != 0;
 			stack--;			/* phrase collapses two operands to one */
 		}
 		else
@@ -4955,7 +4957,8 @@ weave_pospost_find(PosTermList *pl, uint64 docid)
  */
 static bool
 weave_phrase_eval_seg(Relation index, const WeaveSegMeta *seg, WeaveQuery q,
-					 const int *termidx, const uint32 *stepdist, int nterms,
+					 const int *termidx, const uint32 *stepdist,
+					 const bool *stepexact, int nterms,
 					 ItemPointerData **tids, int *ntids, int *captids)
 {
 	PosTermList *tl = (PosTermList *) palloc0(nterms * sizeof(PosTermList));	/* alloc-ok: nterms = query term count */
@@ -5027,7 +5030,7 @@ weave_phrase_eval_seg(Relation index, const WeaveSegMeta *seg, WeaveQuery q,
 				goto done;
 			}
 			weave_phrase_step_pos(acc, nacc, pp[t]->pos, pp[t]->npos,
-								stepdist[t - 1], tmp, &nout);
+								stepdist[t - 1], stepexact[t - 1], tmp, &nout);
 			memcpy(acc, tmp, nout * sizeof(uint32));
 			nacc = nout;
 		}
@@ -5138,6 +5141,7 @@ weave_collect_matches(Relation index, WeaveQuery query, TidSet *out, bool *reche
 	bool		use_pos_phrase = false;	/* positional phrase fast path applies */
 	int			pterm[WEAVE_QUERY_MAX_PHRASE_TERMS];
 	uint32		pstep[WEAVE_QUERY_MAX_PHRASE_TERMS] = {0};
+	bool		pexact[WEAVE_QUERY_MAX_PHRASE_TERMS] = {0};
 	int			npterm = 0;
 	ItemPointerData *ptids = NULL;
 	int			nptids = 0;
@@ -5221,7 +5225,7 @@ collect_retry:
 	 */
 	if (has_phrase && !has_fuzzy_regex && !has_not && !has_weighted &&
 		weave_index_wants_positions(index) &&
-		weave_phrase_chain(query, pterm, pstep, &npterm))
+		weave_phrase_chain(query, pterm, pstep, pexact, &npterm))
 		use_pos_phrase = true;
 
 	/*
@@ -5406,7 +5410,7 @@ collect_retry:
 				 * throw here loses one query, not a vacuum */
 				ptids = (ItemPointerData *) WEAVE_ALLOC_MAYBE_HUGE((Size) captids * sizeof(ItemPointerData));
 			}
-			if (!weave_phrase_eval_seg(index, sg, query, pterm, pstep, npterm,
+			if (!weave_phrase_eval_seg(index, sg, query, pterm, pstep, pexact, npterm,
 									  &ptids, &nptids, &captids))
 			{
 				/* fall back: restart collection from scratch via the AND path */

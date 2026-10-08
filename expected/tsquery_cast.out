@@ -44,6 +44,9 @@ SELECT count(*) AS docs, count(*) FILTER (WHERE tsv = strip(tsv) AND length(tsv)
 -- reaches the scan-side recheck rather than an executor recheck (AGENTS.md)
 CREATE INDEX tc_tsv ON tc USING weave (tsv tsvector_lex_ops);
 CREATE INDEX tc_expr ON tc USING weave (to_wdoc(tsv));
+-- positions = on: a pure phrase chain is answered from the postings' positions
+-- (weave_phrase_eval_seg), the other evaluator of an exact gap
+CREATE INDEX tc_pos ON tc USING weave (to_wdoc(tsv)) WITH (positions = on);
 -- core's row set, the cast's row set (heap evaluation), the two index counts
 -- (ix_ok), the ranked index scan's relation to core (ranked), or the refusal
 CREATE FUNCTION pg_temp.cmp(q text, OUT core int[], OUT weave int[],
@@ -69,7 +72,8 @@ BEGIN
 	SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO weave
 	  FROM tc WHERE to_wdoc(tsv) @@@ wq;
 	ix_ok := weave_count('tc_tsv', wq) = cardinality(core)
-		 AND weave_count('tc_expr', wq) = cardinality(core);
+		 AND weave_count('tc_expr', wq) = cardinality(core)
+		 AND weave_count('tc_pos', wq) = cardinality(core);
 	-- the ranked scan (WHERE @@@ q ORDER BY <=> q).  Its candidates come from
 	-- q's literal terms, so a prefix expansion or a row matching only through
 	-- NOT is reached by the padding phase (doc/GAPS.md G94; it was a SUBSET).
@@ -116,9 +120,16 @@ SELECT q, cardinality(c.core) AS ncore,
 		('quick <-> brown'), ('quick:A <-> brown'), ('quick <-> brown:B'),
 		('(quick <-> brown) <-> fox'), ('(quick <-> brown) & fox'),
 		('!(quick <-> brown)'), ('fox <-> fox'),
-		-- phrase shapes wquery cannot express exactly
+		-- exact gaps (WEAVE_QF_PHRASE_EXACT): <0> is the same position, <N>
+		-- exactly N, a right operand's width adds to the gap
 		('quick <2> brown'), ('quick <0> brown'), ('quick <3> brown'),
-		('quick <-> (brown <-> fox)'), ('quick <-> (brown | fox)'),
+		('fox <0> fox'), ('fox <2> fox'), ('quick <1> brown'), ('quick:A <2> brown:C'),
+		('quick <-> (brown <-> fox)'), ('quick <2> (brown <3> fox)'),
+		('(quick <2> brown) <-> (fox <0> fox)'), ('(quick <0> quick) <2> fox'),
+		('quick <-> (brown <-> (fox <-> dog))'), ('!(quick <2> brown)'),
+		('quick <2> brown | dog <0> dog'), ('quick <2> brown & !fox'),
+		-- phrase shapes wquery cannot express exactly: still refused
+		('quick <-> (brown | fox)'),
 		('quick <-> (brown & fox)'), ('quick <-> !brown'), ('fo:* <-> dog'),
 		('quick <-> fo:*'),
 		-- negation
@@ -327,51 +338,62 @@ NOTICE:  text-search query doesn't contain lexemes: ""
 NOTICE:  text-search query doesn't contain lexemes: ""
 NOTICE:  text-search query doesn't contain lexemes: ""
 NOTICE:  text-search query doesn't contain lexemes: ""
-             q             | ncore | verdict | ranked |                                      refused                                      
----------------------------+-------+---------+--------+-----------------------------------------------------------------------------------
- fox:A                     |    30 | same    | same   | 
- fox:B                     |    30 | same    | same   | 
- fox:C                     |    42 | same    | same   | 
- fox:D                     |    51 | same    | same   | 
- fox:AB                    |    56 | same    | same   | 
- fox:CD                    |    83 | same    | same   | 
- fox:AD                    |    74 | same    | same   | 
- fox:BCD                   |   100 | same    | same   | 
- fox:ABCD                  |   113 | same    | same   | 
- fox:A & dog:B             |     5 | same    | same   | 
- fox:A | dog:D             |    72 | same    | same   | 
- fo:*                      |   158 | same    | same   | 
- qu:*                      |   110 | same    | same   | 
- f:*                       |   158 | same    | same   | 
- fo:* & !fox               |    45 | same    | same   | 
- fo:* | la:*               |   180 | same    | same   | 
- fo:*A                     |    57 | refused |        | cannot convert tsquery to wquery: a prefix lexeme with a weight restriction
- fo:*AB                    |   100 | refused |        | cannot convert tsquery to wquery: a prefix lexeme with a weight restriction
- quick <-> brown           |    14 | same    | same   | 
- quick:A <-> brown         |     6 | same    | same   | 
- quick <-> brown:B         |     4 | same    | same   | 
- (quick <-> brown) <-> fox |     0 | same    | same   | 
- (quick <-> brown) & fox   |     7 | same    | same   | 
- !(quick <-> brown)        |   186 | same    | same   | 
- fox <-> fox               |    12 | same    | same   | 
- quick <2> brown           |    13 | refused |        | cannot convert tsquery to wquery: a phrase that is not a left-nested chain of <->
- quick <0> brown           |     0 | refused |        | cannot convert tsquery to wquery: a phrase that is not a left-nested chain of <->
- quick <3> brown           |     8 | refused |        | cannot convert tsquery to wquery: a phrase that is not a left-nested chain of <->
- quick <-> (brown <-> fox) |     0 | refused |        | cannot convert tsquery to wquery: a phrase that is not a left-nested chain of <->
- quick <-> (brown | fox)   |    29 | refused |        | cannot convert tsquery to wquery: &, | or ! inside a phrase
- quick <-> (brown & fox)   |     0 | refused |        | cannot convert tsquery to wquery: &, | or ! inside a phrase
- quick <-> !brown          |   105 | refused |        | cannot convert tsquery to wquery: &, | or ! inside a phrase
- fo:* <-> dog              |    35 | refused |        | cannot convert tsquery to wquery: a prefix lexeme inside a phrase
- quick <-> fo:*            |    29 | refused |        | cannot convert tsquery to wquery: a prefix lexeme inside a phrase
- !fox                      |    87 | same    | same   | 
- !fox & !dog               |    33 | same    | same   | 
- !(fox | dog)              |    33 | same    | same   | 
- !!fox                     |   113 | same    | same   | 
- fox & !dog:A              |    92 | same    | same   | 
- zzz                       |     0 | same    | same   | 
- !zzz                      |   200 | same    | same   | 
-                           |     0 | same    | same   | 
-(42 rows)
+                  q                  | ncore | verdict | ranked |                                   refused                                   
+-------------------------------------+-------+---------+--------+-----------------------------------------------------------------------------
+ fox:A                               |    30 | same    | same   | 
+ fox:B                               |    30 | same    | same   | 
+ fox:C                               |    42 | same    | same   | 
+ fox:D                               |    51 | same    | same   | 
+ fox:AB                              |    56 | same    | same   | 
+ fox:CD                              |    83 | same    | same   | 
+ fox:AD                              |    74 | same    | same   | 
+ fox:BCD                             |   100 | same    | same   | 
+ fox:ABCD                            |   113 | same    | same   | 
+ fox:A & dog:B                       |     5 | same    | same   | 
+ fox:A | dog:D                       |    72 | same    | same   | 
+ fo:*                                |   158 | same    | same   | 
+ qu:*                                |   110 | same    | same   | 
+ f:*                                 |   158 | same    | same   | 
+ fo:* & !fox                         |    45 | same    | same   | 
+ fo:* | la:*                         |   180 | same    | same   | 
+ fo:*A                               |    57 | refused |        | cannot convert tsquery to wquery: a prefix lexeme with a weight restriction
+ fo:*AB                              |   100 | refused |        | cannot convert tsquery to wquery: a prefix lexeme with a weight restriction
+ quick <-> brown                     |    14 | same    | same   | 
+ quick:A <-> brown                   |     6 | same    | same   | 
+ quick <-> brown:B                   |     4 | same    | same   | 
+ (quick <-> brown) <-> fox           |     0 | same    | same   | 
+ (quick <-> brown) & fox             |     7 | same    | same   | 
+ !(quick <-> brown)                  |   186 | same    | same   | 
+ fox <-> fox                         |    12 | same    | same   | 
+ quick <2> brown                     |    13 | same    | same   | 
+ quick <0> brown                     |     0 | same    | same   | 
+ quick <3> brown                     |     8 | same    | same   | 
+ fox <0> fox                         |   113 | same    | same   | 
+ fox <2> fox                         |    14 | same    | same   | 
+ quick <1> brown                     |    14 | same    | same   | 
+ quick:A <2> brown:C                 |     1 | same    | same   | 
+ quick <-> (brown <-> fox)           |     0 | same    | same   | 
+ quick <2> (brown <3> fox)           |     1 | same    | same   | 
+ (quick <2> brown) <-> (fox <0> fox) |     3 | same    | same   | 
+ (quick <0> quick) <2> fox           |    18 | same    | same   | 
+ quick <-> (brown <-> (fox <-> dog)) |     0 | same    | same   | 
+ !(quick <2> brown)                  |   187 | same    | same   | 
+ quick <2> brown | dog <0> dog       |   133 | same    | same   | 
+ quick <2> brown & !fox              |     5 | same    | same   | 
+ quick <-> (brown | fox)             |    29 | refused |        | cannot convert tsquery to wquery: &, | or ! inside a phrase
+ quick <-> (brown & fox)             |     0 | refused |        | cannot convert tsquery to wquery: &, | or ! inside a phrase
+ quick <-> !brown                    |   105 | refused |        | cannot convert tsquery to wquery: &, | or ! inside a phrase
+ fo:* <-> dog                        |    35 | refused |        | cannot convert tsquery to wquery: a prefix lexeme inside a phrase
+ quick <-> fo:*                      |    29 | refused |        | cannot convert tsquery to wquery: a prefix lexeme inside a phrase
+ !fox                                |    87 | same    | same   | 
+ !fox & !dog                         |    33 | same    | same   | 
+ !(fox | dog)                        |    33 | same    | same   | 
+ !!fox                               |   113 | same    | same   | 
+ fox & !dog:A                        |    92 | same    | same   | 
+ zzz                                 |     0 | same    | same   | 
+ !zzz                                |   200 | same    | same   | 
+                                     |     0 | same    | same   | 
+(53 rows)
 
 -- ---- randomized -----------------------------------------------------------
 CREATE FUNCTION pg_temp.rq(depth int) RETURNS text LANGUAGE plpgsql VOLATILE AS $$
@@ -412,17 +434,16 @@ SELECT count(*) AS queries,
   FROM rres;
  queries | same | different | refused | same_nonempty 
 ---------+------+-----------+---------+---------------
-     400 |  160 |         0 |     240 |           159
+     400 |  182 |         0 |     218 |           173
 (1 row)
 
 SELECT refused, count(*) FROM rres WHERE refused IS NOT NULL GROUP BY 1 ORDER BY 1;
-                                      refused                                      | count 
------------------------------------------------------------------------------------+-------
- cannot convert tsquery to wquery: &, | or ! inside a phrase                       |   113
- cannot convert tsquery to wquery: a phrase that is not a left-nested chain of <-> |    46
- cannot convert tsquery to wquery: a prefix lexeme inside a phrase                 |    46
- cannot convert tsquery to wquery: a prefix lexeme with a weight restriction       |    35
-(4 rows)
+                                   refused                                   | count 
+-----------------------------------------------------------------------------+-------
+ cannot convert tsquery to wquery: &, | or ! inside a phrase                 |   128
+ cannot convert tsquery to wquery: a prefix lexeme inside a phrase           |    51
+ cannot convert tsquery to wquery: a prefix lexeme with a weight restriction |    39
+(3 rows)
 
 -- the disagreements, if any (none)
 SELECT i, q, core, weave, ix_ok FROM rres
@@ -439,34 +460,145 @@ SELECT ranked, count(*),
   FROM rres WHERE refused IS NULL GROUP BY 1 ORDER BY 1;
  ranked | count | without_prefix_or_not 
 --------+-------+-----------------------
- same   |   160 |                   119
+ same   |   182 |                   133
 (1 row)
 
 -- coverage: the converted set exercises each feature at least once
 SELECT count(*) FILTER (WHERE q ~ ':[A-D]+') AS weighted,
 	   count(*) FILTER (WHERE q ~ ':\*') AS prefixed,
 	   count(*) FILTER (WHERE q ~ '<->') AS phrased,
+	   count(*) FILTER (WHERE q ~ '<[0-9]+>') AS exact_gap,
 	   count(*) FILTER (WHERE q ~ '!') AS negated
   FROM rres WHERE refused IS NULL;
- weighted | prefixed | phrased | negated 
-----------+----------+---------+---------
-       55 |       23 |      11 |      20
+ weighted | prefixed | phrased | exact_gap | negated 
+----------+----------+---------+-----------+---------
+       72 |       24 |      21 |        20 |      27
 (1 row)
 
--- the text form of each mapped shape
+-- the text form of each mapped shape; an exact gap prints as core does
 SELECT q, q::tsquery::wquery::text AS wquery
   FROM (VALUES ('fox:A'), ('fox:BD'), ('fox:ABCD'), ('fo:*'), ('!fox:C'),
-			   ('quick <-> brown <-> fox'), ('fox:A & (dog | la:*)')) v(q);
-            q            |              wquery               
--------------------------+-----------------------------------
- fox:A                   | 'fox':A
- fox:BD                  | 'fox':BD
- fox:ABCD                | 'fox'
- fo:*                    | 'fo'*
- !fox:C                  | !'fox':C
- quick <-> brown <-> fox | (('quick' <-> 'brown') <-> 'fox')
- fox:A & (dog | la:*)    | ('fox':A & ('dog' | 'la'*))
-(7 rows)
+			   ('quick <-> brown <-> fox'), ('fox:A & (dog | la:*)'),
+			   ('quick <0> brown'), ('quick <3> brown'), ('quick <-> (brown <2> fox)'),
+			   ('(quick <2> brown) <0> (fox <-> dog)')) v(q);
+                  q                  |                    wquery                     
+-------------------------------------+-----------------------------------------------
+ fox:A                               | 'fox':A
+ fox:BD                              | 'fox':BD
+ fox:ABCD                            | 'fox'
+ fo:*                                | 'fo'*
+ !fox:C                              | !'fox':C
+ quick <-> brown <-> fox             | (('quick' <-> 'brown') <-> 'fox')
+ fox:A & (dog | la:*)                | ('fox':A & ('dog' | 'la'*))
+ quick <0> brown                     | ('quick' <0> 'brown')
+ quick <3> brown                     | ('quick' <3> 'brown')
+ quick <-> (brown <2> fox)           | ('quick' <-> ('brown' <2> 'fox'))
+ (quick <2> brown) <0> (fox <-> dog) | (('quick' <2> 'brown') <0> ('fox' <-> 'dog'))
+(11 rows)
+
+-- phraseto_tsquery: a stopword leaves a gap, which core spells <N>
+SELECT p, doc, phraseto_tsquery('english', p)::text AS tsquery,
+	   phraseto_tsquery('english', p)::wquery::text AS wquery,
+	   to_tsvector('english', doc) @@ phraseto_tsquery('english', p) AS core,
+	   to_wdoc(to_tsvector('english', doc)) @@@ phraseto_tsquery('english', p)::wquery AS weave
+  FROM (VALUES ('cat in the hat'), ('the cat in the hat'), ('cat hat'), ('cat in hat')) v(p),
+	   (VALUES ('the cat in the hat sat'), ('a cat hat'), ('cat in a hat'),
+			   ('cat in the big hat')) t(doc)
+ ORDER BY 1, 2;
+         p          |          doc           |     tsquery     |      wquery       | core | weave 
+--------------------+------------------------+-----------------+-------------------+------+-------
+ cat hat            | a cat hat              | 'cat' <-> 'hat' | ('cat' <-> 'hat') | t    | t
+ cat hat            | cat in a hat           | 'cat' <-> 'hat' | ('cat' <-> 'hat') | f    | f
+ cat hat            | cat in the big hat     | 'cat' <-> 'hat' | ('cat' <-> 'hat') | f    | f
+ cat hat            | the cat in the hat sat | 'cat' <-> 'hat' | ('cat' <-> 'hat') | f    | f
+ cat in hat         | a cat hat              | 'cat' <2> 'hat' | ('cat' <2> 'hat') | f    | f
+ cat in hat         | cat in a hat           | 'cat' <2> 'hat' | ('cat' <2> 'hat') | f    | f
+ cat in hat         | cat in the big hat     | 'cat' <2> 'hat' | ('cat' <2> 'hat') | f    | f
+ cat in hat         | the cat in the hat sat | 'cat' <2> 'hat' | ('cat' <2> 'hat') | f    | f
+ cat in the hat     | a cat hat              | 'cat' <3> 'hat' | ('cat' <3> 'hat') | f    | f
+ cat in the hat     | cat in a hat           | 'cat' <3> 'hat' | ('cat' <3> 'hat') | t    | t
+ cat in the hat     | cat in the big hat     | 'cat' <3> 'hat' | ('cat' <3> 'hat') | f    | f
+ cat in the hat     | the cat in the hat sat | 'cat' <3> 'hat' | ('cat' <3> 'hat') | t    | t
+ the cat in the hat | a cat hat              | 'cat' <3> 'hat' | ('cat' <3> 'hat') | f    | f
+ the cat in the hat | cat in a hat           | 'cat' <3> 'hat' | ('cat' <3> 'hat') | t    | t
+ the cat in the hat | cat in the big hat     | 'cat' <3> 'hat' | ('cat' <3> 'hat') | f    | f
+ the cat in the hat | the cat in the hat sat | 'cat' <3> 'hat' | ('cat' <3> 'hat') | t    | t
+(16 rows)
+
+-- <0> where it can match: two lexemes at one position (what an ispell or
+-- thesaurus dictionary produces; a 'simple' tsvector never does).  Core, the
+-- heap, and the three index arms (positions = on answers a pure chain from the
+-- postings) must agree.
+CREATE TEMP TABLE tz (id int, tsv tsvector);
+INSERT INTO tz VALUES (1, 'quick:1 brown:1 fox:2'), (2, 'quick:1 brown:2 fox:3'),
+	(3, 'quick:1,3 brown:3 fox:4 dog:4'), (4, 'brown:1 quick:2 fox:2'),
+	(5, 'quick:5 brown:5 fox:7 dog:9'), (6, 'fox:1 dog:1 quick:3 brown:3');
+CREATE INDEX tz_tsv ON tz USING weave (tsv tsvector_lex_ops);
+CREATE INDEX tz_expr ON tz USING weave (to_wdoc(tsv));
+CREATE INDEX tz_pos ON tz USING weave (to_wdoc(tsv)) WITH (positions = on);
+SELECT q, (SELECT array_agg(id ORDER BY id) FROM tz WHERE tsv @@ q::tsquery) AS core,
+	   (SELECT array_agg(id ORDER BY id) FROM tz WHERE to_wdoc(tsv) @@@ q::tsquery::wquery) AS heap,
+	   weave_count('tz_tsv', q::tsquery::wquery) AS ix_tsv,
+	   weave_count('tz_expr', q::tsquery::wquery) AS ix_expr,
+	   weave_count('tz_pos', q::tsquery::wquery) AS ix_pos
+  FROM (VALUES ('quick <0> brown'), ('brown <0> quick'), ('fox <0> dog'),
+			   ('(quick <0> brown) <-> fox'), ('quick <-> (fox <0> dog)'),
+			   ('(fox <0> dog) <2> (quick <0> brown)'), ('quick <0> brown <2> dog'),
+			   ('quick <2> fox'), ('quick <-> fox')) v(q);
+                  q                  |   core    |   heap    | ix_tsv | ix_expr | ix_pos 
+-------------------------------------+-----------+-----------+--------+---------+--------
+ quick <0> brown                     | {1,3,5,6} | {1,3,5,6} |      4 |       4 |      4
+ brown <0> quick                     | {1,3,5,6} | {1,3,5,6} |      4 |       4 |      4
+ fox <0> dog                         | {3,6}     | {3,6}     |      2 |       2 |      2
+ (quick <0> brown) <-> fox           | {1,3}     | {1,3}     |      2 |       2 |      2
+ quick <-> (fox <0> dog)             | {3}       | {3}       |      1 |       1 |      1
+ (fox <0> dog) <2> (quick <0> brown) | {6}       | {6}       |      1 |       1 |      1
+ quick <0> brown <2> dog             |           |           |      0 |       0 |      0
+ quick <2> fox                       | {2,5}     | {2,5}     |      2 |       2 |      2
+ quick <-> fox                       | {1,3}     | {1,3}     |      2 |       2 |      2
+(9 rows)
+
+-- the binary form keeps the exact-gap flag: through COPY (FORMAT binary) and
+-- back (wquery_send -> wquery_recv) the value has the same bytes and the
+-- received one answers like core.  Per-backend file name (G60).
+CREATE TEMP TABLE wqa (id int, q text, w wquery);
+CREATE TEMP TABLE wqb (id int, w wquery);
+INSERT INTO wqa SELECT i, q, q::tsquery::wquery
+  FROM unnest(ARRAY['quick <0> brown', 'quick <2> brown', 'quick <-> (brown <2> fox)',
+					'(quick <2> brown) <-> fox', 'fox <0> fox']) WITH ORDINALITY u(q, i);
+SELECT '/tmp/pg_weave_wq_rt_' || pg_backend_pid() || '.bin' AS wqfile \gset
+COPY (SELECT id, w FROM wqa) TO :'wqfile' WITH (FORMAT binary);
+COPY wqb FROM :'wqfile' WITH (FORMAT binary);
+SELECT a.q, wquery_send(b.w) = wquery_send(a.w) AS binary_same, b.w::text AS received,
+	   (SELECT count(*) FROM tc WHERE to_wdoc(tsv) @@@ b.w) AS recv_rows,
+	   (SELECT count(*) FROM tc WHERE tsv @@ a.q::tsquery) AS core_rows
+  FROM wqa a JOIN wqb b USING (id) ORDER BY id;
+             q             | binary_same |             received              | recv_rows | core_rows 
+---------------------------+-------------+-----------------------------------+-----------+-----------
+ quick <0> brown           | t           | ('quick' <0> 'brown')             |         0 |         0
+ quick <2> brown           | t           | ('quick' <2> 'brown')             |        13 |        13
+ quick <-> (brown <2> fox) | t           | ('quick' <-> ('brown' <2> 'fox')) |         1 |         1
+ (quick <2> brown) <-> fox | t           | (('quick' <2> 'brown') <-> 'fox') |         3 |         3
+ fox <0> fox               | t           | ('fox' <0> 'fox')                 |       113 |       113
+(5 rows)
+
+-- PRE-EXISTING, recorded not fixed: wquery_out's text does not parse back.
+-- wquery_in reads '<' and '>' as separators and the '-' of '<->' as NOT, and
+-- drops a suffix after a quoted term, so each rendering below re-parses to a
+-- different query.  (Binary send/recv above is exact.)
+SELECT w::text AS rendered, w::text::wquery::text AS reparsed,
+	   w::text::wquery::text = w::text AS round_trips
+  FROM (VALUES ('quick <-> brown'::tsquery::wquery), ('quick <2> brown'::tsquery::wquery),
+			   ('fo:*'::tsquery::wquery), ('fox:A'::tsquery::wquery),
+			   ('"quick brown"'::wquery)) v(w);
+       rendered        |          reparsed           | round_trips 
+-----------------------+-----------------------------+-------------
+ ('quick' <-> 'brown') | ('quick' & !'brown')        | f
+ ('quick' <2> 'brown') | (('quick' & '2') & 'brown') | f
+ 'fo'*                 | 'fo'                        | f
+ 'fox':A               | ('fox' & 'a')               | f
+ ('quick' <-> 'brown') | ('quick' & !'brown')        | f
+(5 rows)
 
 -- the ranked arm really is an index scan with the ranking pass
 SET enable_seqscan = off;
