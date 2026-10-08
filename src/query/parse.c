@@ -1022,6 +1022,12 @@ to_wquery_byid(PG_FUNCTION_ARGS)
  * the phrase operator prints as ` <-> `, which the query lexer does not accept
  * as input -- the rendering is human-readable, not a guaranteed round-trip.)
  * Postfix RPN is walked with a small string stack.
+ *
+ * An exact-gap phrase (WEAVE_QF_PHRASE_EXACT, from the tsquery cast) prints in
+ * tsquery's spelling, `<->` for N = 1 and `<N>` otherwise, so its text reads as
+ * the tsquery it came from.  N is recovered from the stored end-to-end gap by
+ * subtracting the right operand's width, tracked on a parallel stack exactly as
+ * migrate.c computes it (core's TS_phrase_execute).
  */
 Datum
 wquery_out(PG_FUNCTION_ARGS)
@@ -1029,6 +1035,7 @@ wquery_out(PG_FUNCTION_ARGS)
 	WeaveQuery	q = PG_GETARG_WQUERY(0);
 	WeaveQueryItem *items = q->items;
 	StringInfoData *stack;
+	int64	   *width;			/* core's phrase width of each stack entry */
 	int			top = 0;
 	uint32		i;
 	StringInfoData result;
@@ -1040,6 +1047,7 @@ wquery_out(PG_FUNCTION_ARGS)
 	}
 
 	stack = (StringInfoData *) palloc(q->nitems * sizeof(StringInfoData));
+	width = (int64 *) palloc0(q->nitems * sizeof(int64));
 
 	for (i = 0; i < q->nitems; i++)
 	{
@@ -1057,6 +1065,7 @@ wquery_out(PG_FUNCTION_ARGS)
 				appendStringInfoChar(&s, '/');
 				appendBinaryStringInfo(&s, t, it->termlen);
 				appendStringInfoChar(&s, '/');
+				width[top] = 0;
 				stack[top++] = s;
 				continue;
 			}
@@ -1081,6 +1090,7 @@ wquery_out(PG_FUNCTION_ARGS)
 				if (it->distance & (1u << 1)) appendStringInfoChar(&s, 'C');
 				if (it->distance & (1u << 0)) appendStringInfoChar(&s, 'D');
 			}
+			width[top] = 0;
 			stack[top++] = s;
 		}
 		else if (it->op == WEAVE_OP_NOT)
@@ -1099,7 +1109,11 @@ wquery_out(PG_FUNCTION_ARGS)
 		{
 			StringInfoData s;
 			const char *opstr;
+			char		gapbuf[32];
+			int64		w;
 
+			Assert(top >= 2);
+			w = Max(width[top - 2], width[top - 1]);	/* AND / OR */
 			switch (it->op)
 			{
 				case WEAVE_OP_AND:
@@ -1111,9 +1125,21 @@ wquery_out(PG_FUNCTION_ARGS)
 				case WEAVE_OP_PHRASE:
 				default:
 					opstr = " <-> ";
+					if (it->flags & WEAVE_QF_PHRASE_EXACT)
+					{
+						int64		n = (int64) it->distance - width[top - 1];
+
+						if (n != 1)
+						{
+							snprintf(gapbuf, sizeof(gapbuf), " <" INT64_FORMAT "> ", n);
+							opstr = gapbuf;
+						}
+						w = (int64) it->distance + width[top - 2];
+					}
+					else
+						w = (int64) it->distance + width[top - 2] + width[top - 1];
 					break;
 			}
-			Assert(top >= 2);
 			initStringInfo(&s);
 			appendStringInfoChar(&s, '(');
 			appendBinaryStringInfo(&s, stack[top - 2].data,
@@ -1125,6 +1151,7 @@ wquery_out(PG_FUNCTION_ARGS)
 			pfree(stack[top - 1].data);
 			pfree(stack[top - 2].data);
 			top -= 2;
+			width[top] = w;
 			stack[top++] = s;
 		}
 	}
