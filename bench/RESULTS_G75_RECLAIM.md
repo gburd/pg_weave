@@ -258,3 +258,12 @@ same commit. The next design must keep the shortfall pass `t/028` needs. Growth 
 fixable without touching the trigger (the `burn` arm's insight, or deferring the free
 stamp), but fix 2 alone failed `t/028` 3 of 10, so any such fix must be A/B'd against
 `t/028` at 10 runs per arm.
+
+### The reverted tip's smoke (`pgweave-20261008-112936-cfcd`, `90ff1d0`)
+
+C code identical to the merge base `98de6dd` except comments. `make installcheck`: exit 0,
+`regression.diffs` empty, lint gates PASS, 34 TAP files / 1,254 tests, "All tests
+successful". `t/033`'s bound is back to `not ok 26 ... # TODO` with excess
+`142 255 255 1002 255 216 255 255 2626 5299 7972`, which is main's sequence from cycle 8
+to the page (`pgweave-20261006-202448-495c`). `t/028`'s control: `ok 113 - quiet plain
+VACUUM still truncates the index (3495 -> 230 blocks)`.
