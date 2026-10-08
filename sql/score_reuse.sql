@@ -491,42 +491,62 @@ RESET pg_weave.reuse_distance;
 RESET track_functions;
 
 -- 9g. Clobbering.  A correlated subquery in the scan's Filter runs a second
--- ordering scan after every outer fetch and before the hidden key is evaluated.
--- `i.id = sf.id` makes the inner scan stop ON THE OUTER'S ROW, so index and TID
--- match and only the keys (or the route) tell the two publications apart:
--- (1) a fused scan on the same index with OTHER weights, on the same row;
--- (2) the same fused scan, same keys, on another row (only the TID differs);
--- (3) a lexical scan on the same index and row whose query is the outer's first
---     channel's; and (4) the reverse, a lexical outer with a fused inner on its
---     row, whose WHERE `@@@` query IS the outer's query -- a fused scan carries
---     that in so->query, so only the route check keeps the lexical lookup off it.
--- The outer WITH TIES set must stay the reference's in every case.
+-- ordering scan after every outer fetch and before the outer row is projected,
+-- and that scan stays open (its entry stays live) until the statement ends.  The
+-- outer row reads its own value in its projection, which is the lookup the hidden
+-- key makes; a WITH TIES count would not show a clobber here, because the inner
+-- value of a row is a function of the same tie group as the outer's.
+--   A. a fused scan, same index, OTHER weights, stopped ON THE OUTER'S ROW, so
+--      index and TID match and only the keys differ;
+--   B. the same fused scan (same keys) on another row: only the TID differs;
+--   C. a lexical scan, same index and row, whose query is the outer's first
+--      channel's: only the route differs;
+--   D. the reverse: a lexical outer and a fused inner on its row whose WHERE `@@@`
+--      query IS the outer's query.  A fused scan carries that in so->query, so
+--      only the route check keeps weave_current_distance() off it.
 CREATE TEMP TABLE sfx AS
   SELECT l.id, 1.0 / (1.0 + s.score) AS dist
   FROM weave_search('sf_w', 'alpha', 5000) s JOIN sf l ON l.ctid = s.ctid;
 SET pg_weave.fuse_normalize = off;
-SELECT (SELECT count(*) FROM (SELECT id FROM sf
-          WHERE (SELECT i.id FROM sf i WHERE i.id = sf.id
-                 ORDER BY fuse(i.d <=> 'alpha', i.d <=> 'beta', weights => '{2,1}') LIMIT 1) > 0
-          ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') FETCH FIRST 5 ROWS WITH TIES) s)
-       = (SELECT ref FROM sf_ties(false, 5) WHERE shape = 'll') AS other_weights_clobber_ok,
-       (SELECT count(*) FROM (SELECT id FROM sf
-          WHERE (SELECT i.id FROM sf i ORDER BY fuse(i.d <=> 'alpha', i.d <=> 'beta', weights => '{1,2}')
-                 LIMIT 1 OFFSET 900 + sf.id % 7) > 0
-          ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') FETCH FIRST 5 ROWS WITH TIES) s)
-       = (SELECT ref FROM sf_ties(false, 5) WHERE shape = 'll') AS same_keys_clobber_ok,
-       (SELECT count(*) FROM (SELECT id FROM sf
-          WHERE (SELECT i.id FROM sf i WHERE i.d @@@ 'alpha' AND i.id = sf.id
-                 ORDER BY i.d <=> 'alpha' LIMIT 1) > 0
-          ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') FETCH FIRST 5 ROWS WITH TIES) s)
-       = (SELECT ref FROM sf_ties(false, 5) WHERE shape = 'll') AS lexical_inner_clobber_ok,
-       (SELECT count(*) FROM (SELECT id FROM sf
-          WHERE d @@@ 'alpha'
-            AND (SELECT i.id FROM sf i WHERE i.d @@@ 'alpha' AND i.id = sf.id
-                 ORDER BY fuse(i.d <=> 'alpha', i.d <=> 'beta') LIMIT 1) > 0
-          ORDER BY d <=> 'alpha' FETCH FIRST 5 ROWS WITH TIES) s)
-       = (SELECT count(*) FROM sfx WHERE dist <= (SELECT dist FROM sfx ORDER BY dist LIMIT 1 OFFSET 4))
-         AS fused_inner_clobber_ok;
+EXPLAIN (COSTS OFF)
+  SELECT id, weave_current_fused_distance('sf_w', ctid, 'alpha'::wquery, 'beta'::wquery, '{1,2}'::real[])
+    FROM sf
+   WHERE (SELECT i.id FROM sf i WHERE i.id = sf.id
+          ORDER BY fuse(i.d <=> 'alpha', i.d <=> 'beta', weights => '{2,1}') LIMIT 1) > 0
+   ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') LIMIT 30;
+CREATE FUNCTION sf_clob(inner_sql text) RETURNS TABLE (n bigint, wrong bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE format($q$
+    SELECT count(*), count(*) FILTER (WHERE s.cur IS NULL OR abs(s.cur - e.dist) > 1e-9 * abs(e.dist))
+      FROM (SELECT id, weave_current_fused_distance('sf_w', ctid, 'alpha'::wquery, 'beta'::wquery,
+                                                    '{1,2}'::real[]) AS cur
+              FROM sf WHERE (%s) > 0
+             ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') LIMIT 30) s
+      JOIN fex e ON e.id = s.id AND NOT e.norm AND e.shape = 'll' $q$, inner_sql);
+END $$;
+SELECT 'A other weights, same row' AS clobber, * FROM sf_clob($$SELECT i.id FROM sf i WHERE i.id = sf.id
+          ORDER BY fuse(i.d <=> 'alpha', i.d <=> 'beta', weights => '{2,1}') LIMIT 1$$)
+UNION ALL
+SELECT 'B same keys, other row', * FROM sf_clob($$SELECT i.id FROM sf i
+          ORDER BY fuse(i.d <=> 'alpha', i.d <=> 'beta', weights => '{1,2}') LIMIT 1 OFFSET 900 + sf.id % 7$$)
+UNION ALL
+SELECT 'C lexical, same row', * FROM sf_clob($$SELECT i.id FROM sf i WHERE i.d @@@ 'alpha' AND i.id = sf.id
+          ORDER BY i.d <=> 'alpha' LIMIT 1$$);
+EXPLAIN (COSTS OFF)
+  SELECT id, weave_current_distance('sf_w', ctid, 'alpha') FROM sf
+   WHERE d @@@ 'alpha'
+     AND (SELECT i.id FROM sf i WHERE i.d @@@ 'alpha' AND i.id = sf.id
+          ORDER BY fuse(i.d <=> 'alpha', i.d <=> 'beta') LIMIT 1) > 0
+   ORDER BY d <=> 'alpha' LIMIT 30;
+SELECT 'D fused inner, lexical outer' AS clobber, count(*) AS n,
+       count(*) FILTER (WHERE s.cur IS NULL OR abs(s.cur - x.dist) > 1e-9 * x.dist) AS wrong
+  FROM (SELECT id, weave_current_distance('sf_w', ctid, 'alpha') AS cur FROM sf
+         WHERE d @@@ 'alpha'
+           AND (SELECT i.id FROM sf i WHERE i.d @@@ 'alpha' AND i.id = sf.id
+                ORDER BY fuse(i.d <=> 'alpha', i.d <=> 'beta') LIMIT 1) > 0
+         ORDER BY d <=> 'alpha' LIMIT 30) s
+  JOIN sfx x USING (id);
 RESET pg_weave.fuse_normalize;
 
 -- 9h. Only the library's C function is planted (as in 8).
@@ -553,5 +573,6 @@ DROP FUNCTION sf_ref(bool);
 DROP FUNCTION sf_cur(bool);
 DROP FUNCTION sf_ties(bool, int);
 DROP FUNCTION sf_calls();
+DROP FUNCTION sf_clob(text);
 DROP FUNCTION sfd_cur(tid);
 DROP TABLE sr, sr2, sr_pt, sr_v, sf, sfd;
