@@ -12,7 +12,7 @@ mkdir -p $OUT
 PGC=/usr/lib/postgresql/17/bin/pg_config
 LIB=$($PGC --pkglibdir)
 SRC=$HOME/pg_weave
-ARMS="${ARMS:-base}"
+ARMS="${ARMS:-base trig_pages trig_reusable trig_off}"
 L22N="${L22N:-2}"
 TESTS="${TESTS:-t/033_reclaim_crash_loop.pl}"
 log() { echo "$(date +%T) $*" | tee -a $OUT/l22.log; }
