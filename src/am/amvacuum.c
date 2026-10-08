@@ -482,8 +482,41 @@ weave_index_is_compacted(Relation index)
 			if (meta.segs[i].dictstart != InvalidBlockNumber)
 				nlive++;
 	}
+	/*
+	 * Several bolts: a pass would coalesce them, so terms (1) and (3) do not apply.
+	 * Term (4) does, and skipping it here is what made an APPEND-ONLY index rewrite
+	 * itself on every plain VACUUM (task L22, bench/RESULTS_G75_RECLAIM.md "Round
+	 * 2").  Measured at 1M rows, no deletes, no crash: once a level merge has left
+	 * a large bolt high in the file with its write-before-free pool below it, every
+	 * later cleanup sees two bolts (that one and the cycle's flush), the trigger
+	 * fires on the pool, and the share-lock pass packs ~30k free pages, EXTENDS the
+	 * other ~40k (its own frees are not recyclable in its own transaction), and
+	 * frees the old copy -- so the next cleanup meets the same layout.  2.0x a
+	 * fresh build, permanently, and 350-1,300 s per VACUUM against 1-2 s.  The
+	 * prediction says exactly that before the pass: FREE < LIVE.
+	 *
+	 * Same conditions as term (4) below, and for the same reasons; in particular
+	 * a tombstone-bearing index keeps the pass, which is the one t/028's
+	 * post-DELETE truncation needs.  Giving up the coalesce is safe: the leveled
+	 * merge earlier in the cleanup already bounds the bolt count, and
+	 * weave_vacuum() (AccessExclusiveLock) still compacts to one.
+	 *
+	 * ponytail: the prediction counts the bolts' pages as they are, but a merge's
+	 * output can be smaller than its inputs (shared terms), which errs toward
+	 * skipping.  Exact would need the merged size; nothing measured it mattering.
+	 */
 	if (nlive > 1)
+	{
+		if (!CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&
+			weave_tombstone_frac(index) == 0.0 &&
+			!weave_pack_would_shrink(index, nblocks))
+		{
+			elog(DEBUG2, "pg_weave: index \"%s\": %u bolts, no tombstones, a pack would not shrink %u pages: no pass",
+				 RelationGetRelationName(index), nlive, nblocks);
+			return true;
+		}
 		return false;				/* multiple segments: pack must coalesce */
+	}
 
 	/*
 	 * (3) tombstone load.  Above the threshold a rewrite has real work to do
@@ -771,6 +804,8 @@ weave_vacuum_compact(Relation index)
 		if (!CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&
 			!weave_any_free_page_recyclable(index))
 		{
+			elog(DEBUG2, "pg_weave: index \"%s\": no free page recyclable yet: no pass",
+				 RelationGetRelationName(index));
 			nblocks = weave_truncate_free_tail(index);
 			if (nblocks < prevblocks)
 				didwork = true;
@@ -1269,6 +1304,10 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 					if (GetRecordedFreeSpace(info->index, b) >= BLCKSZ / 2)
 						freeblks++;
 				/* reclaim when >= 25% of the file is free (bloated after merges) */
+				elog(DEBUG2, "pg_weave: index \"%s\": cleanup trigger: %u pages, %u free, tombstone fraction %.3f: %s",
+					 RelationGetRelationName(info->index), nblocks, freeblks,
+					 weave_tombstone_frac(info->index),
+					 (nblocks > 16 && freeblks > nblocks / 4) ? "compaction" : "no compaction");
 				if (nblocks > 16 && freeblks > nblocks / 4)
 					(void) weave_vacuum_compact(info->index);
 			}

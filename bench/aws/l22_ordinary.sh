@@ -122,5 +122,34 @@ for r in $RUNS; do
 	echo "SUMMARY $r excess/ref per cycle:$ex"
 done | tee $OUT/summary.log
 grep -c "DONE" $OUT/*.log | tee -a $OUT/summary.log
+
+# GROWTH-1 ASSERTION on arm c (task L22 round 2): from cycle ASSERT_FROM (the first
+# cleanup after the 8-bolt level merge) every append-only VACUUM is cheap, the index
+# stays within C_RATIO of a fresh build, and its excess stops growing.  Before the fix
+# cycle 9 alone took 350 s and reached 2.03x (pgweave-20261008-160908-2708).
+fail=0
+AF=${ASSERT_FROM:-9}
+for r in $RUNS; do
+	[ ${r:0:1} = c ] || continue
+	e0=; el=; fl=; bad=
+	for c in $(seq $AF $CYC); do
+		line=$(grep "OWL $r cycle $c:" $OUT/$r.log)
+		[ -n "$line" ] || { bad="$bad cycle$c:missing"; continue; }
+		p=$(echo "$line" | grep -o ' pages=[0-9]*' | cut -d= -f2)
+		s=$(echo "$line" | grep -o ' secs=[0-9]*' | cut -d= -f2)
+		f=$(grep -o "REF c cycle $c: pages=[0-9]*" $OUT/ref.log | grep -o '[0-9]*$')
+		[ -n "$f" ] || { bad="$bad cycle$c:noref"; continue; }
+		[ "$s" -le ${C_SECS:-120} ] || bad="$bad cycle$c:secs=$s"
+		awk -v p=$p -v f=$f -v m=${C_RATIO:-1.6} 'BEGIN { exit !(p <= f * m) }' || bad="$bad cycle$c:ratio=$p/$f"
+		[ -n "$e0" ] || e0=$((p - f))
+		el=$((p - f)); fl=$f
+	done
+	if [ -n "$el" ] && [ $((el - e0)) -gt $((fl / 50 + 64)) ]; then
+		bad="$bad growth=$((el - e0))>$((fl / 50 + 64))"
+	fi
+	if [ -z "$bad" ]; then echo "ASSERT $r PASS (cycles $AF..$CYC, excess $e0 -> $el)"
+	else echo "ASSERT $r FAIL:$bad"; fi
+done | tee -a $OUT/summary.log
+grep -q '^ASSERT .* FAIL' $OUT/summary.log && fail=1
 rm -rf $ROOT
-exit 0
+exit $fail

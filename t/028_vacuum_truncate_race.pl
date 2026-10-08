@@ -211,6 +211,11 @@ for my $v (1 .. 3)
 		"SET client_min_messages = debug2;\nSELECT weave_alloc_stats_reset();\nVACUUM t;\n"
 		. "SELECT 'alloc ' || weave_alloc_stats()::text;");
 	my ($rline) = $verr =~ /(reclaimed \d+ stranded.*?ms)/;
+	# task L22: the cleanup trigger's inputs and decision, and a declined pass
+	my ($tline) = $verr =~ /(cleanup trigger: [^\n]*)/;
+	my ($nline) = $verr =~ /(\d+ bolts, no tombstones[^\n]*|no free page recyclable yet[^\n]*)/;
+	$rline = ($rline // 'no reclaim line') . '; ' . ($tline // 'no trigger line')
+	  . ($nline ? "; $nline" : '');
 	my ($aline) = $vout =~ /(alloc .*)/;
 	push @trail, "after VACUUM $v: " . $node->safe_psql('postgres', $state_sql)
 	  . '; ' . ($rline // 'no reclaim line') . '; ' . ($aline // 'no alloc stats');
