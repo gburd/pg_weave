@@ -140,7 +140,7 @@ CREATE TABLE lt (id int, d wdoc) WITH (autovacuum_enabled = off);
 INSERT INTO lt SELECT g, to_wdoc('simple', concat_ws(' ',
    CASE WHEN g % 10 = 0 THEN 'w1' END, CASE WHEN g % 2 = 0 THEN 'w2' END,
    CASE WHEN g % 500 = 3 THEN 'rare' END,
-   (SELECT string_agg('f' || ((g * 7919 + i * 104729) % 50000), ' ') FROM generate_series(1, 8) i)))
+   (SELECT string_agg('f' || ((g::int8 * 7919 + i * 104729) % 50000), ' ') FROM generate_series(1, 8) i)))
   FROM generate_series(1, $n) g;
 CREATE INDEX lt_w ON lt USING weave (d);
 VACUUM ANALYZE lt;
