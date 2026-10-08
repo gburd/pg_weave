@@ -342,10 +342,9 @@ END $$;
 SELECT * FROM sf_cur(true) UNION ALL SELECT * FROM sf_cur(false);
 
 -- 9d. The sort key's readers, against the reference, in both modes.  WITH TIES
--- keeps every row tied with the k-th ON THE KEY: with the scan's values that is
--- the reference's tie group; with the operator's (reuse off) it is a different
--- set, because the N = 1 values tie differently.  A cursor fetched row by row and
--- a nested-loop rescan (a different query vector per outer row) read it too.
+-- keeps every row tied with the k-th ON THE KEY, which with the scan's values is
+-- the reference's tie group.  A cursor fetched row by row and a nested-loop rescan
+-- (a different query vector per outer row) read it too.
 CREATE FUNCTION sf_ties(norm bool, k int) RETURNS TABLE (shape text, got bigint, ref bigint, outside bigint)
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -370,13 +369,25 @@ END $$;
 SELECT 'norm' AS mode, * FROM sf_ties(true, 5)
 UNION ALL SELECT 'raw', * FROM sf_ties(false, 5)
 UNION ALL SELECT 'raw k=40', * FROM sf_ties(false, 40);
--- the control, at top level (a plpgsql function would keep its cached plan
--- across a GUC change): with reuse off the key is the operator's N = 1 value,
--- which depends on tf alone, so it ties far more rows than the reference's 'll'
-SET pg_weave.reuse_distance = off; SET pg_weave.fuse_normalize = off;
-SELECT count(*) AS fused_with_ties_reuse_off
-  FROM (SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}')
-        FETCH FIRST 5 ROWS WITH TIES) s;
+-- THE CONTROL, which must be able to differ.  On 'alpha'/'beta' it cannot: the
+-- operator's N = 1 key happens to tie exactly the reference's 16 rows (measured;
+-- the first index group's successor has another tf).  So it runs on two terms of
+-- tf = 1, 'w3' and 'w5', which no row has both of: the operator gives EVERY
+-- matching row one value, while the index's length normalization gives several.
+-- With reuse off WITH TIES therefore returns every ranked row; with it on, the
+-- reference's tie group.  At top level, because a plpgsql function keeps its
+-- cached plan across a GUC change.
+SET pg_weave.fuse_normalize = off;
+CREATE TEMP TABLE fexw AS
+  SELECT -s.score AS dist FROM weave_fuse_search('sf_w', ARRAY['w3'::wquery, 'w5'], NULL, NULL, 5000) s;
+SELECT (SELECT count(*) FROM fexw) AS w_ranked,
+       (SELECT count(*) FROM fexw WHERE dist <= (SELECT dist FROM fexw ORDER BY dist LIMIT 1 OFFSET 4))
+         AS w_reference_with_ties,
+       (SELECT count(*) FROM (SELECT id FROM sf ORDER BY fuse(d <=> 'w3', d <=> 'w5')
+                              FETCH FIRST 5 ROWS WITH TIES) s) AS w_with_ties_on;
+SET pg_weave.reuse_distance = off;
+SELECT count(*) AS w_with_ties_off
+  FROM (SELECT id FROM sf ORDER BY fuse(d <=> 'w3', d <=> 'w5') FETCH FIRST 5 ROWS WITH TIES) s;
 RESET pg_weave.reuse_distance; RESET pg_weave.fuse_normalize;
 -- a cursor over a substituted WITH TIES plan, one row at a time
 BEGIN;
