@@ -6393,7 +6393,7 @@ every hand-written NOT test in the suite negated a plain term.
   segment is rechecked for those shapes. Feeding the leaf sets into `weave_eval_query()`
   instead would make them fast; not done here.
 
-**Still open, recorded rather than fixed: the ranked scan returns a SUBSET for a query
+**Still open, recorded rather than fixed, and now its own entry, G94: the ranked scan returns a SUBSET for a query
 with NOT.** `WHERE d @@@ '!fox' ORDER BY d <=> '!fox'` generates candidates only from the
 query's positive literal terms (WAND cursors), so a row that matches only through a NOT
 is never ranked, and the G56 padding phase is skipped because the restriction IS the
@@ -6414,4 +6414,25 @@ Gate: `sql/tsquery_cast.sql` -- 42 hand-written and 400 random tsqueries over on
 native fuzzy/regex-under-boolean queries, seqscan against both indexes. Mutants:
 `bench/aws/g93_mutants.sh` (M1-M10, each verified BUILT with an installed `.so` that
 differs from the clean one).
+
+### G94 — WRONG ANSWER: the ranked scan `WHERE d @@@ q ORDER BY d <=> q` returns a SUBSET when q contains a NOT (or a prefix) — **FOUND 2026-10-08 by G93's test; OPEN**
+
+Split out of G93 (see its "Still open" paragraph for the evidence). Candidates come only
+from q's positive literal terms (the WAND cursors), so a row that matches q only through a
+NOT is never ranked, and the G56 padding walk is skipped because `weave_pad_wanted()`
+assumes "the restriction IS the ORDER BY query, so no padding row could pass it", which is
+false when q has a NOT. Run `pgweave-20261008-021816-1bca`: 35 of 160 converted random
+queries came back short, every one with a prefix or a NOT; `!fox`, `!fox & !dog`,
+`!(fox | dog)`, `!zzz` and `!(quick <-> brown)` are all subsets. Prefix is the
+already-documented G1 risk; NOT is not documented anywhere. A user writing
+`WHERE body @@@ 'postgres & !mysql' ORDER BY body <=> 'postgres & !mysql' LIMIT 10` is fine
+(every match contains `postgres`), but `'!mysql'` alone, or `'postgres | !mysql'`, loses rows.
+
+Likely fix: when `ordSameQuery`/`ordQueryRestricts` holds and q has a NOT whose complement
+is not covered by a positive conjunct (the same coverage idea as G93's
+`weave_query_fr_covered()`), pad (`weave_pad_wanted()`), rechecking each padding row against
+q; rows matching only through the NOT then come after every ranked row at their own BM25
+distance... which is NOT their correct rank if they score above some ranked row. So a correct
+fix has to either score the padding rows and merge, or refuse to order such a query by index
+(the planner hook could decline). `sql/tsquery_cast.sql` pins today's behaviour.
 
