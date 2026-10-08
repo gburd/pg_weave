@@ -1379,6 +1379,16 @@ typedef struct EvalVal
 {
 	TidSet		set;
 	bool		negated;		/* true => set represents docs NOT to include */
+	/*
+	 * The entry is a SUPERSET of its exact answer, left for the heap recheck to
+	 * shrink: a weight-restricted leaf (postings carry no zone labels) and any
+	 * PHRASE (evaluated as AND).  AND and OR are monotone, so a superset in is
+	 * a superset out -- but NOT is not: the complement of a superset is a
+	 * SUBSET, and the recheck cannot restore the rows it lost (G93:
+	 * `!over:CD` and `!(quick <-> brown)` silently dropped rows).  So NOT of an
+	 * inexact entry is "every document", still inexact.
+	 */
+	bool		inexact;
 } EvalVal;
 
 /*
@@ -1525,12 +1535,21 @@ weave_eval_query(Relation index, const WeaveSegMeta *seg, WeaveQuery q,
 			}
 			stack[top].set = s;
 			stack[top].negated = false;
+			stack[top].inexact = (it->flags & WEAVE_QF_WEIGHTED) != 0;
 			top++;
 		}
 		else if (it->op == WEAVE_OP_NOT)
 		{
 			Assert(top >= 1);
-			stack[top - 1].negated = !stack[top - 1].negated;
+			if (stack[top - 1].inexact)
+			{
+				/* see EvalVal: the complement of the empty set is everything */
+				stack[top - 1].set.tids = NULL;
+				stack[top - 1].set.n = 0;
+				stack[top - 1].negated = true;
+			}
+			else
+				stack[top - 1].negated = !stack[top - 1].negated;
 		}
 		else					/* AND / OR */
 		{
@@ -1538,6 +1557,7 @@ weave_eval_query(Relation index, const WeaveSegMeta *seg, WeaveQuery q,
 			EvalVal		a = stack[--top];
 			EvalVal		res;
 
+			res.inexact = a.inexact || b.inexact || it->op == WEAVE_OP_PHRASE;
 			if (it->op == WEAVE_OP_AND || it->op == WEAVE_OP_PHRASE)
 			{
 				/* PHRASE is treated as AND for candidate generation; the
