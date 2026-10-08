@@ -31,24 +31,37 @@ END $$;
 SELECT count(*) AS docs, count(*) FILTER (WHERE tsv = strip(tsv) AND length(tsv) > 0) AS stripped
   FROM tc;
 
--- core's row set, the cast's row set, or the cast's refusal
-CREATE FUNCTION pg_temp.cmp(q text, OUT core int[], OUT weave int[], OUT refused text)
+-- the index arms: weave_count() enters the scan machinery directly, so it
+-- reaches the scan-side recheck rather than an executor recheck (AGENTS.md)
+CREATE INDEX tc_tsv ON tc USING weave (tsv tsvector_lex_ops);
+CREATE INDEX tc_expr ON tc USING weave (to_wdoc(tsv));
+
+-- core's row set, the cast's row set (heap evaluation), the two index counts,
+-- or the cast's refusal
+CREATE FUNCTION pg_temp.cmp(q text, OUT core int[], OUT weave int[],
+							OUT ix_ok bool, OUT refused text)
 LANGUAGE plpgsql AS $$
+DECLARE
+	wq wquery;
 BEGIN
 	SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO core
 	  FROM tc WHERE tsv @@ q::tsquery;
 	BEGIN
-		SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO weave
-		  FROM tc WHERE to_wdoc(tsv) @@@ q::tsquery::wquery;
+		wq := q::tsquery::wquery;
 	EXCEPTION WHEN feature_not_supported THEN
 		refused := SQLERRM;
+		RETURN;
 	END;
+	SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO weave
+	  FROM tc WHERE to_wdoc(tsv) @@@ wq;
+	ix_ok := weave_count('tc_tsv', wq) = cardinality(core)
+		 AND weave_count('tc_expr', wq) = cardinality(core);
 END $$;
 
 -- ---- hand-written ---------------------------------------------------------
 SELECT q, cardinality(c.core) AS ncore,
 	   CASE WHEN c.refused IS NOT NULL THEN 'refused'
-			WHEN c.core = c.weave THEN 'same' ELSE 'DIFFERENT' END AS verdict,
+			WHEN c.core = c.weave AND c.ix_ok THEN 'same' ELSE 'DIFFERENT' END AS verdict,
 	   c.refused
   FROM (VALUES
 		-- weights, single and combined
@@ -104,18 +117,25 @@ CREATE TEMP TABLE rres AS
 SELECT i, q, c.* FROM rqs, LATERAL pg_temp.cmp(q) c;
 -- every converted query agrees with core; the rest were refused, by reason
 SELECT count(*) AS queries,
-	   count(*) FILTER (WHERE refused IS NULL AND core = weave) AS same,
-	   count(*) FILTER (WHERE refused IS NULL AND core IS DISTINCT FROM weave) AS different,
+	   count(*) FILTER (WHERE refused IS NULL AND core = weave AND ix_ok) AS same,
+	   count(*) FILTER (WHERE refused IS NULL AND (core IS DISTINCT FROM weave
+												  OR ix_ok IS NOT TRUE)) AS different,
 	   count(*) FILTER (WHERE refused IS NOT NULL) AS refused,
 	   count(*) FILTER (WHERE refused IS NULL AND cardinality(core) > 0) AS same_nonempty
   FROM rres;
 SELECT refused, count(*) FROM rres WHERE refused IS NOT NULL GROUP BY 1 ORDER BY 1;
 -- the disagreements, if any (none)
-SELECT i, q, core, weave FROM rres
- WHERE refused IS NULL AND core IS DISTINCT FROM weave ORDER BY i LIMIT 20;
+SELECT i, q, core, weave, ix_ok FROM rres
+ WHERE refused IS NULL AND (core IS DISTINCT FROM weave OR ix_ok IS NOT TRUE)
+ ORDER BY i LIMIT 20;
 -- coverage: the converted set exercises each feature at least once
 SELECT count(*) FILTER (WHERE q ~ ':[A-D]+') AS weighted,
 	   count(*) FILTER (WHERE q ~ ':\*') AS prefixed,
 	   count(*) FILTER (WHERE q ~ '<->') AS phrased,
 	   count(*) FILTER (WHERE q ~ '!') AS negated
   FROM rres WHERE refused IS NULL;
+
+-- the text form of each mapped shape
+SELECT q, q::tsquery::wquery::text AS wquery
+  FROM (VALUES ('fox:A'), ('fox:BD'), ('fox:ABCD'), ('fo:*'), ('!fox:C'),
+			   ('quick <-> brown <-> fox'), ('fox:A & (dog | la:*)')) v(q);
