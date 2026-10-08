@@ -65,3 +65,55 @@ count, and the `weave_distance` call count from `track_functions` (on: 0; off: o
 - Synthetic corpus: this measures the mechanism, not a real-corpus speedup. The win scales
   with document size, so a real corpus of long documents (Wikipedia articles) should see it,
   and one of short titles should not.
+
+## The fused route: the prize, measured before building (2026-10-08, `wt/g86f`)
+
+**Run:** `pgweave-20261008-041234-7383`, c7i.4xlarge, Debian 13, PostgreSQL 17, commit
+`de5b10e`'s successor (smoke green on the same host first). Job script:
+`bench/aws/g86f_prize.sh`. Same corpus as above plus an 8-d vector per row (every 997th
+NULL). Median of 25 warm runs after 5 discarded, `jit` and parallelism off, two runs per arm.
+
+Three arms per cell, all over the SAME k rows:
+- **q**: `SELECT id FROM lh ORDER BY fuse(...) LIMIT k`, the query as written (the fused
+  index scan; every cell's `EXPLAIN VERBOSE` shows the `<~>` transport key).
+- **evalsum**: `sum(fuse(...))` over those k rows fetched by a TID scan. This is the cost of
+  the hidden key alone and an upper bound on what reuse can remove. Its control, `count(id)`
+  over the same TID scan (heap fetch and deform, no detoast), is 0.006-0.09 ms everywhere.
+- **srf**: `weave_fuse_search(..., k)`, the same fused scan with nothing re-evaluated.
+
+Per-row calls at LIMIT 400, from `track_functions`: `lexlex` = `fuse(d <=> 'c', d <=> 'rare')`
+made 400 `fuse`, **800 `weave_distance`, 800 `weave_lexscore`** (G86's figure, reproduced);
+`lexvec` = `fuse(d <=> 'c', v <-> q)` made 400 each of `weave_distance`, `weave_lexscore`,
+`wvec_l2_distance`, `weave_l2score`.
+
+| kind | n | query | LIMIT | q ms (run 1 / 2) | evalsum ms | srf ms |
+|---|---:|---|---:|---|---:|---:|
+| long | 50000 | lexlex | 10 | 0.468 / 0.470 | 0.421 / 0.428 | 0.048 / 0.048 |
+| long | 50000 | lexlex | 400 | 18.146 / 17.788 | 17.591 / 17.557 | 0.214 / 0.216 |
+| long | 50000 | lexvec | 10 | 4.899 / 4.925 | 0.215 / 0.218 | 4.747 / 4.765 |
+| long | 50000 | lexvec | 400 | 20.355 / 21.402 | 9.144 / 9.201 | 10.664 / 10.427 |
+| long | 200000 | lexlex | 10 | 0.542 / 0.536 | 0.433 / 0.428 | 0.117 / 0.117 |
+| long | 200000 | lexlex | 400 | 18.028 / 18.076 | 17.537 / 17.526 | 0.361 / 0.349 |
+| long | 200000 | lexvec | 10 | 18.711 / 18.753 | 0.214 / 0.225 | 19.012 / 18.932 |
+| long | 200000 | lexvec | 400 | 51.409 / 51.457 | 9.259 / 9.221 | 39.974 / 38.871 |
+| short | 200000 | lexlex | 10 | 0.235 / 0.232 | 0.009 / 0.009 | 0.365 / 0.367 |
+| short | 200000 | lexlex | 400 | 1.827 / 1.830 | 0.146 / 0.148 | 1.770 / 1.770 |
+| short | 200000 | lexvec | 400 | 37.023 / 36.837 | 0.149 / 0.148 | 36.595 / 37.157 |
+| short | 1000000 | lexlex | 10 | 0.599 / 0.597 | 0.009 / 0.009 | 0.729 / 0.737 |
+| short | 1000000 | lexlex | 400 | 2.569 / 2.571 | 0.147 / 0.149 | 2.505 / 2.543 |
+| short | 1000000 | lexvec | 400 | 182.942 / 181.759 | 0.152 / 0.150 | 182.119 / 182.461 |
+
+What it says, before anything is built:
+
+- **Long, TOASTed documents: the hidden key IS the query.** Two lexical channels at LIMIT
+  400 take 18 ms, and 17.6 ms of that is re-evaluating `fuse()`: two detoasts and two N = 1
+  BM25s per row, about 22 µs per channel per row, as for the lexical route. The same scan
+  without it takes 0.21 ms at 50k and 0.35 ms at 200k, a 50-85x ceiling. With a vector
+  channel the lexical half is one detoast per row (9.2 ms), and the ceiling is 20.4 -> 10.5
+  ms at 50k and 51.4 -> 39 ms at 200k. The vector channel's own scan dominates there.
+- **Short inline documents: nothing.** At 200k and at 1M the hidden key costs 0.07 ms
+  above its control, against 1.8-2.6 ms for the query. Every short cell's `q` and `srf`
+  overlap or differ by less than that. Reuse is not expected to move them, and the same
+  holds for the lexical route.
+- A third query (`fuse(d <=> 'a | b', d <=> 'c')`) produced no numbers: the job split its
+  arguments on `|`. It is a harness bug, not a result, and the cell was dropped.
