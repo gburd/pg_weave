@@ -267,3 +267,62 @@ successful". `t/033`'s bound is back to `not ok 26 ... # TODO` with excess
 `142 255 255 1002 255 216 255 255 2626 5299 7972`, which is main's sequence from cycle 8
 to the page (`pgweave-20261006-202448-495c`). `t/028`'s control: `ok 113 - quiet plain
 VACUUM still truncates the index (3495 -> 230 blocks)`.
+
+### Round 2, step 1: do the growths hit ORDINARY workloads? (`pgweave-20261008-160908-2708`, `f3f4f6f`)
+
+The maintainer allowed one more L22 round only if it would make a significant difference,
+and made it conditional on first measuring whether the growth happens without crashes.
+Harness: `bench/aws/l22_ordinary.sh`. c7i.4xlarge, Debian 13, PG 17.11. Six private
+clusters ran at once on one host and one `.so`: two runs per arm. The table is the same
+`s (body, emb, price)` with three channels that `g75_scale.sh` uses. 1M rows, 14 cycles,
+B = 100k rows per cycle, serial builds. **No crash anywhere.** The reference is a
+fresh `CREATE INDEX` over exactly the live row set of each cycle. It is built in a
+separate cluster, so no DDL spends an xid inside an arm. Both runs of every arm agreed
+**to the page at every cycle**, so the within-arm spread is zero.
+
+- **(a)** INSERT 10 %, DELETE the oldest 10 %, plain `VACUUM`, autovacuum off.
+- **(b)** the same INSERT and DELETE with autovacuum on at default settings and no manual
+  VACUUM. Each cycle waits 90 s.
+- **(c)** pure append: INSERT 10 % and plain `VACUUM`, with no deletes.
+
+Index pages minus the fresh build's, per cycle 0..14 (the reference is 36,313 for a and b,
+and 36,313 → 87,086 for c):
+
+| arm | excess over a fresh build | at cycle 14 |
+|---|---|---|
+| a | 0 5,626 9,309 12,991 16,673 20,355 24,037 27,719 60,472 **71,103** 3,708 5,655 9,338 13,020 16,702 | 1.46× (peak 2.96× at 9) |
+| b | 0 5,626 5,626 7,572 20,497 20,497 20,497 31,442 31,442 31,442 42,404 42,404 42,404 53,363 53,363 | **2.47×, still rising** |
+| c | 0 2,004 2,059 2,082 2,136 2,181 2,237 2,283 31,401 70,991 74,564 78,204 81,827 85,451 89,077 | **2.02×** from cycle 9 on |
+
+What each arm's allocator counters show (`weave_alloc_stats()` around every INSERT and VACUUM):
+
+- **(a) is a bounded sawtooth with period 10.** Cycles 1–7 add one bolt each (+3,682 pages),
+  and the tombstoned rows stay in their bolts until the 8-bolt level merge. Cycle 8's
+  merge extends 30,806 pages. Cycle 9's VACUUM runs the share-lock compaction pass and
+  peaks the file at 2.96×. Cycle 10's compacts it to 1.10×, and cycles 11–14 repeat cycles
+  1–4 to within 29 pages. **Growth 2 fires here**, without a crash: every INSERT after a
+  plain VACUUM shows `fsm_defer` 1,947 = `extend` 1,947, the xid collision. But it is a
+  constant one-batch pool, about 5 % of the index. The INSERT extends its batch and the
+  next VACUUM's flush reuses the 1,947 pages the INSERT could not, so with the collision
+  fixed the per-cycle growth would still be one bolt.
+- **(b) shows no xid collision.** Every INSERT after an autovacuum reuses its pages
+  (`fsm_reuse` 1,946, `extend` 0). Something assigns an xid between autovacuum's free and
+  the next INSERT. Autoanalyze is the likely candidate; that is not demonstrated. The
+  growth comes in steps of ~11k pages, one per autovacuum (every third cycle): bolts plus
+  the original, fully tombstoned bolt waiting for a level merge, which L19's
+  tombstone-blind trigger never forces. Whether it saws back the way (a) does is
+  unmeasured at 14 cycles. Job 2 runs it to 30.
+- **(c) is growth 1's shape with no crash and no deletes.** Cycle 8's level merge extends
+  30,785 pages. From cycle 9 **every** VACUUM runs the share-lock compaction pass with
+  fewer reusable pages than live ones. It extends the shortfall (41,278, then ~5,300 per
+  cycle) and frees the old copy, and the excess equals the freed count. So the file holds
+  at about **2.0× a fresh build and grows with the data**. Each such VACUUM is a full
+  rewrite: 350, 858, 922, 999, 1,115 s, against 1–2 s before cycle 8.
+
+**Verdict, against the brief's test** (more than ~10 % of the index per 10 cycles, or
+without bound): **GO** on (b) and (c). But **a fix to growth 2 (the xid collision) would
+not make a significant difference to any of the three**. In (a) it is a constant 5 %, in
+(b) it does not occur, and (c) is growth 1. The significant ordinary-workload costs are
+(c)'s permanent 2× plus its full rewrite on every VACUUM (the compaction trigger and pass,
+which this round was told not to touch, and which `t/028` constrains), and (b)'s tombstone
+retention (L19's trigger). Reported to the lead for a decision before any step 2.
