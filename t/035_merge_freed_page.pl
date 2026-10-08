@@ -27,13 +27,21 @@
 #     not allowed to block its level) -- two bolts remain;
 #   REINDEX: one bolt, every invariant holds, every term answered.
 #
-# The cases:
-#   dict_freed   the LAST dictionary page flagged freed (nextblk was already
-#                Invalid there, so this is exactly what weave_free_page() leaves)
-#   post_freed   the LAST page of the shared posting chain flagged freed
-#   dict_cut     the FIRST dictionary page's nextblk set to Invalid, NO flag: a
-#                cut no per-page test can see; only the recorded term count
-#                (WeaveSegMeta.nterms) shows it
+# The cases.  "Freed" is what weave_free_page_locked() writes: the flag, the XID
+# stamp, nextblk ended.  "Cut" is nextblk ended with NO flag, which no per-page
+# test can see; only a recorded length shows it.
+#   dict_freed     the LAST dictionary page freed
+#   dict_mid_freed a MIDDLE dictionary page freed: the merge's dictionary walk
+#                  used to stop there and publish a bolt without the terms behind
+#   dict_cut       the FIRST dictionary page cut: the term count
+#                  (WeaveSegMeta.nterms) disagrees
+#   post_freed     the LAST page of the shared posting chain freed
+#   post_mid_freed a MIDDLE posting page freed
+#   post_cut       a MIDDLE posting page cut: the chain no longer reaches the
+#                  last term's first posting block
+#   dictindex_freed, doclen_freed, surf_freed, doclist_freed: the last page of
+#                  the dictionary index, doclen sidecar, SuRF trie and
+#                  document list chains freed
 
 use strict;
 use warnings FATAL => 'all';
@@ -50,7 +58,20 @@ use constant {
 	NTERMS_PER_DOC => 12,
 };
 
-my @cases = qw(dict_freed post_freed dict_cut);
+# case => [chain kind (weave_page_info), which page, how]
+my %spec = (
+	dict_freed      => [ 'dictionary',     'last',  'free' ],
+	dict_mid_freed  => [ 'dictionary',     'mid',   'free' ],
+	dict_cut        => [ 'dictionary',     'first', 'cut' ],
+	post_freed      => [ 'postings',       'last',  'free' ],
+	post_mid_freed  => [ 'postings',       'mid',   'free' ],
+	post_cut        => [ 'postings',       'mid',   'cut' ],
+	dictindex_freed => [ 'dict_index',     'last',  'free' ],
+	doclen_freed    => [ 'doclen_sidecar', 'last',  'free' ],
+	surf_freed      => [ 'surf_trie',      'last',  'free' ],
+	doclist_freed   => [ 'doclist',        'last',  'free' ],
+);
+my @cases = sort keys %spec;
 
 my $node = PostgreSQL::Test::Cluster->new('primary');
 # PG18 inits with data checksums on; this test rewrites page bytes offline
@@ -79,7 +100,11 @@ sub round
 	sql("VACUUM $t");
 }
 
-# (answered, total): terms the index answers with exactly their one document
+# (answered, total): terms the index answers with exactly their one document --
+# every term of round 4 (the damaged bolt) and one term per document of every
+# other round.  weave_search() enters the scan machinery directly, with no
+# executor recheck behind it (AGENTS.md: the suite running is not the SITE
+# running).
 sub answers
 {
 	my ($t) = @_;
@@ -87,7 +112,7 @@ sub answers
 		SELECT count(*) FILTER (WHERE (SELECT count(*) FROM weave_search('${t}_w',
 		                    to_wquery('simple', term), 5)) = 1)
 		       || '/' || count(*)
-		  FROM ${t}_terms});
+		  FROM ${t}_terms WHERE term LIKE 'r4d%' OR term LIKE '%t1'});
 }
 
 sub pages_of
@@ -112,9 +137,12 @@ sub chain
 {
 	my ($pages, $kind) = @_;
 	my @b = grep { $pages->{$_}{kind} eq $kind } keys %$pages;
+	return () unless @b;
 	my %pointed = map { $pages->{$_}{next} => 1 } @b;
 	my @head = grep { !$pointed{$_} } @b;
-	die "one $kind head expected, got @head" unless @head == 1;
+	die "one $kind head expected, got (@head) among: "
+	  . join(' ', map { "$_=$pages->{$_}{kind}->$pages->{$_}{next}" } sort { $a <=> $b } keys %$pages)
+	  unless @head == 1;
 	my @c = ($head[0]);
 	push @c, $pages->{ $c[-1] }{next} while $pages->{ $c[-1] }{next} != -1;
 	die "$kind chain leaves the bolt" if grep { !exists $pages->{$_} } @c;
@@ -132,6 +160,7 @@ sub lsns
 
 # ---- build every case's index up to round 7 --------------------------------
 my %c;
+my @live;
 for my $t (@cases)
 {
 	sql(qq{
@@ -141,20 +170,28 @@ for my $t (@cases)
 	});
 	for my $r (1 .. 7)
 	{
-		my $lo = sql('SELECT pg_current_wal_lsn()');
+		# the INSERT pointer: VACUUM assigns no XID, so its commit flushes
+		# nothing and the WRITE pointer can trail the pages it just wrote
+		my $lo = sql('SELECT pg_current_wal_insert_lsn()');
 		round($t, $r, $r == 4 ? 70 : 100);
-		my $hi = sql('SELECT pg_current_wal_lsn()');
+		my $hi = sql('SELECT pg_current_wal_insert_lsn()');
 		$c{$t}{pages} = pages_of($t, $lo, $hi) if $r == 4;
 	}
 	is(sql("SELECT weave_index_nsegments('${t}_w')"), '7',
 		"$t: seven bolts, one per round, none merged yet");
-	my @dict = chain($c{$t}{pages}, 'dictionary');
-	my @post = chain($c{$t}{pages}, 'postings');
-	cmp_ok(scalar @dict, '>=', 2, "$t: round 4's dictionary spans " . scalar(@dict) . ' pages');
-	cmp_ok(scalar @post, '>=', 2, "$t: round 4's posting chain spans " . scalar(@post) . ' pages');
-	$c{$t}{dict} = \@dict;
-	$c{$t}{post} = \@post;
-	$c{$t}{dictroot} = $dict[0];
+	my ($kind, $which, $how) = @{ $spec{$t} };
+	my @ch = chain($c{$t}{pages}, $kind);
+	if (!@ch)
+	{
+		fail("$t: round 4's bolt has no $kind page to damage");
+		next;
+	}
+	push @live, $t;
+	$c{$t}{dictroot} = (chain($c{$t}{pages}, 'dictionary'))[0];
+	cmp_ok(scalar @ch, '>=', $which eq 'last' ? 1 : 3,
+		"$t: round 4's $kind chain spans " . scalar(@ch) . " page(s): @ch");
+	$c{$t}{bad} = $which eq 'first' ? $ch[0]
+	  : $which eq 'last' ? $ch[-1] : $ch[ int(@ch / 2) ];
 	is(sql(qq{SELECT count(*) FROM weave_check('${t}_w', true) WHERE NOT ok}), '0',
 		"$t: every invariant holds before the damage");
 	$c{$t}{ans0} = answers($t);
@@ -190,16 +227,21 @@ sub mark_freed
 	return;
 }
 
-$c{dict_freed}{bad} = $c{dict_freed}{dict}[-1];
-mark_freed($path{dict_freed}, $c{dict_freed}{bad});
-$c{post_freed}{bad} = $c{post_freed}{post}[-1];
-mark_freed($path{post_freed}, $c{post_freed}{bad});
-$c{dict_cut}{bad} = $c{dict_cut}{dict}[0];
-rw($path{dict_cut}, $c{dict_cut}{bad}, NEXTBLK_OFF, 'V', sub { 0xFFFFFFFF });
+for my $t (@live)
+{
+	if ($spec{$t}[2] eq 'free')
+	{
+		mark_freed($path{$t}, $c{$t}{bad});
+	}
+	else
+	{
+		rw($path{$t}, $c{$t}{bad}, NEXTBLK_OFF, 'V', sub { 0xFFFFFFFF });
+	}
+}
 $node->start;
 
 # ---- the merge meets it ----------------------------------------------------
-for my $t (@cases)
+for my $t (@live)
 {
 	my $bad = $c{$t}{bad};
 	my @r4 = sort { $a <=> $b } keys %{ $c{$t}{pages} };
@@ -222,7 +264,7 @@ for my $t (@cases)
 
 	my $chk = sql(qq{SELECT ok || ' ' || coalesce(detail, '')
 		FROM weave_check('${t}_w', true) WHERE invariant = 'bolt_chains_intact'});
-	like($chk, qr/^f .*block $bad\b/,
+	like($chk, qr/^false .*block $bad\b/,
 		"$t: weave_check(deep) reports the bolt, naming block $bad");
 	note("$t: bolt_chains_intact: $chk");
 	like(answers($t), qr{^(\d+)/\1$}, "$t: every term answered after round 8");

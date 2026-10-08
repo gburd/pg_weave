@@ -10,7 +10,7 @@ PGC=/usr/lib/postgresql/17/bin/pg_config
 LIB=$($PGC --pkglibdir)
 SRC=$HOME/pg_weave
 PHASES="${PHASES:-smokelogs control mutants pg18}"
-MUTS="${MUTS:-noflag nocount publish noskip}"
+MUTS="${MUTS:-noflag nocount noseek nodictwalk nopostwalk nodictidx nodoclen nosurf nodoclist publish noskip}"
 log() { echo "$(date +%T) $*" | tee -a $OUT/l23.log; }
 wipe() { [ -e "$1" ] && find "$1" -depth -delete; true; }
 
@@ -24,7 +24,22 @@ sub() {	# file, from (literal), to (literal): must match exactly once
 		die "mutant: pattern matched $n times in $ARGV\n" unless $n == 1;
 		my $t = $ENV{TO}; s/$f/$t/;' "$1"
 }
+# one walker's faults discarded: it still walks and marks, its report goes nowhere
+junk() {	# file, the walk call ending in ", e);"
+	local to=${2%, e);}
+	sub "$1" "$2" "{ StringInfoData j_; initStringInfo(&j_); ${to}, &j_); }	/* MUTANT $m */"
+}
 case $m in
+nodictwalk) junk src/am/amcheck.c '(void) wvck_walk_chain(cx, seg->dictstart, WEAVE_PK_DICT, e);' ;;
+nodictidx)  junk src/am/amcheck.c '(void) wvck_walk_chain(cx, seg->dictindexstart, WEAVE_PK_DICTINDEX, e);' ;;
+nodoclen)   junk src/am/amcheck.c '(void) wvck_walk_chain(cx, seg->doclenstart, WEAVE_PK_DOCLEN, e);' ;;
+nosurf)     junk src/am/amcheck.c '(void) wvck_walk_chain(cx, surfroot, WEAVE_PK_SURF, e);' ;;
+nodoclist)  junk src/am/amcheck.c '(void) wvck_walk_chain(cx, dlroot, WEAVE_PK_DOCLIST, e);' ;;
+nopostwalk)
+	sub src/am/amcheck.c 'if (wvck_walk_chain(cx, postchain, WEAVE_PK_POSTING, e) >= 0 &&' \
+		'if (({ StringInfoData j_; initStringInfo(&j_); wvck_walk_chain(cx, postchain, WEAVE_PK_POSTING, &j_); }) >= 0 &&	/* MUTANT nopostwalk */' ;;
+noseek)		# the posting chain must reach the last term's first block (post_cut)
+	sub src/am/amcheck.c 'lastposting != InvalidBlockNumber && !cx->seekhit)' 'false && lastposting != InvalidBlockNumber && !cx->seekhit)	/* MUTANT noseek */' ;;
 noflag)		# the per-page FREED test in the chain walk (dict_freed, post_freed)
 	sub src/am/amcheck.c '		if (WeavePageIsFreed(page))
 		{
@@ -65,7 +80,7 @@ run_tap() {
 	mkdir -p $OUT/taplog-$tag
 	cp "$d"/tmp_check/log/regress_log_* $OUT/taplog-$tag/ 2>/dev/null
 	if ! grep -q '^Result: ' $OUT/tap-$tag.log; then echo RAN_NOTHING; return; fi
-	echo "rc=$rc $(grep -E '^Result: ' $OUT/tap-$tag.log) $(grep -E '^Files=' $OUT/tap-$tag.log | cut -d, -f1-2) $(cat $OUT/taplog-$tag/* 2>/dev/null | grep -cE '^(not )?ok ') asserts, $(cat $OUT/taplog-$tag/* 2>/dev/null | grep -cE '^not ok') not_ok"
+	echo "rc=$rc $(grep -E '^Result: ' $OUT/tap-$tag.log) $(grep -E '^Files=' $OUT/tap-$tag.log | cut -d, -f1-2) $(cat $OUT/taplog-$tag/* 2>/dev/null | grep -cE '\) (not )?ok [0-9]') asserts, $(cat $OUT/taplog-$tag/* 2>/dev/null | grep -cE '\) not ok [0-9]') not_ok"
 }
 
 ok=1
@@ -103,7 +118,7 @@ if [[ " $PHASES " == *" mutants "* ]]; then
 		md5=$(md5sum $LIB/pg_weave.so | cut -d' ' -f1)
 		if [ "$md5" = "$CLEAN_MD5" ]; then log "$m: installed .so is the CLEAN one -- not counted"; ok=0; continue; fi
 		res=$(run_tap $D mut-$m $PGC t/035_merge_freed_page.pl)
-		fails=$(grep -hE '^not ok' $OUT/taplog-mut-$m/* 2>/dev/null | head -4 | tr '\n' ' ')
+		fails=$(grep -hE ') not ok [0-9]' $OUT/taplog-mut-$m/* 2>/dev/null | head -4 | tr '\n' ' ')
 		case "$res" in
 		RAN_NOTHING) log "$m: the TAP run printed no Result -- not counted"; ok=0 ;;
 		*"Result: FAIL"*) log "$m: CAUGHT (so=$md5): $res :: $fails" ;;
