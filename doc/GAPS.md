@@ -6598,24 +6598,30 @@ output inspected, then committed as `25e7cff`):
   that commit, committed in `25e7cff`).
 
 *Latency -- a LOSS, by construction, recorded (hard rule 8).* `bench/aws/g94_job.sh` stage
-D, c7i.4xlarge, 200k rows (`w1` in 10 %, `rare` in 0.2 %, 8 filler terms each), median of 12
-after 3 warm-up, two runs per arm, "before" = this tree with P1 applied (main's decision):
+D, c7i.4xlarge, `w1` in 10 % of rows, `rare` in 0.2 %, 8 filler terms each; median of 12
+after 3 warm-up, two runs per arm (`run1 / run2`), "before" = this tree with P1 applied
+(main's decision). Run `pgweave-20261008-134841-4ce2` (commit `25e7cff`, strict smoke green
+first); the 200k arm also ran on `-133259-ef07` at 29.9-32.6 ms after, same shape.
 
-| query | LIMIT | before (rows) | after (rows) |
-|---|---|---|---|
-| `!w1` | 10 | 0.77 / 0.75 ms (**0**) | 29.9 / 30.1 ms (10) |
-| `!w1` | 1000 | 0.74 / 0.75 ms (**0**) | 30.4 / 30.4 ms (1000) |
-| `rare \| !w1` | 10 | 0.26 / 0.27 ms (10) | 0.27 / 0.27 ms (10) |
-| `rare \| !w1` | 5000 | 1.44 / 1.48 ms (**400**) | 32.6 / 32.5 ms (5000) |
-| `w2 & !w1` (covered) | 10 | 2.61 / 2.57 ms | 2.58 / 2.54 ms |
-| `w1` (covered) | 10 | 0.07 / 0.07 ms | 0.07 / 0.07 ms |
+| query | LIMIT | 200k before (rows) | 200k after | 1M before (rows) | 1M after |
+|---|---|---|---|---|---|
+| `!w1` | 10 | 0.80 / 0.80 ms (**0**) | 32.2 / 32.2 ms | 4.02 / 4.03 ms (**0**) | 159.2 / 159.0 ms |
+| `!w1` | 1000 | 0.81 / 0.80 ms (**0**) | 32.4 / 32.5 ms | 4.02 / 4.01 ms (**0**) | 159.5 / 159.7 ms |
+| `rare \| !w1` | 10 | 0.29 / 0.28 ms | 0.28 / 0.29 ms | 0.80 / 0.80 ms | 0.80 / 0.81 ms |
+| `rare \| !w1` | 5000 | 1.54 / 1.55 ms (**400**) | 35.1 / 35.1 ms | 8.84 / 8.98 ms (**2000**) | 166.8 / 167.1 ms |
+| `w2 & !w1` (covered) | 10 | 2.76 / 2.75 ms | 2.77 / 2.76 ms | 13.59 / 13.73 ms | 13.63 / 13.66 ms |
+| `w1` (covered) | 10 | 0.08 / 0.08 ms | 0.08 / 0.08 ms | 0.31 / 0.30 ms | 0.30 / 0.31 ms |
+
+Every row count in the "after" columns is the LIMIT, and `!w1` matches 180,000 / 900,000
+rows. Within-arm spread is under 1 %, and the after-cost scales 5.0x from 200k to 1M, so it is
+linear in the match set (hard rules 10 and 11).
 
 "before" was fast because it answered 0 rows where 180,000 match. The after-cost is the
 padding's set-up, not its rows: LIMIT 10 and LIMIT 1000 cost the same 30 ms, because
 `weave_pad_begin()` collects q's whole match set (`weave_collect_matches()`, here a NOT
 over 180k rows) and sorts the ranked TIDs before emitting its first row. A query whose
 ranked rows already fill the LIMIT pays nothing (`rare | !w1` LIMIT 10), and covered queries
-are unchanged. 1M: see below (run 2).
+are unchanged.
 
 **Remaining limits, stated.**
 - **`weave_search()` is still a subset** for an uncovered query: it shares the ranked
