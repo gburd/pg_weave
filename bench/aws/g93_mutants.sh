@@ -38,6 +38,10 @@ M6_prefix_in_phrase_accepted)
 	sub $F '			if (in_phrase)
 				mig_refuse' '			if (false)
 				mig_refuse' ;;
+M8_index_not_inexact_reverted)
+	sub src/am/amscan.c '			if (stack[top - 1].inexact)
+			{' '			if (false)
+			{' ;;
 M7_pre_fix_converter)
 	cp /tmp/out/migrate.c.prefix $F ;;
 *) echo "unknown mutant $m"; exit 2 ;;
@@ -240,7 +244,7 @@ PGC=/usr/lib/postgresql/17/bin/pg_config
 LIB=$($PGC --pkglibdir)
 SRC=$HOME/pg_weave
 T=tsquery_cast
-MUTS="${MUTS:-M1_weight_dropped M2_prefix_dropped M3_phrase_distance_plus_one M4_phrase_N_accepted_as_at_most_N M5_bool_in_phrase_accepted M6_prefix_in_phrase_accepted M7_pre_fix_converter}"
+MUTS="${MUTS:-M1_weight_dropped M2_prefix_dropped M3_phrase_distance_plus_one M4_phrase_N_accepted_as_at_most_N M5_bool_in_phrase_accepted M6_prefix_in_phrase_accepted M7_pre_fix_converter M8_index_not_inexact_reverted}"
 NOTICE='NOTICE:  extension "pg_weave" already exists, skipping'
 log() { echo "$(date +%T) $*" | tee -a $OUT/mutants.log; }
 wipe() { [ -d "$1" ] && find "$1" -depth -delete; true; }
@@ -261,6 +265,27 @@ run_t() {
 	echo $OUT/$T-$2.out
 }
 install_tree "$SRC" clean || { log "CONTROL build/install FAILED"; exit 1; }
+# DIAGNOSTIC PROBE (not a gate): native wquery fuzzy/regex leaves inside boolean
+# structure, heap evaluation vs weave_count.  A disagreement is a finding.
+psql -X -d postgres -v ON_ERROR_STOP=1 > $OUT/probe_fuzzy_bool.out 2>&1 <<'PROBE'
+DROP DATABASE IF EXISTS g93probe;
+CREATE DATABASE g93probe;
+\c g93probe
+CREATE EXTENSION pg_weave;
+SELECT setseed(0.5);
+CREATE TABLE p (id int, d wdoc);
+INSERT INTO p SELECT g, to_wdoc('simple', (SELECT string_agg((ARRAY['quick','brown','browne','fox','foxes','dog','lazy','jump'])[1 + floor(random()*8)::int], ' ') FROM generate_series(1, 1 + (g % 5)))) FROM generate_series(1, 2000) g;
+CREATE INDEX p_ix ON p USING weave (d);
+CREATE INDEX p_ix_trgm ON p USING weave (d) WITH (trigrams = on, positions = on);
+SET enable_indexscan = off; SET enable_bitmapscan = off;
+SELECT q, (SELECT count(*) FROM p WHERE d @@@ q::wquery) AS heap,
+       weave_count('p_ix', q::wquery) AS ix, weave_count('p_ix_trgm', q::wquery) AS ix_trgm_pos
+  FROM (VALUES ('brwn~1'), ('quick | brwn~1'), ('!brwn~1'), ('quick & !brwn~1'), ('!(quick & brwn~1)'),
+               ('/fox.*/'), ('dog | /fox.*/'), ('!/fox.*/'), ('dog & !/fox.*/'), ('brwn~1 & /fox.*/'),
+               ('brwn~1 | /fox.*/'), ('!(brwn~1 | /fox.*/)'), ('fox:A'), ('!fox:A'), ('"quick brown"'),
+               ('!"quick brown"'), ('quick:A | !dog'), ('!(fox:D & dog)')) v(q);
+PROBE
+echo "probe exit $?" >> $OUT/probe_fuzzy_bool.out
 CLEAN_MD5=$(md5sum $LIB/pg_weave.so | cut -d' ' -f1)
 c1=$(run_t "$SRC" clean1); c2=$(run_t "$SRC" clean2)
 [ "$c1" != RAN_NOTHING ] && [ "$c2" != RAN_NOTHING ] || { log "CONTROL ran nothing"; exit 1; }
