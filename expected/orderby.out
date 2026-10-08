@@ -14,7 +14,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 ALTER EXTENSION pg_weave UPDATE;
-NOTICE:  version "0.30.0" of extension "pg_weave" is already installed
+NOTICE:  version "0.31.0" of extension "pg_weave" is already installed
 CREATE TABLE ob (id serial, d wdoc);
 -- A vocabulary with three frequency bands so ranking is meaningful and the
 -- top-k is not an arbitrary tie-break.
@@ -506,7 +506,9 @@ SELECT to_wdoc(strip(to_tsvector('simple','quick red slow brown')))
 
 -- (c) The fourth route, which no producer-side fix reaches: a boolean
 --     sub-expression under a phrase loses positions from the QUERY SHAPE, on a
---     FULLY POSITIONED document. Reachable through the shipped tsquery cast.
+--     FULLY POSITIONED document. It was reachable through the tsquery cast,
+--     which since G93 REFUSES a boolean under a phrase (core evaluates it
+--     positionally; wquery cannot), so only binary wquery input reaches it now.
 SELECT to_tsvector('simple','fox brown zzz quick') @@ to_tsquery('simple','quick <-> (brown & fox)')
          AS core_bool_under_phrase;
  core_bool_under_phrase 
@@ -517,11 +519,8 @@ SELECT to_tsvector('simple','fox brown zzz quick') @@ to_tsquery('simple','quick
 SELECT to_wdoc('simple','fox brown zzz quick')
          @@@ (to_tsquery('simple','quick <-> (brown & fox)'))::wquery
          AS weave_bool_under_phrase;
- weave_bool_under_phrase 
--------------------------
- f
-(1 row)
-
+ERROR:  cannot convert tsquery to wquery: &, | or ! inside a phrase
+DETAIL:  wquery evaluates a phrase over &, | or ! as false; tsquery evaluates it positionally.
 -- (d) Phrase-with-prefix stays deliberately permissive: prefix expansion is not
 --     tracked positionally, and that is shipped behaviour. The fix distinguishes
 --     this from (b) and (c) with an explicit reason flag rather than a

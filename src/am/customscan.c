@@ -565,10 +565,11 @@ weave_hint_indexscan(IndexScan *scan, Limit *limit, Oid wqueryoid)
  * list IS the top plan's: Limit, Sort and Incremental Sort share their input's
  * list and the top one is relabelled by apply_tlist_labeling().  A scan under a
  * join or an Append gets its own list with resjunk = false and is left alone,
- * which is a lost optimization and not a wrong answer.  Only the lexical route
- * qualifies: a vector scan's value is a quantized score and an edit-distance or
- * fused scan's resjunk entry is not `d <=> q` (doc/GAPS.md G86 has the reasons
- * per channel).  pg_weave.reuse_distance = off disables it.
+ * which is a lost optimization and not a wrong answer.  Two routes qualify:
+ * this lexical one, and the fused one (weave_reuse_fused() below).  A vector
+ * scan's value is a quantized score and an edit-distance one is not reused
+ * (doc/GAPS.md G86 has the reasons per channel).  pg_weave.reuse_distance = off
+ * disables both.
  * --------------------------------------------------------------------------- */
 bool		pg_weave_reuse_distance = true;
 
@@ -578,10 +579,38 @@ typedef struct WeaveWalkCtx
 	PlannedStmt *stmt;
 	bool		reuseResolved;	/* the three OIDs below were looked up */
 	Oid			curdistfn;		/* weave_current_distance(regclass, tid, wquery) */
+	Oid			curfusefn;		/* weave_current_fused_distance(regclass, tid,
+								 * VARIADIC "any"), 0.31.0 */
 	Oid			wdoc;			/* in wquery's schema */
 	Oid			wquery;
 	bool		planted;		/* curdistfn was put in this plan */
+	bool		plantedFuse;	/* curfusefn was put in this plan */
 } WeaveWalkCtx;
+
+/* is `fn` this library's C function `sym` returning float8? */
+static bool
+weave_reuse_fn_ok(Oid fn, const char *sym, Oid variadic)
+{
+	HeapTuple	tup;
+	bool		ok = false;
+
+	if (!OidIsValid(fn))
+		return false;
+	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn));
+	if (HeapTupleIsValid(tup))
+	{
+		Form_pg_proc p = (Form_pg_proc) GETSTRUCT(tup);
+		bool		isnull;
+		Datum		src = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosrc,
+										  &isnull);
+
+		ok = (p->prolang == ClanguageId && p->prorettype == FLOAT8OID &&
+			  p->provariadic == variadic && !isnull &&
+			  strcmp(TextDatumGetCString(src), sym) == 0);
+		ReleaseSysCache(tup);
+	}
+	return ok;
+}
 
 /*
  * Find weave_current_distance(regclass, tid, wquery) in the schema of the
@@ -600,7 +629,7 @@ weave_reuse_resolve(WeaveWalkCtx *cx)
 	Oid			nsp;
 	Oid			fn;
 	Oid			argtypes[3] = {REGCLASSOID, TIDOID, InvalidOid};
-	bool		ok = false;
+	Oid			fuseargs[3] = {REGCLASSOID, TIDOID, ANYOID};
 
 	cx->reuseResolved = true;
 	cx->wquery = cx->wqueryoid;
@@ -618,23 +647,69 @@ weave_reuse_resolve(WeaveWalkCtx *cx)
 						 CStringGetDatum("weave_current_distance"),
 						 PointerGetDatum(buildoidvector(argtypes, 3)),
 						 ObjectIdGetDatum(nsp));
-	if (!OidIsValid(fn))
-		return;
-	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn));
-	if (HeapTupleIsValid(tup))
-	{
-		Form_pg_proc p = (Form_pg_proc) GETSTRUCT(tup);
-		bool		isnull;
-		Datum		src = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosrc,
-										  &isnull);
-
-		ok = (p->prolang == ClanguageId && p->prorettype == FLOAT8OID &&
-			  !isnull &&
-			  strcmp(TextDatumGetCString(src), "weave_current_distance") == 0);
-		ReleaseSysCache(tup);
-	}
-	if (ok)
+	if (weave_reuse_fn_ok(fn, "weave_current_distance", InvalidOid))
 		cx->curdistfn = fn;
+	/* the fused route's, 0.31.0; absent from an older catalog, which only
+	 * turns fused reuse off */
+	fn = GetSysCacheOid3(PROCNAMEARGSNSP, Anum_pg_proc_oid,
+						 CStringGetDatum("weave_current_fused_distance"),
+						 PointerGetDatum(buildoidvector(fuseargs, 3)),
+						 ObjectIdGetDatum(nsp));
+	if (weave_reuse_fn_ok(fn, "weave_current_fused_distance", ANYOID))
+		cx->curfusefn = fn;
+}
+
+/*
+ * The FUSED route (0.31.0).  A fused scan's keys are one `<=>`/`<->`/`<#>` per
+ * channel plus the `<~>` weights transport (src/am/fusepath.c), and its slot-0
+ * value is the fused -S it ordered by, or its padding value.  The hidden
+ * `fuse(...)` entry whose call those keys were built from becomes
+ *
+ *     COALESCE(weave_current_fused_distance(index, ctid, q1, ..., qn, w),
+ *              fuse(...))
+ *
+ * q1..qn and w being the keys' right operands, so the function can check that
+ * the scan it answers from has exactly these keys.  The value differs from
+ * fuse()'s (corpus BM25 and quantized vector scores against N = 1 and exact
+ * ones, and a different summation order), which is the lexical route's reason
+ * for touching only RESJUNK entries, and holds here for the same reason.
+ */
+static void
+weave_reuse_fused(IndexScan *scan, WeaveWalkCtx *cx)
+{
+	ListCell   *lc;
+
+	if (!OidIsValid(cx->curfusefn))
+		return;
+	foreach(lc, scan->scan.plan.targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		CoalesceExpr *ce;
+		List	   *args;
+		ListCell   *kc;
+
+		if (!tle->resjunk ||
+			!weave_fuse_is_scan_key(tle->expr, scan->indexorderbyorig))
+			continue;
+		args = list_make2(makeConst(REGCLASSOID, -1, InvalidOid, sizeof(Oid),
+									ObjectIdGetDatum(scan->indexid),
+									false, true),
+						  makeVar(scan->scan.scanrelid,
+								  SelfItemPointerAttributeNumber,
+								  TIDOID, -1, InvalidOid, 0));
+		foreach(kc, scan->indexorderbyorig)
+			args = lappend(args, copyObject(lsecond(((OpExpr *) lfirst(kc))->args)));
+		ce = makeNode(CoalesceExpr);
+		ce->coalescetype = FLOAT8OID;
+		ce->coalescecollid = InvalidOid;
+		ce->args = list_make2(makeFuncExpr(cx->curfusefn, FLOAT8OID, args,
+										   InvalidOid, InvalidOid,
+										   COERCE_EXPLICIT_CALL),
+							  tle->expr);
+		ce->location = -1;
+		tle->expr = (Expr *) ce;
+		cx->plantedFuse = true;
+	}
 }
 
 static void
@@ -644,14 +719,18 @@ weave_reuse_distance(IndexScan *scan, WeaveWalkCtx *cx)
 	Node	   *q;
 	ListCell   *lc;
 
-	if (list_length(scan->indexorderbyorig) != 1 ||
-		!IsA(linitial(scan->indexorderbyorig), OpExpr))
+	if (!cx->reuseResolved)
+		weave_reuse_resolve(cx);
+	if (list_length(scan->indexorderbyorig) > 1)
+	{
+		weave_reuse_fused(scan, cx);
+		return;
+	}
+	if (!IsA(linitial(scan->indexorderbyorig), OpExpr))
 		return;
 	orig = (OpExpr *) linitial(scan->indexorderbyorig);
 	if (list_length(orig->args) != 2)
 		return;
-	if (!cx->reuseResolved)
-		weave_reuse_resolve(cx);
 	if (!OidIsValid(cx->curdistfn))
 		return;
 	/*
@@ -754,7 +833,8 @@ weave_planner(Query *parse, const char *query_string, int cursorOptions,
 	weave_hint_walk(stmt->planTree, &cx);
 	foreach(lc, stmt->subplans)
 		weave_hint_walk((Plan *) lfirst(lc), &cx);
-	/* a plan naming weave_current_distance() is invalidated if it is dropped */
+	/* a plan naming weave_current_[fused_]distance() is invalidated if the
+	 * function is dropped */
 	if (cx.planted)
 	{
 		PlanInvalItem *inval = makeNode(PlanInvalItem);
@@ -762,6 +842,15 @@ weave_planner(Query *parse, const char *query_string, int cursorOptions,
 		inval->cacheId = PROCOID;
 		inval->hashValue = GetSysCacheHashValue1(PROCOID,
 												 ObjectIdGetDatum(cx.curdistfn));
+		stmt->invalItems = lappend(stmt->invalItems, inval);
+	}
+	if (cx.plantedFuse)
+	{
+		PlanInvalItem *inval = makeNode(PlanInvalItem);
+
+		inval->cacheId = PROCOID;
+		inval->hashValue = GetSysCacheHashValue1(PROCOID,
+												 ObjectIdGetDatum(cx.curfusefn));
 		stmt->invalItems = lappend(stmt->invalItems, inval);
 	}
 	return stmt;

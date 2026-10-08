@@ -64,9 +64,12 @@ Gate M3: a corpus of real `to_tsquery` queries returns identical row sets before
 and after.
 
 Note the honest gap: `tsquery` → `wquery` is a helper plus a cast, not a
-transparent rewrite, because `wquery` supports constructs (`NEAR`, `term~k`,
-`/re/`) that `tsquery` has no syntax for and `tsquery` has weight-class
-constructs that need mapping. Tracked in `doc/PHASES.md` under inherited debt.
+transparent rewrite. The cast maps `&`, `|`, `!`, weights (`lex:AB`), prefixes
+(`lex:*`) and left-nested `<->` chains exactly, and REFUSES (`feature_not_supported`)
+what wquery cannot answer the same way: `<N>` other than `<->` (core's is an exact gap,
+wquery's phrase is "at most N"), a boolean or prefix inside a phrase, and a weighted
+prefix. So `phraseto_tsquery()` output with a stopword gap does not convert yet
+(`doc/GAPS.md` G93). Tracked in `doc/PHASES.md` under inherited debt.
 
 ## Trigram compatibility
 

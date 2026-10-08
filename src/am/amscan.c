@@ -1379,6 +1379,16 @@ typedef struct EvalVal
 {
 	TidSet		set;
 	bool		negated;		/* true => set represents docs NOT to include */
+	/*
+	 * The entry is a SUPERSET of its exact answer, left for the heap recheck to
+	 * shrink: a weight-restricted leaf (postings carry no zone labels) and any
+	 * PHRASE (evaluated as AND).  AND and OR are monotone, so a superset in is
+	 * a superset out -- but NOT is not: the complement of a superset is a
+	 * SUBSET, and the recheck cannot restore the rows it lost (G93:
+	 * `!over:CD` and `!(quick <-> brown)` silently dropped rows).  So NOT of an
+	 * inexact entry is "every document", still inexact.
+	 */
+	bool		inexact;
 } EvalVal;
 
 /*
@@ -1525,12 +1535,21 @@ weave_eval_query(Relation index, const WeaveSegMeta *seg, WeaveQuery q,
 			}
 			stack[top].set = s;
 			stack[top].negated = false;
+			stack[top].inexact = (it->flags & WEAVE_QF_WEIGHTED) != 0;
 			top++;
 		}
 		else if (it->op == WEAVE_OP_NOT)
 		{
 			Assert(top >= 1);
-			stack[top - 1].negated = !stack[top - 1].negated;
+			if (stack[top - 1].inexact)
+			{
+				/* see EvalVal: the complement of the empty set is everything */
+				stack[top - 1].set.tids = NULL;
+				stack[top - 1].set.n = 0;
+				stack[top - 1].negated = true;
+			}
+			else
+				stack[top - 1].negated = !stack[top - 1].negated;
 		}
 		else					/* AND / OR */
 		{
@@ -1538,6 +1557,7 @@ weave_eval_query(Relation index, const WeaveSegMeta *seg, WeaveQuery q,
 			EvalVal		a = stack[--top];
 			EvalVal		res;
 
+			res.inexact = a.inexact || b.inexact || it->op == WEAVE_OP_PHRASE;
 			if (it->op == WEAVE_OP_AND || it->op == WEAVE_OP_PHRASE)
 			{
 				/* PHRASE is treated as AND for candidate generation; the
@@ -2745,12 +2765,19 @@ weave_curdist_reset_cb(void *arg)
 	weave_curdist_forget((WeaveScanOpaque) arg);
 }
 
-/* Is this a lexical `<=>` ordering scan, the one shape whose value is reused? */
+/*
+ * Is this an ordering scan whose value is reused: the lexical `<=>` route, or a
+ * fused one (weave_current_fused_distance() below)?  A fused scan's so->query
+ * may hold its WHERE clause's `@@@` query, so the two lookups tell the routes
+ * apart by so->fuseScan, never by so->query.
+ */
 static inline bool
-weave_curdist_lexical(IndexScanDesc scan, WeaveScanOpaque so)
+weave_curdist_wanted(IndexScanDesc scan, WeaveScanOpaque so)
 {
+	if (so->fuseScan)
+		return true;
 	return scan->numberOfOrderBys == 1 && !so->vecScan && !so->edistScan &&
-		!so->fuseScan && so->query != NULL;
+		so->query != NULL;
 }
 
 /* publish the ordering value of the tuple this scan is returning */
@@ -2794,7 +2821,7 @@ weave_current_distance(PG_FUNCTION_ARGS)
 											 it.cur);
 		IndexScanDesc scan = so->curdistScan;
 
-		if (so->query == NULL || so->curdistIndex != indexoid ||
+		if (so->fuseScan || so->query == NULL || so->curdistIndex != indexoid ||
 			!ItemPointerEquals(&scan->xs_heaptid, tid))
 			continue;
 		if (q == NULL)
@@ -2806,6 +2833,117 @@ weave_current_distance(PG_FUNCTION_ARGS)
 		 * this statement, say): the one that published LAST is the one whose
 		 * tuple is being projected, since projection follows the fetch.
 		 */
+		if (best == NULL || so->curdistSeq > best->curdistSeq)
+			best = so;
+	}
+	if (best == NULL || best->curdistIsnull)
+		PG_RETURN_NULL();
+	PG_RETURN_FLOAT8(best->curdistValue);
+}
+
+/*
+ * Do arguments 2.. of a weave_current_fused_distance() call name exactly the
+ * ORDER BY keys of this fused scan?  Argument 2 + i is key i's right operand, in
+ * the planner's key order: each channel's query, then the weights transport.
+ *
+ * TYPED BY THE SCAN KEY, so a direct SQL call can never get a datum read as the
+ * wrong type: the executor sets an ORDER BY key's sk_subtype to its operator's
+ * right type, and the argument's own type must be that one.  A key without a
+ * subtype -- weave_fuse_search() builds its keys by hand -- never matches, which
+ * costs nothing: that scan runs inside one SRF call and no target list is
+ * evaluated while it is live.  Each value is compared with the scan's own copy
+ * (fuseQ/fuseV/fuseW), not with sk_argument, which belongs to the executor.
+ */
+static bool
+weave_curfuse_keys_match(FunctionCallInfo fcinfo, IndexScanDesc scan,
+						 WeaveScanOpaque so)
+{
+	int			i;
+	int			j = 0;
+
+	for (i = 0; i < scan->numberOfOrderBys; i++)
+	{
+		ScanKey		sk = &scan->orderByData[i];
+		Datum		d = PG_GETARG_DATUM(i + 2);
+
+		if (!OidIsValid(sk->sk_subtype) ||
+			get_fn_expr_argtype(fcinfo->flinfo, i + 2) != sk->sk_subtype)
+			return false;
+		if (sk->sk_strategy == WEAVE_STRAT_FUSE_WEIGHTS)
+		{
+			ArrayType  *a = DatumGetArrayTypeP(d);
+
+			if (ARR_NDIM(a) != 1 || ARR_HASNULL(a) ||
+				ARR_ELEMTYPE(a) != FLOAT4OID || ARR_DIMS(a)[0] != so->nfuse ||
+				memcmp(ARR_DATA_PTR(a), so->fuseW,
+					   so->nfuse * sizeof(float4)) != 0)
+				return false;
+			continue;
+		}
+		if (j >= so->nfuse || so->fuseStrat[j] != sk->sk_strategy)
+			return false;
+		if (so->fuseStrat[j] == WEAVE_STRAT_DISTANCE)
+		{
+			if (!weave_query_same(so->fuseQ[j], DatumGetWQuery(d)))
+				return false;
+		}
+		else
+		{
+			WVec	   *v = DatumGetWVec(d);
+
+			if (VARSIZE_ANY(v) != VARSIZE_ANY(so->fuseV[j]) ||
+				memcmp(v, so->fuseV[j], VARSIZE_ANY(v)) != 0)
+				return false;
+		}
+		j++;
+	}
+	return j == so->nfuse;
+}
+
+/*
+ * weave_current_fused_distance(index regclass, row_ctid tid, VARIADIC "any")
+ * -> float8: the fused route's weave_current_distance() (doc/GAPS.md G86).
+ *
+ * The planner hook (src/am/customscan.c) replaces the hidden sort-key copy of
+ * `ORDER BY fuse(...)` with
+ *
+ *     COALESCE(weave_current_fused_distance(index, ctid, q1, ..., qn, weights),
+ *              fuse(...))
+ *
+ * where q1..qn and weights are the right operands of the scan's ORDER BY keys.
+ * This answers the value the live fused scan on `index` stored for that heap
+ * TID: the fused -S of a ranked row, or the padding value of a padded one (0
+ * lexical-only, +Infinity with a vector key; NULL, and so the fallback, for a
+ * row whose fuse() is NULL).  NULL when no live fused scan has exactly those
+ * keys and that row, which includes every call outside such a scan.
+ */
+PG_FUNCTION_INFO_V1(weave_current_fused_distance);
+
+Datum
+weave_current_fused_distance(PG_FUNCTION_ARGS)
+{
+	Oid			indexoid = PG_GETARG_OID(0);
+	ItemPointer tid = PG_GETARG_ITEMPOINTER(1);
+	int			nkeys = PG_NARGS() - 2;
+	WeaveScanOpaque best = NULL;
+	dlist_iter	it;
+
+	/* `VARIADIC array` packs the keys into one argument: not the planted form */
+	if (get_fn_expr_variadic(fcinfo->flinfo))
+		PG_RETURN_NULL();
+	dlist_foreach(it, &weave_curdist_live)
+	{
+		WeaveScanOpaque so = dlist_container(WeaveScanOpaqueData, curdistNode,
+											 it.cur);
+		IndexScanDesc scan = so->curdistScan;
+
+		if (!so->fuseScan || so->curdistIndex != indexoid ||
+			scan->numberOfOrderBys != nkeys ||
+			!ItemPointerEquals(&scan->xs_heaptid, tid))
+			continue;
+		if (!weave_curfuse_keys_match(fcinfo, scan, so))
+			continue;
+		/* the latest publication wins, as in weave_current_distance() */
 		if (best == NULL || so->curdistSeq > best->curdistSeq)
 			best = so;
 	}
@@ -3877,7 +4015,7 @@ weave_pad_emit(IndexScanDesc scan, WeaveScanOpaque so, ItemPointer tid,
 	dist[0].isnull = nulldist;
 	index_store_float8_orderby_distances(scan, typ, dist, false);
 	/* the value the stream orders this row at, which is what a sort key reads */
-	if (weave_curdist_lexical(scan, so))
+	if (weave_curdist_wanted(scan, so))
 		weave_curdist_note(scan, so, dist[0].value, dist[0].isnull);
 }
 
@@ -4534,7 +4672,7 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 		dist[0].value = so->ordered[so->ordpos].score;
 		dist[0].isnull = false;
 		index_store_float8_orderby_distances(scan, typ, dist, false);
-		if (weave_curdist_lexical(scan, so))
+		if (weave_curdist_wanted(scan, so))
 			weave_curdist_note(scan, so, dist[0].value, false);
 	}
 	so->ordpos++;
@@ -4896,6 +5034,42 @@ done:
 }
 
 /*
+ * Is every match of q inside the union of its fuzzy/regex leaves' matches?
+ * That union is the only candidate set the fuzzy/regex collect path builds, so
+ * it is sound only when this holds: AND (and PHRASE, a subset of AND) needs one
+ * covered arm, OR needs both, NOT never.  `a | b~1`, `!b~1` and `a & !/re/`
+ * are not covered and returned only the leaves' rows (G93) -- the recheck can
+ * shrink a candidate set, never add to it.
+ */
+static bool
+weave_query_fr_covered(WeaveQuery q)
+{
+	bool	   *st = (bool *) palloc(Max(q->nitems, 1) * sizeof(bool));
+	int			top = 0;
+	uint32		i;
+	bool		r;
+
+	for (i = 0; i < q->nitems; i++)
+	{
+		WeaveQueryItem *it = &q->items[i];
+
+		if (it->type == WEAVE_QI_VAL)
+			st[top++] = (it->flags & (WEAVE_QF_FUZZY | WEAVE_QF_REGEX)) != 0;
+		else if (it->op == WEAVE_OP_NOT)
+			st[top - 1] = false;
+		else
+		{
+			top--;
+			st[top - 1] = (it->op == WEAVE_OP_OR) ? (st[top - 1] && st[top])
+				: (st[top - 1] || st[top]);
+		}
+	}
+	r = (top == 1 && st[0]);
+	pfree(st);
+	return r;
+}
+
+/*
  * weave_collect_matches: evaluate the scan's query across all segments + the
  * pending list; return matching TIDs (sorted, unique) and a *recheck flag
  * (true iff any term used the over-generating trigram funnel / NOT-universe
@@ -4910,6 +5084,7 @@ weave_collect_matches(Relation index, WeaveQuery query, TidSet *out, bool *reche
 	int			pending_cap;
 	WeaveTombstones seg_tombs;
 	bool		has_fuzzy_regex = false;
+	bool		fr_covered = false;	/* see weave_query_fr_covered */
 	bool		has_not = false;
 	bool		has_phrase = false;
 	bool		has_weighted = false;
@@ -4977,6 +5152,8 @@ collect_retry:
 			has_weighted = true;
 	}
 
+	fr_covered = has_fuzzy_regex && weave_query_fr_covered(query);
+
 	/*
 	 * A weight-restricted (term:LABEL) query cannot be answered from the index
 	 * alone -- the posting positions carry only the ordinal, not the field
@@ -5028,7 +5205,8 @@ collect_retry:
 
 			cands.tids = NULL;
 			cands.n = 0;
-			for (qi = 0; qi < query->nitems; qi++)
+			/* not covered: any_trgm stays false, so the universe fallback */
+			for (qi = 0; fr_covered && qi < query->nitems; qi++)
 			{
 				WeaveQueryItem *it = &query->items[qi];
 				TidSet		ts;
@@ -7615,7 +7793,13 @@ weave_query_is_pure_or(WeaveQuery q)
 
 		if (it->type == WEAVE_QI_VAL)
 		{
-			if (it->flags & (WEAVE_QF_PREFIX | WEAVE_QF_FUZZY | WEAVE_QF_REGEX))
+			/*
+			 * WEIGHTED too (G93): a posting carries no zone label, so neither
+			 * the disjunction nor the cursor-presence gate can tell `fox:A`
+			 * from `fox`; the collect path's heap recheck can.
+			 */
+			if (it->flags & (WEAVE_QF_PREFIX | WEAVE_QF_FUZZY | WEAVE_QF_REGEX |
+							 WEAVE_QF_WEIGHTED))
 				return false;
 		}
 		else					/* operator */
@@ -7654,7 +7838,13 @@ weave_query_is_pure_boolean(WeaveQuery q)
 
 		if (it->type == WEAVE_QI_VAL)
 		{
-			if (it->flags & (WEAVE_QF_PREFIX | WEAVE_QF_FUZZY | WEAVE_QF_REGEX))
+			/*
+			 * WEIGHTED too (G93): a posting carries no zone label, so neither
+			 * the disjunction nor the cursor-presence gate can tell `fox:A`
+			 * from `fox`; the collect path's heap recheck can.
+			 */
+			if (it->flags & (WEAVE_QF_PREFIX | WEAVE_QF_FUZZY | WEAVE_QF_REGEX |
+							 WEAVE_QF_WEIGHTED))
 				return false;
 		}
 		else					/* operator */
@@ -8353,7 +8543,9 @@ weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
 		 * regex EXPANSION (no posting for the literal term) is never generated as
 		 * a ranked candidate.  The recheck only shrinks, so ranked fuzzy/prefix/
 		 * regex results are a correct SUBSET of the @@@ matches, not the full set.
-		 * PHRASE/NEAR/boolean are exact.  Use @@@ for exhaustive fuzzy/prefix.
+		 * PHRASE/NEAR and NOT-free boolean are exact.  A NOT is a subset too: a
+		 * row matching only through it has no positive literal term to be
+		 * generated by (doc/GAPS.md G93, open).  Use @@@ for exhaustive answers.
 		 *
 		 * TidSet is TID-sorted and weave_tid_to_docid is monotonic in TID
 		 * order, so the docid array comes out sorted (binary-searchable).
