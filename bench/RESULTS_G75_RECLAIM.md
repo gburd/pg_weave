@@ -228,7 +228,10 @@ blocks)`. The A/B, ten runs per arm, one host, each arm a distinct `.so`
 | `nofit` | no | yes | **3 of 10** |
 | `base` | yes | yes | **3 of 10** |
 
-The allocator counters of the three VACUUMs after the DELETE (the control's own trail)
+The counts alone are weak evidence. Each arm against `pre` gives p ≈ 0.2–0.5 (Fisher). The
+three fixed arms pooled are 8 of 30 against 0 of 10, p ≈ 0.08, and G73 records one failure
+of this control on a tree that did not touch VACUUM. The stronger evidence is the shape of
+the failures. The allocator counters of the three VACUUMs after the DELETE (the control's own trail)
 show the shape. On `pre`, VACUUM 1 always runs a share-lock pass (`lowfree_reuse` about
 200, 70–163 extends) and ends at 260–870 pages, and VACUUM 2 finishes the job (about 250).
 On every failing run of every arm, VACUUM 1 runs no pass (`lowfree_reuse` 0), VACUUMs 2
