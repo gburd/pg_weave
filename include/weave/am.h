@@ -1274,6 +1274,9 @@ weave_segwrite_barrier(Relation index)
  * (src/am/amcheck.c says why it must be one walk). */
 extern uint8 *weave_reach_map(Relation index, const WeaveMetaPageData *meta,
 							  BlockNumber nblocks, bool *complete);
+/* L23: NULL if every chain of `seg` is intact, else a palloc'd description.
+ * The merge's pre-flight over its inputs; src/am/amcheck.c says why. */
+extern char *weave_bolt_damage(Relation index, const WeaveSegMeta *seg);
 /* The reclaim itself (src/am/amvacuum.c): returns the pages freed */
 extern int64 weave_reclaim_unreachable(Relation index, XLogRecPtr fence, int elevel);
 /* Allocation for a page linked IN THE SAME RECORD that writes it (the pending
