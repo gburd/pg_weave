@@ -5821,8 +5821,8 @@ Tests, `sql/score_reuse.sql` §9, expected output from a full EC2 installcheck:
 **Mutants** (`bench/aws/g86f_job.sh` stage C, run `pgweave-20261008-074244-b985`; each BUILT,
 installed with a different `.so` md5, then run against the solo baseline; the unmutated tree
 passed solo before and after): **8 of 8 killed.**
-`visible` (500 of 500 visible values changed); `prevrow` (9 + 385 wrong row values, every
-WITH TIES / rescan / cursor check, the padding values); `padzero` (0 of 100 padded rows at
+`visible` (500 of 500 visible values changed); `prevrow` (59 and 385 wrong fused row values in 9c, and
+the lexical sections' 9; every WITH TIES, rescan and cursor check; the padding values); `padzero` (0 of 100 padded rows at
 0); `padinf` (the +Infinity row published as 0); `unkeyed` (clobber A 14 wrong, B 30 wrong);
 `noweights` (clobber A 14 wrong); `noroute` (clobber D 30 wrong); `nopublish` (every
 published value NULL).
