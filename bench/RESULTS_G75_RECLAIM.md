@@ -302,9 +302,11 @@ What each arm's allocator counters show (`weave_alloc_stats()` around every INSE
   peaks the file at 2.96×. Cycle 10's compacts it to 1.10×, and cycles 11–14 repeat cycles
   1–4 to within 29 pages. **Growth 2 fires here**, without a crash: every INSERT after a
   plain VACUUM shows `fsm_defer` 1,947 = `extend` 1,947, the xid collision. But it is a
-  constant one-batch pool, about 5 % of the index. The INSERT extends its batch and the
-  next VACUUM's flush reuses the 1,947 pages the INSERT could not, so with the collision
-  fixed the per-cycle growth would still be one bolt.
+  constant one-batch pool, about 5 % of the index, and the pool exists with or without
+  the collision. The INSERT extends its batch, and the next VACUUM's flush reuses the 1,947
+  pages the INSERT could not and frees the batch it flushed. With the collision fixed, the
+  INSERT would reuse the pool and the flush would extend instead. Either way the cycle
+  grows by one bolt and leaves one batch free.
 - **(b) shows no xid collision.** Every INSERT after an autovacuum reuses its pages
   (`fsm_reuse` 1,946, `extend` 0). Something assigns an xid between autovacuum's free and
   the next INSERT. Autoanalyze is the likely candidate; that is not demonstrated. The
