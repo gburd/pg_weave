@@ -5789,7 +5789,7 @@ documents, two lexical channels at LIMIT 400 took 18 ms, and 17.6 ms of that was
   `fuseW`) are byte-equal to the arguments. Each argument's type must be the key's
   `sk_subtype`, so a hand-written call can never get a datum read as the wrong type. It
   answers NULL otherwise, which includes every call outside a scan. **The name is
-  provisional**: the lead was told it on 2026-10-08 and did not object before merge-ready.
+  provisional and awaits a lead decision** (the lexical function's name was one).
 - **Route separation, the one new hazard.** A fused scan's `so->query` can hold its WHERE
   clause's `@@@` query. So a lexical lookup that keyed only on (index, TID, query) would
   answer from a fused scan nested in its Filter. `weave_current_distance()` now skips
