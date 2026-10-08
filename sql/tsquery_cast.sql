@@ -165,3 +165,20 @@ EXPLAIN (COSTS OFF)
 SELECT id FROM tc WHERE tsv @@@ 'fox:A'::wquery ORDER BY tsv <=> 'fox:A'::wquery LIMIT 1000;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
+
+-- ---- the index's other inexact leaves (native wquery, no cast) ------------
+-- With any fuzzy or regex leaf the collector's candidate set was the union of
+-- those leaves' matches, whatever the rest of the query said, so an OR with a
+-- plain term or any NOT returned only the leaves' rows.  Seqscan vs both indexes.
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SELECT q, (SELECT count(*) FROM tc WHERE to_wdoc(tsv) @@@ q::wquery) AS heap,
+	   weave_count('tc_expr', q::wquery) AS expr_ix,
+	   weave_count('tc_tsv', q::wquery) AS tsv_ix
+  FROM (VALUES ('brwn~1'), ('quick | brwn~1'), ('!brwn~1'), ('quick & !brwn~1'),
+			   ('!(quick & brwn~1)'), ('/fo.*/'), ('dog | /fo.*/'), ('!/fo.*/'),
+			   ('dog & !/fo.*/'), ('brwn~1 & /fo.*/'), ('brwn~1 | /fo.*/'),
+			   ('!(brwn~1 | /fo.*/)'), ('"quick brwn~1"'), ('quick & (dog | brwn~1)'),
+			   ('quick | (dog & brwn~1)')) v(q);
+RESET enable_indexscan;
+RESET enable_bitmapscan;

@@ -4916,6 +4916,42 @@ done:
 }
 
 /*
+ * Is every match of q inside the union of its fuzzy/regex leaves' matches?
+ * That union is the only candidate set the fuzzy/regex collect path builds, so
+ * it is sound only when this holds: AND (and PHRASE, a subset of AND) needs one
+ * covered arm, OR needs both, NOT never.  `a | b~1`, `!b~1` and `a & !/re/`
+ * are not covered and returned only the leaves' rows (G93) -- the recheck can
+ * shrink a candidate set, never add to it.
+ */
+static bool
+weave_query_fr_covered(WeaveQuery q)
+{
+	bool	   *st = (bool *) palloc(Max(q->nitems, 1) * sizeof(bool));
+	int			top = 0;
+	uint32		i;
+	bool		r;
+
+	for (i = 0; i < q->nitems; i++)
+	{
+		WeaveQueryItem *it = &q->items[i];
+
+		if (it->type == WEAVE_QI_VAL)
+			st[top++] = (it->flags & (WEAVE_QF_FUZZY | WEAVE_QF_REGEX)) != 0;
+		else if (it->op == WEAVE_OP_NOT)
+			st[top - 1] = false;
+		else
+		{
+			top--;
+			st[top - 1] = (it->op == WEAVE_OP_OR) ? (st[top - 1] && st[top])
+				: (st[top - 1] || st[top]);
+		}
+	}
+	r = (top == 1 && st[0]);
+	pfree(st);
+	return r;
+}
+
+/*
  * weave_collect_matches: evaluate the scan's query across all segments + the
  * pending list; return matching TIDs (sorted, unique) and a *recheck flag
  * (true iff any term used the over-generating trigram funnel / NOT-universe
@@ -4930,6 +4966,7 @@ weave_collect_matches(Relation index, WeaveQuery query, TidSet *out, bool *reche
 	int			pending_cap;
 	WeaveTombstones seg_tombs;
 	bool		has_fuzzy_regex = false;
+	bool		fr_covered = false;	/* see weave_query_fr_covered */
 	bool		has_not = false;
 	bool		has_phrase = false;
 	bool		has_weighted = false;
@@ -4997,6 +5034,8 @@ collect_retry:
 			has_weighted = true;
 	}
 
+	fr_covered = has_fuzzy_regex && weave_query_fr_covered(query);
+
 	/*
 	 * A weight-restricted (term:LABEL) query cannot be answered from the index
 	 * alone -- the posting positions carry only the ordinal, not the field
@@ -5048,7 +5087,8 @@ collect_retry:
 
 			cands.tids = NULL;
 			cands.n = 0;
-			for (qi = 0; qi < query->nitems; qi++)
+			/* not covered: any_trgm stays false, so the universe fallback */
+			for (qi = 0; fr_covered && qi < query->nitems; qi++)
 			{
 				WeaveQueryItem *it = &query->items[qi];
 				TidSet		ts;
