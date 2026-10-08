@@ -213,3 +213,35 @@ plus 1 % of the twin. Checked against the gate run's numbers offline, that asser
 the base (2,354 against an allowance of 866) and passes the `drop` arm (0).
 
 Gate for the second fix: `pgweave-20261008-081449-3b76`, `bench/aws/l22_gate2.sh`, results below.
+
+### LOSS: both fixes regress `t/028`'s truncation control, so L22 is NOT done
+
+The second fix's smoke (`pgweave-20261008-084355-13a3`, `eae415d`) failed one TAP
+assertion: `t/028` 113, `quiet plain VACUUM still truncates the index (4286 -> 4465
+blocks)`. The A/B, ten runs per arm, one host, each arm a distinct `.so`
+(`pgweave-20261008-090818-c96f`, `bench/aws/l22_t028.sh`):
+
+| arm | compaction fix (`weave_pack_fits_reusable`) | allocator fix (skip and put back) | `t/028` control failed |
+|---|---|---|---|
+| `pre` | no | no | **0 of 10** |
+| `noskip` | yes | no | **2 of 10** |
+| `nofit` | no | yes | **3 of 10** |
+| `base` | yes | yes | **3 of 10** |
+
+The allocator counters of the three VACUUMs after the DELETE (the control's own trail)
+show the shape. On `pre`, VACUUM 1 always runs a share-lock pass (`lowfree_reuse` about
+200, 70–163 extends) and ends at 260–870 pages, and VACUUM 2 finishes the job (about 250).
+On every failing run of every arm, VACUUM 1 runs no pass (`lowfree_reuse` 0), VACUUMs 2
+and 3 do nothing, and the file stays at 3,100–4,700 pages.
+
+So **the pass that starts with fewer reusable pages than live ones, which the compaction
+fix declines, is what reclaims in `t/028`'s case.** The statement in the first fix's
+comment that "that two-VACUUM shape never shrank" is true of `t/033` only, and is
+**RETRACTED** as a general claim. A likely reason, not demonstrated: with 90 % of the rows
+deleted, the pass's output is a small fraction of its input, and the page-counted live
+side does not see that. The allocator fix's failure looks like the retracted G75 change's
+mechanism: the extra reuse empties the pool of recyclable pages that the 256-page probe
+looks at. That is not demonstrated either.
+
+The `t/033` and scale results above stand as measurements of the mechanisms. The fixes
+trade those growths against this control, and that trade is not taken on the branch.
