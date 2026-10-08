@@ -54,6 +54,7 @@ SELECT invariant, ok FROM weave_check('cd_weave') ORDER BY invariant;
 SELECT invariant, ok FROM weave_check('cd_weave', true) ORDER BY invariant;
             invariant             | ok 
 ----------------------------------+----
+ bolt_chains_intact               | t
  chains_do_not_overlap            | t
  chandesc_coverage                | t
  chandesc_reachable               | t
@@ -74,7 +75,7 @@ SELECT invariant, ok FROM weave_check('cd_weave', true) ORDER BY invariant;
  vector_block_stats_match_codes   | t
  vector_coverage                  | t
  vector_warp_map_ascending        | t
-(20 rows)
+(21 rows)
 
 -- The only assertion that matters: nothing is violated.
 SELECT count(*) AS violations FROM weave_check('cd_weave', true) WHERE NOT ok;

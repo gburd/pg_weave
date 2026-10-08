@@ -712,6 +712,7 @@ CREATE INDEX dvt_idx ON dvt USING weave (body wdoc_lex_ops, cat text_docval_ops)
 SELECT invariant, ok FROM weave_check('dvt_idx', true) ORDER BY invariant;
             invariant             | ok 
 ----------------------------------+----
+ bolt_chains_intact               | t
  chains_do_not_overlap            | t
  chandesc_coverage                | t
  chandesc_reachable               | t
@@ -732,7 +733,7 @@ SELECT invariant, ok FROM weave_check('dvt_idx', true) ORDER BY invariant;
  vector_block_stats_match_codes   | t
  vector_coverage                  | t
  vector_warp_map_ascending        | t
-(20 rows)
+(21 rows)
 
 SELECT count(*) AS violations FROM weave_check('dvt_idx', true) WHERE NOT ok;
  violations 
@@ -791,6 +792,7 @@ SELECT count(*) >= 24 AS docvalues_weft_covers_all_inputs
 SELECT invariant, ok FROM weave_check('dvtm_idx', true) ORDER BY invariant;
             invariant             | ok 
 ----------------------------------+----
+ bolt_chains_intact               | t
  chains_do_not_overlap            | t
  chandesc_coverage                | t
  chandesc_reachable               | t
@@ -811,7 +813,7 @@ SELECT invariant, ok FROM weave_check('dvtm_idx', true) ORDER BY invariant;
  vector_block_stats_match_codes   | t
  vector_coverage                  | t
  vector_warp_map_ascending        | t
-(20 rows)
+(21 rows)
 
 SELECT count(*) AS violations FROM weave_check('dvtm_idx', true) WHERE NOT ok;
  violations 

@@ -98,6 +98,7 @@ typedef struct WeaveCheckCtx
 	 */
 	BlockNumber seekblk;
 	bool		seekhit;
+	BlockNumber lastblk;		/* the last page the latest walk accepted */
 
 	/*
 	 * L23: also check each bolt's RECORDED LENGTHS -- the dictionary's entry
@@ -258,6 +259,7 @@ wvck_walk_chain_5kinds(WeaveCheckCtx *cx, BlockNumber blk, WeavePageKind want,
 		}
 		UnlockReleaseBuffer(buf);
 		wvck_mark(cx, blk);
+		cx->lastblk = blk;
 		if (blk == cx->seekblk)
 			cx->seekhit = true;
 		n++;
@@ -1603,6 +1605,7 @@ wvck_bolt_dict_count(WeaveCheckCtx *cx, const WeaveSegMeta *seg, StringInfo e)
 {
 	BlockNumber blk = seg->dictstart;
 	BlockNumber lastposting = InvalidBlockNumber;
+	BlockNumber lastdict = InvalidBlockNumber;
 	int64		npages = 0;
 	uint64		nent = 0;
 
@@ -1644,13 +1647,14 @@ wvck_bolt_dict_count(WeaveCheckCtx *cx, const WeaveSegMeta *seg, StringInfo e)
 			ptr += MAXALIGN(offsetof(WeaveDictEntry, term) + de->termlen);
 		}
 		UnlockReleaseBuffer(buf);
+		lastdict = blk;
 		blk = next;
 	}
 	if (nent != (uint64) seg->nterms)
 	{
 		wvck_sep(e);
-		appendStringInfo(e, "the dictionary chain holds %llu terms but the bolt directory says %u",
-						 (unsigned long long) nent, seg->nterms);
+		appendStringInfo(e, "the dictionary chain ends at block %u holding %llu terms but the bolt directory says %u",
+						 lastdict, (unsigned long long) nent, seg->nterms);
 		cx->incomplete = true;	/* the pages past a cut are live, not leaked */
 	}
 	return lastposting;
@@ -1838,12 +1842,13 @@ wvck_mark_bolt(WeaveCheckCtx *cx, const WeaveSegMeta *seg, StringInfo e)
 			lastposting = wvck_bolt_dict_count(cx, seg, e);
 		cx->seekblk = lastposting;
 		cx->seekhit = false;
+		cx->lastblk = InvalidBlockNumber;
 		(void) wvck_walk_chain(cx, postchain, WEAVE_PK_POSTING, e);
 		if (lastposting != InvalidBlockNumber && !cx->seekhit)
 		{
 			wvck_sep(e);
-			appendStringInfo(e, "the shared posting chain does not reach block %u, where the last term's postings start",
-							 lastposting);
+			appendStringInfo(e, "the shared posting chain ends at block %u and does not reach block %u, where the last term's postings start",
+							 cx->lastblk, lastposting);
 			cx->incomplete = true;
 		}
 		cx->seekblk = InvalidBlockNumber;
