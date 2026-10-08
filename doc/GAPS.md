@@ -6580,7 +6580,7 @@ native fuzzy/regex-under-boolean queries, seqscan against both indexes. Mutants:
 `bench/aws/g93_mutants.sh` (M1-M10, each verified BUILT with an installed `.so` that
 differs from the clean one).
 
-### G94 — WRONG ANSWER: the ranked scan `WHERE d @@@ q ORDER BY d <=> q` returns a SUBSET when q contains a NOT (or a prefix) — **FOUND 2026-10-08 by G93's test; FIXED 2026-10-08 on `wt/g94` for the ordering scan (NOT, prefix, fuzzy and regex alike); the `weave_search()` SRF is still a subset**
+### G94 — WRONG ANSWER: the ranked scan `WHERE d @@@ q ORDER BY d <=> q` returns a SUBSET when q contains a NOT (or a prefix) — **FOUND 2026-10-08 by G93's test; FIXED 2026-10-08 on `wt/g94` for the ordering scan (NOT, prefix, fuzzy and regex alike), and on `wt/g94s` for the `weave_search()` SRF**
 
 Split out of G93 (see its "Still open" paragraph for the evidence). Candidates come only
 from q's positive literal terms (the WAND cursors), so a row that matches q only through a
@@ -6686,11 +6686,8 @@ ranked rows already fill the LIMIT pays nothing (`rare | !w1` LIMIT 10), and cov
 are unchanged.
 
 **Remaining limits, stated.**
-- **`weave_search()` is still a subset** for an uncovered query: it shares the ranked
-  pass and has no padding phase. Its rows past the ranked ones would all be at score 0, so
-  the fix there is "append the rest of the match set at 0"; not done (not in this task's
-  gate, and the SRF's `k` makes it cheap when wanted). `src/am/amscan.c`'s collect-site
-  comment says so.
+- ~~**`weave_search()` is still a subset**~~ for an uncovered query. **FIXED 2026-10-08 on
+  `wt/g94s`**, see "The `weave_search()` remainder" below.
 - **Beyond `WEAVE_ORD_WIDTH_MAX` (~67M) ranked candidates** the ladder stops and the
   padding would emit the rest at 1.0 while some still score above 0 -- out of order. The
   same ceiling already bounds every other route's ranked phase; unreachable at today's
@@ -6701,6 +6698,78 @@ are unchanged.
 - **The padding's first-row cost is O(match set)** (above). Cheaper would be a streaming
   walk of the gate set that skips ranked TIDs without materializing it -- the G76 walk
   already streams its emission; it is the collection that is whole. Not done.
+
+**The `weave_search()` remainder (2026-10-08, `wt/g94s`, maintainer decision 2026-10-08).**
+`weave_search(index, q, k)` ran the same ranked pass with no padding phase, so for an
+uncovered q it returned only the matches that hold a literal term. By the proof above, every
+other match scores exactly 0. So `weave_topk_visible()` now calls `weave_topk_pad()` when it
+came back with fewer than k rows, the query is not covered (`weave_query_lit_covered()`)
+**and ranked generation was exhausted** (`ncand < wantk`). Past the over-fetch growth cap a
+row holding a literal term could still be unranked, and padding then would put a 0 above it.
+`weave_topk_pad()` collects q's match set, drops the TIDs already ranked, and keeps the first
+k - nvis that pass `weave_recheck_exact()` (visibility plus exact match: the collected set
+over-generates for a NOT over a phrase or a weighted leaf). That function now takes a limit,
+so the heap fetches are bounded by k rather than by the match set. It appends those rows at
+score 0. Its TIDs come out of the index, so they are HOT-chain roots like the ranked ones:
+G74's behaviour is unchanged, and `sql/ranked_not.sql` maps TIDs through its root map for
+that reason. The ordering scan's padding machinery (`weave_pad_begin()`) is not reused: it
+lives on the scan descriptor and streams through `amgettuple`, while the SRF needs a bounded
+array. What they share is the collector, the recheck and the coverage predicate.
+
+*`weave_fuse_search()` and a fused ordering scan with a NOT: no hole.* `weave_fuse_search()`
+takes no restriction, and its lexical-only answer already pads every unreached document at
+-0 (FUSED_TOPK.md sect. 7e). A fused ordering scan always pads (`weave_pad_wanted()` returns
+true for `fuseScan`, G71). `sql/ranked_not.sql` block 6 pins both: `weave_fuse_search(['!fox',
+'dog'])` returns every non-NULL document, and `WHERE d @@@ '!fox' ORDER BY fuse(d <=> 'dog',
+d <=> 'fox')` returns exactly the 1,598 matches, with 0 duplicated, short or extra. No
+mutant was run against block 6, because no code changed there.
+
+*Gate evidence (EC2 Debian 13, PG17.11),* run `pgweave-20261008-162641-39d3` (commit
+`c02d7b6`; smoke tolerated red only because the two expected files were owed; full-run output
+read, then committed as `28e7e04`):
+- `sql/ranked_not.sql` block 5: for each of the 18 queries, `weave_search()` at k = 100000,
+  1, the ranked count, ranked + 3 and match count - 1. At k = 100000 it returns exactly the
+  heap's `@@@` set (short, extra and dup all 0), scores never rise, and a row is at score 0
+  exactly when it holds no literal term. At every smaller k it returns exactly
+  least(k, nmatch) matching rows, at the full list's scores. All 0.
+- `sql/tsquery_cast.sql`: the `weave_search()` caveat is gone. A row the ordering scan
+  returns that `weave_search(.., 1000)` does not counts as `MISORDERED` (it used to be
+  coalesced to 1.0). Every verdict is unchanged, still `same 160`.
+- The expected-output diff is only the new comments, blocks 5 and 6, and `tsquery_cast`'s
+  function text. No result row of blocks 1-4 or of `tsquery_cast` changed (hard rule 3; read
+  line by line). Solo control: the clean tree run twice gives 0 diff lines, and full-run vs
+  solo gives 0 lines for each file.
+- **Mutants 3/3** (`bench/aws/g94s_job.sh` stage C). Each was asserted to APPLY, BUILD and
+  INSTALL a `.so` whose md5 differs from the clean one, and each was KILLED:
+  - S1, no padding: block 5 is `short` 1,581 of 1,598 for `!fox`, and `tsquery_cast` turns
+    35 rows `MISORDERED` (all with a prefix or a NOT).
+  - S2, padding cut to k but not rechecked: `extra` on 14 queries, deleted rows and the 180
+    `!"quick brown"` non-matches.
+  - S3, padding not stopped at k: `bad_k` on every uncovered query.
+
+  After the mutants the clean `.so` reinstalled with the clean md5, and the rerun gave
+  0 diff lines.
+- PG18.0 installcheck (regression + isolation), with the new outputs as expected: all 32
+  plus 2 passed.
+
+*Latency, a LOSS by construction, recorded (hard rule 8)* (stage D, the G94 fixture:
+c7i.4xlarge, median of 12 after 3 warm-up, two runs per arm `run1 / run2`; "before" is this
+tree with S1 applied):
+
+| query | k | 200k before (rows) | 200k after | 1M before (rows) | 1M after |
+|---|---|---|---|---|---|
+| `!w1` | 10 | 0.73 / 0.74 ms (**0**) | 30.3 / 30.0 ms | 3.73 / 3.92 ms (**0**) | 149.2 / 149.0 ms |
+| `!w1` | 1000 | 0.73 / 0.73 ms (**0**) | 30.1 / 30.3 ms | 3.66 / 3.83 ms (**0**) | 149.1 / 150.0 ms |
+| `rare \| !w1` | 10 | 0.25 / 0.26 ms | 0.25 / 0.26 ms | 0.73 / 0.74 ms | 0.74 / 0.73 ms |
+| `rare \| !w1` | 5000 | 1.00 / 1.02 ms (**400**) | 36.7 / 36.7 ms | 5.36 / 5.58 ms (**2000**) | 183.1 / 184.5 ms |
+| `w2 & !w1` (covered) | 10 | 2.56 / 2.54 ms | 2.57 / 2.53 ms | 12.6 / 13.0 ms | 12.8 / 13.5 ms |
+| `w1` (covered) | 10 | 0.07 / 0.07 ms | 0.07 / 0.07 ms | 0.27 / 0.29 ms | 0.28 / 0.29 ms |
+
+Every "after" row count equals k, and "before" was fast because it answered 0 of 180,000 /
+900,000 matches. The cost is G95's: collecting q's whole match set, linear in it (5.0x from
+200k to 1M) and independent of k. A query whose ranked rows fill k pays nothing, and covered
+queries are unchanged within the within-arm spread. The same streaming walk G95 waits for
+would fix this too.
 
 ### G95 — an uncovered NOT / prefix / fuzzy / regex ranked scan costs O(match set) before its first padded row — **ACCEPTED FOR NOW by maintainer decision 2026-10-08; REVISIT when a streaming padding walk exists**
 
@@ -6716,4 +6785,9 @@ padded rows as they are found (they all share distance 1.0, so any order among t
 tie order), stopping when the executor stops pulling -- would make `LIMIT 10` cost O(10 / match
 density) instead of O(match set). When that exists, re-measure this entry's two queries at the
 same two scales and close it. Covered queries (`fox & !dog`) never pad and are unaffected.
+
+**`weave_search()` has the same cost since 2026-10-08** (G94's SRF remainder,
+`weave_topk_pad()`): `!w1` at k = 10 takes 30 ms at 200k and 149 ms at 1M
+(`pgweave-20261008-162641-39d3`, two runs per arm). It is the same collection, and the
+streaming walk should serve both. Re-measure it in the same revisit.
 
