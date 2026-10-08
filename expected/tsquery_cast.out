@@ -78,8 +78,9 @@ BEGIN
 	-- q's literal terms, so a prefix expansion or a row matching only through
 	-- NOT is reached by the padding phase (doc/GAPS.md G94; it was a SUBSET).
 	-- 'same' needs the set AND the order: each row at the distance the scan
-	-- published for it, that distance weave_search()'s (1.0 for a row it does
-	-- not rank), and the stream non-decreasing.
+	-- published for it, that distance weave_search()'s (which returns every
+	-- match too, a padded one at score 0, distance 1.0), and the stream
+	-- non-decreasing.  A row weave_search() does not return is 'MISORDERED'.
 	SET LOCAL enable_seqscan = off;
 	SET LOCAL enable_bitmapscan = off;
 	FOR rr IN SELECT id, ctid AS t, weave_current_distance('tc_tsv', ctid, wq) AS cur
@@ -95,8 +96,8 @@ BEGIN
 	  FROM (SELECT u.cur, lag(u.cur) OVER (ORDER BY u.o) AS prev, s.score
 			  FROM unnest(tids, curs) WITH ORDINALITY u(t, cur, o)
 			  LEFT JOIN weave_search('tc_tsv', wq, 1000) s ON s.ctid = u.t) z
-	 WHERE cur IS NULL OR cur < prev
-		OR abs(cur - coalesce(1.0 / (1.0 + score), 1.0)) > 1e-9;
+	 WHERE cur IS NULL OR cur < prev OR score IS NULL
+		OR abs(cur - 1.0 / (1.0 + score)) > 1e-9;
 	ranked := CASE WHEN r = core AND bad = 0 THEN 'same'
 				   WHEN r = core THEN 'MISORDERED'
 				   WHEN r <@ core THEN 'subset'
