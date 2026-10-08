@@ -117,3 +117,56 @@ What it says, before anything is built:
   holds for the lexical route.
 - A third query (`fuse(d <=> 'a | b', d <=> 'c')`) produced no numbers: the job split its
   arguments on `|`. It is a harness bug, not a result, and the cell was dropped.
+
+## The fused route, built: reuse off vs on (2026-10-08, `wt/g86f`)
+
+**Run:** `pgweave-20261008-074244-b985`, c7i.4xlarge, Debian 13, PostgreSQL 17, commit
+`3008a6a`. Job script `bench/aws/g86f_job.sh` stage D, the prize job's corpus and queries,
+`pg_weave.reuse_distance` off and on, median of 25 warm runs after 5 discarded, two runs per
+arm. The smoke on that host was red only on `score_reuse` (its expected file was owed) and
+`limit_hint_fuse` (the two substituted `Output:` lines, intended; see G86).
+
+**Evidence each arm ran what it says:** each cell records the GUC from `pg_settings`, the
+count of `weave_current_fused_distance` lines in its own `EXPLAIN VERBOSE` (2 on, 0 off), the
+`<~>` transport (1 in every cell: a fused index scan), the md5 of the returned id list, and
+the per-row function calls from `track_functions`. **Identical md5 on and off in every cell**,
+so the answer did not change. Calls with reuse on: only `weave_current_fused_distance`, once
+per row. With it off: `lexlex` 400 `fuse`, 800 `weave_distance`, 800 `weave_lexscore` at
+LIMIT 400; `lexvec` 400 each of `fuse`, `weave_distance`, `weave_lexscore`,
+`wvec_l2_distance`, `weave_l2score`.
+
+| kind | n | query | LIMIT | ms off (run 1 / 2) | ms on (run 1 / 2) |
+|---|---:|---|---:|---|---|
+| long | 50000 | lexlex | 10 | 0.530 / 0.532 | **0.047 / 0.049** |
+| long | 50000 | lexlex | 400 | 20.199 / 20.194 | **0.256 / 0.254** |
+| long | 50000 | lexvec | 10 | 5.467 / 5.480 | **5.154 / 5.175** |
+| long | 50000 | lexvec | 400 | 22.418 / 22.472 | **11.701 / 11.854** |
+| long | 200000 | lexlex | 10 | 0.609 / 0.608 | **0.125 / 0.127** |
+| long | 200000 | lexlex | 400 | 20.279 / 20.925 | **0.416 / 0.414** |
+| long | 200000 | lexvec | 10 | 20.698 / 21.708 | 20.351 / 21.145 |
+| long | 200000 | lexvec | 400 | 56.448 / 56.505 | **46.329 / 44.959** |
+| short | 200000 | lexlex | 10 | 0.257 / 0.260 | 0.259 / 0.264 |
+| short | 200000 | lexlex | 400 | 2.059 / 2.066 | **2.011 / 1.998** |
+| short | 200000 | lexvec | 10 | 21.394 / 21.121 | 21.551 / 20.282 |
+| short | 200000 | lexvec | 400 | 45.380 / 43.308 | 44.968 / 42.399 |
+| short | 1000000 | lexlex | 10 | 0.677 / 0.673 | 0.672 / 0.703 |
+| short | 1000000 | lexlex | 400 | 2.899 / 2.882 | **2.832 / 2.829** |
+| short | 1000000 | lexvec | 10 | 98.822 / 95.922 | 98.618 / 105.264 |
+| short | 1000000 | lexvec | 400 | 192.445 / 206.198 | 195.695 / 194.191 |
+
+What it says:
+
+- **Long, TOASTed documents: the prize was collected.** Two lexical channels at LIMIT 400
+  drop from 20.2 to 0.255 ms at 50k (79x) and from 20.3-20.9 to 0.415 ms at 200k (49x). Both
+  land where `weave_fuse_search()` sat in the prize run (0.21 / 0.35 ms), so nothing is left
+  over. At LIMIT 10 the drop is 0.53 -> 0.048 ms and 0.61 -> 0.126 ms. With a vector channel
+  only the lexical half's detoast goes: 22.4 -> 11.8 ms at 50k and 56.5 -> 45.6 ms at 200k
+  at LIMIT 400. The rest is the vector channel's own scan, which this does not touch.
+- **Short documents: nothing, as predicted.** Two cells clear their spread: `lexlex` LIMIT
+  400 at 200k (2.06 -> 2.00 ms, 3 %) and at 1M (2.89 -> 2.83 ms, 2 %). Both are about the
+  0.07 ms the prize run measured as the hidden key's whole cost, and they reproduce at both
+  scales. Every `lexvec` short cell overlaps, with a within-arm spread (up to 14 ms at 1M)
+  far larger than anything reuse could remove.
+- **`lexvec` LIMIT 10 at 200k overlaps** (20.7/21.7 -> 20.4/21.1 ms): ten re-evaluations are
+  ~0.2 ms of a vector-dominated scan.
+- Synthetic corpus, as above: a mechanism measurement, not a real-corpus claim.
