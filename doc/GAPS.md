@@ -6518,7 +6518,7 @@ native fuzzy/regex-under-boolean queries, seqscan against both indexes. Mutants:
 `bench/aws/g93_mutants.sh` (M1-M10, each verified BUILT with an installed `.so` that
 differs from the clean one).
 
-### G94 — WRONG ANSWER: the ranked scan `WHERE d @@@ q ORDER BY d <=> q` returns a SUBSET when q contains a NOT (or a prefix) — **FOUND 2026-10-08 by G93's test; OPEN**
+### G94 — WRONG ANSWER: the ranked scan `WHERE d @@@ q ORDER BY d <=> q` returns a SUBSET when q contains a NOT (or a prefix) — **FOUND 2026-10-08 by G93's test; FIXED 2026-10-08 on `wt/g94` for the ordering scan (NOT, prefix, fuzzy and regex alike); the `weave_search()` SRF is still a subset**
 
 Split out of G93 (see its "Still open" paragraph for the evidence). Candidates come only
 from q's positive literal terms (the WAND cursors), so a row that matches q only through a
@@ -6539,3 +6539,97 @@ distance... which is NOT their correct rank if they score above some ranked row.
 fix has to either score the padding rows and merge, or refuse to order such a query by index
 (the planner hook could decline). `sql/tsquery_cast.sql` pins today's behaviour.
 
+**Fix (2026-10-08, `wt/g94`, option (a): pad, rechecked, and the order is provably exact).**
+Which rows the ranked pass misses, exactly: its WAND cursors are *every* literal term of
+q (`weave_query_terms()` flattens operators and keeps negated terms), and its gate admits
+exactly q's matches. So it emits precisely the matches that hold at least one literal
+term, each at its BM25 over the literal terms, and misses precisely the matches that hold
+none. A missed row therefore scores 0 and has distance exactly 1.0, which is the value
+the G56 padding emits it at and is >= every ranked distance (1/(1+S), S >= 0). The worry in
+the entry above -- a row matching through the NOT that "may contain positive terms from
+another branch" -- does not arise: such a row holds a literal term, so it was a candidate,
+the gate admitted it, and it was ranked at its own score. So `fox | !dog` emits the 411 fox
+rows by score, then the 1,369 rows holding neither term at 1.0, and that is the
+heap-and-sort answer's order. The same argument covers a prefix, fuzzy or regex leaf: a
+row matching only through an expansion holds no literal term (the literal `fo` of `fo*` is
+one, so a document containing `fo` ranks; one with `fox` alone pads).
+
+*Code (`src/am/amscan.c`):* `weave_pad_wanted()` now pads when the restriction IS the
+ORDER BY query but the query is not covered by its literal terms,
+`weave_query_lit_covered()`: plain leaf covered; prefix/fuzzy/regex leaf and every NOT
+not; AND/PHRASE covered by one arm, OR only by both; the empty query covered (it matches
+nothing). It and G93's `weave_query_fr_covered()` are one function now,
+`weave_query_leaves_cover()`, asked two questions. `fox & !dog`, `fox & fo*` and
+`fox & !"quick brown"` are covered and do not pad. The padding's recheck
+(`xs_recheck = numberOfKeys > 0`, unchanged) is what keeps its rows to q's matches: the
+gate walk (G76) walks q's collected set, which over-generates for a NOT over a phrase or a
+weighted leaf (G93's "inexact" NOT is the universe). No new SQL object, no format change.
+
+*Gate evidence (EC2 Debian 13, PG17.11).* Run `pgweave-20261008-133259-ef07` (commit
+`2179ddd`, smoke tolerated red only because the new expected files were owed; full-run
+output inspected, then committed as `25e7cff`):
+- `sql/tsquery_cast.sql`'s `ranked` column now requires the SET equal to core `@@` AND
+  each row at the distance the scan published for it (`weave_current_distance()`), that
+  distance equal to `weave_search()`'s (1.0 for a row it does not rank), and the stream
+  non-decreasing. Hand-written: every prefix and NOT row `subset -> same` (10 rows); random:
+  `same 125, subset 35` -> **`same 160`**. The expected-output diff is exactly those rows
+  and the new function text (hard rule 3; read line by line).
+- `sql/ranked_not.sql` (new, in `REGRESS`): 18 queries (NOT, NOT over a phrase, prefix,
+  fuzzy, regex, three covered controls, the empty-answer `zzz`) over 2,019 rows with zero-
+  term documents, NULL documents, pending inserts, UPDATEs, HOT updates and deletes. For
+  each: six windows (LIMIT 5, LIMIT just below and just above the ranked count, OFFSET across
+  the boundary, the tail, no LIMIT) checked for short / extra / duplicate rows, each row's
+  published distance against the oracle, and each row's distance against the oracle's
+  sorted position; a refcursor with `MOVE 20` and another ordering scan between fetches; a
+  rescan per outer row at LIMIT 3/500/5000; a plan check that each query is the ordering
+  scan. A third oracle that uses no index: a row is below the floor exactly when it holds a
+  literal term (`terms_ok`, true for all 17 non-empty queries). All `ok`.
+- `sql/weave.sql`'s `fuzzy_ranked_eq_bitmap` is now `t` (it was `f`, "by design").
+- Solo control: clean tree run twice, 0 diff lines; full-run vs solo 0 lines.
+- **Mutants 6/6** (`bench/aws/g94_job.sh` stage C), each asserted to APPLY, BUILD and
+  INSTALL a `.so` whose md5 differs from the clean one, then KILLED: P1 padding disabled
+  again (prefix/NOT rows back to `subset`); P2 padding rows not rechecked (`!"quick brown"`
+  returns 180 rows it should not, `SUPERSET`); P3 padding entered after the first pass
+  instead of after the ladder (`MISORDERED`, 279 rows misplaced in `fox | !dog` LIMIT 408);
+  P4 padding at 0.5, below the ranked distances (`MISORDERED`); P5 a prefix leaf counted as a
+  literal term (`subset`); P6 an OR covered by one arm (`fox | !dog` 425 of 1,780 rows).
+  After the mutants the clean `.so` reinstalled with the clean md5 and 0 diff lines.
+- PG18.0 installcheck: 31/32, the one failure `weave.out`'s `f -> t` above (expected owed at
+  that commit, committed in `25e7cff`).
+
+*Latency -- a LOSS, by construction, recorded (hard rule 8).* `bench/aws/g94_job.sh` stage
+D, c7i.4xlarge, 200k rows (`w1` in 10 %, `rare` in 0.2 %, 8 filler terms each), median of 12
+after 3 warm-up, two runs per arm, "before" = this tree with P1 applied (main's decision):
+
+| query | LIMIT | before (rows) | after (rows) |
+|---|---|---|---|
+| `!w1` | 10 | 0.77 / 0.75 ms (**0**) | 29.9 / 30.1 ms (10) |
+| `!w1` | 1000 | 0.74 / 0.75 ms (**0**) | 30.4 / 30.4 ms (1000) |
+| `rare \| !w1` | 10 | 0.26 / 0.27 ms (10) | 0.27 / 0.27 ms (10) |
+| `rare \| !w1` | 5000 | 1.44 / 1.48 ms (**400**) | 32.6 / 32.5 ms (5000) |
+| `w2 & !w1` (covered) | 10 | 2.61 / 2.57 ms | 2.58 / 2.54 ms |
+| `w1` (covered) | 10 | 0.07 / 0.07 ms | 0.07 / 0.07 ms |
+
+"before" was fast because it answered 0 rows where 180,000 match. The after-cost is the
+padding's set-up, not its rows: LIMIT 10 and LIMIT 1000 cost the same 30 ms, because
+`weave_pad_begin()` collects q's whole match set (`weave_collect_matches()`, here a NOT
+over 180k rows) and sorts the ranked TIDs before emitting its first row. A query whose
+ranked rows already fill the LIMIT pays nothing (`rare | !w1` LIMIT 10), and covered queries
+are unchanged. 1M: see below (run 2).
+
+**Remaining limits, stated.**
+- **`weave_search()` is still a subset** for an uncovered query: it shares the ranked
+  pass and has no padding phase. Its rows past the ranked ones would all be at score 0, so
+  the fix there is "append the rest of the match set at 0"; not done (not in this task's
+  gate, and the SRF's `k` makes it cheap when wanted). `src/am/amscan.c`'s collect-site
+  comment says so.
+- **Beyond `WEAVE_ORD_WIDTH_MAX` (~67M) ranked candidates** the ladder stops and the
+  padding would emit the rest at 1.0 while some still score above 0 -- out of order. The
+  same ceiling already bounds every other route's ranked phase; unreachable at today's
+  segment sizes, untested.
+- **A row a concurrent merge brings in between the ranked phase and the padding** is the
+  ordering scan's existing "not order-stable under concurrent modification" note
+  (`weave_ord_pass()`), unchanged.
+- **The padding's first-row cost is O(match set)** (above). Cheaper would be a streaming
+  walk of the gate set that skips ranked TIDs without materializing it -- the G76 walk
+  already streams its emission; it is the collection that is whole. Not done.
