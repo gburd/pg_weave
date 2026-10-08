@@ -297,6 +297,14 @@ SET pg_weave.reuse_distance = off;
 EXPLAIN (VERBOSE, COSTS OFF)
   SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta', weights => '{1,2}') LIMIT 3;
 RESET pg_weave.reuse_distance;
+-- An Incremental Sort over a fused scan does not arise: the fused path is offered
+-- only when fuse() is the WHOLE sort key (src/am/fusepath.c
+-- weave_fuse_pathkey_call), so `ORDER BY fuse(...), id` is a Sort over a seq scan
+-- and keeps evaluating fuse() per row.  Recorded in doc/GAPS.md G86.
+RESET enable_seqscan; RESET enable_sort;
+EXPLAIN (COSTS OFF)
+  SELECT id FROM sf ORDER BY fuse(d <=> 'alpha', d <=> 'beta'), id LIMIT 3;
+SET enable_seqscan = off; SET enable_sort = off;
 -- outside a scan the function answers NULL
 SELECT weave_current_fused_distance('sf_w', '(0,1)', 'alpha'::wquery, 'beta'::wquery,
                                     '{1,2}'::real[]) IS NULL AS fused_null_outside_a_scan;
