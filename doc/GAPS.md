@@ -6496,8 +6496,8 @@ every hand-written NOT test in the suite negated a plain term.
   segment is rechecked for those shapes. Feeding the leaf sets into `weave_eval_query()`
   instead would make them fast; not done here.
 
-**Still open, recorded rather than fixed, and now its own entry, G94: the ranked scan returns a SUBSET for a query
-with NOT.** `WHERE d @@@ '!fox' ORDER BY d <=> '!fox'` generates candidates only from the
+**Still open, recorded rather than fixed, and now its own entry, G94 (FIXED 2026-10-08 on `wt/g94` for the ordering
+scan; see G94): the ranked scan returns a SUBSET for a query with NOT.** `WHERE d @@@ '!fox' ORDER BY d <=> '!fox'` generates candidates only from the
 query's positive literal terms (WAND cursors), so a row that matches only through a NOT
 is never ranked, and the G56 padding phase is skipped because the restriction IS the
 ORDER BY query (`weave_pad_wanted()`: "no padding row could pass it" -- false for a query
