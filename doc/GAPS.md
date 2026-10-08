@@ -5092,6 +5092,26 @@ raise an ERROR, not stop, on a `WEAVE_FREED` page met on a live chain. **Superse
 2026-10-06 by maintainer decision: WARN and skip that merge instead (task L23).** An ERROR
 would make every later VACUUM fail until REINDEX.
 
+**L23 inventory, 2026-10-07 (code reading, before the fix; unverified by test).** Every
+chain the merge reads from a SOURCE bolt, and what each walker does today on a page that
+is `WEAVE_FREED` (contents intact, `nextblk` reset to Invalid, kind bits kept):
+
+| chain | walker | today on a freed page |
+|---|---|---|
+| dictionary | `merge_source_load_page()` (ambuild.c) | no kind or FREED check; chain ENDS, later terms dropped, merge publishes. **Silent loss** (the reported defect) |
+| postings | `weave_decode_term()` (am.c) | no kind or FREED check; returns `n < df`, merge ignores the shortfall. **Silent loss** |
+| doclen sidecar | `weave_doclens_load()` (ambuild.c) | kind check only, freed page passes; chain ENDS, later docids get doclen 0 in the merged bolt. **Silent wrong BM25** |
+| tombstones | `weave_read_blob()` (trgm_page.c) | no kind or FREED check; stops with the buffer short, then the G85 size check ERRORs. **VACUUM fails** |
+| document list | `weave_segment_docset()` -> `weave_doclist_read()` | rejects FREED, then ERROR. **VACUUM fails** |
+| vector weft | `weave_vec_merge_append()` (vecwrite.c) | kind check only; the geometric chain notices it ends early, abandons with DEBUG1. **Silent skip** |
+| cgram weft | `weave_cgram_merge_append()` (ambuild.c) | dict kind check only; chain ENDS, pairs dropped, returns success. **Silent loss** (cgram false negatives) |
+| docvalues | `weave_docvals_load()` | kind check only; short image, validator ERRORs. **VACUUM fails** |
+| SuRF, trigram dir/data, dict index | not read by the merge | rebuilt from the merged term stream, so the merge cannot meet a freed page on them |
+
+Two recorded lengths exist to cross-check: `WeaveSegMeta.nterms` equals the dictionary entry
+count (already asserted by `weave_check`'s SuRF row), and each dictionary entry's `df` equals
+its posting count.
+
 **SUPERSEDED 2026-10-06, same branch: the "growth defect" below was the test, not the
 index.** `t/033` gave the crashed index two VACUUMs per cycle and its twin one. From
 cycle 8 onwards, each crashed-index VACUUM after the restart ran the share-lock
