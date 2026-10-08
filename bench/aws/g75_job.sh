@@ -36,8 +36,8 @@ nofence)
 	sub $f '		if (PageGetLSN(page) > fence)' '		if (false && PageGetLSN(page) > fence)	/* MUTANT nofence */' ;;
 noguard)
 	"$0" nobarrier; "$0" nofence ;;
-nodrop)	# L22: the FSM loop re-queues a freed, not-yet-recyclable page and stops again
-	sub src/am/am.c '				if (ndropped < WEAVE_FSM_DROP_MAX &&' '				if (false && ndropped < WEAVE_FSM_DROP_MAX &&	/* MUTANT nodrop */' ;;
+noskip)	# L22: the FSM loop re-queues a freed, not-yet-recyclable page and stops again
+	sub src/am/am.c '				if (nskipped < WEAVE_FSM_SKIP_MAX &&' '				if (false && nskipped < WEAVE_FSM_SKIP_MAX &&	/* MUTANT noskip */' ;;
 nofit)	# L22: the share-lock pass is gated by the recyclability probe alone again
 	sub $f '			 !weave_pack_fits_reusable(index)))' '			 !weave_any_free_page_recyclable(index)))	/* MUTANT nofit */' ;;
 *) echo "unknown mutant $m"; exit 2 ;;

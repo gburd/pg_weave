@@ -979,18 +979,30 @@ weave_new_buffer_linked(Relation index)
 }
 
 /*
- * How many not-yet-recyclable freed pages one allocation may take out of the
- * FSM before it gives up on the map and extends.  It bounds what a single call
- * reads, because a merge can free most of the index under one xid.  A batch of
- * allocations still drains such a run, at this many pages per call.
+ * How many not-yet-recyclable freed pages one allocation may skip before it
+ * gives up on the map and extends.  It bounds what a single call reads, because
+ * a merge can free most of the index under one xid.  The search hint moves past
+ * what was skipped, so a batch of allocations gets through such a run at about
+ * this many pages per call.
  */
-#define WEAVE_FSM_DROP_MAX 64
+#define WEAVE_FSM_SKIP_MAX 64
+
+/* put back what weave_new_buffer_internal() skipped (see the comment there) */
+static void
+weave_fsm_rerecord(Relation index, const BlockNumber *blks, int n)
+{
+	int			i;
+
+	for (i = 0; i < n; i++)
+		RecordFreeIndexPage(index, blks[i]);
+}
 
 static Buffer
 weave_new_buffer_internal(Relation index)
 {
 	Buffer		buffer;
-	int			ndropped = 0;
+	BlockNumber skipped[WEAVE_FSM_SKIP_MAX];
+	int			nskipped = 0;
 
 	/*
 	 * Low-bias reuse: during a compaction, prefer the lowest free block so
@@ -1074,36 +1086,39 @@ weave_new_buffer_internal(Relation index)
 			if (!weave_page_recyclable(index, BufferGetPage(buffer)))
 			{
 				/*
-				 * A FREED PAGE THAT IS NOT YET RECYCLABLE IS DROPPED, NOT RE-QUEUED
-				 * (task L22), up to WEAVE_FSM_DROP_MAX per call.  GetFreeIndexPage()
-				 * has already taken it out of the map.  The next VACUUM's reclaim puts
-				 * it back: a page that is FREED, unreachable, absent from the FSM
-				 * and reusable now is the state that pass re-records
-				 * (weave_reclaim_unreachable()).  So skipping it costs at most one
-				 * VACUUM of delay, and the loop can move on to the next candidate.
+				 * A FREED PAGE THAT IS NOT YET RECYCLABLE IS SKIPPED, up to
+				 * WEAVE_FSM_SKIP_MAX per call, and every skipped page is recorded
+				 * free again before this call returns (task L22).  GetFreeIndexPage()
+				 * marked it used, so while it is held back the FSM search moves on to
+				 * the next candidate.  Putting it back afterwards leaves the map's
+				 * contents exactly as they were, and the search hint (fp_next_slot)
+				 * now points past it.
 				 *
-				 * MEASURED at 1M rows (bench/aws/l22_scale_ablate.sh, arm `drop`).
-				 * The first INSERT after a VACUUM runs under the xid that VACUUM
-				 * stamped on its frees.  With the re-queue-and-break below, every one
-				 * of its 1,177 allocations met the same refused page and extended, on
-				 * every other cycle: the crashed index grew 1,177 -> 2,354 -> 3,531
-				 * over its twin.  With the drop it stayed at 1,177.  Pages that are
-				 * NOT freed (a stale entry for a live page) keep the old rule:
-				 * dropping those failed t/028's truncation control (SEGMENT_FORMAT.md
-				 * sect. 10, the superseded allocator change).
+				 * MEASURED at 1M rows (bench/aws/l22_scale_ablate.sh).  The first
+				 * INSERT after a VACUUM runs under the xid that VACUUM stamped on its
+				 * frees.  With re-queue-and-stop, each of its 1,177 allocations was
+				 * handed the same refused page again and extended, every other cycle:
+				 * the crashed index grew 1,177 -> 2,354 -> 3,531 over its twin.  An
+				 * arm that skipped without putting back stayed at 1,177, but taking
+				 * the entries out broke weave_vacuum()'s compaction (sql/weave.sql's
+				 * recycling bound, pgweave-20261008-081449-3b76).  The reclaim cannot
+				 * put them back when their stamp is its own xid.  A live page with a
+				 * stale entry keeps the old rule below: dropping those failed t/028's
+				 * truncation control (SEGMENT_FORMAT.md sect. 10, the superseded
+				 * allocator change).
 				 */
-				if (ndropped < WEAVE_FSM_DROP_MAX &&
+				if (nskipped < WEAVE_FSM_SKIP_MAX &&
 					!PageIsNew(BufferGetPage(buffer)) &&
 					WeavePageIsFreed(BufferGetPage(buffer)))
 				{
 					weave_alloc_fsm_defer++;
-					ndropped++;
 					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 					ReleaseBuffer(buffer);
+					skipped[nskipped++] = blk;
 					continue;
 				}
 				/*
-				 * A live page with a stale entry, or the drop budget is spent:
+				 * A live page with a stale entry, or the skip budget is spent:
 				 * re-record it so a later allocation gets it, and STOP.
 				 *
 				 * THE `break` IS DELIBERATE AND ITS COST IS REAL.  This used to say
@@ -1129,8 +1144,8 @@ weave_new_buffer_internal(Relation index)
 				 * The pending append comes through here, and on a crash loop the
 				 * first INSERT after each VACUUM met its own xid's frees and extended
 				 * its whole batch, about 1,177 pages every second cycle at 1M rows.
-				 * That is why a freed page is dropped above.  The stop remains for a
-				 * live page and for a spent drop budget.
+				 * That is why a freed page is skipped above.  The stop remains for a
+				 * live page and for a spent skip budget.
 				 */
 				weave_alloc_fsm_defer++;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -1139,12 +1154,14 @@ weave_new_buffer_internal(Relation index)
 				break;
 			}
 			weave_alloc_fsm_reuse++;
+			weave_fsm_rerecord(index, skipped, nskipped);
 			return buffer;		/* got it */
 		}
 		/* someone else is using it; try the next free page */
 		weave_alloc_fsm_contended++;
 		ReleaseBuffer(buffer);
 	}
+	weave_fsm_rerecord(index, skipped, nskipped);
 
 	/*
 	 * Extend the relation.  The relation extension lock MUST be held around the

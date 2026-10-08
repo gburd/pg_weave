@@ -197,8 +197,15 @@ The crash is not needed for either growth. Both are idle-cluster effects of the 
 gate's xid stamp, and the crash loop only provides a schedule where the first transaction
 after a VACUUM is always an INSERT.
 
-**The second fix** (`16d429f`): the FSM loop drops a freed, not-yet-recyclable candidate,
-up to 64 per call, and moves on. A live page with a stale entry keeps the old
+**The second fix.** The FSM loop skips a freed, not-yet-recyclable candidate, up to 64 per
+call, and moves on. Every skipped page is recorded free again before the call returns.
+The first version (`16d429f`) dropped them instead, as arm `drop` did. Its smoke
+(`pgweave-20261008-081449-3b76`) failed `sql/weave.sql`'s recycling bound
+(`size_bounded` f): `weave_vacuum()`'s compaction gathers its low-free list from the FSM,
+and the reclaim cannot put back a page whose stamp is its own xid. That is the same reason
+the reclaim never removes an FSM entry. **Superseded** by the skip-and-put-back version,
+which leaves the map's contents unchanged and only moves the search past the skipped
+pages. A live page with a stale entry keeps the old
 re-queue-and-stop rule. Dropping those is the allocator change G75 retracted, which made
 `t/028` fail 3 in 10. `g75_scale.sh` now also asserts that the excess stops growing over
 the last four cycles: it may rise by at most what those cycles stranded, plus 64 pages

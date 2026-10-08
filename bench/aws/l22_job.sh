@@ -26,7 +26,7 @@ apply() {	# arm -> substitution in the current dir
 	local f=src/am/amvacuum.c from to
 	case $1 in
 	base) return 0 ;;
-	nodrop)	f=src/am/am.c; from='				if (ndropped < WEAVE_FSM_DROP_MAX &&'; to='				if (false && ndropped < WEAVE_FSM_DROP_MAX &&	/* ARM */' ;;
+	noskip)	f=src/am/am.c; from='				if (nskipped < WEAVE_FSM_SKIP_MAX &&'; to='				if (false && nskipped < WEAVE_FSM_SKIP_MAX &&	/* ARM */' ;;
 	nofit)	from='			 !weave_pack_fits_reusable(index)))'; to='			 !weave_any_free_page_recyclable(index)))	/* ARM */' ;;
 	fit)	from='!weave_any_free_page_recyclable(index))'; to='!weave_l22_pack_fits(index))	/* ARM */' ;;
 	swap)	f=t/033_reclaim_crash_loop.pl
