@@ -38,12 +38,13 @@ use Time::HiRes qw(usleep);
 # cut) stopped at cycle 7, one cycle BEFORE the post-crash compaction growth starts,
 # so the size bound below could never fail and prove reported it as "TODO passed".
 # 11 reaches cycles 8-10, where the measured excess (2,626 / 5,299 / 7,972 pages in
-# pgweave-20261006-010652-fb9f) clears the bound, so the TODO is a live signal again.
+# pgweave-20261006-010652-fb9f) cleared the bound before L22's fix, so the bound
+# can fail here.
 # What stays HARD at every cycle -- leaked == 0 after one VACUUM and a clean deep
 # check -- needs only enough crashes that land inside a flush, and the
 # total-stranded assertion below proves they did.  The 1M-row scale run
-# (bench/aws/g75_job.sh, RESULTS_G75.md) is the long loop.  The growth itself is
-# task L22 in doc/PHASES.md.
+# (bench/aws/g75_job.sh, RESULTS_G75_RECLAIM.md) is the long loop.  The growth
+# was task L22 in doc/PHASES.md.
 my $cycles = 11;
 my $rows = 30000;
 
@@ -199,19 +200,18 @@ my $worst = -1e9;
 for (@excess) { $worst = $_ if $_ > $worst; }
 note('excess of c_w over its twin per cycle: ' . join(' ', @excess)
 	  . '; stranded per crash: ' . join(' ', @strand) . "; slack $slack pages");
-# TODO, NOT PASSING, AND RECORDED AS A LOSS (doc/GAPS.md G75, "OPEN: the size
-# bound").  At 18 cycles the crashed index's excess over its twin reaches ~22,000
-# pages on runs where every cycle's stranded pages WERE reclaimed (leaked == 0 and
-# a clean deep check, asserted hard above).  The allocator counters say where the
-# growth comes from: from the first large merge on, every post-crash VACUUM of
-# `c` runs the share-lock compaction (lowfree_reuse 10k-21k, extend ~2,080 --
-# the L19 ratchet weave_vacuumcleanup() describes), while the twin, on the same
-# VACUUM schedule, does not compact at all.  Why the trigger fires on one and not
-# the other is NOT yet known, so the bound is kept, visible, as a TODO rather
-# than loosened.  `prove` reports it as "not ok # TODO" every run.
-TODO:
-{
-	local $TODO = 'G75 / L22: crash-loop size bound -- crashed index compacts every cycle, twin does not (open, doc/PHASES.md L22)';
+# HARD since task L22 (doc/PHASES.md).  It was a TODO from G75 to L22: from the
+# first large merge on, the crashed index's excess grew by about two flushes a
+# cycle (2,626 / 5,299 / 7,972 at cycles 8-10).  THE CRASH WAS NOT THE CAUSE, and
+# neither were the stale free-space entries a crash leaves (the reclaim clears them
+# before the trigger reads the map; measured).  The cause was a share-lock
+# compaction pass started with fewer reusable pages than live ones, so it extended
+# the shortfall every VACUUM.  Which index got it was decided by INSERT ORDER: the
+# first INSERT after a merge runs under the very xid the merge stamped on its
+# frees, cannot reuse them, extends, and leaves its low free pages old enough for
+# weave_any_free_page_recyclable() to say yes.  Inserting `t` first moved the growth
+# to the twin (pgweave-20261008-014427-e5f8, arm `swap`).  The fix is
+# weave_pack_fits_reusable() in weave_vacuum_compact().
 cmp_ok($worst, '<=', $bound,
 	"at every cycle the crashed index's excess over its twin (worst $worst pages) is at most one crash's stranding ($maxs) + $slack");
 # The discriminating case is accumulation: had nothing been reclaimed, the
@@ -222,8 +222,6 @@ cmp_ok($worst, '<=', $bound,
 # count was raised, rather than the bound loosened, when one run fell short.
 cmp_ok($sums, '>', $bound,
 	"and the crashes stranded enough in total ($sums pages) that accumulation would exceed that bound ($bound)");
-
-}
 
 $node->stop;
 done_testing();

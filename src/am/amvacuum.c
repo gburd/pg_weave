@@ -617,35 +617,43 @@ weave_low_free_fits_live(Relation index)
 }
 
 /*
- * L22 ABLATION PROTOTYPE: would a pack-only pass fit in pages reusable NOW,
- * counted from the pages rather than the FSM?  live = initialized, not freed.
+ * Would a pack-only pass fit in the pages it may reuse NOW?  Supply: pages the
+ * free space map offers (weave_alloc_begin() gathers from it) that are new or
+ * WEAVE_FREED and that weave_page_recyclable() would hand out.  Live: every
+ * initialized page that is not WEAVE_FREED, counted from the pages and not from
+ * the free space map, which is not crash-safe.  Reads every page, as the reclaim
+ * pass earlier in the same cleanup does.  Task L22; the caller says why.
  */
 static bool
-weave_l22_pack_fits(Relation index)
+weave_pack_fits_reusable(Relation index)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
-	BlockNumber b;
-	BlockNumber live = 0,
-				reusable = 0;
+	BlockNumber blk;
+	BlockNumber live = 0;
+	BlockNumber supply = 0;
 
-	for (b = 1; b < nblocks; b++)
+	for (blk = 1; blk < nblocks; blk++)
 	{
-		Buffer		buf = ReadBuffer(index, b);
+		Buffer		buf;
 		Page		page;
 
+		CHECK_FOR_INTERRUPTS();	/* no buffer lock held here */
+		buf = ReadBuffer(index, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		if (PageIsNew(page) ||
 			(PageGetSpecialSize(page) == MAXALIGN(sizeof(WeavePageOpaqueData)) &&
 			 WeavePageIsFreed(page)))
-			reusable += weave_page_reusable_now(index, page);
+		{
+			if (GetRecordedFreeSpace(index, blk) >= BLCKSZ / 2 &&
+				weave_page_reusable_now(index, page))
+				supply++;
+		}
 		else
 			live++;
 		UnlockReleaseBuffer(buf);
 	}
-	elog(LOG, "pg_weave L22 fits \"%s\": nblocks=%u live=%u reusable=%u",
-		 RelationGetRelationName(index), nblocks, live, reusable);
-	return reusable >= live;
+	return supply >= live;
 }
 
 bool
@@ -740,8 +748,6 @@ weave_vacuum_compact(Relation index)
 		 */
 		if (weave_index_is_compacted(index))
 		{
-			elog(LOG, "pg_weave L22 compact \"%s\" pass %d: is_compacted",
-				 RelationGetRelationName(index), pass);
 			nblocks = weave_truncate_free_tail(index);
 			if (nblocks < prevblocks)
 				didwork = true;
@@ -782,13 +788,36 @@ weave_vacuum_compact(Relation index)
 		 * t/015 requires a shrink on the horizon-advancing arm, so a regression
 		 * into permanent skipping fails a test rather than silently stopping work.
 		 */
-		elog(LOG, "pg_weave L22 compact \"%s\" pass %d: probe=%d fits=%d ael=%d",
-			 RelationGetRelationName(index), pass,
-			 (int) weave_any_free_page_recyclable(index),
-			 (int) weave_l22_pack_fits(index),
-			 (int) CheckRelationLockedByMe(index, AccessExclusiveLock, true));
+		/*
+		 * AND SKIP A PASS THAT CANNOT FIT IN WHAT IS REUSABLE NOW (task L22).
+		 * "Some page is recyclable" was not enough, measured.  A share-lock pass is
+		 * pack-only; if the reusable supply is smaller than the live data it packs
+		 * that supply, EXTENDS the rest onto the tail, and frees the old copy under
+		 * its own xid, so nothing is truncatable and the next VACUUM finds the same
+		 * shortfall.  t/033 (pgweave-20261008-014427-e5f8): supply 10,244 against
+		 * 12,033 live, 1,782 extends, and about two flushes more every cycle after
+		 * (excess 2,626 / 5,299 / 10,776 pages).  With this predicate the excess
+		 * was 589 / 0 / 0, two runs.
+		 *
+		 * The sibling's count-based skip stalled because it took the live size from
+		 * stale free-space records.  This one counts live pages from the pages, so a
+		 * stale entry cannot inflate it, and the supply grows on its own as the
+		 * horizon passes the freeing xid.  What it gives up: a VACUUM no longer
+		 * spends one pass extending in the hope that the NEXT one fits.  That
+		 * two-VACUUM shape never shrank in t/033, and the floor stays a
+		 * weave_vacuum() outcome, as G47 already records.
+		 *
+		 * ponytail: with tombstones the pass shrinks the live data as it goes, so
+		 * the page count overstates what it must place (term (4) of
+		 * weave_index_is_compacted() measured a 409-page error in the dangerous
+		 * direction).  That case keeps the probe alone, and the ratchet is still
+		 * possible on a delete-bearing index.  The upgrade is a tombstone-aware
+		 * estimate of the pass's output.
+		 */
 		if (!CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&
-			!weave_any_free_page_recyclable(index))
+			(weave_tombstone_frac(index) > 0.0 ?
+			 !weave_any_free_page_recyclable(index) :
+			 !weave_pack_fits_reusable(index)))
 		{
 			nblocks = weave_truncate_free_tail(index);
 			if (nblocks < prevblocks)
@@ -1193,59 +1222,6 @@ weave_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 static XLogRecPtr weave_reclaim_prepare(Relation index);
 
-/*
- * L22 DIAGNOSTIC (doc/PHASES.md L22): the cleanup trigger's input as the FSM
- * reports it and as the pages report it, logged at each step of the cleanup.
- * Reads every page; temporary.
- */
-static void
-weave_l22_census(Relation index, const char *where,
-				 BlockNumber *pgfree_out, BlockNumber *reusable_out)
-{
-	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
-	BlockNumber b;
-	BlockNumber fsmfree = 0,
-				pgfree = 0,
-				stale = 0,
-				notfsm = 0,
-				reusable = 0,
-				unrec = 0;
-
-	for (b = 1; b < nblocks; b++)
-	{
-		bool		infsm = GetRecordedFreeSpace(index, b) >= BLCKSZ / 2;
-		Buffer		buf = ReadBuffer(index, b);
-		Page		page;
-		bool		isfree;
-		bool		reuse = false;
-
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		page = BufferGetPage(buf);
-		isfree = PageIsNew(page) ||
-			(PageGetSpecialSize(page) == MAXALIGN(sizeof(WeavePageOpaqueData)) &&
-			 WeavePageIsFreed(page));
-		if (isfree)
-			reuse = weave_page_reusable_now(index, page);
-		UnlockReleaseBuffer(buf);
-		fsmfree += infsm;
-		pgfree += isfree;
-		reusable += reuse;
-		if (infsm && !isfree)
-			stale++;
-		if (isfree && !infsm)
-			notfsm++;
-		if (infsm && isfree && !reuse)
-			unrec++;
-	}
-	elog(LOG, "pg_weave L22 census \"%s\" %s: nblocks=%u fsm_free=%u page_free=%u reusable_now=%u fsm_stale_live=%u free_not_in_fsm=%u fsm_free_not_reusable=%u quarter=%u",
-		 RelationGetRelationName(index), where, nblocks, fsmfree, pgfree,
-		 reusable, stale, notfsm, unrec, nblocks / 4);
-	if (pgfree_out)
-		*pgfree_out = pgfree;
-	if (reusable_out)
-		*reusable_out = reusable;
-}
-
 IndexBulkDeleteResult *
 weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
@@ -1279,12 +1255,9 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			 * frees (see the free arm there), so this order is right only together
 			 * with that.
 			 */
-			weave_l22_census(info->index, "start", NULL, NULL);
 			(void) weave_reclaim_unreachable(info->index, fence,
 											 info->message_level);
-			weave_l22_census(info->index, "after-reclaim", NULL, NULL);
 			(void) weave_flush_pending(info->index);
-			weave_l22_census(info->index, "after-flush", NULL, NULL);
 			weave_merge_segments(info->index);
 
 			/*
@@ -1331,22 +1304,14 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			{
 				BlockNumber nblocks = RelationGetNumberOfBlocks(info->index);
 				BlockNumber freeblks = 0;
-				BlockNumber pgfree = 0;
-				BlockNumber reusable = 0;
 				BlockNumber b;
 
 				for (b = 1; b < nblocks; b++)
 					if (GetRecordedFreeSpace(info->index, b) >= BLCKSZ / 2)
 						freeblks++;
-				weave_l22_census(info->index, "trigger", &pgfree, &reusable);
 				/* reclaim when >= 25% of the file is free (bloated after merges) */
 				if (nblocks > 16 && freeblks > nblocks / 4)
-				{
 					(void) weave_vacuum_compact(info->index);
-					weave_l22_census(info->index, "after-compact", NULL, NULL);
-				}
-				(void) pgfree;
-				(void) reusable;
 			}
 		}
 		PG_FINALLY();
