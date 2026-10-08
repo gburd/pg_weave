@@ -80,8 +80,8 @@ CREATE INDEX sr_pt_gist ON sr_pt USING gist (p);
 ANALYZE sr_pt;
 EXPLAIN (VERBOSE, COSTS OFF)
   SELECT id FROM sr_pt ORDER BY p <-> point(3, 3) LIMIT 3;
--- the other routes are not substituted: a vector scan's value is a quantized
--- score, and an edit-distance or fused sort key is not `d <=> q` (doc/GAPS.md G86)
+-- the vector and edit-distance routes are not substituted (doc/GAPS.md G86); the
+-- fused one is, by weave_current_fused_distance() (section 9)
 CREATE TABLE sr_v (id int, d wdoc, v wvec(4));
 INSERT INTO sr_v SELECT g, to_wdoc('simple', 'alpha w' || (g % 17)),
        ('[' || (g % 7) || ',' || (g % 5) || ',' || (g % 3) || ',1]')::wvec
@@ -449,11 +449,17 @@ INSERT INTO sfd SELECT g, to_wdoc('simple', 'alpha w' || g), ('[' || g * 0.1 || 
   FROM generate_series(1, 20) g;
 CREATE INDEX sfd_w ON sfd USING weave (d, v);
 INSERT INTO sfd VALUES (21, to_wdoc('simple', 'alpha w21'), '[1,2,3]');
-SELECT array_agg(id ORDER BY rn) FILTER (WHERE rn > 18) AS last_rows,
-       (array_agg(cur ORDER BY rn DESC))[1] AS last_value
+-- Read through a cheap STABLE wrapper: a VOLATILE call in the SELECT list would be
+-- postponed above the Limit, and the scan's own list, no longer the top plan's,
+-- would keep the hidden fuse() unsubstituted (and raise).
+CREATE FUNCTION sfd_cur(t tid) RETURNS float8 LANGUAGE plpgsql STABLE COST 1 AS
+  $$ BEGIN RETURN weave_current_fused_distance('sfd_w', t, 'alpha'::wquery,
+                                               '[0,0,0,1]'::wvec, '{1,1}'::real[]); END $$;
+SELECT count(*) AS rows_out, (array_agg(id ORDER BY rn DESC))[1] AS last_id,
+       (array_agg(cur ORDER BY rn DESC))[1] AS last_value,
+       count(*) FILTER (WHERE cur IS NULL) AS no_value
   FROM (SELECT row_number() OVER () AS rn, id, cur
-          FROM (SELECT id, weave_current_fused_distance('sfd_w', ctid, 'alpha'::wquery,
-                                                        '[0,0,0,1]'::wvec, '{1,1}'::real[]) AS cur
+          FROM (SELECT id, sfd_cur(ctid) AS cur
                   FROM sfd ORDER BY fuse(d <=> 'alpha', v <-> '[0,0,0,1]') LIMIT 100) s) t;
 SET pg_weave.reuse_distance = off;
 SELECT count(*) FROM (SELECT id FROM sfd ORDER BY fuse(d <=> 'alpha', v <-> '[0,0,0,1]') LIMIT 100) s;
@@ -547,4 +553,5 @@ DROP FUNCTION sf_ref(bool);
 DROP FUNCTION sf_cur(bool);
 DROP FUNCTION sf_ties(bool, int);
 DROP FUNCTION sf_calls();
+DROP FUNCTION sfd_cur(tid);
 DROP TABLE sr, sr2, sr_pt, sr_v, sf, sfd;
