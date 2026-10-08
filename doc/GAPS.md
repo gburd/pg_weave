@@ -5129,7 +5129,7 @@ Both were tested by ablation on EC2. The reclaim clears the stale entries before
 reads the map. The trigger fired on the twin too, and the twin's pass was stopped by the
 recyclability probe. Swapping the insert order moved the growth to the never-crashed twin.
 The growth came from share-lock compaction passes that started with fewer reusable pages
-than live ones. The fix and the measurements are in `doc/PHASES.md` L22 and
+than live ones. The scale run's twin then exposed a second growth with a separate cause. The first INSERT after a VACUUM runs under the xid that VACUUM stamped on its frees, and the allocator's FSM loop re-queued the first refused page and extended the whole batch. That is fixed too. The fixes and the measurements are in `doc/PHASES.md` L22 and
 `bench/RESULTS_G75_RECLAIM.md` "L22". The text below is the record as it stood before L22.
 
 **OPEN (until L22): the size bound in a long crash loop.** At 18 cycles (`pgweave-20261006-001850-1420`,
