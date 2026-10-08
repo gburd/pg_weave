@@ -1086,6 +1086,15 @@ weave_new_buffer_internal(Relation index)
 				 * with `continue` and costs one page.  The remaining users of this
 				 * loop are ordinary segment writes, for which one deferred page
 				 * ending the sequence is a bounded cost, not a ratchet.
+				 *
+				 * SUPERSEDED 2026-10-08 (task L22): it can be a ratchet.  The pending
+				 * append comes through here, and the first INSERT after a VACUUM runs
+				 * under the xid that VACUUM stamped on its frees.  In a 1M-row crash
+				 * loop every one of that INSERT's 1,177 allocations met the same
+				 * refused page and extended, every second cycle.  Skipping freed
+				 * pages instead fixed that and was REVERTED, because it regressed
+				 * t/028's truncation control (3 of 10 against 0 of 10).  doc/PHASES.md
+				 * L22 has the runs and the follow-up.
 				 */
 				weave_alloc_fsm_defer++;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -1438,6 +1447,13 @@ weave_work_stats_reset(PG_FUNCTION_ARGS)
  * skipped pass cannot become a permanently skipped pass.  Tightening this to a
  * count therefore trades a bounded overshoot for an unbounded stall, and must not
  * be done without a measurement that shows the overshoot matters.
+ *
+ * THAT MEASUREMENT EXISTS (task L22), and it cuts both ways.  In t/033 the
+ * overshoot was unbounded: a pass started with fewer reusable pages than live
+ * ones extended the shortfall on every VACUUM.  Gating on "live fits in reusable
+ * now" stopped it, and was REVERTED because t/028 needs exactly that pass to
+ * truncate after a large DELETE (2 of 10 failures against 0 of 10).
+ * doc/PHASES.md L22.
  */
 #define WEAVE_RECYCLE_PROBE_MAX 256
 

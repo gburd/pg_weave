@@ -12,7 +12,7 @@ are under `bench/aws/out/`.
 | `t/031` asserts: after recovery to each WAL record of a flush and one VACUUM, 0 leaked pages and a clean `weave_check(deep)` | **PASS** | 14 of 14 points, `reclaimed N of N` at every one. `pgweave-20261005-180209-054c` onward |
 | positive control: `t/031` fails with the reclaim disabled | **PASS (caught)** | mutant `noreclaim`: 39 `not ok` (`freed 0 of 1` …). `pgweave-20261005-195152-d889`, `pgweave-20261006-001850-1420` |
 | `t/029` deep check still passes | **PASS** | every smoke since `0878356` |
-| crash loop: relation size bounded | **PARTIAL: see "Losses"** | `t/033`: 0 leaked pages and a clean deep check after **every** cycle (hard). Excess over a never-crashed twin: **TODO** at 18 cycles |
+| crash loop: relation size bounded | **PARTIAL: see "Losses" and "L22" (mechanisms known, fixes reverted)** | `t/033`: 0 leaked pages and a clean deep check after **every** cycle (hard). Excess over a never-crashed twin: **TODO** at 18 cycles |
 | concurrency: a reclaim beside a mid-segment writer never frees a page that a later publish links | **PASS** | `t/032` phases A and B, each with evidence that its window was hit (below) |
 | mutant: reclaim ignores the in-progress-writer guard | **PASS (caught)** | `noguard`, `nobarrier`, `nofence` each caught by **corruption** assertions, not only by evidence assertions (below) |
 | hard rule 12, scale: 1M rows, repeated crash-during-flush, VACUUM, deep clean, answers equal the heap | **PASS** | `g75_scale.sh`, two runs (below) |
@@ -94,3 +94,176 @@ unmeasured.
   at once, and running the pass after the flush. Details in G75.
 - **Owed: a merge launders a freed live page** (G75). The merge's chain walkers should
   raise an ERROR, not stop.
+
+## L22 — the crash-loop size bound (`doc/PHASES.md` L22)
+
+**STATUS: OPEN. Both mechanisms are demonstrated, and both fixes measured here are REVERTED
+on the branch tip** because they regress `t/028`'s truncation control (last section).
+The fix and gate sections below are kept as the record of what was measured. The
+reverted tip's smoke is at the end of this section.
+
+Branch `wt/l22`. Harness: `bench/aws/l22_job.sh` (t/033 under ablation arms),
+`bench/aws/l22_gate.sh` (the gate), `bench/aws/g75_scale.sh` (now with a never-crashed
+twin), `bench/aws/l22_scale_ablate.sh` (the scale arms). EC2 c7i.4xlarge, Debian 13, PG 17.11.
+
+### The ablation (t/033, 11 cycles, two runs per arm)
+
+The two diagnostic builds, which are not on the branch tip: `d48c485` logs the
+trigger's inputs at every cleanup step, on both indexes, counted both from the FSM and
+from the pages. `24a0b57` also logs which exit `weave_vacuum_compact()` takes. Each
+arm makes one exact-once substitution, and every C arm built a `.so` with its own md5.
+
+| arm | what it removes | excess at cycles 8 / 9 / 10 (run 1; run 2) | run |
+|---|---|---|---|
+| base | nothing | 2,626 / 5,299 / 10,776; same | `pgweave-20261008-005536-eed3` |
+| `trig_pages` | the trigger counts free pages from the pages, not the FSM | 2,626 / 5,299 / 10,776; same | same |
+| `trig_reusable` | the trigger counts only pages reusable now | 2,626 / 5,299 / 10,776; same | same |
+| `trig_off` | the trigger | 844 / 844 / 844; 844 / 844 / 1,433 | same |
+| `fit` | a share-lock pass runs only if reusable ≥ live (from the pages) | 589 / 0 / 0; 589 / 0 / 589 | `pgweave-20261008-014427-e5f8` |
+| `swap` | t/033 inserts the twin first | −1,508 / 7 / −2,666; −2,371 / 7 / −2,666 (**the twin grows**: `t_w` 22,023 → 24,649 → 27,322 → 29,995) | same |
+| `xid` | one `txid_current()` before the inserts | 255 / 5,306 / 5,306; same | same |
+
+What the census showed (base, both runs):
+
+- **The trigger fires on both indexes** from cycle 8, for example on the twin with
+  9,989 FSM-free pages against a quarter of 5,505. The stale FSM entries a crash leaves
+  (1,088 and 1,343 per cycle) are marked used by the reclaim *before* the trigger reads
+  the map, so at the trigger the FSM and the pages agree on both indexes. **REFUTED:
+  "stale FSM entries feed the trigger".**
+- The twin's pass was stopped by `weave_any_free_page_recyclable()`, the 256-page probe.
+  The crashed index's pass got past it with 10,244 reusable pages against 12,033 live.
+  It packed what it could, extended 1,782, and freed the old copy under its own xid, so
+  nothing was truncatable. The shortfall came back on every VACUUM after that.
+- Which index got past the probe was decided by **INSERT order**, not by the crash. A
+  merge stamps its frees with `ReadNextTransactionId()`. The next transaction is the
+  first INSERT, and it cannot reuse pages stamped with its own xid, so it extends and
+  leaves the low free pages old. The second INSERT reuses them. `swap` moves the growth
+  to the never-crashed twin. **REFUTED: "the crash causes it".**
+
+### The fix and the gate (`pgweave-20261008-022758-8a5a`, commit `40c9898`) — REVERTED, see the last section
+
+`weave_pack_fits_reusable()` in `src/am/amvacuum.c`. On a tombstone-free index, a
+share-lock pass needs the live pages, counted from the pages, to fit in the pages reusable
+now. With tombstones, the probe alone still decides.
+
+| gate | result |
+|---|---|
+| smoke: `make installcheck`, 34 TAP files | PASS, 1,294 tests; `t/033` ok **with no TODO**; `t/015` ok |
+| `t/033` bound, hard, two runs (control) | PASS: worst excess 1,064 (bound 2,255) and 844 (bound 1,421) |
+| `t/015` (no ratchet), two runs | PASS; the G47 vector-weft arm still settles at 198 |
+| mutant `nofit` (the probe alone again), built, distinct `.so` | **CAUGHT** by `t/033`: excess 2,626 / 5,299 / 7,972, the pre-fix numbers to the page |
+| G75's four mutants | CAUGHT, as before |
+| 1M rows, 14 crash cycles, with a twin | numerically PASS (worst 3,531, bound 6,750), **but see the next section** |
+
+### A second growth at scale, which the compaction fix does not touch (its fix is REVERTED too)
+
+The gate's scale run (above) measured this excess of the crashed index over its twin,
+per cycle:
+
+    0 2352 851 2672 1171 0 0 0 1177 1177 2354 2354 3531 3531
+
+From cycle 9 the excess grew by 1,177 pages every two cycles. That is one 60k-row batch
+of pending pages. The post-crash VACUUMs did **no allocation work at all**, so this is
+not the compaction mechanism above. **The 14-cycle bound passed while the excess was
+still growing**, so the bound alone was not evidence that the size is bounded.
+
+**The scale run did not catch `nofit` either.** On the `nofit` mutant the scale run
+printed the same sequence to the page and passed (`RESULT fail=0`). At 1M rows no
+share-lock compaction pass ever started, so the twin bound there cannot discriminate the
+first fix. `t/033` is what catches `nofit`.
+
+**The ablation** (`pgweave-20261008-063547-9cdb`, `bench/aws/l22_scale_ablate.sh`, five
+clusters on one host and one `.so`, 12 cycles, `checkpoint_timeout` 1h in every arm).
+Each `INSERT` was bracketed by the allocator counters. Excess per cycle, cycles 8–11:
+
+| arm | what it changes | excess | `INSERT s` at cycle 9 (fsm reuse / fsm defer / extend) |
+|---|---|---|---|
+| base | nothing | 0 / 1,177 / 1,177 / 2,354 | 0 / 1,177 / 1,177 |
+| `ckpt` | a CHECKPOINT after each cycle's VACUUMs | 0 / 1,177 / 1,177 / 2,354 | 0 / 1,177 / 1,177 |
+| `burn` | one `txid_current()` before `INSERT s` | 0 / 0 / 0 / 0 | 1,177 / 0 / 0 |
+| `swap` | the twin is inserted first | 0 / 0 / 0 / −1,177 (the twin grows) | 1,177 / 0 / 0 |
+| `drop` | the FSM loop drops a freed, not-yet-recyclable page and continues | 0 / 1,177 / 1,177 / 1,177 | 0 / 21,424 / 1,177 |
+
+- **REFUTED: a crash-reverted free space map causes it.** The run had no checkpoint
+  between crashes, and the reclaim's stale-entry count climbed every cycle (2,370 →
+  15,760). `ckpt` fixed the stale count at 2,678, and the growth was the same.
+- **CONFIRMED: an xid-stamp collision.** VACUUM stamps the pages it frees with
+  `ReadNextTransactionId()`. Nothing assigns an xid before the next `INSERT s`, so that
+  INSERT runs under the stamped xid and can reuse none of those pages. The FSM loop in
+  `weave_new_buffer_internal()` then re-queued the first refused page and stopped, so each
+  of the 1,177 allocations met the same page and extended. `burn` spends that xid
+  elsewhere, and the growth is gone. `swap` hands the collision to the twin.
+- **`drop` is the fix.** The first collision still extends one batch, because every
+  candidate is refused (21,424 dropped, all freed by the cycle-8 merge). After that the
+  excess stays at 1,177, and the base climbs. A dropped page comes back on the next
+  VACUUM through the reclaim's re-record arm.
+
+The crash is not needed for either growth. Both are idle-cluster effects of the recycle
+gate's xid stamp, and the crash loop only provides a schedule where the first transaction
+after a VACUUM is always an INSERT.
+
+**The second fix.** The FSM loop skips a freed, not-yet-recyclable candidate, up to 64 per
+call, and moves on. Every skipped page is recorded free again before the call returns.
+The first version (`16d429f`) dropped them instead, as arm `drop` did. Its smoke
+(`pgweave-20261008-081449-3b76`) failed `sql/weave.sql`'s recycling bound
+(`size_bounded` f): `weave_vacuum()`'s compaction gathers its low-free list from the FSM,
+and the reclaim cannot put back a page whose stamp is its own xid. That is the same reason
+the reclaim never removes an FSM entry. **Superseded** by the skip-and-put-back version,
+which leaves the map's contents unchanged and only moves the search past the skipped
+pages. A live page with a stale entry keeps the old
+re-queue-and-stop rule. Dropping those is the allocator change G75 retracted, which made
+`t/028` fail 3 in 10. `g75_scale.sh` now also asserts that the excess stops growing over
+the last four cycles: it may rise by at most what those cycles stranded, plus 64 pages
+plus 1 % of the twin. Checked against the gate run's numbers offline, that assertion fails
+the base (2,354 against an allowance of 866) and passes the `drop` arm (0).
+
+Gate for the second fix: `pgweave-20261008-081449-3b76`, `bench/aws/l22_gate2.sh`, results below.
+
+### LOSS: both fixes regress `t/028`'s truncation control, so both are REVERTED and L22 stays open
+
+The second fix's smoke (`pgweave-20261008-084355-13a3`, `eae415d`) failed one TAP
+assertion: `t/028` 113, `quiet plain VACUUM still truncates the index (4286 -> 4465
+blocks)`. The A/B, ten runs per arm, one host, each arm a distinct `.so`
+(`pgweave-20261008-090818-c96f`, `bench/aws/l22_t028.sh`):
+
+| arm | compaction fix (`weave_pack_fits_reusable`) | allocator fix (skip and put back) | `t/028` control failed |
+|---|---|---|---|
+| `pre` | no | no | **0 of 10** |
+| `noskip` | yes | no | **2 of 10** |
+| `nofit` | no | yes | **3 of 10** |
+| `base` | yes | yes | **3 of 10** |
+
+The counts alone are weak evidence. Each arm against `pre` gives p ≈ 0.2–0.5 (Fisher). The
+three fixed arms pooled are 8 of 30 against 0 of 10, p ≈ 0.08, and G73 records one failure
+of this control on a tree that did not touch VACUUM. The stronger evidence is the shape of
+the failures. The allocator counters of the three VACUUMs after the DELETE (the control's own trail)
+show the shape. On `pre`, VACUUM 1 always runs a share-lock pass (`lowfree_reuse` about
+200, 70–163 extends) and ends at 260–870 pages, and VACUUM 2 finishes the job (about 250).
+On every failing run of every arm, VACUUM 1 runs no pass (`lowfree_reuse` 0), VACUUMs 2
+and 3 do nothing, and the file stays at 3,100–4,700 pages.
+
+So **the pass that starts with fewer reusable pages than live ones, which the compaction
+fix declines, is what reclaims in `t/028`'s case.** The statement in the first fix's
+comment that "that two-VACUUM shape never shrank" is true of `t/033` only, and is
+**RETRACTED** as a general claim. A likely reason, not demonstrated: with 90 % of the rows
+deleted, the pass's output is a small fraction of its input, and the page-counted live
+side does not see that. The allocator fix's failure looks like the retracted G75 change's
+mechanism: the extra reuse empties the pool of recyclable pages that the 256-page probe
+looks at. That is not demonstrated either.
+
+The `t/033` and scale results above stand as measurements of the mechanisms. The fixes
+trade those growths against this control. **Lead decision 2026-10-08: that trade is not
+taken.** Both C fixes are reverted at the tip, and `t/033`'s bound is a `TODO` again in the
+same commit. The next design must keep the shortfall pass `t/028` needs. Growth 2 may be
+fixable without touching the trigger (the `burn` arm's insight, or deferring the free
+stamp), but fix 2 alone failed `t/028` 3 of 10, so any such fix must be A/B'd against
+`t/028` at 10 runs per arm.
+
+### The reverted tip's smoke (`pgweave-20261008-112936-cfcd`, `90ff1d0`)
+
+C code identical to the merge base `98de6dd` except comments. `make installcheck`: exit 0,
+`regression.diffs` empty, lint gates PASS, 34 TAP files / 1,254 tests, "All tests
+successful". `t/033`'s bound is back to `not ok 26 ... # TODO` with excess
+`142 255 255 1002 255 216 255 255 2626 5299 7972`, which is main's sequence from cycle 8
+to the page (`pgweave-20261006-202448-495c`). `t/028`'s control: `ok 113 - quiet plain
+VACUUM still truncates the index (3495 -> 230 blocks)`.

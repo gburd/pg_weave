@@ -5092,6 +5092,52 @@ raise an ERROR, not stop, on a `WEAVE_FREED` page met on a live chain. **Superse
 2026-10-06 by maintainer decision: WARN and skip that merge instead (task L23).** An ERROR
 would make every later VACUUM fail until REINDEX.
 
+**FIXED 2026-10-08 by L23 (branch `wt/l23`), measured on EC2, `pgweave-20261008-104055-e8bd`.**
+`weave_merge_segments_streaming()` now pre-flights every input before it reads or allocates
+anything: `weave_bolt_damage()` (src/am/amcheck.c) runs the deep check's own per-bolt walk
+and checks the two recorded lengths, the dictionary entry count against `WeaveSegMeta.nterms`
+and that the shared posting chain reaches the last term's first block. A damaged input gets a
+`WARNING` naming the index, the bolt's dictionary block and the damaged block, and nothing is
+written. The tiered selectors leave that bolt out and keep merging the rest. `weave_check(deep)`
+has a new row, `bolt_chains_intact`. `t/035_merge_freed_page.pl` covers ten cases: freed last
+and middle dictionary pages, a cut dictionary, freed last and middle posting pages, a cut
+posting chain, and freed dict-index, doclen, SuRF and doclist pages. Eleven mutants each built
+a distinct `.so` and failed t/035. **The loss is real, not hypothetical:** with the merge
+ignoring the verdict (mutant `publish`), the cut-dictionary case answered 955 of 1,540 probe
+terms after the merge, and the freed-middle-dictionary case answered 1,465. With the fix every
+term is answered at every step. Limits:
+
+- Covered by code but **not by t/035**: the vector, cgram, docvalues, trigram and tombstone
+  chains (the test index has none of them), the parallel merge path (the test runs with
+  `max_parallel_maintenance_workers = 0`), and `weave_compact_to_one()` in amvacuum.c, which
+  calls `weave_merge_selected()` and therefore **stops** at a damaged bolt instead of skipping it.
+  So `weave_vacuum()` does not compact an index that has one.
+- A damaged bolt stays until REINDEX. Every VACUUM repeats the WARNING (seen in round 9), and
+  per code reading the strict reachability map is incomplete, so the stranded-page reclaim is
+  skipped with a LOG on every VACUUM too.
+- Cost **unmeasured**: every merge walks each input's chains once more, and the reclaim's map
+  makes one more pass over each bolt's dictionary pages.
+
+**L23 inventory, 2026-10-07 (code reading, before the fix; unverified by test).** Every
+chain the merge reads from a SOURCE bolt, and what each walker does today on a page that
+is `WEAVE_FREED` (contents intact, `nextblk` reset to Invalid, kind bits kept):
+
+| chain | walker | today on a freed page |
+|---|---|---|
+| dictionary | `merge_source_load_page()` (ambuild.c) | no kind or FREED check; chain ENDS, later terms dropped, merge publishes. **Silent loss** (the reported defect) |
+| postings | `weave_decode_term()` (am.c) | no kind or FREED check; returns `n < df`, merge ignores the shortfall. **Silent loss** |
+| doclen sidecar | `weave_doclens_load()` (ambuild.c) | kind check only, freed page passes; chain ENDS, later docids get doclen 0 in the merged bolt. **Silent wrong BM25** |
+| tombstones | `weave_read_blob()` (trgm_page.c) | no kind or FREED check; stops with the buffer short, then the G85 size check ERRORs. **VACUUM fails** |
+| document list | `weave_segment_docset()` -> `weave_doclist_read()` | rejects FREED, then ERROR. **VACUUM fails** |
+| vector weft | `weave_vec_merge_append()` (vecwrite.c) | kind check only; the geometric chain notices it ends early, abandons with DEBUG1. **Silent skip** |
+| cgram weft | `weave_cgram_merge_append()` (ambuild.c) | dict kind check only; chain ENDS, pairs dropped, returns success. **Silent loss** (cgram false negatives) |
+| docvalues | `weave_docvals_load()` | kind check only; short image, validator ERRORs. **VACUUM fails** |
+| SuRF, trigram dir/data, dict index | not read by the merge | rebuilt from the merged term stream, so the merge cannot meet a freed page on them |
+
+Two recorded lengths exist to cross-check: `WeaveSegMeta.nterms` equals the dictionary entry
+count (already asserted by `weave_check`'s SuRF row), and each dictionary entry's `df` equals
+its posting count.
+
 **SUPERSEDED 2026-10-06, same branch: the "growth defect" below was the test, not the
 index.** `t/033` gave the crashed index two VACUUMs per cycle and its twin one. From
 cycle 8 onwards, each crashed-index VACUUM after the restart ran the share-lock
@@ -5122,6 +5168,22 @@ every reachable page the FSM lists as free. This is safe under the mutex: nothin
 reachable page during the pass, and marking a page used hands it to nobody. On `main`,
 any crash with recent FSM updates can trigger this ratchet. It is not specific to
 pending flushes.
+
+**STILL OPEN, MECHANISMS KNOWN (L22, 2026-10-08, `wt/l22`).** The "probable mechanism"
+below is **REFUTED**, and so is the assumption that the crash causes the growth. Both were
+tested by ablation on EC2 (`pgweave-20261008-005536-eed3`, `pgweave-20261008-014427-e5f8`).
+The reclaim clears the stale entries before the trigger reads the map, and the trigger
+fires on the twin too; the twin's pass is stopped by the recyclability probe. The
+crashed index's pass starts with fewer reusable pages than live ones and extends the
+shortfall, and swapping the insert order moved the growth to the never-crashed twin. The
+scale run's twin then exposed a second growth with another cause
+(`pgweave-20261008-063547-9cdb`). The first INSERT after a VACUUM runs under the xid
+that VACUUM stamped on its frees, and the allocator's FSM loop re-queued the first
+refused page and extended the whole batch. A fix for each was built and measured. **Both
+were REVERTED** because they regress `t/028`'s truncation control: 0/10 with neither fix,
+2/10 and 3/10 with each alone, and 3/10 with both (`pgweave-20261008-090818-c96f`). The
+bound below is a `TODO` again. `doc/PHASES.md` L22 and `bench/RESULTS_G75_RECLAIM.md`
+"L22" have the runs and the follow-ups. The text below is the record as it stood before L22.
 
 **OPEN: the size bound in a long crash loop.** At 18 cycles (`pgweave-20261006-001850-1420`,
 `057fc9d`), `t/033`'s crashed index ended up as much as 22,476 pages larger than its
