@@ -164,7 +164,10 @@ term_positions(WeaveDoc doc, const char *term, int termlen, uint16 flags,
 /*
  * Phrase step over raw ascending position arrays: return, in out[0..*nout),
  * the right positions p such that some left position L satisfies
- * 0 < p - L <= distance.  out must have room for nright values.  This is the
+ * 0 < p - L <= distance, or, when `exact` (tsquery's <N>, WEAVE_QF_PHRASE_EXACT),
+ * p - L == distance, so distance 0 is the same position.  The caller folds the
+ * right operand's width into `distance` (see the flag); positions here are
+ * operand END positions in both modes.  out must have room for nright values.  This is the
  * single source of truth for phrase adjacency; both the in-memory matcher
  * (phrase_step) and the index posting-list phrase evaluator use it, so a
  * phrase answered from the postings is byte-identical to the heap recheck.
@@ -172,7 +175,7 @@ term_positions(WeaveDoc doc, const char *term, int termlen, uint16 flags,
 void
 weave_phrase_step_pos(const uint32 *left, int nleft,
 					const uint32 *right, int nright,
-					uint32 distance, uint32 *out, int *nout)
+					uint32 distance, bool exact, uint32 *out, int *nout)
 {
 	int			li = 0,
 				ri,
@@ -192,11 +195,20 @@ weave_phrase_step_pos(const uint32 *left, int nleft,
 		if (p == WEAVE_POS_UNKNOWN)
 			continue;
 
-		/* advance li to the first left position that could be in range */
-		while (li < nleft && WEAVE_POS_ORD(left[li]) + distance < p)
+		/* advance li to the first left position that could be in range
+		 * (64-bit: a binary-received distance may be anything) */
+		while (li < nleft && (uint64) WEAVE_POS_ORD(left[li]) + distance < p)
 			li++;
+		if (li >= nleft)
+			continue;
+		if (exact)
+		{
+			/* tsquery's <N>: exactly L + distance == p, 0 = same position */
+			if ((uint64) WEAVE_POS_ORD(left[li]) + distance == p)
+				out[k++] = right[ri];
+		}
 		/* any left position L with p-distance <= L < p works */
-		if (li < nleft && WEAVE_POS_ORD(left[li]) < p && p - WEAVE_POS_ORD(left[li]) <= distance)
+		else if (WEAVE_POS_ORD(left[li]) < p && p - WEAVE_POS_ORD(left[li]) <= distance)
 			out[k++] = right[ri];	/* keep the original (label-bearing) word */
 	}
 	*nout = k;
@@ -208,7 +220,7 @@ weave_phrase_step_pos(const uint32 *left, int nleft,
  * position L satisfies 0 < p - L <= distance.  Both inputs are ascending.
  */
 static MatchVal
-phrase_step(MatchVal left, MatchVal right, uint32 distance)
+phrase_step(MatchVal left, MatchVal right, uint32 distance, bool exact)
 {
 	MatchVal	r;
 
@@ -260,7 +272,7 @@ phrase_step(MatchVal left, MatchVal right, uint32 distance)
 
 	r.pos = (uint32 *) palloc(right.npos * sizeof(uint32));
 	weave_phrase_step_pos(left.pos, left.npos, right.pos, right.npos,
-						distance, r.pos, &r.npos);
+						distance, exact, r.pos, &r.npos);
 	r.present = (r.npos > 0);
 	return r;
 }
@@ -302,7 +314,8 @@ weave_doc_matches(WeaveDoc doc, WeaveQuery query)
 		{
 			Assert(top >= 2);
 			stack[top - 2] = phrase_step(stack[top - 2], stack[top - 1],
-										 it->distance);
+										 it->distance,
+										 (it->flags & WEAVE_QF_PHRASE_EXACT) != 0);
 			top--;
 		}
 		else if (it->op == WEAVE_OP_AND)

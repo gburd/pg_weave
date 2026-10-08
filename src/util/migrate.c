@@ -89,18 +89,21 @@ mig_refuse(const char *what, const char *detail)
  *
  * Returns the operand's phrase WIDTH in core's sense (TS_phrase_execute): 0
  * for a lexeme, N + width(left) + width(right) for `left <N> right`.  Core
- * matches `L <N> R` when end(L) + N + width(R) == end(R) -- an EXACT gap --
- * where wquery's phrase matches 0 < end(R) - end(L) <= distance.  The two agree
- * exactly when N + width(R) == 1, which is emitted as distance 1: every
- * left-nested chain of <-> (the shape `a <-> b <-> c` parses to) and nothing
- * else.  Any other gap would over-match (<2> accepts gap 1) or never match
- * (<0>), so it is refused.
+ * matches `L <N> R` when end(L) + N + width(R) == end(R) -- an EXACT gap
+ * between END positions, 0 meaning the same position.  That is emitted as a
+ * WEAVE_QF_PHRASE_EXACT phrase with distance N + width(R), which both wquery
+ * evaluators answer as end(R) - end(L) == distance, so every chain of lexemes
+ * -- <0>, <N>, left- or right-nested, phrase of phrases -- maps exactly.
+ * (Without the flag a wquery phrase is a gap of 1..distance, which agrees with
+ * <-> only when N + width(R) == 1; the flag is set on every phrase anyway so
+ * there is one rule.)
  *
  * Inside a phrase, wquery's &, | and ! drop positions and make the phrase
- * false, while core evaluates them positionally; and a prefix lexeme carries
- * no positions in wquery, which makes the phrase permissive.  Both refused.
+ * false, while core evaluates them positionally (negated position sets aligned
+ * by width, TS_phrase_output); and a prefix lexeme carries no positions in
+ * wquery, which makes the phrase permissive.  Both refused.
  */
-static int
+static int64
 mig_walk(MigState *st, QueryItem *item, bool in_phrase)
 {
 	check_stack_depth();
@@ -142,7 +145,7 @@ mig_walk(MigState *st, QueryItem *item, bool in_phrase)
 	else if (item->type == QI_OPR)
 	{
 		QueryOperator *op = &item->qoperator;
-		int			wl,
+		int64		wl,
 					wr;
 
 		if (op->oper != OP_PHRASE && in_phrase)
@@ -169,10 +172,12 @@ mig_walk(MigState *st, QueryItem *item, bool in_phrase)
 				mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_OR, 0, 1, NULL, 0);
 				return 0;
 			case OP_PHRASE:
-				if (op->distance + wr != 1)
-					mig_refuse("a phrase that is not a left-nested chain of <->",
-							   "tsquery's <N> matches a gap of exactly N tokens; wquery's phrase matches a gap of 1 to N.");
-				mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_PHRASE, 0, 1, NULL, 0);
+				/* widths add up (int64: a long query cannot overflow);
+				 * a gap past every position never matches, as in core */
+				mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_PHRASE,
+						 WEAVE_QF_PHRASE_EXACT,
+						 (uint32) Min(op->distance + wr, (int64) PG_UINT32_MAX),
+						 NULL, 0);
 				return op->distance + wl + wr;
 		}
 		elog(ERROR, "unrecognized tsquery operator: %d", op->oper);

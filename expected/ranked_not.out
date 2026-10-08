@@ -12,7 +12,7 @@
 -- ranked distance.  A match through the NOT that holds a literal term from
 -- another branch IS a candidate and is ranked.  Every check below is against
 -- two oracles that do not use the ordering scan: the heap's `@@@` (the set) and
--- weave_search()'s scores (the distance, 1.0 for a row it does not rank), plus
+-- weave_search()'s scores (the distance; block 5 checks it is complete), plus
 -- a third that does not use the index at all: a row is ranked (< 1.0) exactly
 -- when it holds one of q's literal terms (`lits`).
 --
@@ -31,6 +31,13 @@
 --   2. a plan check per query: each is answered by the ordering scan
 --   3. a cursor, with MOVE and another ordering scan between fetches
 --   4. a rescan per outer row (a correlated subplan)
+--   5. weave_search() is complete too: with k >= the match count it returns
+--      exactly the heap's `@@@` set, scores non-increasing, a row at score 0
+--      exactly when it holds no literal term; with a smaller k exactly k rows,
+--      the head of that list by score   (mutants, bench/aws/g94s_job.sh: no
+--      padding; padding not rechecked; padding past k)
+--   6. the fused routes with a NOT: weave_fuse_search() and a fused ordering
+--      scan gated by `@@@ '!fox'` return every row they should
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 NOTICE:  extension "pg_weave" already exists, skipping
 SET jit = off;
@@ -93,7 +100,8 @@ INSERT INTO qs VALUES
 	(17, '!zzz', 'zzz'),
 	(18, 'zzz', 'zzz');							-- covered, empty
 -- the oracle: the heap's match set (no index), each row at weave_search()'s
--- distance, 1.0 when it does not rank the row; and whether it holds a literal term
+-- distance (1.0 if it were missing; block 5 shows none is); and whether it holds
+-- a literal term
 SET enable_indexscan = off; SET enable_bitmapscan = off;
 CREATE TEMP TABLE ex (q text, id int, dist float8, hasterm bool);
 DO $$
@@ -285,4 +293,104 @@ SELECT v.q, l.lim,
 (9 rows)
 
 RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort;
+-- ---- 5. weave_search() ----------------------------------------------------
+-- k = 100000 (>= every match count), 1, the ranked count, just above it, and
+-- one below the match count.  Its TIDs are HOT-chain roots, mapped through
+-- rootmap; a TID rootmap does not know (a deleted row) has id NULL and counts
+-- as extra.
+CREATE TEMP TABLE ws (q text, k int, ord bigint, id int, score float8);
+DO $$
+DECLARE r record; m int; nr int;
+BEGIN
+	FOR r IN SELECT * FROM qs ORDER BY qn LOOP
+		SELECT count(*), count(*) FILTER (WHERE hasterm) INTO m, nr FROM ex WHERE ex.q = r.q;
+		INSERT INTO ws
+		SELECT r.q, ks.k, s.o, mm.id, s.score
+		  FROM (SELECT DISTINCT unnest(ARRAY[100000, 1, greatest(nr, 1), nr + 3,
+											 greatest(m - 1, 1)]) AS k) ks
+		  CROSS JOIN LATERAL weave_search('rn_w', r.q::wquery, ks.k) WITH ORDINALITY s(ctid, score, o)
+		  LEFT JOIN rootmap mm ON mm.tid = s.ctid;
+	END LOOP;
+END $$;
+-- full: the k = 100000 list.  bad_k: how many smaller k are not exactly
+-- least(k, nmatch) rows, all matches, at the full list's first scores.
+SELECT qs.qn, qs.q, x.nmatch,
+	   (SELECT count(*) FROM ws WHERE ws.q = qs.q AND k = 100000) AS n,
+	   (SELECT count(*) FROM ex WHERE ex.q = qs.q AND NOT EXISTS
+		   (SELECT 1 FROM ws WHERE ws.q = qs.q AND k = 100000 AND ws.id = ex.id)) AS short,
+	   (SELECT count(*) FROM ws WHERE ws.q = qs.q AND k = 100000 AND NOT EXISTS
+		   (SELECT 1 FROM ex WHERE ex.q = qs.q AND ex.id = ws.id)) AS extra,
+	   (SELECT count(*) - count(DISTINCT id) FROM ws WHERE ws.q = qs.q AND k = 100000) AS dup,
+	   (SELECT count(*) FROM (SELECT score, lag(score) OVER (ORDER BY ord) AS prev
+								FROM ws WHERE ws.q = qs.q AND k = 100000) z
+		 WHERE score > prev) AS rising,
+	   (SELECT count(*) FROM ws JOIN ex ON ex.q = ws.q AND ex.id = ws.id
+		 WHERE ws.q = qs.q AND k = 100000 AND (ws.score = 0) = ex.hasterm) AS zero_wrong,
+	   (SELECT count(*) FROM (SELECT DISTINCT k FROM ws WHERE ws.q = qs.q AND k < 100000) kk
+		 WHERE (SELECT count(*) FROM ws WHERE ws.q = qs.q AND ws.k = kk.k) <> least(kk.k, x.nmatch)
+			OR EXISTS (SELECT 1 FROM ws WHERE ws.q = qs.q AND ws.k = kk.k AND NOT EXISTS
+						 (SELECT 1 FROM ex WHERE ex.q = qs.q AND ex.id = ws.id))
+			OR EXISTS (SELECT 1 FROM ws a JOIN ws f ON f.q = a.q AND f.k = 100000 AND f.ord = a.ord
+						WHERE a.q = qs.q AND a.k = kk.k
+						  AND round(a.score::numeric, 9) <> round(f.score::numeric, 9))) AS bad_k
+  FROM qs, LATERAL (SELECT count(*) AS nmatch FROM ex WHERE ex.q = qs.q) x
+ ORDER BY qs.qn;
+ qn |           q           | nmatch |  n   | short | extra | dup | rising | zero_wrong | bad_k 
+----+-----------------------+--------+------+-------+-------+-----+--------+------------+-------
+  1 | fox                   |    411 |  411 |     0 |     0 |   0 |      0 |          0 |     0
+  2 | !fox                  |   1598 | 1598 |     0 |     0 |   0 |      0 |          0 |     0
+  3 | !fox & !dog           |   1369 | 1369 |     0 |     0 |   0 |      0 |          0 |     0
+  4 | !(fox | dog)          |   1369 | 1369 |     0 |     0 |   0 |      0 |          0 |     0
+  5 | fox | !dog            |   1780 | 1780 |     0 |     0 |   0 |      0 |          0 |     0
+  6 | quick | !fox          |   1662 | 1662 |     0 |     0 |   0 |      0 |          0 |     0
+  7 | (fox & !dog) | !quick |   1745 | 1745 |     0 |     0 |   0 |      0 |          0 |     0
+  8 | !(fox & dog)          |   1952 | 1952 |     0 |     0 |   0 |      0 |          0 |     0
+  9 | !"quick brown"        |   1829 | 1829 |     0 |     0 |   0 |      0 |          0 |     0
+ 10 | fox & !"quick brown"  |    375 |  375 |     0 |     0 |   0 |      0 |          0 |     0
+ 11 | fo*                   |    519 |  519 |     0 |     0 |   0 |      0 |          0 |     0
+ 12 | fo* | dog             |    733 |  733 |     0 |     0 |   0 |      0 |          0 |     0
+ 13 | fox & fo*             |    411 |  411 |     0 |     0 |   0 |      0 |          0 |     0
+ 14 | brwn~1                |    319 |  319 |     0 |     0 |   0 |      0 |          0 |     0
+ 15 | /fo.*/                |    519 |  519 |     0 |     0 |   0 |      0 |          0 |     0
+ 16 | dog | !/fo.*/         |   1562 | 1562 |     0 |     0 |   0 |      0 |          0 |     0
+ 17 | !zzz                  |   2009 | 2009 |     0 |     0 |   0 |      0 |          0 |     0
+ 18 | zzz                   |      0 |    0 |     0 |     0 |   0 |      0 |          0 |     0
+(18 rows)
+
+-- ---- 6. the fused routes with a NOT ---------------------------------------
+-- weave_fuse_search() carries no restriction, so every non-NULL document is a
+-- row of its answer (padded at 0 when no channel reaches it); a fused ordering
+-- scan gated by `@@@ '!fox'` must return exactly that gate's matches.
+SELECT (SELECT count(*) FROM weave_fuse_search('rn_w', ARRAY['!fox'::wquery, 'dog'::wquery],
+											   k => 100000))
+	   = (SELECT count(*) FROM rn WHERE d IS NOT NULL) AS fuse_search_every_document;
+ fuse_search_every_document 
+----------------------------
+ t
+(1 row)
+
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_sort = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM rn WHERE d @@@ '!fox'::wquery
+ ORDER BY fuse(d <=> 'dog'::wquery, d <=> 'fox'::wquery);
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Index Scan using rn_w on rn
+   Index Cond: (d @@@ '!''fox'''::wquery)
+   Order By: ((d <=> '''dog'''::wquery) AND (d <=> '''fox'''::wquery) AND (d <~> '{1,1}'::real[]))
+(3 rows)
+
+CREATE TEMP TABLE fz AS
+  SELECT id FROM rn WHERE d @@@ '!fox'::wquery
+   ORDER BY fuse(d <=> 'dog'::wquery, d <=> 'fox'::wquery);
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_sort;
+SELECT (SELECT count(*) FROM fz) AS fused_n,
+	   (SELECT count(*) FROM fz) - (SELECT count(DISTINCT id) FROM fz) AS fused_dup,
+	   (SELECT count(*) FROM ex WHERE q = '!fox' AND id NOT IN (SELECT id FROM fz)) AS fused_short,
+	   (SELECT count(*) FROM fz WHERE id NOT IN (SELECT id FROM ex WHERE q = '!fox')) AS fused_extra;
+ fused_n | fused_dup | fused_short | fused_extra 
+---------+-----------+-------------+-------------
+    1598 |         0 |           0 |           0
+(1 row)
+
 DROP TABLE rn;

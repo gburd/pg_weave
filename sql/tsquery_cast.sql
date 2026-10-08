@@ -35,6 +35,9 @@ SELECT count(*) AS docs, count(*) FILTER (WHERE tsv = strip(tsv) AND length(tsv)
 -- reaches the scan-side recheck rather than an executor recheck (AGENTS.md)
 CREATE INDEX tc_tsv ON tc USING weave (tsv tsvector_lex_ops);
 CREATE INDEX tc_expr ON tc USING weave (to_wdoc(tsv));
+-- positions = on: a pure phrase chain is answered from the postings' positions
+-- (weave_phrase_eval_seg), the other evaluator of an exact gap
+CREATE INDEX tc_pos ON tc USING weave (to_wdoc(tsv)) WITH (positions = on);
 
 -- core's row set, the cast's row set (heap evaluation), the two index counts
 -- (ix_ok), the ranked index scan's relation to core (ranked), or the refusal
@@ -61,13 +64,15 @@ BEGIN
 	SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO weave
 	  FROM tc WHERE to_wdoc(tsv) @@@ wq;
 	ix_ok := weave_count('tc_tsv', wq) = cardinality(core)
-		 AND weave_count('tc_expr', wq) = cardinality(core);
+		 AND weave_count('tc_expr', wq) = cardinality(core)
+		 AND weave_count('tc_pos', wq) = cardinality(core);
 	-- the ranked scan (WHERE @@@ q ORDER BY <=> q).  Its candidates come from
 	-- q's literal terms, so a prefix expansion or a row matching only through
 	-- NOT is reached by the padding phase (doc/GAPS.md G94; it was a SUBSET).
 	-- 'same' needs the set AND the order: each row at the distance the scan
-	-- published for it, that distance weave_search()'s (1.0 for a row it does
-	-- not rank), and the stream non-decreasing.
+	-- published for it, that distance weave_search()'s (which returns every
+	-- match too, a padded one at score 0, distance 1.0), and the stream
+	-- non-decreasing.  A row weave_search() does not return is 'MISORDERED'.
 	SET LOCAL enable_seqscan = off;
 	SET LOCAL enable_bitmapscan = off;
 	FOR rr IN SELECT id, ctid AS t, weave_current_distance('tc_tsv', ctid, wq) AS cur
@@ -83,8 +88,8 @@ BEGIN
 	  FROM (SELECT u.cur, lag(u.cur) OVER (ORDER BY u.o) AS prev, s.score
 			  FROM unnest(tids, curs) WITH ORDINALITY u(t, cur, o)
 			  LEFT JOIN weave_search('tc_tsv', wq, 1000) s ON s.ctid = u.t) z
-	 WHERE cur IS NULL OR cur < prev
-		OR abs(cur - coalesce(1.0 / (1.0 + score), 1.0)) > 1e-9;
+	 WHERE cur IS NULL OR cur < prev OR score IS NULL
+		OR abs(cur - 1.0 / (1.0 + score)) > 1e-9;
 	ranked := CASE WHEN r = core AND bad = 0 THEN 'same'
 				   WHEN r = core THEN 'MISORDERED'
 				   WHEN r <@ core THEN 'subset'
@@ -108,9 +113,16 @@ SELECT q, cardinality(c.core) AS ncore,
 		('quick <-> brown'), ('quick:A <-> brown'), ('quick <-> brown:B'),
 		('(quick <-> brown) <-> fox'), ('(quick <-> brown) & fox'),
 		('!(quick <-> brown)'), ('fox <-> fox'),
-		-- phrase shapes wquery cannot express exactly
+		-- exact gaps (WEAVE_QF_PHRASE_EXACT): <0> is the same position, <N>
+		-- exactly N, a right operand's width adds to the gap
 		('quick <2> brown'), ('quick <0> brown'), ('quick <3> brown'),
-		('quick <-> (brown <-> fox)'), ('quick <-> (brown | fox)'),
+		('fox <0> fox'), ('fox <2> fox'), ('quick <1> brown'), ('quick:A <2> brown:C'),
+		('quick <-> (brown <-> fox)'), ('quick <2> (brown <3> fox)'),
+		('(quick <2> brown) <-> (fox <0> fox)'), ('(quick <0> quick) <2> fox'),
+		('quick <-> (brown <-> (fox <-> dog))'), ('!(quick <2> brown)'),
+		('quick <2> brown | dog <0> dog'), ('quick <2> brown & !fox'),
+		-- phrase shapes wquery cannot express exactly: still refused
+		('quick <-> (brown | fox)'),
 		('quick <-> (brown & fox)'), ('quick <-> !brown'), ('fo:* <-> dog'),
 		('quick <-> fo:*'),
 		-- negation
@@ -170,13 +182,73 @@ SELECT ranked, count(*),
 SELECT count(*) FILTER (WHERE q ~ ':[A-D]+') AS weighted,
 	   count(*) FILTER (WHERE q ~ ':\*') AS prefixed,
 	   count(*) FILTER (WHERE q ~ '<->') AS phrased,
+	   count(*) FILTER (WHERE q ~ '<[0-9]+>') AS exact_gap,
 	   count(*) FILTER (WHERE q ~ '!') AS negated
   FROM rres WHERE refused IS NULL;
 
--- the text form of each mapped shape
+-- the text form of each mapped shape; an exact gap prints as core does
 SELECT q, q::tsquery::wquery::text AS wquery
   FROM (VALUES ('fox:A'), ('fox:BD'), ('fox:ABCD'), ('fo:*'), ('!fox:C'),
-			   ('quick <-> brown <-> fox'), ('fox:A & (dog | la:*)')) v(q);
+			   ('quick <-> brown <-> fox'), ('fox:A & (dog | la:*)'),
+			   ('quick <0> brown'), ('quick <3> brown'), ('quick <-> (brown <2> fox)'),
+			   ('(quick <2> brown) <0> (fox <-> dog)')) v(q);
+
+-- phraseto_tsquery: a stopword leaves a gap, which core spells <N>
+SELECT p, doc, phraseto_tsquery('english', p)::text AS tsquery,
+	   phraseto_tsquery('english', p)::wquery::text AS wquery,
+	   to_tsvector('english', doc) @@ phraseto_tsquery('english', p) AS core,
+	   to_wdoc(to_tsvector('english', doc)) @@@ phraseto_tsquery('english', p)::wquery AS weave
+  FROM (VALUES ('cat in the hat'), ('the cat in the hat'), ('cat hat'), ('cat in hat')) v(p),
+	   (VALUES ('the cat in the hat sat'), ('a cat hat'), ('cat in a hat'),
+			   ('cat in the big hat')) t(doc)
+ ORDER BY 1, 2;
+
+-- <0> where it can match: two lexemes at one position (what an ispell or
+-- thesaurus dictionary produces; a 'simple' tsvector never does).  Core, the
+-- heap, and the three index arms (positions = on answers a pure chain from the
+-- postings) must agree.
+CREATE TEMP TABLE tz (id int, tsv tsvector);
+INSERT INTO tz VALUES (1, 'quick:1 brown:1 fox:2'), (2, 'quick:1 brown:2 fox:3'),
+	(3, 'quick:1,3 brown:3 fox:4 dog:4'), (4, 'brown:1 quick:2 fox:2'),
+	(5, 'quick:5 brown:5 fox:7 dog:9'), (6, 'fox:1 dog:1 quick:3 brown:3');
+CREATE INDEX tz_tsv ON tz USING weave (tsv tsvector_lex_ops);
+CREATE INDEX tz_expr ON tz USING weave (to_wdoc(tsv));
+CREATE INDEX tz_pos ON tz USING weave (to_wdoc(tsv)) WITH (positions = on);
+SELECT q, (SELECT array_agg(id ORDER BY id) FROM tz WHERE tsv @@ q::tsquery) AS core,
+	   (SELECT array_agg(id ORDER BY id) FROM tz WHERE to_wdoc(tsv) @@@ q::tsquery::wquery) AS heap,
+	   weave_count('tz_tsv', q::tsquery::wquery) AS ix_tsv,
+	   weave_count('tz_expr', q::tsquery::wquery) AS ix_expr,
+	   weave_count('tz_pos', q::tsquery::wquery) AS ix_pos
+  FROM (VALUES ('quick <0> brown'), ('brown <0> quick'), ('fox <0> dog'),
+			   ('(quick <0> brown) <-> fox'), ('quick <-> (fox <0> dog)'),
+			   ('(fox <0> dog) <2> (quick <0> brown)'), ('quick <0> brown <2> dog'),
+			   ('quick <2> fox'), ('quick <-> fox')) v(q);
+
+-- the binary form keeps the exact-gap flag: through COPY (FORMAT binary) and
+-- back (wquery_send -> wquery_recv) the value has the same bytes and the
+-- received one answers like core.  Per-backend file name (G60).
+CREATE TEMP TABLE wqa (id int, q text, w wquery);
+CREATE TEMP TABLE wqb (id int, w wquery);
+INSERT INTO wqa SELECT i, q, q::tsquery::wquery
+  FROM unnest(ARRAY['quick <0> brown', 'quick <2> brown', 'quick <-> (brown <2> fox)',
+					'(quick <2> brown) <-> fox', 'fox <0> fox']) WITH ORDINALITY u(q, i);
+SELECT '/tmp/pg_weave_wq_rt_' || pg_backend_pid() || '.bin' AS wqfile \gset
+COPY (SELECT id, w FROM wqa) TO :'wqfile' WITH (FORMAT binary);
+COPY wqb FROM :'wqfile' WITH (FORMAT binary);
+SELECT a.q, wquery_send(b.w) = wquery_send(a.w) AS binary_same, b.w::text AS received,
+	   (SELECT count(*) FROM tc WHERE to_wdoc(tsv) @@@ b.w) AS recv_rows,
+	   (SELECT count(*) FROM tc WHERE tsv @@ a.q::tsquery) AS core_rows
+  FROM wqa a JOIN wqb b USING (id) ORDER BY id;
+
+-- PRE-EXISTING, recorded not fixed: wquery_out's text does not parse back.
+-- wquery_in reads '<' and '>' as separators and the '-' of '<->' as NOT, and
+-- drops a suffix after a quoted term, so each rendering below re-parses to a
+-- different query.  (Binary send/recv above is exact.)
+SELECT w::text AS rendered, w::text::wquery::text AS reparsed,
+	   w::text::wquery::text = w::text AS round_trips
+  FROM (VALUES ('quick <-> brown'::tsquery::wquery), ('quick <2> brown'::tsquery::wquery),
+			   ('fo:*'::tsquery::wquery), ('fox:A'::tsquery::wquery),
+			   ('"quick brown"'::wquery)) v(w);
 
 -- the ranked arm really is an index scan with the ranking pass
 SET enable_seqscan = off;

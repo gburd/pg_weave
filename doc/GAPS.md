@@ -6573,6 +6573,98 @@ when `ordSameQuery` and the query has a NOT or an expanding leaf; it touches the
 ordering machinery, so it is left for a task of its own. `sql/tsquery_cast.sql` pins
 the current state (`ranked` column: never SUPERSET; subset only with a prefix or a NOT).
 
+**EXACT-GAP PHRASE, 2026-10-08 (`wt/phrase`, maintainer decision 2026-10-08: format change OK).**
+Design, written before the code:
+
+- *Core's semantics* (`TS_phrase_execute` / `TS_phrase_output`, `tsvector_op.c`). Every
+  match is reported at its END position plus a static `width` (lexemes - 1): a lexeme has
+  width 0, `L <N> R` has width `N + width(L) + width(R)`, NOT keeps its operand's width,
+  AND/OR take the max (and OR takes the surviving side's width when the other side fails,
+  so it is not static). `L <N> R` matches at `p` iff `R` ends at `p` and `L` ends at
+  `p - N - width(R)` -- gap EXACTLY `N + width(R)` between the two end positions. So
+  `<0>` is "same position", and a right-nested `a <1> (b <1> c)` is `end(a) + 2 == end(c)`.
+- *wquery representation: a flag, not an op code.* `WEAVE_QF_PHRASE_EXACT` on a
+  `WEAVE_OP_PHRASE` item (`flags` is 0 on every OPR item every producer emits today), with
+  `distance` = the exact end-to-end gap the cast computes as `N + width(R)`. Chosen over a
+  new op code because every site that does not EVALUATE adjacency (candidate AND in
+  `weave_eval_query`, the inexact flag, the pure-boolean / pure-OR gates, `has_phrase`)
+  must treat the exact form exactly like PHRASE, and a flag gets that for free; a new op
+  code would fall into the "else = OR" arm of `weave_eval_query` wherever a site was
+  missed. The two sites that DO evaluate adjacency share `weave_phrase_step_pos()`, which
+  gains an `exact` argument, so the compiler finds every caller.
+- *Mapped by the cast once both evaluators read the flag:* `<0>`, `<N>`, left-nested,
+  right-nested and phrase-of-phrase chains of lexemes (weighted lexemes included), hence
+  `phraseto_tsquery` with stopword gaps. *Still refused:* `&`, `|`, `!` and `lex:*` inside a
+  phrase -- core evaluates those positionally with negated position sets and
+  width alignment (`TSPO_L_ONLY`/`R_ONLY`, `negate`), which neither wquery evaluator models.
+- *Found while designing, pre-existing:* `wquery_out` output does not re-parse. The lexer
+  treats `<` and `>` as separators and `-` as NOT, so `('a' <-> 'b')` reads back as
+  `'a' & !'b'`; `'a'*`, `'a'~1` and `'a':A` lose the suffix after the quote. Binary
+  send/recv round-trips every field (flags included). A text form that round-trips needs
+  new `wquery_in` syntax, which is a decision (see the report on `wt/phrase`).
+
+**Built, 2026-10-08 (`wt/phrase`).** `WEAVE_QF_PHRASE_EXACT` (`include/weave/weave.h`);
+`weave_phrase_step_pos(..., exact, ...)` (`src/query/match.c`) is the one comparison, used
+by the heap matcher's `phrase_step()` and by the index's positional chain
+(`weave_phrase_chain()` records a per-step flag, `weave_phrase_eval_seg()` passes it,
+`src/am/amscan.c`); the candidate AND, the inexact flag and recheck needed no change because
+the item is still `WEAVE_OP_PHRASE`. `mig_walk` sets the flag on every phrase with
+`distance = N + width(R)` (int64, clamped at `UINT32_MAX`). `wquery_out` prints the exact
+form in tsquery's spelling (`<->` for N = 1, `<N>` otherwise, N recovered by subtracting
+the right operand's width) so the cast's output reads as the tsquery it came from. No
+`wquery_in` syntax: the flag is reachable only through the cast and binary input.
+
+Refusals, `sql/tsquery_cast.sql`, same seed, before (`wt/g93`) and after:
+
+| | hand-written (53 now, 42 before) | random 400 converted | random refused |
+|---|---|---|---|
+| before | 4 phrase shapes refused as "not a left-nested chain" | 160 | 240: bool-in-phrase 113, not-a-chain 46, prefix-in-phrase 46, weighted prefix 35 |
+| after | every `<0>` / `<N>` / nested lexeme chain converts and agrees | **182** | **218**: bool-in-phrase 128, prefix-in-phrase 51, weighted prefix 39 |
+
+(The random set is generated before the cast is tried, so the 400 queries are identical;
+a query refused as "not a chain" before now either converts or hits a later refusal deeper
+in the same query, which is why the other buckets grew.) `phraseto_tsquery('english',
+'cat in the hat')` = `'cat' <3> 'hat'` converts and answers like core on four documents,
+gaps 1-3.
+
+**Still refused, and why.** `&`, `|`, `!` inside a phrase. Core evaluates them
+positionally: AND inside a phrase is "both at the same end position after width
+alignment" (`TSPO_BOTH` with offsets `maxwidth - width`), OR is a union whose width is the
+surviving side's (so it is not static, which the cast's width computation needs), and NOT
+is a negated position set (`negate`). wquery's evaluators carry a plain position list per
+operand and drop it at a boolean operator. Modelling core would need a position-set
+algebra with negation in both evaluators -- a larger change than this one, and
+`(brown | fox)` inside a phrase is the shape `phraseto_tsquery` produces only for a
+multi-variant dictionary (ispell, thesaurus). A prefix lexeme inside a phrase: wquery's
+prefix leaf carries no positions. Both are follow-ups if a real query corpus shows them.
+
+Gate evidence (EC2 Debian 13, PG17.11): run `pgweave-20261008-172913-2266` on `b678b5e`:
+the full installcheck differed from expected only in `tsquery_cast` (each change read and
+intended, hard rule 3); solo control twice, 0 diff lines, 0 DIFFERENT rows, full-run =
+solo; 0 disagreements among 182 converted random queries on the heap, a
+`tsvector_lex_ops` index, an expression index and a `positions = on` index (the
+positional chain), and the ranked scan `same` on all 182. Mutants (`bench/aws/phrase_job.sh`),
+each BUILT with an installed `.so` differing from the clean one and then changing the solo
+output, 6/6: exact gap evaluated as at-most in the heap (10 DIFFERENT rows); in the index's
+positional chain (5); off by one in the shared comparison (18); the cast adding the left
+width instead of the right (3); `wquery_recv` dropping an operator's flag (the binary-COPY
+rows); the cast not setting the flag (10). Clean tree reinstalled after, 0 diff lines.
+PG18 installcheck 32/32 + isolation 2/2 with that run's outputs as expected. That run's
+random table has no two lexemes at one position, so every `<0>` in it was "no rows" or
+the same lexeme; run `pgweave-20261008-173959-7e54` on `733e877` adds a six-row table that
+does (what an ispell or thesaurus dictionary produces), nine shapes including `<0>` on both
+sides of a `<2>`: core = heap = all three index arms on every one. Its output differs from
+the first run's only by the added sections (0 removed lines) and is the committed expected
+output; mutants 6/6 again, PG18 32/32 + 2/2 again. It also pins the pre-existing text
+re-parse failure: `('quick' <-> 'brown')` reads back as `('quick' & !'brown')`, `'fo'*` as
+`'fo'`, `'fox':A` as `('fox' & 'a')`.
+
+Full strict smoke green on `f0bc290` (`pgweave-20261008-174946-139f`: lint, codec,
+`make installcheck` exit 0 with regression, isolation and TAP 35 files / 1484 tests).
+
+**No CORE_CANDIDATES row:** core's phrase semantics are what is being matched, and nothing
+in core blocks or would simplify it.
+
 Gate: `sql/tsquery_cast.sql` -- 42 hand-written and 400 random tsqueries over one
 200-row weighted table, core `@@` against the cast through the heap, `weave_count()` on a
 `tsvector_lex_ops` index and an expression index, and the ranked index scan; plus 15
@@ -6580,7 +6672,7 @@ native fuzzy/regex-under-boolean queries, seqscan against both indexes. Mutants:
 `bench/aws/g93_mutants.sh` (M1-M10, each verified BUILT with an installed `.so` that
 differs from the clean one).
 
-### G94 — WRONG ANSWER: the ranked scan `WHERE d @@@ q ORDER BY d <=> q` returns a SUBSET when q contains a NOT (or a prefix) — **FOUND 2026-10-08 by G93's test; FIXED 2026-10-08 on `wt/g94` for the ordering scan (NOT, prefix, fuzzy and regex alike); the `weave_search()` SRF is still a subset**
+### G94 — WRONG ANSWER: the ranked scan `WHERE d @@@ q ORDER BY d <=> q` returns a SUBSET when q contains a NOT (or a prefix) — **FOUND 2026-10-08 by G93's test; FIXED 2026-10-08 on `wt/g94` for the ordering scan (NOT, prefix, fuzzy and regex alike), and on `wt/g94s` for the `weave_search()` SRF**
 
 Split out of G93 (see its "Still open" paragraph for the evidence). Candidates come only
 from q's positive literal terms (the WAND cursors), so a row that matches q only through a
@@ -6686,11 +6778,8 @@ ranked rows already fill the LIMIT pays nothing (`rare | !w1` LIMIT 10), and cov
 are unchanged.
 
 **Remaining limits, stated.**
-- **`weave_search()` is still a subset** for an uncovered query: it shares the ranked
-  pass and has no padding phase. Its rows past the ranked ones would all be at score 0, so
-  the fix there is "append the rest of the match set at 0"; not done (not in this task's
-  gate, and the SRF's `k` makes it cheap when wanted). `src/am/amscan.c`'s collect-site
-  comment says so.
+- ~~**`weave_search()` is still a subset**~~ for an uncovered query. **FIXED 2026-10-08 on
+  `wt/g94s`**, see "The `weave_search()` remainder" below.
 - **Beyond `WEAVE_ORD_WIDTH_MAX` (~67M) ranked candidates** the ladder stops and the
   padding would emit the rest at 1.0 while some still score above 0 -- out of order. The
   same ceiling already bounds every other route's ranked phase; unreachable at today's
@@ -6701,6 +6790,78 @@ are unchanged.
 - **The padding's first-row cost is O(match set)** (above). Cheaper would be a streaming
   walk of the gate set that skips ranked TIDs without materializing it -- the G76 walk
   already streams its emission; it is the collection that is whole. Not done.
+
+**The `weave_search()` remainder (2026-10-08, `wt/g94s`, maintainer decision 2026-10-08).**
+`weave_search(index, q, k)` ran the same ranked pass with no padding phase, so for an
+uncovered q it returned only the matches that hold a literal term. By the proof above, every
+other match scores exactly 0. So `weave_topk_visible()` now calls `weave_topk_pad()` when it
+came back with fewer than k rows, the query is not covered (`weave_query_lit_covered()`)
+**and ranked generation was exhausted** (`ncand < wantk`). Past the over-fetch growth cap a
+row holding a literal term could still be unranked, and padding then would put a 0 above it.
+`weave_topk_pad()` collects q's match set, drops the TIDs already ranked, and keeps the first
+k - nvis that pass `weave_recheck_exact()` (visibility plus exact match: the collected set
+over-generates for a NOT over a phrase or a weighted leaf). That function now takes a limit,
+so the heap fetches are bounded by k rather than by the match set. It appends those rows at
+score 0. Its TIDs come out of the index, so they are HOT-chain roots like the ranked ones:
+G74's behaviour is unchanged, and `sql/ranked_not.sql` maps TIDs through its root map for
+that reason. The ordering scan's padding machinery (`weave_pad_begin()`) is not reused: it
+lives on the scan descriptor and streams through `amgettuple`, while the SRF needs a bounded
+array. What they share is the collector, the recheck and the coverage predicate.
+
+*`weave_fuse_search()` and a fused ordering scan with a NOT: no hole.* `weave_fuse_search()`
+takes no restriction, and its lexical-only answer already pads every unreached document at
+-0 (FUSED_TOPK.md sect. 7e). A fused ordering scan always pads (`weave_pad_wanted()` returns
+true for `fuseScan`, G71). `sql/ranked_not.sql` block 6 pins both: `weave_fuse_search(['!fox',
+'dog'])` returns every non-NULL document, and `WHERE d @@@ '!fox' ORDER BY fuse(d <=> 'dog',
+d <=> 'fox')` returns exactly the 1,598 matches, with 0 duplicated, short or extra. No
+mutant was run against block 6, because no code changed there.
+
+*Gate evidence (EC2 Debian 13, PG17.11),* run `pgweave-20261008-162641-39d3` (commit
+`c02d7b6`; smoke tolerated red only because the two expected files were owed; full-run output
+read, then committed as `28e7e04`):
+- `sql/ranked_not.sql` block 5: for each of the 18 queries, `weave_search()` at k = 100000,
+  1, the ranked count, ranked + 3 and match count - 1. At k = 100000 it returns exactly the
+  heap's `@@@` set (short, extra and dup all 0), scores never rise, and a row is at score 0
+  exactly when it holds no literal term. At every smaller k it returns exactly
+  least(k, nmatch) matching rows, at the full list's scores. All 0.
+- `sql/tsquery_cast.sql`: the `weave_search()` caveat is gone. A row the ordering scan
+  returns that `weave_search(.., 1000)` does not counts as `MISORDERED` (it used to be
+  coalesced to 1.0). Every verdict is unchanged, still `same 160`.
+- The expected-output diff is only the new comments, blocks 5 and 6, and `tsquery_cast`'s
+  function text. No result row of blocks 1-4 or of `tsquery_cast` changed (hard rule 3; read
+  line by line). Solo control: the clean tree run twice gives 0 diff lines, and full-run vs
+  solo gives 0 lines for each file.
+- **Mutants 3/3** (`bench/aws/g94s_job.sh` stage C). Each was asserted to APPLY, BUILD and
+  INSTALL a `.so` whose md5 differs from the clean one, and each was KILLED:
+  - S1, no padding: block 5 is `short` 1,581 of 1,598 for `!fox`, and `tsquery_cast` turns
+    35 rows `MISORDERED` (all with a prefix or a NOT).
+  - S2, padding cut to k but not rechecked: `extra` on 14 queries, deleted rows and the 180
+    `!"quick brown"` non-matches.
+  - S3, padding not stopped at k: `bad_k` on every uncovered query.
+
+  After the mutants the clean `.so` reinstalled with the clean md5, and the rerun gave
+  0 diff lines.
+- PG18.0 installcheck (regression + isolation), with the new outputs as expected: all 32
+  plus 2 passed.
+
+*Latency, a LOSS by construction, recorded (hard rule 8)* (stage D, the G94 fixture:
+c7i.4xlarge, median of 12 after 3 warm-up, two runs per arm `run1 / run2`; "before" is this
+tree with S1 applied):
+
+| query | k | 200k before (rows) | 200k after | 1M before (rows) | 1M after |
+|---|---|---|---|---|---|
+| `!w1` | 10 | 0.73 / 0.74 ms (**0**) | 30.3 / 30.0 ms | 3.73 / 3.92 ms (**0**) | 149.2 / 149.0 ms |
+| `!w1` | 1000 | 0.73 / 0.73 ms (**0**) | 30.1 / 30.3 ms | 3.66 / 3.83 ms (**0**) | 149.1 / 150.0 ms |
+| `rare \| !w1` | 10 | 0.25 / 0.26 ms | 0.25 / 0.26 ms | 0.73 / 0.74 ms | 0.74 / 0.73 ms |
+| `rare \| !w1` | 5000 | 1.00 / 1.02 ms (**400**) | 36.7 / 36.7 ms | 5.36 / 5.58 ms (**2000**) | 183.1 / 184.5 ms |
+| `w2 & !w1` (covered) | 10 | 2.56 / 2.54 ms | 2.57 / 2.53 ms | 12.6 / 13.0 ms | 12.8 / 13.5 ms |
+| `w1` (covered) | 10 | 0.07 / 0.07 ms | 0.07 / 0.07 ms | 0.27 / 0.29 ms | 0.28 / 0.29 ms |
+
+Every "after" row count equals k, and "before" was fast because it answered 0 of 180,000 /
+900,000 matches. The cost is G95's: collecting q's whole match set, linear in it (5.0x from
+200k to 1M) and independent of k. A query whose ranked rows fill k pays nothing, and covered
+queries are unchanged within the within-arm spread. The same streaming walk G95 waits for
+would fix this too.
 
 ### G95 — an uncovered NOT / prefix / fuzzy / regex ranked scan costs O(match set) before its first padded row — **ACCEPTED FOR NOW by maintainer decision 2026-10-08; REVISIT when a streaming padding walk exists**
 
@@ -6716,4 +6877,32 @@ padded rows as they are found (they all share distance 1.0, so any order among t
 tie order), stopping when the executor stops pulling -- would make `LIMIT 10` cost O(10 / match
 density) instead of O(match set). When that exists, re-measure this entry's two queries at the
 same two scales and close it. Covered queries (`fox & !dog`) never pad and are unaffected.
+
+**`weave_search()` has the same cost since 2026-10-08** (G94's SRF remainder,
+`weave_topk_pad()`): `!w1` at k = 10 takes 30 ms at 200k and 149 ms at 1M
+(`pgweave-20261008-162641-39d3`, two runs per arm). It is the same collection, and the
+streaming walk should serve both. Re-measure it in the same revisit.
+
+### G96 — `wquery_out` text does not parse back: a phrase, prefix, fuzzy or weighted term reloads as a DIFFERENT query — **FOUND 2026-10-08 by the exact-gap phrase work (`wt/phrase`); OPEN, needs a syntax decision**
+
+`wquery_out` prints phrases as `'quick' <-> 'brown'` (and since `wt/phrase`, exact gaps as `<N>`),
+prefixes as `'fo'*`, fuzzy as `'fo'~1` and weights as `'fox':A`. `wquery_in` reads none of these
+back: `<` and `>` are separators and `-` is NOT, and a suffix after a closing quote is dropped or
+split. Pinned by `sql/tsquery_cast.sql`:
+
+| printed | reads back as |
+|---|---|
+| `('quick' <-> 'brown')` | `'quick' & !'brown'` |
+| `'fo'*` | `'fo'` |
+| `'fox':A` | `'fox' & 'a'` |
+
+So a text-format `COPY` / `pg_dump` of a stored `wquery` column, or any client that round-trips
+a wquery through text, silently changes the query. Binary I/O is exact. This is the G89 rule
+(every value a function returns must round-trip) applied to the query type.
+
+**Decision needed (the phrase agent's proposal):** make `wquery_in` accept what `wquery_out`
+prints -- the tsquery operators `<->` / `<N>` between operands and a quoted term followed by `*`,
+`~k` or `:ABCD`. Cost: `a <-> b` today means `a & !b` and `a<2>b` means `a & 2 & b`; both change
+meaning. Nothing is released, so only tests notice. The alternative (print only what today's parser
+reads) cannot express an exact gap, so it does not close the round trip.
 

@@ -65,11 +65,13 @@ and after.
 
 Note the honest gap: `tsquery` → `wquery` is a helper plus a cast, not a
 transparent rewrite. The cast maps `&`, `|`, `!`, weights (`lex:AB`), prefixes
-(`lex:*`) and left-nested `<->` chains exactly, and REFUSES (`feature_not_supported`)
-what wquery cannot answer the same way: `<N>` other than `<->` (core's is an exact gap,
-wquery's phrase is "at most N"), a boolean or prefix inside a phrase, and a weighted
-prefix. So `phraseto_tsquery()` output with a stopword gap does not convert yet
-(`doc/GAPS.md` G93). Tracked in `doc/PHASES.md` under inherited debt.
+(`lex:*`) and phrases of lexemes -- `<->`, `<N>`, `<0>`, nested either way -- exactly,
+so `phraseto_tsquery()` output with a stopword gap converts. It REFUSES
+(`feature_not_supported`) what wquery cannot answer the same way: a boolean or prefix
+inside a phrase (`a <-> (b | c)`, `a <-> b:*`) and a weighted prefix (`doc/GAPS.md` G93).
+An exact-gap phrase has no spelling in wquery's own text syntax yet: it exists only as
+the cast's output, and its printed form (`('cat' <3> 'hat')`) does not parse back.
+Tracked in `doc/PHASES.md` under inherited debt.
 
 ## Trigram compatibility
 
