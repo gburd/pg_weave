@@ -94,3 +94,84 @@ unmeasured.
   at once, and running the pass after the flush. Details in G75.
 - **Owed: a merge launders a freed live page** (G75). The merge's chain walkers should
   raise an ERROR, not stop.
+
+## L22 — the crash-loop size bound (`doc/PHASES.md` L22)
+
+Branch `wt/l22`. Harness: `bench/aws/l22_job.sh` (t/033 under ablation arms),
+`bench/aws/l22_gate.sh` (the gate), `bench/aws/g75_scale.sh` (now with a never-crashed
+twin), `bench/aws/l22_scale_ablate.sh` (the scale arms). EC2 c7i.4xlarge, Debian 13, PG 17.11.
+
+### The ablation (t/033, 11 cycles, two runs per arm)
+
+The two diagnostic builds, which are not on the branch tip: `d48c485` logs the
+trigger's inputs at every cleanup step, on both indexes, counted both from the FSM and
+from the pages. `24a0b57` also logs which exit `weave_vacuum_compact()` takes. Each
+arm makes one exact-once substitution, and every C arm built a `.so` with its own md5.
+
+| arm | what it removes | excess at cycles 8 / 9 / 10 (run 1; run 2) | run |
+|---|---|---|---|
+| base | nothing | 2,626 / 5,299 / 10,776; same | `pgweave-20261008-005536-eed3` |
+| `trig_pages` | the trigger counts free pages from the pages, not the FSM | 2,626 / 5,299 / 10,776; same | same |
+| `trig_reusable` | the trigger counts only pages reusable now | 2,626 / 5,299 / 10,776; same | same |
+| `trig_off` | the trigger | 844 / 844 / 844; 844 / 844 / 1,433 | same |
+| `fit` | a share-lock pass runs only if reusable ≥ live (from the pages) | 589 / 0 / 0; 589 / 0 / 589 | `pgweave-20261008-014427-e5f8` |
+| `swap` | t/033 inserts the twin first | −1,508 / 7 / −2,666; −2,371 / 7 / −2,666 (**the twin grows**: `t_w` 22,023 → 24,649 → 27,322 → 29,995) | same |
+| `xid` | one `txid_current()` before the inserts | 255 / 5,306 / 5,306; same | same |
+
+What the census showed (base, both runs):
+
+- **The trigger fires on both indexes** from cycle 8, for example on the twin with
+  9,989 FSM-free pages against a quarter of 5,505. The stale FSM entries a crash leaves
+  (1,088 and 1,343 per cycle) are marked used by the reclaim *before* the trigger reads
+  the map, so at the trigger the FSM and the pages agree on both indexes. **REFUTED:
+  "stale FSM entries feed the trigger".**
+- The twin's pass was stopped by `weave_any_free_page_recyclable()`, the 256-page probe.
+  The crashed index's pass got past it with 10,244 reusable pages against 12,033 live.
+  It packed what it could, extended 1,782, and freed the old copy under its own xid, so
+  nothing was truncatable. The shortfall came back on every VACUUM after that.
+- Which index got past the probe was decided by **INSERT order**, not by the crash. A
+  merge stamps its frees with `ReadNextTransactionId()`. The next transaction is the
+  first INSERT, and it cannot reuse pages stamped with its own xid, so it extends and
+  leaves the low free pages old. The second INSERT reuses them. `swap` moves the growth
+  to the never-crashed twin. **REFUTED: "the crash causes it".**
+
+### The fix and the gate (`pgweave-20261008-022758-8a5a`, commit `40c9898`)
+
+`weave_pack_fits_reusable()` in `src/am/amvacuum.c`. On a tombstone-free index, a
+share-lock pass needs the live pages, counted from the pages, to fit in the pages reusable
+now. With tombstones, the probe alone still decides.
+
+| gate | result |
+|---|---|
+| smoke: `make installcheck`, 34 TAP files | PASS, 1,294 tests; `t/033` ok **with no TODO**; `t/015` ok |
+| `t/033` bound, hard, two runs (control) | PASS: worst excess 1,064 (bound 2,255) and 844 (bound 1,421) |
+| `t/015` (no ratchet), two runs | PASS; the G47 vector-weft arm still settles at 198 |
+| mutant `nofit` (the probe alone again), built, distinct `.so` | **CAUGHT** by `t/033`: excess 2,626 / 5,299 / 7,972, the pre-fix numbers to the page |
+| G75's four mutants | CAUGHT, as before |
+| 1M rows, 14 crash cycles, with a twin | numerically PASS (worst 3,531, bound 6,750), **but see the next section** |
+
+### LOSS, OPEN: a second growth at scale, which this fix does not touch
+
+The scale run's excess of the crashed index over its twin, per cycle:
+
+    0 2352 851 2672 1171 0 0 0 1177 1177 2354 2354 3531 3531
+
+From cycle 9 the excess grows by 1,177 pages every two cycles. That is one 60k-row
+batch's segment, and the post-crash VACUUMs did **no allocation work at all**
+(`alloc (0,0,0,0,0,0,0)`). The growth is at the crashed table's INSERT, while the twin
+stays at 80,299. It is not the compaction mechanism above: no pass runs. A 14-cycle bound
+that passes is therefore not evidence that the growth is bounded. What the run shows:
+
+- The reclaim's **stale-entry count grows every cycle**: 2,370, 5,048, 7,726, 10,404,
+  13,082, 15,760. Its re-recorded count tracks the excess exactly: 1,177, 2,354, 2,354,
+  3,531, 3,531, 4,708.
+- The server log shows **no checkpoint between crashes** from 03:06 to 03:57. Each
+  restart's end-of-recovery checkpoint resets the timer, and a cycle (about 4.5 min) is
+  shorter than `checkpoint_timeout` (5 min). Each end-of-recovery checkpoint did write
+  ~11.4k buffers, including FSM pages.
+- **Hypothesis, not demonstrated:** each crash restores a free space map that lists pages
+  since reused and freed again, stamped with an xid the next INSERT then gets. The
+  allocator's FSM loop treats that first non-recyclable candidate as the end of reuse
+  (`weave_new_buffer_internal()`, the deliberate `break`), so the whole batch extends.
+  The ablation that tests it: `bench/aws/l22_scale_ablate.sh`, with arms `swap`, `ckpt`
+  and `burn` beside `base`, results below when run.
