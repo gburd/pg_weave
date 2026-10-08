@@ -44,6 +44,11 @@ LANGUAGE plpgsql AS $$
 DECLARE
 	wq wquery;
 	r int[];
+	rr record;
+	ids int[] := '{}';
+	tids tid[] := '{}';
+	curs float8[] := '{}';
+	bad int;
 BEGIN
 	SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO core
 	  FROM tc WHERE tsv @@ q::tsquery;
@@ -57,17 +62,31 @@ BEGIN
 	  FROM tc WHERE to_wdoc(tsv) @@@ wq;
 	ix_ok := weave_count('tc_tsv', wq) = cardinality(core)
 		 AND weave_count('tc_expr', wq) = cardinality(core);
-	-- the ranked scan (WHERE @@@ q ORDER BY <=> q) has no heap recheck.  Its
-	-- candidates come from q's positive literal terms, so a prefix expansion
-	-- or a row matching only through NOT is not generated: a SUBSET is the
-	-- documented limitation; any row core does not match is a wrong answer.
+	-- the ranked scan (WHERE @@@ q ORDER BY <=> q).  Its candidates come from
+	-- q's literal terms, so a prefix expansion or a row matching only through
+	-- NOT is reached by the padding phase (doc/GAPS.md G94; it was a SUBSET).
+	-- 'same' needs the set AND the order: each row at the distance the scan
+	-- published for it, that distance weave_search()'s (1.0 for a row it does
+	-- not rank), and the stream non-decreasing.
 	SET LOCAL enable_seqscan = off;
 	SET LOCAL enable_bitmapscan = off;
-	SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO r FROM
-		(SELECT id FROM tc WHERE tsv @@@ wq ORDER BY tsv <=> wq LIMIT 1000) x;
+	FOR rr IN SELECT id, ctid AS t, weave_current_distance('tc_tsv', ctid, wq) AS cur
+				FROM tc WHERE tsv @@@ wq ORDER BY tsv <=> wq LIMIT 1000 LOOP
+		ids := ids || rr.id;
+		tids := tids || rr.t;
+		curs := curs || rr.cur;
+	END LOOP;
 	SET LOCAL enable_seqscan = on;
 	SET LOCAL enable_bitmapscan = on;
-	ranked := CASE WHEN r = core THEN 'same'
+	SELECT coalesce(array_agg(i ORDER BY i), '{}') INTO r FROM unnest(ids) i;
+	SELECT count(*) INTO bad
+	  FROM (SELECT u.cur, lag(u.cur) OVER (ORDER BY u.o) AS prev, s.score
+			  FROM unnest(tids, curs) WITH ORDINALITY u(t, cur, o)
+			  LEFT JOIN weave_search('tc_tsv', wq, 1000) s ON s.ctid = u.t) z
+	 WHERE cur IS NULL OR cur < prev
+		OR abs(cur - coalesce(1.0 / (1.0 + score), 1.0)) > 1e-9;
+	ranked := CASE WHEN r = core AND bad = 0 THEN 'same'
+				   WHEN r = core THEN 'MISORDERED'
 				   WHEN r <@ core THEN 'subset'
 				   ELSE 'SUPERSET' END;
 END $$;
@@ -142,7 +161,8 @@ SELECT refused, count(*) FROM rres WHERE refused IS NOT NULL GROUP BY 1 ORDER BY
 SELECT i, q, core, weave, ix_ok FROM rres
  WHERE refused IS NULL AND (core IS DISTINCT FROM weave OR ix_ok IS NOT TRUE)
  ORDER BY i LIMIT 20;
--- the ranked scan: never a SUPERSET; a subset only with a prefix or a NOT
+-- the ranked scan: the same set as core, in order, for every converted query
+-- (G94: it was a subset for 35, each with a prefix or a NOT)
 SELECT ranked, count(*),
 	   count(*) FILTER (WHERE q !~ ':\*' AND q !~ '!') AS without_prefix_or_not
   FROM rres WHERE refused IS NULL GROUP BY 1 ORDER BY 1;

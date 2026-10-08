@@ -3293,14 +3293,12 @@ SELECT count(*) AS fuzzy_violations FROM (
                 0
 (1 row)
 
--- ranked fuzzy/prefix/regex return a correct SUBSET of the @@@ matches, not the
--- identical set: the ranked WAND path builds cursors from the literal query term
--- (weave_query_terms), so a doc that matches only via a fuzzy/prefix/regex
--- EXPANSION (no posting for the literal term) is never generated as a ranked
--- candidate.  weave_recheck_exact only ever shrinks, so every returned row is a
--- true match (fuzzy_violations = 0 above) but the ranked count can be < the
--- bitmap @@@ count.  Hence f, by design (a known limitation, documented in
--- CAPABILITIES.md / ROADMAP.md); use @@@ for exhaustive fuzzy/prefix retrieval.
+-- ranked fuzzy/prefix/regex return the SAME set as the bitmap @@@ (doc/GAPS.md
+-- G94; this was f, a documented SUBSET, until then).  The ranked WAND pass builds
+-- cursors from the literal query term (weave_query_terms), so a doc that matches
+-- only via a fuzzy/prefix/regex EXPANSION is never a ranked candidate; it scores 0
+-- on the literal terms, and the padding phase emits it at distance 1.0, after
+-- every ranked row, rechecked.  sql/ranked_not.sql checks the order too.
 SELECT (SELECT count(*) FROM (
           SELECT d FROM rf WHERE d @@@ 'document~1'::wquery
           ORDER BY d <=> 'document~1'::wquery LIMIT 500) s)
@@ -3308,7 +3306,7 @@ SELECT (SELECT count(*) FROM (
      AS fuzzy_ranked_eq_bitmap;
  fuzzy_ranked_eq_bitmap 
 ------------------------
- f
+ t
 (1 row)
 
 RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;

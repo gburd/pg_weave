@@ -3734,25 +3734,42 @@ weave_query_has_not(WeaveQuery q)
 	return false;
 }
 
+static bool weave_query_lit_covered(WeaveQuery q);
+
 /*
  * The G56 padding phase -- see the padActive fields in WeaveScanOpaqueData.
  *
  * Wanted on every ordering route: lexical `<=>`, vector (`<->`, `<#>`),
  * edit-distance (`<@>`) and, since doc/GAPS.md G71, fused -- whose ranked phase
  * is exact over its gate, which is now also why it must pad: rows the gate
- * excludes (a NULL vector) are still rows of the table.  Not when a single-key
- * restriction IS the ORDER BY query (ordQueryRestricts, whatever keys are beside
- * it):
- * every key is ANDed, so a row q does not match fails that key and the heap
- * walk would return nothing -- once per rescan, under a nested loop.
+ * excludes (a NULL vector) are still rows of the table.  Not when a restriction
+ * IS the ORDER BY query (ordQueryRestricts, whatever keys are beside it) and
+ * the ranked phase provably emitted all of its matches: every key is ANDed, so
+ * a row q does not match fails that key and the heap walk would return nothing
+ * -- once per rescan, under a nested loop.
  */
 static bool
 weave_pad_wanted(IndexScanDesc scan, WeaveScanOpaque so)
 {
 	if (so->fuseScan)
 		return true;			/* G71: see weave_pad_emit for the distance */
-	return scan->numberOfOrderBys == 1 &&
-		!so->ordSameQuery && !so->ordQueryRestricts;
+	if (scan->numberOfOrderBys != 1)
+		return false;
+	if (!so->ordSameQuery && !so->ordQueryRestricts)
+		return true;
+	/*
+	 * The restriction IS the ORDER BY query, and the ranked phase is complete
+	 * only for a query every match of which holds one of its literal terms
+	 * (doc/GAPS.md G94).  Otherwise -- a NOT (`!fox`, `fox | !dog`), a prefix,
+	 * fuzzy or regex leaf outside a covering AND -- pad, and the per-row recheck
+	 * weave_pad_emit asks for keeps only q's matches.  THE ORDER IS EXACT: the
+	 * ranked pass scores exactly the literal terms present and generates a
+	 * candidate from each of them, so it misses precisely the matches holding
+	 * none.  Those score 0, distance 1.0, which is the value they pad at and is
+	 * >= every ranked distance.  A row matching through the NOT but holding a
+	 * literal term from another branch was a candidate, and was ranked.
+	 */
+	return !weave_query_lit_covered(so->query);
 }
 
 static void
@@ -5034,27 +5051,40 @@ done:
 }
 
 /*
- * Is every match of q inside the union of its fuzzy/regex leaves' matches?
- * That union is the only candidate set the fuzzy/regex collect path builds, so
- * it is sound only when this holds: AND (and PHRASE, a subset of AND) needs one
- * covered arm, OR needs both, NOT never.  `a | b~1`, `!b~1` and `a & !/re/`
- * are not covered and returned only the leaves' rows (G93) -- the recheck can
- * shrink a candidate set, never add to it.
+ * Does every match of q satisfy at least one leaf with ((flags & mask) != 0) ==
+ * want?  Leaves combine as: AND (and PHRASE, a subset of AND) needs one covered
+ * arm, OR needs both, NOT never.  The empty query matches nothing, so it is
+ * covered.  Two questions are asked with it:
+ *
+ *  - weave_query_fr_covered (mask FUZZY|REGEX, want true): is every match inside
+ *    the union of the fuzzy/regex leaves' matches?  That union is the only
+ *    candidate set the fuzzy/regex collect path builds, so it is sound only when
+ *    this holds.  `a | b~1`, `!b~1` and `a & !/re/` are not covered and returned
+ *    only the leaves' rows (G93) -- the recheck can shrink a candidate set,
+ *    never add to it.
+ *
+ *  - weave_query_lit_covered (mask PREFIX|FUZZY|REGEX, want false): does every
+ *    match contain one of q's literal terms?  The ranked pass's WAND cursors are
+ *    exactly those terms, so only then is its candidate set the whole match set
+ *    (doc/GAPS.md G94; see weave_pad_wanted).
  */
 static bool
-weave_query_fr_covered(WeaveQuery q)
+weave_query_leaves_cover(WeaveQuery q, uint16 mask, bool want)
 {
-	bool	   *st = (bool *) palloc(Max(q->nitems, 1) * sizeof(bool));
+	bool	   *st;
 	int			top = 0;
 	uint32		i;
 	bool		r;
 
+	if (q->nitems == 0)
+		return true;
+	st = (bool *) palloc(q->nitems * sizeof(bool));
 	for (i = 0; i < q->nitems; i++)
 	{
 		WeaveQueryItem *it = &q->items[i];
 
 		if (it->type == WEAVE_QI_VAL)
-			st[top++] = (it->flags & (WEAVE_QF_FUZZY | WEAVE_QF_REGEX)) != 0;
+			st[top++] = ((it->flags & mask) != 0) == want;
 		else if (it->op == WEAVE_OP_NOT)
 			st[top - 1] = false;
 		else
@@ -5067,6 +5097,19 @@ weave_query_fr_covered(WeaveQuery q)
 	r = (top == 1 && st[0]);
 	pfree(st);
 	return r;
+}
+
+static bool
+weave_query_fr_covered(WeaveQuery q)
+{
+	return weave_query_leaves_cover(q, WEAVE_QF_FUZZY | WEAVE_QF_REGEX, true);
+}
+
+static bool
+weave_query_lit_covered(WeaveQuery q)
+{
+	return weave_query_leaves_cover(q, WEAVE_QF_PREFIX | WEAVE_QF_FUZZY |
+									WEAVE_QF_REGEX, false);
 }
 
 /*
@@ -8544,8 +8587,10 @@ weave_topk_candidates_range(Relation index, WeaveQuery q, int wantk,
 		 * a ranked candidate.  The recheck only shrinks, so ranked fuzzy/prefix/
 		 * regex results are a correct SUBSET of the @@@ matches, not the full set.
 		 * PHRASE/NEAR and NOT-free boolean are exact.  A NOT is a subset too: a
-		 * row matching only through it has no positive literal term to be
-		 * generated by (doc/GAPS.md G93, open).  Use @@@ for exhaustive answers.
+		 * row matching only through it has no literal term to be generated by.
+		 * The ordering scan completes both kinds with its padding phase, at the
+		 * distance such a row has, 1.0 (doc/GAPS.md G94, weave_pad_wanted); the
+		 * weave_search() SRF has no padding phase and stays a subset.
 		 *
 		 * TidSet is TID-sorted and weave_tid_to_docid is monotonic in TID
 		 * order, so the docid array comes out sorted (binary-searchable).
