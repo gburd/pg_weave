@@ -5601,7 +5601,7 @@ half, VACUUM, smash the tombstone blob's bytes, and the scan must ERROR, not ret
 built `.so`, md5 differs) the scan returned **4000**, the resurrected answer, and tests 22-24
 failed; with it they pass.
 
-### G86 — an ordered scan's `d <=> q` (and every channel of a fused `fuse(...)`) is RE-EVALUATED per returned row: a heap detoast plus a fresh BM25, for a value the scan already computed — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 measured it at 28% of rare-term CPU); FIXED 2026-10-07 for the lexical `<=>` route (`wt/g86`, ext 0.29.0); vector, `<@>` and `fuse()` deliberately NOT substituted (reasons below)**
+### G86 — an ordered scan's `d <=> q` (and every channel of a fused `fuse(...)`) is RE-EVALUATED per returned row: a heap detoast plus a fresh BM25, for a value the scan already computed — **FOUND 2026-10-06 by the sibling review (pg_fts 1.9.0 measured it at 28% of rare-term CPU); FIXED 2026-10-07 for the lexical `<=>` route (`wt/g86`, ext 0.29.0) and 2026-10-08 for the fused `fuse()` route (`wt/g86f`, ext 0.31.0); vector and `<@>` deliberately NOT substituted (reasons below)**
 
 The planner keeps the ORDER BY expression in the scan's target list (it feeds the sort key
 and the Limit), so the executor evaluates it for every row the index returns, even though
@@ -5661,7 +5661,8 @@ for `<=>` is the N = 1 `weave_distance()` and differs from the corpus value the 
 in. The lexical route ships on that bar. `sql/score_reuse.sql` §4 checks it per row
 against `weave_search()`'s distance, and §5 checks it through every reader.
 
-**`fuse()` qualifies under the corrected bar and is OWED, not done.** Its resjunk entry
+**`fuse()` qualifies under the corrected bar.** (Was OWED; **DONE 2026-10-08**, see "FIXED for
+the fused route" below.) Its resjunk entry
 is `fuse(weave_lexscore(d <=> a), ...)`, and the scan's slot-0 value is the fused `-S` it
 ordered by (`weave_fuse_pass()`). Substituting needs:
 (1) the fused score published per row, from the ranked emission and from
@@ -5770,6 +5771,105 @@ PG17 smoke on `b5e1beb` (`pgweave-20261007-002744-3074`): regression 26/26, isol
 2/2, TAP 33 files / 1,275 tests. `expected/limit_hint.out` changed by exactly the two
 substituted `Output:` lines and the header padding they widen. That is semantic, intended,
 and inspected line by line (hard rule 3).
+**FIXED for the fused route, 2026-10-08 (`wt/g86f`, ext 0.31.0).** Measured first
+(`bench/RESULTS_G86_SCORE_REUSE.md`, run `pgweave-20261008-041234-7383`). On 11 KB TOASTed
+documents, two lexical channels at LIMIT 400 took 18 ms, and 17.6 ms of that was the hidden
+`fuse()`. Short documents spent 0.07 ms on it. Built in four pieces:
+
+- **The scan publishes the value it ordered by**, on the same keyed live list as the lexical
+  route (`weave_curdist_wanted()` in `src/am/amscan.c` now admits a fused scan). That is the
+  ranked `-S` from `weave_gettuple()`, and from `weave_pad_emit()` the fused padding value:
+  `0` lexical-only (fuse() of a row no channel reached is `-(0 + 0)`), `+Infinity` with a
+  vector key, NULL for a row whose fuse() is NULL. The value is `+0`, not the brief's `-0`;
+  the two compare equal, so a sort reads them alike.
+- **`weave_current_fused_distance(regclass, tid, VARIADIC "any")`**, new in 0.31.0. Its
+  arguments after the TID are the right operands of the scan's ORDER BY keys, in key order:
+  each channel's query, then the weights array. It answers from the live fused scan whose
+  index and current heap TID match, and whose own copies of those keys (`fuseQ`, `fuseV`,
+  `fuseW`) are byte-equal to the arguments. Each argument's type must be the key's
+  `sk_subtype`, so a hand-written call can never get a datum read as the wrong type. It
+  answers NULL otherwise, which includes every call outside a scan. **The name is
+  provisional**: the lead was told it on 2026-10-08 and did not object before merge-ready.
+- **Route separation, the one new hazard.** A fused scan's `so->query` can hold its WHERE
+  clause's `@@@` query. So a lexical lookup that keyed only on (index, TID, query) would
+  answer from a fused scan nested in its Filter. `weave_current_distance()` now skips
+  fused publishers, and the fused lookup skips lexical ones (`sql/score_reuse.sql` 9g D;
+  the `noroute` mutant).
+- **The planner match** (`weave_fuse_is_scan_key()` in `src/am/fusepath.c`, called from
+  `weave_reuse_fused()` in `src/am/customscan.c`) replays the path's attribution against
+  `indexorderbyorig`. Channel i, read through a recovery wrapper and with `q <=> col`
+  commuted, must be key i with equal operands. The weights must equal the transport's;
+  NULL weights were transported as all ones. The last key must be `<~>`. Only RESJUNK
+  entries are touched.
+
+Tests, `sql/score_reuse.sql` §9, expected output from a full EC2 installcheck:
+
+- plans: hidden key only, a commutator plus `WHERE @@@` gate, and a visible `fuse()` (same
+  call and another one) left alone;
+- 500 of 500 visible values unchanged;
+- the published value equals `weave_fuse_search()`'s `-score` on 1,000 + 900 rows, in both
+  `fuse_normalize` modes;
+- `WITH TIES` at k = 5 and 40 in both modes and both shapes, a row-by-row cursor, and a
+  nested-loop rescan with a parameterized vector (3 of 3), all against the reference;
+- padding: 100 rows at `0` after every ranked row, 20 NULL-vector rows at NULL after every
+  ranked one, and a +Infinity row (a pending vector of the wrong dimension);
+- zero per-row `weave_distance`, `weave_lexscore`, `fuse` or `wvec_l2_distance` calls, with
+  a control that counts them;
+- four clobber shapes, each reading the published value per row (A–D in 9g);
+- only the library's C function is planted.
+
+**Mutants** (`bench/aws/g86f_job.sh` stage C, run `pgweave-20261008-074244-b985`; each BUILT,
+installed with a different `.so` md5, then run against the solo baseline; the unmutated tree
+passed solo before and after): **8 of 8 killed.**
+`visible` (500 of 500 visible values changed); `prevrow` (9 + 385 wrong row values, every
+WITH TIES / rescan / cursor check, the padding values); `padzero` (0 of 100 padded rows at
+0); `padinf` (the +Infinity row published as 0); `unkeyed` (clobber A 14 wrong, B 30 wrong);
+`noweights` (clobber A 14 wrong); `noroute` (clobber D 30 wrong); `nopublish` (every
+published value NULL).
+
+**A test that could not fail, caught by its first run.** The first 9d control (reuse off on
+the 'alpha'/'beta' corpus) was meant to show the operator's N = 1 key tying a different set.
+It returned 16, exactly the reference's tie group: the N = 1 values happen to tie the same
+rows there. It was replaced by a control on two tf = 1 terms, where the operator ties every
+matching row and the index does not. **Before 0.31.0 that shape's `WITH TIES` returned every
+ranked row.** That, and the `ORDER BY fuse(d <=> 'alpha', v <-> q)` over a pending vector of
+the wrong dimension (which raised "different wvec dimensions 3 and 4" through the hidden key
+and now returns the row last), are the **visible behaviour changes**. They are the lexical
+route's change applied to the fused key: a reader of the key now sees the value the stream
+is ordered by.
+
+**Measured on EC2,** `pgweave-20261008-074244-b985`, two runs per arm at two scales, identical
+md5 of the answer on and off in every cell:
+
+| corpus | query | LIMIT | ms off (run 1 / 2) | ms on (run 1 / 2) |
+|---|---|---:|---:|---:|
+| long, 50k | `fuse(d <=> 'c', d <=> 'rare')` | 400 | 20.199 / 20.194 | **0.256 / 0.254** |
+| long, 200k | same | 400 | 20.279 / 20.925 | **0.416 / 0.414** |
+| long, 200k | same | 10 | 0.609 / 0.608 | **0.125 / 0.127** |
+| long, 50k | `fuse(d <=> 'c', v <-> q)` | 400 | 22.418 / 22.472 | **11.701 / 11.854** |
+| long, 200k | same | 400 | 56.448 / 56.505 | **46.329 / 44.959** |
+| short, 200k / 1M | two lexical | 400 | 2.06 / 2.89 | 2.00 / 2.83 (2-3 %) |
+| short, 200k / 1M | lexical + vector | 10, 400 | — | within run-to-run spread |
+
+**Stated as a loss where it is one:** short documents gain about 0.06 ms per 400 rows. That
+is the hidden key's whole cost there, and it is invisible next to a vector channel. With a
+vector key, half the long-document time remains: the vector channel's own scan.
+
+**Where it does not apply (fused).**
+
+- **An Incremental Sort over a fused scan cannot happen today.** The brief and the "owed"
+  list above assumed one. `weave_fuse_pathkey_call()` offers the fused path only when
+  `fuse()` is the WHOLE sort key (`list_length(root->query_pathkeys) == 1`). So
+  `ORDER BY fuse(...), id` is a Sort over a seq scan that evaluates `fuse()` per row, which
+  `sql/score_reuse.sql` 9a shows as a plan. Offering the fused path with a prefix pathkey
+  is a separate planner change, not taken here.
+- `weave_fuse_search()` builds its scan keys without a subtype, so no hidden key can match
+  it. Nothing evaluates a target list while it runs anyway.
+- As for the lexical route: a scan under a join, an Append or a projecting node has no
+  RESJUNK entry. A VOLATILE SELECT-list column moves the scan's list below a projection, so
+  the hidden key is not substituted there (9e reads through a STABLE wrapper for that
+  reason).
+
 - **Which channels' scan values equal the operator's.** Lexical `<=>`: the scan's value is
   the corpus BM25 distance and `weave_distance()` is the N = 1 one. They are not equal, so
   only RESJUNK entries may be substituted (pg_fts's rule). Vector `<->`/`<#>`/`<=>`: the
