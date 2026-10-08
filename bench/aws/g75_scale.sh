@@ -9,12 +9,19 @@
 #   - 0 leaked pages and weave_check(deep) clean,
 #   - every probe query equal between the index and the heap,
 # and at the end that the index did not grow by the sum of what was stranded.
+#
+# THE TWIN (task L22, doc/PHASES.md).  Table `u` gets the same rows, inserted
+# after `s`'s in each cycle as t/033 does, and the same VACUUM schedule, but is
+# never crashed.  The excess of s_w over u_w is the size bound t/033 asserts, here
+# at 1M rows: at most the largest single crash's stranding + 64 + 5 % of the twin,
+# at every cycle.  G75_TWIN=0 turns it off.
 # Also times the reclaim pass on the 1M-row index (the cost the spec owes).
 set -u
 OUT=${OUT:-/tmp/out}
 mkdir -p $OUT
 N=${G75_N:-1000000}
 CYCLES=${G75_CYCLES:-8}
+TWIN=${G75_TWIN:-1}
 BATCH=${G75_BATCH:-60000}
 BIN=/usr/lib/postgresql/17/bin
 D=/tmp/g75scale
@@ -48,11 +55,14 @@ INSERT INTO s SELECT g, to_wdoc('simple', 'common w' || (g % 5000) || ' x' || (g
        g % 1000
   FROM generate_series(1, $N) g;
 CREATE INDEX s_w ON s USING weave (body, emb, price int8_docval_ops);
+CREATE TABLE u (LIKE s);
+INSERT INTO u SELECT * FROM s;
+CREATE INDEX u_w ON u USING weave (body, emb, price int8_docval_ops);
 SQL
 rc=$?; log "setup rc=$rc"; [ $rc = 0 ] || { tail $OUT/scale_setup.log; exit 1; }
 
 leaked() { q "SELECT count(*) FROM weave_page_info('s_w') WHERE NOT reachable AND coalesce(freed,false)=false AND NOT uninitialized"; }
-pages() { q "SELECT pg_relation_size('s_w') / 8192"; }
+pages() { q "SELECT pg_relation_size('${1:-s_w}') / 8192"; }
 check() {	# phase -> 0 iff index == heap on every probe
 	local fail=0
 	for p in "body @@@ 'common'" "body @@@ 'x3 & !w7'" "price < 3" "price < 3 AND body @@@ '!x5'"; do
@@ -78,13 +88,18 @@ for r in 1 2; do
 	echo "SET client_min_messages = debug2; VACUUM s;" | $PSQL > $OUT/scale_quiet$r.log 2>&1
 	t1=$(date +%s.%N)
 	line=$(grep -o 'reclaimed .*' $OUT/scale_quiet$r.log | tail -1)
+	[ $TWIN = 1 ] && q "VACUUM u" > /dev/null
 	log "SCALE quiet VACUUM $r: $(awk "BEGIN{print $t1 - $t0}") s total; $line"
 done
 
 sumstranded=0
+maxst=0
+worst=-1000000000
+exs=
 for c in $(seq 1 $CYCLES); do
 	lo=$((N + (c - 1) * BATCH + 1)); hi=$((N + c * BATCH))
 	q "INSERT INTO s SELECT g, to_wdoc('simple', 'common cyc$c w' || g), ('[' || (g % 1000) || ',1,1,1]')::wvec, g % 1000 FROM generate_series($lo, $hi) g" > /dev/null
+	[ $TWIN = 1 ] && q "INSERT INTO u SELECT g, to_wdoc('simple', 'common cyc$c w' || g), ('[' || (g % 1000) || ',1,1,1]')::wvec, g % 1000 FROM generate_series($lo, $hi) g" > /dev/null
 	before=$(pages)
 	$PSQL -c "VACUUM s" > $OUT/scale_vac$c.log 2>&1 &
 	inwin=0
@@ -97,15 +112,28 @@ for c in $(seq 1 $CYCLES); do
 	start || { log "restart failed in cycle $c"; exit 1; }
 	st=$(leaked)
 	sumstranded=$((sumstranded + st))
-	echo "SET client_min_messages = debug2; VACUUM s;" | $PSQL > $OUT/scale_post$c.log 2>&1 \
+	[ "$st" -gt "$maxst" ] && maxst=$st
+	# the twin's schedule mirrors t/033's: one VACUUM where s had the crashed one,
+	# s's post-crash VACUUM, then one more
+	[ $TWIN = 1 ] && q "VACUUM u" > /dev/null
+	echo "SET client_min_messages = debug2; SELECT weave_alloc_stats_reset(); VACUUM s; SELECT 'alloc ' || weave_alloc_stats()::text;" \
+		| $PSQL > $OUT/scale_post$c.log 2>&1 \
 		|| { log "VACUUM failed after cycle $c"; fail=1; }
+	[ $TWIN = 1 ] && q "VACUUM u" > /dev/null
 	rline=$(grep -o 'reclaimed .*' $OUT/scale_post$c.log | tail -1)
 	lk=$(leaked)
 	bad=$(q "SELECT coalesce(string_agg(invariant || ': ' || coalesce(detail,''), '; '), '') FROM weave_check('s_w', true) WHERE NOT ok")
 	check cycle$c || fail=1
 	[ "$lk" = 0 ] || fail=1
 	[ -z "$bad" ] || fail=1
-	log "SCALE cycle $c: in_window=$inwin stranded=$st leaked_after_vacuum=$lk deep_bad='$bad' pages $before -> $(pages); $rline"
+	aline=$(grep -o 'alloc (.*' $OUT/scale_post$c.log | tail -1)
+	tline=
+	if [ $TWIN = 1 ]; then
+		ps=$(pages); pu=$(pages u_w); ex=$((ps - pu)); exs="$exs $ex"
+		[ "$ex" -gt "$worst" ] && worst=$ex
+		tline=" twin u_w=$pu excess=$ex"
+	fi
+	log "SCALE cycle $c: in_window=$inwin stranded=$st leaked_after_vacuum=$lk deep_bad='$bad' pages $before -> $(pages)$tline; post-crash VACUUM $aline; $rline"
 done
 
 # a never-crashed reference for the same row count: REINDEX is the minimum
@@ -114,6 +142,11 @@ q "CREATE INDEX s_ref ON s USING weave (body, emb, price int8_docval_ops)" > /de
 pr=$(q "SELECT pg_relation_size('s_ref') / 8192")
 log "SCALE end: s_w=$pf pages, freshly built reference=$pr pages, total stranded by $CYCLES crashes=$sumstranded"
 [ "$sumstranded" -gt 0 ] || { log "SCALE: no crash stranded anything -- the window was never hit"; fail=1; }
+if [ $TWIN = 1 ]; then
+	bound=$((maxst + 64 + $(pages u_w) / 20))
+	log "SCALE twin: excess of s_w over u_w per cycle:$exs; worst $worst, bound $bound (max stranding $maxst + 64 + 5% of twin)"
+	[ "$worst" -le "$bound" ] || { log "SCALE twin: BOUND FAILED"; fail=1; }
+fi
 
 $BIN/pg_ctl -D $D -m fast stop > /dev/null 2>&1
 rm -rf $D

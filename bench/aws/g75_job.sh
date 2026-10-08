@@ -10,7 +10,7 @@ PGC=/usr/lib/postgresql/17/bin/pg_config
 LIB=$($PGC --pkglibdir)
 SRC=$HOME/pg_weave
 PHASES="${PHASES:-control mutants scale}"
-MUTS="${MUTS:-noreclaim:t/031_doclist_atomic.pl noguard:t/032_reclaim_concurrent.pl nobarrier:t/032_reclaim_concurrent.pl nofence:t/032_reclaim_concurrent.pl}"
+MUTS="${MUTS:-noreclaim:t/031_doclist_atomic.pl noguard:t/032_reclaim_concurrent.pl nobarrier:t/032_reclaim_concurrent.pl nofence:t/032_reclaim_concurrent.pl nofit:t/033_reclaim_crash_loop.pl}"
 log() { echo "$(date +%T) $*" | tee -a $OUT/g75.log; }
 
 cat > $OUT/apply.sh <<'MUTEOF'
@@ -36,6 +36,8 @@ nofence)
 	sub $f '		if (PageGetLSN(page) > fence)' '		if (false && PageGetLSN(page) > fence)	/* MUTANT nofence */' ;;
 noguard)
 	"$0" nobarrier; "$0" nofence ;;
+nofit)	# L22: the share-lock pass is gated by the recyclability probe alone again
+	sub $f '			 !weave_pack_fits_reusable(index)))' '			 !weave_any_free_page_recyclable(index)))	/* MUTANT nofit */' ;;
 *) echo "unknown mutant $m"; exit 2 ;;
 esac
 grep -c MUTANT $f
@@ -89,7 +91,7 @@ if [[ " $PHASES " == *" control "* ]]; then
 	install_tree "$SRC" clean || { log "CONTROL build/install FAILED"; exit 1; }
 	CLEAN_MD5=$(md5sum $LIB/pg_weave.so | cut -d' ' -f1)
 	for r in 1 2; do
-		res=$(run_tap "$SRC" control$r t/029_flush_atomic.pl t/031_doclist_atomic.pl t/032_reclaim_concurrent.pl t/033_reclaim_crash_loop.pl)
+		res=$(run_tap "$SRC" control$r t/029_flush_atomic.pl t/031_doclist_atomic.pl t/032_reclaim_concurrent.pl t/033_reclaim_crash_loop.pl t/015_alloc_outcomes.pl)
 		log "CONTROL run $r (so=$CLEAN_MD5): $res"
 		case "$res" in *"Result: PASS"*) ;; *) ok=0 ;; esac
 	done
@@ -132,6 +134,25 @@ if [[ " $PHASES " == *" scale "* ]]; then
 	else
 		log "SCALE: no bench/aws/g75_scale.sh in this tree"; ok=0
 	fi
+fi
+
+# the scale run on a MUTANT (SCALEMUT=<name>): the positive control for the
+# scale run's twin bound; expected to FAIL it
+if [[ " $PHASES " == *" scalemut "* ]]; then
+	m=${SCALEMUT:-nofit}; D=/tmp/mut-$m
+	[ -d $D ] && find $D -depth -delete
+	cp -a $SRC $D
+	if (cd $D && bash $OUT/apply.sh $m > $OUT/apply-scale-$m.log 2>&1) && install_tree $D scale-$m; then
+		md5=$(md5sum $LIB/pg_weave.so | cut -d' ' -f1)
+		[ -n "$CLEAN_MD5" ] && [ "$md5" = "$CLEAN_MD5" ] && { log "SCALEMUT $m: .so is the CLEAN one"; ok=0; }
+		mkdir -p $OUT/scalemut; OUT=$OUT/scalemut bash $SRC/bench/aws/g75_scale.sh > $OUT/scalemut/scale.log 2>&1
+		src=$?
+		log "SCALEMUT $m (so=$md5) exit=$src: $(grep -E '^(SCALE twin|RESULT)' $OUT/scalemut/scale.log | tr '\n' ' ')"
+	else
+		log "SCALEMUT $m: did not apply/build -- not counted"; ok=0
+	fi
+	find $D -depth -delete
+	install_tree "$SRC" clean-restore2 > /dev/null 2>&1
 fi
 
 log "DONE ok=$ok"

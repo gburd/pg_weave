@@ -6,13 +6,18 @@
 # server log (the "L22 census" lines, when the tree has the diagnostic) are kept
 # under /tmp/out/<arm>-<run>/.
 # ARMS: base (no substitution), or any name in apply() below.
+#
+# The C arms patch the DIAGNOSTIC tree they were written against: trig_* need
+# d48c485, fit needs 24a0b57 (both removed by the fix, 4a18fdf).  swap and xid
+# patch t/033 only and run on any tree.  Results: doc/PHASES.md L22,
+# bench/RESULTS_G75_RECLAIM.md.
 set -u
 OUT=/tmp/out
 mkdir -p $OUT
 PGC=/usr/lib/postgresql/17/bin/pg_config
 LIB=$($PGC --pkglibdir)
 SRC=$HOME/pg_weave
-ARMS="${ARMS:-base fit swap xid}"
+ARMS="${ARMS:-base swap}"
 L22N="${L22N:-2}"
 TESTS="${TESTS:-t/033_reclaim_crash_loop.pl t/015_alloc_outcomes.pl}"
 log() { echo "$(date +%T) $*" | tee -a $OUT/l22.log; }
