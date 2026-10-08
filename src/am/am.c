@@ -1438,6 +1438,13 @@ weave_work_stats_reset(PG_FUNCTION_ARGS)
  * skipped pass cannot become a permanently skipped pass.  Tightening this to a
  * count therefore trades a bounded overshoot for an unbounded stall, and must not
  * be done without a measurement that shows the overshoot matters.
+ *
+ * THAT MEASUREMENT EXISTS NOW (task L22), and the overshoot was not bounded: a
+ * pass started with fewer reusable pages than live ones extended the shortfall
+ * on every VACUUM, about two flushes a cycle in t/033.  So weave_vacuum_compact()
+ * now asks for the count on a tombstone-free index, with the live side counted
+ * from the pages, which is what keeps it clear of the stale-record stall above.
+ * This probe still gates the pass alone when there are tombstones to drop.
  */
 #define WEAVE_RECYCLE_PROBE_MAX 256
 

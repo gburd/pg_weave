@@ -1300,6 +1300,15 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			 * rewrite-in-place under a share lock, not this one line.
 			 * t/015_alloc_outcomes.pl asserts the no-ratchet property, so adding
 			 * the term fails loudly instead of shipping.
+			 *
+			 * THE FSM COUNT BELOW IS NOT WHAT DECIDES WHETHER A PASS RUNS (task L22,
+			 * measured).  After a crash the map can list live pages as free, but
+			 * the reclaim at the top of this function has already marked them used
+			 * by the time this runs, and counting free pages from the pages instead
+			 * changed nothing in t/033.  Once an index is a quarter free this fires
+			 * on every VACUUM.  What stops a pass that can only grow the file is
+			 * the check inside weave_vacuum_compact() for whether the live data fits
+			 * in pages reusable now.
 			 */
 			{
 				BlockNumber nblocks = RelationGetNumberOfBlocks(info->index);
