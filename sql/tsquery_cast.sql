@@ -37,12 +37,13 @@ CREATE INDEX tc_tsv ON tc USING weave (tsv tsvector_lex_ops);
 CREATE INDEX tc_expr ON tc USING weave (to_wdoc(tsv));
 
 -- core's row set, the cast's row set (heap evaluation), the two index counts
--- and the ranked index scan (ix_ok), or the cast's refusal
+-- (ix_ok), the ranked index scan's relation to core (ranked), or the refusal
 CREATE FUNCTION pg_temp.cmp(q text, OUT core int[], OUT weave int[],
-							OUT ix_ok bool, OUT refused text)
+							OUT ix_ok bool, OUT ranked text, OUT refused text)
 LANGUAGE plpgsql AS $$
 DECLARE
 	wq wquery;
+	r int[];
 BEGIN
 	SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO core
 	  FROM tc WHERE tsv @@ q::tsquery;
@@ -56,21 +57,26 @@ BEGIN
 	  FROM tc WHERE to_wdoc(tsv) @@@ wq;
 	ix_ok := weave_count('tc_tsv', wq) = cardinality(core)
 		 AND weave_count('tc_expr', wq) = cardinality(core);
-	-- the ranked scan: its boolean gate admits rows without a heap recheck
+	-- the ranked scan (WHERE @@@ q ORDER BY <=> q) has no heap recheck.  Its
+	-- candidates come from q's positive literal terms, so a prefix expansion
+	-- or a row matching only through NOT is not generated: a SUBSET is the
+	-- documented limitation; any row core does not match is a wrong answer.
 	SET LOCAL enable_seqscan = off;
 	SET LOCAL enable_bitmapscan = off;
-	ix_ok := ix_ok AND core IS NOT DISTINCT FROM
-		(SELECT coalesce(array_agg(id ORDER BY id), '{}') FROM
-			(SELECT id FROM tc WHERE tsv @@@ wq ORDER BY tsv <=> wq LIMIT 1000) r);
+	SELECT coalesce(array_agg(id ORDER BY id), '{}') INTO r FROM
+		(SELECT id FROM tc WHERE tsv @@@ wq ORDER BY tsv <=> wq LIMIT 1000) x;
 	SET LOCAL enable_seqscan = on;
 	SET LOCAL enable_bitmapscan = on;
+	ranked := CASE WHEN r = core THEN 'same'
+				   WHEN r <@ core THEN 'subset'
+				   ELSE 'SUPERSET' END;
 END $$;
 
 -- ---- hand-written ---------------------------------------------------------
 SELECT q, cardinality(c.core) AS ncore,
 	   CASE WHEN c.refused IS NOT NULL THEN 'refused'
 			WHEN c.core = c.weave AND c.ix_ok THEN 'same' ELSE 'DIFFERENT' END AS verdict,
-	   c.refused
+	   c.ranked, c.refused
   FROM (VALUES
 		-- weights, single and combined
 		('fox:A'), ('fox:B'), ('fox:C'), ('fox:D'), ('fox:AB'), ('fox:CD'),
@@ -136,6 +142,10 @@ SELECT refused, count(*) FROM rres WHERE refused IS NOT NULL GROUP BY 1 ORDER BY
 SELECT i, q, core, weave, ix_ok FROM rres
  WHERE refused IS NULL AND (core IS DISTINCT FROM weave OR ix_ok IS NOT TRUE)
  ORDER BY i LIMIT 20;
+-- the ranked scan: never a SUPERSET; a subset only with a prefix or a NOT
+SELECT ranked, count(*),
+	   count(*) FILTER (WHERE q !~ ':\*' AND q !~ '!') AS without_prefix_or_not
+  FROM rres WHERE refused IS NULL GROUP BY 1 ORDER BY 1;
 -- coverage: the converted set exercises each feature at least once
 SELECT count(*) FILTER (WHERE q ~ ':[A-D]+') AS weighted,
 	   count(*) FILTER (WHERE q ~ ':\*') AS prefixed,

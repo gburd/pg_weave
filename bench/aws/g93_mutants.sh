@@ -42,6 +42,9 @@ M8_index_not_inexact_reverted)
 	sub src/am/amscan.c '			if (stack[top - 1].inexact)
 			{' '			if (false)
 			{' ;;
+M9_ranked_gate_ignores_weight)
+	perl -0pi -e 's/ \|\n\t\t\t\t\t\t\t WEAVE_QF_WEIGHTED\)\)/))/g' src/am/amscan.c
+	n=$(grep -c 'WEAVE_QF_WEIGHTED))' src/am/amscan.c); [ "$n" = 1 ] || { echo "M9: $n left"; exit 1; } ;;
 M7_pre_fix_converter)
 	cp /tmp/out/migrate.c.prefix $F ;;
 *) echo "unknown mutant $m"; exit 2 ;;
@@ -244,7 +247,7 @@ PGC=/usr/lib/postgresql/17/bin/pg_config
 LIB=$($PGC --pkglibdir)
 SRC=$HOME/pg_weave
 T=tsquery_cast
-MUTS="${MUTS:-M1_weight_dropped M2_prefix_dropped M3_phrase_distance_plus_one M4_phrase_N_accepted_as_at_most_N M5_bool_in_phrase_accepted M6_prefix_in_phrase_accepted M7_pre_fix_converter M8_index_not_inexact_reverted}"
+MUTS="${MUTS:-M1_weight_dropped M2_prefix_dropped M3_phrase_distance_plus_one M4_phrase_N_accepted_as_at_most_N M5_bool_in_phrase_accepted M6_prefix_in_phrase_accepted M7_pre_fix_converter M8_index_not_inexact_reverted M9_ranked_gate_ignores_weight}"
 NOTICE='NOTICE:  extension "pg_weave" already exists, skipping'
 log() { echo "$(date +%T) $*" | tee -a $OUT/mutants.log; }
 wipe() { [ -d "$1" ] && find "$1" -depth -delete; true; }

@@ -7635,7 +7635,13 @@ weave_query_is_pure_or(WeaveQuery q)
 
 		if (it->type == WEAVE_QI_VAL)
 		{
-			if (it->flags & (WEAVE_QF_PREFIX | WEAVE_QF_FUZZY | WEAVE_QF_REGEX))
+			/*
+			 * WEIGHTED too (G93): a posting carries no zone label, so neither
+			 * the disjunction nor the cursor-presence gate can tell `fox:A`
+			 * from `fox`; the collect path's heap recheck can.
+			 */
+			if (it->flags & (WEAVE_QF_PREFIX | WEAVE_QF_FUZZY | WEAVE_QF_REGEX |
+							 WEAVE_QF_WEIGHTED))
 				return false;
 		}
 		else					/* operator */
@@ -7674,7 +7680,13 @@ weave_query_is_pure_boolean(WeaveQuery q)
 
 		if (it->type == WEAVE_QI_VAL)
 		{
-			if (it->flags & (WEAVE_QF_PREFIX | WEAVE_QF_FUZZY | WEAVE_QF_REGEX))
+			/*
+			 * WEIGHTED too (G93): a posting carries no zone label, so neither
+			 * the disjunction nor the cursor-presence gate can tell `fox:A`
+			 * from `fox`; the collect path's heap recheck can.
+			 */
+			if (it->flags & (WEAVE_QF_PREFIX | WEAVE_QF_FUZZY | WEAVE_QF_REGEX |
+							 WEAVE_QF_WEIGHTED))
 				return false;
 		}
 		else					/* operator */
