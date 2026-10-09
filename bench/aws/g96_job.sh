@@ -6,14 +6,15 @@
 # C  mutants: each must APPLY, BUILD, INSTALL a .so differing from the clean one, then
 #    change the solo output; the clean tree is reinstalled and re-run at the end
 # E  PG18 installcheck (regression + isolation) with the full-run outputs as expected
-# STAGES selects (default ABCE).  Results under /tmp/out.
+# T  t/034 alone (the wquery dump/restore), marker-checked
+# STAGES selects (default ATBCE).  Results under /tmp/out.
 set -u
 cd ~/pg_weave
 PGC=/usr/lib/postgresql/17/bin/pg_config
 LIB=$($PGC --pkglibdir)
 OUT=/tmp/out
 mkdir -p $OUT
-STAGES=${STAGES:-ABCE}
+STAGES=${STAGES:-ATBCE}
 TESTS="wquery_roundtrip tsquery_cast"
 NOTICE='NOTICE:  extension "pg_weave" already exists, skipping'
 
@@ -43,6 +44,20 @@ solo() {	# $1 tree, $2 label -> path of NOTICE-stripped output, or RAN_NOTHING
 }
 # the installed .so must be this tree's
 install_tree ~/pg_weave clean || { echo "clean install FAILED"; exit 1; }
+
+# ---- T  t/034 (pg_dump of a wdoc and a wquery column) on its own, so a red
+# regression file does not hide it; the marker is the test's own G96 line
+if [[ $STAGES == *T* ]]; then
+{
+	(make installcheck PG_CONFIG=$PGC REGRESS= ISOLATION= \
+	   PROVE_TESTS=t/034_wdoc_dump_restore.pl > $OUT/t034.log 2>&1); rc=$?
+	cp tmp_check/log/regress_log_034_wdoc_dump_restore $OUT/ 2>/dev/null
+	echo "T: t/034 exit $rc"
+	grep -E '^(ok|not ok)' tmp_check/log/regress_log_034_wdoc_dump_restore 2>/dev/null | grep -c 'G96' \
+		| sed 's/^/T: G96 assertions reported: /'
+	grep -E '^not ok' tmp_check/log/regress_log_034_wdoc_dump_restore 2>/dev/null
+} 2>&1 | tee $OUT/T.txt
+fi
 
 # ---- B
 if [[ $STAGES == *B* ]]; then
