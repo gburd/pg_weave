@@ -36,6 +36,8 @@
 #include "weave/weave.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
+#include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 
 /* An operand collected during the parse, before flattening to a varlena. */
@@ -61,7 +63,8 @@ typedef enum
 	TOK_RPAREN,
 	TOK_QUOTE,					/* " -- starts/ends a phrase */
 	TOK_NEAR,					/* NEAR keyword (proximity) */
-	TOK_COMMA					/* , inside NEAR(...) */
+	TOK_COMMA,					/* , inside NEAR(...) */
+	TOK_PHRASE					/* <->, <N> (exact gap) or <=N> (at most N) */
 } TokKind;
 
 typedef struct Token
@@ -73,6 +76,8 @@ typedef struct Token
 	int			fuzzy_k;		/* TOK_TERM followed by ~k (0 = not fuzzy) */
 	bool		regex;			/* TOK_TERM holds a regex (from /.../ ) */
 	uint32		weightmask;		/* TOK_TERM followed by :ABCD -> label mask (0 = none) */
+	bool		exact;			/* TOK_PHRASE: <-> / <N> rather than <=N> */
+	uint32		gap;			/* TOK_PHRASE: N */
 } Token;
 
 typedef struct ParseState
@@ -88,7 +93,7 @@ typedef struct ParseState
 	Token		peeked;			/* one-token lookahead cache */
 } ParseState;
 
-static void parse_or(ParseState *st);
+static int64 parse_or(ParseState *st);
 static void emit_dist(ParseState *st, uint8 type, uint8 op, char *term,
 					  int termlen, uint16 flags, uint32 distance);
 
@@ -161,6 +166,134 @@ emit_dist(ParseState *st, uint8 type, uint8 op, char *term, int termlen,
 }
 
 /*
+ * Read the decimal digits at buf[p...] into *val.  Returns the position after
+ * them (p itself when there are none) and sets *overflow when the value
+ * exceeds `max`.  Every number the lexer reads goes through here: the old
+ * open-coded loops wrapped, so `term~4294967297` meant ~1.
+ */
+static int
+lex_digits(const char *buf, int len, int p, uint32 max, uint32 *val,
+		   bool *overflow)
+{
+	uint64		v = 0;
+
+	*overflow = false;
+	while (p < len && buf[p] >= '0' && buf[p] <= '9')
+	{
+		v = v * 10 + (buf[p] - '0');
+		if (v > max)
+		{
+			*overflow = true;
+			v = max;
+		}
+		p++;
+	}
+	*val = (uint32) v;
+	return p;
+}
+
+/*
+ * The suffixes a term may carry -- `*` (prefix), `~k` (fuzzy) and `:ABCD`
+ * (weight labels) -- read after a bare term or after a quoted 'literal', so
+ * wquery_out's 'fo'* / 'fo'~1 / 'fox':A parse back (doc/GAPS.md G96).
+ */
+static void
+lex_suffix(ParseState *st, Token *tok)
+{
+	/* a trailing '*' marks a prefix term */
+	if (st->pos < st->len && st->buf[st->pos] == '*')
+	{
+		tok->prefix = true;
+		st->pos++;
+	}
+	/* a trailing '~k' marks a fuzzy term (k defaults to 2) */
+	else if (st->pos < st->len && st->buf[st->pos] == '~')
+	{
+		uint32		k;
+		bool		overflow;
+		int			p = st->pos + 1;
+		int			e = lex_digits(st->buf, st->len, p, PG_INT32_MAX, &k,
+								   &overflow);
+
+		if (overflow)
+			st->error = true;
+		st->pos = e;
+
+		/*
+		 * `term~0` IS AN EDIT BUDGET OF ZERO, i.e. the term itself, and it is
+		 * now normalized to a PLAIN term rather than widened to ~1.  The old
+		 * Max(k, 1) answered a stricter question with a looser one: a user who
+		 * wrote ~0 also got every term at distance 1, which is a wrong answer
+		 * in the false-POSITIVE direction and the only kind this parser
+		 * produces on its own.  Zero is also what contrib/fuzzystrmatch's
+		 * levenshtein() means by zero, and that agreement is the basis of the
+		 * oracle in sql/fuzzyuleven.sql.
+		 *
+		 * Normalized rather than carried as a fuzzy item with k = 0 because
+		 * `fuzzy_k == 0` is this lexer's sentinel for "not fuzzy" (see the
+		 * field's comment and the flag assignment below), and the two mean the
+		 * same rows: the exact-term route returns precisely the terms at
+		 * distance 0, doing less work than an automaton with an empty budget.
+		 * The visible consequence is that 'term~0'::wquery prints as 'term',
+		 * which is the normalization stated rather than hidden.
+		 *
+		 * A BARE `term~` still means 2, unchanged: there is no digit to honour
+		 * there, so the default is a convention rather than a value the user
+		 * wrote.
+		 */
+		tok->fuzzy_k = (e > p) ? (int) k : 2;
+	}
+
+	/*
+	 * A trailing ':' followed by a run of weight labels A/B/C/D (any case)
+	 * restricts the term to those field zones (tsquery-style term:A).  Sets a
+	 * 4-bit mask (bit L for label L in 0..3 = D,C,B,A).  Applies to plain,
+	 * prefix, and fuzzy terms; a regex term already consumed its slashes.
+	 */
+	if (st->pos < st->len && st->buf[st->pos] == ':')
+	{
+		int			p = st->pos + 1;
+		uint32		mask = 0;
+
+		while (p < st->len)
+		{
+			char		c = st->buf[p];
+
+			if (c == 'A' || c == 'a')
+				mask |= 1u << 3;
+			else if (c == 'B' || c == 'b')
+				mask |= 1u << 2;
+			else if (c == 'C' || c == 'c')
+				mask |= 1u << 1;
+			else if (c == 'D' || c == 'd')
+				mask |= 1u << 0;
+			else
+				break;
+			p++;
+		}
+		/* only consume the ':LABELS' if it was a valid non-empty label run */
+		if (mask != 0)
+		{
+			/*
+			 * A weight label cannot combine with a prefix/fuzzy suffix in this
+			 * release (those are presence-only, no per-occurrence positions to
+			 * zone-filter).  Reject term:A* / term:A~k as a syntax error rather
+			 * than silently dropping the * / ~k: the parser sees weightmask and
+			 * a prefix/fuzzy flag together and errors.
+			 */
+			if (p < st->len && (st->buf[p] == '*' || st->buf[p] == '~'))
+			{
+				tok->prefix = (st->buf[p] == '*');
+				tok->fuzzy_k = (st->buf[p] == '~') ? 2 : 0;
+				p++;
+			}
+			tok->weightmask = mask;
+			st->pos = p;
+		}
+	}
+}
+
+/*
  * Raw lexer.  Recognizes &, |, !, - and parentheses as punctuation; the
  * keywords AND/OR/NOT (case-insensitive) as operators; everything else is a
  * term.  A bare "and"/"or"/"not" is treated as an operator only when it stands
@@ -174,7 +307,7 @@ emit_dist(ParseState *st, uint8 type, uint8 op, char *term, int termlen,
 static Token
 lex_raw(ParseState *st)
 {
-	Token		tok = {TOK_EOF, NULL, 0, false, 0, false};
+	Token		tok = {0};
 	int			start;
 	int			flen;
 	char	   *folded;
@@ -251,6 +384,95 @@ lex_raw(ParseState *st)
 				st->pos++;
 				tok.kind = TOK_QUOTE;
 				return tok;
+			case '<':
+				{
+					/*
+					 * tsquery's phrase operators, which wquery_out prints
+					 * (doc/GAPS.md G96): `<->` and `<N>` are an EXACT gap of N
+					 * (WEAVE_QF_PHRASE_EXACT), `<=N>` is wquery's own "at most
+					 * N" (the NEAR/"..." semantics).  Any other '<' is an
+					 * ordinary separator, as it always was.
+					 */
+					int			p = st->pos + 1;
+					bool		atmost = false;
+					bool		overflow = false;
+					uint32		n = 1;
+					int			e;
+
+					if (p + 1 < st->len && st->buf[p] == '-' &&
+						st->buf[p + 1] == '>')
+						e = p + 1;
+					else
+					{
+						if (p < st->len && st->buf[p] == '=')
+						{
+							atmost = true;
+							p++;
+						}
+						e = lex_digits(st->buf, st->len, p, PG_UINT32_MAX, &n,
+									   &overflow);
+						if (e == p || e >= st->len || st->buf[e] != '>')
+						{
+							st->pos++;	/* not an operator: a separator */
+							break;
+						}
+					}
+					if (overflow)
+						st->error = true;
+					st->pos = e + 1;
+					tok.kind = TOK_PHRASE;
+					tok.exact = !atmost;
+					tok.gap = n;
+					return tok;
+				}
+			case '\'':
+				{
+					/*
+					 * A quoted literal, 'text', as wquery_out prints every
+					 * term: the bytes between the quotes VERBATIM (no folding,
+					 * no keywords -- 'and' is a term), with \x standing for x,
+					 * and optionally followed by a suffix (`*`, `~k`, `:ABCD`).
+					 * Like tsquery's 'Fox', which stays 'Fox'.  Verbatim is
+					 * what makes the text round-trip: a stored term need not be
+					 * folded (the tsquery cast copies lexemes, to_wquery(cfg)
+					 * stores whatever the dictionary returned).
+					 *
+					 * It is a literal only at a token boundary and only when an
+					 * unescaped closing quote follows with something between,
+					 * so `don't` and a lone `'` still separate as before.
+					 */
+					int			j = st->pos + 1;
+					int			k;
+					char	   *lit;
+					int			n = 0;
+
+					if (st->pos > 0 &&
+						is_token_byte((unsigned char) st->buf[st->pos - 1]))
+					{
+						st->pos++;
+						break;
+					}
+					while (j < st->len && st->buf[j] != '\'')
+						j += (st->buf[j] == '\\' && j + 1 < st->len) ? 2 : 1;
+					if (j >= st->len || j == st->pos + 1)
+					{
+						st->pos++;	/* unterminated or empty: a separator */
+						break;
+					}
+					lit = (char *) palloc(j - st->pos);
+					for (k = st->pos + 1; k < j; k++)
+					{
+						if (st->buf[k] == '\\')
+							k++;
+						lit[n++] = st->buf[k];
+					}
+					st->pos = j + 1;
+					tok.kind = TOK_TERM;
+					tok.term = lit;
+					tok.termlen = n;
+					lex_suffix(st, &tok);
+					return tok;
+				}
 			case '/':
 				{
 					/* /regex/ : read until the closing slash (not folded) */
@@ -267,7 +489,18 @@ lex_raw(ParseState *st)
 						st->pos++;	/* consume closing slash */
 					else
 					{
-						tok.kind = TOK_EOF;	/* unterminated regex */
+						/*
+						 * Unterminated: a TRAILING '/' is a dropped separator
+						 * like any other (`foo/` is 'foo'), but one with a word
+						 * after it is an error.  This returned EOF, so `a /foo`
+						 * and `a / b` silently became just 'a' (doc/GAPS.md G96).
+						 */
+						int			j;
+
+						for (j = rstart; j < st->len; j++)
+							if (is_token_byte((unsigned char) st->buf[j]))
+								st->error = true;
+						tok.kind = TOK_EOF;
 						return tok;
 					}
 					rbuf = (char *) palloc(rlen);
@@ -350,101 +583,7 @@ lex_raw(ParseState *st)
 		tok.kind = TOK_TERM;
 		tok.term = folded;
 		tok.termlen = flen;
-		/* a trailing '*' marks a prefix term */
-		if (st->pos < st->len && st->buf[st->pos] == '*')
-		{
-			tok.prefix = true;
-			st->pos++;
-		}
-		/* a trailing '~k' marks a fuzzy term (k defaults to 2) */
-		else if (st->pos < st->len && st->buf[st->pos] == '~')
-		{
-			int			k = 0;
-			bool		havedigit = false;
-
-			st->pos++;
-			while (st->pos < st->len &&
-				   st->buf[st->pos] >= '0' && st->buf[st->pos] <= '9')
-			{
-				k = k * 10 + (st->buf[st->pos] - '0');
-				havedigit = true;
-				st->pos++;
-			}
-
-			/*
-			 * `term~0` IS AN EDIT BUDGET OF ZERO, i.e. the term itself, and it
-			 * is now normalized to a PLAIN term rather than widened to ~1.  The
-			 * old Max(k, 1) answered a stricter question with a looser one: a
-			 * user who wrote ~0 also got every term at distance 1, which is a
-			 * wrong answer in the false-POSITIVE direction and the only kind
-			 * this parser produces on its own.  Zero is also what
-			 * contrib/fuzzystrmatch's levenshtein() means by zero, and that
-			 * agreement is the basis of the oracle in sql/fuzzyuleven.sql.
-			 *
-			 * Normalized rather than carried as a fuzzy item with k = 0 because
-			 * `fuzzy_k == 0` is this lexer's sentinel for "not fuzzy" (see the
-			 * field's comment and the flag assignment below), and the two mean
-			 * the same rows: the exact-term route returns precisely the terms at
-			 * distance 0, doing less work than an automaton with an empty budget.
-			 * The visible consequence is that 'term~0'::wquery prints as 'term',
-			 * which is the normalization stated rather than hidden.
-			 *
-			 * A BARE `term~` still means 2, unchanged: there is no digit to
-			 * honour there, so the default is a convention rather than a value
-			 * the user wrote.
-			 */
-			tok.fuzzy_k = havedigit ? k : 2;
-		}
-		/*
-		 * A trailing ':' followed by a run of weight labels A/B/C/D (any case)
-		 * restricts the term to those field zones (tsquery-style term:A).  Sets
-		 * a 4-bit mask (bit L for label L in 0..3 = D,C,B,A).  Applies to plain,
-		 * prefix, and fuzzy terms; a regex term already consumed its slashes.
-		 */
-		if (st->pos < st->len && st->buf[st->pos] == ':')
-		{
-			int			p = st->pos + 1;
-			uint32		mask = 0;
-
-			while (p < st->len)
-			{
-				char		c = st->buf[p];
-
-				if (c == 'A' || c == 'a')
-					mask |= 1u << 3;
-				else if (c == 'B' || c == 'b')
-					mask |= 1u << 2;
-				else if (c == 'C' || c == 'c')
-					mask |= 1u << 1;
-				else if (c == 'D' || c == 'd')
-					mask |= 1u << 0;
-				else
-					break;
-				p++;
-			}
-			/* only consume the ':LABELS' if it was a valid non-empty label run */
-			if (mask != 0)
-			{
-				/* A weight label cannot combine with a prefix/fuzzy suffix in this
-				 * release (those are presence-only, no per-occurrence positions to
-				 * zone-filter).  Reject term:A* / term:A~k as a syntax error rather
-				 * than silently dropping the * / ~k. */
-				if (p < st->len && (st->buf[p] == '*' || st->buf[p] == '~'))
-				{
-					tok.kind = TOK_TERM;
-					tok.term = folded;
-					tok.termlen = flen;
-					tok.weightmask = mask;
-					tok.prefix = (st->buf[p] == '*');
-					tok.fuzzy_k = (st->buf[p] == '~') ? 2 : 0;
-					st->pos = p + 1;
-					/* parser sees weightmask + prefix/fuzzy flag together -> error */
-					return tok;
-				}
-				tok.weightmask = mask;
-				st->pos = p;
-			}
-		}
+		lex_suffix(st, &tok);
 	}
 	return tok;
 }
@@ -476,15 +615,27 @@ peek(ParseState *st)
 	return st->peeked;
 }
 
-/* primary := '(' expr ')' | '"' term+ '"' | term */
-static void
+/*
+ * primary := '(' expr ')' | '"' term+ '"' | NEAR '(' term+ [',' k] ')' | term
+ *
+ * Every parse_* function returns its operand's phrase WIDTH, the quantity an
+ * exact gap is stored relative to (WEAVE_QF_PHRASE_EXACT): 0 for a term, the
+ * larger operand's for AND / OR, the operand's for NOT, D + width(L) for an
+ * exact phrase and D + width(L) + width(R) for an at-most one.  wquery_out
+ * subtracts the same width to print N, and wquery_validate() checks it, so the
+ * three must agree; migrate.c computes core's equivalent for the cast.
+ */
+static int64
 parse_primary(ParseState *st)
 {
-	Token		tok = next_token(st);
+	Token		tok;
+	int64		w = 0;
 
+	check_stack_depth();
+	tok = next_token(st);
 	if (tok.kind == TOK_LPAREN)
 	{
-		parse_or(st);
+		w = parse_or(st);
 		tok = next_token(st);
 		if (tok.kind != TOK_RPAREN)
 			st->error = true;
@@ -521,6 +672,7 @@ parse_primary(ParseState *st)
 		}
 		if (nterms == 0)
 			st->error = true;	/* empty phrase "" */
+		w = Max(nterms - 1, 0);
 	}
 	else if (tok.kind == TOK_NEAR)
 	{
@@ -533,7 +685,7 @@ parse_primary(ParseState *st)
 		if (p.kind != TOK_LPAREN)
 		{
 			st->error = true;
-			return;
+			return 0;
 		}
 		/* terms up to the comma */
 		for (;;)
@@ -549,7 +701,7 @@ parse_primary(ParseState *st)
 				 p.kind != TOK_NOT && p.kind != TOK_NEAR) || p.term == NULL)
 			{
 				st->error = true;
-				return;
+				return 0;
 			}
 			emit(st, WEAVE_QI_VAL, 0, p.term, p.termlen,
 				 p.prefix ? WEAVE_QF_PREFIX : 0);
@@ -560,21 +712,17 @@ parse_primary(ParseState *st)
 		if (p.kind == TOK_COMMA)
 		{
 			Token		kt = next_token(st);
-			int			j;
+			bool		overflow;
 
-			if (kt.kind != TOK_TERM)
+			/* k: digits only, and in range (this loop used to wrap) */
+			if (kt.kind != TOK_TERM || kt.regex || kt.prefix || kt.fuzzy_k ||
+				kt.weightmask ||
+				lex_digits(kt.term, kt.termlen, 0, PG_UINT32_MAX, &dist,
+						   &overflow) != kt.termlen || kt.termlen == 0 ||
+				overflow)
 			{
 				st->error = true;
-				return;
-			}
-			for (j = 0; j < kt.termlen; j++)
-			{
-				if (kt.term[j] < '0' || kt.term[j] > '9')
-				{
-					st->error = true;
-					return;
-				}
-				dist = dist * 10 + (kt.term[j] - '0');
+				return 0;
 			}
 			p = next_token(st);
 		}
@@ -583,12 +731,12 @@ parse_primary(ParseState *st)
 		if (p.kind != TOK_RPAREN)
 		{
 			st->error = true;
-			return;
+			return 0;
 		}
 		if (nterms < 2 || dist < 1)
 		{
 			st->error = true;	/* NEAR needs >=2 terms and k>=1 */
-			return;
+			return 0;
 		}
 		/* join the nterms operands with PHRASE(dist): nterms-1 operators */
 		{
@@ -597,6 +745,7 @@ parse_primary(ParseState *st)
 			for (m = 1; m < nterms; m++)
 				emit_dist(st, WEAVE_QI_OPR, WEAVE_OP_PHRASE, NULL, 0, 0, dist);
 		}
+		w = (int64) (nterms - 1) * dist;
 	}
 	else if (tok.kind == TOK_TERM)
 	{
@@ -620,7 +769,7 @@ parse_primary(ParseState *st)
 			if (f != 0)
 			{
 				st->error = true;
-				return;
+				return 0;
 			}
 			f = WEAVE_QF_WEIGHTED;
 			dist = tok.weightmask;
@@ -631,29 +780,73 @@ parse_primary(ParseState *st)
 	{
 		st->error = true;
 	}
+	return w;
 }
 
 /* unary := NOT unary | primary */
-static void
+static int64
 parse_unary(ParseState *st)
 {
-	Token		tok = peek(st);
+	Token		tok;
+	int64		w;
 
+	check_stack_depth();
+	tok = peek(st);
 	if (tok.kind == TOK_NOT)
 	{
 		(void) next_token(st);
-		parse_unary(st);
+		w = parse_unary(st);
 		emit(st, WEAVE_QI_OPR, WEAVE_OP_NOT, NULL, 0, 0);
 	}
 	else
-		parse_primary(st);
+		w = parse_primary(st);
+	return w;
 }
 
-/* and_expr := unary ( AND? unary )*  (implicit AND between adjacent terms) */
-static void
+/*
+ * phrase_expr := unary ( PHRASE unary )*, left-associative, binding tighter
+ * than AND and looser than NOT -- tsquery's precedence, so the cast's text
+ * (`'quick' <-> 'brown' <-> 'fox'` from core) reads as core reads it.
+ *
+ * `L <N> R` (and `<->`, N = 1) is an exact gap stored as D = N + width(R);
+ * `L <=N> R` is "within N", stored as D = N, the NEAR / "..." semantics.
+ */
+static int64
+parse_phrase(ParseState *st)
+{
+	int64		w = parse_unary(st);
+
+	while (peek(st).kind == TOK_PHRASE)
+	{
+		Token		op = next_token(st);
+		int64		wr = parse_unary(st);
+		uint32		d;
+
+		if (op.exact)
+		{
+			/* clamped like the cast: a gap past every position never matches */
+			if (wr > PG_UINT32_MAX)
+				st->error = true;
+			d = (uint32) Min((int64) op.gap + wr, (int64) PG_UINT32_MAX);
+			w = (int64) d + w;
+		}
+		else
+		{
+			d = op.gap;
+			w = (int64) d + w + wr;
+		}
+		emit_dist(st, WEAVE_QI_OPR, WEAVE_OP_PHRASE, NULL, 0,
+				  op.exact ? WEAVE_QF_PHRASE_EXACT : 0, d);
+	}
+	return w;
+}
+
+/* and_expr := phrase ( AND? phrase )*  (implicit AND between adjacent terms) */
+static int64
 parse_and(ParseState *st)
 {
-	parse_unary(st);
+	int64		w = parse_phrase(st);
+
 	for (;;)
 	{
 		Token		tok = peek(st);
@@ -661,7 +854,7 @@ parse_and(ParseState *st)
 		if (tok.kind == TOK_AND)
 		{
 			(void) next_token(st);
-			parse_unary(st);
+			w = Max(w, parse_phrase(st));
 			emit(st, WEAVE_QI_OPR, WEAVE_OP_AND, NULL, 0, 0);
 		}
 		else if (tok.kind == TOK_TERM || tok.kind == TOK_NOT ||
@@ -669,19 +862,21 @@ parse_and(ParseState *st)
 				 tok.kind == TOK_NEAR)
 		{
 			/* implicit AND */
-			parse_unary(st);
+			w = Max(w, parse_phrase(st));
 			emit(st, WEAVE_QI_OPR, WEAVE_OP_AND, NULL, 0, 0);
 		}
 		else
 			break;
 	}
+	return w;
 }
 
 /* or_expr := and_expr ( OR and_expr )* */
-static void
+static int64
 parse_or(ParseState *st)
 {
-	parse_and(st);
+	int64		w = parse_and(st);
+
 	for (;;)
 	{
 		Token		tok = peek(st);
@@ -689,12 +884,13 @@ parse_or(ParseState *st)
 		if (tok.kind == TOK_OR)
 		{
 			(void) next_token(st);
-			parse_and(st);
+			w = Max(w, parse_and(st));
 			emit(st, WEAVE_QI_OPR, WEAVE_OP_OR, NULL, 0, 0);
 		}
 		else
 			break;
 	}
+	return w;
 }
 
 /*
