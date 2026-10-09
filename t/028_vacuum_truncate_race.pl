@@ -222,8 +222,10 @@ for my $v (1 .. 3)
 }
 my $after = $node->safe_psql('postgres', q{SELECT pg_relation_size('w') / 8192});
 note("G73 trail: $_") for @trail;
+# diag on failure, so the smoke's console log (which keeps no regress_log) has it
 cmp_ok($after, '<', $before,
-	"quiet plain VACUUM still truncates the index ($before -> $after blocks)");
+	"quiet plain VACUUM still truncates the index ($before -> $after blocks)")
+  or diag(join("\n", map { "G73 trail: $_" } @trail));
 for my $pred ("cat < 'k'", "cat >= 'k'")
 {
 	is(idx_count($pred), heap_count($pred), "after truncation: index == heap for $pred");
