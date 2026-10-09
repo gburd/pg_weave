@@ -38,6 +38,11 @@ apply() {	# arm -> substitution in the current dir
 	# probe passing at candidate 1..228 (typically 130-150), so 64 should make the
 	# window-full shape the common case rather than a 1-in-15 one
 	amp) from='#define WEAVE_RECYCLE_PROBE_MAX 256'; to='#define WEAVE_RECYCLE_PROBE_MAX 64	/* ARM */' ;;
+	# L22 growth 2's reverted allocator fix (65bed24: skip a freed, not-yet-
+	# recyclable FSM candidate and put it back), on top of this tree.  Its
+	# revert (eb2dc03) was for t/028 3/10, whose failing shape is G73's.
+	skip) git apply -R bench/aws/g73/skip.patch && echo "src/am/am.c: skip.patch applied (ARM)"; return $? ;;
+	unfixedskip) apply skip && apply unfixed; return $? ;;
 	ampunfixed) apply amp && apply unfixed; return $? ;;
 	amprefresh) apply amp && apply refresh; return $? ;;
 	ampnobound) apply amp && apply nobound; return $? ;;
@@ -65,7 +70,10 @@ install_tree() {
 
 ok=1
 declare -A MD5
-SHAPES="${G73_SHAPES:-5:3000}"	# storm seconds:CREATE INDEX rows
+# Build every arm once and keep its .so; runs then swap the installed .so, so arms
+# can be INTERLEAVED in blocks on one host (G73_BLOCKS) without a rebuild each.
+# Only pg_weave.so differs between C arms; the install SQL is the tree's own.
+BUILT=""
 for arm in $CARMS; do
 	D=/tmp/arm-$arm
 	[ -d $D ] && find $D -depth -delete
@@ -76,30 +84,50 @@ for arm in $CARMS; do
 	if ! install_tree $D $arm; then
 		log "$arm: DID NOT BUILD ($(grep -m3 error $OUT/build-$arm.log))"; ok=0; continue
 	fi
-	md5=$(md5sum $LIB/pg_weave.so | cut -d' ' -f1)
+	cp $LIB/pg_weave.so /tmp/so-$arm.so
+	md5=$(md5sum /tmp/so-$arm.so | cut -d' ' -f1)
+	dup=0
 	for a in "${!MD5[@]}"; do
-		[ "${MD5[$a]}" = "$md5" ] && { log "$arm: .so identical to $a's -- arm not counted"; ok=0; }
+		[ "${MD5[$a]}" = "$md5" ] && { log "$arm: .so identical to $a's -- arm not counted"; ok=0; dup=1; }
 	done
+	[ $dup = 1 ] && continue
 	MD5[$arm]=$md5
+	log "$arm: built, so=$md5 ($(cat $OUT/apply-$arm.log | tr '\n' ' '))"
+	BUILT="$BUILT $arm"
+done
+TESTS="${G73_TESTS:-bench/aws/g73_repro.pl}"
+for blk in $(seq 1 ${G73_BLOCKS:-1}); do
+for arm in $BUILT; do
+	D=/tmp/arm-$arm
+	sudo install -m 755 /tmp/so-$arm.so $LIB/pg_weave.so
+	md5=$(md5sum $LIB/pg_weave.so | cut -d' ' -f1)
+	[ "$md5" = "${MD5[$arm]}" ] || { log "$arm: installed .so is not the arm's"; ok=0; continue; }
 	for shape in $SHAPES; do
 	secs=${shape%%:*}; rows=${shape##*:}
 	for r in $(seq 1 $N); do
-		tag=$arm-s$secs-r$rows-$r
+		tag=$arm-s$secs-r$rows-b$blk-$r
 		[ -d $D/tmp_check ] && find $D/tmp_check -depth -delete
 		(cd $D && G73_SECS=$secs G73_BASEROWS=$rows make installcheck PG_CONFIG=$PGC REGRESS= ISOLATION= \
-			PROVE_TESTS=bench/aws/g73_repro.pl > $OUT/tap-$tag.log 2>&1)
+			PROVE_TESTS="$TESTS" > $OUT/tap-$tag.log 2>&1)
 		rc=$?
 		mkdir -p $OUT/$tag
 		cp $D/tmp_check/log/* $OUT/$tag/ 2>/dev/null
+		if ! grep -q '^Result: ' $OUT/tap-$tag.log; then log "$tag: RAN_NOTHING rc=$rc"; ok=0; continue; fi
 		nr=$(cat $OUT/$tag/regress_log_* 2>/dev/null | grep -c 'G73R ')
-		log "$tag so=$md5 rc=$rc rounds=$nr $(cat $OUT/$tag/regress_log_* 2>/dev/null | grep 'G73T ' | sed 's/^# //' | tr '\n' ' ')"
-		[ "$nr" -gt 0 ] || { log "$tag: RAN_NOTHING"; ok=0; }
+		nnok=$(cat $OUT/$tag/regress_log_* 2>/dev/null | grep '^not ok' | tr '\n' ' ')
+		probe=$(cat $OUT/$tag/regress_log_* 2>/dev/null | grep -c 'G73 trail.*no free page recyclable yet')
+		log "$tag so=$md5 rc=$rc $(grep '^Result: ' $OUT/tap-$tag.log) rounds=$nr probe_decline_trail_lines=$probe not_ok=[$nnok] $(cat $OUT/$tag/regress_log_* 2>/dev/null | grep 'G73T ' | sed 's/.*# //' | tr '\n' ' ')"
 	done
 	done
-	find $D -depth -delete
 done
-log "TOTALS:"
-for d in $OUT/*/; do t=$(basename $d); c=${t%%-s*}; cat $d/regress_log_* 2>/dev/null | grep 'G73R ' |
+done
+log "TOTALS (reproducer rounds):"
+for d in $OUT/*/; do t=$(basename $d); c=${t%%-s[0-9]*}; cat $d/regress_log_* 2>/dev/null | grep 'G73R ' |
 	sed "s/.*arm=\([a-z]*\) secs=\([0-9]*\) rows=\([0-9]*\).*result=\([A-Z]*\).*/$c \2s \3r \1 \4/"; done | sort | uniq -c | tee -a $OUT/g73.log
+log "TOTALS (TAP runs):"
+for arm in $BUILT; do
+	n=$(grep -c " $arm-s.* so=.*Result: FAIL" $OUT/g73.log); t=$(grep -c " $arm-s.* so=" $OUT/g73.log)
+	log "TAP $arm: $n of $t failed"
+done
 log "DONE ok=$ok"
 [ $ok = 1 ]
