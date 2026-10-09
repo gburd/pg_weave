@@ -454,9 +454,13 @@ lex_raw(ParseState *st)
 					}
 					while (j < st->len && st->buf[j] != '\'')
 						j += (st->buf[j] == '\\' && j + 1 < st->len) ? 2 : 1;
-					if (j >= st->len || j == st->pos + 1)
+					if (j >= st->len || j == st->pos + 1 ||
+						(j + 1 < st->len &&
+						 is_token_byte((unsigned char) st->buf[j + 1])))
 					{
-						st->pos++;	/* unterminated or empty: a separator */
+						/* unterminated, empty, or closed inside a word
+						 * (`'tis and 'twas`): a separator, as before */
+						st->pos++;
 						break;
 					}
 					lit = (char *) palloc(j - st->pos);
