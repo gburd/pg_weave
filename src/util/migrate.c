@@ -166,10 +166,10 @@ mig_walk(MigState *st, QueryItem *item, bool in_phrase)
 		switch (op->oper)
 		{
 			case OP_AND:
-				mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_AND, 0, 1, NULL, 0);
+				mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_AND, 0, 0, NULL, 0);
 				return 0;
 			case OP_OR:
-				mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_OR, 0, 1, NULL, 0);
+				mig_emit(st, WEAVE_QI_OPR, WEAVE_OP_OR, 0, 0, NULL, 0);
 				return 0;
 			case OP_PHRASE:
 				/* widths add up (int64: a long query cannot overflow);

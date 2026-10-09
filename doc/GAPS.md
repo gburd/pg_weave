@@ -6902,7 +6902,7 @@ same two scales and close it. Covered queries (`fox & !dog`) never pad and are u
 (`pgweave-20261008-162641-39d3`, two runs per arm). It is the same collection, and the
 streaming walk should serve both. Re-measure it in the same revisit.
 
-### G96 — `wquery_out` text does not parse back: a phrase, prefix, fuzzy or weighted term reloads as a DIFFERENT query — **FOUND 2026-10-08 by the exact-gap phrase work (`wt/phrase`); OPEN, needs a syntax decision**
+### G96 — `wquery_out` text does not parse back: a phrase, prefix, fuzzy or weighted term reloads as a DIFFERENT query — **FOUND 2026-10-08 by the exact-gap phrase work (`wt/phrase`); **FIXED 2026-10-09 on `wt/g96`** (maintainer decision: `wquery_in` reads what `wquery_out` prints) -- and the fix found six more silent-wrong-query or crash bugs in the same I/O path**
 
 `wquery_out` prints phrases as `'quick' <-> 'brown'` (and since `wt/phrase`, exact gaps as `<N>`),
 prefixes as `'fo'*`, fuzzy as `'fo'~1` and weights as `'fox':A`. `wquery_in` reads none of these
@@ -6924,4 +6924,86 @@ prints -- the tsquery operators `<->` / `<N>` between operands and a quoted term
 `~k` or `:ABCD`. Cost: `a <-> b` today means `a & !b` and `a<2>b` means `a & 2 & b`; both change
 meaning. Nothing is released, so only tests notice. The alternative (print only what today's parser
 reads) cannot express an exact gap, so it does not close the round trip.
+
+**Decision, 2026-10-09 (maintainer): yes.** Done on `wt/g96`. **FIXED** — gate evidence below.
+
+**The syntax `wquery_in` now reads** (`src/query/parse.c`; all of it is what `wquery_out` prints):
+
+| spelling | meaning | item |
+|---|---|---|
+| `L <-> R`, `L <N> R` | tsquery's exact gap N (0 = same position) | `WEAVE_OP_PHRASE`, `WEAVE_QF_PHRASE_EXACT`, distance N + width(R) |
+| `L <=N> R` | at most N apart: the `"..."` / `NEAR` semantics as an operator | `WEAVE_OP_PHRASE`, distance N |
+| `'text'` | a quoted literal: the bytes VERBATIM (no folding, no keywords), `\'` and `\\` escaped | a term |
+| `'text'*`, `'text'~k`, `'text':ABCD` | the suffixes, after a literal as after a bare word | prefix / fuzzy / weighted |
+
+The phrase operators bind tighter than `&` and looser than `!`, left-associative: tsquery's
+precedence, so the cast's text reads the way core reads it. A `'` is a literal only at a token
+boundary and only when an unescaped closing quote follows with something between and no word
+directly after (so `don't`, `'tis` and a lone `'` separate as before). A `<` that starts none of the
+three operators is still a separator (`a < b`, `a <x> b`, `a <=> b`). The lexer never looks
+inside `/.../`, so `/a<->b/` is still the regex `a<->b`.
+
+**What `wquery_out` prints.** Terms as quoted literals with their suffix (unchanged); `&`, `|`,
+`!` fully parenthesised (unchanged). An at-most phrase prints in the NATIVE syntax that builds
+exactly its shape: a left-deep chain of plain or prefix words 1 apart as `"quick brown fox"`; a
+right-deep chain with one gap k as `NEAR(quick brown fox, k)` (a two-word chain with k = 1 is
+both, and prints as `"a b"`); only a shape no native spelling builds, which only binary input
+or `<=N>` itself can produce (a phrase over a NOT or a fuzzy term, mixed gaps), prints as
+`(L <=N> R)`. Inside `"..."` / `NEAR()` a word is bare if it is `[a-z0-9]+` and not a keyword,
+else a quoted literal (`"the 'and' clause"`). An exact gap prints as `<->` / `<N>`, as before.
+
+**Meaning changes, all intended:** `a <-> b` was `a & !b`, `a<2>b` was `a & 2 & b`; `'Fox'` was
+folded to `fox` and is now the term `Fox` (tsquery does the same); `'tis'` was `tis`. Expected
+output that changed for that reason: `weave.out` (6 hunks, every one a phrase now printing as
+`"..."` / `NEAR()`, plus `/unterminated` below), `tsvector_input.out` (one EXPLAIN printing
+`'"quick brown"'::wquery`), `tsquery_cast.out` (the pinned non-round-trip table now `t` in all
+five rows, the new count). Each hunk was read; no row count or verdict changed.
+
+**Bugs found and fixed on the way** (each a silently different query or a crash):
+
+1. **`wquery_recv` accepted any item list, and a malformed one crashed the backend.** A postfix
+   list that underflows the stack (`AND` alone, `NOT` alone) indexed `stack[-1]` in
+   `wquery_out` and in both evaluators; unknown flags, a gap on a plain term, a weight mask 0
+   or > 15, fuzzy `~0`, a `/` in a regex or bytes invalid in the server encoding were stored.
+   `weave_query_validate()` now accepts exactly what `wquery_out` can print and `wquery_in` read
+   back, and errors (`invalid_binary_representation`) on anything else; 14 refusals pinned.
+2. **`qnode_flatten` dropped an operator's flags**, so an exact gap became "at most N" whenever
+   a stopword was elided ANYWHERE in the query: `to_wquery('english', 'the & (quick <2> brown)')`.
+3. **An unterminated `/regex` silently truncated the query**: the lexer returned end-of-input,
+   so `a /foo` and `a / b` both meant just `a`. Now a syntax error when a word follows the `/`; a
+   trailing `foo/` is still `foo`. `'/unterminated'::wquery` was the empty query and is now an
+   error (`weave.out`).
+4. **Every number the lexer read wrapped**: `fo~4294967297` was `fo~1`, and the `NEAR(..., k)`
+   loop overflowed a `uint32`. One overflow-checked `lex_digits()`; out of range is a syntax error.
+5. **A `/regex/` inside `"..."` or `NEAR()` became a plain term with the regex's text.** Error.
+6. The tsquery cast emitted AND / OR items with `distance = 1` where the parser writes 0, so a
+   cast value and its parsed text could never be byte-identical (`src/util/migrate.c`; no
+   evaluator reads the field).
+
+**Found, NOT fixed (pre-existing, recorded):**
+
+- Inside `"..."` and `NEAR()`, a fuzzy or weighted word loses its suffix silently
+  (`"quick brwn~1"` is the phrase `quick brwn`). `sql/tsquery_cast.sql` pins that query, and the
+  fix is a phrase-word grammar change, not a round-trip one.
+- Stopword elision drops an exact gap's operand without adding its width to the gap:
+  `to_wquery('english', 'quick <-> the <-> fox')` is `quick <-> fox`, where core's
+  `to_tsquery` gives `quick <2> fox`. The at-most case was already documented as losing the gap
+  ("the adjacency gap is lost", the comment above `QNode`); the exact case answers differently
+  from core.
+
+**Gate evidence (EC2 Debian 13, PG17.11 and PG18):** `sql/wquery_roundtrip.sql` (new, in
+`REGRESS`): 74 hand-written inputs over every item kind and flag, 13 cast shapes, 1,000 random
+TEXT queries through `wquery_in`, 1,000 random postfix lists through `wquery_recv` (a binary COPY
+file written with `lo_export`, so shapes no text builds are covered), 14 recv refusals, and a
+text `COPY` of a wquery column out and back; `sql/tsquery_cast.sql` checks every query the cast
+converts (228 of 228 round-trip); `t/034` dumps and restores a wquery column (`-Fp`, `-Fc`).
+Mutants, each BUILT (distinct `.so` md5) and then FAILED the two tests: `<N>` parsed as at-most,
+weight suffix dropped, prefix suffix dropped, `~k` printed off by one, `~k` parsed off by one,
+`qnode_flatten` dropping flags, exact gap printed without the right width — 7 of 7 killed
+(runs `pgweave-20261009-151119-1324` and `pgweave-20261009-152402-28b4`, identical .so md5s,
+both 7 of 7; each mutant also changed the solo output by 6-68 lines). The clean tree ran the solo
+files twice per run with 0 lines between them. t/034: 22 of 22, the three G96 assertions among them
+(`pgweave-20261009-152402-28b4`, `remote/regress_log_034_wdoc_dump_restore`). PG18 installcheck exit 0
+against the PG17 outputs. Full smoke on the final commit `b20623c`: `pgweave-20261009-153455-198f`,
+regression + isolation green (empty `regression.diffs`), TAP 35 files / 1,547 tests PASS, lint and codec green.
 

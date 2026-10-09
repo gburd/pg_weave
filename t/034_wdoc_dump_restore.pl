@@ -52,6 +52,31 @@ $node->safe_psql('src', q{
 	CREATE INDEX docs_w ON docs USING weave (d) WITH (positions = on);
 });
 
+# doc/GAPS.md G96: a stored wquery column survives the same text COPY.  One
+# row per item kind and flag, the exact gaps through the tsquery cast (its
+# only producer besides binary input).  Before G96 the phrases, prefix,
+# fuzzy and weighted rows restored as different queries.
+$node->safe_psql('src', q{
+	CREATE TABLE wq (id int PRIMARY KEY, q wquery);
+	INSERT INTO wq VALUES
+	  (1, 'quick & (brown | !fox)'), (2, '"quick brown fox"'),
+	  (3, 'NEAR(quick brown fox, 3)'), (4, 'fo* & qu*'),
+	  (5, 'brwn~1 | brown~3'), (6, 'fox:A & dog:BD'), (7, '/^fo+x$/ | dog'),
+	  (8, ''), (9, $$'it\'s' & 'Fox' & 'and'$$),
+	  (10, 'quick <2> (brown <-> fox)'), (11, '(quick <0> brown) <3> fox'),
+	  (12, '!(quick <=2> brown) & NEAR(a b, 1)');
+	INSERT INTO wq SELECT 100 + i, q::tsquery::wquery
+	  FROM unnest(ARRAY['quick <-> brown', 'quick <2> brown', 'fox:A <0> dog',
+	                    '(a <3> b) <-> (c <-> d)', 'fo:* & !dog:C']) WITH ORDINALITY u(q, i);
+});
+my $wq_fp = q{
+	SELECT string_agg(id || ':' || md5(wquery_send(q)::text), ',' ORDER BY id)
+	  FROM wq};
+my $src_wq = $node->safe_psql('src', $wq_fp);
+is($node->safe_psql('src', q{SELECT count(*) FROM wq
+	WHERE wquery_send(q::text::wquery) = wquery_send(q)}), '17',
+	'control: every source wquery round-trips through its text in place');
+
 my $nlong = $node->safe_psql('src',
 	q{SELECT count(*) FROM docs WHERE wdoc_length(d) > 16383});
 is($nlong, '7', 'control: seven source documents are longer than 16,383 tokens');
@@ -116,6 +141,8 @@ foreach my $fmt ('p', 'c')
 		"-F$fmt: ORDER BY d <=> q returns the same rows and scores after restore");
 	is($node->safe_psql($db, $phrase), $src_phrase,
 		"-F$fmt: phrase count from the restored index matches the source");
+	is($node->safe_psql($db, $wq_fp), $src_wq,
+		"-F$fmt: every restored wquery is byte-identical to its source (G96)");
 }
 
 $node->stop;

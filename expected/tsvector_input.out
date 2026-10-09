@@ -278,13 +278,13 @@ SELECT weave_count('tsi_ix', '"quick brown" & fox'::wquery) AS cnt_ix,
 RESET enable_bitmapscan;
 SET enable_indexscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM tsi WHERE tsv @@@ '"quick brown"'::wquery;
-                               QUERY PLAN                                
--------------------------------------------------------------------------
+                         QUERY PLAN                          
+-------------------------------------------------------------
  Aggregate
    ->  Bitmap Heap Scan on tsi
-         Recheck Cond: (tsv @@@ '(''quick'' <-> ''brown'')'::wquery)
+         Recheck Cond: (tsv @@@ '"quick brown"'::wquery)
          ->  Bitmap Index Scan on tsi_ix
-               Index Cond: (tsv @@@ '(''quick'' <-> ''brown'')'::wquery)
+               Index Cond: (tsv @@@ '"quick brown"'::wquery)
 (5 rows)
 
 SELECT count(*) FROM tsi WHERE tsv @@@ '"quick brown"'::wquery;
