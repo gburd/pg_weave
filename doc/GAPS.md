@@ -6902,7 +6902,7 @@ same two scales and close it. Covered queries (`fox & !dog`) never pad and are u
 (`pgweave-20261008-162641-39d3`, two runs per arm). It is the same collection, and the
 streaming walk should serve both. Re-measure it in the same revisit.
 
-### G96 — `wquery_out` text does not parse back: a phrase, prefix, fuzzy or weighted term reloads as a DIFFERENT query — **FOUND 2026-10-08 by the exact-gap phrase work (`wt/phrase`); OPEN, needs a syntax decision**
+### G96 — `wquery_out` text does not parse back: a phrase, prefix, fuzzy or weighted term reloads as a DIFFERENT query — **FOUND 2026-10-08 by the exact-gap phrase work (`wt/phrase`); decision taken 2026-10-09 (wquery_in reads what wquery_out prints); IN PROGRESS on `wt/g96`**
 
 `wquery_out` prints phrases as `'quick' <-> 'brown'` (and since `wt/phrase`, exact gaps as `<N>`),
 prefixes as `'fo'*`, fuzzy as `'fo'~1` and weights as `'fox':A`. `wquery_in` reads none of these
