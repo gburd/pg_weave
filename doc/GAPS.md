@@ -4939,6 +4939,25 @@ the merge's output" instead of "smaller". **Owed:** reproduce with `log_lock_wai
 NOTICE on the skipped conditional lock before changing the assertion; a test that relaxes
 its assertion without knowing why it failed is the eleventh-member mistake.
 
+**2026-10-09, `wt/l22b` (task L22 round 2): the failing shape, read from the trail.** A
+failing run's trail now carries the cleanup trigger's inputs and decision (DEBUG2), and the
+control `diag`s it on failure. On the one failure whose trail survived
+(`pgweave-20261009-012908-ab8e`, fix build), the first VACUUM after the DELETE fired the
+trigger (4,493 pages, 2,696 free, tombstone fraction 0.900) and was then **declined by the
+L19 recyclability probe at pass 0**: "no free page recyclable yet: no pass", `lowfree_reuse`
+0, 168 extends. VACUUMs 2 and 3 were the same, and the file went 4,325 → 4,493. On every
+passing run the pass ran (`lowfree_reuse` 196–214) and the probe declined only the second
+pass. So the control fails when **none of the first 256 free pages in the FSM is
+recyclable yet** at the first post-DELETE VACUUM: the storm's last frees are still within
+the xid horizon. That is a property of where the storm left its free pages, which is why
+the rate moves with any change to the storm's allocation pattern. Counts so far, the
+quiet-host loops only: unfixed tree 0 of 10 + 0 of 30 + 0 of 10 (`oldtrig`, job A) ≈ 0 of
+50 plus this entry's original 1 in ~15 full runs; L22 fix 3 of 43. The difference is not
+significant (Fisher p ≈ 0.24–0.30). **Still owed:** a control that does not depend on the
+horizon having passed the storm's frees. For example, spend an xid in a separate
+transaction before the VACUUM (as `t/015`'s `xidburn` does), or retry the VACUUM, with a
+time cap, until the probe passes.
+
 ### G74 — `weave_search()` returns a HOT-chain ROOT TID, so `JOIN t ON t.ctid = s.ctid` silently drops every HOT-updated row — **FOUND 2026-10-04 by the F3 agent while building `weave_fuse_search()`'s oracle; PRE-EXISTING; OPEN**
 
 An access method must hand the executor HOT-chain root TIDs (AGENTS.md), and

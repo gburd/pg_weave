@@ -267,3 +267,181 @@ successful". `t/033`'s bound is back to `not ok 26 ... # TODO` with excess
 `142 255 255 1002 255 216 255 255 2626 5299 7972`, which is main's sequence from cycle 8
 to the page (`pgweave-20261006-202448-495c`). `t/028`'s control: `ok 113 - quiet plain
 VACUUM still truncates the index (3495 -> 230 blocks)`.
+
+### Round 2, step 1: do the growths hit ORDINARY workloads? (`pgweave-20261008-160908-2708`, `f3f4f6f`)
+
+The maintainer allowed one more L22 round only if it would make a significant difference,
+and made it conditional on first measuring whether the growth happens without crashes.
+Harness: `bench/aws/l22_ordinary.sh`. c7i.4xlarge, Debian 13, PG 17.11. Six private
+clusters ran at once on one host and one `.so`: two runs per arm. The table is the same
+`s (body, emb, price)` with three channels that `g75_scale.sh` uses. 1M rows, 14 cycles,
+B = 100k rows per cycle, serial builds. **No crash anywhere.** The reference is a
+fresh `CREATE INDEX` over exactly the live row set of each cycle. It is built in a
+separate cluster, so no DDL spends an xid inside an arm. Both runs of every arm agreed
+**to the page at every cycle**, so the within-arm spread is zero.
+
+- **(a)** INSERT 10 %, DELETE the oldest 10 %, plain `VACUUM`, autovacuum off.
+- **(b)** the same INSERT and DELETE with autovacuum on at default settings and no manual
+  VACUUM. Each cycle waits 90 s.
+- **(c)** pure append: INSERT 10 % and plain `VACUUM`, with no deletes.
+
+Index pages minus the fresh build's, per cycle 0..14 (the reference is 36,313 for a and b,
+and 36,313 → 87,086 for c):
+
+| arm | excess over a fresh build | at cycle 14 |
+|---|---|---|
+| a | 0 5,626 9,309 12,991 16,673 20,355 24,037 27,719 60,472 **71,103** 3,708 5,655 9,338 13,020 16,702 | 1.46× (peak 2.96× at 9) |
+| b | 0 5,626 5,626 7,572 20,497 20,497 20,497 31,442 31,442 31,442 42,404 42,404 42,404 53,363 53,363 | **2.47×, still rising** |
+| c | 0 2,004 2,059 2,082 2,136 2,181 2,237 2,283 31,401 70,991 74,564 78,204 81,827 85,451 89,077 | **2.02×** from cycle 9 on |
+
+What each arm's allocator counters show (`weave_alloc_stats()` around every INSERT and VACUUM):
+
+- **(a) is a bounded sawtooth with period 10.** Cycles 1–7 add one bolt each (+3,682 pages),
+  and the tombstoned rows stay in their bolts until the 8-bolt level merge. Cycle 8's
+  merge extends 30,806 pages. Cycle 9's VACUUM runs the share-lock compaction pass and
+  peaks the file at 2.96×. Cycle 10's compacts it to 1.10×, and cycles 11–14 repeat cycles
+  1–4 to within 29 pages. **Growth 2 fires here**, without a crash: every INSERT after a
+  plain VACUUM shows `fsm_defer` 1,947 = `extend` 1,947, the xid collision. But it is a
+  constant one-batch pool, about 5 % of the index, and the pool exists with or without
+  the collision. The INSERT extends its batch, and the next VACUUM's flush reuses the 1,947
+  pages the INSERT could not and frees the batch it flushed. With the collision fixed, the
+  INSERT would reuse the pool and the flush would extend instead. Either way the cycle
+  grows by one bolt and leaves one batch free.
+- **(b) shows no xid collision.** Every INSERT after an autovacuum reuses its pages
+  (`fsm_reuse` 1,946, `extend` 0). Something assigns an xid between autovacuum's free and
+  the next INSERT. Autoanalyze is the likely candidate; that is not demonstrated. The
+  growth comes in steps of ~11k pages, one per autovacuum (every third cycle): bolts plus
+  the original, fully tombstoned bolt waiting for a level merge, which L19's
+  tombstone-blind trigger never forces. Whether it saws back the way (a) does is
+  unmeasured at 14 cycles. Job 2 runs it to 30.
+- **(c) is growth 1's shape with no crash and no deletes.** Cycle 8's level merge extends
+  30,785 pages. From cycle 9 **every** VACUUM runs the share-lock compaction pass with
+  fewer reusable pages than live ones. It extends the shortfall (41,278, then ~5,300 per
+  cycle) and frees the old copy, and the excess equals the freed count. So the file holds
+  at about **2.0× a fresh build and grows with the data**. Each such VACUUM is a full
+  rewrite: 350, 858, 922, 999, 1,115 s, against 1–2 s before cycle 8.
+
+**Verdict, against the brief's test** (more than ~10 % of the index per 10 cycles, or
+without bound): **GO** on (b) and (c). But **a fix to growth 2 (the xid collision) would
+not make a significant difference to any of the three**. In (a) it is a constant 5 %, in
+(b) it does not occur, and (c) is growth 1. The significant ordinary-workload costs are
+(c)'s permanent 2× plus its full rewrite on every VACUUM (the compaction trigger and pass,
+which this round was told not to touch, and which `t/028` constrains), and (b)'s tombstone
+retention (L19's trigger). Reported to the lead for a decision before any step 2.
+
+### Round 2, step 2: growth 1 fixed (`647d6da`, run `pgweave-20261008-222527-e179`)
+
+**Lead redirect after step 1:** fix growth 1 (the share-lock compaction pass), not growth 2,
+and do not regress `t/028`.
+
+**What arm (c)'s counters showed.** From cycle 9 on, every cleanup sees **two bolts**: the
+big one the cycle-8 level merge wrote high in the file, and that cycle's flush. Term (2) of
+`weave_index_is_compacted()` (`nlive > 1`) returned "not compacted" before term (4) was
+reached. Term (4) is the G47 outcome prediction `weave_pack_would_shrink()`, applied only
+under a share lock with no tombstones. So the pass ran with the merge's write-before-free
+pool below it (FREE about 31k at cycle 9, 69k at cycle 10) and LIVE larger than that (67k,
+73k). It packed the pool, extended the rest, and freed the old copy under its own xid, so the
+next cleanup met the same layout. At cycle 8 (one bolt) term (4) had already declined
+correctly.
+
+**The fix** (`src/am/amvacuum.c`, `weave_index_is_compacted()`). Apply term (4) to several
+bolts too, under the same conditions: no `AccessExclusiveLock`, tombstone fraction 0. If the
+FSM predicts that the pack would not shrink the file, there is no pass. Stated precisely,
+the predicate tells "the pass shrinks the file" (FREE ≥ LIVE: the copy fits below the LIVE-th
+free block, so the tail truncates) apart from "the pass re-copies into an extension because
+its prior copy is not reusable" (FREE < LIVE: the shortfall goes onto fresh high blocks,
+which stay live). Giving up the coalesce is cheap: the cleanup's leveled merge already bounds
+the bolt count, and `weave_vacuum()` still compacts to one. DEBUG2 lines now report the
+cleanup trigger's inputs and decision, and any declined pass. `t/028`'s G73 trail captures
+them.
+
+| gate | result |
+|---|---|
+| smoke, `5963e78` | installcheck PASS; TAP 35 files, 1,484 tests, PASS |
+| `t/028`, 10 runs per arm, one host | fix 0 of 10 failed (`.so` 96461c…); mutant `oldtrig` (the old rule, exact-once substitution, `.so` 1a17be…) 0 of 10. **Superseded by the 30-run count below**: the next smoke failed once |
+| `t/028` ablation, from its own trail | at VACUUM 1 after the DELETE, in **all 20 runs**: trigger `~2,100 free of ~3,900 pages, tombstone fraction 0.900: compaction`. The pass ran (`lowfree_reuse` 180–201) and reached 239–754 pages. The new term needs tombstone fraction 0, so it **cannot apply** to that VACUUM |
+| `t/033` + `t/015`, twice | PASS. **`t/033`'s TODO bound passed** (`TODO passed: 26-27`): excess over the twin worst 844 on both runs (main: 2,626 / 5,299 / 7,972) |
+| step-1 workloads on the fix, two runs per arm | (c) **fixed**: see below. (a) and (b) **identical to step 1, to the page**, both runs |
+| 1M-row crash-loop scale run with the twin | twin bound PASS (worst 2,553, bound 6,631). **Stops-growing assertion FAILS** (2,354 over the last four cycles, allowed 866). The excess is `0 2296 795 2553 1052 0 0 0 0 0 1177 1177 2354 2354`: growth 2's +1,177 every two cycles (the xid collision), the same shape as `pgweave-20261008-022758-8a5a` on the unfixed tree. Not fixed here, by the lead's redirect |
+
+Arm (c), the excess over a fresh build per cycle 0..14 (two runs, identical to the page):
+
+| tree | excess | at 14 | VACUUM seconds, cycles 9–14 |
+|---|---|---|---|
+| step 1 (main) | 0 2,004 … 2,283 31,401 **70,991 74,564 78,204 81,827 85,451 89,077** | 2.02× | 350, 858, 922, 999, 1,115, 1,296 |
+| fix | 0 2,004 … 2,283 31,401 **27,766 24,126 22,450 18,826 17,147 13,518** | **1.16×** | 1, 2, 1, 2, 1, 2 |
+
+With the fix, the cycle-8 merge's pool drains into later INSERTs and flushes. The excess
+falls about 3,000 pages per cycle, and every VACUUM after cycle 8 is a 1–2 s no-op
+compaction. `bench/aws/l22_ordinary.sh` now asserts this from cycle 9: VACUUM ≤ 120 s, size
+≤ 1.6× fresh, excess not rising by more than 2 % of the reference. It passes both runs on the
+fix and fails both on step 1's logs (checked offline: every cycle 350–1,296 s, 2.0×, growth
+18,086). **On the BUILT mutant `oldtrig` (`.so` 1a17be…, same run) it fails too:** 139,935
+pages and 334 s at cycle 9, then 147,148 and 1,080 s at cycle 10. Those sizes are step 1's
+to the page.
+
+### `t/028` at 30 runs per arm, and what a failure looks like (`pgweave-20261009-012908-ab8e`, `05ea144`)
+
+Job B's smoke (`pgweave-20261009-005928-536d`, same C code) failed `t/028`'s truncation
+control once (4,134 → 4,292). That smoke keeps no TAP log, so the control now `diag`s its
+trail on failure. Job C ran `t/028` in six interleaved blocks of 5 fix + 5 `oldtrig` on one
+host, with the same two `.so`s as job A. Its own smoke passed: 1,544 TAP tests, `t/028`
+included.
+
+| build | job A | smokes | job C | total |
+|---|---|---|---|---|
+| fix (`.so` 96461c…) | 0 of 10 | 1 of 3 | **2 of 30** (blocks 1 and 5) | **3 of 43** (7 %) |
+| `oldtrig` = the old rule (`.so` 1a17be…) | 0 of 10 | — | **0 of 30** | **0 of 40** |
+
+Job C's 2/30 against 0/30 gives Fisher p ≈ 0.49, and the totals give p ≈ 0.24. On the
+unfixed tree, G73 records this control failing about 1 in 15 full runs. **The rates do not
+differ measurably.** Also, the block-1 failure's trail was lost: a harness slip let later
+blocks overwrite its log directory (`L22PFX`, fixed in `e825abe`). Of the four failures,
+only the block-5 trail survived.
+
+**The surviving failure is the known shape, and the new term did not decide it.** The first
+VACUUM after the DELETE fired the trigger (4,493 pages, 2,696 free, tombstone fraction
+0.900). It was then declined at pass 0 by the **L19 recyclability probe**: "no free page
+recyclable yet: no pass", `lowfree_reuse` 0, 168 extends. VACUUMs 2 and 3 repeated it, and
+the file went 4,325 → 4,493. The fix's own DEBUG2 line ("N bolts, no tombstones, a pack
+would not shrink") does **not** appear: with tombstones present the term cannot fire,
+exactly as designed. All 35 surviving passing trails, on both builds, run pass 0
+(`lowfree_reuse` 196–214). This is the same shape as round 1's failures (VACUUM 1 runs no
+pass, `lowfree_reuse` 0, the file stays at 3,100–4,700 pages). What the probe sees is the
+FSM's first 256 free pages, and their recyclability depends on where the storm phase left
+its last frees relative to the xid horizon. The fix can change that only indirectly: the
+storm's own VACUUMs run with no tombstones and several bolts, so the new term declines some
+of their passes. No mechanism for a rate difference is demonstrated, and none is needed to
+explain the counts. G73 now records the shape, and what is owed is a control that does not
+depend on the horizon (`doc/GAPS.md` G73).
+
+**`t/033`'s hard bound, fix vs mutant** (job C, the last block, two runs each): fix PASS,
+worst excess 844 on both. `oldtrig` FAIL (`not ok 26`), excess
+`141 255 255 1031 277 255 255 255 2626 5299 7972`, which is main's numbers to the page.
+
+**The 1M-row crash-loop scale run with the never-crashed twin, fix vs the old rule on the
+same host** (job C, sequential, 14 cycles). Excess of the crashed index over its twin, per
+cycle:
+
+| build | excess per cycle 1..14 | worst (bound) | last 4 cycles (allowed) |
+|---|---|---|---|
+| `oldtrig` (`.so` 1a17be…) | 1055 2673 2676 1175 2444 943 2673 0 **1177 1177 2354 2354 3531 3531** | 3,531 (6,754) | 2,354 (866): STILL GROWING |
+| fix (`.so` 96461c…) | 0 2001 2676 1175 2384 883 2673 0 **1177 1177 2354 2354 3531 3531** | 3,531 (6,754) | 2,354 (866): STILL GROWING |
+
+From cycle 8 on the two builds are **identical to the page**. At 1M rows no share-lock
+compaction pass starts on either index (round 1 found the same), so growth 1 does not
+appear in this run and the fix has nothing to change here. Both builds fail the
+stops-growing assertion on **growth 2**, the xid collision: +1,177 every two cycles, as on
+the unfixed tree (`pgweave-20261008-022758-8a5a`). The gate the lead set ("not worse than
+the old rule on the same run") is met. Job A's scale run on the fix (`e179`) was the same
+staircase, one step behind (worst 2,553).
+
+### What remains open in L22: growth 2
+
+**Growth 2 is the open half of L22**, and it is unfixed by decision. Evidence:
+`pgweave-20261009-012908-ab8e` (both builds above) and `pgweave-20261008-063547-9cdb` (the
+ablation: `burn` removes it, `drop` holds it flat). In ordinary workloads it costs a constant
+one-batch pool, about 5 % (step 1, arm a). In a crash loop it grows without bound at about
+one pending batch every two cycles. The candidates are still the ones listed under step 1,
+and any of them must be A/B'd against `t/028`, which now has a trail to read.
+

@@ -38,7 +38,7 @@ use Time::HiRes qw(usleep);
 # cut) stopped at cycle 7, one cycle BEFORE the post-crash compaction growth starts,
 # so the size bound below could never fail and prove reported it as "TODO passed".
 # 11 reaches cycles 8-10, where the measured excess (2,626 / 5,299 / 7,972 pages in
-# pgweave-20261006-010652-fb9f) clears the bound, so the TODO is a live signal again.
+# pgweave-20261006-010652-fb9f) clears the bound, so the bound can fail (mutant oldtrig).
 # What stays HARD at every cycle -- leaked == 0 after one VACUUM and a clean deep
 # check -- needs only enough crashes that land inside a flush, and the
 # total-stranded assertion below proves they did.  The 1M-row scale run
@@ -199,24 +199,16 @@ my $worst = -1e9;
 for (@excess) { $worst = $_ if $_ > $worst; }
 note('excess of c_w over its twin per cycle: ' . join(' ', @excess)
 	  . '; stranded per crash: ' . join(' ', @strand) . "; slack $slack pages");
-# TODO, NOT PASSING, AND RECORDED AS A LOSS (doc/GAPS.md G75, "OPEN: the size
-# bound").  At 18 cycles the crashed index's excess over its twin reaches ~22,000
-# pages on runs where every cycle's stranded pages WERE reclaimed (leaked == 0 and
-# a clean deep check, asserted hard above).  The allocator counters say where the
-# growth comes from: from the first large merge on, every post-crash VACUUM of
-# `c` runs the share-lock compaction (lowfree_reuse 10k-21k, extend ~2,080 --
-# the L19 ratchet weave_vacuumcleanup() describes), while the twin, on the same
-# VACUUM schedule, does not compact at all.  WHY IS NOW KNOWN (task L22,
-# doc/PHASES.md): the trigger fires on both; the twin's pass is stopped by the
-# recyclability probe, and the crashed index's pass starts with fewer reusable
-# pages than live ones and extends the shortfall.  INSERT order, not the crash,
-# picks the index.  A fix that declines that pass made this bound pass and was
-# REVERTED, because t/028's truncation control needs the same pass.  So the bound
-# stays a visible TODO rather than loosened.  `prove` reports it as
-# "not ok # TODO" every run.
-TODO:
-{
-	local $TODO = 'G75 / L22: crash-loop size bound -- crashed index compacts every cycle, twin does not (open, doc/PHASES.md L22)';
+# HARD AGAIN (task L22 round 2).  It was a TODO from G75 until the growth was
+# found: from the first large merge on, the crashed index's post-crash VACUUM ran
+# the share-lock compaction over SEVERAL tombstone-free bolts with fewer free pages
+# than live ones, extended the shortfall, and met the same layout on the next
+# VACUUM (excess 2,626 / 5,299 / 7,972).  weave_index_is_compacted() now declines
+# that pass when the free space map predicts it cannot shrink the file, and the
+# excess is 254-844 (pgweave-20261008-222527-e179, two runs).  INSERT order, not the
+# crash, picked the index.  t/028's post-DELETE pass is unaffected: it has
+# tombstones, which keep the pass.  Mutant oldtrig (bench/aws/l22_job.sh) restores
+# the old rule and must fail this.
 cmp_ok($worst, '<=', $bound,
 	"at every cycle the crashed index's excess over its twin (worst $worst pages) is at most one crash's stranding ($maxs) + $slack");
 # The discriminating case is accumulation: had nothing been reclaimed, the
@@ -227,8 +219,6 @@ cmp_ok($worst, '<=', $bound,
 # count was raised, rather than the bound loosened, when one run fell short.
 cmp_ok($sums, '>', $bound,
 	"and the crashes stranded enough in total ($sums pages) that accumulation would exceed that bound ($bound)");
-
-}
 
 $node->stop;
 done_testing();

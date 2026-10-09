@@ -40,6 +40,14 @@ apply() {	# arm -> substitution in the current dir
 	trig_pages)		from='if (nblocks > 16 && freeblks > nblocks / 4)'; to='if (nblocks > 16 && pgfree > nblocks / 4)	/* ARM */' ;;
 	trig_reusable)	from='if (nblocks > 16 && freeblks > nblocks / 4)'; to='if (nblocks > 16 && reusable > nblocks / 4)	/* ARM */' ;;
 	trig_off)		from='if (nblocks > 16 && freeblks > nblocks / 4)'; to='if (false && nblocks > 16 && freeblks > nblocks / 4)	/* ARM */' ;;
+	# L22 round 2 (growth 1): oldtrig = the pre-fix rule (several bolts always run the pass)
+	oldtrig)	from='	if (nlive > 1)
+	{
+		if (!CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&'
+			to='	if (nlive > 1)
+	{
+		if (false &&	/* ARM */
+			!CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&' ;;
 	*)
 		if [ -n "${ARM_FROM_FILE:-}" ] && [ "$1" = "${ARM_NAME:-}" ]; then
 			from=$(cat "$ARM_FROM_FILE"); to=$(cat "$ARM_TO_FILE")
@@ -85,7 +93,7 @@ for arm in $ARMS; do
 	fi
 	MD5[$arm]=$md5
 	for r in $(seq 1 $L22N); do
-		tag=$arm-$r
+		tag=${L22PFX:-}$arm-$r
 		[ -d $D/tmp_check ] && find $D/tmp_check -depth -delete
 		(cd $D && make installcheck PG_CONFIG=$PGC REGRESS= ISOLATION= \
 			PROVE_TESTS="$TESTS" > $OUT/tap-$tag.log 2>&1)

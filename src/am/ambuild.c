@@ -4691,19 +4691,10 @@ weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel)
 	return weave_merge_selected_ex(index, sel, nsel, NULL);
 }
 
-/*
- * L23: the bolts a merge loop has found damaged, by descriptor.  By CONTENT, not
- * position, for the reason weave_merge_selected() re-locates its inputs by
- * content: each merge that commits renumbers the directory.
- */
-typedef struct MergeSkip
-{
-	WeaveSegMeta seg[WEAVE_MAX_SEGMENTS];
-	int			n;
-} MergeSkip;
-
-static bool
-merge_skipped(const MergeSkip *sk, const WeaveSegMeta *seg)
+/* L23: is `seg` one of the bolts a merge loop has found damaged?  WeaveMergeSkip
+ * is in include/weave/am.h, which says why it is by content. */
+bool
+weave_merge_skipped(const WeaveMergeSkip *sk, const WeaveSegMeta *seg)
 {
 	int			i;
 
@@ -4715,10 +4706,10 @@ merge_skipped(const MergeSkip *sk, const WeaveSegMeta *seg)
 
 /* Run one selected merge; on a damaged-input refusal, remember that input and
  * report "try again without it" (true) rather than "stop" (false). */
-static bool
-merge_selected_or_skip(Relation index, const WeaveMetaPageData *meta,
-					   const uint32 *sel, uint32 nsel, MergeSkip *sk,
-					   bool *merged)
+bool
+weave_merge_selected_or_skip(Relation index, const WeaveMetaPageData *meta,
+							 const uint32 *sel, uint32 nsel, WeaveMergeSkip *sk,
+							 bool *merged)
 {
 	int			damaged = -1;
 
@@ -5073,7 +5064,7 @@ weave_merge_all(Relation index, bool try_parallel)
 	bool		didwork = false;
 	int			guard;
 	WeaveAllocScope saved_alloc;
-	MergeSkip	sk;
+	WeaveMergeSkip sk;
 
 	weave_assert_merge_serialized(index);
 	sk.n = 0;
@@ -5152,7 +5143,7 @@ weave_merge_all(Relation index, bool try_parallel)
 		for (i = 0; i < meta.nsegments; i++)
 			if (meta.segs[i].dictstart != InvalidBlockNumber &&
 				weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok) &&
-				!merge_skipped(&sk, &meta.segs[i]))
+				!weave_merge_skipped(&sk, &meta.segs[i]))
 			{
 				cand[ncand].idx = i;
 				cand[ncand].size = meta.segs[i].ndocs - meta.segs[i].ndeleted;
@@ -5173,7 +5164,7 @@ weave_merge_all(Relation index, bool try_parallel)
 
 			/* stop when the directory changed underneath; go round again
 			 * without a damaged input (L23) */
-			if (!merge_selected_or_skip(index, &meta, sel, nsel, &sk, &merged))
+			if (!weave_merge_selected_or_skip(index, &meta, sel, nsel, &sk, &merged))
 				break;
 			if (merged)
 				didwork = true;
@@ -5294,7 +5285,7 @@ weave_merge_segments(Relation index)
 {
 	int			guard;
 	WeaveAllocScope saved_alloc;
-	MergeSkip	sk;
+	WeaveMergeSkip sk;
 
 	weave_assert_merge_serialized(index);
 	sk.n = 0;
@@ -5377,7 +5368,7 @@ weave_merge_segments(Relation index)
 			 * counting it would select a level whose runs cannot be merged and spin
 			 * the loop until the guard stopped it. */
 			if (!weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok) ||
-				merge_skipped(&sk, &meta.segs[i]))
+				weave_merge_skipped(&sk, &meta.segs[i]))
 				continue;
 			lvlcount[weave_seg_level(meta.segs[i].ndocs - meta.segs[i].ndeleted)]++;
 		}
@@ -5421,7 +5412,7 @@ weave_merge_segments(Relation index)
 				if (meta.segs[i].dictstart == InvalidBlockNumber)
 					continue;
 				if (!weave_seg_mergeable(index, &meta.segs[i], vecok, cgramok) ||
-					merge_skipped(&sk, &meta.segs[i]))
+					weave_merge_skipped(&sk, &meta.segs[i]))
 					continue;	/* sect. 7.3, the cgram rule, and L23 */
 				sz = meta.segs[i].ndocs - meta.segs[i].ndeleted;
 				if (weave_seg_level(sz) != target)
@@ -5441,7 +5432,7 @@ weave_merge_segments(Relation index)
 			bool		merged;
 
 			/* directory changed underneath: stop; damaged input: retry without it */
-			if (!merge_selected_or_skip(index, &meta, sel, nsel, &sk, &merged))
+			if (!weave_merge_selected_or_skip(index, &meta, sel, nsel, &sk, &merged))
 				break;
 		}
 	}

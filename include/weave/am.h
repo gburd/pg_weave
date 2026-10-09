@@ -2235,6 +2235,24 @@ extern void weave_merge_segments(Relation index);
 extern bool weave_merge_all(Relation index, bool try_parallel);
 extern bool weave_merge_selected(Relation index, const uint32 *sel, uint32 nsel);
 
+/*
+ * L23: the bolts a merge loop has found damaged, by descriptor.  By CONTENT, not
+ * position, for the reason weave_merge_selected() re-locates its inputs by
+ * content: each merge that commits renumbers the directory.  Here, not static in
+ * ambuild.c, because weave_compact_to_one() in amvacuum.c skips them too: a bolt
+ * that can never merge must not stop weave_vacuum() compacting the rest.
+ */
+typedef struct WeaveMergeSkip
+{
+	WeaveSegMeta seg[WEAVE_MAX_SEGMENTS];
+	int			n;
+} WeaveMergeSkip;
+
+extern bool weave_merge_skipped(const WeaveMergeSkip *sk, const WeaveSegMeta *seg);
+extern bool weave_merge_selected_or_skip(Relation index, const WeaveMetaPageData *meta,
+										 const uint32 *sel, uint32 nsel,
+										 WeaveMergeSkip *sk, bool *merged);
+
 /* Non-static so amvacuum.c can ask it before starting a relocation pass: the
  * page-recycle predicate it wraps is static in am.c (allocator-private), and the
  * answer decides whether that pass can pack into the space it frees or can only

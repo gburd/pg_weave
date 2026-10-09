@@ -119,30 +119,47 @@ weave_compact_to_one(Relation index, bool extend_only)
 {
 	bool		didwork = false;
 	int			guard;
+	WeaveMergeSkip sk;
 
 	if (extend_only)
 		weave_alloc_extend_only = true;
 	else
 		weave_alloc_begin(index);	/* gather + hand out lowest free first */
 
+	sk.n = 0;
 	PG_TRY();
 	{
-		/* rewrite all live segments once (relocates their pages) ... */
+		/*
+		 * rewrite all live segments once (relocates their pages) ...
+		 *
+		 * A bolt the merge's pre-flight finds DAMAGED (L23) is left out and the
+		 * rest are tried again, as the leveled merge does: before this, one such
+		 * bolt made both loops stop, so weave_vacuum() compacted nothing at all.
+		 */
+		for (guard = 0; guard < WEAVE_MAX_SEGMENTS; guard++)
 		{
 			WeaveMetaPageData meta;
 			uint32		sel[WEAVE_MAX_SEGMENTS];
 			uint32		nsel = 0;
 			uint32		i;
+			bool		merged;
 			Buffer		mb = ReadBuffer(index, WEAVE_METAPAGE_BLKNO);
 
 			LockBuffer(mb, BUFFER_LOCK_SHARE);
 			weave_meta_from_page(BufferGetPage(mb), &meta);
 			UnlockReleaseBuffer(mb);
 			for (i = 0; i < meta.nsegments; i++)
-				if (meta.segs[i].dictstart != InvalidBlockNumber)
+				if (meta.segs[i].dictstart != InvalidBlockNumber &&
+					!weave_merge_skipped(&sk, &meta.segs[i]))
 					sel[nsel++] = i;
-			if (nsel >= 1 && weave_merge_selected(index, sel, nsel))
+			if (nsel < 1 ||
+				!weave_merge_selected_or_skip(index, &meta, sel, nsel, &sk, &merged))
+				break;
+			if (merged)
+			{
 				didwork = true;
+				break;
+			}
 		}
 
 		/* ... then coalesce any remaining segments down to one */
@@ -152,6 +169,7 @@ weave_compact_to_one(Relation index, bool extend_only)
 			uint32		sel[WEAVE_MAX_SEGMENTS];
 			uint32		nsel = 0;
 			uint32		i;
+			bool		merged;
 			Buffer		mb;
 
 			CHECK_FOR_INTERRUPTS();	/* between merges (no lock/window held) */
@@ -162,13 +180,15 @@ weave_compact_to_one(Relation index, bool extend_only)
 			if (meta.nsegments <= 1)
 				break;
 			for (i = 0; i < meta.nsegments; i++)
-				if (meta.segs[i].dictstart != InvalidBlockNumber)
+				if (meta.segs[i].dictstart != InvalidBlockNumber &&
+					!weave_merge_skipped(&sk, &meta.segs[i]))
 					sel[nsel++] = i;
 			if (nsel <= 1)
 				break;
-			if (!weave_merge_selected(index, sel, nsel))
+			if (!weave_merge_selected_or_skip(index, &meta, sel, nsel, &sk, &merged))
 				break;
-			didwork = true;
+			if (merged)
+				didwork = true;
 		}
 	}
 	PG_FINALLY();
@@ -462,8 +482,41 @@ weave_index_is_compacted(Relation index)
 			if (meta.segs[i].dictstart != InvalidBlockNumber)
 				nlive++;
 	}
+	/*
+	 * Several bolts: a pass would coalesce them, so terms (1) and (3) do not apply.
+	 * Term (4) does, and skipping it here is what made an APPEND-ONLY index rewrite
+	 * itself on every plain VACUUM (task L22, bench/RESULTS_G75_RECLAIM.md "Round
+	 * 2").  Measured at 1M rows, no deletes, no crash: once a level merge has left
+	 * a large bolt high in the file with its write-before-free pool below it, every
+	 * later cleanup sees two bolts (that one and the cycle's flush), the trigger
+	 * fires on the pool, and the share-lock pass packs ~30k free pages, EXTENDS the
+	 * other ~40k (its own frees are not recyclable in its own transaction), and
+	 * frees the old copy -- so the next cleanup meets the same layout.  2.0x a
+	 * fresh build, permanently, and 350-1,300 s per VACUUM against 1-2 s.  The
+	 * prediction says exactly that before the pass: FREE < LIVE.
+	 *
+	 * Same conditions as term (4) below, and for the same reasons; in particular
+	 * a tombstone-bearing index keeps the pass, which is the one t/028's
+	 * post-DELETE truncation needs.  Giving up the coalesce is safe: the leveled
+	 * merge earlier in the cleanup already bounds the bolt count, and
+	 * weave_vacuum() (AccessExclusiveLock) still compacts to one.
+	 *
+	 * ponytail: the prediction counts the bolts' pages as they are, but a merge's
+	 * output can be smaller than its inputs (shared terms), which errs toward
+	 * skipping.  Exact would need the merged size; nothing measured it mattering.
+	 */
 	if (nlive > 1)
+	{
+		if (!CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&
+			weave_tombstone_frac(index) == 0.0 &&
+			!weave_pack_would_shrink(index, nblocks))
+		{
+			elog(DEBUG2, "pg_weave: index \"%s\": %u bolts, no tombstones, a pack would not shrink %u pages: no pass",
+				 RelationGetRelationName(index), nlive, nblocks);
+			return true;
+		}
 		return false;				/* multiple segments: pack must coalesce */
+	}
 
 	/*
 	 * (3) tombstone load.  Above the threshold a rewrite has real work to do
@@ -751,6 +804,8 @@ weave_vacuum_compact(Relation index)
 		if (!CheckRelationLockedByMe(index, AccessExclusiveLock, true) &&
 			!weave_any_free_page_recyclable(index))
 		{
+			elog(DEBUG2, "pg_weave: index \"%s\": no free page recyclable yet: no pass",
+				 RelationGetRelationName(index));
 			nblocks = weave_truncate_free_tail(index);
 			if (nblocks < prevblocks)
 				didwork = true;
@@ -1249,6 +1304,10 @@ weave_vacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 					if (GetRecordedFreeSpace(info->index, b) >= BLCKSZ / 2)
 						freeblks++;
 				/* reclaim when >= 25% of the file is free (bloated after merges) */
+				elog(DEBUG2, "pg_weave: index \"%s\": cleanup trigger: %u pages, %u free, tombstone fraction %.3f: %s",
+					 RelationGetRelationName(info->index), nblocks, freeblks,
+					 weave_tombstone_frac(info->index),
+					 (nblocks > 16 && freeblks > nblocks / 4) ? "compaction" : "no compaction");
 				if (nblocks > 16 && freeblks > nblocks / 4)
 					(void) weave_vacuum_compact(info->index);
 			}

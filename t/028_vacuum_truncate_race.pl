@@ -211,14 +211,21 @@ for my $v (1 .. 3)
 		"SET client_min_messages = debug2;\nSELECT weave_alloc_stats_reset();\nVACUUM t;\n"
 		. "SELECT 'alloc ' || weave_alloc_stats()::text;");
 	my ($rline) = $verr =~ /(reclaimed \d+ stranded.*?ms)/;
+	# task L22: the cleanup trigger's inputs and decision, and a declined pass
+	my ($tline) = $verr =~ /(cleanup trigger: [^\n]*)/;
+	my ($nline) = $verr =~ /(\d+ bolts, no tombstones[^\n]*|no free page recyclable yet[^\n]*)/;
+	$rline = ($rline // 'no reclaim line') . '; ' . ($tline // 'no trigger line')
+	  . ($nline ? "; $nline" : '');
 	my ($aline) = $vout =~ /(alloc .*)/;
 	push @trail, "after VACUUM $v: " . $node->safe_psql('postgres', $state_sql)
 	  . '; ' . ($rline // 'no reclaim line') . '; ' . ($aline // 'no alloc stats');
 }
 my $after = $node->safe_psql('postgres', q{SELECT pg_relation_size('w') / 8192});
 note("G73 trail: $_") for @trail;
+# diag on failure, so the smoke's console log (which keeps no regress_log) has it
 cmp_ok($after, '<', $before,
-	"quiet plain VACUUM still truncates the index ($before -> $after blocks)");
+	"quiet plain VACUUM still truncates the index ($before -> $after blocks)")
+  or diag(join("\n", map { "G73 trail: $_" } @trail));
 for my $pred ("cat < 'k'", "cat >= 'k'")
 {
 	is(idx_count($pred), heap_count($pred), "after truncation: index == heap for $pred");
