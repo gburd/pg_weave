@@ -419,3 +419,29 @@ depend on the horizon (`doc/GAPS.md` G73).
 worst excess 844 on both. `oldtrig` FAIL (`not ok 26`), excess
 `141 255 255 1031 277 255 255 255 2626 5299 7972`, which is main's numbers to the page.
 
+**The 1M-row crash-loop scale run with the never-crashed twin, fix vs the old rule on the
+same host** (job C, sequential, 14 cycles). Excess of the crashed index over its twin, per
+cycle:
+
+| build | excess per cycle 1..14 | worst (bound) | last 4 cycles (allowed) |
+|---|---|---|---|
+| `oldtrig` (`.so` 1a17be…) | 1055 2673 2676 1175 2444 943 2673 0 **1177 1177 2354 2354 3531 3531** | 3,531 (6,754) | 2,354 (866): STILL GROWING |
+| fix (`.so` 96461c…) | 0 2001 2676 1175 2384 883 2673 0 **1177 1177 2354 2354 3531 3531** | 3,531 (6,754) | 2,354 (866): STILL GROWING |
+
+From cycle 8 on the two builds are **identical to the page**. At 1M rows no share-lock
+compaction pass starts on either index (round 1 found the same), so growth 1 does not
+appear in this run and the fix has nothing to change here. Both builds fail the
+stops-growing assertion on **growth 2**, the xid collision: +1,177 every two cycles, as on
+the unfixed tree (`pgweave-20261008-022758-8a5a`). The gate the lead set ("not worse than
+the old rule on the same run") is met. Job A's scale run on the fix (`e179`) was the same
+staircase, one step behind (worst 2,553).
+
+### What remains open in L22: growth 2
+
+**Growth 2 is the open half of L22**, and it is unfixed by decision. Evidence:
+`pgweave-20261009-012908-ab8e` (both builds above) and `pgweave-20261008-063547-9cdb` (the
+ablation: `burn` removes it, `drop` holds it flat). In ordinary workloads it costs a constant
+one-batch pool, about 5 % (step 1, arm a). In a crash loop it grows without bound at about
+one pending batch every two cycles. The candidates are still the ones listed under step 1,
+and any of them must be A/B'd against `t/028`, which now has a trail to read.
+
