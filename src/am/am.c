@@ -55,6 +55,7 @@
 #include "access/genam.h"
 #include "access/generic_xlog.h"
 #include "access/transam.h"		/* ReadNextTransactionId (recycle gate) */
+#include "access/xact.h"			/* GetTopTransactionIdIfAny (G73 probe diagnostic) */
 #include "access/xlog.h"			/* RecoveryInProgress (maintenance-fn guard) */
 #include "access/parallel.h"
 #include "access/reloptions.h"
@@ -87,6 +88,7 @@
 #include "storage/freespace.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
+#include "storage/procarray.h"		/* GetOldestNonRemovableTransactionId (G73 probe diagnostic) */
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
 #include "utils/array.h"
@@ -1457,12 +1459,121 @@ weave_work_stats_reset(PG_FUNCTION_ARGS)
  */
 #define WEAVE_RECYCLE_PROBE_MAX 256
 
+/*
+ * doc/GAPS.md G73: what the probe saw, at DEBUG2.  Per candidate: freed or not,
+ * and the free-xid stamp relative to ReadNextTransactionId() now ("at next" =
+ * no xid has been assigned since the free, so no horizon can have passed it).
+ */
+typedef struct WeaveProbeDiag
+{
+	int			probed;
+	int			notfreed;
+	int			atnext;			/* stamp == ReadNextTransactionId() */
+	TransactionId smin;
+	TransactionId smax;
+} WeaveProbeDiag;
+
+static void
+weave_probe_diag_note(WeaveProbeDiag *d, Page page, TransactionId nextxid)
+{
+	TransactionId s;
+
+	d->probed++;
+	if (PageIsNew(page) || (WeavePageGetOpaque(page)->flags & WEAVE_FREED) == 0)
+	{
+		d->notfreed += PageIsNew(page) ? 0 : 1;
+		return;
+	}
+	s = ((PageHeader) page)->pd_prune_xid;
+	if (!TransactionIdIsValid(s))
+		return;
+	if (s == nextxid)
+		d->atnext++;
+	if (!TransactionIdIsValid(d->smin) || TransactionIdPrecedes(s, d->smin))
+		d->smin = s;
+	if (!TransactionIdIsValid(d->smax) || TransactionIdFollows(s, d->smax))
+		d->smax = s;
+}
+
+/*
+ * On a DECLINE only (so it cannot change a pass that runs): census every
+ * free-listed page against the horizon exactly as the probe asks it (the
+ * heuristic GlobalVisTestShouldUpdate() refresh, nothing more), then force a
+ * horizon recomputation and count what a fresh horizon would let through.
+ * The forced recomputation is what nbtree's _bt_pendingfsm_finalize() does; if
+ * it changes the count, the cached GlobalVisState was stale (G73 hypothesis a);
+ * if it does not, the stamps themselves are at or past the true horizon.
+ */
+static void
+weave_probe_diag_decline(Relation index, const WeaveProbeDiag *w,
+						 TransactionId nextxid)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	GlobalVisState *vis = GlobalVisTestFor(NULL);
+	TransactionId horizon;
+	BlockNumber blk;
+	int			nfree = 0,
+				nfreed = 0,
+				cached_ok = 0,
+				fresh_ok = 0,
+				atnext = 0;
+
+	for (blk = 1; blk < nblocks; blk++)
+	{
+		Buffer		buf;
+		Page		page;
+		TransactionId s;
+
+		if (GetRecordedFreeSpace(index, blk) < BLCKSZ / 2)
+			continue;
+		nfree++;
+		buf = ReadBuffer(index, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!PageIsNew(page) && (WeavePageGetOpaque(page)->flags & WEAVE_FREED) != 0 &&
+			TransactionIdIsValid(s = ((PageHeader) page)->pd_prune_xid))
+		{
+			nfreed++;
+			if (s == nextxid)
+				atnext++;
+			if (GlobalVisTestIsRemovableXid(vis, s))
+				cached_ok++;
+		}
+		UnlockReleaseBuffer(buf);
+	}
+	horizon = GetOldestNonRemovableTransactionId(NULL);
+	for (blk = 1; blk < nblocks; blk++)
+	{
+		Buffer		buf;
+		Page		page;
+		TransactionId s;
+
+		if (GetRecordedFreeSpace(index, blk) < BLCKSZ / 2)
+			continue;
+		buf = ReadBuffer(index, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!PageIsNew(page) && (WeavePageGetOpaque(page)->flags & WEAVE_FREED) != 0 &&
+			TransactionIdIsValid(s = ((PageHeader) page)->pd_prune_xid) &&
+			GlobalVisTestIsRemovableXid(vis, s))
+			fresh_ok++;
+		UnlockReleaseBuffer(buf);
+	}
+	elog(DEBUG2, "pg_weave: index \"%s\": G73 recycle probe DECLINED: window %d probed, %d not freed, %d stamped at next xid, stamps [%u, %u]; next xid %u, RecentXmin %u, own xid %u; whole file: %d free-listed, %d freed, %d at next xid, %d recyclable on the cached horizon, %d after a forced refresh (horizon %u)",
+		 RelationGetRelationName(index), w->probed, w->notfreed, w->atnext,
+		 w->smin, w->smax, nextxid, RecentXmin, GetTopTransactionIdIfAny(),
+		 nfree, nfreed, atnext, cached_ok, fresh_ok, horizon);
+}
+
 bool
 weave_any_free_page_recyclable(Relation index)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
 	BlockNumber blk;
 	int			probed = 0;
+	bool		diag = message_level_is_interesting(DEBUG2);
+	TransactionId nextxid = ReadNextTransactionId();
+	WeaveProbeDiag d = {0, 0, 0, InvalidTransactionId, InvalidTransactionId};
 
 	for (blk = 1; blk < nblocks && probed < WEAVE_RECYCLE_PROBE_MAX; blk++)
 	{
@@ -1476,10 +1587,21 @@ weave_any_free_page_recyclable(Relation index)
 		buf = ReadBuffer(index, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		ok = weave_page_recyclable(index, BufferGetPage(buf));
+		if (diag)
+			weave_probe_diag_note(&d, BufferGetPage(buf), nextxid);
 		UnlockReleaseBuffer(buf);
 		if (ok)
+		{
+			if (diag)
+				elog(DEBUG2, "pg_weave: index \"%s\": G73 recycle probe PASSED at candidate %d (block %u): %d not freed, %d stamped at next xid, stamps [%u, %u]; next xid %u, RecentXmin %u, own xid %u",
+					 RelationGetRelationName(index), probed, blk, d.notfreed,
+					 d.atnext, d.smin, d.smax, nextxid, RecentXmin,
+					 GetTopTransactionIdIfAny());
 			return true;
+		}
 	}
+	if (diag)
+		weave_probe_diag_decline(index, &d, nextxid);
 	return false;
 }
 
