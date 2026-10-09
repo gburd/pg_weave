@@ -93,7 +93,7 @@ for arm in $ARMS; do
 	fi
 	MD5[$arm]=$md5
 	for r in $(seq 1 $L22N); do
-		tag=$arm-$r
+		tag=${L22PFX:-}$arm-$r
 		[ -d $D/tmp_check ] && find $D/tmp_check -depth -delete
 		(cd $D && make installcheck PG_CONFIG=$PGC REGRESS= ISOLATION= \
 			PROVE_TESTS="$TESTS" > $OUT/tap-$tag.log 2>&1)
