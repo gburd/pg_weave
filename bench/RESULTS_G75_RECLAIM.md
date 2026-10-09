@@ -376,4 +376,6 @@ falls about 3,000 pages per cycle, and every VACUUM after cycle 8 is a 1–2 s n
 compaction. `bench/aws/l22_ordinary.sh` now asserts this from cycle 9: VACUUM ≤ 120 s, size
 ≤ 1.6× fresh, excess not rising by more than 2 % of the reference. It passes both runs on the
 fix and fails both on step 1's logs (checked offline: every cycle 350–1,296 s, 2.0×, growth
-18,086).
+18,086). **On the BUILT mutant `oldtrig` (`.so` 1a17be…, same run) it fails too:** 139,935
+pages and 334 s at cycle 9, then 147,148 and 1,080 s at cycle 10. Those sizes are step 1's
+to the page.
