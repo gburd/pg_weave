@@ -27,7 +27,8 @@ use Time::HiRes qw(time);
 
 my $nrounds = $ENV{G73_ROUNDS} // 12;
 my @arms = split ' ', ($ENV{G73_ARMS} // 'none burn');
-use constant SECS => 5;
+my $secs = $ENV{G73_SECS} // 5;	# t/028 uses 5; longer storms leave bigger bolts
+my $baserows = $ENV{G73_BASEROWS} // 3000;	# t/028 uses 3000: the CREATE INDEX segment's size
 
 my $node = PostgreSQL::Test::Cluster->new('g73');
 $node->init;
@@ -49,17 +50,17 @@ my %tally;
 for my $round (1 .. $nrounds)
 {
 	my $arm = $arms[($round - 1) % @arms];
-	$node->safe_psql('postgres', q{
+	$node->safe_psql('postgres', qq{
 		DROP TABLE IF EXISTS t;
 		CREATE TABLE t (id bigserial, body wdoc, cat text COLLATE "C")
 		    WITH (autovacuum_enabled = off);
 		INSERT INTO t(body, cat) SELECT to_wdoc('common w' || (g % 50)),
 		  CASE WHEN g % 13 = 0 THEN NULL
 		       ELSE chr(97 + g % 26) || lpad((g % 97)::text, 2, '0') END
-		  FROM generate_series(1, 3000) g;
+		  FROM generate_series(1, $baserows) g;
 		CREATE INDEX w ON t USING weave (body wdoc_lex_ops, cat text_docval_ops);
 	});
-	my $end = sprintf('%.3f', time() + SECS);
+	my $end = sprintf('%.3f', time() + $secs);
 	my @s;
 	for my $i (1 .. 4)
 	{
@@ -81,7 +82,7 @@ END \$\$});
 		  . qq{ -d postgres -c 'VACUUM t' || exit 1; echo v; sleep 0.05; done}],
 		'<', \$vin, '>', \$vout, '2>', \$verr);
 	push @s, { name => 'vacuum', h => $vh, out => \$vout, err => \$verr };
-	my $deadline = time() + SECS + 120;
+	my $deadline = time() + $secs + 120;
 	while (time() < $deadline)
 	{
 		my $live = 0;
@@ -117,7 +118,7 @@ END \$\$});
 	}
 	my $res = $sizes[-1] < $before ? 'PASS' : 'FAIL';
 	$tally{"$arm $res"}++;
-	note("G73R round=$round arm=$arm nvac=$nvac before=$before after=" . join(',', @sizes)
+	note("G73R round=$round arm=$arm secs=$secs rows=$baserows nvac=$nvac before=$before after=" . join(',', @sizes)
 	  . " result=$res" . ($errs =~ /ERROR/ ? ' storm_error' : ''));
 	cmp_ok($nvac, '>=', 10, "round $round: the storm's VACUUM loop ran ($nvac)");
 }

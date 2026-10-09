@@ -1460,6 +1460,19 @@ weave_work_stats_reset(PG_FUNCTION_ARGS)
 #define WEAVE_RECYCLE_PROBE_MAX 256
 
 /*
+ * Was this page freed since the last xid assignment, i.e. is its free-xid stamp
+ * the next xid `nextxid` read before it was locked?  Such a page is certainly
+ * not recyclable yet, whatever the horizon.  `page` must be pinned and locked.
+ */
+static bool
+weave_page_freed_this_epoch(Page page, TransactionId nextxid)
+{
+	return !PageIsNew(page) &&
+		(WeavePageGetOpaque(page)->flags & WEAVE_FREED) != 0 &&
+		TransactionIdFollowsOrEquals(((PageHeader) page)->pd_prune_xid, nextxid);
+}
+
+/*
  * doc/GAPS.md G73: what the probe saw, at DEBUG2.  Per candidate: freed or not,
  * and the free-xid stamp relative to ReadNextTransactionId() now ("at next" =
  * no xid has been assigned since the free, so no horizon can have passed it).
@@ -1589,6 +1602,19 @@ weave_any_free_page_recyclable(Relation index)
 		ok = weave_page_recyclable(index, BufferGetPage(buf));
 		if (diag)
 			weave_probe_diag_note(&d, BufferGetPage(buf), nextxid);
+		/*
+		 * A page freed since the last xid assignment is not a sample of the
+		 * horizon (doc/GAPS.md G73): its stamp IS the next xid, which no horizon
+		 * can pass until an xid assigned after it completes, so it says nothing
+		 * about whether older free pages are recyclable.  It does not use up the
+		 * window.  Measured: the first post-DELETE VACUUM's own merge frees the
+		 * build segment's pages at the FRONT of the file, so the window is these
+		 * pages first; past 256 of them the probe declined although recyclable
+		 * pages lay beyond, and in a quiet cluster nothing ends the epoch, so
+		 * every later VACUUM declined the same way.
+		 */
+		if (!ok && weave_page_freed_this_epoch(BufferGetPage(buf), nextxid))
+			probed--;
 		UnlockReleaseBuffer(buf);
 		if (ok)
 		{
