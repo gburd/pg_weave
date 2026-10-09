@@ -7,7 +7,7 @@
 #   G73N       reproducer runs per C arm (default 4), G73_ROUNDS rounds each
 # Logs: /tmp/out/<carm>-<n>/ (TAP log, regress log); summary /tmp/out/g73.log.
 set -u
-OUT=/tmp/out; mkdir -p $OUT
+OUT=${G73_OUT:-/tmp/out}; mkdir -p $OUT
 PGC=/usr/lib/postgresql/17/bin/pg_config
 LIB=$($PGC --pkglibdir)
 SRC=$HOME/pg_weave
@@ -22,8 +22,10 @@ apply() {	# arm -> substitution in the current dir
 	# the G73 fix removed (mutant): this VACUUM's own frees use up the window
 	unfixed) from='		if (!ok && weave_page_freed_this_epoch(BufferGetPage(buf), nextxid))'
 		to='		if (false && !ok && weave_page_freed_this_epoch(BufferGetPage(buf), nextxid))	/* ARM */' ;;
-	# hypothesis (a) on the unfixed tree
+	# hypothesis (a) on the unfixed tree, and with the fix
 	refresh) apply unfixed && apply refresh0; return $? ;;
+	refreshfix) apply refresh0; return $? ;;
+	ampfix) apply amp; return $? ;;
 	# hypothesis (a): force the horizon recomputation nbtree's
 	# _bt_pendingfsm_finalize() does, before the probe decides
 	refresh0) from='	WeaveProbeDiag d = {0, 0, 0, InvalidTransactionId, InvalidTransactionId};
