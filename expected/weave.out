@@ -370,9 +370,9 @@ SELECT to_wquery('english','postgres & !the')::text AS q_pg_not_the;  -- 'postgr
 (1 row)
 
 SELECT to_wquery('english','"postgres the database"')::text AS q_phrase_mid; -- ('postgr' <-> 'databas')
-       q_phrase_mid       
---------------------------
- ('postgr' <-> 'databas')
+   q_phrase_mid   
+------------------
+ "postgr databas"
 (1 row)
 
 -- wquery elision matches the standard to_tsquery reduction (both drop 'the')
@@ -715,9 +715,9 @@ DROP TABLE inc;
 -- quoted phrase queries via per-term positions.
 -- phrase renders with <-> and round-trips
 SELECT '"quick brown fox"'::wquery;
-              wquery               
------------------------------------
- (('quick' <-> 'brown') <-> 'fox')
+      wquery       
+-------------------
+ "quick brown fox"
 (1 row)
 
 -- adjacency is enforced: "quick brown" matches, "quick fox" does not
@@ -763,9 +763,9 @@ SELECT to_wdoc('quick red brown fox') @@@ '"quick brown fox"'::wquery AS three_m
 -- operand, not operators (ROADMAP #12b).  Use the 'simple' config so they are
 -- not dropped as stopwords.  A bare keyword phrase must parse and match.
 SELECT to_wquery('simple','"the and clause"')::text AS kw_phrase_parses;   -- (('the' <-> 'and') <-> 'clause')
-         kw_phrase_parses         
-----------------------------------
- (('the' <-> 'and') <-> 'clause')
+  kw_phrase_parses  
+--------------------
+ "the 'and' clause"
 (1 row)
 
 SELECT to_wdoc('simple','read the and clause here') @@@ to_wquery('simple','"the and clause"') AS kw_phrase_hit;   -- t
@@ -2983,12 +2983,12 @@ SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexscan=on;
 EXPLAIN (COSTS OFF) SELECT id FROM rp
   WHERE d @@@ to_wquery('simple'::regconfig, '"quick brown"')
   ORDER BY d <=> to_wquery('simple'::regconfig, '"quick brown"') LIMIT 50;
-                           QUERY PLAN                            
------------------------------------------------------------------
+                     QUERY PLAN                      
+-----------------------------------------------------
  Limit
    ->  Index Scan using rp_weave on rp
-         Index Cond: (d @@@ '(''quick'' <-> ''brown'')'::wquery)
-         Order By: (d <=> '(''quick'' <-> ''brown'')'::wquery)
+         Index Cond: (d @@@ '"quick brown"'::wquery)
+         Order By: (d <=> '"quick brown"'::wquery)
 (4 rows)
 
 -- PHRASE: ranked top-50 must contain ZERO non-adjacent docs (was 20 pre-fix).
@@ -4333,9 +4333,9 @@ SELECT 'a & b'::wquery::text, 'a | b'::wquery::text, '!a'::wquery::text,
        '"a b c"'::wquery::text, 'a*'::wquery::text, 'a~1'::wquery::text,
        '/^ab/'::wquery::text, '(a | b) & c'::wquery::text,
        'NEAR(a b, 3)'::wquery::text, 'a b'::wquery::text;   -- implicit AND
-    text     |    text     | text |          text           | text | text  | text  |        text         |     text      |    text     
--------------+-------------+------+-------------------------+------+-------+-------+---------------------+---------------+-------------
- ('a' & 'b') | ('a' | 'b') | !'a' | (('a' <-> 'b') <-> 'c') | 'a'* | 'a'~1 | /^ab/ | (('a' | 'b') & 'c') | ('a' <-> 'b') | ('a' & 'b')
+    text     |    text     | text |  text   | text | text  | text  |        text         |     text     |    text     
+-------------+-------------+------+---------+------+-------+-------+---------------------+--------------+-------------
+ ('a' & 'b') | ('a' | 'b') | !'a' | "a b c" | 'a'* | 'a'~1 | /^ab/ | (('a' | 'b') & 'c') | NEAR(a b, 3) | ('a' & 'b')
 (1 row)
 
 -- keyword operators, case-insensitive
@@ -4358,11 +4358,9 @@ ERROR:  syntax error in wquery: ""unterminated"
 LINE 1: SELECT '"unterminated'::wquery;
                ^
 SELECT '/unterminated'::wquery;         -- unterminated regex
- wquery 
---------
- 
-(1 row)
-
+ERROR:  syntax error in wquery: "/unterminated"
+LINE 1: SELECT '/unterminated'::wquery;
+               ^
 SELECT '""'::wquery;                    -- empty phrase
 ERROR:  syntax error in wquery: """"
 LINE 1: SELECT '""'::wquery;
@@ -5943,9 +5941,9 @@ SELECT to_wquery('simple','pkg-config:A')::text AS label_on_hyphenated;
 (1 row)
 
 SELECT to_wquery('simple','"pkg-config tool"')::text AS phrase_with_hyphenated;
-  phrase_with_hyphenated   
----------------------------
- ('pkg-config' <-> 'tool')
+ phrase_with_hyphenated 
+------------------------
+ "'pkg-config' tool"
 (1 row)
 
 -- the operators these bytes still are: only a separator FLANKED by word

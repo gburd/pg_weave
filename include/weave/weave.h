@@ -154,7 +154,8 @@ typedef struct WeaveQueryItem
  * position).  R must end EXACTLY N + width(R) positions after L ends, where a
  * term has width 0 and a phrase has width N + width(L) + width(R) -- core's
  * TS_phrase_execute.  Without the flag a phrase is "gap 1..distance" (NEAR).
- * Only the tsquery cast produces it; the text parser has no syntax for it.
+ * The text spelling is tsquery's, `L <-> R` / `L <N> R`; the at-most phrase
+ * without the flag is `L <=N> R` (or the native "..." / NEAR() it prints as).
  */
 #define WEAVE_QF_PHRASE_EXACT	0x0010
 
