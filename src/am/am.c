@@ -1434,8 +1434,22 @@ weave_work_stats_reset(PG_FUNCTION_ARGS)
  * one costs a buffer read, and the caller may run on every autovacuum cycle.  The
  * bound can only produce a FALSE NEGATIVE -- "nothing recyclable" when a page
  * beyond the probe window was -- which makes the caller skip a pass it could have
- * done.  That is self-correcting on the next cycle and is the safe direction: a
- * false positive would start a relocation that can only grow the file.
+ * done.  A false negative is the safe direction (a false positive would start a
+ * relocation that can only grow the file), but it said "self-correcting on the
+ * next cycle", and that is FALSE for one class of page (doc/GAPS.md G73):
+ *
+ * A PAGE FREED SINCE THE LAST XID ASSIGNMENT DOES NOT COUNT AGAINST THE WINDOW.
+ * Its stamp is ReadNextTransactionId() as of now, so it cannot be recyclable
+ * until some transaction assigned an xid after the free has finished, and in an
+ * idle cluster none has.  The cleanup's own merge frees whole segments this way,
+ * and a merge of the build segment frees the FRONT of the file, which is exactly
+ * where this scan starts.  Measured (bench/aws/g73_job.sh, t/028's control): the
+ * first post-DELETE VACUUM's window held 130-150 such pages on most rounds, and on
+ * a failing round all 256, with 1,560 recyclable pages beyond the window and the
+ * forced horizon refresh changing nothing.  No xid was assigned in between, so the
+ * next VACUUM saw the same 256 pages and the next cycle did NOT correct anything:
+ * three VACUUMs declined identically and t/028's truncation control failed.  Such a
+ * page still costs its buffer read; the bound on reads is the file length.
  *
  * NECESSARY, NOT SUFFICIENT, and deliberately so.  "Some page is recyclable" does
  * not mean "enough pages are recyclable to hold the live data", so a pass can still
@@ -1602,17 +1616,8 @@ weave_any_free_page_recyclable(Relation index)
 		ok = weave_page_recyclable(index, BufferGetPage(buf));
 		if (diag)
 			weave_probe_diag_note(&d, BufferGetPage(buf), nextxid);
-		/*
-		 * A page freed since the last xid assignment is not a sample of the
-		 * horizon (doc/GAPS.md G73): its stamp IS the next xid, which no horizon
-		 * can pass until an xid assigned after it completes, so it says nothing
-		 * about whether older free pages are recyclable.  It does not use up the
-		 * window.  Measured: the first post-DELETE VACUUM's own merge frees the
-		 * build segment's pages at the FRONT of the file, so the window is these
-		 * pages first; past 256 of them the probe declined although recyclable
-		 * pages lay beyond, and in a quiet cluster nothing ends the epoch, so
-		 * every later VACUUM declined the same way.
-		 */
+		/* freed since the last xid assignment: not a sample of the horizon, so
+		 * it does not use up the window (G73; see the function comment) */
 		if (!ok && weave_page_freed_this_epoch(BufferGetPage(buf), nextxid))
 			probed--;
 		UnlockReleaseBuffer(buf);
