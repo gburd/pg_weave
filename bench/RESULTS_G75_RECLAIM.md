@@ -358,7 +358,7 @@ them.
 | gate | result |
 |---|---|
 | smoke, `5963e78` | installcheck PASS; TAP 35 files, 1,484 tests, PASS |
-| `t/028`, 10 runs per arm, one host | **fix 0 of 10 failed** (`.so` 96461c…); mutant `oldtrig` (the old rule, exact-once substitution, `.so` 1a17be…) 0 of 10 |
+| `t/028`, 10 runs per arm, one host | fix 0 of 10 failed (`.so` 96461c…); mutant `oldtrig` (the old rule, exact-once substitution, `.so` 1a17be…) 0 of 10. **Superseded by the 30-run count below**: the next smoke failed once |
 | `t/028` ablation, from its own trail | at VACUUM 1 after the DELETE, in **all 20 runs**: trigger `~2,100 free of ~3,900 pages, tombstone fraction 0.900: compaction`. The pass ran (`lowfree_reuse` 180–201) and reached 239–754 pages. The new term needs tombstone fraction 0, so it **cannot apply** to that VACUUM |
 | `t/033` + `t/015`, twice | PASS. **`t/033`'s TODO bound passed** (`TODO passed: 26-27`): excess over the twin worst 844 on both runs (main: 2,626 / 5,299 / 7,972) |
 | step-1 workloads on the fix, two runs per arm | (c) **fixed**: see below. (a) and (b) **identical to step 1, to the page**, both runs |
@@ -379,3 +379,43 @@ fix and fails both on step 1's logs (checked offline: every cycle 350–1,296 s,
 18,086). **On the BUILT mutant `oldtrig` (`.so` 1a17be…, same run) it fails too:** 139,935
 pages and 334 s at cycle 9, then 147,148 and 1,080 s at cycle 10. Those sizes are step 1's
 to the page.
+
+### `t/028` at 30 runs per arm, and what a failure looks like (`pgweave-20261009-012908-ab8e`, `05ea144`)
+
+Job B's smoke (`pgweave-20261009-005928-536d`, same C code) failed `t/028`'s truncation
+control once (4,134 → 4,292). That smoke keeps no TAP log, so the control now `diag`s its
+trail on failure. Job C ran `t/028` in six interleaved blocks of 5 fix + 5 `oldtrig` on one
+host, with the same two `.so`s as job A. Its own smoke passed: 1,544 TAP tests, `t/028`
+included.
+
+| build | job A | smokes | job C | total |
+|---|---|---|---|---|
+| fix (`.so` 96461c…) | 0 of 10 | 1 of 3 | **2 of 30** (blocks 1 and 5) | **3 of 43** (7 %) |
+| `oldtrig` = the old rule (`.so` 1a17be…) | 0 of 10 | — | **0 of 30** | **0 of 40** |
+
+Job C's 2/30 against 0/30 gives Fisher p ≈ 0.49, and the totals give p ≈ 0.24. On the
+unfixed tree, G73 records this control failing about 1 in 15 full runs. **The rates do not
+differ measurably.** Also, the block-1 failure's trail was lost: a harness slip let later
+blocks overwrite its log directory (`L22PFX`, fixed in `e825abe`). Of the four failures,
+only the block-5 trail survived.
+
+**The surviving failure is the known shape, and the new term did not decide it.** The first
+VACUUM after the DELETE fired the trigger (4,493 pages, 2,696 free, tombstone fraction
+0.900). It was then declined at pass 0 by the **L19 recyclability probe**: "no free page
+recyclable yet: no pass", `lowfree_reuse` 0, 168 extends. VACUUMs 2 and 3 repeated it, and
+the file went 4,325 → 4,493. The fix's own DEBUG2 line ("N bolts, no tombstones, a pack
+would not shrink") does **not** appear: with tombstones present the term cannot fire,
+exactly as designed. All 35 surviving passing trails, on both builds, run pass 0
+(`lowfree_reuse` 196–214). This is the same shape as round 1's failures (VACUUM 1 runs no
+pass, `lowfree_reuse` 0, the file stays at 3,100–4,700 pages). What the probe sees is the
+FSM's first 256 free pages, and their recyclability depends on where the storm phase left
+its last frees relative to the xid horizon. The fix can change that only indirectly: the
+storm's own VACUUMs run with no tombstones and several bolts, so the new term declines some
+of their passes. No mechanism for a rate difference is demonstrated, and none is needed to
+explain the counts. G73 now records the shape, and what is owed is a control that does not
+depend on the horizon (`doc/GAPS.md` G73).
+
+**`t/033`'s hard bound, fix vs mutant** (job C, the last block, two runs each): fix PASS,
+worst excess 844 on both. `oldtrig` FAIL (`not ok 26`), excess
+`141 255 255 1031 277 255 255 255 2626 5299 7972`, which is main's numbers to the page.
+
