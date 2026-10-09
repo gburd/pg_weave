@@ -8,15 +8,20 @@
  *
  *	  expr    := or_expr
  *	  or_expr := and_expr ( ('|' | 'OR') and_expr )*
- *	  and_expr:= unary ( ('&' | 'AND')? unary )*        -- implicit AND
+ *	  and_expr:= phrase ( ('&' | 'AND')? phrase )*      -- implicit AND
+ *	  phrase  := unary ( ('<->' | '<N>' | '<=N>') unary )*   -- left-assoc
  *	  unary   := ('!' | 'NOT' | '-') unary | primary
  *
  *	  '-' is negation only in PREFIX position; between two word characters it is
  *	  part of the term ('pkg-config'), as are '.' and '/'.  See
  *	  is_term_infix_byte().
- *	  primary := '(' expr ')' | term
+ *	  primary := '(' expr ')' | '"' word+ '"' | NEAR '(' word+ [',' k] ')' | term
  *	  term    := run of token bytes (folded like the analyzer), which may contain
- *	             an intra-word '-', '.' or '/'
+ *	             an intra-word '-', '.' or '/', or a quoted 'literal' (verbatim,
+ *	             \' and \\ escaped); either may carry '*', '~k' or ':ABCD'
+ *
+ *	  wquery_out prints only this syntax, and wquery_in reads it back to the
+ *	  same bytes (doc/GAPS.md G96, sql/wquery_roundtrip.sql).
  *
  * The parser emits a postfix (RPN) item list, the same shape tsquery uses, so
  * evaluation is a simple stack machine.  Supported: AND, OR, NOT, parenthesised
