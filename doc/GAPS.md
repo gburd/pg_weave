@@ -4919,7 +4919,7 @@ reclaims, and `weave_check(deep)` is how to tell that one is due.**
   `STICKY ... (2600 vs 2340)`. That is exactly the predicted failure, so the test
   measures the window.
 
-### G73 — t/028's "quiet plain VACUUM still truncates the index" control failed once on a tree that does not touch VACUUM — **FOUND 2026-10-04; flake in a test's positive control, not a product defect so far; OPEN**
+### G73 — t/028's "quiet plain VACUUM still truncates the index" control failed once on a tree that does not touch VACUUM — **FOUND 2026-10-04; ROOT-CAUSED 2026-10-09 (`wt/g73`): a PRODUCT defect in the L19 recyclability probe, not a flake; FIXED on `wt/g73`, NOT MERGED**
 
 The full gate on `wt/f9b` (`eb28db7`, run `pgweave-20261004-210709`) failed exactly one
 TAP assertion out of 1,100: t/028 test 113, `quiet plain VACUUM still truncates the index
@@ -4957,6 +4957,115 @@ significant (Fisher p ≈ 0.24–0.30). **Still owed:** a control that does not 
 horizon having passed the storm's frees. For example, spend an xid in a separate
 transaction before the VACUUM (as `t/015`'s `xidburn` does), or retry the VACUUM, with a
 time cap, until the probe passes.
+
+**2026-10-09, `wt/g73`: ROOT CAUSE, read from a diagnostic that fired, and fixed.** The
+L19 probe `weave_any_free_page_recyclable()` (`src/am/am.c`) reads the first 256
+free-listed pages from block 1 up and asks each one `weave_page_recyclable()`. The first
+post-DELETE VACUUM's own cleanup merge frees the build segment, which is at the **front** of
+the file, and stamps those pages `ReadNextTransactionId()`. No xid has been assigned since,
+so no horizon can pass that stamp and those pages are never recyclable in that VACUUM. When
+256 or more of them come first, the window is all of them, the probe answers "nothing
+recyclable", and the pass is skipped, even though storm-era free pages further up the file
+are recyclable. In a quiet cluster nothing assigns an xid between the three VACUUMs, so the
+next xid does not move and each one sees the same 256 pages. The probe comment's "self-correcting
+on the next cycle" is false for exactly this case.
+
+*The diagnostic.* A DEBUG2 line in the probe (`51b7ce7`) logs the window's stamps against the
+next xid and, on a decline, a whole-file census on the probe's own horizon and again after
+a forced `GetOldestNonRemovableTransactionId(NULL)` (nbtree's `_bt_pendingfsm_finalize()`
+refresh). It fired on run 1 (`pgweave-20261009-131103-9279`) before its silence counted
+for anything: on every round the pass-0 probe passed at candidate K, with K−1 candidates
+stamped at the next xid, and K was typically 130–150 (range 1–228). On the first reproduced
+failure (`pgweave-20261009-140235-02eb`, unfixed, round 11) all three VACUUMs logged: "window 256
+probed, 256 stamped at next xid 336451, own xid 0; whole file 2667 free-listed, 1107 at next
+xid, **1560 recyclable on the probe's horizon, 1560 after a forced refresh**".
+
+*The lead's hypotheses, tested.* **(a) A stale `GlobalVisState` is REFUTED as the cause.** On
+every decline the forced refresh changed nothing. Each VACUUM is a fresh backend, and
+`vacuum_get_cutoffs()` computes the horizons at its start anyway. Forcing the refresh before
+the probe (arm `refresh`) **amplifies** the failure instead: 21 of 48 `none` rounds against
+1 of 36 unfixed. Every one of those 21 has the same 256-at-next-xid shape. The likely path
+is that it changes where the storm's VACUUMs leave their frees, which is unmeasured. **(b)
+Burning an xid before each VACUUM removes the failure** (0 of 156 `burn` rounds on window-256
+arms), because it ends the epoch: VACUUM 1 may still decline, and VACUUM 2 then passes,
+e.g. 4,330 → 218. So the test-side change would have hidden a real product defect: an idle
+production database after a large DELETE hits the same thing.
+
+*The fix* (`f3239d4`, comment `479d592`): a candidate stamped at or after the next xid read
+when the probe started (`weave_page_freed_this_epoch()`) no longer counts against the
+256-candidate window. That page is certainly not recyclable and says nothing about older
+ones. It still costs its buffer read, so the probe's read bound becomes the file length.
+The cleanup's reclaim already walks the whole file on every VACUUM. No format change, no
+new WAL, no change to what `weave_page_recyclable()` accepts.
+
+*Evidence* (`bench/aws/g73_job.sh` + `bench/aws/g73_repro.pl`, which is t/028's storm and
+control repeated in rounds; distinct `.so` per arm, arms interleaved in blocks on one host).
+Probe-shape failures, counted as rounds where VACUUM 1 declined with the window full of
+next-xid stamps and the file did not shrink:
+
+| arm | what it is | `none` | `burn` |
+|---|---|---|---|
+| `unfixed` | the fix removed (mutant) | 1 of 72 | 0 of 72 |
+| `base` | the fix | 0 of 48 | 0 of 48 |
+| `refresh` | unfixed + forced horizon refresh | 21 of 48 | 0 of 48 |
+| `refreshfix` | fix + forced horizon refresh | 0 of 12 | 0 of 12 |
+| `ampunfixed` | unfixed, window 64 (amplifier) | 8 of 12 | 0 of 12 |
+| `ampfix` | fix, window 64 | 0 of 12 | 0 of 12 |
+
+Runs `pgweave-20261009-131103-9279` (unfixed tree, before the fix existed),
+`pgweave-20261009-140235-02eb` and `pgweave-20261009-145506-9615`; every failing round's
+shape was classified from its own trail by script. Fisher, two-sided: `ampunfixed` against
+`ampfix`, `none`, 8/12 against 0/12, p = 0.0013. `refresh` against `refreshfix`, 21/48
+against 0/12, p = 0.005. All unfixed-tree arms against all fix arms: 30 of 264 against 0 of
+144, p < 10^-5. **At the shipped window and with no amplifier the reproducer is no better than
+t/028 (1 of 72), so it is the amplified arms that carry the significance.**
+
+*t/028 itself, 30 runs per arm* (`pgweave-20261009-145506-9615`, ten interleaved blocks of
+three on one host): **unfixed 2 of 30, fix 0 of 30**, and fix plus L22 growth 2's reverted
+allocator change (`skip`, below) 0 of 30. Both unfixed failures have this entry's shape:
+VACUUM 1 ran the trigger and the probe declined pass 0. VACUUM 1 shrank the file in all 60
+runs of the two fix arms. 2/30 against 0/30 is not significant on its own (Fisher p = 0.49),
+which is why the amplified reproducer arms above are the evidence. t/028 shows only that
+the fix is not worse and that the failing shape is gone from its trails.
+
+*L22 growth 2, what falls out.* Growth 2 is the same stamp class (a page freed under next
+xid N cannot be reused by the transaction that receives N), at a different site: the
+allocator's FSM loop, not this probe. **This fix does not touch it.** But the reason growth
+2's allocator fix was reverted now looks like THIS bug. `65bed24` (skip a freed,
+not-yet-recyclable FSM candidate and put it back) failed t/028 3 of 10 in round 1, and the
+failing shape was VACUUM 1 declining pass 0. Re-applied on top of this fix (arm `skip`,
+`bench/aws/g73/skip.patch`), it fails t/028 0 of 30 (Fisher p ≈ 0.012 against 3/10, across
+different hosts and trees). Whether `skip` fixes growth 2 at scale on this tree is
+**unmeasured** here: `bench/aws/g75_scale.sh` was not run. `doc/PHASES.md` L22.
+
+*Gates on the final commit* (`pgweave-20261009-164034-9227`, `e016e4f`): the PG17 smoke
+passed (`make installcheck` rc 0: regression, isolation and 1,484 TAP tests, with an empty
+`regression.diffs`). `t/015`, `t/033` and `t/032` passed twice, and `t/033`'s hard bound
+held (worst 844 and 1,064). The mutant (`ampunfixed`, built, distinct `.so`) restored the
+failure: 11 of 24 probe-shape failures against 0 of 24 for `ampfix`, two interleaved blocks,
+Fisher p = 0.0002. Each arm also had 6 of 24 `nocompact` rounds, the second shape above. PG18
+`make installcheck` passed (PostgreSQL 18.0, 32 regression tests, 2 isolation tests, 1,484
+TAP tests).
+
+*Limitations.* (1) At the shipped window and without an amplifier the reproducer fails about
+1 round in 70, so the significance comes from amplified arms, which change the probe
+window or force a horizon refresh. That is standard ablation practice, but the unamplified
+rate on the fix (0 of 96 rounds, 0 of 30 t/028 runs) is consistent with the base rate (1 of
+72, 2 of 30) only weakly on its own. (2) Why a forced refresh amplifies the failure is
+unmeasured. (3) The fix raises the probe's worst-case read count from 256 to the number of
+free-listed pages, and only when the window would otherwise have been this VACUUM's own frees.
+Not timed separately; the reclaim already walks every page on every VACUUM. (4) No core
+candidate: the stale-cache hypothesis is refuted, and quantizing on the next xid is inherent
+to `ReadNextTransactionId()` stamps. nbtree's own comment says its pending-FSM optimization is
+"never effective without some other backend concurrently consuming an XID".
+
+*A second, different shape, found by the amplifier.* At window 64 the storm's own VACUUMs
+run about 50 times per storm instead of 28, and the storm can leave under a quarter of the
+file free. VACUUM 1's trigger then reads "512 free of 2357: no compaction". That is the
+tombstone-blind trigger (L19's measured decision), not this probe. It happened on 6 rounds,
+all at window 64 (4 `ampfix` `burn`, 1 `ampunfixed` `burn`, 1 `ampunfixed` `none`), and on
+0 of 360 rounds at the shipped window. The table above does not count those 6 rounds.
+It is recorded here so nobody reads it as a hole in the fix.
 
 ### G74 — `weave_search()` returns a HOT-chain ROOT TID, so `JOIN t ON t.ctid = s.ctid` silently drops every HOT-updated row — **FOUND 2026-10-04 by the F3 agent while building `weave_fuse_search()`'s oracle; PRE-EXISTING; OPEN**
 
