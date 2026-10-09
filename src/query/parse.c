@@ -659,7 +659,9 @@ parse_primary(ParseState *st)
 				st->error = true;
 				break;
 			}
-			if (p.term == NULL)	/* defensive: only real punctuation lacks text */
+			/* a /regex/ is not a phrase word: it was taken as a plain term
+			 * with the regex's text (doc/GAPS.md G96) */
+			if (p.term == NULL || p.regex)
 			{
 				st->error = true;
 				break;
@@ -698,7 +700,8 @@ parse_primary(ParseState *st)
 			/* inside NEAR(...), and/or/not/near are literal words (they carry
 			 * their folded text), not operators. */
 			if ((p.kind != TOK_TERM && p.kind != TOK_AND && p.kind != TOK_OR &&
-				 p.kind != TOK_NOT && p.kind != TOK_NEAR) || p.term == NULL)
+				 p.kind != TOK_NOT && p.kind != TOK_NEAR) || p.term == NULL ||
+				p.regex)
 			{
 				st->error = true;
 				return 0;
@@ -922,6 +925,7 @@ typedef struct QNode
 	bool		empty;			/* subtree elided (all-stopword) */
 	int			item;			/* index into items[] for a VAL leaf, else -1 */
 	uint8		op;				/* WEAVE_OP_* for an internal node */
+	uint16		flags;			/* the operator's WEAVE_QF_* (PHRASE_EXACT) */
 	uint32		distance;		/* phrase gap */
 	struct QNode *left;
 	struct QNode *right;		/* NULL for NOT (unary, uses left) */
@@ -943,7 +947,9 @@ qnode_build(ParsedItem *items, int *pos)
 		(*pos)--;
 		return n;
 	}
+	check_stack_depth();
 	n->op = items[*pos].op;
+	n->flags = items[*pos].flags;
 	n->distance = items[*pos].distance;
 	(*pos)--;
 	if (n->op == WEAVE_OP_NOT)
@@ -964,6 +970,7 @@ qnode_simplify(QNode *n)
 		return NULL;
 	if (n->item >= 0)
 		return n;					/* leaf: emptiness marked by the caller */
+	check_stack_depth();
 	n->left = qnode_simplify(n->left);
 	n->right = qnode_simplify(n->right);
 	if (n->op == WEAVE_OP_NOT)
@@ -1006,7 +1013,7 @@ qnode_flatten(QNode *n, ParsedItem *src, ParsedItem *out, int *k)
 		qnode_flatten(n->right, src, out, k);
 	out[*k].type = WEAVE_QI_OPR;
 	out[*k].op = n->op;
-	out[*k].flags = 0;
+	out[*k].flags = n->flags;	/* was 0: an exact gap became "at most" */
 	out[*k].distance = n->distance;
 	out[*k].term = NULL;
 	out[*k].termlen = 0;
@@ -1214,27 +1221,102 @@ to_wquery_byid(PG_FUNCTION_ARGS)
 }
 
 /*
- * Render an wquery as fully parenthesised infix for display/debugging.  (Note
- * the phrase operator prints as ` <-> `, which the query lexer does not accept
- * as input -- the rendering is human-readable, not a guaranteed round-trip.)
- * Postfix RPN is walked with a small string stack.
+ * The phrase WIDTH of an operand, as parse_primary() defines it and as
+ * migrate.c computes core's: 0 for a term, the operand's for NOT, the larger
+ * for AND / OR, D + width(L) for an exact phrase and D + width(L) + width(R)
+ * for an at-most one.  wquery_out recovers an exact phrase's N as
+ * D - width(R), and weave_query_validate() checks that it is not negative.
+ */
+static int64
+query_op_width(const WeaveQueryItem *it, int64 wl, int64 wr)
+{
+	if (it->op != WEAVE_OP_PHRASE)
+		return Max(wl, wr);
+	if (it->flags & WEAVE_QF_PHRASE_EXACT)
+		return (int64) it->distance + wl;
+	return (int64) it->distance + wl + wr;
+}
+
+/*
+ * Is `t` safe to print BARE inside "..." or NEAR(...)?  Only when the lexer
+ * would read it back as the same bytes: ASCII lower-case letters and digits
+ * (which fold to themselves).  Anything else is printed as a quoted literal.
+ */
+static bool
+out_bare_word(const char *t, int len)
+{
+	int			j;
+
+	if (len == 0)
+		return false;
+	for (j = 0; j < len; j++)
+		if (!((t[j] >= 'a' && t[j] <= 'z') || (t[j] >= '0' && t[j] <= '9')))
+			return false;
+	return true;
+}
+
+static void
+out_quoted(StringInfo s, const char *t, int len)
+{
+	int			j;
+
+	appendStringInfoChar(s, '\'');
+	for (j = 0; j < len; j++)
+	{
+		if (t[j] == '\'' || t[j] == '\\')
+			appendStringInfoChar(s, '\\');
+		appendStringInfoChar(s, t[j]);
+	}
+	appendStringInfoChar(s, '\'');
+}
+
+/* One operand on wquery_out's stack. */
+typedef struct OutEnt
+{
+	StringInfoData s;			/* the operand as a standalone expression */
+	StringInfoData words;		/* word / chain: its words for "..." / NEAR() */
+	bool		word;			/* a plain or prefix term (a phrase word) */
+	bool		lchain;			/* left-deep at-most-1 chain: prints "a b c" */
+	bool		rchain;			/* right-deep at-most-k chain: NEAR(a b c, k) */
+	uint32		k;				/* rchain's gap */
+	int64		width;
+} OutEnt;
+
+/*
+ * wquery_out -- render a wquery as text that wquery_in parses back to the
+ * SAME value, byte for byte (doc/GAPS.md G96; sql/wquery_roundtrip.sql).
  *
- * An exact-gap phrase (WEAVE_QF_PHRASE_EXACT, from the tsquery cast) prints in
- * tsquery's spelling, `<->` for N = 1 and `<N>` otherwise, so its text reads as
- * the tsquery it came from.  N is recovered from the stored end-to-end gap by
- * subtracting the right operand's width, tracked on a parallel stack exactly as
- * migrate.c computes it (core's TS_phrase_execute).
+ * Terms print as quoted literals, 'text' with \' and \\ escaped, followed by
+ * their suffix: `*` (prefix), `~k` (fuzzy) or `:ABCD` (weight).  A regex is
+ * /text/.  AND, OR and NOT print as `&`, `|` and `!`, fully parenthesised.
+ *
+ * Phrases print in the native syntax that produces exactly their shape, and
+ * only otherwise as an operator:
+ *
+ *	- a LEFT-deep chain of plain / prefix words at most 1 apart, as "..."
+ *	  emits it: "quick brown fox";
+ *	- a RIGHT-deep chain of plain / prefix words with one gap k, as NEAR
+ *	  emits it: NEAR(quick brown fox, 3) (a two-word chain with k = 1 is both,
+ *	  and prints as "quick brown");
+ *	- any other at-most phrase, which only binary input can build (an operand
+ *	  that is not a word, mixed gaps), as `(L <=N> R)`;
+ *	- an exact gap (WEAVE_QF_PHRASE_EXACT, from the tsquery cast) in tsquery's
+ *	  spelling, `<->` for N = 1 and `<N>` otherwise, N recovered from the stored
+ *	  end-to-end gap by subtracting the right operand's width.
+ *
+ * Iterative over the postfix items with a string stack, so a long chain does
+ * not recurse.  A value built by wquery_recv was checked by
+ * weave_query_validate(), so the stack shape and every N here are sound.
  */
 Datum
 wquery_out(PG_FUNCTION_ARGS)
 {
 	WeaveQuery	q = PG_GETARG_WQUERY(0);
 	WeaveQueryItem *items = q->items;
-	StringInfoData *stack;
-	int64	   *width;			/* core's phrase width of each stack entry */
+	OutEnt	   *stack;
 	int			top = 0;
 	uint32		i;
-	StringInfoData result;
+	char	   *result;
 
 	if (q->nitems == 0)
 	{
@@ -1242,123 +1324,227 @@ wquery_out(PG_FUNCTION_ARGS)
 		PG_RETURN_CSTRING(pstrdup(""));
 	}
 
-	stack = (StringInfoData *) palloc(q->nitems * sizeof(StringInfoData));
-	width = (int64 *) palloc0(q->nitems * sizeof(int64));
+	stack = (OutEnt *) palloc0(q->nitems * sizeof(OutEnt));
 
 	for (i = 0; i < q->nitems; i++)
 	{
 		WeaveQueryItem *it = &items[i];
+		OutEnt		e;
 
+		memset(&e, 0, sizeof(e));
+		initStringInfo(&e.s);
 		if (it->type == WEAVE_QI_VAL)
 		{
-			StringInfoData s;
-			int			j;
 			const char *t = WEAVE_QUERY_ITEMTEXT(q, it);
 
-			initStringInfo(&s);
 			if (it->flags & WEAVE_QF_REGEX)
 			{
-				appendStringInfoChar(&s, '/');
-				appendBinaryStringInfo(&s, t, it->termlen);
-				appendStringInfoChar(&s, '/');
-				width[top] = 0;
-				stack[top++] = s;
-				continue;
+				appendStringInfoChar(&e.s, '/');
+				appendBinaryStringInfo(&e.s, t, it->termlen);
+				appendStringInfoChar(&e.s, '/');
 			}
-			appendStringInfoChar(&s, '\'');
-			for (j = 0; j < (int) it->termlen; j++)
+			else
 			{
-				if (t[j] == '\'' || t[j] == '\\')
-					appendStringInfoChar(&s, '\\');
-				appendStringInfoChar(&s, t[j]);
-			}
-			appendStringInfoChar(&s, '\'');
-			if (it->flags & WEAVE_QF_PREFIX)
-				appendStringInfoChar(&s, '*');
-			else if (it->flags & WEAVE_QF_FUZZY)
-				appendStringInfo(&s, "~%u", it->distance);
-			else if (it->flags & WEAVE_QF_WEIGHTED)
-			{
-				/* render the weight mask as :A/B/C/D (high labels first) */
-				appendStringInfoChar(&s, ':');
-				if (it->distance & (1u << 3)) appendStringInfoChar(&s, 'A');
-				if (it->distance & (1u << 2)) appendStringInfoChar(&s, 'B');
-				if (it->distance & (1u << 1)) appendStringInfoChar(&s, 'C');
-				if (it->distance & (1u << 0)) appendStringInfoChar(&s, 'D');
-			}
-			width[top] = 0;
-			stack[top++] = s;
-		}
-		else if (it->op == WEAVE_OP_NOT)
-		{
-			StringInfoData s;
-
-			Assert(top >= 1);
-			initStringInfo(&s);
-			appendStringInfoString(&s, "!");
-			appendBinaryStringInfo(&s, stack[top - 1].data,
-								   stack[top - 1].len);
-			pfree(stack[top - 1].data);
-			stack[top - 1] = s;
-		}
-		else
-		{
-			StringInfoData s;
-			const char *opstr;
-			char		gapbuf[32];
-			int64		w;
-
-			Assert(top >= 2);
-			w = Max(width[top - 2], width[top - 1]);	/* AND / OR */
-			switch (it->op)
-			{
-				case WEAVE_OP_AND:
-					opstr = " & ";
-					break;
-				case WEAVE_OP_OR:
-					opstr = " | ";
-					break;
-				case WEAVE_OP_PHRASE:
-				default:
-					opstr = " <-> ";
-					if (it->flags & WEAVE_QF_PHRASE_EXACT)
-					{
-						int64		n = (int64) it->distance - width[top - 1];
-
-						if (n != 1)
-						{
-							snprintf(gapbuf, sizeof(gapbuf), " <" INT64_FORMAT "> ", n);
-							opstr = gapbuf;
-						}
-						w = (int64) it->distance + width[top - 2];
-					}
+				out_quoted(&e.s, t, it->termlen);
+				if (it->flags & WEAVE_QF_PREFIX)
+					appendStringInfoChar(&e.s, '*');
+				else if (it->flags & WEAVE_QF_FUZZY)
+					appendStringInfo(&e.s, "~%u", it->distance);
+				else if (it->flags & WEAVE_QF_WEIGHTED)
+				{
+					/* the weight mask as :A/B/C/D (high labels first) */
+					appendStringInfoChar(&e.s, ':');
+					if (it->distance & (1u << 3))
+						appendStringInfoChar(&e.s, 'A');
+					if (it->distance & (1u << 2))
+						appendStringInfoChar(&e.s, 'B');
+					if (it->distance & (1u << 1))
+						appendStringInfoChar(&e.s, 'C');
+					if (it->distance & (1u << 0))
+						appendStringInfoChar(&e.s, 'D');
+				}
+				if ((it->flags & ~WEAVE_QF_PREFIX) == 0)
+				{
+					/* a phrase word: bare if the lexer reads it back as is */
+					e.word = true;
+					initStringInfo(&e.words);
+					if (out_bare_word(t, it->termlen))
+						appendBinaryStringInfo(&e.words, t, it->termlen);
 					else
-						w = (int64) it->distance + width[top - 2] + width[top - 1];
-					break;
+						out_quoted(&e.words, t, it->termlen);
+					if (it->flags & WEAVE_QF_PREFIX)
+						appendStringInfoChar(&e.words, '*');
+				}
 			}
-			initStringInfo(&s);
-			appendStringInfoChar(&s, '(');
-			appendBinaryStringInfo(&s, stack[top - 2].data,
-								   stack[top - 2].len);
-			appendStringInfoString(&s, opstr);
-			appendBinaryStringInfo(&s, stack[top - 1].data,
-								   stack[top - 1].len);
-			appendStringInfoChar(&s, ')');
-			pfree(stack[top - 1].data);
-			pfree(stack[top - 2].data);
+			stack[top++] = e;
+			continue;
+		}
+		if (it->op == WEAVE_OP_NOT)
+		{
+			Assert(top >= 1);
+			appendStringInfoChar(&e.s, '!');
+			appendBinaryStringInfo(&e.s, stack[top - 1].s.data,
+								   stack[top - 1].s.len);
+			e.width = stack[top - 1].width;
+			stack[top - 1] = e;
+			continue;
+		}
+
+		Assert(top >= 2);
+		{
+			OutEnt	   *l = &stack[top - 2];
+			OutEnt	   *r = &stack[top - 1];
+			bool		atmost = (it->op == WEAVE_OP_PHRASE &&
+								  !(it->flags & WEAVE_QF_PHRASE_EXACT));
+
+			e.width = query_op_width(it, l->width, r->width);
+			if (atmost)
+			{
+				e.lchain = it->distance == 1 && (l->word || l->lchain) && r->word;
+				e.rchain = it->distance >= 1 && l->word &&
+					(r->word || (r->rchain && r->k == it->distance));
+				e.k = it->distance;
+			}
+			if (e.lchain || e.rchain)
+			{
+				/* the same words either way: L's, then R's */
+				initStringInfo(&e.words);
+				appendBinaryStringInfo(&e.words, l->words.data, l->words.len);
+				appendStringInfoChar(&e.words, ' ');
+				appendBinaryStringInfo(&e.words, r->words.data, r->words.len);
+				if (e.lchain)
+					appendStringInfo(&e.s, "\"%s\"", e.words.data);
+				else
+					appendStringInfo(&e.s, "NEAR(%s, %u)", e.words.data, e.k);
+			}
+			else
+			{
+				appendStringInfoChar(&e.s, '(');
+				appendBinaryStringInfo(&e.s, l->s.data, l->s.len);
+				switch (it->op)
+				{
+					case WEAVE_OP_AND:
+						appendStringInfoString(&e.s, " & ");
+						break;
+					case WEAVE_OP_OR:
+						appendStringInfoString(&e.s, " | ");
+						break;
+					default:
+						if (atmost)
+							appendStringInfo(&e.s, " <=%u> ", it->distance);
+						else if ((int64) it->distance - r->width == 1)
+							appendStringInfoString(&e.s, " <-> ");
+						else
+							appendStringInfo(&e.s, " <" INT64_FORMAT "> ",
+											 (int64) it->distance - r->width);
+						break;
+				}
+				appendBinaryStringInfo(&e.s, r->s.data, r->s.len);
+				appendStringInfoChar(&e.s, ')');
+			}
 			top -= 2;
-			width[top] = w;
-			stack[top++] = s;
+			stack[top++] = e;
 		}
 	}
 
 	Assert(top == 1);
-	initStringInfo(&result);
-	appendBinaryStringInfo(&result, stack[0].data, stack[0].len);
-	pfree(stack[0].data);
+	result = stack[0].s.data;
 
 	PG_FREE_IF_COPY(q, 0);
-	PG_RETURN_CSTRING(result.data);
+	PG_RETURN_CSTRING(result);
+}
+
+/*
+ * weave_query_validate -- reject a wquery that no parser could have built.
+ *
+ * wquery_recv is a trust boundary, and before this check it accepted any item
+ * sequence: a postfix list that underflows the stack (`AND` alone) indexed
+ * stack[-1] in wquery_out and in both evaluators, unknown flags and gaps were
+ * stored, and a term with a NUL, a '/' in a regex or bytes invalid in the
+ * server encoding printed as text that does not read back.  What is accepted
+ * here is exactly what wquery_out can print and wquery_in can read back to
+ * the same bytes (doc/GAPS.md G96).
+ */
+static void
+weave_query_validate(WeaveQuery q)
+{
+	int64	   *width = (int64 *) palloc(Max(q->nitems, 1) * sizeof(int64));
+	int			top = 0;
+	uint32		i;
+
+	for (i = 0; i < q->nitems; i++)
+	{
+		WeaveQueryItem *it = &q->items[i];
+		const char *bad = NULL;
+
+		if (it->type == WEAVE_QI_VAL)
+		{
+			const char *t = WEAVE_QUERY_ITEMTEXT(q, it);
+
+			if (it->op != 0)
+				bad = "operator on a term";
+			else if (it->flags == WEAVE_QF_FUZZY)
+			{
+				if (it->distance < 1 || it->distance > PG_INT32_MAX)
+					bad = "fuzzy edit budget out of range";
+			}
+			else if (it->flags == WEAVE_QF_WEIGHTED)
+			{
+				if (it->distance < 1 || it->distance > 0xF)
+					bad = "weight mask out of range";
+			}
+			else if (it->flags != 0 && it->flags != WEAVE_QF_PREFIX &&
+					 it->flags != WEAVE_QF_REGEX)
+				bad = "term flags";
+			else if (it->distance != 0)
+				bad = "gap on a term";
+			if (bad == NULL && it->termlen == 0 && it->flags != WEAVE_QF_REGEX)
+				bad = "empty term";
+			if (bad == NULL && (it->flags & WEAVE_QF_REGEX) &&
+				memchr(t, '/', it->termlen) != NULL)
+				bad = "'/' in a regex";
+			if (bad == NULL)
+				(void) pg_verifymbstr(t, it->termlen, false);
+			width[top++] = 0;
+		}
+		else if (it->op == WEAVE_OP_NOT)
+		{
+			if (top < 1)
+				bad = "NOT without an operand";
+			else if (it->flags != 0 || it->distance != 0)
+				bad = "flags or gap on NOT";
+		}
+		else
+		{
+			if (top < 2)
+				bad = "operator without two operands";
+			else if (it->op != WEAVE_OP_PHRASE &&
+					 (it->flags != 0 || it->distance != 0))
+				bad = "flags or gap on AND / OR";
+			else if (it->op == WEAVE_OP_PHRASE &&
+					 (it->flags & ~WEAVE_QF_PHRASE_EXACT) != 0)
+				bad = "phrase flags";
+			else if (it->op == WEAVE_OP_PHRASE &&
+					 (it->flags & WEAVE_QF_PHRASE_EXACT) &&
+					 (int64) it->distance < width[top - 1])
+				bad = "exact gap shorter than its right operand";
+			if (bad == NULL)
+			{
+				width[top - 2] = query_op_width(it, width[top - 2],
+												width[top - 1]);
+				top--;
+			}
+		}
+		if (bad != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+					 errmsg("invalid wquery: %s at item %u", bad, i + 1)));
+	}
+	if (q->nitems > 0 && top != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+				 errmsg("invalid wquery: %d operands left over", top)));
+	pfree(width);
 }
 
 Datum
@@ -1467,6 +1653,7 @@ wquery_recv(PG_FUNCTION_ARGS)
 		}
 	}
 
+	weave_query_validate(q);
 	PG_RETURN_WQUERY(q);
 }
 
