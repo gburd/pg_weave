@@ -98,6 +98,7 @@ for arm in $CARMS; do
 	BUILT="$BUILT $arm"
 done
 TESTS="${G73_TESTS:-bench/aws/g73_repro.pl}"
+SHAPES="${G73_SHAPES:-5:3000}"	# storm seconds:CREATE INDEX rows
 for blk in $(seq 1 ${G73_BLOCKS:-1}); do
 for arm in $BUILT; do
 	D=/tmp/arm-$arm
@@ -118,7 +119,13 @@ for arm in $BUILT; do
 		nr=$(cat $OUT/$tag/regress_log_* 2>/dev/null | grep -c 'G73R ')
 		nnok=$(cat $OUT/$tag/regress_log_* 2>/dev/null | grep '^not ok' | tr '\n' ' ')
 		probe=$(cat $OUT/$tag/regress_log_* 2>/dev/null | grep -c 'G73 trail.*no free page recyclable yet')
-		log "$tag so=$md5 rc=$rc $(grep '^Result: ' $OUT/tap-$tag.log) rounds=$nr probe_decline_trail_lines=$probe not_ok=[$nnok] $(cat $OUT/$tag/regress_log_* 2>/dev/null | grep 'G73T ' | sed 's/.*# //' | tr '\n' ' ')"
+		# evidence the thing meant to run, ran: reproducer rounds, or t/028's control line
+		ctl=$(cat $OUT/$tag/regress_log_* 2>/dev/null | grep -c 'quiet plain VACUUM still truncates the index')
+		case $TESTS in
+		*g73_repro*) [ "$nr" -gt 0 ] || { log "$tag: RAN_NOTHING (no G73R rounds)"; ok=0; } ;;
+		*028*) [ "$ctl" -gt 0 ] || { log "$tag: RAN_NOTHING (no t/028 control line)"; ok=0; } ;;
+		esac
+		log "$tag so=$md5 rc=$rc $(grep '^Result: ' $OUT/tap-$tag.log) rounds=$nr ctl=$ctl probe_decline_trail_lines=$probe not_ok=[$nnok] $(cat $OUT/$tag/regress_log_* 2>/dev/null | grep 'G73T ' | sed 's/.*# //' | tr '\n' ' ')"
 	done
 	done
 done
