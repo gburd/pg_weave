@@ -74,8 +74,8 @@ SELECT to_wdoc('a x b') @@@ 'a <=2> b'::wquery AS at_most_2,
 	   to_wdoc('a b') @@@ 'a <0> b'::wquery AS exact_0;
 
 -- the suffixes keep their value: a weight restricts, a prefix expands, ~k is k
-SELECT $$'fox':A$$::wquery::text AS w, to_wdoc('fox', 'B') @@@ $$'fox':A$$::wquery AS w_wrong_zone,
-	   to_wdoc('fox', 'A') @@@ $$'fox':A$$::wquery AS w_right_zone,
+SELECT $$'fox':A$$::wquery::text AS w, to_wdoc('simple', 'fox', 'B') @@@ $$'fox':A$$::wquery AS w_wrong_zone,
+	   to_wdoc('simple', 'fox', 'A') @@@ $$'fox':A$$::wquery AS w_right_zone,
 	   to_wdoc('foxes') @@@ $$'fox'*$$::wquery AS prefix_hit,
 	   to_wdoc('fax') @@@ $$'fox'~1$$::wquery AS fuzzy_1,
 	   to_wdoc('fax') @@@ $$'fxx'~1$$::wquery AS fuzzy_1_miss,
@@ -95,7 +95,7 @@ BEGIN
 	FOREACH q IN ARRAY ARRAY['a /foo', 'a / b', 'fo~99999999999', 'a <99999999999> b',
 							 'NEAR(a b, 99999999999)', 'NEAR(a b, 0)', 'NEAR(a b, x)',
 							 '"a /re/"', 'NEAR(a /re/, 2)', 'a <->', '<-> a', 'a <-> <-> b',
-							 $$'a'*:A$$, 'fox:A*', 'fo*:A'] LOOP
+							 '''a''*:A', 'fox:A*', 'fo*:A'] LOOP
 		BEGIN
 			PERFORM q::wquery;
 			RAISE NOTICE '%: accepted as %', q, q::wquery::text;

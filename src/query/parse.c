@@ -860,8 +860,11 @@ parse_and(ParseState *st)
 
 		if (tok.kind == TOK_AND)
 		{
+			int64		wr;
+
 			(void) next_token(st);
-			w = Max(w, parse_phrase(st));
+			wr = parse_phrase(st);	/* not inside Max(): it is a macro */
+			w = Max(w, wr);
 			emit(st, WEAVE_QI_OPR, WEAVE_OP_AND, NULL, 0, 0);
 		}
 		else if (tok.kind == TOK_TERM || tok.kind == TOK_NOT ||
@@ -869,7 +872,9 @@ parse_and(ParseState *st)
 				 tok.kind == TOK_NEAR)
 		{
 			/* implicit AND */
-			w = Max(w, parse_phrase(st));
+			int64		wr = parse_phrase(st);
+
+			w = Max(w, wr);
 			emit(st, WEAVE_QI_OPR, WEAVE_OP_AND, NULL, 0, 0);
 		}
 		else
@@ -890,8 +895,11 @@ parse_or(ParseState *st)
 
 		if (tok.kind == TOK_OR)
 		{
+			int64		wr;
+
 			(void) next_token(st);
-			w = Max(w, parse_and(st));
+			wr = parse_and(st);
+			w = Max(w, wr);
 			emit(st, WEAVE_QI_OPR, WEAVE_OP_OR, NULL, 0, 0);
 		}
 		else
