@@ -53,9 +53,9 @@ if [[ $STAGES == *T* ]]; then
 	   PROVE_TESTS=t/034_wdoc_dump_restore.pl > $OUT/t034.log 2>&1); rc=$?
 	cp tmp_check/log/regress_log_034_wdoc_dump_restore $OUT/ 2>/dev/null
 	echo "T: t/034 exit $rc"
-	grep -E '^(ok|not ok)' tmp_check/log/regress_log_034_wdoc_dump_restore 2>/dev/null | grep -c 'G96' \
+	grep -E '(ok|not ok) [0-9]+ - .*G96' tmp_check/log/regress_log_034_wdoc_dump_restore 2>/dev/null | grep -c '^' \
 		| sed 's/^/T: G96 assertions reported: /'
-	grep -E '^not ok' tmp_check/log/regress_log_034_wdoc_dump_restore 2>/dev/null
+	grep -E 'not ok [0-9]+ -' tmp_check/log/regress_log_034_wdoc_dump_restore 2>/dev/null
 } 2>&1 | tee $OUT/T.txt
 fi
 
