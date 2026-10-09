@@ -97,11 +97,7 @@ BEGIN
 END $$;
 
 -- ---- hand-written ---------------------------------------------------------
-SELECT q, cardinality(c.core) AS ncore,
-	   CASE WHEN c.refused IS NOT NULL THEN 'refused'
-			WHEN c.core = c.weave AND c.ix_ok THEN 'same' ELSE 'DIFFERENT' END AS verdict,
-	   c.ranked, c.refused
-  FROM (VALUES
+CREATE TEMP TABLE hand AS SELECT q FROM (VALUES
 		-- weights, single and combined
 		('fox:A'), ('fox:B'), ('fox:C'), ('fox:D'), ('fox:AB'), ('fox:CD'),
 		('fox:AD'), ('fox:BCD'), ('fox:ABCD'), ('fox:A & dog:B'), ('fox:A | dog:D'),
@@ -128,7 +124,12 @@ SELECT q, cardinality(c.core) AS ncore,
 		-- negation
 		('!fox'), ('!fox & !dog'), ('!(fox | dog)'), ('!!fox'), ('fox & !dog:A'),
 		-- a term no document has; the empty query
-		('zzz'), ('!zzz'), ('')) v(q),
+		('zzz'), ('!zzz'), ('')) v(q);
+SELECT q, cardinality(c.core) AS ncore,
+	   CASE WHEN c.refused IS NOT NULL THEN 'refused'
+			WHEN c.core = c.weave AND c.ix_ok THEN 'same' ELSE 'DIFFERENT' END AS verdict,
+	   c.ranked, c.refused
+  FROM hand,
 	   LATERAL pg_temp.cmp(q) c;
 
 -- ---- randomized -----------------------------------------------------------
@@ -169,6 +170,20 @@ SELECT count(*) AS queries,
 	   count(*) FILTER (WHERE refused IS NULL AND cardinality(core) > 0) AS same_nonempty
   FROM rres;
 SELECT refused, count(*) FROM rres WHERE refused IS NOT NULL GROUP BY 1 ORDER BY 1;
+-- G96: every query the cast converts, hand-written and random, prints text
+-- that wquery_in reads back to the same bytes (and prints the same again)
+CREATE FUNCTION pg_temp.cast_rt(q text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE
+	w wquery;
+BEGIN
+	w := q::tsquery::wquery;
+	RETURN wquery_send(w::text::wquery) = wquery_send(w) AND w::text::wquery::text = w::text;
+EXCEPTION WHEN feature_not_supported THEN
+	RETURN NULL;
+END $$;
+SELECT count(rt) AS converted, count(*) FILTER (WHERE rt) AS round_trip
+  FROM (SELECT pg_temp.cast_rt(q) AS rt
+		  FROM (SELECT q FROM hand UNION ALL SELECT q FROM rres) s) z;
 -- the disagreements, if any (none)
 SELECT i, q, core, weave, ix_ok FROM rres
  WHERE refused IS NULL AND (core IS DISTINCT FROM weave OR ix_ok IS NOT TRUE)
@@ -240,10 +255,9 @@ SELECT a.q, wquery_send(b.w) = wquery_send(a.w) AS binary_same, b.w::text AS rec
 	   (SELECT count(*) FROM tc WHERE tsv @@ a.q::tsquery) AS core_rows
   FROM wqa a JOIN wqb b USING (id) ORDER BY id;
 
--- PRE-EXISTING, recorded not fixed: wquery_out's text does not parse back.
--- wquery_in reads '<' and '>' as separators and the '-' of '<->' as NOT, and
--- drops a suffix after a quoted term, so each rendering below re-parses to a
--- different query.  (Binary send/recv above is exact.)
+-- G96, FIXED: wquery_out's text parses back.  Until then wquery_in read '<'
+-- and '>' as separators and the '-' of '<->' as NOT, and dropped a suffix
+-- after a quoted term, so each rendering below re-parsed to a different query.
 SELECT w::text AS rendered, w::text::wquery::text AS reparsed,
 	   w::text::wquery::text = w::text AS round_trips
   FROM (VALUES ('quick <-> brown'::tsquery::wquery), ('quick <2> brown'::tsquery::wquery),

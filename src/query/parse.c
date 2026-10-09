@@ -1256,6 +1256,11 @@ out_bare_word(const char *t, int len)
 	for (j = 0; j < len; j++)
 		if (!((t[j] >= 'a' && t[j] <= 'z') || (t[j] >= '0' && t[j] <= '9')))
 			return false;
+	/* a keyword is a word inside "...", but lexes without its suffix */
+	if ((len == 3 && (memcmp(t, "and", 3) == 0 || memcmp(t, "not", 3) == 0)) ||
+		(len == 2 && memcmp(t, "or", 2) == 0) ||
+		(len == 4 && memcmp(t, "near", 4) == 0))
+		return false;
 	return true;
 }
 
