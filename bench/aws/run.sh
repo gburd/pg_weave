@@ -121,6 +121,19 @@ OUT=$ROOT/bench/aws/out/$RUN
 say() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[31mFATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 
+# A burner account has an end date.  AWS_EXPIRES (ISO-8601 UTC, e.g.
+# 2026-10-10T14:43:47Z) refuses a launch that would still be running inside the
+# last EXPIRY_MARGIN_MIN minutes (default 75) of the account's life, so an
+# instance is never lost mid-run to the expiry and no result exists only on a
+# dead host.  JOB_MINUTES is the caller's estimate of the job's wall time
+# (default 60).  Checked BEFORE any AWS call, so a refusal creates nothing.
+if [ -n "${AWS_EXPIRES:-}" ]; then
+	exp=$(date -u -d "$AWS_EXPIRES" +%s 2>/dev/null) || die "AWS_EXPIRES='$AWS_EXPIRES' is not a date"
+	need=$(( (${JOB_MINUTES:-60} + ${EXPIRY_MARGIN_MIN:-75}) * 60 ))
+	left=$(( exp - $(date -u +%s) ))
+	[ "$left" -gt "$need" ] || die "account $PROFILE expires at $AWS_EXPIRES ($((left / 60)) min left); a ${JOB_MINUTES:-60}-min job plus ${EXPIRY_MARGIN_MIN:-75} min margin does not fit. Lower JOB_MINUTES only if the job really is shorter."
+fi
+
 mkdir -p "$OUT"
 aws sts get-caller-identity --profile "$PROFILE" >"$OUT/identity.json" \
 	|| die "profile $PROFILE cannot authenticate"
