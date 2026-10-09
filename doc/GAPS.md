@@ -5018,7 +5018,25 @@ shape was classified from its own trail by script. Fisher, two-sided: `ampunfixe
 `ampfix`, `none`, 8/12 against 0/12, p = 0.0013. `refresh` against `refreshfix`, 21/48
 against 0/12, p = 0.005. All unfixed-tree arms against all fix arms: 30 of 264 against 0 of
 144, p < 10^-5. **At the shipped window and with no amplifier the reproducer is no better than
-t/028 (1 of 72), so it is the amplified arms that carry the significance.** FIXME-T028
+t/028 (1 of 72), so it is the amplified arms that carry the significance.**
+
+*t/028 itself, 30 runs per arm* (`pgweave-20261009-145506-9615`, ten interleaved blocks of
+three on one host): **unfixed 2 of 30, fix 0 of 30**, and fix plus L22 growth 2's reverted
+allocator change (`skip`, below) 0 of 30. Both unfixed failures have this entry's shape:
+VACUUM 1 ran the trigger and the probe declined pass 0. VACUUM 1 shrank the file in all 60
+runs of the two fix arms. 2/30 against 0/30 is not significant on its own (Fisher p = 0.49),
+which is why the amplified reproducer arms above are the evidence. t/028 shows only that
+the fix is not worse and that the failing shape is gone from its trails.
+
+*L22 growth 2, what falls out.* Growth 2 is the same stamp class (a page freed under next
+xid N cannot be reused by the transaction that receives N), at a different site: the
+allocator's FSM loop, not this probe. **This fix does not touch it.** But the reason growth
+2's allocator fix was reverted now looks like THIS bug. `65bed24` (skip a freed,
+not-yet-recyclable FSM candidate and put it back) failed t/028 3 of 10 in round 1, and the
+failing shape was VACUUM 1 declining pass 0. Re-applied on top of this fix (arm `skip`,
+`bench/aws/g73/skip.patch`), it fails t/028 0 of 30 (Fisher p ≈ 0.012 against 3/10, across
+different hosts and trees). Whether `skip` fixes growth 2 at scale on this tree is
+**unmeasured** here: `bench/aws/g75_scale.sh` was not run. `doc/PHASES.md` L22.
 
 *A second, different shape, found by the amplifier.* At window 64 the storm's own VACUUMs
 run about 50 times per storm instead of 28, and the storm can leave under a quarter of the
