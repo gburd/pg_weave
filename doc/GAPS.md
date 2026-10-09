@@ -5038,6 +5038,27 @@ failing shape was VACUUM 1 declining pass 0. Re-applied on top of this fix (arm 
 different hosts and trees). Whether `skip` fixes growth 2 at scale on this tree is
 **unmeasured** here: `bench/aws/g75_scale.sh` was not run. `doc/PHASES.md` L22.
 
+*Gates on the final commit* (`pgweave-20261009-164034-9227`, `e016e4f`): the PG17 smoke
+passed (`make installcheck` rc 0: regression, isolation and 1,484 TAP tests, with an empty
+`regression.diffs`). `t/015`, `t/033` and `t/032` passed twice, and `t/033`'s hard bound
+held (worst 844 and 1,064). The mutant (`ampunfixed`, built, distinct `.so`) restored the
+failure: 11 of 24 probe-shape failures against 0 of 24 for `ampfix`, two interleaved blocks,
+Fisher p = 0.0002. Each arm also had 6 of 24 `nocompact` rounds, the second shape above. PG18
+`make installcheck` passed (PostgreSQL 18.0, 32 regression tests, 2 isolation tests, 1,484
+TAP tests).
+
+*Limitations.* (1) At the shipped window and without an amplifier the reproducer fails about
+1 round in 70, so the significance comes from amplified arms, which change the probe
+window or force a horizon refresh. That is standard ablation practice, but the unamplified
+rate on the fix (0 of 96 rounds, 0 of 30 t/028 runs) is consistent with the base rate (1 of
+72, 2 of 30) only weakly on its own. (2) Why a forced refresh amplifies the failure is
+unmeasured. (3) The fix raises the probe's worst-case read count from 256 to the number of
+free-listed pages, and only when the window would otherwise have been this VACUUM's own frees.
+Not timed separately; the reclaim already walks every page on every VACUUM. (4) No core
+candidate: the stale-cache hypothesis is refuted, and quantizing on the next xid is inherent
+to `ReadNextTransactionId()` stamps. nbtree's own comment says its pending-FSM optimization is
+"never effective without some other backend concurrently consuming an XID".
+
 *A second, different shape, found by the amplifier.* At window 64 the storm's own VACUUMs
 run about 50 times per storm instead of 28, and the storm can leave under a quarter of the
 file free. VACUUM 1's trigger then reads "512 free of 2357: no compaction". That is the
