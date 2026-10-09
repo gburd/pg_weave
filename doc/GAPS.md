@@ -5017,7 +5017,8 @@ Runs `pgweave-20261009-131103-9279` (unfixed tree, before the fix existed),
 shape was classified from its own trail by script. Fisher, two-sided: `ampunfixed` against
 `ampfix`, `none`, 8/12 against 0/12, p = 0.0013. `refresh` against `refreshfix`, 21/48
 against 0/12, p = 0.005. All unfixed-tree arms against all fix arms: 30 of 264 against 0 of
-144. FIXME-T028
+144, p < 10^-5. **At the shipped window and with no amplifier the reproducer is no better than
+t/028 (1 of 72), so it is the amplified arms that carry the significance.** FIXME-T028
 
 *A second, different shape, found by the amplifier.* At window 64 the storm's own VACUUMs
 run about 50 times per storm instead of 28, and the storm can leave under a quarter of the
