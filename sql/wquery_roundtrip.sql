@@ -78,8 +78,8 @@ SELECT $$'fox':A$$::wquery::text AS w, to_wdoc('simple', 'fox', 'B') @@@ $$'fox'
 	   to_wdoc('simple', 'fox', 'A') @@@ $$'fox':A$$::wquery AS w_right_zone,
 	   to_wdoc('foxes') @@@ $$'fox'*$$::wquery AS prefix_hit,
 	   to_wdoc('fax') @@@ $$'fox'~1$$::wquery AS fuzzy_1,
-	   to_wdoc('fax') @@@ $$'fxx'~1$$::wquery AS fuzzy_1_miss,
-	   to_wdoc('fax') @@@ $$'fxx'~2$$::wquery AS fuzzy_2;
+	   to_wdoc('fax') @@@ $$'fzz'~1$$::wquery AS fuzzy_1_miss,
+	   to_wdoc('fax') @@@ $$'fzz'~2$$::wquery AS fuzzy_2;
 
 -- spellings that are NOT an operator or a literal keep their old meaning
 SELECT input, input::wquery::text
@@ -139,6 +139,10 @@ BEGIN
 		ELSIF d < 0.8 THEN
 			RETURN q;
 		END IF;
+		-- bare: not a keyword (and / near would lex as operators)
+		IF w IN ('and', 'near') THEN
+			RETURN q;
+		END IF;
 		RETURN lower(replace(w, '''', ''));
 	ELSIF r < 0.42 THEN
 		RETURN '!(' || pg_temp.tq(depth - 1) || ')';
@@ -149,7 +153,8 @@ CREATE TEMP TABLE tqs AS
 SELECT i, pg_temp.tq(4) AS input FROM generate_series(1, 1000) i;
 CREATE TEMP TABLE tres AS
 SELECT i, input, r.* FROM tqs, LATERAL pg_temp.rt(input::wquery) r;
-SELECT count(*) AS queries, count(*) FILTER (WHERE same_bytes AND same_text) AS round_trip,
+SELECT count(*) AS queries, count(DISTINCT txt) AS distinct_queries,
+	   count(*) FILTER (WHERE same_bytes AND same_text) AS round_trip,
 	   count(*) FILTER (WHERE txt LIKE '%"%') AS quoted_phrase,
 	   count(*) FILTER (WHERE txt LIKE '%NEAR(%') AS near,
 	   count(*) FILTER (WHERE txt ~ '<->|<[0-9]+>') AS exact_gap,
@@ -241,7 +246,7 @@ SELECT wquery_send(pg_temp.recv(wquery_send('a & "b c"'::wquery)))
 
 CREATE TEMP TABLE braw AS
 SELECT i, int2send(2::int2) || int4send(x.n) || x.b AS b
-  FROM generate_series(1, 1000) i, LATERAL pg_temp.bq(4) x;
+  FROM generate_series(1, 1000) i, LATERAL pg_temp.bq(4 + 0 * i) x;	-- per row
 CREATE FUNCTION pg_temp.brt(b bytea, OUT q wquery, OUT err text) LANGUAGE plpgsql AS $$
 BEGIN
 	q := pg_temp.recv(b);
@@ -251,7 +256,8 @@ END $$;
 CREATE TEMP TABLE bres AS
 SELECT i, b, x.q, x.err, r.* FROM braw, LATERAL pg_temp.brt(b) x,
 	   LATERAL pg_temp.rt(x.q) r;
-SELECT count(*) AS lists, count(*) FILTER (WHERE err IS NOT NULL) AS refused,
+SELECT count(*) AS lists, count(DISTINCT b) AS distinct_lists,
+	   count(*) FILTER (WHERE err IS NOT NULL) AS refused,
 	   count(*) FILTER (WHERE wquery_send(q) = b) AS recv_exact,
 	   count(*) FILTER (WHERE same_bytes AND same_text) AS round_trip,
 	   count(*) FILTER (WHERE txt LIKE '%"%') AS quoted_phrase,
