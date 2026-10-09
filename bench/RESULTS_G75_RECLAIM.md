@@ -328,3 +328,52 @@ not make a significant difference to any of the three**. In (a) it is a constant
 (c)'s permanent 2× plus its full rewrite on every VACUUM (the compaction trigger and pass,
 which this round was told not to touch, and which `t/028` constrains), and (b)'s tombstone
 retention (L19's trigger). Reported to the lead for a decision before any step 2.
+
+### Round 2, step 2: growth 1 fixed (`647d6da`, run `pgweave-20261008-222527-e179`)
+
+**Lead redirect after step 1:** fix growth 1 (the share-lock compaction pass), not growth 2,
+and do not regress `t/028`.
+
+**What arm (c)'s counters showed.** From cycle 9 on, every cleanup sees **two bolts**: the
+big one the cycle-8 level merge wrote high in the file, and that cycle's flush. Term (2) of
+`weave_index_is_compacted()` (`nlive > 1`) returned "not compacted" before term (4) was
+reached. Term (4) is the G47 outcome prediction `weave_pack_would_shrink()`, applied only
+under a share lock with no tombstones. So the pass ran with the merge's write-before-free
+pool below it (FREE about 31k at cycle 9, 69k at cycle 10) and LIVE larger than that (67k,
+73k). It packed the pool, extended the rest, and freed the old copy under its own xid, so the
+next cleanup met the same layout. At cycle 8 (one bolt) term (4) had already declined
+correctly.
+
+**The fix** (`src/am/amvacuum.c`, `weave_index_is_compacted()`). Apply term (4) to several
+bolts too, under the same conditions: no `AccessExclusiveLock`, tombstone fraction 0. If the
+FSM predicts that the pack would not shrink the file, there is no pass. Stated precisely,
+the predicate tells "the pass shrinks the file" (FREE ≥ LIVE: the copy fits below the LIVE-th
+free block, so the tail truncates) apart from "the pass re-copies into an extension because
+its prior copy is not reusable" (FREE < LIVE: the shortfall goes onto fresh high blocks,
+which stay live). Giving up the coalesce is cheap: the cleanup's leveled merge already bounds
+the bolt count, and `weave_vacuum()` still compacts to one. DEBUG2 lines now report the
+cleanup trigger's inputs and decision, and any declined pass. `t/028`'s G73 trail captures
+them.
+
+| gate | result |
+|---|---|
+| smoke, `5963e78` | installcheck PASS; TAP 35 files, 1,484 tests, PASS |
+| `t/028`, 10 runs per arm, one host | **fix 0 of 10 failed** (`.so` 96461c…); mutant `oldtrig` (the old rule, exact-once substitution, `.so` 1a17be…) 0 of 10 |
+| `t/028` ablation, from its own trail | at VACUUM 1 after the DELETE, in **all 20 runs**: trigger `~2,100 free of ~3,900 pages, tombstone fraction 0.900: compaction`. The pass ran (`lowfree_reuse` 180–201) and reached 239–754 pages. The new term needs tombstone fraction 0, so it **cannot apply** to that VACUUM |
+| `t/033` + `t/015`, twice | PASS. **`t/033`'s TODO bound passed** (`TODO passed: 26-27`): excess over the twin worst 844 on both runs (main: 2,626 / 5,299 / 7,972) |
+| step-1 workloads on the fix, two runs per arm | (c) **fixed**: see below. (a) and (b) **identical to step 1, to the page**, both runs |
+| 1M-row crash-loop scale run with the twin | twin bound PASS (worst 2,553, bound 6,631). **Stops-growing assertion FAILS** (2,354 over the last four cycles, allowed 866). The excess is `0 2296 795 2553 1052 0 0 0 0 0 1177 1177 2354 2354`: growth 2's +1,177 every two cycles (the xid collision), the same shape as `pgweave-20261008-022758-8a5a` on the unfixed tree. Not fixed here, by the lead's redirect |
+
+Arm (c), the excess over a fresh build per cycle 0..14 (two runs, identical to the page):
+
+| tree | excess | at 14 | VACUUM seconds, cycles 9–14 |
+|---|---|---|---|
+| step 1 (main) | 0 2,004 … 2,283 31,401 **70,991 74,564 78,204 81,827 85,451 89,077** | 2.02× | 350, 858, 922, 999, 1,115, 1,296 |
+| fix | 0 2,004 … 2,283 31,401 **27,766 24,126 22,450 18,826 17,147 13,518** | **1.16×** | 1, 2, 1, 2, 1, 2 |
+
+With the fix, the cycle-8 merge's pool drains into later INSERTs and flushes. The excess
+falls about 3,000 pages per cycle, and every VACUUM after cycle 8 is a 1–2 s no-op
+compaction. `bench/aws/l22_ordinary.sh` now asserts this from cycle 9: VACUUM ≤ 120 s, size
+≤ 1.6× fresh, excess not rising by more than 2 % of the reference. It passes both runs on the
+fix and fails both on step 1's logs (checked offline: every cycle 350–1,296 s, 2.0×, growth
+18,086).
