@@ -7004,5 +7004,6 @@ weight suffix dropped, prefix suffix dropped, `~k` printed off by one, `~k` pars
 both 7 of 7; each mutant also changed the solo output by 6-68 lines). The clean tree ran the solo
 files twice per run with 0 lines between them. t/034: 22 of 22, the three G96 assertions among them
 (`pgweave-20261009-152402-28b4`, `remote/regress_log_034_wdoc_dump_restore`). PG18 installcheck exit 0
-against the PG17 outputs.
+against the PG17 outputs. Full smoke on the final commit `b20623c`: `pgweave-20261009-153455-198f`,
+regression + isolation green (empty `regression.diffs`), TAP 35 files / 1,547 tests PASS, lint and codec green.
 
