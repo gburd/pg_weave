@@ -1,6 +1,7 @@
 -- Run against main BEFORE changing padding, then against G95. No wall-clock
 -- assertion: shared buffer visits expose materialization on a 20k-match set.
--- The baseline must fail this generous (<512 visits) first-row budget.
+-- Baseline measured only 40/17 visits despite full materialization. This is
+-- diagnostic, NOT a streaming gate: compressed-set CPU work is invisible here.
 \set ON_ERROR_STOP on
 CREATE EXTENSION IF NOT EXISTS pg_weave;
 SET jit = off;
@@ -24,9 +25,7 @@ BEGIN
     visits := (p->0->'Plan'->>'Shared Hit Blocks')::int
             + (p->0->'Plan'->>'Shared Read Blocks')::int;
     RAISE NOTICE 'G95 first-row budget: % buffer visits: %', visits, q;
-    IF visits >= 512 THEN
-      RAISE EXCEPTION 'G95 padding materializes before LIMIT: % buffer visits', visits;
-    END IF;
+
   END LOOP;
 END $$;
 DROP TABLE g95_stream;
