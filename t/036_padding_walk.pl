@@ -70,12 +70,12 @@ for my $case ('partial', 'expression')
 {
  my $key = $case eq 'partial' ? 'd' : "to_wdoc('simple', body)";
  my $pred = $case eq 'partial' ? 'WHERE eligible' : '';
+ my $doc = $case eq 'partial' ? "to_wdoc('simple',body)" : "to_wdoc('simple','fox')";
  sql(qq{
    CREATE TABLE padmeta (id int, d wdoc, body text, eligible bool);
-   INSERT INTO padmeta SELECT g, to_wdoc('simple','wrong'),
-     CASE WHEN g=7 THEN NULL WHEN g%3=0 THEN 'fox' ELSE '' END, g%2=0
-     FROM generate_series(1,12) g;
-   UPDATE padmeta SET d=to_wdoc('simple',body);
+   INSERT INTO padmeta SELECT g, $doc, body, g%2=0 FROM
+     (SELECT g, CASE WHEN g=7 THEN NULL WHEN g%3=0 THEN 'fox' ELSE '' END AS body
+        FROM generate_series(1,12) g) s;
    CREATE INDEX padmeta_w ON padmeta USING weave ($key) $pred;
    CREATE TABLE metaroots AS SELECT id, ctid AS root FROM padmeta;
  });

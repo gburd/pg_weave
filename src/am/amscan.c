@@ -4801,11 +4801,11 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 	 * widens when the executor drains what is materialized -- which is what
 	 * rows the recheck discards do -- until it can prove nothing further exists
 	 * (candfull / maxhits, vecDone / vecLanes, edistDone, fuseDone / maxhits).
-	 * Two limits remain, both in doc/GAPS.md: a ladder stops widening at
-	 * WEAVE_ORD_WIDTH_MAX candidates, so more rejected rows than that go
-	 * unreturned (a pass that loses every race with a concurrent merge no
-	 * longer ends a ladder short: it raises 40001, G58);
-	 * and the ranked phase emits only documents the ORDER BY argument ranks
+	 * A ladder that reaches WEAVE_ORD_WIDTH_MAX without proving exhaustion
+	 * raises 54000 rather than padding unranked matches at fabricated scores
+	 * (G94/G95). A pass that loses every race with a concurrent merge raises
+	 * 40001 (G58);
+	 * the ranked phase emits only documents the ORDER BY argument ranks
 	 * (for `<=>`, those matching its query).  On the lexical `<=>` route the
 	 * padding phase (weave_pad_gettuple) then emits the rest of the table, so
 	 * `price < c ORDER BY d <=> q` returns every price < c row, as a heap
@@ -9309,6 +9309,8 @@ weave_ord_probe(Relation index, WeaveScanOpaque so, int want)
  *     can find more.  Nearly redundant now: at that width the heap cannot fill,
  *     so (1) fires anyway.  Kept as a cheap early stop.
  *
+ * The allocation cap is not a third exhaustion proof: reaching it must ERROR,
+ * never release padding at fabricated zero scores (doc/GAPS.md G94/G95).
  * A broad query with a large (or no) LIMIT is inherently expensive here, but
  * correctness wins; a small-LIMIT first page is still served by the narrow first
  * pass alone.
@@ -9321,7 +9323,11 @@ weave_ord_grow(Relation index, WeaveScanOpaque so)
 	if ((double) so->curk >= so->maxhits)
 		return false;			/* already as wide as every possible match */
 	if (so->curk >= WEAVE_ORD_WIDTH_MAX)
-		return false;			/* cannot widen further */
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("weave lexical ordering candidate limit (%d) reached before ranked exhaustion",
+						WEAVE_ORD_WIDTH_MAX),
+				 errhint("Use a smaller LIMIT, or disable index scans to sort the full result.")));
 
 	so->curk = (so->curk > WEAVE_ORD_WIDTH_MAX / 4)
 		? WEAVE_ORD_WIDTH_MAX : so->curk * 4;
@@ -9705,7 +9711,11 @@ weave_vec_grow(Relation index, WeaveScanOpaque so)
 	if (so->vecDone)
 		return false;			/* the pass returned every live lane */
 	if (so->veck >= WEAVE_ORD_WIDTH_MAX)
-		return false;			/* cannot widen further */
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("weave vector ordering candidate limit (%d) reached before ranked exhaustion",
+						WEAVE_ORD_WIDTH_MAX),
+				 errhint("Use a smaller LIMIT, or disable index scans to sort the full result.")));
 
 	next = (int64) so->veck * 4;
 	if (next > (int64) WEAVE_ORD_WIDTH_MAX)
@@ -9719,8 +9729,8 @@ weave_vec_grow(Relation index, WeaveScanOpaque so)
 	 */
 	if (so->vecLanes > 0 && (uint64) next > so->vecLanes)
 		next = (int64) so->vecLanes;
-	if (next <= (int64) so->veck)
-		return false;			/* progress is not optional: no wider pass exists */
+	/* vecDone already proved veck < vecLanes, and the width cap raised above. */
+	Assert(next > (int64) so->veck);
 
 	so->veck = (int) next;
 	weave_vec_pass(index, so);
@@ -10135,12 +10145,9 @@ weave_edist_grow(Relation index, WeaveScanOpaque so)
 {
 	if (so->edistDone)
 		return false;			/* the pass returned the complete match set */
-	if (so->edistThr >= INT_MAX - 1)
-		return false;
-	/* Progress is not optional: a nextthr that failed to exceed the current
-	 * threshold would repeat the pass forever. */
-	if (so->edistNext <= so->edistThr)
-		so->edistNext = so->edistThr + 1;
+	/* The pass records only distances > edistThr, with INT_MAX meaning done.
+	 * There is no candidate-width cap on this ladder. */
+	Assert(so->edistNext > so->edistThr && so->edistNext < INT_MAX);
 	so->edistThr = so->edistNext;
 	weave_edist_pass(index, so);
 	return true;
@@ -11745,9 +11752,9 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 	 * pending one scoring at least the k-th kept is correctly placed among them;
 	 * one scoring less could be outranked by a flushed document only a wider pass
 	 * finds, so it waits for that pass (and the TID filter below keeps an earlier
-	 * pass's emission from repeating).  A complete pass emits every one, and so
-	 * does the last rung the ladder can reach, because nothing wider is coming
-	 * and the alternative is the padding's +Infinity.
+	 * pass's emission from repeating).  Only proven exhaustion emits every one:
+	 * the width cap is NOT completion, and must not release rows beyond the
+	 * frontier even before weave_fuse_grow() raises the limit error.
 	 *
 	 * DEDUPLICATED BY TID, keeping the better score: a pass that runs between a
 	 * flush's segment add and its list clear sees a document in both places, and
@@ -11756,8 +11763,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 	if (npend > 0)
 	{
 		bool		last = complete ||
-			(double) so->fusek >= so->maxhits ||
-			so->fusek >= WEAVE_ORD_WIDTH_MAX;
+			(double) so->fusek >= so->maxhits;
 		double		frontier = (last || nacc == 0) ? (double) INFINITY
 			: acc[nacc - 1].score;
 		int			nadd = 0;
@@ -11847,7 +11853,11 @@ weave_fuse_grow(Relation index, WeaveScanOpaque so)
 	if ((double) so->fusek >= so->maxhits)
 		return false;			/* already as wide as every possible match */
 	if (so->fusek >= WEAVE_ORD_WIDTH_MAX)
-		return false;			/* cannot widen further */
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("weave fused ordering candidate limit (%d) reached before ranked exhaustion",
+						WEAVE_ORD_WIDTH_MAX),
+				 errhint("Use a smaller LIMIT, or disable index scans to sort the full result.")));
 
 	so->fusek = (so->fusek > WEAVE_ORD_WIDTH_MAX / 4)
 		? WEAVE_ORD_WIDTH_MAX : so->fusek * 4;
