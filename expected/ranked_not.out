@@ -393,4 +393,133 @@ SELECT (SELECT count(*) FROM fz) AS fused_n,
     1598 |         0 |           0 |           0
 (1 row)
 
+-- ---- 7. G95 randomized padding windows ----------------------------------
+-- Membership comes from a forced seqscan, never from the SRF. Score positions
+-- come from the full SRF (block 5 independently pins its zero-score contract).
+-- Mutants: skip exact recheck; repeat a padding TID; stop early; pad before
+-- ranked exhaustion. WITH TIES must drain the zero-score tail, even at LIMIT 1.
+SELECT setseed(0.95);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE rp (id int, d wdoc, tag int DEFAULT 0)
+  WITH (autovacuum_enabled = off, fillfactor = 50);
+INSERT INTO rp (id, d)
+SELECT g, CASE WHEN random() < 0.04 THEN NULL ELSE to_wdoc('simple',
+  (SELECT coalesce(string_agg('w' || t, ' '), '')
+     FROM generate_series(1, 8) t WHERE random() < 0.25 + g * 0.0)) END
+  FROM generate_series(1, 257) g;
+CREATE INDEX rp_w ON rp USING weave (d);
+CREATE TEMP TABLE rp_roots AS SELECT ctid AS tid, id FROM rp;
+UPDATE rp SET tag = 1 WHERE id % 3 = 0;
+DELETE FROM rp WHERE id % 19 = 0;
+INSERT INTO rp (id, d) SELECT g, to_wdoc('simple', CASE WHEN g % 2 = 0 THEN '' ELSE 'w3' END)
+  FROM generate_series(258, 273) g;
+INSERT INTO rp_roots SELECT ctid, id FROM rp WHERE id > 257;
+CREATE TEMP TABLE rp_ref (id int PRIMARY KEY, score float8);
+CREATE TEMP TABLE rp_got (id int, score float8, ord bigint GENERATED ALWAYS AS IDENTITY);
+CREATE FUNCTION pg_temp.pad_random() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE
+  q text; leaf text; j int; m int; lim int; off int; ties bool;
+  want int; cutoff float8; n int := 0; plan json; sql text;
+BEGIN
+  FOR j IN 1..40 LOOP
+    leaf := 'w' || (1 + floor(random() * 8))::int;
+    q := CASE j % 5
+      WHEN 0 THEN '!' || leaf
+      WHEN 1 THEN leaf || '*'
+      WHEN 2 THEN 'wx~1'
+      WHEN 3 THEN '/^w[1-4]$/'
+      ELSE '!("' || leaf || ' w3")' END;
+    IF j % 3 = 0 THEN q := 'w2 | (' || q || ')'; END IF;
+    PERFORM set_config('enable_indexscan', 'off', true);
+    PERFORM set_config('enable_bitmapscan', 'off', true);
+    PERFORM set_config('enable_seqscan', 'on', true);
+    TRUNCATE rp_ref;
+    EXECUTE format('EXPLAIN (FORMAT JSON) SELECT id FROM rp WHERE d @@@ %L::wquery', q) INTO plan;
+    IF plan->0->'Plan'->>'Node Type' IS DISTINCT FROM 'Seq Scan' THEN
+      RAISE EXCEPTION 'G95 reference not seqscan: %', plan;
+    END IF;
+    EXECUTE format('INSERT INTO rp_ref SELECT id, NULL FROM rp WHERE d @@@ %L::wquery', q);
+    SELECT count(*) INTO m FROM rp_ref;
+    -- Full SRF must agree with the independent set, roots included.
+    TRUNCATE rp_got;
+    INSERT INTO rp_got (id, score) SELECT r.id, s.score FROM weave_search('rp_w', q::wquery, 10000) WITH ORDINALITY s
+      LEFT JOIN rp_roots r ON r.tid = s.ctid ORDER BY s.ordinality;
+    IF (SELECT count(*) FROM rp_got) <> m OR
+       (SELECT count(DISTINCT id) FROM rp_got) <> m OR
+       EXISTS (SELECT 1 FROM rp_got g LEFT JOIN rp_ref r USING (id) WHERE r.id IS NULL) THEN
+      RAISE EXCEPTION 'G95 full SRF set mismatch: %', q;
+    END IF;
+    UPDATE rp_ref r SET score = g.score FROM rp_got g WHERE r.id = g.id;
+    PERFORM set_config('enable_indexscan', 'on', true);
+    PERFORM set_config('enable_seqscan', 'off', true);
+    PERFORM set_config('enable_sort', 'off', true);
+    EXECUTE format('EXPLAIN (FORMAT JSON) SELECT id FROM rp WHERE d @@@ %1$L::wquery '
+                   'ORDER BY d <=> %1$L::wquery', q) INTO plan;
+    IF plan->0->'Plan'->>'Node Type' IS DISTINCT FROM 'Index Scan' OR
+       plan->0->'Plan'->>'Index Name' IS DISTINCT FROM 'rp_w' THEN
+      RAISE EXCEPTION 'G95 ordering site not reached: %', plan;
+    END IF;
+    FOREACH lim IN ARRAY ARRAY[1, greatest(m - 1, 1), greatest(m, 1), m + 1] LOOP
+      FOREACH off IN ARRAY ARRAY[0, m / 2, m, m + 1] LOOP
+        FOREACH ties IN ARRAY ARRAY[false, true] LOOP
+          want := greatest(0, least(lim, m - off));
+          SELECT score INTO cutoff FROM rp_ref ORDER BY score DESC OFFSET off + lim - 1 LIMIT 1;
+          IF ties AND cutoff IS NOT NULL THEN
+            SELECT greatest(0, count(*) - off) INTO want FROM rp_ref WHERE score >= cutoff;
+          END IF;
+          TRUNCATE rp_got;
+          sql := format('SELECT id, weave_current_distance(''rp_w'', ctid, %1$L::wquery) AS dist '
+                        'FROM rp WHERE d @@@ %1$L::wquery ORDER BY d <=> %1$L::wquery '
+                        'OFFSET %2$s FETCH FIRST %3$s ROWS %4$s', q, off, lim,
+                        CASE WHEN ties THEN 'WITH TIES' ELSE 'ONLY' END);
+          EXECUTE 'INSERT INTO rp_got (id, score) SELECT id, 1.0 / dist - 1.0 FROM (' || sql || ') x';
+          -- Identity records insertion/emission order; never sort the answer
+          -- by score before checking it. In particular no positive may follow 0.
+          IF EXISTS (SELECT 1 FROM
+               (SELECT score, lag(score) OVER (ORDER BY ord) AS prev FROM rp_got) s
+               WHERE score > prev) THEN
+            RAISE EXCEPTION 'G95 emission order mismatch q=% lim=% off=% ties=%', q, lim, off, ties;
+          END IF;
+          IF (SELECT count(*) FROM rp_got) <> want OR
+             (SELECT count(DISTINCT id) FROM rp_got) <> want OR
+             EXISTS (SELECT 1 FROM rp_got g LEFT JOIN rp_ref r USING (id)
+                      WHERE r.id IS NULL OR abs(r.score - g.score) > 1e-8) OR
+             EXISTS (SELECT 1 FROM
+               (SELECT score, row_number() OVER (ORDER BY ord) AS pos FROM rp_got) g
+               JOIN (SELECT score, row_number() OVER (ORDER BY score DESC) AS pos FROM rp_ref) r
+                 ON r.pos = g.pos + off WHERE abs(r.score - g.score) > 1e-8) THEN
+            RAISE EXCEPTION 'G95 window mismatch q=% lim=% off=% ties=% want=%', q, lim, off, ties, want;
+          END IF;
+          n := n + 1;
+        END LOOP;
+      END LOOP;
+      TRUNCATE rp_got;
+      INSERT INTO rp_got (id, score) SELECT r.id, s.score FROM weave_search('rp_w', q::wquery, lim) WITH ORDINALITY s
+        LEFT JOIN rp_roots r ON r.tid = s.ctid ORDER BY s.ordinality;
+      IF (SELECT count(*) FROM rp_got) <> least(lim, m) OR
+         (SELECT count(DISTINCT id) FROM rp_got) <> least(lim, m) OR
+         EXISTS (SELECT 1 FROM rp_got g LEFT JOIN rp_ref r USING (id)
+                  WHERE r.id IS NULL OR abs(r.score - g.score) > 1e-8) OR
+         EXISTS (SELECT 1 FROM
+           (SELECT score, row_number() OVER (ORDER BY ord) AS pos FROM rp_got) g
+           JOIN (SELECT score, row_number() OVER (ORDER BY score DESC) AS pos FROM rp_ref) r
+             USING (pos) WHERE abs(r.score - g.score) > 1e-8) THEN
+        RAISE EXCEPTION 'G95 limited SRF mismatch q=% k=%', q, lim;
+      END IF;
+    END LOOP;
+  END LOOP;
+  RETURN n;
+END $$;
+SELECT pg_temp.pad_random() AS randomized_windows;
+ randomized_windows 
+--------------------
+               1280
+(1 row)
+
+RESET enable_indexscan; RESET enable_bitmapscan; RESET enable_seqscan; RESET enable_sort;
+DROP TABLE rp;
 DROP TABLE rn;

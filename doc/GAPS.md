@@ -6908,10 +6908,19 @@ are unchanged.
 **Remaining limits, stated.**
 - ~~**`weave_search()` is still a subset**~~ for an uncovered query. **FIXED 2026-10-08 on
   `wt/g94s`**, see "The `weave_search()` remainder" below.
-- **Beyond `WEAVE_ORD_WIDTH_MAX` (~67M) ranked candidates** the ladder stops and the
-  padding would emit the rest at 1.0 while some still score above 0 -- out of order. The
-  same ceiling already bounds every other route's ranked phase; unreachable at today's
-  segment sizes, untested.
+- **SUPERSEDED 2026-10-11, G95 review follow-up:** beyond
+  `WEAVE_ORD_WIDTH_MAX` (~67M) ranked candidates the ladder formerly stopped and
+  padding emitted remaining positive matches at 1.0. This was described here as
+  an untested limit; it was a wrong-answer bug. Lexical, vector and fused ordering
+  now raise **54000 (`program_limit_exceeded`)** at an unproven cap, naming the
+  limit and suggesting a smaller LIMIT or a non-index sort. Exhaustion proofs
+  still take precedence. The fused pending frontier no longer treats the cap as
+  completion. Edit-distance has no width cap: its next-distance sentinel proves
+  exhaustion. `weave_search()`'s existing exhaustion guard is unchanged.
+  Reduced-cap baseline (128) fabricated **172 positive rows at distance 1**;
+  the fixed build refuses, and built/installed/site-reaching mutants of all
+  three cap branches and the pending frontier fail. See `bench/RESULTS_G95.md`
+  for the release-hook exclusion proof and full gates.
 - **A row a concurrent merge brings in between the ranked phase and the padding** is the
   ordering scan's existing "not order-stable under concurrent modification" note
   (`weave_ord_pass()`), unchanged.
@@ -6992,6 +7001,80 @@ queries are unchanged within the within-arm spread. The same streaming walk G95 
 would fix this too.
 
 ### G95 — an uncovered NOT / prefix / fuzzy / regex ranked scan costs O(match set) before its first padded row — **ACCEPTED FOR NOW by maintainer decision 2026-10-08; REVISIT when a streaming padding walk exists**
+
+**FIXED 2026-10-11 on `wt/g95` (padding collection only).** The historical cost
+below is **SUPERSEDED**, not retracted: it was correct for the materializing
+implementation. `weave_pad_walk_begin/next/end()` now serve both the ordering
+scan and `weave_topk_pad()`: enumerate heap HOT roots in ascending TID-derived
+docid order, fetch under the snapshot, apply the partial-index predicate and
+exact query, skip ranked TIDs, and stop on demand (SRF: at its requested k).
+G94's score-zero argument is unchanged, but its exhaustion premise needed a
+separate fix: **the review found the width cap was not exhaustion**. The ordering
+ladders now error at an unproven cap rather than padding; see G94's dated
+supersession above. This corrects the original unconditional exhaustion claim,
+not the streaming-walk latency measurements.
+
+Measured against exact main `f0b6ed7`, A/A first then A/B twice at both scales,
+run **pgweave-20261011-134626-a1aa, us-west-2**, c7i.2xlarge, PG17.11:
+`!w1` LIMIT 10 scan 29.475/29.526 -> 0.737/0.746 ms at 200k and
+146.723/147.048 -> 3.700/3.681 ms at 1M; SRF k=10
+29.629/29.609 -> 0.729/0.714 and 147.040/147.387 -> 3.687/3.671 ms.
+`rare | !w1` LIMIT 5000 scan 32.281/32.289 -> 3.978/3.982 and
+154.181/154.595 -> 9.919/9.872 ms. Every measured query passed correctness
+before timing. Both PG17/18 full regression, isolation and TAP pass; three
+built, installed, site-reaching mutants caught exact-recheck, dedup and HOT-root
+violations. Full numbers, A/A spreads, p99, losses and evidence:
+`bench/RESULTS_G95.md`, raw summaries `bench/RESULTS_G95.csv`.
+
+**Not an end-to-end sublinear-query claim:** ranked generation still reads
+postings for NOT and materializes gates for prefix/fuzzy/regex. A sparse
+predicate can still make the new padding walk traverse the heap; that case
+is unmeasured at scale. The SRF materializes up to its explicit k before its
+first call returns, so an outer LIMIT does not shorten that k. These are not
+whole-match-set padding startup costs, which is the gap closed here.
+
+**Review coverage added 2026-10-11:** the randomized windows now compare actual
+emission positions (not a score-sorted answer); SRF ordinality is captured before
+joining the root map. `t/036_padding_walk.pl` asserts six LP_REDIRECT roots before
+querying, verifies returned root TIDs, and coordinates a committed HOT update,
+pruning and insert between cursor fetches. It also checks partial and expression
+indexes through both SRF and ordering scan. Bypassing the partial predicate fails
+both oracles after its site marker fires. Reduced-cap and predicate mutation
+harness: `bench/aws/g95_review_mutants.sh`; evidence in `bench/RESULTS_G95.md`.
+Final dev gate **pgweave-dev-20261011-140738-2421512, us-east-1**: PG17.11 and
+PG18.6 each pass 33 regression + 2 isolation with no diffs, and all 36 TAP files
+(1,501 / 1,521 assertions respectively). All five follow-up mutants killed on
+PG17 after build/install/site proofs. The host is verified terminated. The
+cap-only fix does not touch G95's measured lexical/SRF path, so the us-west-2
+latencies above stand without remeasurement.
+
+**SUPERSEDED 2026-10-11 (G95 re-review):** the review fix's exact-cap
+exhaustion handling was incomplete: maxhits is an upper bound, not a count.
+With cap 128, 128 `fox dog` documents plus 128 empty documents give lexical
+`fox | dog` a bound of 256; two fused channels over 128 `fox dog` documents
+also sum to 256. Both raised 54000 on `dbf22ed`, despite having all candidates.
+`28df190` asks for cap + 1 internally on the final lexical/fused pass and tests
+completeness against that width (per bolt for fusion). A filled probe is
+trimmed to the nominal cap before emission; it cannot escape through LIMIT
+or release pending rows/padding. An unfilled probe proves exhaustion without
+requiring the bound to be tight. The prior error behavior remains for sets
+strictly above the cap, including cap + 1.
+
+Tests `bench/aws/g95_cap_overlap.sql` were committed first (`2140c2f`) and
+both counterexamples failed on the unchanged `dbf22ed` production code.
+Fixed controls pass, including exact-cap padding, cap + 1 with and without
+LIMIT, and the existing single-term exact-cap and larger-set refusals. Removing
+the probes built, installed, reached both marked sites and failed both exact-cap
+oracles; all five older review mutants were also caught. Dev run
+**pgweave-dev-20261011-144050-2511078, us-east-1**: PG17.11 / PG18.6 each
+33 regression + 2 isolation, no diffs, and 36 TAP files (1,581 / 1,521
+assertions); four lints pass. Host killed and independently verified terminated.
+Cap + 1 fits int, but its 16-byte candidate heap is 1 GB, one byte above
+MaxAllocSize: BMW/MaxScore heaps and ordered-array growth now use existing
+huge-safe Size allocations. Because those sites also run at LIMIT 10, the
+latency claim is remeasured in us-west-2 rather than inherited; see
+`bench/RESULTS_G95.md` for the new run and allocation scope.
+
 
 G94's fix pads the ranked scan with every match that holds no literal term, and
 `weave_pad_begin()` collects q's WHOLE match set before emitting the first padded row. So the

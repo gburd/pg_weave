@@ -152,6 +152,37 @@ typedef struct ScoredTid
 	double		score;
 }			ScoredTid;
 
+/*
+ * G95: a lazy walk of heap HOT roots, in global docid (TID) order.  Unlike a
+ * materialized gate, its startup does not depend on the match count.  Query
+ * and ranked TIDs are borrowed; all other resources belong to the walk.
+ */
+typedef struct WeavePadWalk
+{
+	Relation	index;
+	Relation	heap;
+	Snapshot	snapshot;
+	WeaveQuery	query;
+	IndexInfo  *info;
+	EState	   *estate;
+	ExprState  *predicate;
+	TupleTableSlot *slot;
+	IndexFetchTableData *fetch;
+	int			lexidx;
+	BlockNumber nblocks;
+	BlockNumber block;
+	OffsetNumber roots[MaxHeapTuplesPerPage];
+	int			nroots;
+	int			pos;
+	ItemPointerData *seen;
+	int			nseen;
+} WeavePadWalk;
+
+static WeavePadWalk *weave_pad_walk_begin(Relation index, Snapshot snapshot,
+										 WeaveQuery query, ScoredTid *ranked, int n);
+static bool weave_pad_walk_next(WeavePadWalk *w, ItemPointer tid);
+static void weave_pad_walk_end(WeavePadWalk *w);
+
 static int weave_topk_visible(Relation index, WeaveQuery q, int k,
 							 bool as_distance, ScoredTid **out);
 static int weave_topk_pad(Relation index, WeaveQuery q, int k, bool as_distance,
@@ -455,6 +486,7 @@ typedef struct WeaveScanOpaqueData
 	 * evaluated on a heap row does not have either (orderby.sql section L14) --
 	 * and the padding extends that ordering; it does not re-derive the heap's.
 	 */
+	WeavePadWalk *padWalk;	/* G95: uncovered lexical query only */
 	bool		padActive;
 	bool		padDone;		/* the heap walk finished: never restart it */
 	TableScanDesc padScan;
@@ -3775,6 +3807,142 @@ weave_pad_wanted(IndexScanDesc scan, WeaveScanOpaque so)
 	return !weave_query_lit_covered(so->query);
 }
 
+/*
+ * No index page is cached here: walking the heap also covers pending and
+ * zero-term documents, and cannot race segment retirement/recycling.  Roots
+ * are enumerated under a page lock, then fetched through the AM's snapshot.
+ * A visible HOT version cannot lose its root while that snapshot is alive.
+ * Partial predicates and index expressions must be applied just as at build.
+ *
+ * ponytail: O(heap positions visited), not posting seeks; a sparse predicate
+ * can still walk the whole heap.  Add a posting iterator if that measured
+ * loss justifies one.  No O(match set) allocation or validation at startup.
+ */
+static WeavePadWalk *
+weave_pad_walk_begin(Relation index, Snapshot snapshot, WeaveQuery query,
+					 ScoredTid *ranked, int n)
+{
+	WeavePadWalk *w = palloc0(sizeof(WeavePadWalk));
+	WeaveIndexLayout layout;
+	int			i;
+
+	weave_index_layout(index, &layout);
+	w->index = index;
+	w->heap = table_open(index->rd_index->indrelid, AccessShareLock);
+	w->snapshot = snapshot;
+	w->query = query;
+	w->lexidx = layout.lexattno - 1;
+	w->info = BuildIndexInfo(index);
+	w->estate = CreateExecutorState();
+	w->predicate = w->info->ii_Predicate != NIL
+		? ExecPrepareQual(w->info->ii_Predicate, w->estate) : NULL;
+	w->slot = table_slot_create(w->heap, NULL);
+#if PG_VERSION_NUM >= 190000
+	w->fetch = table_index_fetch_begin(w->heap, SO_NONE);
+#else
+	w->fetch = table_index_fetch_begin(w->heap);
+#endif
+	w->nblocks = RelationGetNumberOfBlocks(w->heap);
+	w->nseen = n;
+	if (n > 0)
+	{
+		w->seen = WEAVE_ALLOC_MAYBE_HUGE((Size) n * sizeof(ItemPointerData));
+		for (i = 0; i < n; i++)
+			w->seen[i] = ranked[i].tid;
+		qsort(w->seen, n, sizeof(ItemPointerData), cmp_tid);
+	}
+	return w;
+}
+
+static bool
+weave_pad_walk_next(WeavePadWalk *w, ItemPointer tid)
+{
+	ExprContext *econtext = GetPerTupleExprContext(w->estate);
+
+	for (;;)
+	{
+		ItemPointerData root;
+		ItemPointerData fetched;
+		bool		call_again = false;
+		bool		all_dead = false;
+		bool		keep = false;
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
+		MemoryContext old;
+
+		CHECK_FOR_INTERRUPTS();
+		if (w->pos == w->nroots)
+		{
+			Buffer		buf;
+			Page		page;
+			OffsetNumber off;
+			OffsetNumber maxoff;
+
+			if (w->block == w->nblocks)
+				return false;
+			buf = ReadBuffer(w->heap, w->block++);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			maxoff = PageGetMaxOffsetNumber(page);
+			w->pos = w->nroots = 0;
+			for (off = FirstOffsetNumber; off <= maxoff; off++)
+			{
+				ItemId		item = PageGetItemId(page, off);
+
+				if (ItemIdIsRedirected(item) ||
+					(ItemIdIsNormal(item) &&
+					 !HeapTupleHeaderIsHeapOnly((HeapTupleHeader) PageGetItem(page, item))))
+					w->roots[w->nroots++] = off;
+			}
+			UnlockReleaseBuffer(buf);
+			if (w->nroots == 0)
+				continue;
+		}
+		ItemPointerSet(&root, w->block - 1, w->roots[w->pos++]);
+		if (w->nseen > 0 &&
+			bsearch(&root, w->seen, w->nseen, sizeof(ItemPointerData), cmp_tid) != NULL)
+			continue;
+		fetched = root;
+		ExecClearTuple(w->slot);
+		if (!table_index_fetch_tuple(w->fetch, &fetched, w->snapshot, w->slot,
+									 &call_again, &all_dead))
+			continue;
+		econtext->ecxt_scantuple = w->slot;
+		old = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+		if (w->predicate == NULL || ExecQual(w->predicate, econtext))
+		{
+			FormIndexDatum(w->info, w->slot, w->estate, values, isnull);
+			if (!isnull[w->lexidx])
+			{
+				WeaveDoc	doc = weave_index_lexdoc(w->index, w->lexidx + 1,
+												values[w->lexidx], NULL);
+
+				keep = weave_doc_matches(doc, w->query);
+			}
+		}
+		MemoryContextSwitchTo(old);
+		ResetExprContext(econtext);
+		if (keep)
+		{
+			*tid = root;
+			return true;
+		}
+	}
+}
+
+static void
+weave_pad_walk_end(WeavePadWalk *w)
+{
+	table_index_fetch_end(w->fetch);
+	ExecDropSingleTupleTableSlot(w->slot);
+	FreeExecutorState(w->estate);
+	table_close(w->heap, AccessShareLock);
+	if (w->seen != NULL)
+		pfree(w->seen);
+	pfree(w->info);
+	pfree(w);
+}
+
 static void
 weave_pad_begin(IndexScanDesc scan, WeaveScanOpaque so)
 {
@@ -3782,6 +3950,16 @@ weave_pad_begin(IndexScanDesc scan, WeaveScanOpaque so)
 	int			i;
 
 	so->padActive = true;
+	/* G94's exhaustion/zero-score proof is unchanged; only enumeration moves.
+	 * Other ordering routes retain their G76 collected gate / NULL handling. */
+	if (!so->vecScan && !so->edistScan && !so->fuseScan &&
+		(so->ordSameQuery || so->ordQueryRestricts) &&
+		!weave_query_lit_covered(so->query))
+	{
+		so->padWalk = weave_pad_walk_begin(index, scan->xs_snapshot, so->query,
+											so->ordered, so->nordered);
+		return;
+	}
 	so->padHeap = table_open(index->rd_index->indrelid, AccessShareLock);
 	so->padSlot = table_slot_create(so->padHeap, NULL);
 	so->padRoots = (OffsetNumber *) palloc(MaxHeapTuplesPerPage * sizeof(OffsetNumber));	/* alloc-ok: one heap page's line pointers, a compile-time bound */
@@ -3959,6 +4137,9 @@ weave_pad_end_walk(WeaveScanOpaque so)
 static void
 weave_pad_end(WeaveScanOpaque so)
 {
+	if (so->padWalk != NULL)
+		weave_pad_walk_end(so->padWalk);
+	so->padWalk = NULL;
 	weave_pad_end_walk(so);
 	if (so->padNulls != NULL)
 		pfree(so->padNulls);
@@ -4066,6 +4247,19 @@ weave_pad_fuse_null(WeaveScanOpaque so, const bool *isnull)
 static bool
 weave_pad_gettuple(IndexScanDesc scan, WeaveScanOpaque so)
 {
+	if (so->padWalk != NULL)
+	{
+		ItemPointerData tid;
+
+		if (weave_pad_walk_next(so->padWalk, &tid))
+		{
+			weave_pad_emit(scan, so, &tid, false);
+			return true;
+		}
+		weave_pad_end(so);
+		so->padDone = true;
+		return false;
+	}
 	/*
 	 * THE GATE WALK (doc/GAPS.md G76): the lexical gate's own sorted TIDs, which
 	 * are HOT-chain roots because they came out of the index.  Each is fetched
@@ -4607,11 +4801,11 @@ weave_gettuple(IndexScanDesc scan, ScanDirection dir)
 	 * widens when the executor drains what is materialized -- which is what
 	 * rows the recheck discards do -- until it can prove nothing further exists
 	 * (candfull / maxhits, vecDone / vecLanes, edistDone, fuseDone / maxhits).
-	 * Two limits remain, both in doc/GAPS.md: a ladder stops widening at
-	 * WEAVE_ORD_WIDTH_MAX candidates, so more rejected rows than that go
-	 * unreturned (a pass that loses every race with a concurrent merge no
-	 * longer ends a ladder short: it raises 40001, G58);
-	 * and the ranked phase emits only documents the ORDER BY argument ranks
+	 * A ladder that reaches WEAVE_ORD_WIDTH_MAX without proving exhaustion
+	 * raises 54000 rather than padding unranked matches at fabricated scores
+	 * (G94/G95). A pass that loses every race with a concurrent merge raises
+	 * 40001 (G58);
+	 * the ranked phase emits only documents the ORDER BY argument ranks
 	 * (for `<=>`, those matching its query).  On the lexical `<=>` route the
 	 * padding phase (weave_pad_gettuple) then emits the rest of the table, so
 	 * `price < c ORDER BY d <=> q` returns every price < c row, as a heap
@@ -8013,7 +8207,8 @@ weave_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filt
 	double		threshold = 0.0;
 	int			t;
 
-	heap = (ScoredTid *) palloc(Max(k, 1) * sizeof(ScoredTid));
+	heap = (ScoredTid *)
+		WEAVE_ALLOC_MAYBE_HUGE((Size) Max(k, 1) * sizeof(ScoredTid));
 
 	/* prime each cursor with its first page */
 	for (t = 0; t < nterms; t++)
@@ -8260,7 +8455,8 @@ weave_search_maxscore(WandCursor *cursors, int nterms, int k,
 				j;
 	int			first_essential;	/* cursors[first_essential..) are essential */
 
-	heap = (ScoredTid *) palloc(Max(k, 1) * sizeof(ScoredTid));
+	heap = (ScoredTid *)
+		WEAVE_ALLOC_MAYBE_HUGE((Size) Max(k, 1) * sizeof(ScoredTid));
 	suffix = (double *) palloc((nterms + 1) * sizeof(double));	/* alloc-ok: nterms = query term count */
 
 	for (t = 0; t < nterms; t++)
@@ -8834,49 +9030,25 @@ weave_topk_visible(Relation index, WeaveQuery q, int k, bool as_distance,
 }
 
 /*
- * Append to results[0..nvis) up to k - nvis visible matches of q it does not
- * hold, at score 0 (distance 1.0), and return the new count.  The ordering
- * scan's padding phase (weave_pad_wanted) has the proof that every one of them
- * scores exactly 0, so the result stays in descending score order.  Its TIDs
- * come out of the index, so they are HOT-chain roots like the ranked ones
- * (doc/GAPS.md G74).  Rechecked always: the collected set over-generates for a
- * NOT over a phrase or a weighted leaf, and the recheck is bounded by k.
- *
- * ponytail: collects q's whole match set, O(match set) before the first row --
- * the same cost doc/GAPS.md G95 accepts for the ordering scan.
+ * Drain the same lazy exact walk as amgettuple, but only as far as the SRF's
+ * requested k.  The caller has already allocated k results and proved ranked
+ * generation exhausted; G94 proves every appended match scores exactly zero.
  */
 static int
 weave_topk_pad(Relation index, WeaveQuery q, int k, bool as_distance,
 			   ScoredTid **results, int nvis)
 {
-	TidSet		m;
-	bool		recheck;
-	ItemPointerData *seen;
-	int			i,
-				n = 0;
+	WeavePadWalk *w = weave_pad_walk_begin(index, GetActiveSnapshot(), q,
+											 *results, nvis);
+	ItemPointerData tid;
 
-	weave_collect_matches(index, q, &m, &recheck);
-	seen = (ItemPointerData *) palloc(Max(nvis, 1) * sizeof(ItemPointerData));	/* alloc-ok: nvis < k, and results is k wide already */
-	for (i = 0; i < nvis; i++)
-		seen[i] = (*results)[i].tid;
-	qsort(seen, nvis, sizeof(ItemPointerData), cmp_tid);
-	for (i = 0; i < m.n; i++)
-		if (nvis == 0 ||
-			bsearch(&m.tids[i], seen, nvis, sizeof(ItemPointerData), cmp_tid) == NULL)
-			m.tids[n++] = m.tids[i];
-	m.n = n;
-	weave_recheck_exact(index, q, &m, k - nvis);
-	/* sized to what it holds, not to k: the caller allocated k */
-	*results = (ScoredTid *) repalloc(*results, Max(nvis + m.n, 1) * sizeof(ScoredTid));	/* alloc-ok: nvis + m.n <= k, the caller's own size */
-	for (i = 0; i < m.n; i++)
+	while (nvis < k && weave_pad_walk_next(w, &tid))
 	{
-		(*results)[nvis].tid = m.tids[i];
+		(*results)[nvis].tid = tid;
 		(*results)[nvis].score = as_distance ? 1.0 : 0.0;
 		nvis++;
 	}
-	pfree(seen);
-	if (m.tids != NULL)
-		pfree(m.tids);
+	weave_pad_walk_end(w);
 	return nvis;
 }
 
@@ -8922,7 +9094,15 @@ weave_topk_pad(Relation index, WeaveQuery q, int k, bool as_distance,
  * that all of it is now reachable by the executor.  Clamped so that
  * width * sizeof(ScoredTid) cannot overflow along the x4 widening ladder.
  */
+/* Reduced-cap proof builds only; no release GUC or runtime branch. */
+#if defined(WEAVE_TEST_HOOKS) && defined(WEAVE_TEST_ORD_WIDTH_MAX)
+#if WEAVE_TEST_ORD_WIDTH_MAX < 64 || WEAVE_TEST_ORD_WIDTH_MAX > INT_MAX / 32
+#error "test ordering width must be between 64 and INT_MAX / 32"
+#endif
+#define WEAVE_ORD_WIDTH_MAX WEAVE_TEST_ORD_WIDTH_MAX
+#else
 #define WEAVE_ORD_WIDTH_MAX (INT_MAX / 32)
+#endif
 
 static int
 weave_ord_width(int k)
@@ -8991,19 +9171,30 @@ weave_ord_pass(Relation index, WeaveScanOpaque so)
 	ScoredTid  *cand = NULL;
 	int			ncand;
 	int			i;
+	int			width = so->curk;
 
-	ncand = weave_topk_candidates_guarded(index, so->query, so->curk, &cand);
+	/*
+	 * Ask for one more at the cap: maxhits is only an upper bound and may
+	 * double-count overlapping terms.  cap + 1 fits int (cap <= INT_MAX/32);
+	 * the candidate heaps use huge-safe Size allocations at this boundary.
+	 */
+	if (width == WEAVE_ORD_WIDTH_MAX)
+		width++;
+	ncand = weave_topk_candidates_guarded(index, so->query, width, &cand);
 
 	/*
 	 * COMPLETENESS SIGNAL.  A pass whose top-k heap never filled scored and
 	 * admitted EVERY matching document: the threshold stays 0.0 until the heap
 	 * holds k entries, and every pruning rule in weave_search_bmw() and
 	 * weave_search_maxscore() is gated on nheap >= k, so nothing was skipped.
-	 * ncand < curk therefore means "this is the entire match set" -- an exact
+	 * ncand < width therefore means "this is the entire match set" -- an exact
 	 * stop for the widening ladder, stronger than the weave_query_maxhits
 	 * estimate it supplements.
 	 */
-	so->candfull = (ncand >= so->curk);
+	so->candfull = (ncand >= width);
+	/* The extra row proves more exist; it must not escape through LIMIT. */
+	if (so->candfull && ncand > so->curk)
+		ncand = so->curk;
 
 	if (ncand > 0 && so->nordered > 0)
 	{
@@ -9083,10 +9274,10 @@ weave_ord_probe(Relation index, WeaveScanOpaque so, int want)
 				newmax = so->maxordered * 2;
 			if (so->ordered == NULL)
 				so->ordered = (ScoredTid *)
-					palloc(newmax * sizeof(ScoredTid));	/* alloc-ok: one entry per visible row materialized, bounded by the pass width, which allocated a same-sized array itself */
+					WEAVE_ALLOC_MAYBE_HUGE((Size) newmax * sizeof(ScoredTid));
 			else
 				so->ordered = (ScoredTid *)
-					repalloc(so->ordered, newmax * sizeof(ScoredTid));	/* alloc-ok: as above */
+					WEAVE_REALLOC_MAYBE_HUGE(so->ordered, (Size) newmax * sizeof(ScoredTid));
 			so->maxordered = newmax;
 		}
 		so->ordered[so->nordered].tid = c->tid;
@@ -9128,9 +9319,12 @@ weave_ord_probe(Relation index, WeaveScanOpaque so, int want)
  *     its candidate list IS the complete match set.  Exact.
  *  2. curk >= maxhits -- the pass was at least as wide as the provable upper
  *     bound on the query's match count (weave_query_maxhits), so no wider pass
- *     can find more.  Nearly redundant now: at that width the heap cannot fill,
- *     so (1) fires anyway.  Kept as a cheap early stop.
+ *     can find more.  Kept as a cheap early stop; equality can fill the heap.
+ *     At the cap the pass probes one extra candidate, so (1) proves exact-cap
+ *     exhaustion even when the upper bound double-counts overlapping terms.
  *
+ * The allocation cap is not a third exhaustion proof: reaching it must ERROR,
+ * never release padding at fabricated zero scores (doc/GAPS.md G94/G95).
  * A broad query with a large (or no) LIMIT is inherently expensive here, but
  * correctness wins; a small-LIMIT first page is still served by the narrow first
  * pass alone.
@@ -9143,7 +9337,11 @@ weave_ord_grow(Relation index, WeaveScanOpaque so)
 	if ((double) so->curk >= so->maxhits)
 		return false;			/* already as wide as every possible match */
 	if (so->curk >= WEAVE_ORD_WIDTH_MAX)
-		return false;			/* cannot widen further */
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("weave lexical ordering candidate limit (%d) reached before ranked exhaustion",
+						WEAVE_ORD_WIDTH_MAX),
+				 errhint("Use a smaller LIMIT, or disable index scans to sort the full result.")));
 
 	so->curk = (so->curk > WEAVE_ORD_WIDTH_MAX / 4)
 		? WEAVE_ORD_WIDTH_MAX : so->curk * 4;
@@ -9527,7 +9725,11 @@ weave_vec_grow(Relation index, WeaveScanOpaque so)
 	if (so->vecDone)
 		return false;			/* the pass returned every live lane */
 	if (so->veck >= WEAVE_ORD_WIDTH_MAX)
-		return false;			/* cannot widen further */
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("weave vector ordering candidate limit (%d) reached before ranked exhaustion",
+						WEAVE_ORD_WIDTH_MAX),
+				 errhint("Use a smaller LIMIT, or disable index scans to sort the full result.")));
 
 	next = (int64) so->veck * 4;
 	if (next > (int64) WEAVE_ORD_WIDTH_MAX)
@@ -9541,8 +9743,8 @@ weave_vec_grow(Relation index, WeaveScanOpaque so)
 	 */
 	if (so->vecLanes > 0 && (uint64) next > so->vecLanes)
 		next = (int64) so->vecLanes;
-	if (next <= (int64) so->veck)
-		return false;			/* progress is not optional: no wider pass exists */
+	/* vecDone already proved veck < vecLanes, and the width cap raised above. */
+	Assert(next > (int64) so->veck);
 
 	so->veck = (int) next;
 	weave_vec_pass(index, so);
@@ -9957,12 +10159,9 @@ weave_edist_grow(Relation index, WeaveScanOpaque so)
 {
 	if (so->edistDone)
 		return false;			/* the pass returned the complete match set */
-	if (so->edistThr >= INT_MAX - 1)
-		return false;
-	/* Progress is not optional: a nextthr that failed to exceed the current
-	 * threshold would repeat the pass forever. */
-	if (so->edistNext <= so->edistThr)
-		so->edistNext = so->edistThr + 1;
+	/* The pass records only distances > edistThr, with INT_MAX meaning done.
+	 * There is no candidate-width cap on this ladder. */
+	Assert(so->edistNext > so->edistThr && so->edistNext < INT_MAX);
 	so->edistThr = so->edistNext;
 	weave_edist_pass(index, so);
 	return true;
@@ -10573,10 +10772,15 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 	int			npend = 0;
 	int			nacc = 0;
 	int			capacc = 0;
+	int			width = so->fusek;
 	bool		complete = true;
 	int			attempt;
 	int			i;
 	int			j;
+
+	/* As in weave_ord_pass, an overlapping union needs a cap + 1 probe. */
+	if (width == WEAVE_ORD_WIDTH_MAX)
+		width++;
 
 	/*
 	 * The @@@ restriction, collected ONCE and cached in the (otherwise unused on
@@ -10975,11 +11179,10 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		vc = (FuseVecChan *)
 			palloc(WEAVE_FUSE_MAX_CHAN * sizeof(FuseVecChan));	/* alloc-ok: as above */
 
-		/* One heap entry per requested candidate.  fusek climbs the x4 ladder to
-		 * WEAVE_ORD_WIDTH_MAX, so this is a corpus-scale allocation and takes the
-		 * huge-safe variant (make check-alloc). */
+		/* One entry per candidate, including the cap + 1 exhaustion probe.
+		 * This corpus-scale allocation needs the huge-safe variant. */
 		heap = (WeaveFuseHit *)
-			WEAVE_ALLOC_MAYBE_HUGE((Size) so->fusek * sizeof(WeaveFuseHit));
+			WEAVE_ALLOC_MAYBE_HUGE((Size) width * sizeof(WeaveFuseHit));
 
 		segctx = AllocSetContextCreate(passctx, "weave fused bolt",
 									   ALLOCSET_DEFAULT_SIZES);
@@ -11353,7 +11556,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 				 * themselves run out, and `live` is NULL so nwarp is not doing
 				 * double duty as a bitmap extent.
 				 */
-				err = weave_fuse_init(&st, cp, nch, heap, so->fusek, NULL,
+				err = weave_fuse_init(&st, cp, nch, heap, width, NULL,
 									  WEAVE_FUSE_END);
 				if (err != WEAVE_FUSE_OK)
 					weave_fuse_error(&st, err);
@@ -11481,7 +11684,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 				 * It is an AND over the bolts: one bolt proving completeness says
 				 * nothing about another.
 				 */
-				if (nh >= so->fusek)
+				if (nh >= width)
 					complete = false;
 
 				if (nh > 0)
@@ -11567,9 +11770,9 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 	 * pending one scoring at least the k-th kept is correctly placed among them;
 	 * one scoring less could be outranked by a flushed document only a wider pass
 	 * finds, so it waits for that pass (and the TID filter below keeps an earlier
-	 * pass's emission from repeating).  A complete pass emits every one, and so
-	 * does the last rung the ladder can reach, because nothing wider is coming
-	 * and the alternative is the padding's +Infinity.
+	 * pass's emission from repeating).  Only proven exhaustion emits every one:
+	 * the width cap is NOT completion, and must not release rows beyond the
+	 * frontier even before weave_fuse_grow() raises the limit error.
 	 *
 	 * DEDUPLICATED BY TID, keeping the better score: a pass that runs between a
 	 * flush's segment add and its list clear sees a document in both places, and
@@ -11578,8 +11781,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 	if (npend > 0)
 	{
 		bool		last = complete ||
-			(double) so->fusek >= so->maxhits ||
-			so->fusek >= WEAVE_ORD_WIDTH_MAX;
+			(double) so->fusek >= so->maxhits;
 		double		frontier = (last || nacc == 0) ? (double) INFINITY
 			: acc[nacc - 1].score;
 		int			nadd = 0;
@@ -11669,7 +11871,11 @@ weave_fuse_grow(Relation index, WeaveScanOpaque so)
 	if ((double) so->fusek >= so->maxhits)
 		return false;			/* already as wide as every possible match */
 	if (so->fusek >= WEAVE_ORD_WIDTH_MAX)
-		return false;			/* cannot widen further */
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("weave fused ordering candidate limit (%d) reached before ranked exhaustion",
+						WEAVE_ORD_WIDTH_MAX),
+				 errhint("Use a smaller LIMIT, or disable index scans to sort the full result.")));
 
 	so->fusek = (so->fusek > WEAVE_ORD_WIDTH_MAX / 4)
 		? WEAVE_ORD_WIDTH_MAX : so->fusek * 4;
