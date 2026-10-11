@@ -37,7 +37,7 @@ BEGIN
    RAISE NOTICE 'G95 CORRECT route=% q=% k=%', route, spec.q, spec.k;
    FOR i IN 1..15 LOOP
     EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ' || sql INTO p;
-    IF route = 'scan' AND p->0->'Plan'->'Plans'->0->>'Node Type' <> 'Index Scan' THEN
+    IF route = 'scan' AND p->0->'Plan'->'Plans'->0->>'Node Type' IS DISTINCT FROM 'Index Scan' THEN
      RAISE EXCEPTION 'G95 not an ordering scan: %', p;
     END IF;
     IF i > 3 THEN

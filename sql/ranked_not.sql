@@ -351,7 +351,7 @@ BEGIN
     PERFORM set_config('enable_seqscan', 'on', true);
     TRUNCATE rp_ref;
     EXECUTE format('EXPLAIN (FORMAT JSON) SELECT id FROM rp WHERE d @@@ %L::wquery', q) INTO plan;
-    IF plan->0->'Plan'->>'Node Type' <> 'Seq Scan' THEN
+    IF plan->0->'Plan'->>'Node Type' IS DISTINCT FROM 'Seq Scan' THEN
       RAISE EXCEPTION 'G95 reference not seqscan: %', plan;
     END IF;
     EXECUTE format('INSERT INTO rp_ref SELECT id, NULL FROM rp WHERE d @@@ %L::wquery', q);
@@ -371,8 +371,8 @@ BEGIN
     PERFORM set_config('enable_sort', 'off', true);
     EXECUTE format('EXPLAIN (FORMAT JSON) SELECT id FROM rp WHERE d @@@ %1$L::wquery '
                    'ORDER BY d <=> %1$L::wquery', q) INTO plan;
-    IF plan->0->'Plan'->>'Node Type' <> 'Index Scan' OR
-       plan->0->'Plan'->>'Index Name' <> 'rp_w' THEN
+    IF plan->0->'Plan'->>'Node Type' IS DISTINCT FROM 'Index Scan' OR
+       plan->0->'Plan'->>'Index Name' IS DISTINCT FROM 'rp_w' THEN
       RAISE EXCEPTION 'G95 ordering site not reached: %', plan;
     END IF;
     FOREACH lim IN ARRAY ARRAY[1, greatest(m - 1, 1), greatest(m, 1), m + 1] LOOP
