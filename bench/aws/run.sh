@@ -110,7 +110,11 @@ case "$JOB" in
 	# merges, holding the index plus its merge output at once.  250 leaves headroom.
 	docvals) VOLGB=${VOLGB_OVERRIDE:-250} ;;
 esac
-REGION=$(aws configure get region --profile "$PROFILE")
+# Every aws call below takes its region from the CLI's own resolution, so
+# AWS_REGION / AWS_DEFAULT_REGION move the whole run; record what it resolved to.
+# (2026-10-11: kiwi's us-east-2 quota was full for hours while us-east-1 and
+# us-west-2 each had ~1,100 vCPUs free.)
+REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region --profile "$PROFILE")}}
 # A random suffix, because the run id names the EC2 key pair and security group:
 # two runs started in the same second (parallel agents) collided on
 # InvalidKeyPair.Duplicate and the second died before launching (2026-10-04).
