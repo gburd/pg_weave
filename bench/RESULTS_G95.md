@@ -115,5 +115,113 @@ SRF row (an outer SQL LIMIT cannot reduce its requested k).
 Sparse predicates may walk the entire heap. That tradeoff is **unmeasured** on
 large sparse prefix/fuzzy/regex corpora, not a claimed win. Those query shapes
 also retain the existing whole-set gate in ranked generation, before padding.
-No disk format, scoring rule, coverage predicate, or ranked exhaustion condition
-changed. No concurrent-update ordering guarantee beyond G94 is added.
+**SUPERSEDED 2026-10-11 (independent review):** the original conclusion here said
+"No disk format, scoring rule, coverage predicate, or ranked exhaustion condition
+changed. No concurrent-update ordering guarantee beyond G94 is added."
+That described the streaming patch, but not an unconditional correctness proof:
+the inherited width-cap branch could start padding before ranked exhaustion.
+The follow-up below fixes that branch. Disk format, scoring and coverage remain
+unchanged; the new concurrency test checks retained-snapshot behavior, not a new
+cross-snapshot ordering guarantee.
+
+
+## Independent-review follow-up: cap is not exhaustion (2026-10-11)
+
+Debian dev host **pgweave-dev-20261011-140738-2421512**, **us-east-1**, c7i.2xlarge;
+PG17.11 / PG18.6. Production fix `7704808`, complete test tree `34478c3`.
+No push or merge. Artifacts pulled incrementally to
+`/scratch/pg_weave/g95-review-evidence/` (raw build/install/SQL/TAP logs,
+library hashes and per-major regression/isolation diffs).
+
+### Correctness change and scope
+
+`weave_ord_grow()`, `weave_vec_grow()` and `weave_fuse_grow()` now raise SQLSTATE
+**54000** if asked to widen past an unproven cap. Each error names the candidate
+limit and supplies a hint. Proven exhaustion still returns false, including a
+full 128-entry heap whose match-count bound is 128. Fused pending rows stay
+behind the ranked frontier at the cap: otherwise a low-scoring pending row could
+escape through LIMIT 129 before the grow function ever ran.
+
+The sibling audit found no reachable edit-distance cap: the pass records only
+next distances strictly above its threshold, with INT_MAX meaning exhausted.
+Its redundant ceiling/progress guards are replaced by that assertion. Likewise,
+vector `next <= veck` is impossible after `vecDone` and the cap check. The
+`weave_search()` SRF's already-correct exhaustion guard is untouched.
+
+**The latency numbers above stand; no remeasurement is claimed.** The lexical
+change is the cap's error path, which none of the measured queries reached;
+ordinary widening, exhaustion, padding and the SRF are unchanged. The fused
+pending change applies only at the cap, and no measured G95 arm used fusion.
+
+### Reduced-cap red / green and release exclusion
+
+The only override is the compile-time `WEAVE_TEST_ORD_WIDTH_MAX`, honored only
+with `WEAVE_TEST_HOOKS`. It adds no GUC or release runtime branch. Reproduce on
+the dev host with `bash bench/aws/g95_review_mutants.sh`; every build/install
+status is checked directly and the installed `.so` is compared with the build.
+
+Before production changes, hook commit `1be81df` (run from test tree `dd7268d`) was exactly `9b26d40`'s production behavior
+with the guarded cap override added. Built with
+`-DWEAVE_TEST_HOOKS -DWEAVE_TEST_ORD_WIDTH_MAX=128`, the ordering-plan oracle in
+`bench/aws/g95_cap.sql` **failed: 172 positive rows fabricated at distance 1**.
+The fixed hook build passes lexical/vector/fused refusal, pending-frontier,
+small-LIMIT and proven-exhaustion controls (`base-cap.log`, `fixed-cap.log`,
+`g95-review-mutants/cap-clean-sql.log`).
+
+A release build made with **only** `-DWEAVE_TEST_ORD_WIDTH_MAX=128` ignores it:
+it returns all 400 rows, with all 300 positive rows at non-padding distances.
+In the same loaded backend `pg_settings` contains no `pg_weave.test_%` GUC;
+the library has no test advisory-GUC string. Its SHA256 equals the subsequent
+ordinary release rebuild. `t/036` repeats the loaded-session GUC absence check.
+This is not a placeholder `SHOW` check.
+
+### Mutation proofs
+
+Each mutant **built, installed a changed hash, reached its NOTICE-marked site,
+and failed its SQL/TAP oracle**; the restored release passed all 14 new TAP
+assertions. `g95-review-mutants/` records each build/install/hash/site and error.
+
+| mutant | observed failure |
+|---|---|
+| lexical cap returns false | 172 positive rows at distance 1; expected 54000 |
+| vector cap returns false | sibling query completes rather than raises 54000 |
+| fused cap returns false | pending-frontier query completes rather than raises 54000 |
+| fused pending cap counted complete | low-scoring pending row escapes at LIMIT 129 |
+| partial predicate bypassed | IDs `1,2,4,5,8,10,11` instead of `2,4,8,10`, both SRF and scan |
+
+### Added test coverage and gate results
+
+`t/036_padding_walk.pl` (also registered in flake.nix) first proves **six actual
+LP_REDIRECT roots**, then requires the SRF to return those roots exactly once.
+A cursor fetches one padding row; another backend commits a HOT update and an
+insert, then VACUUM runs. Page inspection proves the retained heap-only version
+is HOT-updated. The resumed cursor sees the old version once and excludes the
+new insert. Partial and expression indexes each exercise the shared walk through
+both SQL routes; the expression fixture's underlying wdoc column deliberately
+has a different value, so using the wrong datum cannot pass.
+
+The 1,280 randomized windows now require nonincreasing scores in emission order,
+including no positive row after padding. An initial test version discovered a
+**harness error**, not a scorer regression: joining SRF rows to roots may reorder
+them. WITH ORDINALITY now captures SRF order before the join. The expected-output
+refresh came from a full regression run; substituting only the edited echoed
+SQL made old and new output byte-identical, including the 1,280 result. No
+semantic result diff was accepted.
+
+| gate | PG17.11 | PG18.6 |
+|---|---:|---:|
+| full regression | 33/33, empty diffs | 33/33, empty diffs |
+| isolation | 2/2, no diffs | 2/2, no diffs |
+| full TAP | 36 files / 1,501 assertions | 36 files / 1,521 assertions |
+| new padding TAP | 14/14 | 14/14 |
+
+Both build/install statuses and installcheck statuses were checked directly;
+logs contain the suite's own markers, including `t/036`, not just exit 0.
+Allocation, pd_lower, ASCII and rename lints all pass. The five mutation proofs
+above ran on PG17. The initial expected-output mismatch and JOIN-order harness
+failure are disclosed above; neither is counted as a passing gate or a caught
+production mutant.
+
+The host was killed after pulling both majors' logs, and AWS independently
+reported **terminated**. Its security group and key pair were deleted. Only
+this task's host was terminated; other agents' regional hosts were left alone.
