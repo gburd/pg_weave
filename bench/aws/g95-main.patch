@@ -1,7 +1,7 @@
-diff --git a/src/am/amscan.c b/src/am/amscan.c
-index 06ee221..7f52c04 100755
---- a/src/am/amscan.c
-+++ b/src/am/amscan.c
+diff --git b/src/am/amscan.c a/src/am/amscan.c
+index 04e9015..7f52c04 100755
+--- b/src/am/amscan.c
++++ a/src/am/amscan.c
 @@ -152,37 +152,6 @@ typedef struct ScoredTid
  	double		score;
  }			ScoredTid;
@@ -134,7 +134,7 @@ index 06ee221..7f52c04 100755
 -			{
 -				ItemId		item = PageGetItemId(page, off);
 -
--				if (ItemIdIsRedirect(item) ||
+-				if (ItemIdIsRedirected(item) ||
 -					(ItemIdIsNormal(item) &&
 -					 !HeapTupleHeaderIsHeapOnly((HeapTupleHeader) PageGetItem(page, item))))
 -					w->roots[w->nroots++] = off;

@@ -3889,7 +3889,7 @@ weave_pad_walk_next(WeavePadWalk *w, ItemPointer tid)
 			{
 				ItemId		item = PageGetItemId(page, off);
 
-				if (ItemIdIsRedirect(item) ||
+				if (ItemIdIsRedirected(item) ||
 					(ItemIdIsNormal(item) &&
 					 !HeapTupleHeaderIsHeapOnly((HeapTupleHeader) PageGetItem(page, item))))
 					w->roots[w->nroots++] = off;
