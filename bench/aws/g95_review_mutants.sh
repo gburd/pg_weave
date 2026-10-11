@@ -36,6 +36,29 @@ build cap-clean "$capflags"
 cap_sql cap-clean
 grep -q 'G95 lexical cap refused' "$out/cap-clean-sql.log"
 [ "$(grep -c 'G95 sibling cap refused' "$out/cap-clean-sql.log")" = 2 ]
+psql -X -v ON_ERROR_STOP=1 -d g95cap -f bench/aws/g95_cap_overlap.sql >"$out/overlap-clean-sql.log" 2>&1
+grep -q 'G95 overlap controls complete' "$out/overlap-clean-sql.log"
+# Remove only the +1 probes. Both exact-cap counterexamples must fail, and
+# both NOTICEs must fire: a failed build or the wrong route is not a kill.
+python3 - <<'PY'
+p='src/am/amscan.c'; s=open(p).read()
+a='if (width == WEAVE_ORD_WIDTH_MAX)\n\t\twidth++;'
+assert s.count(a)==2
+for route in ('lexical', 'fused'):
+ s=s.replace(a, 'if (width == WEAVE_ORD_WIDTH_MAX)\n\t\telog(NOTICE, "G95 PROBE MUTANT SITE '+route+'");', 1)
+open(p,'w').write(s)
+PY
+build cap-no-probe "$capflags"
+! cmp -s "$out/cap-clean.sha256" "$out/cap-no-probe.sha256"
+if psql -X -v ON_ERROR_STOP=1 -d g95cap -f bench/aws/g95_cap_overlap.sql >"$out/no-probe-sql.log" 2>&1; then
+ echo 'SURVIVED no-probe'; exit 1
+fi
+for route in lexical fused; do
+ grep -q "G95 PROBE MUTANT SITE $route" "$out/no-probe-sql.log"
+ grep -q "G95 overlap FAIL $route exact cap: unexpected 54000" "$out/no-probe-sql.log"
+done
+grep -q 'ERROR:.*G95 overlap controls failed:' "$out/no-probe-sql.log"
+echo 'KILLED no-probe: built installed both sites reached both exact-cap oracles failed'
 for route in lexical vector fused frontier; do
  cp "$out/amscan.clean.c" src/am/amscan.c
  ROUTE=$route python3 - <<'PY'

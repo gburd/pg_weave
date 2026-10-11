@@ -8207,7 +8207,8 @@ weave_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filt
 	double		threshold = 0.0;
 	int			t;
 
-	heap = (ScoredTid *) palloc(Max(k, 1) * sizeof(ScoredTid));
+	heap = (ScoredTid *)
+		WEAVE_ALLOC_MAYBE_HUGE((Size) Max(k, 1) * sizeof(ScoredTid));
 
 	/* prime each cursor with its first page */
 	for (t = 0; t < nterms; t++)
@@ -8454,7 +8455,8 @@ weave_search_maxscore(WandCursor *cursors, int nterms, int k,
 				j;
 	int			first_essential;	/* cursors[first_essential..) are essential */
 
-	heap = (ScoredTid *) palloc(Max(k, 1) * sizeof(ScoredTid));
+	heap = (ScoredTid *)
+		WEAVE_ALLOC_MAYBE_HUGE((Size) Max(k, 1) * sizeof(ScoredTid));
 	suffix = (double *) palloc((nterms + 1) * sizeof(double));	/* alloc-ok: nterms = query term count */
 
 	for (t = 0; t < nterms; t++)
@@ -9169,19 +9171,30 @@ weave_ord_pass(Relation index, WeaveScanOpaque so)
 	ScoredTid  *cand = NULL;
 	int			ncand;
 	int			i;
+	int			width = so->curk;
 
-	ncand = weave_topk_candidates_guarded(index, so->query, so->curk, &cand);
+	/*
+	 * Ask for one more at the cap: maxhits is only an upper bound and may
+	 * double-count overlapping terms.  cap + 1 fits int (cap <= INT_MAX/32);
+	 * the candidate heaps use huge-safe Size allocations at this boundary.
+	 */
+	if (width == WEAVE_ORD_WIDTH_MAX)
+		width++;
+	ncand = weave_topk_candidates_guarded(index, so->query, width, &cand);
 
 	/*
 	 * COMPLETENESS SIGNAL.  A pass whose top-k heap never filled scored and
 	 * admitted EVERY matching document: the threshold stays 0.0 until the heap
 	 * holds k entries, and every pruning rule in weave_search_bmw() and
 	 * weave_search_maxscore() is gated on nheap >= k, so nothing was skipped.
-	 * ncand < curk therefore means "this is the entire match set" -- an exact
+	 * ncand < width therefore means "this is the entire match set" -- an exact
 	 * stop for the widening ladder, stronger than the weave_query_maxhits
 	 * estimate it supplements.
 	 */
-	so->candfull = (ncand >= so->curk);
+	so->candfull = (ncand >= width);
+	/* The extra row proves more exist; it must not escape through LIMIT. */
+	if (so->candfull && ncand > so->curk)
+		ncand = so->curk;
 
 	if (ncand > 0 && so->nordered > 0)
 	{
@@ -9261,10 +9274,10 @@ weave_ord_probe(Relation index, WeaveScanOpaque so, int want)
 				newmax = so->maxordered * 2;
 			if (so->ordered == NULL)
 				so->ordered = (ScoredTid *)
-					palloc(newmax * sizeof(ScoredTid));	/* alloc-ok: one entry per visible row materialized, bounded by the pass width, which allocated a same-sized array itself */
+					WEAVE_ALLOC_MAYBE_HUGE((Size) newmax * sizeof(ScoredTid));
 			else
 				so->ordered = (ScoredTid *)
-					repalloc(so->ordered, newmax * sizeof(ScoredTid));	/* alloc-ok: as above */
+					WEAVE_REALLOC_MAYBE_HUGE(so->ordered, (Size) newmax * sizeof(ScoredTid));
 			so->maxordered = newmax;
 		}
 		so->ordered[so->nordered].tid = c->tid;
@@ -9306,8 +9319,9 @@ weave_ord_probe(Relation index, WeaveScanOpaque so, int want)
  *     its candidate list IS the complete match set.  Exact.
  *  2. curk >= maxhits -- the pass was at least as wide as the provable upper
  *     bound on the query's match count (weave_query_maxhits), so no wider pass
- *     can find more.  Nearly redundant now: at that width the heap cannot fill,
- *     so (1) fires anyway.  Kept as a cheap early stop.
+ *     can find more.  Kept as a cheap early stop; equality can fill the heap.
+ *     At the cap the pass probes one extra candidate, so (1) proves exact-cap
+ *     exhaustion even when the upper bound double-counts overlapping terms.
  *
  * The allocation cap is not a third exhaustion proof: reaching it must ERROR,
  * never release padding at fabricated zero scores (doc/GAPS.md G94/G95).
@@ -10758,10 +10772,15 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 	int			npend = 0;
 	int			nacc = 0;
 	int			capacc = 0;
+	int			width = so->fusek;
 	bool		complete = true;
 	int			attempt;
 	int			i;
 	int			j;
+
+	/* As in weave_ord_pass, an overlapping union needs a cap + 1 probe. */
+	if (width == WEAVE_ORD_WIDTH_MAX)
+		width++;
 
 	/*
 	 * The @@@ restriction, collected ONCE and cached in the (otherwise unused on
@@ -11160,11 +11179,10 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 		vc = (FuseVecChan *)
 			palloc(WEAVE_FUSE_MAX_CHAN * sizeof(FuseVecChan));	/* alloc-ok: as above */
 
-		/* One heap entry per requested candidate.  fusek climbs the x4 ladder to
-		 * WEAVE_ORD_WIDTH_MAX, so this is a corpus-scale allocation and takes the
-		 * huge-safe variant (make check-alloc). */
+		/* One entry per candidate, including the cap + 1 exhaustion probe.
+		 * This corpus-scale allocation needs the huge-safe variant. */
 		heap = (WeaveFuseHit *)
-			WEAVE_ALLOC_MAYBE_HUGE((Size) so->fusek * sizeof(WeaveFuseHit));
+			WEAVE_ALLOC_MAYBE_HUGE((Size) width * sizeof(WeaveFuseHit));
 
 		segctx = AllocSetContextCreate(passctx, "weave fused bolt",
 									   ALLOCSET_DEFAULT_SIZES);
@@ -11538,7 +11556,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 				 * themselves run out, and `live` is NULL so nwarp is not doing
 				 * double duty as a bitmap extent.
 				 */
-				err = weave_fuse_init(&st, cp, nch, heap, so->fusek, NULL,
+				err = weave_fuse_init(&st, cp, nch, heap, width, NULL,
 									  WEAVE_FUSE_END);
 				if (err != WEAVE_FUSE_OK)
 					weave_fuse_error(&st, err);
@@ -11666,7 +11684,7 @@ weave_fuse_pass(Relation index, WeaveScanOpaque so)
 				 * It is an AND over the bolts: one bolt proving completeness says
 				 * nothing about another.
 				 */
-				if (nh >= so->fusek)
+				if (nh >= width)
 					complete = false;
 
 				if (nh > 0)

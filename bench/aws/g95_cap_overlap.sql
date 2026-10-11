@@ -62,6 +62,13 @@ SELECT pg_temp.capcheck(
 SELECT pg_temp.capcheck(
   'SELECT id FROM capoverlap ORDER BY fuse(d <=> ''fox''::wquery, d <=> ''dog''::wquery)',
   -1, 'fused cap plus one');
+-- Do not let the probe itself escape as a successful LIMIT cap+1 prefix.
+SELECT pg_temp.capcheck(
+  'SELECT id FROM capoverlap WHERE d @@@ ''fox | dog''::wquery ORDER BY d <=> ''fox | dog''::wquery LIMIT 129',
+  -1, 'lexical cap plus one LIMIT');
+SELECT pg_temp.capcheck(
+  'SELECT id FROM capoverlap ORDER BY fuse(d <=> ''fox''::wquery, d <=> ''dog''::wquery) LIMIT 129',
+  -1, 'fused cap plus one LIMIT');
 DO $$
 DECLARE failures text;
 BEGIN
