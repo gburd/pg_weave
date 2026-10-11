@@ -419,7 +419,7 @@ INSERT INTO rp (id, d) SELECT g, to_wdoc('simple', CASE WHEN g % 2 = 0 THEN '' E
   FROM generate_series(258, 273) g;
 INSERT INTO rp_roots SELECT ctid, id FROM rp WHERE id > 257;
 CREATE TEMP TABLE rp_ref (id int PRIMARY KEY, score float8);
-CREATE TEMP TABLE rp_got (id int, score float8);
+CREATE TEMP TABLE rp_got (id int, score float8, ord bigint GENERATED ALWAYS AS IDENTITY);
 CREATE FUNCTION pg_temp.pad_random() RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
   q text; leaf text; j int; m int; lim int; off int; ties bool;
@@ -446,8 +446,8 @@ BEGIN
     SELECT count(*) INTO m FROM rp_ref;
     -- Full SRF must agree with the independent set, roots included.
     TRUNCATE rp_got;
-    INSERT INTO rp_got SELECT r.id, s.score FROM weave_search('rp_w', q::wquery, 10000) s
-      LEFT JOIN rp_roots r ON r.tid = s.ctid;
+    INSERT INTO rp_got (id, score) SELECT r.id, s.score FROM weave_search('rp_w', q::wquery, 10000) WITH ORDINALITY s
+      LEFT JOIN rp_roots r ON r.tid = s.ctid ORDER BY s.ordinality;
     IF (SELECT count(*) FROM rp_got) <> m OR
        (SELECT count(DISTINCT id) FROM rp_got) <> m OR
        EXISTS (SELECT 1 FROM rp_got g LEFT JOIN rp_ref r USING (id) WHERE r.id IS NULL) THEN
@@ -476,13 +476,20 @@ BEGIN
                         'FROM rp WHERE d @@@ %1$L::wquery ORDER BY d <=> %1$L::wquery '
                         'OFFSET %2$s FETCH FIRST %3$s ROWS %4$s', q, off, lim,
                         CASE WHEN ties THEN 'WITH TIES' ELSE 'ONLY' END);
-          EXECUTE 'INSERT INTO rp_got SELECT id, 1.0 / dist - 1.0 FROM (' || sql || ') x';
+          EXECUTE 'INSERT INTO rp_got (id, score) SELECT id, 1.0 / dist - 1.0 FROM (' || sql || ') x';
+          -- Identity records insertion/emission order; never sort the answer
+          -- by score before checking it. In particular no positive may follow 0.
+          IF EXISTS (SELECT 1 FROM
+               (SELECT score, lag(score) OVER (ORDER BY ord) AS prev FROM rp_got) s
+               WHERE score > prev) THEN
+            RAISE EXCEPTION 'G95 emission order mismatch q=% lim=% off=% ties=%', q, lim, off, ties;
+          END IF;
           IF (SELECT count(*) FROM rp_got) <> want OR
              (SELECT count(DISTINCT id) FROM rp_got) <> want OR
              EXISTS (SELECT 1 FROM rp_got g LEFT JOIN rp_ref r USING (id)
                       WHERE r.id IS NULL OR abs(r.score - g.score) > 1e-8) OR
              EXISTS (SELECT 1 FROM
-               (SELECT score, row_number() OVER (ORDER BY score DESC) AS pos FROM rp_got) g
+               (SELECT score, row_number() OVER (ORDER BY ord) AS pos FROM rp_got) g
                JOIN (SELECT score, row_number() OVER (ORDER BY score DESC) AS pos FROM rp_ref) r
                  ON r.pos = g.pos + off WHERE abs(r.score - g.score) > 1e-8) THEN
             RAISE EXCEPTION 'G95 window mismatch q=% lim=% off=% ties=% want=%', q, lim, off, ties, want;
@@ -491,14 +498,14 @@ BEGIN
         END LOOP;
       END LOOP;
       TRUNCATE rp_got;
-      INSERT INTO rp_got SELECT r.id, s.score FROM weave_search('rp_w', q::wquery, lim) s
-        LEFT JOIN rp_roots r ON r.tid = s.ctid;
+      INSERT INTO rp_got (id, score) SELECT r.id, s.score FROM weave_search('rp_w', q::wquery, lim) WITH ORDINALITY s
+        LEFT JOIN rp_roots r ON r.tid = s.ctid ORDER BY s.ordinality;
       IF (SELECT count(*) FROM rp_got) <> least(lim, m) OR
          (SELECT count(DISTINCT id) FROM rp_got) <> least(lim, m) OR
          EXISTS (SELECT 1 FROM rp_got g LEFT JOIN rp_ref r USING (id)
                   WHERE r.id IS NULL OR abs(r.score - g.score) > 1e-8) OR
          EXISTS (SELECT 1 FROM
-           (SELECT score, row_number() OVER (ORDER BY score DESC) AS pos FROM rp_got) g
+           (SELECT score, row_number() OVER (ORDER BY ord) AS pos FROM rp_got) g
            JOIN (SELECT score, row_number() OVER (ORDER BY score DESC) AS pos FROM rp_ref) r
              USING (pos) WHERE abs(r.score - g.score) > 1e-8) THEN
         RAISE EXCEPTION 'G95 limited SRF mismatch q=% k=%', q, lim;
