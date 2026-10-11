@@ -6993,6 +6993,34 @@ would fix this too.
 
 ### G95 — an uncovered NOT / prefix / fuzzy / regex ranked scan costs O(match set) before its first padded row — **ACCEPTED FOR NOW by maintainer decision 2026-10-08; REVISIT when a streaming padding walk exists**
 
+**FIXED 2026-10-11 on `wt/g95` (padding collection only).** The historical cost
+below is **SUPERSEDED**, not retracted: it was correct for the materializing
+implementation. `weave_pad_walk_begin/next/end()` now serve both the ordering
+scan and `weave_topk_pad()`: enumerate heap HOT roots in ascending TID-derived
+docid order, fetch under the snapshot, apply the partial-index predicate and
+exact query, skip ranked TIDs, and stop on demand (SRF: at its requested k).
+G94's ranked-exhaustion and score-zero proof is unchanged.
+
+Measured against exact main `f0b6ed7`, A/A first then A/B twice at both scales,
+run **pgweave-20261011-134626-a1aa, us-west-2**, c7i.2xlarge, PG17.11:
+`!w1` LIMIT 10 scan 29.475/29.526 -> 0.737/0.746 ms at 200k and
+146.723/147.048 -> 3.700/3.681 ms at 1M; SRF k=10
+29.629/29.609 -> 0.729/0.714 and 147.040/147.387 -> 3.687/3.671 ms.
+`rare | !w1` LIMIT 5000 scan 32.281/32.289 -> 3.978/3.982 and
+154.181/154.595 -> 9.919/9.872 ms. Every measured query passed correctness
+before timing. Both PG17/18 full regression, isolation and TAP pass; three
+built, installed, site-reaching mutants caught exact-recheck, dedup and HOT-root
+violations. Full numbers, A/A spreads, p99, losses and evidence:
+`bench/RESULTS_G95.md`, raw summaries `bench/RESULTS_G95.csv`.
+
+**Not an end-to-end sublinear-query claim:** ranked generation still reads
+postings for NOT and materializes gates for prefix/fuzzy/regex. A sparse
+predicate can still make the new padding walk traverse the heap; that case
+is unmeasured at scale. The SRF materializes up to its explicit k before its
+first call returns, so an outer LIMIT does not shorten that k. These are not
+whole-match-set padding startup costs, which is the gap closed here.
+
+
 G94's fix pads the ranked scan with every match that holds no literal term, and
 `weave_pad_begin()` collects q's WHOLE match set before emitting the first padded row. So the
 cost is linear in the match set and independent of LIMIT: `!w1` LIMIT 10 is 32 ms at 200k rows
