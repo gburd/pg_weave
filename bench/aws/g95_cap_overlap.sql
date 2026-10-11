@@ -17,6 +17,9 @@ LANGUAGE plpgsql AS $$
 DECLARE p json; n int; unique_n int;
 BEGIN
   EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+  IF p->0->'Plan'->>'Node Type' = 'Limit' THEN
+    p := json_build_array(json_build_object('Plan', p->0->'Plan'->'Plans'->0));
+  END IF;
   IF p->0->'Plan'->>'Node Type' <> 'Index Scan' THEN
     RAISE EXCEPTION 'G95 overlap ordering site not reached: %', p;
   END IF;
