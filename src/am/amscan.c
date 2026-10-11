@@ -9092,7 +9092,15 @@ weave_topk_pad(Relation index, WeaveQuery q, int k, bool as_distance,
  * that all of it is now reachable by the executor.  Clamped so that
  * width * sizeof(ScoredTid) cannot overflow along the x4 widening ladder.
  */
+/* Reduced-cap proof builds only; no release GUC or runtime branch. */
+#if defined(WEAVE_TEST_HOOKS) && defined(WEAVE_TEST_ORD_WIDTH_MAX)
+#if WEAVE_TEST_ORD_WIDTH_MAX < 64 || WEAVE_TEST_ORD_WIDTH_MAX > INT_MAX / 32
+#error "test ordering width must be between 64 and INT_MAX / 32"
+#endif
+#define WEAVE_ORD_WIDTH_MAX WEAVE_TEST_ORD_WIDTH_MAX
+#else
 #define WEAVE_ORD_WIDTH_MAX (INT_MAX / 32)
+#endif
 
 static int
 weave_ord_width(int k)
