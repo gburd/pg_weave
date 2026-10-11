@@ -392,7 +392,11 @@ BEGIN
           IF (SELECT count(*) FROM rp_got) <> want OR
              (SELECT count(DISTINCT id) FROM rp_got) <> want OR
              EXISTS (SELECT 1 FROM rp_got g LEFT JOIN rp_ref r USING (id)
-                      WHERE r.id IS NULL OR abs(r.score - g.score) > 1e-8) THEN
+                      WHERE r.id IS NULL OR abs(r.score - g.score) > 1e-8) OR
+             EXISTS (SELECT 1 FROM
+               (SELECT score, row_number() OVER (ORDER BY score DESC) AS pos FROM rp_got) g
+               JOIN (SELECT score, row_number() OVER (ORDER BY score DESC) AS pos FROM rp_ref) r
+                 ON r.pos = g.pos + off WHERE abs(r.score - g.score) > 1e-8) THEN
             RAISE EXCEPTION 'G95 window mismatch q=% lim=% off=% ties=% want=%', q, lim, off, ties, want;
           END IF;
           n := n + 1;
@@ -404,7 +408,11 @@ BEGIN
       IF (SELECT count(*) FROM rp_got) <> least(lim, m) OR
          (SELECT count(DISTINCT id) FROM rp_got) <> least(lim, m) OR
          EXISTS (SELECT 1 FROM rp_got g LEFT JOIN rp_ref r USING (id)
-                  WHERE r.id IS NULL OR abs(r.score - g.score) > 1e-8) THEN
+                  WHERE r.id IS NULL OR abs(r.score - g.score) > 1e-8) OR
+         EXISTS (SELECT 1 FROM
+           (SELECT score, row_number() OVER (ORDER BY score DESC) AS pos FROM rp_got) g
+           JOIN (SELECT score, row_number() OVER (ORDER BY score DESC) AS pos FROM rp_ref) r
+             USING (pos) WHERE abs(r.score - g.score) > 1e-8) THEN
         RAISE EXCEPTION 'G95 limited SRF mismatch q=% k=%', q, lim;
       END IF;
     END LOOP;
