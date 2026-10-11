@@ -14,7 +14,7 @@ install() {
  make -j2 with_llvm=no > "$out/$1-build.log" 2>&1 || {
   tail -60 "$out/$1-build.log"; return 1;
  }
- sudo make install with_llvm=no > "$out/$1-install.log" 2>&1 || {
+ sudo make install PG_CONFIG="$PG_CONFIG" with_llvm=no > "$out/$1-install.log" 2>&1 || {
   tail -60 "$out/$1-install.log"; return 1;
  }
  echo "BUILT AND INSTALLED $1"

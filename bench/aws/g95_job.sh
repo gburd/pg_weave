@@ -26,7 +26,7 @@ build() {
 }
 install() {
  local tree=$1 arm=$2
- (cd "$tree"; sudo make install with_llvm=no >"$out/$arm-install.log" 2>&1) || {
+ (cd "$tree"; sudo make install PG_CONFIG="$PG_CONFIG" with_llvm=no >"$out/$arm-install.log" 2>&1) || {
    tail -60 "$out/$arm-install.log"; exit 1;
  }
  sha256sum "$($PG_CONFIG --pkglibdir)/pg_weave.so" >> "$out/libraries.txt"
