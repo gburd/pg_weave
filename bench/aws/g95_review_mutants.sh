@@ -36,21 +36,32 @@ build cap-clean "$capflags"
 cap_sql cap-clean
 grep -q 'G95 lexical cap refused' "$out/cap-clean-sql.log"
 [ "$(grep -c 'G95 sibling cap refused' "$out/cap-clean-sql.log")" = 2 ]
-for route in lexical vector fused; do
+for route in lexical vector fused frontier; do
  cp "$out/amscan.clean.c" src/am/amscan.c
  ROUTE=$route python3 - <<'PY'
 import os,re
 p='src/am/amscan.c'; s=open(p).read(); route=os.environ['ROUTE']
-pattern=r'ereport\(ERROR,\s*\(errcode\(ERRCODE_PROGRAM_LIMIT_EXCEEDED\),\s*errmsg\("weave '+route+r' ordering candidate limit.*?errhint\("Use a smaller LIMIT, or disable index scans to sort the full result\."\)\)\);'
-s,n=re.subn(pattern, '{ elog(NOTICE, "G95 CAP MUTANT SITE '+route+'"); return false; }', s, flags=re.S)
-assert n==1,n
+if route == 'frontier':
+ a='bool\t\tlast = complete ||\n\t\t\t(double) so->fusek >= so->maxhits;'
+ b='bool\t\tlast = complete ||\n\t\t\t(double) so->fusek >= so->maxhits ||\n\t\t\tso->fusek >= WEAVE_ORD_WIDTH_MAX;'
+ assert s.count(a)==1
+ s=s.replace(a,b)
+ a='int\t\t\tnadd = 0;'
+ # This declaration occurs elsewhere too: instrument beside the frontier only.
+ a=': acc[nacc - 1].score;\n\t\tint\t\t\tnadd = 0;'
+ assert s.count(a)==1
+ s=s.replace(a,a+'\n\t\tif (so->fusek >= WEAVE_ORD_WIDTH_MAX) elog(NOTICE, "G95 CAP MUTANT SITE frontier");')
+else:
+ pattern=r'ereport\(ERROR,\s*\(errcode\(ERRCODE_PROGRAM_LIMIT_EXCEEDED\),\s*errmsg\("weave '+route+r' ordering candidate limit.*?errhint\("Use a smaller LIMIT, or disable index scans to sort the full result\."\)\)\);'
+ s,n=re.subn(pattern, '{ elog(NOTICE, "G95 CAP MUTANT SITE '+route+'"); return false; }', s, flags=re.S)
+ assert n==1,n
 open(p,'w').write(s)
 PY
  build "cap-$route" "$capflags"
  ! cmp -s "$out/cap-clean.sha256" "$out/cap-$route.sha256"
  if cap_sql "cap-$route"; then echo "SURVIVED $route"; exit 1; fi
  grep -q "G95 CAP MUTANT SITE $route" "$out/cap-$route-sql.log"
- grep -q 'ERROR:.*G95 .*cap not refused' "$out/cap-$route-sql.log"
+ grep -Eq 'ERROR:.*G95 (.*cap not refused|pending frontier released)' "$out/cap-$route-sql.log"
  echo "KILLED $route: built installed site reached oracle failed"
 done
 cp "$out/amscan.clean.c" src/am/amscan.c

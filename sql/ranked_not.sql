@@ -358,8 +358,8 @@ BEGIN
     SELECT count(*) INTO m FROM rp_ref;
     -- Full SRF must agree with the independent set, roots included.
     TRUNCATE rp_got;
-    INSERT INTO rp_got (id, score) SELECT r.id, s.score FROM weave_search('rp_w', q::wquery, 10000) s
-      LEFT JOIN rp_roots r ON r.tid = s.ctid;
+    INSERT INTO rp_got (id, score) SELECT r.id, s.score FROM weave_search('rp_w', q::wquery, 10000) WITH ORDINALITY s
+      LEFT JOIN rp_roots r ON r.tid = s.ctid ORDER BY s.ordinality;
     IF (SELECT count(*) FROM rp_got) <> m OR
        (SELECT count(DISTINCT id) FROM rp_got) <> m OR
        EXISTS (SELECT 1 FROM rp_got g LEFT JOIN rp_ref r USING (id) WHERE r.id IS NULL) THEN
@@ -410,8 +410,8 @@ BEGIN
         END LOOP;
       END LOOP;
       TRUNCATE rp_got;
-      INSERT INTO rp_got (id, score) SELECT r.id, s.score FROM weave_search('rp_w', q::wquery, lim) s
-        LEFT JOIN rp_roots r ON r.tid = s.ctid;
+      INSERT INTO rp_got (id, score) SELECT r.id, s.score FROM weave_search('rp_w', q::wquery, lim) WITH ORDINALITY s
+        LEFT JOIN rp_roots r ON r.tid = s.ctid ORDER BY s.ordinality;
       IF (SELECT count(*) FROM rp_got) <> least(lim, m) OR
          (SELECT count(DISTINCT id) FROM rp_got) <> least(lim, m) OR
          EXISTS (SELECT 1 FROM rp_got g LEFT JOIN rp_ref r USING (id)
