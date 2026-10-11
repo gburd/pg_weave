@@ -7048,6 +7048,33 @@ PG17 after build/install/site proofs. The host is verified terminated. The
 cap-only fix does not touch G95's measured lexical/SRF path, so the us-west-2
 latencies above stand without remeasurement.
 
+**SUPERSEDED 2026-10-11 (G95 re-review):** the review fix's exact-cap
+exhaustion handling was incomplete: maxhits is an upper bound, not a count.
+With cap 128, 128 `fox dog` documents plus 128 empty documents give lexical
+`fox | dog` a bound of 256; two fused channels over 128 `fox dog` documents
+also sum to 256. Both raised 54000 on `dbf22ed`, despite having all candidates.
+`28df190` asks for cap + 1 internally on the final lexical/fused pass and tests
+completeness against that width (per bolt for fusion). A filled probe is
+trimmed to the nominal cap before emission; it cannot escape through LIMIT
+or release pending rows/padding. An unfilled probe proves exhaustion without
+requiring the bound to be tight. The prior error behavior remains for sets
+strictly above the cap, including cap + 1.
+
+Tests `bench/aws/g95_cap_overlap.sql` were committed first (`2140c2f`) and
+both counterexamples failed on the unchanged `dbf22ed` production code.
+Fixed controls pass, including exact-cap padding, cap + 1 with and without
+LIMIT, and the existing single-term exact-cap and larger-set refusals. Removing
+the probes built, installed, reached both marked sites and failed both exact-cap
+oracles; all five older review mutants were also caught. Dev run
+**pgweave-dev-20261011-144050-2511078, us-east-1**: PG17.11 / PG18.6 each
+33 regression + 2 isolation, no diffs, and 36 TAP files (1,581 / 1,521
+assertions); four lints pass. Host killed and independently verified terminated.
+Cap + 1 fits int, but its 16-byte candidate heap is 1 GB, one byte above
+MaxAllocSize: BMW/MaxScore heaps and ordered-array growth now use existing
+huge-safe Size allocations. Because those sites also run at LIMIT 10, the
+latency claim is remeasured in us-west-2 rather than inherited; see
+`bench/RESULTS_G95.md` for the new run and allocation scope.
+
 
 G94's fix pads the ranked scan with every match that holds no literal term, and
 `weave_pad_begin()` collects q's WHOLE match set before emitting the first padded row. So the
