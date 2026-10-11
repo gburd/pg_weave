@@ -436,17 +436,28 @@ $SSH 'cd pg_weave && nproc && free -g | head -2 && lscpu | grep -E "^Model name|
 # ---------------------------------------------------------------------------
 run_smoke() {
 	say "build"
-	$SSH 'cd pg_weave && make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config 2>&1 \
-			| grep -viE "^(gcc|clang) " | tail -25; test -f pg_weave.so' \
-		| tee "$OUT/build.log" || die "build failed (see $OUT/build.log)"
-	say "build produced pg_weave.so"
+	# make's OWN status, after `make clean`: the old form piped make through
+	# grep|tail and then tested `-f pg_weave.so`, which reports a stale .so as a
+	# successful build (AGENTS.md, ninth member).  with_llvm=no keeps PGXS from
+	# writing bitcode the image's clang and PG's LLVM disagree about (tenth member).
+	$SSH 'cd pg_weave && make clean PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
+		  make with_llvm=no PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/tmp/build.log 2>&1
+		  rc=$?; grep -viE "^(gcc|clang) " /tmp/build.log | tail -25; exit $rc' \
+		> "$OUT/build.log" 2>&1 \
+		|| { cat "$OUT/build.log" >&2; die "build failed (see $OUT/build.log)"; }
+	say "build succeeded (make exit 0)"
 
 	say "lint gates"
 	$SSH 'cd pg_weave && for t in check-ascii check-alloc check-rename; do
 			printf "%-14s " "$t"
 			make -s $t PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1 \
 				&& echo PASS || echo FAIL
-		  done' 2>&1 | tee "$OUT/lint.log"
+		  done' > "$OUT/lint.log" 2>&1
+	cat "$OUT/lint.log"
+	# A lint that prints FAIL and lets the job continue is a gate that cannot fail.
+	if grep -q FAIL "$OUT/lint.log" || [ "$(grep -c PASS "$OUT/lint.log")" != 3 ]; then
+		die "lint gate failed (see $OUT/lint.log)"
+	fi
 
 	say "standalone codec property test (17741 checks)"
 	$SSH 'cd pg_weave && gcc -O2 -I include -o /tmp/tq test/hegel/test_quantize.c \
@@ -475,8 +486,11 @@ run_smoke() {
 	# The status has to be rescued on BOTH sides of the ssh: the remote shell's own
 	# exit status is `tail`'s, so the log goes to a file, the status is saved, the
 	# tail is printed, and the status is re-raised.
-	$SSH 'cd pg_weave && sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/dev/null 2>&1
-		  sudo -u postgres pg_ctlcluster 17 main start 2>/dev/null || true
+	# The install's status is checked too: an install that fails after writing
+	# part of the bitcode tree is the tenth member's delayed-fuse landmine.
+	$SSH 'cd pg_weave && sudo make install with_llvm=no PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/tmp/install.log 2>&1' \
+		|| { $SSH 'tail -30 /tmp/install.log' >&2; die "make install failed"; }
+	$SSH 'cd pg_weave && sudo -u postgres pg_ctlcluster 17 main start 2>/dev/null || true
 		  sudo -u postgres createuser -s $(whoami) 2>/dev/null || true
 		  make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config >/tmp/ic.log 2>&1
 		  rc=$?; tail -30 /tmp/ic.log; exit $rc' \
