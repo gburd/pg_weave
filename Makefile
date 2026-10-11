@@ -560,7 +560,8 @@ check-sparsemap-wire:
 .PHONY: check-fuzz
 check-fuzz:
 	@if command -v $${CC:-clang} >/dev/null 2>&1 || command -v clang >/dev/null 2>&1; then \
-		bash test/fuzz/run.sh | tail -3; \
+		bash test/fuzz/run.sh >/tmp/pgw-fuzz.log 2>&1; rc=$$?; tail -3 /tmp/pgw-fuzz.log; \
+		if [ $$rc -ne 0 ]; then cat /tmp/pgw-fuzz.log; exit $$rc; fi; \
 	else \
 		echo "SKIP check-fuzz: clang not found (ASan+UBSan harness needs it)"; \
 	fi
