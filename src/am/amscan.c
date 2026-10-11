@@ -152,6 +152,37 @@ typedef struct ScoredTid
 	double		score;
 }			ScoredTid;
 
+/*
+ * G95: a lazy walk of heap HOT roots, in global docid (TID) order.  Unlike a
+ * materialized gate, its startup does not depend on the match count.  Query
+ * and ranked TIDs are borrowed; all other resources belong to the walk.
+ */
+typedef struct WeavePadWalk
+{
+	Relation	index;
+	Relation	heap;
+	Snapshot	snapshot;
+	WeaveQuery	query;
+	IndexInfo  *info;
+	EState	   *estate;
+	ExprState  *predicate;
+	TupleTableSlot *slot;
+	IndexFetchTableData *fetch;
+	int			lexidx;
+	BlockNumber nblocks;
+	BlockNumber block;
+	OffsetNumber roots[MaxHeapTuplesPerPage];
+	int			nroots;
+	int			pos;
+	ItemPointerData *seen;
+	int			nseen;
+} WeavePadWalk;
+
+static WeavePadWalk *weave_pad_walk_begin(Relation index, Snapshot snapshot,
+										 WeaveQuery query, ScoredTid *ranked, int n);
+static bool weave_pad_walk_next(WeavePadWalk *w, ItemPointer tid);
+static void weave_pad_walk_end(WeavePadWalk *w);
+
 static int weave_topk_visible(Relation index, WeaveQuery q, int k,
 							 bool as_distance, ScoredTid **out);
 static int weave_topk_pad(Relation index, WeaveQuery q, int k, bool as_distance,
@@ -455,6 +486,7 @@ typedef struct WeaveScanOpaqueData
 	 * evaluated on a heap row does not have either (orderby.sql section L14) --
 	 * and the padding extends that ordering; it does not re-derive the heap's.
 	 */
+	WeavePadWalk *padWalk;	/* G95: uncovered lexical query only */
 	bool		padActive;
 	bool		padDone;		/* the heap walk finished: never restart it */
 	TableScanDesc padScan;
@@ -3775,6 +3807,142 @@ weave_pad_wanted(IndexScanDesc scan, WeaveScanOpaque so)
 	return !weave_query_lit_covered(so->query);
 }
 
+/*
+ * No index page is cached here: walking the heap also covers pending and
+ * zero-term documents, and cannot race segment retirement/recycling.  Roots
+ * are enumerated under a page lock, then fetched through the AM's snapshot.
+ * A visible HOT version cannot lose its root while that snapshot is alive.
+ * Partial predicates and index expressions must be applied just as at build.
+ *
+ * ponytail: O(heap positions visited), not posting seeks; a sparse predicate
+ * can still walk the whole heap.  Add a posting iterator if that measured
+ * loss justifies one.  No O(match set) allocation or validation at startup.
+ */
+static WeavePadWalk *
+weave_pad_walk_begin(Relation index, Snapshot snapshot, WeaveQuery query,
+					 ScoredTid *ranked, int n)
+{
+	WeavePadWalk *w = palloc0(sizeof(WeavePadWalk));
+	WeaveIndexLayout layout;
+	int			i;
+
+	weave_index_layout(index, &layout);
+	w->index = index;
+	w->heap = table_open(index->rd_index->indrelid, AccessShareLock);
+	w->snapshot = snapshot;
+	w->query = query;
+	w->lexidx = layout.lexattno - 1;
+	w->info = BuildIndexInfo(index);
+	w->estate = CreateExecutorState();
+	w->predicate = w->info->ii_Predicate != NIL
+		? ExecPrepareQual(w->info->ii_Predicate, w->estate) : NULL;
+	w->slot = table_slot_create(w->heap, NULL);
+#if PG_VERSION_NUM >= 190000
+	w->fetch = table_index_fetch_begin(w->heap, SO_NONE);
+#else
+	w->fetch = table_index_fetch_begin(w->heap);
+#endif
+	w->nblocks = RelationGetNumberOfBlocks(w->heap);
+	w->nseen = n;
+	if (n > 0)
+	{
+		w->seen = WEAVE_ALLOC_MAYBE_HUGE((Size) n * sizeof(ItemPointerData));
+		for (i = 0; i < n; i++)
+			w->seen[i] = ranked[i].tid;
+		qsort(w->seen, n, sizeof(ItemPointerData), cmp_tid);
+	}
+	return w;
+}
+
+static bool
+weave_pad_walk_next(WeavePadWalk *w, ItemPointer tid)
+{
+	ExprContext *econtext = GetPerTupleExprContext(w->estate);
+
+	for (;;)
+	{
+		ItemPointerData root;
+		ItemPointerData fetched;
+		bool		call_again = false;
+		bool		all_dead = false;
+		bool		keep = false;
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
+		MemoryContext old;
+
+		CHECK_FOR_INTERRUPTS();
+		if (w->pos == w->nroots)
+		{
+			Buffer		buf;
+			Page		page;
+			OffsetNumber off;
+			OffsetNumber maxoff;
+
+			if (w->block == w->nblocks)
+				return false;
+			buf = ReadBuffer(w->heap, w->block++);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buf);
+			maxoff = PageGetMaxOffsetNumber(page);
+			w->pos = w->nroots = 0;
+			for (off = FirstOffsetNumber; off <= maxoff; off++)
+			{
+				ItemId		item = PageGetItemId(page, off);
+
+				if (ItemIdIsRedirect(item) ||
+					(ItemIdIsNormal(item) &&
+					 !HeapTupleHeaderIsHeapOnly((HeapTupleHeader) PageGetItem(page, item))))
+					w->roots[w->nroots++] = off;
+			}
+			UnlockReleaseBuffer(buf);
+			if (w->nroots == 0)
+				continue;
+		}
+		ItemPointerSet(&root, w->block - 1, w->roots[w->pos++]);
+		if (w->nseen > 0 &&
+			bsearch(&root, w->seen, w->nseen, sizeof(ItemPointerData), cmp_tid) != NULL)
+			continue;
+		fetched = root;
+		ExecClearTuple(w->slot);
+		if (!table_index_fetch_tuple(w->fetch, &fetched, w->snapshot, w->slot,
+									 &call_again, &all_dead))
+			continue;
+		econtext->ecxt_scantuple = w->slot;
+		old = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+		if (w->predicate == NULL || ExecQual(w->predicate, econtext))
+		{
+			FormIndexDatum(w->info, w->slot, w->estate, values, isnull);
+			if (!isnull[w->lexidx])
+			{
+				WeaveDoc	doc = weave_index_lexdoc(w->index, w->lexidx + 1,
+												values[w->lexidx], NULL);
+
+				keep = weave_doc_matches(doc, w->query);
+			}
+		}
+		MemoryContextSwitchTo(old);
+		ResetExprContext(econtext);
+		if (keep)
+		{
+			*tid = root;
+			return true;
+		}
+	}
+}
+
+static void
+weave_pad_walk_end(WeavePadWalk *w)
+{
+	table_index_fetch_end(w->fetch);
+	ExecDropSingleTupleTableSlot(w->slot);
+	FreeExecutorState(w->estate);
+	table_close(w->heap, AccessShareLock);
+	if (w->seen != NULL)
+		pfree(w->seen);
+	pfree(w->info);
+	pfree(w);
+}
+
 static void
 weave_pad_begin(IndexScanDesc scan, WeaveScanOpaque so)
 {
@@ -3782,6 +3950,16 @@ weave_pad_begin(IndexScanDesc scan, WeaveScanOpaque so)
 	int			i;
 
 	so->padActive = true;
+	/* G94's exhaustion/zero-score proof is unchanged; only enumeration moves.
+	 * Other ordering routes retain their G76 collected gate / NULL handling. */
+	if (!so->vecScan && !so->edistScan && !so->fuseScan &&
+		(so->ordSameQuery || so->ordQueryRestricts) &&
+		!weave_query_lit_covered(so->query))
+	{
+		so->padWalk = weave_pad_walk_begin(index, scan->xs_snapshot, so->query,
+											so->ordered, so->nordered);
+		return;
+	}
 	so->padHeap = table_open(index->rd_index->indrelid, AccessShareLock);
 	so->padSlot = table_slot_create(so->padHeap, NULL);
 	so->padRoots = (OffsetNumber *) palloc(MaxHeapTuplesPerPage * sizeof(OffsetNumber));	/* alloc-ok: one heap page's line pointers, a compile-time bound */
@@ -3959,6 +4137,9 @@ weave_pad_end_walk(WeaveScanOpaque so)
 static void
 weave_pad_end(WeaveScanOpaque so)
 {
+	if (so->padWalk != NULL)
+		weave_pad_walk_end(so->padWalk);
+	so->padWalk = NULL;
 	weave_pad_end_walk(so);
 	if (so->padNulls != NULL)
 		pfree(so->padNulls);
@@ -4066,6 +4247,19 @@ weave_pad_fuse_null(WeaveScanOpaque so, const bool *isnull)
 static bool
 weave_pad_gettuple(IndexScanDesc scan, WeaveScanOpaque so)
 {
+	if (so->padWalk != NULL)
+	{
+		ItemPointerData tid;
+
+		if (weave_pad_walk_next(so->padWalk, &tid))
+		{
+			weave_pad_emit(scan, so, &tid, false);
+			return true;
+		}
+		weave_pad_end(so);
+		so->padDone = true;
+		return false;
+	}
 	/*
 	 * THE GATE WALK (doc/GAPS.md G76): the lexical gate's own sorted TIDs, which
 	 * are HOT-chain roots because they came out of the index.  Each is fetched
@@ -8834,49 +9028,25 @@ weave_topk_visible(Relation index, WeaveQuery q, int k, bool as_distance,
 }
 
 /*
- * Append to results[0..nvis) up to k - nvis visible matches of q it does not
- * hold, at score 0 (distance 1.0), and return the new count.  The ordering
- * scan's padding phase (weave_pad_wanted) has the proof that every one of them
- * scores exactly 0, so the result stays in descending score order.  Its TIDs
- * come out of the index, so they are HOT-chain roots like the ranked ones
- * (doc/GAPS.md G74).  Rechecked always: the collected set over-generates for a
- * NOT over a phrase or a weighted leaf, and the recheck is bounded by k.
- *
- * ponytail: collects q's whole match set, O(match set) before the first row --
- * the same cost doc/GAPS.md G95 accepts for the ordering scan.
+ * Drain the same lazy exact walk as amgettuple, but only as far as the SRF's
+ * requested k.  The caller has already allocated k results and proved ranked
+ * generation exhausted; G94 proves every appended match scores exactly zero.
  */
 static int
 weave_topk_pad(Relation index, WeaveQuery q, int k, bool as_distance,
 			   ScoredTid **results, int nvis)
 {
-	TidSet		m;
-	bool		recheck;
-	ItemPointerData *seen;
-	int			i,
-				n = 0;
+	WeavePadWalk *w = weave_pad_walk_begin(index, GetActiveSnapshot(), q,
+											 *results, nvis);
+	ItemPointerData tid;
 
-	weave_collect_matches(index, q, &m, &recheck);
-	seen = (ItemPointerData *) palloc(Max(nvis, 1) * sizeof(ItemPointerData));	/* alloc-ok: nvis < k, and results is k wide already */
-	for (i = 0; i < nvis; i++)
-		seen[i] = (*results)[i].tid;
-	qsort(seen, nvis, sizeof(ItemPointerData), cmp_tid);
-	for (i = 0; i < m.n; i++)
-		if (nvis == 0 ||
-			bsearch(&m.tids[i], seen, nvis, sizeof(ItemPointerData), cmp_tid) == NULL)
-			m.tids[n++] = m.tids[i];
-	m.n = n;
-	weave_recheck_exact(index, q, &m, k - nvis);
-	/* sized to what it holds, not to k: the caller allocated k */
-	*results = (ScoredTid *) repalloc(*results, Max(nvis + m.n, 1) * sizeof(ScoredTid));	/* alloc-ok: nvis + m.n <= k, the caller's own size */
-	for (i = 0; i < m.n; i++)
+	while (nvis < k && weave_pad_walk_next(w, &tid))
 	{
-		(*results)[nvis].tid = m.tids[i];
+		(*results)[nvis].tid = tid;
 		(*results)[nvis].score = as_distance ? 1.0 : 0.0;
 		nvis++;
 	}
-	pfree(seen);
-	if (m.tids != NULL)
-		pfree(m.tids);
+	weave_pad_walk_end(w);
 	return nvis;
 }
 
