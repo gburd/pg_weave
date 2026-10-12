@@ -1,0 +1,72 @@
+-- G40: amgettuple must return HOT-chain roots, not visible successor TIDs.
+-- Unlike cgram.sql's pre-build UPDATE, these updates happen AFTER CREATE INDEX.
+-- Keep ample page space and disable autovacuum; no VACUUM runs in this test.
+CREATE EXTENSION IF NOT EXISTS pg_weave;
+CREATE TABLE hot_roots (id integer, revision integer, d wdoc, body text)
+  WITH (fillfactor = 20, autovacuum_enabled = false);
+INSERT INTO hot_roots
+SELECT i, 0, to_wdoc('simple', 'alpha'), 'alpha beta'
+FROM generate_series(1, 12) AS i;
+CREATE INDEX hot_roots_idx ON hot_roots USING weave (d, body gram_ops);
+
+BEGIN;
+-- Only a non-indexed column changes: two HOT successors per original root.
+UPDATE hot_roots SET revision = 1;
+UPDATE hot_roots SET revision = 2;
+-- Transaction-local counters are synchronous, unlike the cumulative stats view.
+-- This is a fixture assertion: moving UPDATE before CREATE INDEX or losing HOT
+-- must not silently turn this into an INSERT-only test of the access method.
+SELECT n_tup_upd = 24 AND n_tup_hot_upd = 24 AS all_updates_hot
+FROM pg_stat_xact_user_tables WHERE relid = 'hot_roots'::regclass;
+
+-- Independent heap oracle, captured before disabling sequential scans.
+SET LOCAL enable_indexscan = off;
+SET LOCAL enable_bitmapscan = off;
+CREATE TEMP TABLE hot_expected ON COMMIT DROP AS
+SELECT id, revision, ctid AS tid FROM hot_roots;
+SELECT count(*) = 12 AND count(DISTINCT tid) = 12
+       AND bool_and(revision = 2) AS heap_has_updated_rows
+FROM hot_expected;
+
+SET LOCAL enable_indexscan = on;
+SET LOCAL enable_seqscan = off;
+SET LOCAL max_parallel_workers_per_gather = 0;
+-- Three amgettuple paths: recorded lexical roots, cgram posting roots, and the
+-- cgram fallback's physical-to-root conversion (%a% has no usable trigram).
+-- The plan IS part of the assertion: a bitmap executor cannot stand in for it.
+EXPLAIN (COSTS OFF)
+SELECT 'lexical' AS arm, id, revision, ctid AS tid
+FROM hot_roots WHERE d @@@ 'alpha'
+UNION ALL
+SELECT 'cgram', id, revision, ctid
+FROM hot_roots WHERE body @~ '%alpha%'
+UNION ALL
+SELECT 'fallback', id, revision, ctid
+FROM hot_roots WHERE body @~ '%a%';
+
+CREATE TEMP TABLE hot_actual ON COMMIT DROP AS
+SELECT 'lexical' AS arm, id, revision, ctid AS tid
+FROM hot_roots WHERE d @@@ 'alpha'
+UNION ALL
+SELECT 'cgram', id, revision, ctid
+FROM hot_roots WHERE body @~ '%alpha%'
+UNION ALL
+SELECT 'fallback', id, revision, ctid
+FROM hot_roots WHERE body @~ '%a%';
+
+-- Include the expected arm names even if a broken path returns ZERO rows.
+-- EXCEPT ALL detects duplicates as well as omissions; comparing tid with the
+-- heap oracle verifies that each id maps to its current visible tuple version.
+SELECT arm,
+       NOT EXISTS (
+         (SELECT id, revision, tid FROM hot_actual a WHERE a.arm = arms.arm
+          EXCEPT ALL SELECT id, revision, tid FROM hot_expected)
+         UNION ALL
+         (SELECT id, revision, tid FROM hot_expected
+          EXCEPT ALL
+          SELECT id, revision, tid FROM hot_actual a WHERE a.arm = arms.arm)
+       ) AS exact_rows_and_ctids
+FROM (VALUES ('lexical'), ('cgram'), ('fallback')) AS arms(arm)
+ORDER BY arm;
+COMMIT;
+DROP TABLE hot_roots;
