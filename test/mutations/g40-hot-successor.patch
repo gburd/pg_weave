@@ -1,0 +1,13 @@
+--- a/src/am/amscan.c
++++ b/src/am/amscan.c
+@@ -6214,7 +6214,9 @@
+ 				}
+ 				if (off >= 1 && off <= MaxHeapTuplesPerPage &&
+ 					roots[off - 1] != InvalidOffsetNumber)
+-					ItemPointerSetOffsetNumber(&rtid, roots[off - 1]);
++					/* G40 mutant: retain the physical HOT-successor TID. */
++					elog(LOG, "G40 mutant: block %u physical %u root %u",
++						 blk, off, roots[off - 1]);
+ 
+ 				if (n >= cap)
+ 				{

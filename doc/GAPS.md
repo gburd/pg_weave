@@ -1990,7 +1990,7 @@ weft is omitted — the same shape as G25 for the vector half. (2) **Hard rule 1
 this touches merge, so local green is not evidence; a run at scale through `bench/aws/` is
 owed before the closure is treated as durable.
 
-### G40 — no regression test exercises a post-build, un-VACUUMed, HOT-churned heap — **OPEN 2026-09-21, found by the pg_tre 4.0.x review**
+### G40 — no regression test exercises a post-build, un-VACUUMed, HOT-churned heap — **CLOSED 2026-10-12 (coverage), found 2026-09-21 by the pg_tre 4.0.x review**
 
 pg_tre 4.0.2 fixed `amgettuple` returning HOT-successor TIDs, and its post-mortem says the
 blind spot that hid the bug for three rounds was a test suite that churned the heap only
@@ -2002,6 +2002,50 @@ inverts `weave_docid_to_tid()` from root TIDs recorded at build/insert time
 (`amscan.c:6395-6405`), so it is structurally immune — but the *coverage* that would catch a
 regression does not exist. What is owed: an arm that UPDATEs after the index is built,
 does not VACUUM, and reads through a plan that must use `amgettuple`.
+
+**CLOSED 2026-10-12 — coverage only; no production change.**
+`sql/hot_roots.sql`, registered in `Makefile`'s `REGRESS`, creates the weave index
+before updating an unindexed column twice on twelve rows. Fillfactor 20 and
+`autovacuum_enabled = false` preserve the fixture; no VACUUM is issued.
+`pg_stat_xact_user_tables` synchronously asserts **24 updates, all HOT**. A
+sequential heap oracle contains twelve distinct current ctids at revision 2.
+With sequential and bitmap scans disabled, EXPLAIN asserts three **Index Scans
+using hot_roots_idx**: lexical recorded roots, cgram posting roots, and the
+cgram heap fallback (`%a%`, no usable trigram). Each result is compared with the
+oracle by symmetric **EXCEPT ALL** over `(id, revision, ctid)`, catching missing
+rows, duplicates and wrong tuple mappings, even when an arm returns zero rows.
+The new expected file was generated from a **full** PG17 regression invocation;
+no existing expected output was changed, and the same file passed on PG18.
+
+**Positive control, both majors:**
+`test/mutations/g40-hot-successor.patch` removes only the root-offset conversion
+in `weave_cgram_heapscan()` (the historical `:4014-4054` site is now around
+`:6178-6217`) and logs physical/root offsets. Applied **only to the disposable
+EC2 copy**, it **built and installed successfully** on PG17 and PG18. On each,
+`hot_roots` failed with **`fallback | t` -> `fallback | f`**; both other arms and
+the HOT/heap fixture assertions stayed true, with the three Index Scans still
+present. The server log associates `CREATE TEMP TABLE hot_actual` with twelve
+site hits: block 0, **physical offsets 25..36 versus roots 1..12**. Thus this is
+a reached, compiled physical-successor mutant, not a build failure counted as a
+catch. The older `cgram` test also failed on its pre-build churn fixture; this
+new test is not the sole detector, but supplies the missing post-build,
+plain-amgettuple arm. Replay instructions are in `test/mutations/README.md`.
+
+**Full restored-code gates:** Debian 13 `c7i.2xlarge`, kiwi **us-west-2**, dev run
+`pgweave-dev-20261012-124639-748270`, base `c53d329`, test commits
+`05364e0` / `c1d1bff`. PG17.11: **34 regression + 2 isolation + 36 TAP files,
+1,501 TAP assertions PASS**. PG18.6: **34 regression + 2 isolation + 36 TAP files,
+1,541 TAP assertions PASS**. Both full `make installcheck` invocations exited
+zero, with empty regression/isolation diffs. Clean builds and installs used
+explicit per-major `PG_CONFIG` and `with_llvm=no`; the restored `amscan.c` hash
+matched the unchanged worktree. No build or test ran locally.
+Artifacts: `/scratch/pg_weave/g40-evidence/{generate-fixed,mutant17,mutant18,green17,green18}/`
+(build/install logs, test output, diffs, TAP logs; mutant `site.log` and
+`driver.log` prove build/site/failure). An initial setup attempt installed to
+the wrong major because sudo dropped environment `PG_CONFIG`; its missing
+extension failures are **not test evidence**. The corrected harness passes
+`PG_CONFIG` explicitly to sudo. Host killed before its deadline and independently
+verified **terminated**, with zero matching security groups or key pairs.
 
 ### G41 — `fuse()` ranked every DISTANCE-spelled channel BACKWARDS, and the defect was printed in a checked-in expected file — **FOUND AND CLOSED 2026-09-22 by F8**
 
